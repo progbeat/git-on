@@ -313,7 +313,9 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             tty_settings[3] |= termios.TOSTOP
             termios.tcsetattr(0, termios.TCSANOW, tty_settings)
             os.chdir(self.repo)
-            os.execve(str(BINARY), [str(BINARY), "HEAD", sys.executable, "-c", code], self.environment(run))
+            env = self.environment(run)
+            env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
+            os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
         captured = bytearray()
         status = None
         sent = False
@@ -349,6 +351,61 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
                 os.waitpid(pid, 0)
             os.close(fd)
 
+    def test_terminal_stop_continue_is_relayed_to_foreground_job(self):
+        run = self.root / "job-control-run"
+        code = "import os,signal; print('stop-ready',flush=True); os.kill(os.getpid(),signal.SIGSTOP); assert os.tcgetpgrp(0)==os.getpgrp(); print('resumed-ok',flush=True)"
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            env = self.environment(run)
+            env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
+            os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
+        captured = bytearray()
+        status = None
+        stops = 0
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if select.select([fd], [], [], 0.05)[0]:
+                    try: captured.extend(os.read(fd, 65536))
+                    except OSError: pass
+                finished, value = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
+                if finished and os.WIFSTOPPED(value):
+                    stops += 1
+                    os.killpg(pid, signal.SIGCONT)
+                elif finished:
+                    status = value
+                    while select.select([fd], [], [], 0.05)[0]:
+                        try: tail = os.read(fd, 65536)
+                        except OSError: break
+                        if not tail: break
+                        captured.extend(tail)
+                    break
+            self.assertIsNotNone(status, f"job control hung: {captured!r}")
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0, captured)
+            self.assertEqual(stops, 1, captured)
+            self.assertIn(b"resumed-ok", captured)
+        finally:
+            if status is None:
+                try: os.killpg(pid, signal.SIGCONT); os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError: pass
+                time.sleep(.1)
+                try: os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                os.waitpid(pid, 0)
+            os.close(fd)
+
+    def test_deep_ignore_negation_is_not_lost_to_matcher_limits(self):
+        name = "a" * 100
+        self.put(".gitignore", "*\n!" + "*a" * 100 + "\n")
+        git(self.repo, "add", "--force", ".gitignore")
+        git(self.repo, "commit", "--quiet", "-m", "deep negative ignore rule")
+        oracle = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", name], cwd=self.repo)
+        self.assertEqual(oracle.returncode, 1)
+        code = "from pathlib import Path\nimport sys\ntry: Path(sys.argv[1]).write_text('denied')\nexcept PermissionError: pass\nelse: raise AssertionError('negation was ignored')\nPath('allowed').write_text('works')"
+        result, _ = self.invoke(sys.executable, "-c", code, name)
+        self.assert_success(result)
+
     def test_escaped_descendant_keeps_busy_mount_for_explicit_cleanup(self):
         pidfile = self.root / "escaped-pid"
         descendant = f"import os,time; from pathlib import Path; Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(300)"
@@ -358,15 +415,18 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             result, _ = self.invoke(sys.executable, "-c", code, descendant, str(pidfile), run=run, timeout=15)
             self.assertEqual(result.returncode, 125, result.stderr)
             self.assertTrue(self.manifest(run)["status"]["runner_error"])
-            self.assertTrue(os.path.ismount(run / "mount"), "busy mount must remain for recovery")
+            # A disconnected FUSE mount returns ENOTCONN to stat(), so
+            # os.path.ismount misleadingly reports false. Inspect mountinfo.
+            mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
+            self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
             self.assertTrue(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
         finally:
             if pidfile.exists():
                 try: os.killpg(int(pidfile.read_text()), signal.SIGKILL)
                 except ProcessLookupError: pass
-        cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=15)
-        self.assert_success(cleanup)
+            cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=15)
+            self.assert_success(cleanup)
         self.assertFalse((run / "mount").exists())
         self.assertFalse((run / "backing").exists())
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))

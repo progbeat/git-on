@@ -1,6 +1,6 @@
 //! Creation rules compiled exclusively from snapshot .gitignore blobs.
 use crate::snapshot::{EntryKind, Snapshot};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::ffi::OsStrExt,
@@ -9,7 +9,7 @@ use std::{
 
 #[derive(Debug)]
 struct Rule {
-    pattern: Vec<u8>,
+    pattern: crate::wildmatch::Pattern,
     negative: bool,
     directory_only: bool,
     basename: bool,
@@ -56,7 +56,7 @@ impl Rule {
         }
         let basename = !anchored && !line.contains(&b'/');
         Some(Self {
-            pattern: line.to_vec(),
+            pattern: crate::wildmatch::Pattern::new(line),
             negative,
             directory_only,
             basename,
@@ -71,11 +71,7 @@ impl Rule {
                 path = &path[slash + 1..];
             }
         }
-        gix_glob::wildmatch(
-            self.pattern.as_slice().into(),
-            path.into(),
-            gix_glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
-        )
+        self.pattern.matches(path)
     }
 }
 
@@ -103,18 +99,6 @@ impl Policy {
                 .split(|&b| b == b'\n')
                 .filter_map(Rule::parse)
                 .collect();
-            // gix wildmatch has a recursion guard at 64. Every recursive frame
-            // consumes at least one star; conservatively bound raw star bytes
-            // so exhaustion can never masquerade as a nonmatching negation.
-            if parsed
-                .iter()
-                .any(|rule| rule.pattern.iter().filter(|&&b| b == b'*').count() >= 64)
-            {
-                bail!(
-                    "ignore pattern exceeds the supported 63-star complexity limit: {}",
-                    path.display()
-                );
-            }
             rules.insert(dir.to_path_buf(), parsed);
         }
         Ok(Self {
@@ -604,19 +588,79 @@ mod tests {
         }
     }
     #[test]
-    fn excessive_wildcards_fail_before_they_can_hide_a_negation() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-        let pattern = format!("*\n!{}\n", "*a".repeat(64));
-        let blob = repo.blob(pattern.as_bytes()).unwrap();
-        let mut tree = repo.treebuilder(None).unwrap();
-        tree.insert(".gitignore", blob, 0o100644).unwrap();
-        let oid = tree.write().unwrap();
-        let snapshot =
-            Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "complexity").unwrap();
-        assert!(Policy::new(&snapshot)
-            .unwrap_err()
-            .to_string()
-            .contains("63-star"));
+    fn deep_wildcards_cannot_hide_a_negation() {
+        for count in [63, 64, 65, 100, 1000] {
+            let pattern = format!("*\n!{}\n", "*a".repeat(count));
+            let (_tmp, _snapshot, policy) = fixture(&pattern, "");
+            assert!(!policy.allows(Path::new(&"a".repeat(count)), false));
+            assert!(policy.allows(Path::new(&"a".repeat(count - 1)), false));
+        }
+    }
+    #[test]
+    fn deep_patterns_match_git_oracle() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for count in [63, 64, 65, 100] {
+            for (atom, matching) in [
+                ("*a", "a"),
+                ("*[ab]", "a"),
+                ("*\\*", "*"),
+                ("*[[:digit:]]", "1"),
+                ("*?", "a"),
+            ] {
+                for negative in [false, true] {
+                    let root = format!(
+                        "{}{}\n",
+                        if negative { "*\n!" } else { "" },
+                        atom.repeat(count)
+                    );
+                    let (tmp, _, policy) = fixture(&root, "");
+                    std::fs::write(tmp.path().join(".gitignore"), &root).unwrap();
+                    let paths = [
+                        matching.repeat(count),
+                        matching.repeat(count - 1),
+                        matching.repeat(count + 1),
+                        format!("{}z", matching.repeat(count)),
+                    ];
+                    let mut child = Command::new("git")
+                        .current_dir(tmp.path())
+                        .args([
+                            "-c",
+                            "core.excludesFile=/dev/null",
+                            "-c",
+                            "core.ignoreCase=false",
+                            "check-ignore",
+                            "--no-index",
+                            "--stdin",
+                            "-z",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    {
+                        let mut stdin = child.stdin.take().unwrap();
+                        for path in &paths {
+                            stdin.write_all(path.as_bytes()).unwrap();
+                            stdin.write_all(&[0]).unwrap();
+                        }
+                    }
+                    let output = child.wait_with_output().unwrap();
+                    assert!(matches!(output.status.code(), Some(0 | 1)));
+                    let ignored: BTreeSet<_> = output
+                        .stdout
+                        .split(|&b| b == 0)
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                    for path in paths {
+                        assert_eq!(
+                            policy.allows(Path::new(&path), false),
+                            ignored.contains(path.as_bytes()),
+                            "pattern={root:?}, path={path:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

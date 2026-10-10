@@ -217,17 +217,26 @@ fn foreground(pgid: libc::pid_t) -> std::io::Result<()> {
     }
     Ok(())
 }
-struct Terminal(Option<libc::pid_t>);
+struct Terminal {
+    parent: Option<libc::pid_t>,
+    child: Option<libc::pid_t>,
+}
 impl Terminal {
     fn capture() -> Self {
         let pgid = unsafe { libc::tcgetpgrp(0) };
-        Self((pgid >= 0 && pgid == unsafe { libc::getpgrp() }).then_some(pgid))
+        Self {
+            parent: (pgid >= 0 && pgid == unsafe { libc::getpgrp() }).then_some(pgid),
+            child: None,
+        }
     }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some(pgid) = self.0 {
-            let _ = foreground(pgid);
+        if let Some(pgid) = self.parent {
+            let current = unsafe { libc::tcgetpgrp(0) };
+            if self.child.is_none_or(|child| current == child) {
+                let _ = foreground(pgid);
+            }
         }
     }
 }
@@ -338,17 +347,28 @@ fn relay_job_control(pid: u32, parent_pgid: Option<libc::pid_t>) -> Result<()> {
     let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WSTOPPED | libc::WNOHANG) };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
+        // WSTOPPED alone reports ECHILD for an exited-but-unreaped child.
+        // The WEXITED|WNOWAIT probe below still owns and observes its exit.
+        if e.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(());
+        }
         if e.kind() != std::io::ErrorKind::Interrupted {
             return Err(e.into());
         }
     }
     if unsafe { info.si_pid() } != 0 {
-        foreground(parent_pgid)?;
-        unsafe {
-            libc::raise(libc::SIGSTOP);
+        let current = unsafe { libc::tcgetpgrp(0) };
+        if current == pid as libc::pid_t {
+            foreground(parent_pgid)?;
         }
-        // Execution resumes here when the invoking shell continues the job.
-        foreground(pid as libc::pid_t)?;
+        unsafe {
+            libc::kill(-parent_pgid, libc::SIGSTOP);
+        }
+        // `fg` gives this runner the terminal; `bg` does not. Never steal it
+        // from the invoking shell on a background resume.
+        if unsafe { libc::tcgetpgrp(0) } == parent_pgid {
+            foreground(pid as libc::pid_t)?;
+        }
         kill_group(pid, libc::SIGCONT);
     }
     Ok(())
@@ -570,8 +590,8 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
             .env("GIT_ON_TREE_OID", manifest.tree_oid.as_ref().unwrap())
             .env("GIT_ON_RUN_DIR", &dir)
             .env("GIT_ON_OUTPUT_DIR", dir.join("output"));
-        let terminal = Terminal::capture();
-        let transfer_terminal = terminal.0.is_some();
+        let mut terminal = Terminal::capture();
+        let transfer_terminal = terminal.parent.is_some();
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
@@ -585,6 +605,7 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
         }
         let mut child = command.spawn().context("spawn command")?;
         let pid = child.id();
+        terminal.child = Some(pid as libc::pid_t);
         manifest.phase = "running".into();
         let outcome = supervise(
             &mut child,
@@ -594,7 +615,7 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
             &dir,
             &mut manifest,
             [1, 2],
-            terminal.0,
+            terminal.parent,
         );
         if manifest.status.exit_code.is_none() && manifest.status.signal.is_none() {
             kill_group(pid, libc::SIGKILL);
@@ -848,5 +869,14 @@ mod tests {
         assert_eq!(fs::read(dir.join("stdout.log")).unwrap(), b"evidence");
         assert_eq!(fs::read(dir.join("output/keep")).unwrap(), b"output");
         assert!(dir.join("manifest.json").exists());
+    }
+    #[test]
+    fn terminal_stop_probe_does_not_misclassify_exited_child() {
+        let mut c = child("pass");
+        while !child_exited(c.id()).unwrap() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        relay_job_control(c.id(), Some(unsafe { libc::getpgrp() })).unwrap();
+        assert!(c.wait().unwrap().success());
     }
 }
