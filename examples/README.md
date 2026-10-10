@@ -1,0 +1,24 @@
+# Locked Python examples
+
+Both examples import a local module that uses NumPy and `@numba.njit(cache=True)`.
+They run that module in two separate Python processes, assert the second process
+reuses the compiled cache without rewriting its files, and print `cache-reused`.
+The committed `.gitignore` permits `__pycache__/` and `.venv/` writes.
+
+After committing the examples in a repository, run either snapshot subtree:
+
+```console
+git on HEAD:examples/pep723 uv run --locked --script main.py
+git on HEAD:examples/uv-project uv run --locked main.py
+```
+
+The first example uses PEP 723 inline metadata and `main.py.lock`. The second
+uses `pyproject.toml` and `uv.lock`. Both pin NumPy 2.2.6 and Numba 0.61.2; the
+lockfiles also pin and hash the llvmlite dependency. Python 3.11–3.13 is required.
+CI validates these with uv 0.8.22. Initial execution needs package-index access.
+
+Inside git-on, the writable snapshot layer is temporary. The examples explicitly
+copy their local import and Numba cache evidence to
+`$GIT_ON_OUTPUT_DIR/cache-evidence/`, which remains in the run directory after
+cleanup. This is an explicit artifact export, not automatic retention of every
+ignored path. Cache reuse is within one run; a later run starts fresh.
