@@ -860,6 +860,10 @@ mod tests {
         fs::write(dir.join("output/keep"), b"output").unwrap();
         fs::write(dir.join("stdout.log"), b"evidence").unwrap();
         assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
+        // Other parallel process tests may briefly inherit this descriptor
+        // between fork and exec (CLOEXEC). Explicitly release the shared OFD
+        // lock before asserting reacquisition, instead of racing that window.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         cleanup(&dir).unwrap();
         cleanup(&dir).unwrap();

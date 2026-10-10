@@ -402,7 +402,7 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
         git(self.repo, "commit", "--quiet", "-m", "deep negative ignore rule")
         oracle = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", name], cwd=self.repo)
         self.assertEqual(oracle.returncode, 1)
-        code = "from pathlib import Path\nimport sys\ntry: Path(sys.argv[1]).write_text('denied')\nexcept PermissionError: pass\nelse: raise AssertionError('negation was ignored')\nPath('allowed').write_text('works')"
+        code = "from pathlib import Path\nimport errno,sys\ntry: Path(sys.argv[1]).write_text('denied')\nexcept OSError as e: assert e.errno in (errno.EROFS, errno.EACCES, errno.EPERM), e\nelse: raise AssertionError('negation was ignored')\nPath('allowed').write_text('works')"
         result, _ = self.invoke(sys.executable, "-c", code, name)
         self.assert_success(result)
 
