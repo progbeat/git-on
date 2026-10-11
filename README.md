@@ -1,6 +1,6 @@
 # git-on
 
-Run a command against one Git tree, with immutable source and temporary writes only where that tree's `.gitignore` permits them. The design goal is lazy access and fast startup without unpacking the repository; the current implementation still has an [eager-loading gap](#required-lazy-access-and-current-implementation-gap).
+Run a command against one Git tree, with immutable source and temporary writes only where that tree's `.gitignore` permits them. Access is lazy: the runner starts without unpacking or recursively scanning the repository, then loads the requested directories and file contents on demand. See [performance and verification](#lazy-access-and-performance).
 
 ```sh
 git on HEAD python script.py
@@ -36,13 +36,17 @@ The policy is language-independent. There are no special write exceptions for Py
 
 This is **not a security sandbox**. Commands inherit the caller's user identity and environment. Absolute paths, symlinks to outside the mount, network connections, and other accessible filesystems remain accessible. It protects the mounted snapshot, not the host. Do not run untrusted code on the strength of this filesystem policy.
 
-Submodules and Git LFS pointer blobs fail before command execution. They are never silently treated as usable checked-out content. Git filters and hooks are not run. The mount contains source-tree entries, not a synthetic `.git` checkout. Git SHA-256 repositories are not currently supported by the bundled libgit2.
+Submodules fail when their metadata is accessed; Git LFS pointer blobs fail when their contents are read. Unused unsupported entries do not prevent starting a command or reading unrelated files. Directory listings can show submodule names. They are never silently treated as usable checked-out content. Git filters and hooks are not run. The mount contains source-tree entries, not a synthetic `.git` checkout. Git SHA-256 repositories are not currently supported by the bundled libgit2.
 
-## Required lazy access and current implementation gap
+## Lazy access and performance
 
-The [behavioral and performance specification](docs/specification.md) requires demand-driven access: start the command without recursively walking or materializing the selected tree, then load directory metadata and file contents as requested. A million-file tree must not require a million-file startup scan. Only the selected paths, applicable ignore rules, and Git storage decoding dependencies should require object access.
+The [behavioral and performance specification](docs/specification.md) defines the contract. Startup resolves and pins the selected tree and mounts its root; it does not recursively enumerate the source. Lookup loads ancestor directory metadata and the requested blob header, directory listing loads only that directory, and read loads the requested content. Write checks load only applicable pinned ignore files.
 
-**This requirement is not implemented yet.** The current runtime recursively loads every selected directory and source blob before mounting, then copies source bytes into filesystem nodes. Startup work and memory therefore scale with the entire selected tree. Passing the existing functional tests does not establish lazy behavior or large-repository performance. The specification records the required behavior and its acceptance checks; this documentation change does not fix the runtime.
+Decoded content retention is bounded: 8 MiB / 128 blob entries, 4 MiB / 256 tree entries, 4,096 blob headers, and 4 MiB / 256 compiled ignore-rule entries. Idle open file descriptors do not pin evicted small payloads. Kernel inode references and active directory listings retain their necessary metadata until released. libgit2 also has its own internal object cache with a default 256 MiB soft target; its default blob caching is disabled.
+
+Git encoding can require decoding an entire requested blob or its delta bases. Large blobs use an immediately unlinked spool in the private backing directory, shared by simultaneous readers and removed after their final close; subsequent ranges in that open file do not repeatedly decode the object. A first read still needs the memory to decode that object. These limits are retained-cache budgets, not a bound on total RSS, kernel cache, active metadata, or temporary large-object decoding.
+
+The run manifest records application-level tree/header/blob requests and cache statistics as `snapshot_metrics`. They exclude initial tree-ish resolution and do not pretend to measure physical I/O or hidden delta-base reads. The [benchmark](tests/benchmark.md) checks exact output and demand counts on a million distinct files; latency and RSS are measured, not promised as a machine-independent SLA.
 
 ## Durable run evidence
 
@@ -96,5 +100,4 @@ The last command requires real FUSE and uv. GitHub Actions runs a separate requi
 
 For the reproducible million-file random-read baseline and measurement limits,
 see [performance benchmarks](tests/benchmark.md). The separate CI benchmark job
-runs the exact digit-tree workload with an optimized binary; successful output
-verification is not evidence that loading is lazy.
+runs the exact digit-tree workload with an optimized binary; output and demand-count gates complement the unit and real-FUSE tests.

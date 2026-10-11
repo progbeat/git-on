@@ -77,12 +77,12 @@ class RepositoryTest(unittest.TestCase):
             env["GIT_ON_RUN_DIR"] = str(run)
         return env
 
-    def invoke(self, *command, tree="HEAD", run=None, input=None, timeout=60):
+    def invoke(self, *command, tree="HEAD", run=None, input=None, timeout=60, extra_env=None):
         if run is None:
             self.counter += 1
             run = self.root / f"run-{self.counter}"
         result = subprocess.run([str(BINARY), tree, *map(str, command)], cwd=self.repo,
-                                env=self.environment(run), input=input, stdout=subprocess.PIPE,
+                                env=dict(self.environment(run), **(extra_env or {})), input=input, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout)
         return result, run
 
@@ -215,6 +215,416 @@ Path(os.environ['GIT_ON_OUTPUT_DIR'], 'result.txt').write_text(Path('out/new/res
         self.assert_success(result)
         self.assertEqual((run / "output/result.txt").read_text(), "first second")
         self.assertFalse((self.repo / "out/new").exists())
+
+    def test_file_operation_matrix_preserves_tracked_bytes(self):
+        self.put("protected.cache", "tracked cache\n")
+        self.put("nested/protected.tmp", "tracked nested\n")
+        git(self.repo, "add", "--force", "protected.cache", "nested/protected.tmp")
+        git(self.repo, "commit", "--quiet", "-m", "tracked ignore precedence")
+        result, _ = self.python(r'''
+import errno, os, stat
+from pathlib import Path
+
+def denied(label, action, codes=(errno.EROFS, errno.EACCES, errno.EPERM)):
+    try: action()
+    except OSError as error:
+        assert error.errno in codes, (label, error)
+    else: raise AssertionError(label + ' unexpectedly succeeded')
+
+def opened(path, flags):
+    fd = os.open(path, flags, 0o600)
+    os.close(fd)
+
+for path in ['tracked.txt', 'out/protected.txt', 'protected.cache',
+             'nested/protected.tmp', '.gitignore']:
+    original = Path(path).read_bytes()
+    before = os.stat(path)
+    for label, operation in [
+        ('write', lambda: Path(path).write_bytes(b'bad')),
+        ('append', lambda: opened(path, os.O_WRONLY | os.O_APPEND)),
+        ('read-write', lambda: opened(path, os.O_RDWR)),
+        ('truncate-open', lambda: opened(path, os.O_WRONLY | os.O_TRUNC)),
+        ('read-only-truncate', lambda: opened(path, os.O_RDONLY | os.O_TRUNC)),
+        ('truncate', lambda: os.truncate(path, 1)),
+        ('chmod', lambda: os.chmod(path, 0o600)),
+        ('chown-self', lambda: os.chown(path, os.getuid(), os.getgid())),
+        ('utime', lambda: os.utime(path, ns=(123000000000, 456000000000))),
+        ('unlink', lambda: os.unlink(path)),
+        ('rename', lambda: os.rename(path, 'out/stolen')),
+        ('hardlink', lambda: os.link(path, 'out/stolen-hardlink')),
+    ]:
+        denied(path + ':' + label, operation)
+        assert Path(path).read_bytes() == original, (path, label)
+    after = os.stat(path)
+    assert (after.st_mode, after.st_size, after.st_mtime_ns) == (before.st_mode, before.st_size, before.st_mtime_ns)
+
+for path in ['out/matrix', 'matrix.cache', 'nested/matrix.tmp']:
+    opened(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    assert Path(path).read_bytes() == b''
+    denied(path + ':exclusive-create', lambda: opened(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL), (errno.EEXIST,))
+    fd = os.open(path, os.O_RDWR)
+    os.write(fd, b'abcdef')
+    assert os.pread(fd, 6, 0) == b'abcdef'
+    os.pwrite(fd, b'XY', 2)
+    assert os.pread(fd, 6, 0) == b'abXYef'
+    os.ftruncate(fd, 3)
+    assert os.fstat(fd).st_size == 3
+    os.ftruncate(fd, 6)
+    assert os.pread(fd, 6, 0) == b'abX\0\0\0'
+    os.fchmod(fd, 0o640)
+    os.fsync(fd)
+    os.close(fd)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, b'!')
+    os.close(fd)
+    assert Path(path).read_bytes() == b'abX\0\0\0!'
+    os.truncate(path, 2)
+    assert Path(path).read_bytes() == b'ab'
+    os.utime(path, ns=(123000000000, 456000000000))
+    os.chown(path, os.getuid(), os.getgid())
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+    assert os.stat(path).st_mtime_ns == 456000000000
+    opened(path, os.O_WRONLY | os.O_TRUNC)
+    assert Path(path).read_bytes() == b''
+    os.unlink(path)
+    assert not Path(path).exists()
+
+for path in ['not-ignored.txt', 'keep.cache', 'nested/keep.tmp', 'nested/plain.txt']:
+    for flags in [os.O_WRONLY | os.O_CREAT, os.O_RDWR | os.O_CREAT,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                  os.O_WRONLY | os.O_CREAT | os.O_APPEND]:
+        denied(path + ':create', lambda: opened(path, flags))
+        assert not os.path.lexists(path)
+''')
+        self.assert_success(result)
+        self.assertEqual((self.repo / "protected.cache").read_text(), "tracked cache\n")
+        self.assertFalse((self.repo / "out/matrix").exists())
+
+    def test_directory_and_rename_operation_matrix_is_atomic(self):
+        result, _ = self.python(r'''
+import errno, os, stat
+from pathlib import Path
+
+def denied(label, action, codes=(errno.EROFS, errno.EACCES, errno.EPERM)):
+    try: action()
+    except OSError as error: assert error.errno in codes, (label, error)
+    else: raise AssertionError(label + ' unexpectedly succeeded')
+
+for path in ['nested', 'plain', 'out']:
+    denied(path + ':chmod', lambda: os.chmod(path, 0o700))
+    denied(path + ':utime', lambda: os.utime(path, (0, 0)))
+    denied(path + ':rename', lambda: os.rename(path, 'moved.cache'))
+    denied(path + ':rmdir', lambda: os.rmdir(path), (errno.EROFS, errno.EACCES, errno.EPERM, errno.ENOTEMPTY))
+for path in ['forbidden-dir', 'plain/forbidden', 'keep.cache']:
+    denied(path + ':mkdir', lambda: os.mkdir(path))
+    assert not Path(path).exists()
+
+Path('out/tree/sub').mkdir(parents=True)
+Path('out/tree/sub/value').write_text('payload')
+os.chmod('out/tree', 0o700)
+os.utime('out/tree', ns=(1000000000, 2000000000))
+assert stat.S_IMODE(os.stat('out/tree').st_mode) == 0o700
+assert os.stat('out/tree').st_mtime_ns == 2000000000
+denied('nonempty-rmdir', lambda: os.rmdir('out/tree'), (errno.ENOTEMPTY, errno.EEXIST))
+denied('directory-cycle', lambda: os.rename('out/tree', 'out/tree/sub/cycle'), (errno.EINVAL,))
+denied('directory-policy-boundary', lambda: os.rename('out/tree', 'plain/moved'))
+assert Path('out/tree/sub/value').read_text() == 'payload'
+assert not Path('plain/moved').exists()
+os.rename('out/tree', 'out/renamed')
+assert not Path('out/tree').exists()
+assert Path('out/renamed/sub/value').read_text() == 'payload'
+Path('out/empty-destination').mkdir()
+os.replace('out/renamed', 'out/empty-destination')
+assert Path('out/empty-destination/sub/value').read_text() == 'payload'
+Path('out/nonempty').mkdir()
+Path('out/nonempty/keep').write_text('keep')
+denied('replace-nonempty-directory', lambda: os.replace('out/empty-destination', 'out/nonempty'), (errno.ENOTEMPTY, errno.EEXIST))
+assert Path('out/nonempty/keep').read_text() == 'keep'
+assert Path('out/empty-destination/sub/value').read_text() == 'payload'
+
+Path('out/source').write_text('source')
+Path('out/destination').write_text('destination')
+old_fd = os.open('out/destination', os.O_RDONLY)
+os.replace('out/source', 'out/destination')
+assert os.read(old_fd, 32) == b'destination'
+os.close(old_fd)
+assert Path('out/destination').read_text() == 'source'
+assert not Path('out/source').exists()
+for target in ['tracked.txt', 'out/protected.txt', '.gitignore', 'tracked-link']:
+    original = Path(target).read_bytes()
+    denied('replace-tracked:' + target, lambda: os.replace('out/destination', target))
+    assert Path(target).read_bytes() == original
+    assert Path('out/destination').read_text() == 'source'
+for target in ['forbidden', 'keep.cache', 'nested/keep.tmp']:
+    denied('rename-disallowed:' + target, lambda: os.rename('out/destination', target))
+    assert not os.path.lexists(target)
+    assert Path('out/destination').read_text() == 'source'
+os.rename('out/destination', 'renamed.cache')
+assert Path('renamed.cache').read_text() == 'source'
+os.unlink('renamed.cache')
+os.unlink('out/empty-destination/sub/value')
+os.rmdir('out/empty-destination/sub')
+os.rmdir('out/empty-destination')
+assert not Path('out/empty-destination').exists()
+''')
+        self.assert_success(result)
+
+    def test_symlink_and_hardlink_lifecycle_matrix(self):
+        result, _ = self.python(r'''
+import errno, os
+from pathlib import Path
+
+def denied(label, action, codes=(errno.EROFS, errno.EACCES, errno.EPERM, errno.EEXIST)):
+    try: action()
+    except OSError as error: assert error.errno in codes, (label, error)
+    else: raise AssertionError(label + ' unexpectedly succeeded')
+
+Path('out/owned').write_text('original')
+for path in ['forbidden-link', 'keep.cache', 'nested/keep.tmp', 'tracked.txt', 'out/protected.txt']:
+    denied('symlink:' + path, lambda: os.symlink('out/owned', path))
+    denied('hardlink:' + path, lambda: os.link('out/owned', path))
+for source in ['tracked.txt', 'out/protected.txt', '.gitignore', 'tracked-link']:
+    denied('hardlink-tracked:' + source, lambda: os.link(source, 'out/hard-protected'))
+
+os.symlink('owned', 'out/soft')
+assert os.readlink('out/soft') == 'owned'
+assert Path('out/soft').read_text() == 'original'
+Path('out/soft').write_text('changed')
+assert Path('out/owned').read_text() == 'changed'
+os.rename('out/soft', 'out/renamed-soft')
+assert os.readlink('out/renamed-soft') == 'owned'
+os.unlink('out/renamed-soft')
+assert Path('out/owned').read_text() == 'changed'
+os.symlink('../tracked.txt', 'out/protected-soft')
+assert Path('out/protected-soft').read_text() == 'committed\n'
+denied('write-through-protected-link', lambda: Path('out/protected-soft').write_text('bad'))
+denied('truncate-through-protected-link', lambda: os.truncate('out/protected-soft', 0))
+os.unlink('out/protected-soft')
+assert Path('tracked.txt').read_text() == 'committed\n'
+os.symlink('../forbidden-target', 'out/dangling')
+denied('create-through-policy-link', lambda: Path('out/dangling').write_text('bad'))
+assert not Path('forbidden-target').exists()
+os.unlink('out/dangling')
+
+os.link('out/owned', 'out/hard')
+assert os.stat('out/owned').st_ino == os.stat('out/hard').st_ino
+assert os.stat('out/owned').st_nlink == 2
+Path('out/hard').write_text('linked')
+assert Path('out/owned').read_text() == 'linked'
+fd = os.open('out/owned', os.O_RDWR)
+os.unlink('out/owned')
+assert os.stat('out/hard').st_nlink == 1
+os.rename('out/hard', 'out/final-hard')
+os.unlink('out/final-hard')
+assert os.fstat(fd).st_nlink == 0
+assert os.pread(fd, 6, 0) == b'linked'
+os.pwrite(fd, b'open', 0)
+os.ftruncate(fd, 4)
+assert os.pread(fd, 10, 0) == b'open'
+os.close(fd)
+assert not Path('out/final-hard').exists()
+''')
+        self.assert_success(result)
+
+    def test_nested_ignore_rules_and_tracked_precedence_survive_cold_lookups(self):
+        self.put("nested/deeper/.gitignore", "!local.tmp\n*.cache\n!keep.cache\n")
+        self.put("nested/deeper/protected.tmp", "nested tracked\n")
+        self.put("nested/deeper/anchor", "anchor\n")
+        git(self.repo, "add", "--force", "nested/deeper")
+        git(self.repo, "commit", "--quiet", "-m", "three-level ignore policy")
+        candidates = ["nested/deeper/local.tmp", "nested/deeper/allowed.tmp",
+                      "nested/deeper/cache.cache", "nested/deeper/keep.cache",
+                      "plain/allowed.tmp", "nested/deeper/plain.txt"]
+        expected = {}
+        for candidate in candidates:
+            decision = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", candidate], cwd=self.repo)
+            self.assertIn(decision.returncode, (0, 1))
+            expected[candidate] = decision.returncode == 0
+        result, _ = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+import errno, json, os, sys
+from pathlib import Path
+for path, allowed in json.loads(sys.argv[1]).items():
+    try: Path(path).write_text('created')
+    except OSError as error:
+        assert not allowed and error.errno in (errno.EROFS, errno.EACCES, errno.EPERM), (path, error)
+    else:
+        assert allowed, path
+        Path(path).unlink()
+# These targets have not first been listed or read by the command.
+for path in ['nested/deeper/protected.tmp', 'out/protected.txt']:
+    Path('out/replacement').write_text('replacement')
+    try: os.replace('out/replacement', path)
+    except OSError as error: assert error.errno in (errno.EROFS, errno.EACCES, errno.EPERM), error
+    else: raise AssertionError('unmaterialized tracked entry was replaced: ' + path)
+    assert Path('out/replacement').read_text() == 'replacement'
+assert Path('nested/deeper/protected.tmp').read_text() == 'nested tracked\n'
+assert Path('out/protected.txt').read_text() == 'tracked despite ignore\n'
+''', json.dumps(expected))
+        self.assert_success(result)
+
+    def test_concurrent_readers_and_writers_do_not_share_artifacts_or_corrupt_appends(self):
+        result, run = self.python(r'''
+from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+Path('out/appends').write_bytes(b'')
+def worker(index):
+    row = ('%04d\n' % index).encode()
+    for iteration in range(20):
+        assert Path('tracked.txt').read_bytes() == b'committed\n'
+        source = Path('out/worker-%d-%d' % (index, iteration))
+        source.write_bytes(row)
+        renamed = source.with_name(source.name + '-renamed')
+        source.rename(renamed)
+        assert renamed.read_bytes() == row
+        renamed.unlink()
+        fd = os.open('out/appends', os.O_WRONLY | os.O_APPEND)
+        try: assert os.write(fd, row) == len(row)
+        finally: os.close(fd)
+with ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(worker, range(8)))
+rows = Path('out/appends').read_bytes().splitlines()
+assert len(rows) == 160, len(rows)
+for index in range(8): assert rows.count(('%04d' % index).encode()) == 20
+assert set(Path('out').iterdir()) == {Path('out/protected.txt'), Path('out/appends')}
+Path(os.environ['GIT_ON_OUTPUT_DIR'], 'append-count').write_text(str(len(rows)))
+''')
+        self.assert_success(result)
+        self.assertEqual((run / "output/append-count").read_text(), "160")
+        self.assertFalse((run / "mount").exists())
+        self.assertFalse((run / "backing").exists())
+        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+        self.assertFalse((self.repo / "out/appends").exists())
+
+    def test_lazy_metadata_does_not_load_unread_blobs_or_descendant_trees(self):
+        from benchmark import digit_fixture, snapshot_metrics
+        fixture = digit_fixture(self.repo, 10000)
+        tree = fixture["tree_oid"]
+        # Isolated Python suppresses CWD module searching and site startup.
+        workloads = [
+            ("pass", 0, 0, 0, 0),
+            ("import os; assert os.listdir('.') == ['0']", 1, 0, 0, 0),
+            ("import os; assert os.stat('0/0/6/4/2/1').st_size == 7", 6, 1, 0, 0),
+            ("import os; assert not os.path.exists('0/0/6/4/2/missing')", 6, 0, 0, 0),
+            ("from pathlib import Path; assert Path('0/0/6/4/2/1').read_bytes() == b'006421\\n'", 6, 1, 1, 7),
+        ]
+        for code, trees, headers, blobs, blob_bytes in workloads:
+            with self.subTest(code=code):
+                result, run = self.invoke(sys.executable, "-I", "-S", "-c", code, tree=tree)
+                self.assert_success(result)
+                metrics = snapshot_metrics(self.manifest(run))
+                self.assertLessEqual(metrics["tree_reads"], trees, metrics)
+                self.assertLessEqual(metrics["header_reads"], headers, metrics)
+                self.assertEqual(metrics["blob_loads"], blobs, metrics)
+                self.assertEqual(metrics["blob_bytes"], blob_bytes, metrics)
+
+    def test_lazy_writes_load_only_relevant_ancestor_ignore_files(self):
+        from benchmark import snapshot_metrics
+        for index in range(12):
+            self.put(f"untouched-{index}/.gitignore", f"unused-{index}/\n")
+            self.put(f"untouched-{index}/payload", "unread sibling content\n")
+        git(self.repo, "add", "--force", "--all")
+        git(self.repo, "commit", "--quiet", "-m", "untouched policy subtrees")
+        expected_rule_bytes = sum((self.repo / path).stat().st_size
+                                  for path in [".gitignore", "nested/.gitignore"])
+        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+import os
+from pathlib import Path
+Path('nested/first.tmp').write_text('first')
+with open('nested/first.tmp', 'a') as output: output.write(' appended')
+os.rename('nested/first.tmp', 'nested/second.tmp')
+assert Path('nested/second.tmp').read_text() == 'first appended'
+os.truncate('nested/second.tmp', 0)
+os.unlink('nested/second.tmp')
+''')
+        self.assert_success(result)
+        metrics = snapshot_metrics(self.manifest(run))
+        self.assertLessEqual(metrics["tree_reads"], 2, metrics)
+        self.assertLessEqual(metrics["header_reads"], 2, metrics)
+        self.assertEqual(metrics["blob_loads"], 2, metrics)
+        self.assertEqual(metrics["blob_bytes"], expected_rule_bytes, metrics)
+
+    def test_repeated_snapshot_reads_reuse_bounded_blob_cache(self):
+        from benchmark import snapshot_metrics
+        # Distinct directory entries reference the same blob. Page-cache reuse
+        # of one pathname alone cannot satisfy this object-cache assertion.
+        for index in range(16):
+            self.put(f"shared/file-{index}", "shared payload\n")
+        git(self.repo, "add", "shared")
+        git(self.repo, "commit", "--quiet", "-m", "shared immutable blob")
+        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+from pathlib import Path
+for _ in range(3):
+    for index in range(16):
+        assert Path('shared/file-%d' % index).read_bytes() == b'shared payload\n'
+''')
+        self.assert_success(result)
+        metrics = snapshot_metrics(self.manifest(run))
+        self.assertEqual(metrics["blob_loads"], 1, metrics)
+        self.assertEqual(metrics["blob_bytes"], len(b"shared payload\n"), metrics)
+        self.assertGreaterEqual(metrics["cache_hits"], 15, metrics)
+        self.assertLessEqual(metrics["tree_reads"], 2, metrics)
+
+    def test_large_snapshot_blob_reads_decode_once_and_respect_cache_bound(self):
+        import hashlib
+        from benchmark import snapshot_metrics
+        payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        (self.repo / "large.bin").write_bytes(payload)
+        expected = hashlib.sha256(payload).hexdigest()
+        git(self.repo, "add", "large.bin")
+        git(self.repo, "commit", "--quiet", "-m", "large immutable read fixture")
+        spool_run = self.root / "large-spool-run"
+        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+import hashlib, os, sys
+size = 16 * 1024 * 1024
+fd = os.open('large.bin', os.O_RDONLY)
+try:
+    assert os.pread(fd, 4096, size - 4096) == bytes(range(256)) * 16
+    actual = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk: break
+        actual.update(chunk)
+    assert actual.hexdigest() == sys.argv[1]
+    assert os.pread(fd, 4096, 0) == bytes(range(256)) * 16
+    assert os.pread(fd, 4096, size) == b''
+finally:
+    os.close(fd)
+''', expected, run=spool_run, extra_env={'TMPDIR': str(spool_run / 'mount/cache')})
+        self.assert_success(result)
+        metrics = snapshot_metrics(self.manifest(run))
+        self.assertEqual(metrics["blob_loads"], 1, metrics)
+        self.assertEqual(metrics["blob_bytes"], len(payload), metrics)
+        self.assertLessEqual(metrics["tree_reads"], 1, metrics)
+        self.assertLessEqual(metrics["header_reads"], 1, metrics)
+
+    def test_unsupported_entries_fail_when_accessed_without_poisoning_siblings(self):
+        pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:" + "a" * 64 + "\nsize 123\n"
+        self.put("unsupported/lfs.bin", pointer)
+        self.put("unsupported/ordinary.txt", "ordinary\n")
+        git(self.repo, "add", "unsupported")
+        head = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{head},unsupported/module")
+        git(self.repo, "commit", "--quiet", "-m", "unsupported objects accessed lazily")
+        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+import errno, os
+from pathlib import Path
+assert Path('tracked.txt').read_text() == 'committed\n'
+assert set(os.listdir('unsupported')) == {'lfs.bin', 'ordinary.txt', 'module'}
+assert Path('unsupported/ordinary.txt').read_text() == 'ordinary\n'
+for action in [lambda: Path('unsupported/lfs.bin').read_bytes(),
+               lambda: os.stat('unsupported/module')]:
+    try: action()
+    except OSError as error: assert error.errno in (errno.EIO, errno.EOPNOTSUPP, errno.ENOSYS), error
+    else: raise AssertionError('unsupported object was presented as usable')
+assert Path('unsupported/ordinary.txt').read_text() == 'ordinary\n'
+''')
+        self.assert_success(result)
+        self.assertFalse((run / "mount").exists())
+        self.assertFalse((run / "backing").exists())
+        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
     def test_runtime_ignore_file_cannot_expand_write_policy(self):
         result, _ = self.python('''

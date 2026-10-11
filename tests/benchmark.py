@@ -27,6 +27,51 @@ ROOT = Path(__file__).resolve().parents[1]
 FORMAT = "git-on-benchmark-v1"
 BLOCK = 65536
 SMALL = tuple((f"file-{i}.txt", (f"active file {i}\n".encode() * 32)[:256]) for i in range(3))
+SNAPSHOT_METRICS = (
+    "tree_reads", "header_reads", "blob_loads", "blob_bytes", "cache_hits",
+    "blob_cache_bytes", "blob_cache_entries", "blob_cache_limit",
+    "tree_cache_bytes", "tree_cache_entries", "tree_cache_limit",
+)
+
+
+def snapshot_metrics(manifest):
+    """Require real runtime counters; never infer reads from file counts/timing."""
+    metrics = manifest.get("snapshot_metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("runner manifest has no snapshot_metrics object")
+    for name in SNAPSHOT_METRICS:
+        value = metrics.get(name)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"snapshot metric {name} must be a nonnegative integer")
+    for kind in ("blob", "tree"):
+        if metrics[kind + "_cache_bytes"] > metrics[kind + "_cache_limit"]:
+            raise ValueError(f"{kind} cache exceeds its configured byte bound")
+    return {name: metrics[name] for name in SNAPSHOT_METRICS}
+
+
+def assert_lazy_reads(case, metrics):
+    """Hard structural gates, independent of machine-dependent timing results."""
+    if case["suite"] == "digits":
+        # Six components mean the root plus five ancestor directory objects.
+        # The fixture has no ignore files. A single leaf lookup must not scan
+        # other trees, ask for sibling blob sizes, or load sibling contents.
+        limits = dict(tree_reads=case["digit_depth"], header_reads=1)
+        exact = dict(blob_loads=1, blob_bytes=7)
+    elif case["suite"] in ("scale", "repeat"):
+        limits = dict(tree_reads=2, header_reads=3, blob_loads=3)
+        exact = dict(blob_bytes=sum(len(content) for _, content in SMALL))
+    else:
+        # A Git object must be decoded in full, but one open file must not
+        # repeatedly decode it for each FUSE read. Large readers may use a
+        # temporary spool outside the bounded shared in-memory cache.
+        limits = dict(tree_reads=1, header_reads=1)
+        exact = dict(blob_loads=1, blob_bytes=case["large_bytes"])
+    for name, maximum in limits.items():
+        if metrics[name] > maximum:
+            raise ValueError(f"non-lazy {case['suite']} access: {name}={metrics[name]} exceeds {maximum}")
+    for name, expected in exact.items():
+        if metrics[name] != expected:
+            raise ValueError(f"unexpected {case['suite']} access: {name}={metrics[name]}, expected {expected}")
 
 
 def environment():
@@ -302,6 +347,10 @@ def measured_process(argv, cwd, env, stdout, stderr, timeout, expected_stdout=No
 
 
 def make_cases(fixtures, suites, repeat_count):
+    available = {fixture["suite"] for fixture in fixtures}
+    missing = set(suites) - available - {"repeat"}
+    if missing:
+        raise ValueError("requested suites have no prepared fixtures: " + ", ".join(sorted(missing)))
     cases = []
     for fixture in fixtures:
         if fixture["suite"] in suites:
@@ -319,7 +368,7 @@ def make_cases(fixtures, suites, repeat_count):
     return cases
 
 
-def machine_metadata(repo):
+def machine_metadata(repo, output=None):
     def read_optional(path):
         try:
             return Path(path).read_text().strip()
@@ -331,6 +380,10 @@ def machine_metadata(repo):
                       if line.startswith("model name")), None)
     filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(repo)],
                                 capture_output=True, text=True, check=False).stdout.strip()
+    evidence_filesystem = None
+    if output is not None:
+        evidence_filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(output)],
+                                            capture_output=True, text=True, check=False).stdout.strip() or None
     try:
         revision = git(ROOT, "rev-parse", "HEAD").decode()
         dirty = bool(git(ROOT, "status", "--porcelain"))
@@ -339,7 +392,8 @@ def machine_metadata(repo):
     return dict(cpu_model=cpu_model, machine=platform.machine(), logical_cpus=os.cpu_count(),
                 physical_memory_bytes=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
                 cgroup_memory_max=read_optional("/sys/fs/cgroup/memory.max"),
-                fixture_filesystem_type=filesystem or None, storage_device_model=None,
+                fixture_filesystem_type=filesystem or None, evidence_filesystem_type=evidence_filesystem,
+                storage_device_model=None,
                 source_revision=revision, source_worktree_dirty=dirty,
                 source_revision_note="Checkout at measurement time; binary identity is its SHA-256.")
 
@@ -370,13 +424,14 @@ def benchmark(args):
         with binary.open("rb") as binary_file:
             binary_hash = hashlib.file_digest(binary_file, "sha256").hexdigest()
         record(dict(event="metadata", format=FORMAT, timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    platform=platform.platform(), hardware_and_source=machine_metadata(repo), python=sys.version,
+                    platform=platform.platform(), hardware_and_source=machine_metadata(repo, output), python=sys.version,
                     binary=str(binary), binary_sha256=binary_hash, cat=cat,
                     binary_version=subprocess.check_output([str(binary), "--version"]).decode().strip(),
                     fixture_manifest=fixture_manifest, repeats=args.repeats, warmups=args.warmups,
                     timeout_s=args.timeout, seed=args.seed, cache_policy="uncontrolled OS cache; per-case warmups",
-                    object_read_counts=None, object_read_bytes=None,
-                    object_metrics_unavailable_reason="The runtime has no object-read instrumentation.",
+                    object_metrics="Per-sample snapshot_metrics copied from the completed runner manifest.",
+                    object_metrics_semantics="Application-level Git tree/header/blob fetches and decoded blob bytes, not physical disk I/O; revision resolution is outside these counters.",
+                    lazy_access_gates="Digits: at most six ancestor trees and one header, exactly one seven-byte blob; caches stay within their byte limits.",
                     cat_child_startup_unavailable_reason="Unmodified cat has no child-start marker.",
                     rss_semantics="Linux wait4 ru_maxrss in KiB; maximum process high-water including waited descendants, not concurrent sum.",
                     command_line=sys.argv))
@@ -402,7 +457,7 @@ def benchmark(args):
                     selection = dict(selected_number=digits, selected_path=path, selection_seed=args.seed)
                     argv = [str(binary), case["tree_oid"], cat, path]
                 measured = measured_process(argv, repo, env, stdout, stderr, args.timeout, expected_stdout)
-                sample = dict(event="sample", case=case, iteration=max(0, iteration), warmup=iteration < 0,
+                sample = dict(event="sample", case=case, iteration=iteration, warmup=iteration < 0,
                               evidence_dir=str(run), stdout=str(stdout), stderr=str(stderr), argv=argv,
                               **selection, **measured)
                 try:
@@ -412,6 +467,8 @@ def benchmark(args):
                     if (manifest["status"]["runner_error"] or manifest["status"]["exit_code"] != 0
                             or not manifest["logs_complete"]):
                         raise RuntimeError("runner manifest does not record complete success")
+                    sample["snapshot_metrics"] = snapshot_metrics(manifest)
+                    assert_lazy_reads(case, sample["snapshot_metrics"])
                     sample.update(observed_total_ms=(measured["observed_exit_ns"] - measured["started_ns"]) / 1e6,
                                   success=True, child_startup_ms=None, workload_ms=None,
                                   child_ready_to_finish_ms=None, verified_stdout_ms=None)
@@ -445,7 +502,10 @@ def benchmark(args):
                 samples.append(sample)
                 metric = "verified_stdout_ms" if case["suite"] == "digits" else "child_startup_ms"
                 print(f"{tag}: " + (f"{metric}={sample[metric]:.3f}, "
-                      f"wait4 RSS={sample['wait4_peak_rss_kib']} KiB" if sample["success"]
+                      f"wait4 RSS={sample['wait4_peak_rss_kib']} KiB, "
+                      f"trees={sample['snapshot_metrics']['tree_reads']}, "
+                      f"blob loads={sample['snapshot_metrics']['blob_loads']}, "
+                      f"blob bytes={sample['snapshot_metrics']['blob_bytes']}" if sample["success"]
                       else f"FAILED; inspect {stderr}"), flush=True)
                 if not sample["success"]:
                     return 130 if measured["interrupted"] else 1
@@ -467,6 +527,10 @@ def summarize(samples):
             if not values:
                 continue
             metrics[name] = dict(min=min(values), median=statistics.median(values), max=max(values))
+        for name in SNAPSHOT_METRICS:
+            values = [sample["snapshot_metrics"][name] for sample in group if "snapshot_metrics" in sample]
+            if values:
+                metrics["snapshot_metrics." + name] = dict(min=min(values), median=statistics.median(values), max=max(values))
         yield dict(event="summary", case=case, samples=len(group), metrics=metrics)
 
 
@@ -530,13 +594,37 @@ class SelfTests(unittest.TestCase):
             self.assertTrue(result["timed_out"])
             self.assertNotEqual(result["returncode"], 0)
 
+    def test_metrics_validate_cache_bounds_and_reject_eager_reads(self):
+        metrics = dict.fromkeys(SNAPSHOT_METRICS, 0)
+        metrics.update(tree_reads=6, header_reads=1, blob_loads=1, blob_bytes=7,
+                       blob_cache_bytes=7, blob_cache_entries=1, blob_cache_limit=1024,
+                       tree_cache_bytes=512, tree_cache_entries=6, tree_cache_limit=1024)
+        case = dict(suite="digits", digit_depth=6)
+        self.assertEqual(snapshot_metrics({"snapshot_metrics": metrics}), metrics)
+        assert_lazy_reads(case, metrics)
+        for name, value in [("tree_reads", 7), ("header_reads", 2), ("blob_loads", 2), ("blob_bytes", 14)]:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    assert_lazy_reads(case, dict(metrics, **{name: value}))
+        for name, value in [("tree_cache_bytes", 1025), ("blob_cache_bytes", 1025),
+                            ("tree_reads", -1), ("blob_loads", True), ("cache_hits", None)]:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    snapshot_metrics({"snapshot_metrics": dict(metrics, **{name: value})})
+        with self.assertRaises(ValueError):
+            snapshot_metrics({})
+        with self.assertRaises(ValueError):
+            snapshot_metrics({"snapshot_metrics": {}})
+
     def test_summary_excludes_warmups_and_failures(self):
         sample = dict(case={"case": "x"}, success=True, warmup=False, child_startup_ms=3,
-                      workload_ms=4, child_ready_to_finish_ms=5, observed_total_ms=6, wait4_peak_rss_kib=7)
+                      workload_ms=4, child_ready_to_finish_ms=5, observed_total_ms=6, wait4_peak_rss_kib=7,
+                      snapshot_metrics=dict.fromkeys(SNAPSHOT_METRICS, 1))
         rows = list(summarize([sample, dict(sample, warmup=True, child_startup_ms=100),
                                dict(sample, success=False, child_startup_ms=None)]))
         self.assertEqual(rows[0]["samples"], 1)
         self.assertEqual(rows[0]["metrics"]["child_startup_ms"]["median"], 3)
+        self.assertEqual(rows[0]["metrics"]["snapshot_metrics.blob_loads"], dict(min=1, median=1, max=1))
 
 
 def integers(value):

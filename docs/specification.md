@@ -105,20 +105,17 @@ functional correctness:
 A benchmark fixture that reuses Git objects must disclose this: it measures
 logical namespace growth but does not by itself model a million distinct blobs.
 
-## Current implementation status
+## Implementation and verification
 
-At implementation commit `2d08744c5858d680441f24afe3540730e2ba7001`,
-`Snapshot::load_with_pin_record` calls recursive `read_tree`, which loads all
-selected directory entries and blob contents before the mount is established.
-Filesystem construction clones those payloads into nodes. This violates the
-lazy-startup and payload-retention requirements above.
+The second implementation replaces the eager traversal with a shared pinned
+object store, demand-only metadata/blob access, bounded caches, and deferred
+inode creation. The FUSE layer retains no duplicate snapshot payloads. Source
+errors are reported when the relevant operation reaches them: submodules fail
+metadata access, LFS pointers fail content reads, and unrelated entries remain
+usable. Listing a directory may report a submodule name without following it.
 
-The current preflight rejection of submodules and LFS pointer blobs also depends
-on that full scan. A lazy implementation must reconcile unsupported-object error
-handling with on-demand access, rather than preserve the scan under a different
-name. This document does not select an unagreed replacement error contract.
-
-Existing green functional CI covers the implemented filesystem and lifecycle
-behavior. It does not demonstrate compliance with these new performance
-requirements. Documentation and benchmark additions alone do not repair the
-runtime or establish a million-file performance result.
+Local unit tests exercise demand counters, unvisited missing objects, cache
+retention/eviction, policy isolation, inode lifetimes, and active large-file
+spooling. Real-FUSE regression and million-file performance results must be
+verified on the exact published revision in GitHub Actions. Consult the PR's
+linked run for that verification; local tests alone are not a real-mount pass.

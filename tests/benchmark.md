@@ -1,9 +1,11 @@
 # Performance benchmarks
 
 `benchmark.py` is a Python 3.11+ standard-library harness for the real Linux
-FUSE runtime. It measures the current implementation, including its eager
-loading. It does not implement lazy loading or turn performance measurements
-into a pass for the [lazy-access specification](../docs/specification.md).
+FUSE runtime. Alongside timings and RSS, it collects the runtime's explicit
+snapshot counters and checks structural lazy-access invariants from the
+[lazy-access specification](../docs/specification.md). An eager tree walk is a
+failed sample even when it happens to finish quickly. The harness does not
+emulate, implement, or infer lazy loading.
 
 ## Exact million-file benchmark
 
@@ -52,8 +54,11 @@ immediately before launching git-on and stops when the harness receives the
 complete expected seven-byte output. This includes mount/setup, the read, and
 git-on's output forwarding. It does not wait for runner teardown. The sample is
 accepted only after successful exit, a successful complete-log manifest, and
-verification that the entire stdout is exactly the chosen number plus newline.
-Any later extra output invalidates the sample.
+verification that the entire stdout is exactly the chosen number plus newline,
+and passing the snapshot-counter and cache-bound checks below. Any later extra
+output invalidates the sample. The external command, path selection, three
+repeats, seed 0, and zero warmups above match the original eager baseline;
+fixture preparation and verification remain outside timing.
 
 `--digit-files` defaults to 1,000 for a bounded smoke run. A smaller fixture uses
 the first N zero-padded numbers at the same six-component depth; not every
@@ -86,13 +91,36 @@ emulation, automatic skip, or silent downscaling.
 - `child_startup_ms` is deliberately null for unmodified `cat`: it emits no
   separate child-start marker. Receiving correct output is not mislabeled as
   child startup. The secondary Python workloads do provide that measurement.
-- Object-read counts and bytes are null. The runtime has no suitable counters.
-  Seven application bytes are not seven object-storage bytes, and physical
-  object counts in the fixture are not runtime read counts. Timings alone
-  cannot prove absence of an eager object walk.
+- `snapshot_metrics.tree_reads`: decoded directory-object fetches through the
+  snapshot layer. `header_reads`: blob-size/header fetches through that layer.
+  `blob_loads` and `blob_bytes`: source blob fetches and full decoded payload
+  bytes before slicing. Revision/tree-ish resolution precedes these counters.
+  They do not measure physical disk I/O, compressed pack bytes, or libgit2's
+  internal delta-base work. Seven application bytes alone would not establish
+  any of these counts.
+- `snapshot_metrics.cache_hits`: reuse reported by the snapshot layer. It is not
+  an OS/FUSE page-cache hit counter. Blob/tree cache bytes and entry counts are
+  the retained state at collection, with explicit configured byte limits; they
+  are not peak RSS or all process memory. The harness rejects cache byte counts
+  above the corresponding limits and rejects absent or malformed counters.
+- The digit workload may fetch at most six tree objects (root plus the five
+  directories on its chosen path), at most one blob header, and exactly one
+  seven-byte blob. This rejects whole-tree enumeration, sibling metadata scans,
+  and unused content loads regardless of timing. These bounds stay the same
+  for 1,000 and 1,000,000 distinct leaves. The `scale`/`repeat` cases permit only
+  the root and active subtree, three accessed headers, and their three small
+  blobs. The `large` case permits only its root, one accessed header, and one
+  whole-blob decode for the open file, regardless of how many FUSE range reads
+  are needed. Large readers may spool decoded contents to temporary storage;
+  cache byte counts describe the shared in-memory cache, not that spool.
+
+All eleven counters are copied from each completed run manifest into the raw
+sample and receive minimum/median/maximum summaries. Instrumentation is required
+for the current harness; old uninstrumented baseline results remain timing/RSS
+evidence only and cannot retrospectively prove lazy access.
 
 Metadata records CPU model, architecture, CPU count, physical RAM, visible
-cgroup memory limit, OS/kernel, Python and Git versions, fixture filesystem type,
+cgroup memory limit, OS/kernel, Python and Git versions, fixture and evidence filesystem types,
 source checkout revision/dirty state, executable version and SHA-256, argv,
 fixture layout, and cache policy. Storage-device model is unknown; add host/disk
 and load details when comparing machines. The checkout revision alone does not
@@ -135,19 +163,22 @@ python3 tests/benchmark.py run \
 - `scale`: read the same three 256-byte files once, while an untouched sibling
   subtree grows. Fanout is at most 100. All unused paths share one 256-byte blob;
   repeated trees are reused. This efficiently stresses logical namespace growth
-  and eager per-path allocation, while strongly favoring object caches and
+  without requiring per-path startup allocation, while strongly favoring object caches and
   deduplication. It does not model a million distinct blobs and does not replace
   the digit fixture. The zero-file fixture still has an empty `unused` directory.
 - `repeat`: on the zero-unused-file fixture, reopen and read those three files
   1,000 times in a single child by default. This is separate from launch scaling
   and reports the repeated-operation duration. Kernel caching may satisfy reads;
-  the result is not an object-cache hit count.
+  workload iterations must not be interpreted as object-cache hits. The actual
+  runtime object-cache count is recorded separately.
 - `large`: read only the first and last 4,096 bytes of a large blob, 8,192 bytes
   total regardless of blob size. Data consists of deterministic SHAKE256 blocks;
   it is distinct from the tiny repeated blob in `scale`. Git may still have to
-  decode the entire object. The benchmark neither hides nor estimates that
-  decoding work. This is a bounded-range workload, not a full-file throughput
-  test.
+  decode the entire object. Decoded blob bytes are recorded rather than
+  equated with the 8,192 application bytes. This is a bounded-range workload,
+  not a full-file throughput test. Integration tests separately read a 16 MiB
+  snapshot in chunks and assert that one open file does not decode the whole
+  object repeatedly.
 
 Secondary fixtures default to loose objects; `prepare --storage packed` repacks
 all fixture refs. The primary digit fixture always starts packed via fast-import.
@@ -165,11 +196,14 @@ counts describe the child reads, not libgit2 or physical I/O.
 
 `self-test` tests fixture determinism and exact contents, expanded shared-tree
 counts, the child workloads, `cat` output observation, timeout handling, and
-summary exclusion of warmups/failures. It does not mount anything and does not
-produce git-on performance evidence.
+summary exclusion of warmups/failures, counter schema validation, cache bounds,
+and rejection of eager-read counter patterns. It does not mount anything and
+does not produce git-on performance evidence.
 
-Local verification during harness development successfully prepared the full
-million-distinct-file fixture and ran the infrastructure self-tests. The local
-container had no `/dev/fuse`, so no real-FUSE performance baseline was measured
-there. Real baseline values must come from a successful real-FUSE run, not from
-fixture-generation timings or these self-tests.
+Local infrastructure checks successfully prepare deterministic fixtures and run
+the self-tests. The local development container has no `/dev/fuse`; a skipped
+integration suite is not a real-FUSE result. Runtime timing, counter, mutation,
+and large-file assertions must be established by successful real-FUSE runs on
+the exact tested binary. Retain their raw manifests, logs, JSONL and executable
+hash rather than treating fixture-generation timings or self-tests as runtime
+evidence.

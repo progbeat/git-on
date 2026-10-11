@@ -1,10 +1,11 @@
-//! Creation rules compiled exclusively from snapshot .gitignore blobs.
+//! Demand-loaded creation rules compiled only from pinned .gitignore blobs.
 use crate::snapshot::{EntryKind, Snapshot};
 use anyhow::Result;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug)]
@@ -75,61 +76,122 @@ impl Rule {
     }
 }
 
+const RULE_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const RULE_CACHE_ENTRIES: usize = 128;
+
+#[derive(Debug, Default)]
+struct RulesCache {
+    entries: BTreeMap<PathBuf, (Arc<Vec<Rule>>, usize, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+impl RulesCache {
+    fn get(&mut self, path: &Path) -> Option<Arc<Vec<Rule>>> {
+        let (rules, _, used) = self.entries.get_mut(path)?;
+        self.clock = self.clock.saturating_add(1);
+        *used = self.clock;
+        Some(rules.clone())
+    }
+    fn insert(&mut self, path: &Path, rules: Arc<Vec<Rule>>, cost: usize) {
+        if cost > RULE_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old_cost, _)) = self.entries.remove(path) {
+            self.bytes -= old_cost;
+        }
+        while self.entries.len() >= RULE_CACHE_ENTRIES
+            || self.bytes > RULE_CACHE_BYTES.saturating_sub(cost)
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, used))| used)
+                .map(|(path, _)| path.clone())
+                .expect("rule cache has a victim");
+            let (_, removed, _) = self.entries.remove(&oldest).unwrap();
+            self.bytes -= removed;
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.entries
+            .insert(path.to_path_buf(), (rules, cost, self.clock));
+        self.bytes += cost;
+    }
+}
 #[derive(Debug)]
 pub struct Policy {
-    tracked: BTreeSet<PathBuf>,
-    rules: BTreeMap<PathBuf, Vec<Rule>>,
+    snapshot: Snapshot,
+    rules: Mutex<RulesCache>,
 }
 impl Policy {
     pub fn new(snapshot: &Snapshot) -> Result<Self> {
-        let mut rules = BTreeMap::new();
-        for (path, entry) in &snapshot.entries {
-            if path.file_name() != Some(std::ffi::OsStr::new(".gitignore"))
-                || entry.kind != EntryKind::File
-            {
-                continue;
-            }
-            let dir = path.parent().unwrap_or(Path::new(""));
-            // Git recognizes only the UTF-8 BOM, not arbitrary Unicode BOMs.
-            let bytes = entry
-                .data
-                .strip_prefix(b"\xef\xbb\xbf")
-                .unwrap_or(&entry.data);
-            let parsed: Vec<Rule> = bytes
-                .split(|&b| b == b'\n')
-                .filter_map(Rule::parse)
-                .collect();
-            rules.insert(dir.to_path_buf(), parsed);
-        }
         Ok(Self {
-            tracked: snapshot.entries.keys().cloned().collect(),
-            rules,
+            snapshot: snapshot.clone(),
+            rules: Mutex::new(RulesCache::default()),
         })
     }
-    /// True only for a new, ignored relative path; tracked names stay immutable.
+    fn rules_at(&self, directory: &Path) -> Result<Arc<Vec<Rule>>> {
+        let mut cache = self
+            .rules
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ignore rule cache poisoned"))?;
+        if let Some(rules) = cache.get(directory) {
+            return Ok(rules);
+        }
+        let mut source_bytes = 0usize;
+        let rules = match self.snapshot.entry(&directory.join(".gitignore"))? {
+            Some(entry) if entry.kind == EntryKind::File => {
+                self.snapshot.with_blob(entry.oid, |data| {
+                    source_bytes = data.len();
+                    // Git recognizes only the UTF-8 BOM.
+                    let bytes = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
+                    Ok(bytes
+                        .split(|&b| b == b'\n')
+                        .filter_map(Rule::parse)
+                        .collect())
+                })?
+            }
+            _ => Vec::new(),
+        };
+        let rules = Arc::new(rules);
+        // Conservative compiled-memory charge: a byte can become a wildcard
+        // atom/class allocation. Also charge paths, empty rules and map overhead.
+        // Oversized rules still work for this operation but are never retained.
+        let cost = source_bytes
+            .saturating_mul(512)
+            .saturating_add(directory.as_os_str().as_bytes().len())
+            .saturating_add(1024);
+        cache.insert(directory, rules.clone(), cost);
+        Ok(rules)
+    }
+    /// True only for a new ignored relative path. Object/rule errors fail closed.
     pub fn allows(&self, path: &Path, is_dir: bool) -> bool {
-        if path.as_os_str().is_empty() || self.tracked.contains(path) {
-            return false;
+        self.check(path, is_dir).unwrap_or(false)
+    }
+    fn check(&self, path: &Path, is_dir: bool) -> Result<bool> {
+        if path.as_os_str().is_empty() {
+            return Ok(false);
         }
         let components: Vec<_> = path.components().collect();
         if components
             .iter()
             .any(|part| !matches!(part, Component::Normal(_)))
         {
-            return false;
+            return Ok(false);
+        }
+        // Protect tracked paths without indexing their siblings or descendants.
+        // A non-directory tracked ancestor is an error, never write permission.
+        if self.snapshot.entry(path)?.is_some() {
+            return Ok(false);
         }
         let mut current = PathBuf::new();
-        let mut applicable = Vec::new();
-        if let Some(rules) = self.rules.get(Path::new("")) {
-            applicable.push((Path::new(""), rules));
-        }
+        let mut applicable = vec![(PathBuf::new(), self.rules_at(Path::new(""))?)];
         for (index, component) in components.iter().enumerate() {
             current.push(component.as_os_str());
             let directory = index + 1 < components.len() || is_dir;
             let mut ignored = false;
             for (base, rules) in &applicable {
                 let relative = current.strip_prefix(base).expect("ancestor ignore base");
-                for rule in *rules {
+                for rule in rules.iter() {
                     if rule.matches(relative.as_os_str().as_bytes(), directory) {
                         ignored = !rule.negative;
                     }
@@ -137,21 +199,20 @@ impl Policy {
             }
             // Negation below an excluded parent cannot re-include a child.
             if ignored {
-                return true;
+                return Ok(true);
             }
-            if directory {
-                if let Some((base, rules)) = self.rules.get_key_value(&current) {
-                    applicable.push((base.as_path(), rules));
-                }
+            if index + 1 < components.len() {
+                applicable.push((current.clone(), self.rules_at(&current)?));
             }
         }
-        false
+        Ok(false)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use git2::Repository;
+    use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use tempfile::TempDir;
     fn fixture(root: &str, nested: &str) -> (TempDir, Snapshot, Policy) {
@@ -171,6 +232,83 @@ mod tests {
         let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "policy").unwrap();
         let policy = Policy::new(&snap).unwrap();
         (tmp, snap, policy)
+    }
+    #[test]
+    fn policy_initialization_and_ancestor_loading_are_lazy() {
+        let (_tmp, snapshot, policy) = fixture("*.log\n", "!keep.log\n");
+        assert_eq!(snapshot.metrics().tree_reads, 0);
+        assert_eq!(snapshot.metrics().header_reads, 0);
+        assert_eq!(snapshot.metrics().blob_loads, 0);
+        assert!(policy.allows(Path::new("root.log"), false));
+        assert_eq!(snapshot.metrics().tree_reads, 1);
+        assert_eq!(snapshot.metrics().blob_loads, 1);
+        assert!(!policy.allows(Path::new("nested/keep.log"), false));
+        assert_eq!(snapshot.metrics().tree_reads, 2);
+        assert_eq!(snapshot.metrics().blob_loads, 2);
+        assert!(policy.allows(Path::new("nested/other.log"), false));
+        assert_eq!(snapshot.metrics().blob_loads, 2);
+        assert_eq!(snapshot.metrics().tree_reads, 2);
+    }
+    #[test]
+    fn policy_owns_pin_and_errors_fail_closed() {
+        let (tmp, snapshot, policy) = fixture("*\n", "");
+        let repo = Repository::open(tmp.path()).unwrap();
+        drop(snapshot);
+        assert!(repo.find_reference("refs/git-on/policy").is_ok());
+        assert!(!policy.allows(Path::new("nested/existing.log/child"), false));
+        assert!(!policy.allows(Path::new("nested/existing.log"), false));
+        assert!(policy.allows(Path::new("untracked"), false));
+        drop(policy);
+        assert!(repo.find_reference("refs/git-on/policy").is_err());
+        for content in [
+            b"*\n".as_slice(),
+            b"version https://git-lfs.github.com/spec/v1\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            let blob = repo.blob(content).unwrap();
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert(".gitignore", blob, 0o100644).unwrap();
+            let oid = tree.write().unwrap();
+            if content == b"*\n" {
+                let hex = blob.to_string();
+                std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..]))
+                    .unwrap();
+            }
+            let snapshot =
+                Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "failure").unwrap();
+            let policy = Policy::new(&snapshot).unwrap();
+            assert!(!policy.allows(Path::new("new-file"), false));
+        }
+    }
+    #[test]
+    fn rule_cache_bounds_entries_bytes_and_bypasses_oversized_rules() {
+        let (_tmp, _snapshot, policy) = fixture("", "");
+        for n in 0..RULE_CACHE_ENTRIES + 10 {
+            policy.rules_at(Path::new(&format!("absent-{n}"))).unwrap();
+        }
+        {
+            let cache = policy.rules.lock().unwrap();
+            assert_eq!(cache.entries.len(), RULE_CACHE_ENTRIES);
+            assert!(cache.bytes <= RULE_CACHE_BYTES);
+            assert!(!cache.entries.contains_key(Path::new("absent-0")));
+        }
+        let pattern = format!("{}\n*.log\n", "#ignored comment\n".repeat(1000));
+        let (_tmp, _snapshot, policy) = fixture(&pattern, "");
+        assert!(policy.allows(Path::new("allowed.log"), false));
+        assert!(policy.rules.lock().unwrap().entries.is_empty());
+        // Test byte-pressure eviction independently of entry pressure.
+        let mut cache = RulesCache::default();
+        for n in 0..3 {
+            cache.insert(
+                Path::new(&format!("dir-{n}")),
+                Arc::new(Vec::new()),
+                RULE_CACHE_BYTES / 2,
+            );
+        }
+        assert_eq!(cache.bytes, RULE_CACHE_BYTES);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key(Path::new("dir-0")));
     }
     #[test]
     fn nested_negation_and_tracked_names() {

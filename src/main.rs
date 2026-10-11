@@ -41,6 +41,8 @@ struct Manifest {
     logs_complete: bool,
     git_dir: Option<PathBuf>,
     pin_ref: Option<String>,
+    #[serde(default)]
+    snapshot_metrics: Option<serde_json::Value>,
 }
 fn now() -> u128 {
     SystemTime::now()
@@ -529,9 +531,11 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
         logs_complete: false,
         git_dir: None,
         pin_ref: None,
+        snapshot_metrics: None,
     };
     save(&dir, &manifest)?;
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    let mut observed_snapshot = None;
     let mut result = (|| -> Result<i32> {
         let snapshot = Snapshot::load_with_pin_record(
             &env::current_dir()?,
@@ -553,6 +557,7 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
         private_dir(&dir.join("output"))?;
         let out = file(&dir.join("stdout.log"))?;
         let err = file(&dir.join("stderr.log"))?;
+        observed_snapshot = Some(snapshot.clone());
         let overlay = Overlay::new(snapshot, dir.join("backing"))?;
         if let Some(signal) = signals.pending().next() {
             bail!("cancelled by signal {signal} before command execution");
@@ -636,6 +641,10 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
             .exit_code
             .unwrap_or_else(|| 128 + manifest.status.signal.unwrap_or(0)))
     })();
+    if let Some(snapshot) = observed_snapshot.take() {
+        manifest.snapshot_metrics = Some(serde_json::to_value(snapshot.metrics())?);
+        drop(snapshot);
+    }
     let cleanup_result = (|| -> Result<()> {
         if !mount_is_ours(&dir, &id)? {
             release_pin(&manifest)?;
@@ -718,6 +727,7 @@ mod tests {
             logs_complete: false,
             git_dir: None,
             pin_ref: None,
+            snapshot_metrics: None,
         }
     }
     fn child(script: &str) -> std::process::Child {

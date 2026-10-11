@@ -59,8 +59,8 @@ jobs:
       - name: Real mount, adversarial operations, process lifecycle, and uv
         run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
 
-  million-file-baseline:
-    # Measurements, not a numerical performance gate or proof of lazy access.
+  lazy-performance:
+    # Exact output and demand-count gates; measured timings have no arbitrary SLA.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -90,9 +90,17 @@ jobs:
           --output benchmark-results
           --binary target/release/git-on
           --repeats 3 --warmups 0 --timeout 180 --seed 0
-      - name: Print measured baseline including failed trials
+      - name: Compare a smaller distinct-file tree
+        run: |
+          python3 tests/benchmark.py prepare --directory /tmp/git-on-small --digit-files 1000
+          python3 tests/benchmark.py run --fixtures /tmp/git-on-small --output benchmark-small --binary target/release/git-on --repeats 3 --warmups 0 --timeout 180 --seed 0
+      - name: Measure untouched subtree scaling, repeated access, and large ranges
+        run: |
+          python3 tests/benchmark.py prepare --directory /tmp/git-on-secondary --suites scale large --sizes 0,1000,1000000 --large-mib 1,16,64
+          python3 tests/benchmark.py run --fixtures /tmp/git-on-secondary --output benchmark-secondary --binary target/release/git-on --suites scale repeat large --repeats 3 --warmups 0 --repeat-count 1000 --timeout 180 --seed 0
+      - name: Print measurements including failed trials
         if: always()
         run: |
-          if test -f benchmark-results/results.jsonl; then
-            cat benchmark-results/results.jsonl
-          fi
+          for directory in benchmark-results benchmark-small benchmark-secondary; do
+            if test -f "$directory/results.jsonl"; then cat "$directory/results.jsonl"; fi
+          done

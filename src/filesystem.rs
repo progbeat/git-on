@@ -1,12 +1,13 @@
 //! An inode-based union of a pinned Git snapshot and a private, disposable
 //! writable layer. User-controlled names never become host filesystem paths.
 use crate::policy::Policy;
-use crate::snapshot::{EntryKind, Snapshot};
+use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
+use git2::Oid;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -24,13 +25,17 @@ fn errno(e: std::io::Error) -> i32 {
 struct Node {
     attr: FileAttr,
     immutable: bool,
+    oid: Option<Oid>,
+    lookups: u64,
+    snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Handle {
     ino: u64,
     flags: i32,
+    reader: Option<BlobReader>,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -39,11 +44,15 @@ pub struct Overlay {
     policy: Policy,
     backing: PathBuf,
     paths: BTreeMap<PathBuf, u64>,
+    inode_paths: HashMap<u64, PathBuf>,
+    upper_paths: BTreeMap<PathBuf, u64>,
+    directory_refs: HashMap<u64, usize>,
     nodes: HashMap<u64, Node>,
     handles: HashMap<u64, Handle>,
     directories: HashMap<u64, Vec<(u64, FileType, OsString)>>,
     next_ino: u64,
     next_handle: u64,
+    snapshot_time: SystemTime,
 }
 
 impl Overlay {
@@ -55,58 +64,203 @@ impl Overlay {
             "backing must be a real directory"
         );
         fs::set_permissions(&backing, fs::Permissions::from_mode(0o700))?;
+        snapshot.set_spool_directory(&backing)?;
         let policy = Policy::new(&snapshot)?;
+        let snapshot_time = SystemTime::now();
         let mut paths = BTreeMap::new();
         let mut nodes = HashMap::new();
-        let now = SystemTime::now();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        let mut next_ino = 2;
-        for (path, entry) in &snapshot.entries {
-            let ino = if path.as_os_str().is_empty() {
-                1
-            } else {
-                let n = next_ino;
-                next_ino += 1;
-                n
-            };
-            let kind = match entry.kind {
-                EntryKind::File => FileType::RegularFile,
-                EntryKind::Directory => FileType::Directory,
-                EntryKind::Symlink => FileType::Symlink,
-            };
-            let size = entry.data.len() as u64;
-            let perm = match kind {
-                FileType::Directory => 0o755,
-                FileType::Symlink => 0o777,
-                _ => (entry.mode & 0o777) as u16,
-            };
-            nodes.insert(
-                ino,
-                Node {
-                    attr: Self::attr(ino, kind, size, perm, uid, gid, now),
-                    immutable: true,
-                    bytes: entry.data.clone(),
-                    file: None,
-                },
-            );
-            paths.insert(path.clone(), ino);
-        }
-        anyhow::ensure!(
-            paths.get(Path::new("")) == Some(&1),
-            "snapshot has no root directory"
+        nodes.insert(
+            1,
+            Node {
+                attr: Self::attr(
+                    1,
+                    FileType::Directory,
+                    0,
+                    0o755,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    snapshot_time,
+                ),
+                immutable: true,
+                oid: Some(snapshot.tree_oid),
+                lookups: 1,
+                snapshot_path: Some(PathBuf::new()),
+                bytes: Vec::new(),
+                file: None,
+            },
         );
+        paths.insert(PathBuf::new(), 1);
         Ok(Self {
             _snapshot: snapshot,
             policy,
             backing,
             paths,
+            inode_paths: HashMap::from([(1, PathBuf::new())]),
+            upper_paths: BTreeMap::new(),
+            directory_refs: HashMap::new(),
             nodes,
             handles: HashMap::new(),
             directories: HashMap::new(),
-            next_ino,
+            next_ino: 2,
             next_handle: 1,
+            snapshot_time,
         })
+    }
+    /// Materialize inode metadata only for the requested pathname. No sibling
+    /// blobs or descendant trees are loaded as a side effect.
+    fn ensure(&mut self, path: &Path) -> FsResult<u64> {
+        if let Some(ino) = self.paths.get(path) {
+            if self.nodes.contains_key(ino) {
+                return Ok(*ino);
+            }
+        }
+        let entry = self
+            ._snapshot
+            .entry(path)
+            .map_err(|_| libc::EIO)?
+            .ok_or(libc::ENOENT)?;
+        let ino = if let Some(ino) = self.paths.get(path) {
+            *ino
+        } else {
+            let ino = self.next_ino;
+            self.next_ino = self.next_ino.checked_add(1).ok_or(libc::ENOSPC)?;
+            ino
+        };
+        let kind = match entry.kind {
+            EntryKind::File => FileType::RegularFile,
+            EntryKind::Directory => FileType::Directory,
+            EntryKind::Symlink => FileType::Symlink,
+        };
+        let perm = match kind {
+            FileType::Directory => 0o755,
+            FileType::Symlink => 0o777,
+            _ => (entry.mode & 0o777) as u16,
+        };
+        self.nodes.insert(
+            ino,
+            Node {
+                attr: Self::attr(
+                    ino,
+                    kind,
+                    entry.size.ok_or(libc::EIO)?,
+                    perm,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    self.snapshot_time,
+                ),
+                immutable: true,
+                oid: Some(entry.oid),
+                lookups: 0,
+                snapshot_path: Some(path.to_path_buf()),
+                bytes: Vec::new(),
+                file: None,
+            },
+        );
+        self.paths.insert(path.to_path_buf(), ino);
+        self.inode_paths.insert(ino, path.to_path_buf());
+        Ok(ino)
+    }
+    fn forget_inode(&mut self, ino: u64, count: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.lookups = node.lookups.saturating_sub(count);
+        }
+        self.reclaim(ino);
+    }
+    fn reclaim(&mut self, ino: u64) {
+        if ino == 1
+            || self.handles.values().any(|h| h.ino == ino)
+            || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0
+        {
+            return;
+        }
+        let removable = self
+            .nodes
+            .get(&ino)
+            .is_none_or(|n| n.lookups == 0 && (n.immutable || n.attr.nlink == 0));
+        if removable {
+            self.nodes.remove(&ino);
+            if let Some(path) = self.inode_paths.remove(&ino) {
+                self.paths.remove(&path);
+            }
+            // Unlinked mutable nodes have no pathname left to remove.
+        }
+    }
+    fn open_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
+        if self.node(ino)?.attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let path = self.path(ino)?;
+        let parent = match path.parent() {
+            Some(parent) => self.ensure(parent)?,
+            None => 1,
+        };
+        let mut entries = vec![
+            (ino, FileType::Directory, OsString::from(".")),
+            (parent, FileType::Directory, OsString::from("..")),
+        ];
+        if self.node(ino)?.immutable {
+            for (name, entry) in self._snapshot.children(&path).map_err(|_| libc::EIO)? {
+                let kind = match entry.kind {
+                    EntryKind::Directory => FileType::Directory,
+                    EntryKind::Symlink => FileType::Symlink,
+                    EntryKind::File => FileType::RegularFile,
+                };
+                let child_path = path.join(&name);
+                let child = if let Some(id) = self.paths.get(&child_path) {
+                    *id
+                } else {
+                    let id = self.next_ino;
+                    self.next_ino = self.next_ino.checked_add(1).ok_or(libc::ENOSPC)?;
+                    self.inode_paths.insert(id, child_path.clone());
+                    self.paths.insert(child_path, id);
+                    id
+                };
+                entries.push((child, kind, name));
+            }
+        }
+        for (p, child) in self
+            .upper_paths
+            .range(path.clone()..)
+            .take_while(|(p, _)| p.starts_with(&path))
+        {
+            if p != &path
+                && p.parent() == Some(path.as_path())
+                && self.nodes.get(child).is_some_and(|n| !n.immutable)
+            {
+                entries.push((
+                    *child,
+                    self.node(*child)?.attr.kind,
+                    p.file_name().ok_or(libc::EIO)?.to_os_string(),
+                ));
+            }
+        }
+        let fh = self.new_handle(ino, flags);
+        for (child, _, _) in &entries {
+            *self.directory_refs.entry(*child).or_default() += 1;
+        }
+        self.directories.insert(fh, entries);
+        Ok(fh)
+    }
+    fn close_handle(&mut self, ino: u64, fh: u64) {
+        self.handles.remove(&fh);
+        let listed = self.directories.remove(&fh).unwrap_or_default();
+        for (child, _, _) in &listed {
+            if let Some(count) = self.directory_refs.get_mut(child) {
+                *count -= 1;
+                if *count == 0 {
+                    self.directory_refs.remove(child);
+                }
+            }
+        }
+        for (child, _, _) in listed {
+            self.reclaim(child);
+        }
+        if !self.handles.values().any(|h| h.ino == ino) {
+            if let Some(n) = self.nodes.get_mut(&ino) {
+                n.file = None;
+            }
+        }
+        self.reclaim(ino);
     }
     fn attr(
         ino: u64,
@@ -142,6 +296,9 @@ impl Overlay {
         self.nodes.get_mut(&ino).ok_or(libc::ENOENT)
     }
     fn path(&self, ino: u64) -> FsResult<PathBuf> {
+        if let Some(path) = &self.node(ino)?.snapshot_path {
+            return Ok(path.clone());
+        }
         self.paths
             .iter()
             .find_map(|(p, n)| (*n == ino).then(|| p.clone()))
@@ -179,7 +336,8 @@ impl Overlay {
     }
     fn fresh(&self, parent: u64, name: &OsStr, kind: FileType) -> FsResult<PathBuf> {
         let p = self.child(parent, name)?;
-        if self.paths.contains_key(&p) {
+        if self.paths.contains_key(&p) || self._snapshot.entry(&p).map_err(|_| libc::EIO)?.is_some()
+        {
             return Err(libc::EEXIST);
         }
         self.allowed(&p, kind)?;
@@ -241,25 +399,36 @@ impl Overlay {
             Node {
                 attr,
                 immutable: false,
+                oid: None,
+                lookups: 0,
+                snapshot_path: None,
                 bytes,
                 file: None,
             },
         );
         self.paths.insert(p.clone(), ino);
+        self.upper_paths.insert(p.clone(), ino);
         self.touch_parent(&p);
         Ok(ino)
     }
     fn new_handle(&mut self, ino: u64, flags: i32) -> u64 {
         let fh = self.next_handle;
         self.next_handle += 1;
-        self.handles.insert(fh, Handle { ino, flags });
+        self.handles.insert(
+            fh,
+            Handle {
+                ino,
+                flags,
+                reader: None,
+            },
+        );
         fh
     }
     fn handle(&self, ino: u64, fh: u64) -> FsResult<Handle> {
         self.handles
             .get(&fh)
             .filter(|h| h.ino == ino)
-            .copied()
+            .cloned()
             .ok_or(libc::EBADF)
     }
     fn open_file(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
@@ -314,7 +483,7 @@ impl Overlay {
         n.attr.ctime = n.attr.mtime;
         Ok(())
     }
-    fn read_data(&self, ino: u64, fh: u64, offset: i64, size: u32) -> FsResult<Vec<u8>> {
+    fn read_data(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> FsResult<Vec<u8>> {
         let h = self.handle(ino, fh)?;
         if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(libc::EBADF);
@@ -343,7 +512,25 @@ impl Overlay {
         } else if count == 0 {
             Ok(Vec::new())
         } else {
-            Ok(n.bytes[offset as usize..offset as usize + count].to_vec())
+            let oid = n.oid.ok_or(libc::EIO)?;
+            // Small payload ownership stays exclusively in the bounded LRU;
+            // an idle open descriptor must not pin an evicted whole payload.
+            if n.attr.size <= BLOB_CACHE_BYTES as u64 {
+                return self
+                    ._snapshot
+                    .read(oid, offset as u64, count as u32)
+                    .map_err(|_| libc::EIO);
+            }
+            if self.handles[&fh].reader.is_none() {
+                let reader = self._snapshot.open(oid).map_err(|_| libc::EIO)?;
+                self.handles.get_mut(&fh).ok_or(libc::EBADF)?.reader = Some(reader);
+            }
+            self.handles[&fh]
+                .reader
+                .as_ref()
+                .ok_or(libc::EIO)?
+                .read(offset as u64, count as u32)
+                .map_err(|_| libc::EIO)
         }
     }
     fn write_data(
@@ -406,6 +593,7 @@ impl Overlay {
         !self.paths.keys().any(|q| q != p && q.starts_with(p))
     }
     fn remove_path(&mut self, p: &Path) {
+        self.upper_paths.remove(p);
         if let Some(ino) = self.paths.remove(p) {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 n.attr.nlink = n
@@ -428,7 +616,7 @@ impl Overlay {
     }
     fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
         let p = self.child(parent, name)?;
-        let ino = *self.paths.get(&p).ok_or(libc::ENOENT)?;
+        let ino = self.ensure(&p)?;
         self.writable(ino)?;
         let kind = self.node(ino)?.attr.kind;
         if directory && kind != FileType::Directory {
@@ -458,7 +646,7 @@ impl Overlay {
         } // RENAME_NOREPLACE = 1
         let from = self.child(parent, name)?;
         let to = self.child(newparent, newname)?;
-        let ino = *self.paths.get(&from).ok_or(libc::ENOENT)?;
+        let ino = self.ensure(&from)?;
         self.writable(ino)?;
         let kind = self.node(ino)?.attr.kind;
         self.allowed(&from, kind)?;
@@ -514,8 +702,10 @@ impl Overlay {
         }
         for (old, _, _) in &moves {
             self.paths.remove(old);
+            self.upper_paths.remove(old);
         }
         for (_, target, id) in moves {
+            self.upper_paths.insert(target.clone(), id);
             self.paths.insert(target, id);
         }
         self.node_mut(ino)?.attr.ctime = SystemTime::now();
@@ -537,6 +727,7 @@ impl Overlay {
         n.attr.nlink = n.attr.nlink.checked_add(1).ok_or(libc::EMLINK)?;
         n.attr.ctime = SystemTime::now();
         self.paths.insert(path.clone(), ino);
+        self.upper_paths.insert(path.clone(), ino);
         self.touch_parent(&path);
         Ok(())
     }
@@ -544,14 +735,20 @@ impl Overlay {
 
 impl Filesystem for Overlay {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let result = self
-            .child(parent, name)
-            .and_then(|p| self.paths.get(&p).copied().ok_or(libc::ENOENT))
-            .and_then(|ino| self.node(ino));
+        let result = (|| {
+            let p = self.child(parent, name)?;
+            let ino = self.ensure(&p)?;
+            let node = self.node_mut(ino)?;
+            node.lookups = node.lookups.saturating_add(1);
+            Ok(node.attr)
+        })();
         match result {
-            Ok(n) => reply.entry(&TTL, &n.attr, 0),
+            Ok(attr) => reply.entry(&TTL, &attr, 0),
             Err(e) => reply.error(e),
         }
+    }
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        self.forget_inode(ino, nlookup);
     }
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
         if let Some(fh) = fh {
@@ -630,9 +827,19 @@ impl Filesystem for Overlay {
         }
     }
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        match self.node(ino) {
-            Ok(n) if n.attr.kind == FileType::Symlink => reply.data(&n.bytes),
-            Ok(_) => reply.error(libc::EINVAL),
+        let result = (|| {
+            let n = self.node(ino)?;
+            if n.attr.kind != FileType::Symlink {
+                return Err(libc::EINVAL);
+            }
+            if let Some(oid) = n.oid {
+                self._snapshot.read_link(oid).map_err(|_| libc::EIO)
+            } else {
+                Ok(n.bytes.clone())
+            }
+        })();
+        match result {
+            Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
         }
     }
@@ -659,7 +866,10 @@ impl Filesystem for Overlay {
             req.gid(),
             Vec::new(),
         ) {
-            Ok(ino) => reply.entry(&TTL, &self.nodes[&ino].attr, 0),
+            Ok(ino) => {
+                self.nodes.get_mut(&ino).unwrap().lookups += 1;
+                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -681,7 +891,10 @@ impl Filesystem for Overlay {
             req.gid(),
             Vec::new(),
         ) {
-            Ok(ino) => reply.entry(&TTL, &self.nodes[&ino].attr, 0),
+            Ok(ino) => {
+                self.nodes.get_mut(&ino).unwrap().lookups += 1;
+                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -718,7 +931,10 @@ impl Filesystem for Overlay {
             req.gid(),
             target.as_os_str().as_bytes().to_vec(),
         ) {
-            Ok(ino) => reply.entry(&TTL, &self.nodes[&ino].attr, 0),
+            Ok(ino) => {
+                self.nodes.get_mut(&ino).unwrap().lookups += 1;
+                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -746,7 +962,10 @@ impl Filesystem for Overlay {
         reply: ReplyEntry,
     ) {
         match self.hardlink(ino, newparent, newname) {
-            Ok(()) => reply.entry(&TTL, &self.nodes[&ino].attr, 0),
+            Ok(()) => {
+                self.nodes.get_mut(&ino).unwrap().lookups += 1;
+                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -782,7 +1001,10 @@ impl Filesystem for Overlay {
             Ok((ino, fh))
         })();
         match result {
-            Ok((ino, fh)) => reply.created(&TTL, &self.nodes[&ino].attr, 0, fh, 0),
+            Ok((ino, fh)) => {
+                self.nodes.get_mut(&ino).unwrap().lookups += 1;
+                reply.created(&TTL, &self.nodes[&ino].attr, 0, fh, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -844,13 +1066,7 @@ impl Filesystem for Overlay {
     ) {
         match self.handle(ino, fh) {
             Ok(_) => {
-                self.handles.remove(&fh);
-                self.directories.remove(&fh);
-                if !self.handles.values().any(|h| h.ino == ino) {
-                    if let Some(n) = self.nodes.get_mut(&ino) {
-                        n.file = None;
-                    }
-                }
+                self.close_handle(ino, fh);
                 reply.ok();
             }
             Err(e) => reply.error(e),
@@ -875,33 +1091,7 @@ impl Filesystem for Overlay {
         }
     }
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let result = (|| {
-            if self.node(ino)?.attr.kind != FileType::Directory {
-                return Err(libc::ENOTDIR);
-            }
-            let path = self.path(ino)?;
-            let parent = path
-                .parent()
-                .and_then(|p| self.paths.get(p))
-                .copied()
-                .unwrap_or(1);
-            let mut entries = vec![
-                (ino, FileType::Directory, OsString::from(".")),
-                (parent, FileType::Directory, OsString::from("..")),
-            ];
-            for (p, child) in &self.paths {
-                if p != &path && p.parent() == Some(path.as_path()) {
-                    entries.push((
-                        *child,
-                        self.node(*child)?.attr.kind,
-                        p.file_name().ok_or(libc::EIO)?.to_os_string(),
-                    ));
-                }
-            }
-            let fh = self.new_handle(ino, flags);
-            self.directories.insert(fh, entries);
-            Ok(fh)
-        })();
+        let result = self.open_directory(ino, flags);
         match result {
             Ok(fh) => reply.opened(fh, 0),
             Err(e) => reply.error(e),
@@ -1064,7 +1254,7 @@ mod tests {
     #[test]
     fn snapshot_reads_offsets_tails_and_modes_and_denies_every_mutation() {
         let (_tmp, mut fs) = fixture();
-        let ino = fs.paths[Path::new("tracked.tmp")];
+        let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
         assert_eq!(fs.nodes[&ino].attr.perm, 0o755);
         let fh = fs.open_file(ino, libc::O_RDONLY).unwrap();
         assert_eq!(fs.read_data(ino, fh, 7, 100).unwrap(), b"content\n");
@@ -1092,7 +1282,103 @@ mod tests {
             fs.fresh(1, OsStr::new("tracked.tmp"), FileType::RegularFile),
             Err(libc::EEXIST)
         );
-        assert_eq!(fs.nodes[&fs.paths[Path::new("link")]].bytes, b"tracked.tmp");
+        let link = fs.ensure(Path::new("link")).unwrap();
+        assert_eq!(
+            fs._snapshot
+                .read_link(fs.nodes[&link].oid.unwrap())
+                .unwrap(),
+            b"tracked.tmp"
+        );
+    }
+    #[test]
+    fn lazy_overlay_starts_with_only_root_and_reclaims_forgotten_metadata() {
+        let (_tmp, mut fs) = fixture();
+        assert_eq!(fs.nodes.len(), 1);
+        assert_eq!(fs.paths.len(), 1);
+        let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        assert_eq!(fs.nodes.len(), 2);
+        let original_time = fs.nodes[&ino].attr.mtime;
+        fs.nodes.get_mut(&ino).unwrap().lookups = 1;
+        let handle = fs.open_file(ino, libc::O_RDONLY).unwrap();
+        fs.forget_inode(ino, 1);
+        assert!(
+            fs.nodes.contains_key(&ino),
+            "open handle retains forgotten inode"
+        );
+        assert_eq!(
+            fs.read_data(ino, handle, 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        fs.handles.remove(&handle);
+        fs.reclaim(ino);
+        assert_eq!(fs.nodes.len(), 1);
+        assert!(!fs.paths.contains_key(Path::new("tracked.tmp")));
+        let replacement = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        assert_ne!(replacement, ino, "never recycle inode IDs");
+        assert_eq!(fs.nodes[&replacement].attr.mtime, original_time);
+    }
+    #[test]
+    fn directory_reserved_inodes_are_stable_and_reclaimed() {
+        let (_tmp, mut fs) = fixture();
+        let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let reserved = fs.paths[Path::new("tracked.tmp")];
+        assert_ne!(reserved, 0);
+        assert!(!fs.nodes.contains_key(&reserved));
+        assert_eq!(fs.ensure(Path::new("tracked.tmp")).unwrap(), reserved);
+        fs.nodes.get_mut(&reserved).unwrap().lookups = 1;
+        fs.close_handle(1, first);
+        assert_eq!(fs.paths[Path::new("tracked.tmp")], reserved);
+        fs.close_handle(1, second);
+        assert_eq!(fs.paths.len(), 2);
+        fs.forget_inode(reserved, 1);
+        assert_eq!(fs.paths.len(), 1);
+        assert_eq!(fs.nodes.len(), 1);
+        assert_eq!(fs.inode_paths.len(), 1);
+        assert!(fs.directory_refs.is_empty());
+    }
+    #[test]
+    fn idle_open_descriptors_do_not_pin_evicted_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        for i in 0..5 {
+            let oid = repo.blob(&vec![b'a' + i; 4 * 1024 * 1024]).unwrap();
+            tree.insert(format!("file{i}"), oid, 0o100644).unwrap();
+        }
+        let oid = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "retention").unwrap();
+        let mut fs = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        for i in 0..5 {
+            let ino = fs.ensure(Path::new(&format!("file{i}"))).unwrap();
+            let fh = fs.open_file(ino, libc::O_RDONLY).unwrap();
+            assert_eq!(fs.read_data(ino, fh, 0, 1).unwrap(), [b'a' + i]);
+        }
+        assert_eq!(fs.handles.len(), 5);
+        assert!(fs.handles.values().all(|h| h.reader.is_none()));
+        let metrics = fs._snapshot.metrics();
+        assert!(metrics.blob_cache_bytes <= BLOB_CACHE_BYTES);
+        assert_eq!(metrics.active_blob_readers, 0);
+    }
+    #[test]
+    fn never_looked_up_tracked_paths_cannot_be_shadowed_or_removed() {
+        let (_tmp, mut fs) = fixture();
+        assert_eq!(fs.paths.len(), 1);
+        assert_eq!(
+            fs.fresh(1, OsStr::new("tracked.tmp"), FileType::RegularFile),
+            Err(libc::EEXIST)
+        );
+        assert_eq!(
+            fs.remove(1, OsStr::new("tracked.tmp"), false),
+            Err(libc::EROFS)
+        );
+        let source = file(&mut fs, 1, "source.tmp");
+        assert_eq!(
+            fs.rename_path(1, OsStr::new("source.tmp"), 1, OsStr::new("tracked.tmp"), 0),
+            Err(libc::EROFS)
+        );
+        assert!(fs.nodes.contains_key(&source));
     }
     #[test]
     fn writable_files_support_offsets_holes_truncate_append_and_unlink() {
