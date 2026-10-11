@@ -5,12 +5,20 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on <tree-ish> <command> [args...]` resolves the selected Git tree once and
+- `git on [--keep] <tree-ish> <command> [args...]` resolves the selected Git tree once and
   launches the given argv from its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.
 - The command remains an ordinary program: standard streams, filesystem errors,
-  and inherited environment retain their documented meanings.
+  and inherited environment retain their documented meanings. stdin, stdout,
+  and stderr are inherited directly; git-on does not capture or tee output.
+- Only `GIT_ON_TREE_OID` is added or overridden in the child environment. No run
+  ID, output-directory, or run-directory variable is synthesized or consumed.
+  Caller-provided variables with such names remain ordinarily inherited.
+- Runner flags are parsed only before the tree-ish. Everything after the
+  tree-ish is literal command argv, including an argument spelled `--keep`.
+- git-on has no built-in execution logs, durable run manifests, artifact export,
+  or experiment-recording layer. Callers may record output externally.
 
 ## Filesystem policy
 
@@ -25,10 +33,22 @@ separate from that contract; a requirement is not a claim of a passing test.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
-- The writable layer is fresh for each run and removed when the run finishes.
-  This does not remove separately recorded run evidence or explicitly exported
-  outputs. Abrupt process or machine termination can require stale-run cleanup;
-  cleanup must remove the temporary layer without deleting explicit outputs.
+- The writable layer is fresh for each run. It uses private filesystem-backed
+  storage under the system temporary location and respects `TMPDIR`; git-on
+  creates no private memory filesystem and imposes no disk quota. The underlying
+  temporary filesystem's capacity and operating-system limits still apply.
+- Default completion unmounts and deletes the writable layer. `--keep` unmounts
+  but preserves that backing directory and reports the containing temporary
+  directory on stderr; retained named files are under `backing/`. It does
+  not retain a mount, duplicate untouched source files, or reuse those writes in
+  another invocation. Host paths explicitly written by the command are outside
+  this cleanup scope.
+- Abrupt process or machine termination and busy mounts may require stale-run
+  cleanup. Minimal temporary recovery metadata is permitted for mount identity,
+  locking, and releasing the exact Git pin; it is not a run manifest or log.
+  `git on --cleanup <temporary-directory>` must refuse active or deliberately
+  retained directories, avoid unrelated mounts and changed pin targets, and
+  never terminate processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
@@ -91,8 +111,11 @@ functional correctness:
   million-file case. Keep file contents and object reuse explicit in results.
 - Observe Git object accesses where instrumentation is available. A no-op
   command must not cause a recursive tree walk; a one-file read must not load
-  unrelated subtree contents. Without such instrumentation, timings alone are
-  not proof of lazy object access.
+  unrelated subtree contents. The opt-in `test-metrics` build may write counters
+  to an explicit inherited `GIT_ON_TEST_METRICS_FD` pipe supplied by the test
+  harness. Normal builds have no metrics channel, and instrumentation must not
+  capture or replace the command's standard streams. Without such
+  instrumentation, timings alone are not proof of lazy object access.
 - Exercise lookup, `stat`, directory listing, one-file reads, repeated reads,
   and large-file partial reads separately. Record decoding dependencies and
   bytes where observable rather than inferring them from wall time.

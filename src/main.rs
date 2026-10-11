@@ -9,7 +9,7 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt},
@@ -17,67 +17,35 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    process::{Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
 };
 
-#[derive(Default, Serialize, Deserialize)]
-struct Status {
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-    runner_error: Option<String>,
-}
+// Ephemeral recovery information only: no invocation history, arguments or logs.
 #[derive(Serialize, Deserialize)]
-struct Manifest {
+struct Recovery {
     format: String,
-    run_id: String,
-    tree_oid: Option<String>,
-    argv: Vec<String>,
-    argv_hex: Vec<String>,
-    started_at_ms: u128,
-    finished_at_ms: Option<u128>,
-    phase: String,
-    status: Status,
-    logs_complete: bool,
+    id: String,
+    keep: bool,
     git_dir: Option<PathBuf>,
+    tree_oid: Option<String>,
     pin_ref: Option<String>,
-    #[serde(default)]
-    snapshot_metrics: Option<serde_json::Value>,
-}
-fn now() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 fn private_dir(path: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(path)
-        .with_context(|| format!("create fresh directory {}", path.display()))
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(())
 }
-fn file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new()
+fn save(dir: &Path, state: &Recovery) -> Result<()> {
+    let path = dir.join(".state-new");
+    let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?)
-}
-fn save(dir: &Path, m: &Manifest) -> Result<()> {
-    let tmp = dir.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut f = file(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, m)?;
-        f.write_all(b"\n")?;
-        f.sync_all()?;
-        fs::rename(&tmp, dir.join("manifest.json"))?;
-        File::open(dir)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
+        .open(&path)?;
+    serde_json::to_writer(&mut f, state)?;
+    f.flush()?;
+    fs::rename(path, dir.join(".state"))?;
+    Ok(())
 }
 fn lock(dir: &Path, create: bool) -> Result<File> {
     let f = OpenOptions::new()
@@ -91,31 +59,6 @@ fn lock(dir: &Path, create: bool) -> Result<File> {
     }
     Ok(f)
 }
-fn run_dir(id: &str) -> Result<PathBuf> {
-    let p = if let Some(p) = env::var_os("GIT_ON_RUN_DIR") {
-        PathBuf::from(p)
-    } else {
-        let data = env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-            .context("set HOME, XDG_DATA_HOME, or GIT_ON_RUN_DIR")?;
-        let parent = data.join("git-on/runs");
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&parent)?;
-        parent.join(id)
-    };
-    private_dir(&p)?;
-    Ok(fs::canonicalize(p)?)
-}
-fn nonblocking(fd: i32) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
 fn kill_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
@@ -125,6 +68,7 @@ fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
     let p = dir.join("mount");
     let source = format!("git-on:{id}");
     let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    let mut found = false;
     for line in mounts.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() > 6 && decode_mount(fields[4]) == p.as_os_str().as_bytes() {
@@ -133,12 +77,28 @@ fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
                 .position(|x| *x == "-")
                 .context("invalid mountinfo")?;
             if fields.get(sep + 2) == Some(&source.as_str()) {
-                return Ok(true);
+                if found {
+                    bail!("stacked mounts at the temporary mountpoint");
+                }
+                found = true;
+                continue;
             }
             bail!("mountpoint is occupied by a different filesystem");
         }
     }
-    Ok(false)
+    Ok(found)
+}
+fn ensure_unmounted(dir: &Path) -> Result<()> {
+    for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        if let Some(point) = line.split_whitespace().nth(4) {
+            let bytes = decode_mount(point);
+            let path = Path::new(std::ffi::OsStr::from_bytes(&bytes));
+            if path.starts_with(dir) {
+                bail!("a mount remains below {}; refusing deletion", dir.display());
+            }
+        }
+    }
+    Ok(())
 }
 fn decode_mount(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -158,9 +118,9 @@ fn decode_mount(s: &str) -> Vec<u8> {
     }
     out
 }
-fn release_pin(m: &Manifest) -> Result<()> {
+fn release_pin(m: &Recovery) -> Result<()> {
     if let (Some(repo), Some(pin), Some(oid)) = (&m.git_dir, &m.pin_ref, &m.tree_oid) {
-        if pin != &format!("refs/git-on/{}", m.run_id) {
+        if pin != &format!("refs/git-on/{}", m.id) {
             bail!("invalid pin reference");
         }
         let repo = git2::Repository::open(repo)?;
@@ -177,30 +137,8 @@ fn release_pin(m: &Manifest) -> Result<()> {
     }
     Ok(())
 }
-fn cleanup(dir: &Path) -> Result<()> {
-    let dir = fs::canonicalize(dir)?;
-    let _lock = lock(&dir, false)?;
-    let m: Manifest = serde_json::from_reader(File::open(dir.join("manifest.json"))?)?;
-    if m.format != "git-on-run-v1" {
-        bail!("unrecognized run format");
-    }
-    if mount_is_ours(&dir, &m.run_id)? {
-        clean_unmount(&dir.join("mount"))?;
-    }
-    release_pin(&m)?;
-    for name in ["mount", "backing"] {
-        let p = dir.join(name);
-        if p.exists() {
-            if fs::symlink_metadata(&p)?.file_type().is_symlink() {
-                bail!("unexpected symlink at {}", p.display());
-            }
-            fs::remove_dir_all(p)?;
-        }
-    }
-    Ok(())
-}
 // tcsetpgrp may send SIGTTOU to a background caller; temporarily block it.
-fn foreground(pgid: libc::pid_t) -> std::io::Result<()> {
+fn foreground(fd: i32, pgid: libc::pid_t) -> std::io::Result<()> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
@@ -210,7 +148,7 @@ fn foreground(pgid: libc::pid_t) -> std::io::Result<()> {
         if error != 0 {
             return Err(std::io::Error::from_raw_os_error(error));
         }
-        let rc = libc::tcsetpgrp(0, pgid);
+        let rc = libc::tcsetpgrp(fd, pgid);
         let error = std::io::Error::last_os_error();
         libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
         if rc != 0 {
@@ -220,24 +158,36 @@ fn foreground(pgid: libc::pid_t) -> std::io::Result<()> {
     Ok(())
 }
 struct Terminal {
+    tty: Option<File>,
     parent: Option<libc::pid_t>,
     child: Option<libc::pid_t>,
 }
 impl Terminal {
     fn capture() -> Self {
-        let pgid = unsafe { libc::tcgetpgrp(0) };
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok();
+        let parent = tty.as_ref().and_then(|f| {
+            (unsafe { libc::tcgetpgrp(f.as_raw_fd()) } >= 0).then_some(unsafe { libc::getpgrp() })
+        });
         Self {
-            parent: (pgid >= 0 && pgid == unsafe { libc::getpgrp() }).then_some(pgid),
+            tty,
+            parent,
             child: None,
         }
+    }
+    fn descriptor(&self) -> Option<i32> {
+        self.tty.as_ref().map(AsRawFd::as_raw_fd)
     }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some(pgid) = self.parent {
-            let current = unsafe { libc::tcgetpgrp(0) };
-            if self.child.is_none_or(|child| current == child) {
-                let _ = foreground(pgid);
+        if let (Some(pgid), Some(fd)) = (self.parent, self.descriptor()) {
+            let current = unsafe { libc::tcgetpgrp(fd) };
+            if self.child == Some(current) {
+                let _ = foreground(fd, pgid);
             }
         }
     }
@@ -278,11 +228,19 @@ fn clean_unmount(mountpoint: &Path) -> Result<()> {
 struct Mounted {
     session: Option<fuser::BackgroundSession>,
     mountpoint: PathBuf,
+    id: String,
 }
 impl Mounted {
     fn finish(&mut self) -> Result<()> {
         if let Some(session) = self.session.take() {
-            let result = clean_unmount(&self.mountpoint);
+            let result =
+                mount_is_ours(self.mountpoint.parent().unwrap(), &self.id).and_then(|mounted| {
+                    if mounted {
+                        clean_unmount(&self.mountpoint)
+                    } else {
+                        Ok(())
+                    }
+                });
             if let Err(error) = result {
                 // Do not invoke fuser's lazy-unmount fallback on a busy mount.
                 // Process exit closes the FUSE connection; the persistent pin
@@ -321,28 +279,8 @@ fn child_exited(pid: u32) -> Result<bool> {
     }
     Ok(unsafe { info.si_pid() } != 0)
 }
-fn terminal_write(fd: i32, bytes: &[u8]) -> std::io::Result<usize> {
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTTOU);
-        let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-        if error != 0 {
-            return Err(std::io::Error::from_raw_os_error(error));
-        }
-        let count = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
-        let error = std::io::Error::last_os_error();
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        if count < 0 {
-            Err(error)
-        } else {
-            Ok(count as usize)
-        }
-    }
-}
-fn relay_job_control(pid: u32, parent_pgid: Option<libc::pid_t>) -> Result<()> {
-    let Some(parent_pgid) = parent_pgid else {
+fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
+    let (Some(parent_pgid), Some(fd)) = (terminal.parent, terminal.descriptor()) else {
         return Ok(());
     };
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -358,209 +296,155 @@ fn relay_job_control(pid: u32, parent_pgid: Option<libc::pid_t>) -> Result<()> {
             return Err(e.into());
         }
     }
+    let current = unsafe { libc::tcgetpgrp(fd) };
+    // The invoking shell may have foregrounded a previously background job.
+    // Give its child the terminal without requiring a second `fg`.
+    if current == parent_pgid {
+        foreground(fd, pid as libc::pid_t)?;
+    }
     if unsafe { info.si_pid() } != 0 {
-        let current = unsafe { libc::tcgetpgrp(0) };
+        let stop = unsafe { info.si_status() };
+        if current == parent_pgid && (stop == libc::SIGTTIN || stop == libc::SIGTTOU) {
+            kill_group(pid, libc::SIGCONT);
+            return Ok(());
+        }
+        let current = unsafe { libc::tcgetpgrp(fd) };
         if current == pid as libc::pid_t {
-            foreground(parent_pgid)?;
+            foreground(fd, parent_pgid)?;
         }
         unsafe {
             libc::kill(-parent_pgid, libc::SIGSTOP);
         }
         // `fg` gives this runner the terminal; `bg` does not. Never steal it
         // from the invoking shell on a background resume.
-        if unsafe { libc::tcgetpgrp(0) } == parent_pgid {
-            foreground(pid as libc::pid_t)?;
+        if unsafe { libc::tcgetpgrp(fd) } == parent_pgid {
+            foreground(fd, pid as libc::pid_t)?;
         }
         kill_group(pid, libc::SIGCONT);
     }
     Ok(())
 }
-fn tee_write(fd: i32, mut bytes: &[u8], signals: &mut Signals, pid: u32) -> Result<()> {
-    let start = Instant::now();
-    while !bytes.is_empty() {
-        for signal in signals.pending() {
-            kill_group(pid, signal);
-        }
-        let remaining = Duration::from_secs(1).saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            bail!("console tee blocked; raw log continues");
-        }
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().max(1) as i32) };
-        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        if rc <= 0 || poll.revents & libc::POLLOUT == 0 {
-            bail!("console tee failed or blocked; raw log continues");
-        }
-        match terminal_write(fd, bytes) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("console tee write failed; raw log continues"),
-            Ok(0) => bail!("console tee write made no progress; raw log continues"),
-            Ok(count) => bytes = &bytes[count..],
-        }
+fn cleanup(dir: &Path) -> Result<()> {
+    let dir = fs::canonicalize(dir)?;
+    let _lock = lock(&dir, false)?;
+    let state: Recovery = serde_json::from_reader(File::open(dir.join(".state"))?)?;
+    if state.format != "git-on-temp-v1" {
+        bail!("unrecognized temporary directory");
     }
+    if state.keep {
+        bail!("kept temporary files must be removed explicitly by their owner");
+    }
+    if mount_is_ours(&dir, &state.id)? {
+        clean_unmount(&dir.join("mount"))?;
+    }
+    ensure_unmounted(&dir)?;
+    release_pin(&state)?;
+    fs::remove_dir_all(dir)?;
     Ok(())
 }
-#[allow(clippy::too_many_arguments)]
 fn supervise(
     child: &mut std::process::Child,
-    out: File,
-    err: File,
     signals: &mut Signals,
-    dir: &Path,
-    manifest: &mut Manifest,
-    tee_fds: [i32; 2],
-    terminal_pgid: Option<libc::pid_t>,
-) -> Result<()> {
+    terminal: &Terminal,
+) -> Result<ExitStatus> {
     let pid = child.id();
-    save(dir, manifest)?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    nonblocking(stdout.as_raw_fd())?;
-    nonblocking(stderr.as_raw_fd())?;
-    let mut logs = [out, err];
-    let readers: [&mut dyn Read; 2] = [&mut stdout, &mut stderr];
-    let mut eof = [false, false];
-    let mut exited = false;
-    let mut dead_at = None;
-    let mut errors = Vec::new();
-    let mut tee = [true, true];
     loop {
         for signal in signals.pending() {
-            kill_group(pid, signal);
-        }
-        if !exited {
-            relay_job_control(pid, terminal_pgid)?;
-        }
-        if !exited && child_exited(pid)? {
-            exited = true;
-            dead_at = Some(Instant::now());
-            kill_group(pid, SIGTERM);
-        }
-        if let Some(t) = dead_at {
-            if t.elapsed() > Duration::from_millis(500) {
-                kill_group(pid, libc::SIGKILL);
-            }
-            if t.elapsed() > Duration::from_secs(2) {
-                if !eof.iter().all(|x| *x) {
-                    errors.push("log pipes remained open after child shutdown".into());
-                }
-                break;
+            if matches!(signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT) {
+                kill_group(pid, signal);
             }
         }
-        for i in 0..2 {
-            if eof[i] {
-                continue;
-            }
-            let mut buf = [0u8; 4096];
-            for _ in 0..64 {
-                match readers[i].read(&mut buf) {
-                    Ok(0) => {
-                        eof[i] = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Err(e) = logs[i].write_all(&buf[..n]) {
-                            errors.push(format!("log write failed: {e}"));
-                            eof[i] = true;
-                            kill_group(pid, libc::SIGKILL);
-                            break;
-                        }
-                        if tee[i] {
-                            if let Err(e) = tee_write(tee_fds[i], &buf[..n], signals, pid) {
-                                errors.push(e.to_string());
-                                tee[i] = false;
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        errors.push(format!("log read failed: {e}"));
-                        eof[i] = true;
-                        kill_group(pid, libc::SIGKILL);
-                        break;
-                    }
-                }
-            }
-        }
-        if exited && eof.iter().all(|x| *x) {
+        relay_job_control(pid, terminal)?;
+        if child_exited(pid)? {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    kill_group(pid, libc::SIGKILL);
-    let status = child.wait()?;
-    manifest.status.exit_code = status.code();
-    manifest.status.signal = status.signal();
-    manifest.logs_complete =
-        eof.iter().all(|x| *x) && !errors.iter().any(|e| e.starts_with("log "));
-    for f in &logs {
-        if let Err(e) = f.sync_all() {
-            errors.push(format!("log sync failed: {e}"));
-            manifest.logs_complete = false;
+        for signal in signals.wait() {
+            if matches!(signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT) {
+                kill_group(pid, signal);
+            }
         }
     }
-    if !errors.is_empty() {
-        bail!("{}", errors.join("; "));
+    // Descendants cannot keep an ephemeral mount alive after its command exits.
+    // Keep the leader unreaped until signalling to avoid process-group ID reuse.
+    kill_group(pid, SIGTERM);
+    kill_group(pid, libc::SIGKILL);
+    Ok(child.wait()?)
+}
+#[cfg(feature = "test-metrics")]
+fn report_metrics(snapshot: &Snapshot) -> Result<()> {
+    use std::os::fd::FromRawFd;
+    if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
+        let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
+        if fd < 3 {
+            bail!("test metrics descriptor must be separate from standard I/O");
+        }
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut output = unsafe { File::from_raw_fd(dup) };
+        serde_json::to_writer(&mut output, &snapshot.metrics())?;
+        output.write_all(b"\n")?;
     }
     Ok(())
 }
-fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
+fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus> {
+    let temp = tempfile::Builder::new().prefix("git-on-").tempdir()?;
+    let dir = fs::canonicalize(temp.path())?;
+    let held_lock = lock(&dir, true)?;
+    let _retained = temp.keep();
     let id = uuid::Uuid::new_v4().to_string();
-    let dir = run_dir(&id)?;
-    let _lock = lock(&dir, true)?;
-    let mut manifest = Manifest {
-        format: "git-on-run-v1".into(),
-        run_id: id.clone(),
-        tree_oid: None,
-        argv: args.iter().map(|a| a.to_string_lossy().into()).collect(),
-        argv_hex: args
-            .iter()
-            .map(|a| a.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
-            .collect(),
-        started_at_ms: now(),
-        finished_at_ms: None,
-        phase: "preparing".into(),
-        status: Status::default(),
-        logs_complete: false,
+    let mut state = Recovery {
+        format: "git-on-temp-v1".into(),
+        id: id.clone(),
+        keep,
         git_dir: None,
+        tree_oid: None,
         pin_ref: None,
-        snapshot_metrics: None,
     };
-    save(&dir, &manifest)?;
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
-    let mut observed_snapshot = None;
-    let mut result = (|| -> Result<i32> {
+    let _lock = held_lock;
+    let mut observed = None;
+    let mut kept_export = None;
+    let mut result = (|| -> Result<ExitStatus> {
+        #[cfg(feature = "test-metrics")]
+        if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
+            let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
+            if fd < 3 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                bail!("invalid test metrics descriptor");
+            }
+        }
+        save(&dir, &state)?;
+        let mut signals = Signals::new([
+            SIGINT,
+            SIGTERM,
+            SIGHUP,
+            SIGQUIT,
+            libc::SIGCHLD,
+            libc::SIGCONT,
+        ])?;
         let snapshot = Snapshot::load_with_pin_record(
             &env::current_dir()?,
             &tree,
             &id,
             |git_dir, pin, oid| {
-                manifest.tree_oid = Some(oid.to_string());
-                manifest.git_dir = Some(git_dir.to_path_buf());
-                manifest.pin_ref = Some(pin.to_owned());
-                save(&dir, &manifest)
+                state.git_dir = Some(git_dir.into());
+                state.pin_ref = Some(pin.into());
+                state.tree_oid = Some(oid.to_string());
+                save(&dir, &state)
             },
         )?;
-        manifest.tree_oid = Some(snapshot.tree_oid.to_string());
-        manifest.git_dir = Some(snapshot.git_dir.clone());
-        manifest.pin_ref = Some(snapshot.pin_ref.clone());
-        save(&dir, &manifest)?;
+        observed = Some(snapshot.clone());
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
-        private_dir(&dir.join("output"))?;
-        let out = file(&dir.join("stdout.log"))?;
-        let err = file(&dir.join("stderr.log"))?;
-        observed_snapshot = Some(snapshot.clone());
-        let overlay = Overlay::new(snapshot, dir.join("backing"))?;
-        if let Some(signal) = signals.pending().next() {
-            bail!("cancelled by signal {signal} before command execution");
+        let mut overlay = Overlay::new(snapshot, dir.join("backing"))?;
+        if keep {
+            kept_export = Some(overlay.enable_keep_export(dir.join("kept")));
+        }
+        if let Some(signal) = signals
+            .pending()
+            .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
+        {
+            return Ok(ExitStatus::from_raw(signal));
         }
         let session = fuser::spawn_mount2(
             overlay,
@@ -577,132 +461,164 @@ fn execute(tree: OsString, args: Vec<OsString>) -> Result<i32> {
         let mut session = Mounted {
             session: Some(session),
             mountpoint: dir.join("mount"),
+            id: id.clone(),
         };
         if !mount_is_ours(&dir, &id)? {
             bail!("FUSE mount did not become ready");
         }
-        if let Some(signal) = signals.pending().next() {
-            bail!("cancelled by signal {signal} before command execution");
+        if let Some(signal) = signals
+            .pending()
+            .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
+        {
+            return Ok(ExitStatus::from_raw(signal));
         }
         let mut command = Command::new(&args[0]);
         command
             .args(&args[1..])
             .current_dir(dir.join("mount"))
             .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("GIT_ON_RUN_ID", &id)
-            .env("GIT_ON_TREE_OID", manifest.tree_oid.as_ref().unwrap())
-            .env("GIT_ON_RUN_DIR", &dir)
-            .env("GIT_ON_OUTPUT_DIR", dir.join("output"));
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env("GIT_ON_TREE_OID", state.tree_oid.as_ref().unwrap());
         let mut terminal = Terminal::capture();
-        let transfer_terminal = terminal.parent.is_some();
+        let tty_fd = terminal.descriptor();
+        let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() });
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if transfer_terminal {
-                    foreground(libc::getpgrp())?;
+                if transfer {
+                    foreground(tty_fd.unwrap(), libc::getpgrp())?;
                 }
                 Ok(())
             });
         }
-        let mut child = command.spawn().context("spawn command")?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                if transfer {
+                    let _ = foreground(tty_fd.unwrap(), unsafe { libc::getpgrp() });
+                }
+                return Err(e).context("spawn command");
+            }
+        };
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
-        manifest.phase = "running".into();
-        let outcome = supervise(
-            &mut child,
-            out,
-            err,
-            &mut signals,
-            &dir,
-            &mut manifest,
-            [1, 2],
-            terminal.parent,
-        );
-        if manifest.status.exit_code.is_none() && manifest.status.signal.is_none() {
+        let outcome = supervise(&mut child, &mut signals, &terminal);
+        if outcome.is_err() {
             kill_group(pid, libc::SIGKILL);
-            if let Ok(status) = child.wait() {
-                manifest.status.exit_code = status.code();
-                manifest.status.signal = status.signal();
-            }
+            let _ = child.wait();
         }
         drop(terminal);
         let unmount = session.finish();
         match (outcome, unmount) {
+            (Ok(status), Ok(())) => Ok(status),
             (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
-            (Err(e), _) | (_, Err(e)) => return Err(e),
-            _ => {}
+            (Err(e), _) | (_, Err(e)) => Err(e),
         }
-        Ok(manifest
-            .status
-            .exit_code
-            .unwrap_or_else(|| 128 + manifest.status.signal.unwrap_or(0)))
     })();
-    if let Some(snapshot) = observed_snapshot.take() {
-        manifest.snapshot_metrics = Some(serde_json::to_value(snapshot.metrics())?);
-        drop(snapshot);
+    if let Some(snapshot) = observed.take() {
+        #[cfg(feature = "test-metrics")]
+        if let Err(e) = report_metrics(&snapshot) {
+            result = Err(e);
+        }
+        // On a busy mount retain the pin for explicit stale recovery.
+        if mount_is_ours(&dir, &id).unwrap_or(true) {
+            std::mem::forget(snapshot);
+        }
     }
     let cleanup_result = (|| -> Result<()> {
-        if !mount_is_ours(&dir, &id)? {
-            release_pin(&manifest)?;
-            for name in ["mount", "backing"] {
-                let p = dir.join(name);
-                if p.exists() {
-                    fs::remove_dir_all(p)?;
+        if mount_is_ours(&dir, &id)? {
+            bail!(
+                "temporary mount remains at {}; use --cleanup after stopping its users",
+                dir.display()
+            );
+        }
+        ensure_unmounted(&dir)?;
+        release_pin(&state)?;
+        if keep {
+            if let Some(export) = kept_export.as_ref() {
+                match export
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("keep export lock poisoned"))?
+                    .as_ref()
+                {
+                    Some(Ok(())) => {
+                        fs::remove_dir_all(dir.join("backing"))?;
+                        fs::rename(dir.join("kept"), dir.join("backing"))?;
+                    }
+                    Some(Err(e)) => bail!(
+                        "cannot export kept files: {e}; raw backing retained at {}",
+                        dir.display()
+                    ),
+                    None => bail!(
+                        "keep export did not complete; raw backing retained at {}",
+                        dir.display()
+                    ),
                 }
             }
+            if dir.join("mount").exists() {
+                fs::remove_dir(dir.join("mount"))?;
+            }
+            eprintln!("git-on: kept temporary files at {}", dir.display());
+        } else {
+            fs::remove_dir_all(&dir)?;
         }
         Ok(())
     })();
-    if let Err(cleanup_error) = cleanup_result {
+    if let Err(e) = cleanup_result {
         result = Err(match result {
-            Ok(_) => cleanup_error,
-            Err(error) => anyhow::anyhow!("{error:#}; cleanup: {cleanup_error:#}"),
+            Ok(_) => e,
+            Err(a) => anyhow::anyhow!("{a:#}; cleanup: {e:#}"),
         });
     }
-    if let Err(e) = &result {
-        manifest.status.runner_error = Some(format!("{e:#}"));
-    }
-    manifest.phase = "finished".into();
-    manifest.finished_at_ms = Some(now());
-    save(&dir, &manifest)?;
-    eprintln!("git-on: run {} ({})", id, dir.display());
     result
 }
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
-    let result = (|| -> Result<i32> {
+    let result = (|| -> Result<ExitStatus> {
         if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: git on [--] <tree-ish> <command> [args...]\n       git on --cleanup <run-directory>\n\nRun argv directly in an immutable Git snapshot. New paths must be ignored by\nthe snapshot's .gitignore files. Linux with FUSE3 required.\nGIT_ON_RUN_DIR selects a fresh evidence directory; otherwise XDG data is used.\nExit: child status (128+signal); runner failure 125; usage 2.");
-            return Ok(0);
+            println!("Usage: git on [--keep] [--] <tree-ish> <command> [args...]\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep retains generated files for debugging after unmount.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.");
+            return Ok(ExitStatus::from_raw(0));
         }
         if args.first().is_some_and(|a| a == "--version") {
             println!("git-on {}", env!("CARGO_PKG_VERSION"));
-            return Ok(0);
+            return Ok(ExitStatus::from_raw(0));
         }
         if args.first().is_some_and(|a| a == "--cleanup") {
             if args.len() != 2 {
-                bail!("usage: git on --cleanup <run-directory>");
+                bail!("usage: git on --cleanup <temporary-directory>");
             }
             cleanup(Path::new(&args[1]))?;
-            return Ok(0);
+            return Ok(ExitStatus::from_raw(0));
         }
-        let args = if args.first().is_some_and(|a| a == "--") {
-            &args[1..]
-        } else {
-            &args[..]
-        };
+        let mut offset = 0;
+        let keep = args.first().is_some_and(|a| a == "--keep");
+        if keep {
+            offset += 1;
+        }
+        if args.get(offset).is_some_and(|a| a == "--") {
+            offset += 1;
+        }
+        let args = &args[offset..];
         if args.len() < 2 {
-            eprintln!("usage: git on <tree-ish> <command> [args...]");
-            return Ok(2);
+            eprintln!("usage: git on [--keep] [--] <tree-ish> <command> [args...]");
+            return Ok(ExitStatus::from_raw(2 << 8));
         }
-        execute(args[0].clone(), args[1..].to_vec())
+        execute(args[0].clone(), args[1..].to_vec(), keep)
     })();
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(status) => {
+            if let Some(signal) = status.signal() {
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+                std::process::exit(128 + signal);
+            }
+            std::process::exit(status.code().unwrap_or(125));
+        }
         Err(e) => {
             eprintln!("git-on: {e:#}");
             std::process::exit(125);
@@ -713,187 +629,89 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn manifest() -> Manifest {
-        Manifest {
-            format: "git-on-run-v1".into(),
-            run_id: "test".into(),
-            tree_oid: None,
-            argv: vec![],
-            argv_hex: vec![],
-            started_at_ms: now(),
-            finished_at_ms: None,
-            phase: "running".into(),
-            status: Status::default(),
-            logs_complete: false,
+    fn recovery(keep: bool) -> Recovery {
+        Recovery {
+            format: "git-on-temp-v1".into(),
+            id: "unit-test".into(),
+            keep,
             git_dir: None,
+            tree_oid: None,
             pin_ref: None,
-            snapshot_metrics: None,
         }
     }
-    fn child(script: &str) -> std::process::Child {
-        let mut command = Command::new("python3");
-        command
-            .args(["-c", script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command.spawn().unwrap()
-    }
-    fn capture(script: &str, broken_log: bool) -> (tempfile::TempDir, Manifest, Result<()>) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut m = manifest();
-        let mut c = child(script);
-        let out = if broken_log {
-            OpenOptions::new().write(true).open("/dev/full").unwrap()
-        } else {
-            file(&dir.path().join("stdout.log")).unwrap()
-        };
-        let err = file(&dir.path().join("stderr.log")).unwrap();
-        let tee = OpenOptions::new().write(true).open("/dev/null").unwrap();
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]).unwrap();
-        let result = supervise(
-            &mut c,
-            out,
-            err,
-            &mut signals,
-            dir.path(),
-            &mut m,
-            [tee.as_raw_fd(), tee.as_raw_fd()],
-            None,
-        );
-        (dir, m, result)
+    #[test]
+    fn recovery_refuses_active_and_kept_data() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("temp");
+        private_dir(&dir).unwrap();
+        let held = lock(&dir, true).unwrap();
+        save(&dir, &recovery(false)).unwrap();
+        assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(held);
+        save(&dir, &recovery(true)).unwrap();
+        assert!(cleanup(&dir).unwrap_err().to_string().contains("kept"));
+        assert!(dir.exists());
+        save(&dir, &recovery(false)).unwrap();
+        cleanup(&dir).unwrap();
+        assert!(!dir.exists());
     }
     #[test]
-    fn captures_separate_raw_streams_and_exit() {
-        let (dir, m, result) = capture(
-            "import os,sys;os.write(1,b'out\\x00\\xff');os.write(2,b'err\\x00\\xfe');sys.exit(7)",
-            false,
-        );
-        result.unwrap();
-        assert_eq!(m.status.exit_code, Some(7));
-        assert!(m.logs_complete);
-        assert_eq!(
-            fs::read(dir.path().join("stdout.log")).unwrap(),
-            b"out\x00\xff"
-        );
-        assert_eq!(
-            fs::read(dir.path().join("stderr.log")).unwrap(),
-            b"err\x00\xfe"
-        );
-    }
-    #[test]
-    fn captures_large_streams_without_deadlock() {
-        let (dir, m, result) = capture(
-            "import os;[(os.write(1,b'o'*4096),os.write(2,b'e'*4096)) for _ in range(512)]",
-            false,
-        );
-        result.unwrap();
-        assert!(m.logs_complete);
-        assert_eq!(
-            fs::metadata(dir.path().join("stdout.log")).unwrap().len(),
-            2097152
-        );
-        assert_eq!(
-            fs::metadata(dir.path().join("stderr.log")).unwrap().len(),
-            2097152
-        );
-    }
-    #[test]
-    fn child_signal_is_not_runner_failure() {
-        let (_, m, result) = capture(
-            "import os,signal;os.kill(os.getpid(),signal.SIGTERM)",
-            false,
-        );
-        result.unwrap();
-        assert_eq!(m.status.signal, Some(SIGTERM));
-        assert_eq!(m.status.exit_code, None);
-    }
-    #[test]
-    fn log_failure_is_incomplete_and_stops_child() {
-        let start = Instant::now();
-        let (_, m, result) = capture("import os,time;os.write(1,b'hello');time.sleep(60)", true);
-        assert!(result.unwrap_err().to_string().contains("log write failed"));
-        assert!(!m.logs_complete);
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert_eq!(m.status.signal, Some(libc::SIGKILL));
-    }
-    #[test]
-    fn escaped_inherited_pipes_have_bounded_drain() {
-        let start = Instant::now();
-        let (_, m, result) = capture(
-            "import os,time\nr,w=os.pipe()\np=os.fork()\nif p==0:\n os.close(r);os.setsid();os.write(w,b'x');os.close(w);time.sleep(3);os._exit(0)\nos.close(w);assert os.read(r,1)==b'x';os.close(r);os._exit(0)",
-            false,
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("log pipes remained open"));
-        assert!(!m.logs_complete);
-        assert_eq!(m.status.exit_code, Some(0));
-        assert!(start.elapsed() < Duration::from_secs(4));
-    }
-    #[test]
-    fn atomic_manifest_and_mount_escape_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut m = manifest();
-        save(dir.path(), &m).unwrap();
-        m.phase = "finished".into();
-        save(dir.path(), &m).unwrap();
-        let loaded: Manifest =
-            serde_json::from_reader(File::open(dir.path().join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(loaded.phase, "finished");
-        assert_eq!(decode_mount("/tmp/a\\040b\\134c"), b"/tmp/a b\\c");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-    #[test]
-    fn cleanup_releases_pin_preserves_evidence_and_refuses_active_lock() {
+    fn recovery_releases_only_its_own_pin() {
         let root = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(root.path().join("repo")).unwrap();
         let oid = repo.treebuilder(None).unwrap().write().unwrap();
-        repo.reference("refs/git-on/test", oid, false, "test")
+        let mut state = recovery(false);
+        state.git_dir = Some(repo.path().into());
+        state.tree_oid = Some(oid.to_string());
+        state.pin_ref = Some("refs/git-on/unit-test".into());
+        repo.reference(state.pin_ref.as_ref().unwrap(), oid, false, "test")
             .unwrap();
-        let dir = root.path().join("run");
-        private_dir(&dir).unwrap();
-        let held = lock(&dir, true).unwrap();
-        let mut m = manifest();
-        m.git_dir = Some(repo.path().into());
-        m.pin_ref = Some("refs/git-on/test".into());
-        m.tree_oid = Some(oid.to_string());
-        save(&dir, &m).unwrap();
-        for name in ["mount", "backing", "output"] {
-            private_dir(&dir.join(name)).unwrap();
-        }
-        fs::write(dir.join("output/keep"), b"output").unwrap();
-        fs::write(dir.join("stdout.log"), b"evidence").unwrap();
-        assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
-        // Other parallel process tests may briefly inherit this descriptor
-        // between fork and exec (CLOEXEC). Explicitly release the shared OFD
-        // lock before asserting reacquisition, instead of racing that window.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
-        drop(held);
-        cleanup(&dir).unwrap();
-        cleanup(&dir).unwrap();
-        assert!(repo.find_reference("refs/git-on/test").is_err());
-        assert!(!dir.join("mount").exists());
-        assert!(!dir.join("backing").exists());
-        assert_eq!(fs::read(dir.join("stdout.log")).unwrap(), b"evidence");
-        assert_eq!(fs::read(dir.join("output/keep")).unwrap(), b"output");
-        assert!(dir.join("manifest.json").exists());
+        release_pin(&state).unwrap();
+        assert!(repo
+            .find_reference(state.pin_ref.as_ref().unwrap())
+            .is_err());
+        state.pin_ref = Some("refs/heads/master".into());
+        assert!(release_pin(&state).is_err());
     }
     #[test]
-    fn terminal_stop_probe_does_not_misclassify_exited_child() {
-        let mut c = child("pass");
-        while !child_exited(c.id()).unwrap() {
-            std::thread::sleep(Duration::from_millis(1));
+    fn event_supervisor_preserves_exit_and_signal() {
+        for script in ["exit 23", "kill -TERM $$"] {
+            let mut signals = Signals::new([
+                SIGINT,
+                SIGTERM,
+                SIGHUP,
+                SIGQUIT,
+                libc::SIGCHLD,
+                libc::SIGCONT,
+            ])
+            .unwrap();
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let terminal = Terminal {
+                tty: None,
+                parent: None,
+                child: None,
+            };
+            let status = supervise(&mut child, &mut signals, &terminal).unwrap();
+            if script.starts_with("exit") {
+                assert_eq!(status.code(), Some(23));
+            } else {
+                assert_eq!(status.signal(), Some(SIGTERM));
+            }
         }
-        relay_job_control(c.id(), Some(unsafe { libc::getpgrp() })).unwrap();
-        assert!(c.wait().unwrap().success());
+    }
+    #[test]
+    fn mount_escapes_are_decoded() {
+        assert_eq!(decode_mount("/tmp/a\\040b\\134c"), b"/tmp/a b\\c");
     }
 }

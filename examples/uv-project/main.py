@@ -12,9 +12,3 @@ for index in range(2):
     else:
         assert cache == first, "Second process rewrote rather than reused the Numba cache"
 print("cache-reused")
-
-# Select artifacts to retain after git-on discards the writable snapshot layer.
-import os
-import shutil
-if output := os.environ.get("GIT_ON_OUTPUT_DIR"):
-    shutil.copytree("__pycache__", Path(output) / "cache-evidence")

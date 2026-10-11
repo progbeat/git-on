@@ -39,8 +39,16 @@ uses `pyproject.toml` and `uv.lock`. Both pin NumPy 2.2.6 and Numba 0.61.2; the
 lockfiles also pin and hash the llvmlite dependency. Python 3.11–3.13 is required.
 CI validates these with uv 0.8.22. Initial execution needs package-index access.
 
-Inside git-on, the writable snapshot layer is temporary. The examples explicitly
-copy their local import and Numba cache evidence to
-`$GIT_ON_OUTPUT_DIR/cache-evidence/`, which remains in the run directory after
-cleanup. This is an explicit artifact export, not automatic retention of every
-ignored path. Cache reuse is within one run; a later run starts fresh.
+Inside git-on, the writable snapshot layer is temporary. Cache reuse is within
+one run; a later run starts fresh. To inspect the generated caches afterward,
+retain that layer explicitly:
+
+```console
+git on --keep HEAD:examples/pep723 uv run --locked --script main.py
+git on --keep HEAD:examples/uv-project uv run --locked main.py
+```
+
+After unmounting, git-on prints the retained temporary-directory path on stderr.
+The generated local-import and Numba cache files are under its
+`backing/__pycache__/` directory. No automatic artifact copy or output-directory environment variable
+is involved. Delete the retained directory when you no longer need it.

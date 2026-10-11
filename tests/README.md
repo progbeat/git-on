@@ -54,16 +54,16 @@ claim the mounted command is sandboxed from the host filesystem.
 
 ## Lazy access and lifecycle
 
-Separate fresh-mount workloads perform no access, list one directory, stat one
-leaf, look up a missing leaf and read one leaf in a 10,000-distinct-blob fixture.
-Manifest counters must show only necessary ancestor trees/header reads and zero
-unread payloads. A write under nested ignore rules loads only its two ancestor
-ignore files while twelve unrelated policy subtrees remain untouched. Distinct
-pathnames sharing one blob test object-cache reuse;
-a 16 MiB chunked/range read tests one decode per open file. Cache retained-byte
-counts must stay within the reported limits. The [benchmark harness](benchmark.md)
-uses the full million-distinct-file acceptance workload with the same structural
-counter gates. Timing by itself is not a laziness assertion.
+The ordinary integration binary has no metrics channel. Black-box laziness
+regressions use unreachable or deliberately unavailable sibling objects to check
+that unrelated content is not visited, while separate workloads exercise lookup,
+listing, stat, reads, applicable nested ignore rules, shared-blob correctness,
+and large-file chunked/range reads. Unit tests validate cache retention and
+object decode reuse. The [benchmark harness](benchmark.md) uses the separate
+`test-metrics` build and an explicitly inherited metrics pipe for structural
+object-count and cache-bound gates on the full million-distinct-file workload.
+It records stdout/stderr and counters externally; it does not use a runtime
+manifest. Timing by itself is not a laziness assertion.
 
 Unsupported LFS blobs and submodules must fail on relevant access while ordinary
 siblings remain readable; mounting an untouched unsupported subtree must not
@@ -71,9 +71,12 @@ require global preflight traversal. Directory name enumeration remains possible.
 
 Other coverage includes pinned snapshots despite dirty index/worktree state;
 raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
-binary stream logs and inherited stdin; exit/signal manifests; PTY foreground
-ownership and stop/continue handling; missing executables; forwarded signals;
-normal and SIGKILL recovery cleanup; refused cleanup of active runs; retained
-busy mounts and explicit recovery; and locked PEP 723/uv project imports with
-Numba cache reuse. Successful concurrent runs verify removal of mount, backing
-storage and Git pins while keeping requested output artifacts.
+binary standard streams and inherited stdin; exit/signal return codes; direct
+terminal detection, PTY foreground ownership and stop/continue handling; missing
+executables; forwarded signals; default temporary-layer removal; `TMPDIR`
+selection; `--keep` retention after unmount; absence of built-in logs, manifests,
+and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
+active or deliberately retained state; retained busy mounts and explicit
+recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
+runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
+retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.

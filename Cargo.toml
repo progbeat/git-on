@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
 
+[features]
+default = []
+# Private benchmark instrumentation; normal builds expose no metrics channel.
+test-metrics = []
+
 [dependencies]
 anyhow = "1"
 fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }

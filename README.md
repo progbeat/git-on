@@ -8,7 +8,7 @@ git on HEAD:experiments uv run --locked experiment.py
 git on 0123456789abcdef0123456789abcdef01234567 python -m pytest
 ```
 
-`git-on` is a Git external command: installing the executable on `PATH` makes `git on` available. The first positional argument is always a Git tree-ish. Everything after it is a literal command and its arguments; no shell is introduced. To use shell syntax, explicitly run `sh -c '...'`.
+`git-on` is a Git external command: installing the executable on `PATH` makes `git on` available. The optional runner flag `--keep` must precede the Git tree-ish. The first positional argument is always a Git tree-ish. Everything after it is a literal command and its arguments; no shell is introduced. To use shell syntax, explicitly run `sh -c '...'`.
 
 ## Installation and support
 
@@ -30,7 +30,7 @@ The selected tree is resolved once to a full tree object ID. Commits, annotated 
 - New ignored content uses a private per-run backing directory. It can be edited, deleted, or renamed only while respecting the same destination policy. Atomic temporary-file replacement works when both paths are allowed.
 - Git executable bits and symlinks are preserved. Hard links cannot provide write access to tracked content. Special device nodes and extended attributes are not supported. Ordinary rename and no-replace rename are supported; exchange/whiteout rename is rejected.
 - A denied filesystem operation returns an ordinary filesystem error to its caller. git-on does not terminate the application merely because an operation was denied; the application handles that error normally.
-- The writable layer is temporary and private to one run. Normal completion removes it; a new run starts empty. Abrupt termination can leave backing files until checked cleanup runs, as described below.
+- The writable layer is temporary and private to one run. Normal completion removes it unless `--keep` was requested; a new run starts empty. Abrupt termination can leave backing files until checked cleanup runs, as described below.
 
 The policy is language-independent. There are no special write exceptions for Python, uv, Numba, or any other tool. See [examples](examples/README.md) for optional application configurations.
 
@@ -46,44 +46,76 @@ Decoded content retention is bounded: 8 MiB / 128 blob entries, 4 MiB / 256 tree
 
 Git encoding can require decoding an entire requested blob or its delta bases. Large blobs use an immediately unlinked spool in the private backing directory, shared by simultaneous readers and removed after their final close; subsequent ranges in that open file do not repeatedly decode the object. A first read still needs the memory to decode that object. These limits are retained-cache budgets, not a bound on total RSS, kernel cache, active metadata, or temporary large-object decoding.
 
-The run manifest records application-level tree/header/blob requests and cache statistics as `snapshot_metrics`. They exclude initial tree-ish resolution and do not pretend to measure physical I/O or hidden delta-base reads. The [benchmark](tests/benchmark.md) checks exact output and demand counts on a million distinct files; latency and RSS are measured, not promised as a machine-independent SLA.
+The [benchmark](tests/benchmark.md) checks exact output and demand counts on a million distinct files using a separate, opt-in instrumented test build. Its counters exclude initial tree-ish resolution and do not measure physical I/O or hidden delta-base reads. The harness captures all evidence externally; normal builds have no metrics output. Latency and RSS are measured, not promised as a machine-independent SLA.
 
-## Durable run evidence
+## Standard streams and temporary writes
 
-Every attempted run creates a fresh private directory. Set `GIT_ON_RUN_DIR` to a path that does not yet exist, or use the default `$XDG_DATA_HOME/git-on/runs/<id>` (`$HOME/.local/share` when unset). Existing directories are never overwritten.
+The command inherits stdin, stdout, and stderr directly. Terminal detection, pipes,
+redirection, binary output, and buffering behave as they do for an ordinary child
+process. git-on does not tee or capture these streams and creates no logs, run
+manifest, or output directory. Use ordinary shell redirection or a separate
+experiment runner when you need durable records.
 
-The directory contains:
+The only environment variable git-on adds or overrides is `GIT_ON_TREE_OID`, the
+full selected tree ID. The rest of the caller's environment is inherited. No
+`GIT_ON_RUN_ID`, `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed.
+If callers already set those names, they remain ordinary inherited variables.
 
-- `manifest.json`: atomic updates recording a unique run ID, resolved tree ID, command argv, start/end timestamps, lifecycle phase, child exit/signal, runner errors, and log completeness
-- `stdout.log`, `stderr.log`: separate raw byte logs, written live while also forwarding output to the caller
-- `output/`: explicit persistent outputs, kept after the mount is removed
+New ignored files use a private directory in the system temporary location,
+respecting `TMPDIR`. Storage uses ordinary filesystem-backed files, not a
+private memory filesystem, and there is no git-on disk quota. If the system's
+temporary location is itself a memory filesystem, choose a disk-backed location
+with `TMPDIR`. Filesystem capacity and operating-system resource limits still
+apply. Temporary directories are private to the current user.
 
-`argv` is readable UTF-8 with replacement for invalid bytes; `argv_hex` records exact Unix argv bytes. No environment dump is recorded. Arguments and output can contain secrets, so directories are mode 0700 and evidence files mode 0600. The caller remains responsible for retention and sharing.
+By default, git-on unmounts and removes the writable layer after the command
+finishes. To retain newly written ignored files:
 
-The child receives these additional variables:
-
-```text
-GIT_ON_RUN_ID
-GIT_ON_TREE_OID
-GIT_ON_RUN_DIR
-GIT_ON_OUTPUT_DIR
+```sh
+git on --keep HEAD python script.py
 ```
 
-Other environment variables and stdin are inherited. There is no PTY: programs may buffer output according to their normal pipe behavior. Save results under `GIT_ON_OUTPUT_DIR` if they must survive the run. Ignored writable files inside the mount are temporary.
+`--keep` must appear before the tree-ish. After unmounting, git-on reports the
+retained temporary-directory path on stderr. Its `backing/` subdirectory
+contains the writable layer with its original paths, not a checkout of the
+selected tree; untouched tracked source files are not copied into it. The mount
+is removed. A small retention marker remains so recovery cleanup cannot mistake
+intentionally kept files for disposable stale state. A later invocation still starts with an empty writable layer. Remove the
+retained directory yourself when finished with it. Alternatively, write or copy
+chosen results to an explicit host path from the command.
 
-The manifest distinguishes a child's nonzero exit or signal from runner failure. A runner failure returns 125; usage errors return 2; otherwise the command's exit code is returned, or `128 + signal`. A child can itself exit 125, so consult the manifest to distinguish it. Logging/tee failure is a runner error, even when the command itself succeeds. Captured raw logs are retained when console forwarding fails.
+Usage errors return 2; a runner failure returns 125; otherwise the command's
+exit code is returned. If the command terminates by signal, git-on re-raises that
+signal after cleanup; shells normally display this as `128 + signal`. A child
+may itself return 125, so that code alone cannot distinguish a runner failure.
+Runner diagnostics go to stderr.
 
 ## Foreground lifecycle and cleanup
 
-The command gets its own process group. SIGINT, SIGTERM, SIGHUP, and SIGQUIT received by git-on are forwarded to that group. A controlling terminal is handed to the child and restored afterward; terminal stop/continue is relayed to the invoking foreground job. After the main child exits, remaining group members receive TERM followed by KILL. Pipe draining is bounded, so a detached process retaining a pipe cannot hang the runner indefinitely; incomplete capture is recorded as a runner error. This is a foreground runner, not a service daemonizer or orchestrator.
+The command gets its own process group. SIGINT, SIGTERM, SIGHUP, and SIGQUIT
+received by git-on are forwarded to that group. A controlling terminal is handed
+to the child and restored afterward; terminal stop/continue is relayed to the
+invoking foreground job. After the main child exits, remaining group members
+receive TERM followed by KILL. git-on does not drain or wait for captured-output
+pipes because it creates none. A detached process outside the managed group can
+still retain inherited descriptors; git-on is a foreground runner, not a service
+daemonizer or host process sandbox.
 
-Git trees are pinned under `refs/git-on/<run-id>` while in use. A normal exit unmounts, releases the pin, and removes the temporary layer while preserving evidence and explicit outputs. If killed abruptly or the machine crashes, run:
+Git trees are pinned under `refs/git-on/<id>` while in use. Normal completion
+unmounts, releases the pin, and removes temporary state. With `--keep`, only the
+writable backing directory is retained. A busy mount or abrupt termination can
+leave a temporary directory, mount, and pin; minimal private recovery metadata
+allows checked cleanup without keeping execution logs or a run manifest:
 
 ```sh
-git on --cleanup /path/to/run-directory
+git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run, will only unmount a matching git-on filesystem, checks the pin's exact target before deleting it, and retains manifest/logs/output. A busy stale mount requires stopping processes using it first. Cleanup does not kill processes by stale PID. Once reviewed, delete old run directories yourself using ordinary filesystem tools. References left by interrupted runs remain until cleanup; they intentionally prevent garbage collection of that snapshot.
+Cleanup refuses an active locked run or a deliberately kept backing directory,
+will only unmount a matching git-on filesystem, and checks the pin's exact target
+before deleting it. A busy stale mount requires stopping processes using it first.
+Cleanup does not kill processes by stale PID. A surviving pin intentionally
+prevents garbage collection until cleanup releases it.
 
 ## Verification
 

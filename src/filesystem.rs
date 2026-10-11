@@ -1,5 +1,7 @@
 //! An inode-based union of a pinned Git snapshot and a private, disposable
-//! writable layer. User-controlled names never become host filesystem paths.
+//! writable layer. During a mount, user-controlled names never become host
+//! filesystem paths. Optional post-unmount export resolves names with no-follow
+//! directory descriptors and never traverses generated symlinks.
 use crate::policy::Policy;
 use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
@@ -8,12 +10,14 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use git2::Oid;
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::{self, File, FileTimes, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 const TTL: Duration = Duration::from_secs(0);
@@ -38,6 +42,67 @@ struct Handle {
     reader: Option<BlobReader>,
 }
 
+/// Completion of the optional post-unmount writable-namespace export.
+pub type KeepExportResult = Arc<Mutex<Option<std::result::Result<(), String>>>>;
+
+struct KeepExport {
+    destination: PathBuf,
+    result: KeepExportResult,
+}
+
+// Export names come from the validated namespace, but descriptor-relative walks
+// also prevent a generated symlink from becoming an ancestor traversal.
+fn export_name(name: &OsStr) -> Result<CString> {
+    Ok(CString::new(name.as_bytes())?)
+}
+fn export_directory(root: &File, path: &Path) -> Result<File> {
+    let mut directory = root.try_clone()?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("invalid export directory");
+        };
+        let name = export_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+fn export_link(source: &File, source_name: &OsStr, parent: &File, name: &OsStr) -> Result<()> {
+    let source_name = export_name(source_name)?;
+    let name = export_name(name)?;
+    if unsafe {
+        libc::linkat(
+            source.as_raw_fd(),
+            source_name.as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+fn export_metadata(file: &File, attr: &FileAttr) -> Result<()> {
+    file.set_times(
+        FileTimes::new()
+            .set_accessed(attr.atime)
+            .set_modified(attr.mtime),
+    )?;
+    file.set_permissions(fs::Permissions::from_mode(u32::from(attr.perm)))?;
+    Ok(())
+}
+
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
 pub struct Overlay {
     _snapshot: Snapshot,
@@ -53,6 +118,7 @@ pub struct Overlay {
     next_ino: u64,
     next_handle: u64,
     snapshot_time: SystemTime,
+    keep_export: Option<KeepExport>,
 }
 
 impl Overlay {
@@ -104,7 +170,159 @@ impl Overlay {
             next_ino: 2,
             next_handle: 1,
             snapshot_time,
+            keep_export: None,
         })
+    }
+    /// Arrange a path-preserving export after the FUSE session releases this
+    /// overlay. The destination must not exist and should share the backing
+    /// filesystem: live regular files are hard-linked, never copied or decoded.
+    pub fn enable_keep_export(&mut self, destination: PathBuf) -> KeepExportResult {
+        assert!(self.keep_export.is_none(), "keep export already configured");
+        let result = Arc::new(Mutex::new(None));
+        self.keep_export = Some(KeepExport {
+            destination,
+            result: Arc::clone(&result),
+        });
+        result
+    }
+    fn export_upper(&self, destination: &Path) -> Result<()> {
+        let mut directories = BTreeSet::new();
+        // Validate the complete upper namespace before writing any destination.
+        // Necessary ancestor directories contain no copied lower entries.
+        for (path, ino) in &self.upper_paths {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, Component::Normal(_))),
+                "invalid retained path"
+            );
+            let node = self.nodes.get(ino).context("missing retained inode")?;
+            anyhow::ensure!(
+                !node.immutable && node.attr.nlink > 0,
+                "invalid retained inode"
+            );
+            if node.attr.kind == FileType::Directory {
+                directories.insert(path.clone());
+            }
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                if let Some(parent_ino) = self.upper_paths.get(parent) {
+                    anyhow::ensure!(
+                        self.nodes
+                            .get(parent_ino)
+                            .is_some_and(|n| n.attr.kind == FileType::Directory),
+                        "retained path has a non-directory ancestor"
+                    );
+                }
+                directories.insert(parent.to_path_buf());
+            }
+        }
+        fs::DirBuilder::new().mode(0o700).create(destination)?;
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(destination)?;
+        let backing = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.backing)?;
+        let mut directories: Vec<_> = directories.into_iter().collect();
+        directories.sort_by_key(|path| path.components().count());
+        for path in &directories {
+            let parent = export_directory(&root, path.parent().unwrap())?;
+            let name = export_name(path.file_name().unwrap())?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        let mut symlink_inodes = HashMap::<u64, PathBuf>::new();
+        for (path, ino) in &self.upper_paths {
+            let node = &self.nodes[ino];
+            if node.attr.kind != FileType::RegularFile {
+                continue;
+            }
+            let parent = export_directory(&root, path.parent().unwrap())?;
+            let source = self
+                .disk_file(*ino)
+                .map_err(std::io::Error::from_raw_os_error)?;
+            anyhow::ensure!(
+                source.metadata()?.is_file(),
+                "retained source is not regular"
+            );
+            export_link(
+                &backing,
+                OsStr::new(&ino.to_string()),
+                &parent,
+                path.file_name().unwrap(),
+            )?;
+            // linkat does not follow a source symlink. Verify identity through
+            // a no-follow descriptor before changing permissions or timestamps.
+            let name = export_name(path.file_name().unwrap())?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let retained = unsafe { File::from_raw_fd(fd) };
+            let actual = retained.metadata()?;
+            let expected = source.metadata()?;
+            anyhow::ensure!(
+                actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+                "retained source changed"
+            );
+        }
+        // Create symlinks last, after every real directory and regular file.
+        // Their bytes may point outside the tree, but are never traversed here.
+        for (path, ino) in &self.upper_paths {
+            let node = &self.nodes[ino];
+            if node.attr.kind != FileType::Symlink {
+                continue;
+            }
+            let parent = export_directory(&root, path.parent().unwrap())?;
+            let name = path.file_name().unwrap();
+            if let Some(first) = symlink_inodes.get(ino) {
+                let first_parent = export_directory(&root, first.parent().unwrap())?;
+                export_link(&first_parent, first.file_name().unwrap(), &parent, name)?;
+            } else {
+                let target = CString::new(node.bytes.as_slice())?;
+                let name = export_name(name)?;
+                if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) }
+                    != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                symlink_inodes.insert(*ino, path.clone());
+            }
+        }
+        // Set restrictive modes only after hardlinks and descendants are ready.
+        let live_inodes: BTreeSet<_> = self.upper_paths.values().copied().collect();
+        for ino in live_inodes {
+            let node = &self.nodes[&ino];
+            if node.attr.kind == FileType::RegularFile {
+                let file = self
+                    .disk_file(ino)
+                    .map_err(std::io::Error::from_raw_os_error)?;
+                export_metadata(&file, &node.attr)?;
+            }
+        }
+        for path in directories.iter().rev() {
+            let directory = export_directory(&root, path)?;
+            if let Some(ino) = self.upper_paths.get(path) {
+                export_metadata(&directory, &self.nodes[ino].attr)?;
+            } else {
+                directory.set_permissions(fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        Ok(())
     }
     /// Materialize inode metadata only for the requested pathname. No sibling
     /// blobs or descendant trees are loaded as a side effect.
@@ -733,6 +951,20 @@ impl Overlay {
     }
 }
 
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if let Some(export) = self.keep_export.take() {
+            let result = self
+                .export_upper(&export.destination)
+                .map_err(|error| format!("{error:#}"));
+            *export
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(result);
+        }
+    }
+}
+
 impl Filesystem for Overlay {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let result = (|| {
@@ -1249,6 +1481,148 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn keep_export_preserves_live_paths_links_modes_and_times_without_lower_reads() {
+        let (temp, mut overlay) = fixture();
+        let cache = dir(&mut overlay, "cache");
+        let ino = file(&mut overlay, cache, "original");
+        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay
+            .write_data(ino, handle, 0, b"generated bytes", 0, libc::O_RDWR)
+            .unwrap();
+        overlay.hardlink(ino, cache, OsStr::new("alias")).unwrap();
+        overlay
+            .rename_path(
+                cache,
+                OsStr::new("original"),
+                cache,
+                OsStr::new("renamed"),
+                0,
+            )
+            .unwrap();
+        let removed = file(&mut overlay, cache, "deleted");
+        overlay.remove(cache, OsStr::new("deleted"), false).unwrap();
+        assert!(!overlay.backing.join(removed.to_string()).exists());
+        let target = b"../../outside".to_vec();
+        let symlink = overlay
+            .make(
+                cache,
+                OsStr::new("link"),
+                FileType::Symlink,
+                0o777,
+                0,
+                0,
+                target,
+            )
+            .unwrap();
+        overlay
+            .hardlink(symlink, cache, OsStr::new("link-alias"))
+            .unwrap();
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(123456789);
+        overlay.nodes.get_mut(&ino).unwrap().attr.perm = 0o510;
+        overlay.nodes.get_mut(&ino).unwrap().attr.mtime = when;
+        overlay.nodes.get_mut(&cache).unwrap().attr.perm = 0o500;
+        overlay.nodes.get_mut(&cache).unwrap().attr.mtime = when;
+        let before = overlay._snapshot.metrics();
+        let destination = temp.path().join("kept");
+        overlay.export_upper(&destination).unwrap();
+        assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
+        assert_eq!(overlay._snapshot.metrics().tree_reads, before.tree_reads);
+        assert_eq!(
+            fs::read(destination.join("cache/alias")).unwrap(),
+            b"generated bytes"
+        );
+        assert!(!destination.join("cache/original").exists());
+        assert!(!destination.join("cache/deleted").exists());
+        assert!(!destination.join("tracked.tmp").exists());
+        assert!(!destination.join(".gitignore").exists());
+        assert_eq!(
+            fs::metadata(destination.join("cache/alias")).unwrap().ino(),
+            fs::metadata(destination.join("cache/renamed"))
+                .unwrap()
+                .ino()
+        );
+        assert_eq!(
+            fs::read_link(destination.join("cache/link")).unwrap(),
+            Path::new("../../outside")
+        );
+        assert_eq!(
+            fs::symlink_metadata(destination.join("cache/link"))
+                .unwrap()
+                .ino(),
+            fs::symlink_metadata(destination.join("cache/link-alias"))
+                .unwrap()
+                .ino()
+        );
+        let file = fs::metadata(destination.join("cache/alias")).unwrap();
+        assert_eq!(file.mode() & 0o777, 0o510);
+        assert_eq!(file.modified().unwrap(), when);
+        let directory = fs::metadata(destination.join("cache")).unwrap();
+        assert_eq!(directory.mode() & 0o777, 0o500);
+        assert_eq!(directory.modified().unwrap(), when);
+        // Restore owner permissions so TempDir can remove the test fixture.
+        fs::set_permissions(destination.join("cache"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[test]
+    fn keep_export_completes_on_drop_and_retains_empty_directories() {
+        let (temp, mut overlay) = fixture();
+        dir(&mut overlay, "cache");
+        let destination = temp.path().join("kept");
+        let result = overlay.enable_keep_export(destination.clone());
+        assert!(result.lock().unwrap().is_none());
+        drop(overlay);
+        assert_eq!(result.lock().unwrap().as_ref().unwrap(), &Ok(()));
+        assert!(destination.join("cache").is_dir());
+    }
+    #[test]
+    fn keep_export_rejects_collisions_and_symlink_ancestors_without_touching_targets() {
+        let (temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "live.tmp");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+        let destination = temp.path().join("kept");
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+        assert!(overlay.export_upper(&destination).is_err());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        fs::remove_file(&destination).unwrap();
+        let link = overlay
+            .make(
+                1,
+                OsStr::new("dir.tmp"),
+                FileType::Symlink,
+                0o777,
+                0,
+                0,
+                b"../outside".to_vec(),
+            )
+            .unwrap();
+        // Deliberately malformed internal state must still fail before export.
+        overlay
+            .upper_paths
+            .insert(PathBuf::from("dir.tmp/escape"), ino);
+        assert!(overlay.export_upper(&destination).is_err());
+        assert!(!destination.exists());
+        overlay.upper_paths.remove(Path::new("dir.tmp/escape"));
+        overlay.upper_paths.insert(PathBuf::from("../escape"), link);
+        assert!(overlay.export_upper(&destination).is_err());
+        assert!(!destination.exists());
+    }
+    #[test]
+    fn keep_export_failure_is_reported_without_removing_backing_data() {
+        let (temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "live.tmp");
+        let backing = overlay.backing.join(ino.to_string());
+        fs::write(&backing, b"save me").unwrap();
+        let destination = temp.path().join("kept");
+        fs::create_dir(&destination).unwrap();
+        let result = overlay.enable_keep_export(destination);
+        drop(overlay);
+        assert!(result.lock().unwrap().as_ref().unwrap().is_err());
+        assert_eq!(fs::read(backing).unwrap(), b"save me");
     }
 
     #[test]

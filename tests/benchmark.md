@@ -10,10 +10,10 @@ emulate, implement, or infer lazy loading.
 ## Exact million-file benchmark
 
 Requires Git, `cat`, Linux, a usable `/dev/fuse`, and `fusermount3` (or
-`fusermount`). Build the release binary before preparing or timing anything:
+`fusermount`). Build the instrumented release binary before preparing or timing anything:
 
 ```sh
-cargo build --release --locked
+cargo build --release --locked --features test-metrics
 python3 tests/benchmark.py self-test
 python3 tests/benchmark.py prepare \
   --directory /tmp/git-on-million --digit-files 1000000
@@ -36,8 +36,9 @@ one million blobs, 111,111 trees, and the fast-import commit.
 
 Preparation verifies every leaf path and its expected blob ID. Generation and
 verification are outside every timed sample. The setup itself can take time and
-memory, but is separate from runtime measurements. The fixture manifest records
-the selected root tree ID and Git's actual object-storage statistics.
+memory, but is separate from runtime measurements. The external harness records
+the selected root tree ID and Git's actual object-storage statistics in `fixtures.json`.
+This fixture description is not a runtime run manifest.
 
 Before each sample, the harness chooses a number using a deterministic random
 seed and records the chosen six-digit number and path. It then runs the compiled
@@ -52,10 +53,11 @@ excludes Git's external-command dispatch overhead. There is no Python child or
 shell in this workload. The primary metric, `verified_stdout_ms`, starts
 immediately before launching git-on and stops when the harness receives the
 complete expected seven-byte output. This includes mount/setup, the read, and
-git-on's output forwarding. It does not wait for runner teardown. The sample is
-accepted only after successful exit, a successful complete-log manifest, and
-verification that the entire stdout is exactly the chosen number plus newline,
-and passing the snapshot-counter and cache-bound checks below. Any later extra
+external pipe observation. The command inherits stdout directly; git-on does not
+capture or forward it. The metric does not wait for runner teardown. A sample is
+accepted only after successful exit, verification that the entire stdout is
+exactly the chosen number plus newline, and the snapshot-counter and cache-bound
+checks below. Any later extra
 output invalidates the sample. The external command, path selection, three
 repeats, seed 0, and zero warmups above match the original eager baseline;
 fixture preparation and verification remain outside timing.
@@ -68,16 +70,17 @@ fixtures and run them with the same release binary and environment.
 
 ## Measurements and caveats
 
-Every run creates `results.jsonl` with metadata, all raw samples (including
-warmups), and per-case minimum/median/maximum summaries. It also preserves
-per-sample stdout/stderr and git-on's run manifests and logs. Failures retain
-available evidence, produce no successful timing summary for that sample, and
+The external harness creates `results.jsonl` with metadata, all raw samples
+(including warmups), and per-case minimum/median/maximum summaries. It also saves
+per-sample stdout, stderr, and raw test-metrics pipe output. git-on creates none
+of these files and has no built-in run manifest or log capture. Failures retain
+available harness evidence, produce no successful timing summary for that sample, and
 stop the run with nonzero status. Missing FUSE fails before taking any sample;
 a device existing but unable to mount fails the actual run. There is no
 emulation, automatic skip, or silent downscaling.
 
 - `verified_stdout_ms`: external observation described above. Scheduling and
-  console forwarding are part of this measurement.
+  pipe delivery are part of this measurement.
 - `observed_total_ms`: invocation through observed runner exit and stdout EOF,
   including teardown and up to roughly 10 ms of exit-polling delay.
 - `wait4_peak_rss_kib`: Linux `wait4`'s `ru_maxrss`, in KiB. This is a maximum
@@ -114,9 +117,19 @@ emulation, automatic skip, or silent downscaling.
   are needed. Large readers may spool decoded contents to temporary storage;
   cache byte counts describe the shared in-memory cache, not that spool.
 
-All eleven counters are copied from each completed run manifest into the raw
-sample and receive minimum/median/maximum summaries. Instrumentation is required
-for the current harness; old uninstrumented baseline results remain timing/RSS
+All eleven checked counters arrive as one JSON object on a separate pipe opened
+by the harness. `Popen(pass_fds=...)` explicitly passes its write descriptor to
+the runner, with `GIT_ON_TEST_METRICS_FD` naming that descriptor. The opt-in
+`test-metrics` build marks it close-on-exec before launching the workload and
+writes counters independently of stdin/stdout/stderr. Normal builds ignore this
+test-only setting and have no metrics output channel. The harness records raw
+pipe bytes in `.metrics` files and copies the validated counters into sample
+records and minimum/median/maximum summaries. Empty, malformed, or missing
+metrics fail the sample; the harness never falls back to timing-only evidence.
+
+The test build adds this end-of-run reporting, so record the feature flag when
+comparing total runtime and memory. Output latency is observed externally before
+teardown reporting. Old uninstrumented baseline results remain timing/RSS
 evidence only and cannot retrospectively prove lazy access.
 
 Metadata records CPU model, architecture, CPU count, physical RAM, visible
@@ -138,12 +151,15 @@ deterministically between rounds. Do not compare an unrecorded debug build with
 a release result, or claim an SLA from a single machine's median.
 
 The per-sample timeout first sends TERM to the private measurement session and
-then KILL after five seconds. After interruption or timeout, the harness asks
-git-on to perform its checked cleanup. Cleanup errors remain in the result;
-inspect the retained run directory before removing it. An external CI timeout,
-OOM kill, or machine failure may prevent the harness from writing a final
-sample. Retain logs and describe that outcome as a failure, not a timing result.
-A timeout is a safety limit, not an agreed performance threshold.
+then KILL after five seconds. Normal signal handling lets git-on unmount and
+clean up; a force kill can leave temporary mount/backing state and a Git pin.
+Use `git on --cleanup <stale-temporary-directory>` if recovery is needed. The
+harness does not discover or remove unrelated temporary directories. An escaped
+descendant retaining a capture descriptor cannot turn a timeout into a success;
+incomplete capture is recorded as failure. An external CI timeout, OOM kill, or
+machine failure may prevent the harness from writing a final sample. Retain the
+available harness evidence and describe that outcome as a failure, not a timing
+result. A timeout is a safety limit, not an agreed performance threshold.
 
 ## Secondary workloads
 
@@ -176,9 +192,9 @@ python3 tests/benchmark.py run \
   it is distinct from the tiny repeated blob in `scale`. Git may still have to
   decode the entire object. Decoded blob bytes are recorded rather than
   equated with the 8,192 application bytes. This is a bounded-range workload,
-  not a full-file throughput test. Integration tests separately read a 16 MiB
-  snapshot in chunks and assert that one open file does not decode the whole
-  object repeatedly.
+  not a full-file throughput test. Integration tests separately verify a 16 MiB
+  snapshot read in chunks; unit tests and this instrumented workload verify
+  decode reuse.
 
 Secondary fixtures default to loose objects; `prepare --storage packed` repacks
 all fixture refs. The primary digit fixture always starts packed via fast-import.
@@ -195,15 +211,15 @@ counts describe the child reads, not libgit2 or physical I/O.
 ## Verification status
 
 `self-test` tests fixture determinism and exact contents, expanded shared-tree
-counts, the child workloads, `cat` output observation, timeout handling, and
-summary exclusion of warmups/failures, counter schema validation, cache bounds,
-and rejection of eager-read counter patterns. It does not mount anything and
+counts, the child workloads, `cat` output observation, timeout handling,
+separate inherited-fd metrics capture, summary exclusion of warmups/failures,
+counter schema validation, cache bounds, and rejection of eager-read patterns. It does not mount anything and
 does not produce git-on performance evidence.
 
 Local infrastructure checks successfully prepare deterministic fixtures and run
 the self-tests. The local development container has no `/dev/fuse`; a skipped
 integration suite is not a real-FUSE result. Runtime timing, counter, mutation,
 and large-file assertions must be established by successful real-FUSE runs on
-the exact tested binary. Retain their raw manifests, logs, JSONL and executable
-hash rather than treating fixture-generation timings or self-tests as runtime
-evidence.
+the exact tested binary. Retain external stdout/stderr, metrics, JSONL and the
+executable hash rather than treating fixture-generation timings or self-tests
+as runtime evidence.

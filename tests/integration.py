@@ -15,6 +15,7 @@ import select
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -59,38 +60,48 @@ class RepositoryTest(unittest.TestCase):
         git(self.repo, "add", "--force", "out/protected.txt")
         git(self.repo, "commit", "--quiet", "-m", "fixture")
         self.tree = git(self.repo, "rev-parse", "HEAD^{tree}")
-        self.counter = 0
+        self.system_tmp = self.root / "system-tmp"
+        self.system_tmp.mkdir()
 
     def put(self, name, content):
         path = self.repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
 
-    def environment(self, run=None):
-        env = os.environ.copy()
-        env.pop("GIT_ON_RUN_DIR", None)
+    def environment(self, temp_root=None):
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GIT_ON_")}
+        env["TMPDIR"] = str(temp_root or self.system_tmp)
         env["XDG_DATA_HOME"] = str(self.root / "data")
         env["XDG_CACHE_HOME"] = str(self.root / "cache")
         env["GIT_CONFIG_GLOBAL"] = os.devnull
         env["GIT_CONFIG_NOSYSTEM"] = "1"
-        if run is not None:
-            env["GIT_ON_RUN_DIR"] = str(run)
         return env
 
-    def invoke(self, *command, tree="HEAD", run=None, input=None, timeout=60, extra_env=None):
-        if run is None:
-            self.counter += 1
-            run = self.root / f"run-{self.counter}"
-        result = subprocess.run([str(BINARY), tree, *map(str, command)], cwd=self.repo,
-                                env=dict(self.environment(run), **(extra_env or {})), input=input, stdout=subprocess.PIPE,
+    def invoke(self, *command, tree="HEAD", keep=False, input=None, timeout=60, extra_env=None):
+        before = set(self.system_tmp.glob("git-on-*"))
+        result = subprocess.run([str(BINARY), *(["--keep"] if keep else []), tree,
+                                 *map(str, command)], cwd=self.repo,
+                                env=dict(self.environment(), **(extra_env or {})),
+                                input=input, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout)
-        return result, run
+        created = set(self.system_tmp.glob("git-on-*")) - before
+        self.assertLessEqual(len(created), 1, created)
+        return result, next(iter(created), None)
 
     def python(self, code, **kwargs):
         return self.invoke(sys.executable, "-c", code, **kwargs)
 
-    def manifest(self, run):
-        return json.loads((run / "manifest.json").read_text())
+    def cleanup_run(self, run, timeout=15):
+        return subprocess.run([str(BINARY), "--cleanup", str(run)],
+                              cwd=self.repo, env=self.environment(),
+                              capture_output=True, timeout=timeout)
+
+    def assert_no_runtime_files(self):
+        self.assertEqual(list(self.system_tmp.iterdir()), [])
+        self.assertFalse((self.root / "data/git-on").exists())
+        self.assertFalse((self.root / "cache/git-on").exists())
+        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
@@ -108,15 +119,43 @@ class CliTests(RepositoryTest):
         result, _ = self.python(f"open({str(sentinel)!r}, 'w').close()", tree="missing-tree-ish")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(sentinel.exists())
+        self.assert_no_runtime_files()
 
-    def test_existing_run_directory_rejected_without_touching_it(self):
-        run = self.root / "existing"
-        run.mkdir()
-        (run / "sentinel").write_text("keep")
-        result, _ = self.python("raise SystemExit(0)", run=run)
+    def test_invalid_arguments_never_execute_or_create_runtime_files(self):
+        for args in [[], ["--keep"], ["--keep", "HEAD"], ["--cleanup"],
+                     ["--cleanup", str(self.root), "extra"], ["--unknown"]]:
+            with self.subTest(args=args):
+                result = subprocess.run([str(BINARY), *args], cwd=self.repo,
+                                        env=self.environment(), capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_no_runtime_files()
+
+    def test_cleanup_rejects_unrelated_missing_and_symlinked_directories(self):
+        unrelated = self.root / "unrelated"
+        unrelated.mkdir()
+        sentinel = unrelated / "sentinel"
+        sentinel.write_text("preserve")
+        alias = self.root / "alias"
+        alias.symlink_to(unrelated, target_is_directory=True)
+        for target in [unrelated, alias, self.root / "missing"]:
+            with self.subTest(target=target):
+                result = self.cleanup_run(target)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(sentinel.read_text(), "preserve")
+                self.assertEqual(list(unrelated.iterdir()), [sentinel])
+                self.assertTrue(alias.is_symlink())
+
+    def test_cleanup_rejects_malformed_state_without_deleting_contents(self):
+        run = self.system_tmp / "git-on-unrecognized"
+        run.mkdir(mode=0o700)
+        (run / ".lock").touch(mode=0o600)
+        (run / ".state").write_text("this is not cleanup metadata")
+        (run / "backing").mkdir()
+        sentinel = run / "backing/valuable"
+        sentinel.write_text("preserve")
+        result = self.cleanup_run(run)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(list(run.iterdir()), [run / "sentinel"])
-        self.assertEqual((run / "sentinel").read_text(), "keep")
+        self.assertEqual(sentinel.read_text(), "preserve")
 
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
@@ -128,7 +167,8 @@ class FuseTests(RepositoryTest):
         self.put("untracked.txt", "not in snapshot")
         result, run = self.python("from pathlib import Path; assert Path('tracked.txt').read_text() == 'committed\\n'; assert not Path('untracked.txt').exists(); assert not Path('.git').exists(); print('snapshot')")
         self.assert_success(result)
-        self.assertEqual(self.manifest(run)["tree_oid"], self.tree)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
         self.assertEqual((self.repo / "tracked.txt").read_text(), "dirty\n")
 
     def test_executable_mode_symlinks_and_repository_discovery(self):
@@ -136,37 +176,87 @@ class FuseTests(RepositoryTest):
         (self.repo / "executable.sh").chmod(0o755)
         git(self.repo, "add", "executable.sh")
         git(self.repo, "commit", "--quiet", "-m", "executable fixture")
-        run = self.root / "discovered-run"
         code = "from pathlib import Path; import os,subprocess; assert os.access('executable.sh',os.X_OK); assert Path('tracked-link').is_symlink(); assert Path('tracked-link').read_text() == 'committed\\n'; subprocess.run(['./executable.sh'],check=True)"
-        result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(run), capture_output=True, timeout=30)
+        result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(), capture_output=True, timeout=30)
         self.assert_success(result)
         self.assertEqual(result.stdout, b"executable\n")
 
     def test_raw_tree_and_subtree_root(self):
         for tree in (self.tree, "HEAD:subtree"):
             source = "tracked.txt" if tree == self.tree else "source.txt"
-            result, run = self.python(f"from pathlib import Path; assert Path({source!r}).is_file(); print('ok')", tree=tree)
+            expected_oid = git(self.repo, "rev-parse", tree)
+            result, run = self.python(f"from pathlib import Path; import os; assert Path({source!r}).is_file(); assert os.environ['GIT_ON_TREE_OID'] == {expected_oid!r}; print('ok')", tree=tree)
             self.assert_success(result)
-            self.assertEqual(self.manifest(run)["tree_oid"], git(self.repo, "rev-parse", tree))
+            self.assertIsNone(run)
+            self.assert_no_runtime_files()
         result, _ = self.python("from pathlib import Path; Path('generated').mkdir(); Path('generated/result').write_text('ok')", tree="HEAD:subtree")
         self.assert_success(result)
 
-    def test_no_shell_inherited_stdin_and_binary_logs(self):
-        code = "import os,sys; assert sys.argv[1:] == ['$(touch nope)', 'a b', '; exit 5']; assert sys.stdin.buffer.read() == b'input\\x00bytes'; os.write(1,b'out\\x00\\xff\\n'); os.write(2,b'err\\x00\\xfe\\n')"
-        argv = [sys.executable, "-c", code, "$(touch nope)", "a b", "; exit 5"]
-        result, run = self.invoke(*argv, input=b"input\x00bytes")
+    def test_no_shell_inherited_stdin_and_exact_binary_stdio(self):
+        code = "import os,sys; assert sys.argv[1:] == ['$(touch nope)', 'a b', '; exit 5', '--keep', '--cleanup']; assert sys.stdin.buffer.read() == b'input\\x00bytes'; os.write(1,b'out\\x00\\xff\\n'); os.write(2,b'err\\x00\\xfe\\n')"
+        result, run = self.invoke(sys.executable, "-c", code, "$(touch nope)", "a b",
+                                  "; exit 5", "--keep", "--cleanup", input=b"input\x00bytes")
         self.assert_success(result)
         self.assertEqual(result.stdout, b"out\x00\xff\n")
-        self.assertIn(b"err\x00\xfe\n", result.stderr)
-        self.assertEqual((run / "stdout.log").read_bytes(), b"out\x00\xff\n")
-        self.assertEqual((run / "stderr.log").read_bytes(), b"err\x00\xfe\n")
-        self.assertEqual(self.manifest(run)["argv"], argv)
+        self.assertEqual(result.stderr, b"err\x00\xfe\n")
+        self.assertIsNone(run)
+        self.assertFalse((self.repo / "nope").exists())
+        self.assert_no_runtime_files()
+
+    def test_stdio_inherits_regular_file_descriptions_and_offsets(self):
+        input_path, output_path = self.root / "stdin", self.root / "combined"
+        input_path.write_bytes(b"skip-input\x00bytes")
+        output_path.write_bytes(b"prefix:")
+        with input_path.open("rb") as source, output_path.open("r+b") as output:
+            source.seek(5)
+            output.seek(7)
+            expected = [(os.fstat(stream.fileno()).st_dev, os.fstat(stream.fileno()).st_ino)
+                        for stream in (source, output, output)]
+            code = r"""
+import json, os, stat, sys
+for fd, expected in enumerate(json.loads(sys.argv[1])):
+    actual = os.fstat(fd)
+    assert stat.S_ISREG(actual.st_mode), (fd, actual.st_mode)
+    assert [actual.st_dev, actual.st_ino] == expected, fd
+assert os.read(0, 100) == b'input\x00bytes'
+assert os.lseek(1, 0, os.SEEK_CUR) == 7
+os.write(1, b'one')
+assert os.lseek(2, 0, os.SEEK_CUR) == 10
+os.write(2, b'two')
+os.lseek(1, 0, os.SEEK_SET)
+os.write(1, b'P')
+"""
+            result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", code,
+                                     json.dumps(expected)], cwd=self.repo,
+                                    env=self.environment(), stdin=source,
+                                    stdout=output, stderr=output, timeout=30)
+            self.assertEqual(result.returncode, 0, output_path.read_bytes())
+            self.assertEqual(source.tell(), len(b"skip-input\x00bytes"))
+            self.assertEqual(output.tell(), 1)
+        self.assertEqual(output_path.read_bytes(), b"Prefix:onetwo")
+        self.assert_no_runtime_files()
+
+    def test_broken_stdout_pipe_preserves_child_sigpipe_status(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c",
+                                     "import os,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL); os.write(1,b'broken')"],
+                                    cwd=self.repo, env=self.environment(), stdout=write_fd,
+                                    stderr=subprocess.PIPE, timeout=30)
+        finally:
+            os.close(write_fd)
+        self.assertEqual(result.returncode, -signal.SIGPIPE)
+        self.assertEqual(result.stderr, b"")
+        self.assert_no_runtime_files()
 
     def test_large_stdout_and_stderr_do_not_deadlock(self):
         result, run = self.python("import os; [(os.write(1,b'x'*65536),os.write(2,b'y'*65536)) for _ in range(40)]")
         self.assert_success(result)
-        self.assertEqual((run / "stdout.log").stat().st_size, 40 * 65536)
-        self.assertEqual((run / "stderr.log").stat().st_size, 40 * 65536)
+        self.assertEqual(result.stdout, b"x" * (40 * 65536))
+        self.assertEqual(result.stderr, b"y" * (40 * 65536))
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
     def test_immutable_operations_and_ignored_artifacts(self):
         result, run = self.python('''
@@ -210,10 +300,11 @@ os.unlink('out/trash')
 assert Path('tracked.txt').read_text() == 'committed\\n'
 assert Path('nested/allowed.tmp').read_text() == 'nested'
 assert not Path('out/trash').exists()
-Path(os.environ['GIT_ON_OUTPUT_DIR'], 'result.txt').write_text(Path('out/new/result').read_text())
+assert Path('out/new/result').read_text() == 'first second'
 ''')
         self.assert_success(result)
-        self.assertEqual((run / "output/result.txt").read_text(), "first second")
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
         self.assertFalse((self.repo / "out/new").exists())
 
     def test_file_operation_matrix_preserves_tracked_bytes(self):
@@ -489,46 +580,69 @@ rows = Path('out/appends').read_bytes().splitlines()
 assert len(rows) == 160, len(rows)
 for index in range(8): assert rows.count(('%04d' % index).encode()) == 20
 assert set(Path('out').iterdir()) == {Path('out/protected.txt'), Path('out/appends')}
-Path(os.environ['GIT_ON_OUTPUT_DIR'], 'append-count').write_text(str(len(rows)))
+print(len(rows))
 ''')
         self.assert_success(result)
-        self.assertEqual((run / "output/append-count").read_text(), "160")
-        self.assertFalse((run / "mount").exists())
-        self.assertFalse((run / "backing").exists())
+        self.assertEqual(result.stdout, b"160\n")
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
         self.assertFalse((self.repo / "out/appends").exists())
 
     def test_lazy_metadata_does_not_load_unread_blobs_or_descendant_trees(self):
-        from benchmark import digit_fixture, snapshot_metrics
-        fixture = digit_fixture(self.repo, 10000)
-        tree = fixture["tree_oid"]
-        # Isolated Python suppresses CWD module searching and site startup.
-        workloads = [
-            ("pass", 0, 0, 0, 0),
-            ("import os; assert os.listdir('.') == ['0']", 1, 0, 0, 0),
-            ("import os; assert os.stat('0/0/6/4/2/1').st_size == 7", 6, 1, 0, 0),
-            ("import os; assert not os.path.exists('0/0/6/4/2/missing')", 6, 0, 0, 0),
-            ("from pathlib import Path; assert Path('0/0/6/4/2/1').read_bytes() == b'006421\\n'", 6, 1, 1, 7),
-        ]
-        for code, trees, headers, blobs, blob_bytes in workloads:
+        # Missing, unreachable-to-the-command objects make eager reads observable
+        # without a production metrics stream or a persistent manifest.
+        self.put("unused/blob", "never read this unique blob\n")
+        self.put("unused/deeper/leaf", "never read this descendant\n")
+        git(self.repo, "add", "unused")
+        git(self.repo, "commit", "--quiet", "-m", "lazy missing-object fixture")
+        for path in ["unused/blob", "unused/deeper"]:
+            oid = git(self.repo, "rev-parse", "HEAD:" + path)
+            loose = self.repo / ".git/objects" / oid[:2] / oid[2:]
+            self.assertTrue(loose.is_file(), f"fixture must have a loose object: {path}")
+            loose.unlink()
+        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r"""
+import os
+from pathlib import Path
+assert 'unused' in os.listdir('.')
+assert set(os.listdir('unused')) == {'blob', 'deeper'}
+assert os.stat('tracked.txt').st_size == len(b'committed\n')
+assert Path('tracked.txt').read_bytes() == b'committed\n'
+for action in [lambda: Path('unused/blob').read_bytes(), lambda: os.listdir('unused/deeper')]:
+    try: action()
+    except OSError: pass
+    else: raise AssertionError('missing object unexpectedly readable')
+assert Path('tracked.txt').read_bytes() == b'committed\n'
+""")
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
+
+    def test_large_digit_tree_supports_small_lazy_workloads(self):
+        from benchmark import digit_fixture
+        tree = digit_fixture(self.repo, 10000)["tree_oid"]
+        workloads = ["pass", "import os; assert os.listdir('.') == ['0']",
+                     "import os; assert os.stat('0/0/6/4/2/1').st_size == 7",
+                     "import os; assert not os.path.exists('0/0/6/4/2/missing')",
+                     "from pathlib import Path; assert Path('0/0/6/4/2/1').read_bytes() == b'006421\\n'"]
+        for code in workloads:
             with self.subTest(code=code):
                 result, run = self.invoke(sys.executable, "-I", "-S", "-c", code, tree=tree)
                 self.assert_success(result)
-                metrics = snapshot_metrics(self.manifest(run))
-                self.assertLessEqual(metrics["tree_reads"], trees, metrics)
-                self.assertLessEqual(metrics["header_reads"], headers, metrics)
-                self.assertEqual(metrics["blob_loads"], blobs, metrics)
-                self.assertEqual(metrics["blob_bytes"], blob_bytes, metrics)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
 
     def test_lazy_writes_load_only_relevant_ancestor_ignore_files(self):
-        from benchmark import snapshot_metrics
         for index in range(12):
             self.put(f"untouched-{index}/.gitignore", f"unused-{index}/\n")
             self.put(f"untouched-{index}/payload", "unread sibling content\n")
         git(self.repo, "add", "--force", "--all")
         git(self.repo, "commit", "--quiet", "-m", "untouched policy subtrees")
-        expected_rule_bytes = sum((self.repo / path).stat().st_size
-                                  for path in [".gitignore", "nested/.gitignore"])
+        for index in range(12):
+            oid = git(self.repo, "rev-parse", f"HEAD:untouched-{index}/.gitignore")
+            loose = self.repo / ".git/objects" / oid[:2] / oid[2:]
+            self.assertTrue(loose.is_file())
+            loose.unlink()
         result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
 import os
 from pathlib import Path
@@ -540,16 +654,12 @@ os.truncate('nested/second.tmp', 0)
 os.unlink('nested/second.tmp')
 ''')
         self.assert_success(result)
-        metrics = snapshot_metrics(self.manifest(run))
-        self.assertLessEqual(metrics["tree_reads"], 2, metrics)
-        self.assertLessEqual(metrics["header_reads"], 2, metrics)
-        self.assertEqual(metrics["blob_loads"], 2, metrics)
-        self.assertEqual(metrics["blob_bytes"], expected_rule_bytes, metrics)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
-    def test_repeated_snapshot_reads_reuse_bounded_blob_cache(self):
-        from benchmark import snapshot_metrics
-        # Distinct directory entries reference the same blob. Page-cache reuse
-        # of one pathname alone cannot satisfy this object-cache assertion.
+    def test_repeated_snapshot_reads_share_identical_blob_contents(self):
+        # Read aliases of one immutable blob through independent file handles.
+        # Cache bounds and decode counts are covered by Snapshot unit tests.
         for index in range(16):
             self.put(f"shared/file-{index}", "shared payload\n")
         git(self.repo, "add", "shared")
@@ -561,21 +671,16 @@ for _ in range(3):
         assert Path('shared/file-%d' % index).read_bytes() == b'shared payload\n'
 ''')
         self.assert_success(result)
-        metrics = snapshot_metrics(self.manifest(run))
-        self.assertEqual(metrics["blob_loads"], 1, metrics)
-        self.assertEqual(metrics["blob_bytes"], len(b"shared payload\n"), metrics)
-        self.assertGreaterEqual(metrics["cache_hits"], 15, metrics)
-        self.assertLessEqual(metrics["tree_reads"], 2, metrics)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
-    def test_large_snapshot_blob_reads_decode_once_and_respect_cache_bound(self):
+    def test_large_snapshot_blob_random_and_sequential_reads_agree(self):
         import hashlib
-        from benchmark import snapshot_metrics
         payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
         (self.repo / "large.bin").write_bytes(payload)
         expected = hashlib.sha256(payload).hexdigest()
         git(self.repo, "add", "large.bin")
         git(self.repo, "commit", "--quiet", "-m", "large immutable read fixture")
-        spool_run = self.root / "large-spool-run"
         result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
 import hashlib, os, sys
 size = 16 * 1024 * 1024
@@ -592,13 +697,10 @@ try:
     assert os.pread(fd, 4096, size) == b''
 finally:
     os.close(fd)
-''', expected, run=spool_run, extra_env={'TMPDIR': str(spool_run / 'mount/cache')})
+''', expected)
         self.assert_success(result)
-        metrics = snapshot_metrics(self.manifest(run))
-        self.assertEqual(metrics["blob_loads"], 1, metrics)
-        self.assertEqual(metrics["blob_bytes"], len(payload), metrics)
-        self.assertLessEqual(metrics["tree_reads"], 1, metrics)
-        self.assertLessEqual(metrics["header_reads"], 1, metrics)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
     def test_unsupported_entries_fail_when_accessed_without_poisoning_siblings(self):
         pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:" + "a" * 64 + "\nsize 123\n"
@@ -622,9 +724,8 @@ for action in [lambda: Path('unsupported/lfs.bin').read_bytes(),
 assert Path('unsupported/ordinary.txt').read_text() == 'ordinary\n'
 ''')
         self.assert_success(result)
-        self.assertFalse((run / "mount").exists())
-        self.assertFalse((run / "backing").exists())
-        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
     def test_runtime_ignore_file_cannot_expand_write_policy(self):
         result, _ = self.python('''
@@ -660,29 +761,80 @@ else:
 ''')
         self.assert_success(result)
 
-    def test_process_exit_and_signal_recorded(self):
+    def test_process_exit_and_signal_are_propagated_and_cleaned(self):
         result, run = self.python("raise SystemExit(37)")
         self.assertEqual(result.returncode, 37)
-        self.assertEqual(self.manifest(run)["status"]["exit_code"], 37)
+        self.assertEqual(result.stderr, b"")
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
         result, run = self.python("import os,signal; os.kill(os.getpid(), signal.SIGTERM)")
-        self.assertIn(result.returncode, (-signal.SIGTERM, 128 + signal.SIGTERM))
-        self.assertEqual(self.manifest(run)["status"]["signal"], signal.SIGTERM)
+        self.assertEqual(result.returncode, -signal.SIGTERM)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
-    def test_missing_executable_records_runner_error(self):
+    def test_missing_executable_reports_runner_error_and_removes_tempdir(self):
         result, run = self.invoke("git-on-certainly-nonexistent-executable")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(self.manifest(run)["status"]["runner_error"])
+        self.assertEqual(result.returncode, 125)
+        self.assertIn(b"git-on", result.stderr)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
-    def test_simultaneous_runs_are_isolated(self):
+    def test_simultaneous_runs_use_private_unique_directories_and_artifacts(self):
         processes = []
-        for index in range(2):
-            run = self.root / f"parallel-{index}"
-            code = f"from pathlib import Path; import time,os; Path('out/shared').write_text('{index}'); time.sleep(.5); assert Path('out/shared').read_text() == '{index}'; Path(os.environ['GIT_ON_OUTPUT_DIR'], 'result').write_text('{index}')"
-            processes.append((subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code], cwd=self.repo, env=self.environment(run), stdout=subprocess.PIPE, stderr=subprocess.PIPE), run, index))
-        for process, run, index in processes:
-            _, stderr = process.communicate(timeout=30)
-            self.assertEqual(process.returncode, 0, stderr)
-            self.assertEqual((run / "output/result").read_text(), str(index))
+        ready_files = [self.root / f"parallel-ready-{index}" for index in range(3)]
+        release = self.root / "parallel-release"
+        try:
+            for index, ready in enumerate(ready_files):
+                code = r"""
+import json, os, sys, time
+from pathlib import Path
+index, ready, release = sys.argv[1:]
+Path('out/shared').write_text(index)
+pending = Path(ready + '.pending')
+pending.write_text(str(Path.cwd().parent))
+pending.replace(ready)
+deadline = time.monotonic() + 20
+while not Path(release).exists() and time.monotonic() < deadline: time.sleep(.01)
+assert Path(release).exists(), 'parent did not release concurrent runs'
+assert Path('out/shared').read_text() == index
+print(index)
+"""
+                processes.append(subprocess.Popen([str(BINARY), "HEAD", sys.executable,
+                                                    "-c", code, str(index), str(ready), str(release)],
+                                                   cwd=self.repo, env=self.environment(),
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            deadline = time.monotonic() + 20
+            while not all(path.exists() for path in ready_files) and time.monotonic() < deadline:
+                if any(process.poll() is not None for process in processes): break
+                time.sleep(.02)
+            self.assertTrue(all(path.exists() for path in ready_files), "parallel children did not become ready")
+            runs = [Path(path.read_text()) for path in ready_files]
+            self.assertEqual(len(set(runs)), 3)
+            for run in runs:
+                self.assertEqual(run.parent, self.system_tmp)
+                self.assertTrue(run.name.startswith("git-on-"))
+                self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
+                self.assertTrue((run / ".state").is_file())
+                self.assertFalse((run / "manifest.json").exists())
+                self.assertFalse((run / "stdout.log").exists())
+                self.assertFalse((run / "stderr.log").exists())
+            release.touch()
+            for index, process in enumerate(processes):
+                stdout, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(stdout, f"{index}\n".encode())
+                self.assertEqual(stderr, b"")
+            self.assert_no_runtime_files()
+            self.assertFalse((self.repo / "out/shared").exists())
+        finally:
+            release.touch()
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                try: process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
 
     def test_append_flags_and_shared_mmap_follow_current_open_description(self):
         result, _ = self.python('''
@@ -714,8 +866,7 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
         self.assert_success(result)
 
     def test_interactive_pty_stdin_has_foreground_process_group(self):
-        run = self.root / "pty-run"
-        code = "import os,sys; assert os.isatty(0); assert os.tcgetpgrp(0) == os.getpgrp(); print('input-ready',flush=True); assert sys.stdin.readline() == 'terminal-input\\n'; print('terminal-ok',flush=True)"
+        code = "import os,sys; assert all(os.isatty(fd) for fd in (0,1,2)); assert os.tcgetpgrp(0) == os.getpgrp(); print('input-ready',flush=True); assert sys.stdin.readline() == 'terminal-input\\n'; print('terminal-ok',flush=True)"
         pid, fd = pty.fork()
         if pid == 0:
             import termios
@@ -723,7 +874,7 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             tty_settings[3] |= termios.TOSTOP
             termios.tcsetattr(0, termios.TCSANOW, tty_settings)
             os.chdir(self.repo)
-            env = self.environment(run)
+            env = self.environment()
             env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
             os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
         captured = bytearray()
@@ -762,12 +913,11 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             os.close(fd)
 
     def test_terminal_stop_continue_is_relayed_to_foreground_job(self):
-        run = self.root / "job-control-run"
         code = "import os,signal; print('stop-ready',flush=True); os.kill(os.getpid(),signal.SIGSTOP); assert os.tcgetpgrp(0)==os.getpgrp(); print('resumed-ok',flush=True)"
         pid, fd = pty.fork()
         if pid == 0:
             os.chdir(self.repo)
-            env = self.environment(run)
+            env = self.environment()
             env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
             os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
         captured = bytearray()
@@ -805,6 +955,154 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
                 os.waitpid(pid, 0)
             os.close(fd)
 
+    def assert_pty_controller(self, controller, input_marker=None, terminal_input=None):
+        """Run a small shell-like controller with a real controlling terminal."""
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(self.repo)
+                controller()
+            except BaseException:
+                import traceback
+                traceback.print_exc()
+                os._exit(1)
+            os._exit(0)
+        captured = bytearray()
+        status = None
+        sent = False
+        try:
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if select.select([fd], [], [], .05)[0]:
+                    try: chunk = os.read(fd, 65536)
+                    except OSError: chunk = b""
+                    captured.extend(chunk)
+                    if input_marker and not sent and input_marker in captured:
+                        os.write(fd, terminal_input)
+                        sent = True
+                finished, value = os.waitpid(pid, os.WNOHANG)
+                if finished:
+                    status = value
+                    while select.select([fd], [], [], .05)[0]:
+                        try: tail = os.read(fd, 65536)
+                        except OSError: break
+                        if not tail: break
+                        captured.extend(tail)
+                    break
+            self.assertIsNotNone(status, f"terminal controller hung: {captured!r}")
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0, captured)
+        finally:
+            if status is None:
+                try: os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                os.waitpid(pid, 0)
+            os.close(fd)
+        self.assert_no_runtime_files()
+        return captured
+
+    def test_background_job_can_move_to_foreground_and_read_terminal(self):
+        def controller():
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            code = r"""
+import os, sys
+assert all(os.isatty(fd) for fd in (0, 1, 2))
+# The runner is initially a background job. Reading must stop the job,
+# allowing the controller to perform the equivalent of the shell's fg.
+assert sys.stdin.readline() == 'foreground-input\n'
+assert os.tcgetpgrp(0) == os.getpgrp()
+print('foreground-read-ok', flush=True)
+"""
+            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code],
+                                       cwd=self.repo, env=self.environment(), preexec_fn=os.setpgrp)
+            reaped = False
+            try:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    finished, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+                    if finished:
+                        assert os.WIFSTOPPED(status), ('background runner did not stop', status)
+                        break
+                    time.sleep(.01)
+                else: raise AssertionError('background terminal reader did not stop')
+                assert os.tcgetpgrp(0) == os.getpgrp(), 'background runner stole the terminal'
+                print('bringing-job-foreground', flush=True)
+                os.tcsetpgrp(0, process.pid)
+                os.killpg(process.pid, signal.SIGCONT)
+                _, status = os.waitpid(process.pid, 0)
+                reaped = True
+                process.returncode = os.waitstatus_to_exitcode(status)
+                assert process.returncode == 0, status
+                assert os.tcgetpgrp(0) == process.pid, 'runner did not restore foreground group'
+                os.tcsetpgrp(0, os.getpgrp())
+                print('controller-restored', flush=True)
+            finally:
+                if not reaped:
+                    try: os.killpg(process.pid, signal.SIGCONT); process.terminate()
+                    except ProcessLookupError: pass
+                    try: process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                os.tcsetpgrp(0, os.getpgrp())
+        captured = self.assert_pty_controller(controller, b"bringing-job-foreground",
+                                              b"foreground-input\n")
+        self.assertIn(b"foreground-read-ok", captured)
+        self.assertIn(b"controller-restored", captured)
+
+    def test_redirected_stdin_preserves_controlling_terminal_job_control(self):
+        def controller():
+            import termios
+            settings = termios.tcgetattr(0)
+            settings[3] |= termios.TOSTOP
+            termios.tcsetattr(0, termios.TCSANOW, settings)
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            code = r"""
+import os, signal
+assert not os.isatty(0)
+assert os.isatty(1) and os.isatty(2)
+with open('/dev/tty', 'rb', buffering=0) as tty:
+    assert os.tcgetpgrp(tty.fileno()) == os.getpgrp()
+    os.kill(os.getpid(), signal.SIGSTOP)
+    assert os.tcgetpgrp(tty.fileno()) == os.getpgrp()
+print('redirected-terminal-ok', flush=True)
+"""
+            # Give the runner its own foreground job group, just as
+            # `git on ... </dev/null` invoked by an interactive shell.
+            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code],
+                                       cwd=self.repo, env=self.environment(),
+                                       stdin=subprocess.DEVNULL, preexec_fn=os.setpgrp)
+            reaped = False
+            try:
+                os.tcsetpgrp(0, process.pid)
+                deadline = time.monotonic() + 15
+                stops = 0
+                while time.monotonic() < deadline:
+                    finished, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+                    if finished and os.WIFSTOPPED(status):
+                        stops += 1
+                        os.tcsetpgrp(0, process.pid)
+                        os.killpg(process.pid, signal.SIGCONT)
+                    elif finished:
+                        reaped = True
+                        process.returncode = os.waitstatus_to_exitcode(status)
+                        assert process.returncode == 0, status
+                        assert stops == 1, stops
+                        assert os.tcgetpgrp(0) == process.pid
+                        break
+                    time.sleep(.01)
+                else: raise AssertionError('redirected-stdin job control hung')
+            finally:
+                if not reaped:
+                    try: os.killpg(process.pid, signal.SIGCONT); process.terminate()
+                    except ProcessLookupError: pass
+                    try: process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                os.tcsetpgrp(0, os.getpgrp())
+        captured = self.assert_pty_controller(controller)
+        self.assertIn(b"redirected-terminal-ok", captured)
+
     def test_deep_ignore_negation_is_not_lost_to_matcher_limits(self):
         name = "a" * 100
         self.put(".gitignore", "*\n!" + "*a" * 100 + "\n")
@@ -816,38 +1114,56 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
         result, _ = self.invoke(sys.executable, "-c", code, name)
         self.assert_success(result)
 
-    def test_escaped_descendant_keeps_busy_mount_for_explicit_cleanup(self):
+    def test_escaped_descendant_retains_busy_mount_until_explicit_cleanup(self):
         pidfile = self.root / "escaped-pid"
+        runfile = self.root / "escaped-run"
         descendant = f"import os,time; from pathlib import Path; Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(300)"
-        code = "import os,subprocess,sys,time; from pathlib import Path; subprocess.Popen([sys.executable,'-c',sys.argv[1]],preexec_fn=os.setsid); p=Path(sys.argv[2]); deadline=time.monotonic()+5\nwhile not p.exists() and time.monotonic()<deadline: time.sleep(.01)\nassert p.exists()"
-        run = self.root / "escaped-run"
+        code = r"""
+import subprocess, sys, time
+from pathlib import Path
+Path(sys.argv[3]).write_text(str(Path.cwd().parent))
+Path('out/recoverable').write_text('artifact')
+subprocess.Popen([sys.executable,'-c',sys.argv[1]], start_new_session=True,
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+p = Path(sys.argv[2])
+deadline = time.monotonic() + 5
+while not p.exists() and time.monotonic() < deadline: time.sleep(.01)
+assert p.exists()
+"""
+        run = None
         try:
-            result, _ = self.invoke(sys.executable, "-c", code, descendant, str(pidfile), run=run, timeout=15)
+            result, run = self.invoke(sys.executable, "-c", code, descendant,
+                                     str(pidfile), str(runfile), timeout=20)
             self.assertEqual(result.returncode, 125, result.stderr)
-            self.assertTrue(self.manifest(run)["status"]["runner_error"])
+            self.assertIsNotNone(run)
+            self.assertEqual(run, Path(runfile.read_text()))
+            self.assertIn(os.fsencode(run), result.stderr)
             # A disconnected FUSE mount returns ENOTCONN to stat(), so
             # os.path.ismount misleadingly reports false. Inspect mountinfo.
             mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
+            self.assertTrue((run / ".state").is_file())
             self.assertTrue(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+            cleanup = self.cleanup_run(run)
+            self.assertNotEqual(cleanup.returncode, 0, "live escaped cwd must remain busy")
+            self.assertTrue((run / "backing").is_dir())
         finally:
             if pidfile.exists():
                 try: os.killpg(int(pidfile.read_text()), signal.SIGKILL)
                 except ProcessLookupError: pass
-            cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=15)
-            self.assert_success(cleanup)
-        self.assertFalse((run / "mount").exists())
-        self.assertFalse((run / "backing").exists())
-        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+            if run is None and runfile.exists(): run = Path(runfile.read_text())
+            if run is not None and run.exists():
+                self.assert_success(self.cleanup_run(run))
+        self.assert_no_runtime_files()
 
     def test_non_utf8_command_argument_is_preserved(self):
         raw = b"bad-\xff-name"
         code = "import os,sys; assert os.fsencode(sys.argv[1]) == bytes([98,97,100,45,255,45,110,97,109,101])"
-        run = self.root / "raw-argv"
-        result = subprocess.run([os.fsencode(BINARY), b"HEAD", os.fsencode(sys.executable), b"-c", code.encode(), raw], cwd=self.repo, env=self.environment(run), capture_output=True, timeout=30)
+        result = subprocess.run([os.fsencode(BINARY), b"HEAD", os.fsencode(sys.executable), b"-c", code.encode(), raw], cwd=self.repo, env=self.environment(), capture_output=True, timeout=30)
         self.assert_success(result)
-        self.assertEqual(self.manifest(run)["argv_hex"][-1], raw.hex())
+        self.assertEqual(result.stderr, b"")
+        self.assert_no_runtime_files()
 
     def test_ignore_decisions_match_git_for_complex_patterns(self):
         self.put(".gitignore", "out/\n*.tmp\n!keep.tmp\n/root-only.dat\nnested/a[0-9].bin\nnested/**/deep.bin\nescaped\\ space.dat\n\\#hash.dat\n\\!bang.dat\n*.trailing\\ \ndirs/\n!dirs/keep.txt\n{foo,bar}.dat\ntabbed\t\nnbsp\u00a0\n[unclosed\nx[[:digit:]].dat\n")
@@ -873,11 +1189,21 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
         result, _ = self.python("from pathlib import Path\nfor name in ['external-only.tmp','global-only.tmp']:\n try: Path(name).write_text('bad')\n except OSError: pass\n else: raise AssertionError(name)")
         self.assert_success(result)
 
-    def start_sleeping_run(self):
-        run = self.root / "sleeping-run"
-        ready = self.root / "child-pid"
-        code = f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); Path(os.environ['GIT_ON_OUTPUT_DIR'], 'keep').write_text('artifact'); time.sleep(300)"
-        process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code], cwd=self.repo, env=self.environment(run), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    def start_sleeping_run(self, keep=False):
+        ready = self.root / "child-ready"
+        code = r"""
+import json, os, sys, time
+from pathlib import Path
+Path('out/keep').write_text('artifact')
+ready = Path(sys.argv[1])
+pending = ready.with_suffix('.pending')
+pending.write_text(json.dumps({'pid': os.getpid(), 'run': str(Path.cwd().parent)}))
+pending.replace(ready)
+time.sleep(300)
+"""
+        process = subprocess.Popen([str(BINARY), *(["--keep"] if keep else []), "HEAD",
+                                    sys.executable, "-c", code, str(ready)], cwd=self.repo,
+                                   env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 20
         while not ready.exists() and time.monotonic() < deadline and process.poll() is None:
             time.sleep(0.02)
@@ -885,57 +1211,192 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             process.kill()
             _, stderr = process.communicate(timeout=5)
             self.fail(f"child did not start: {stderr!r}")
-        child_pid = int(ready.read_text())
+        data = json.loads(ready.read_text())
+        child_pid, run = data["pid"], Path(data["run"])
         def stop():
             try: os.killpg(child_pid, signal.SIGKILL)
             except ProcessLookupError: pass
-            if process.poll() is None: process.kill()
-            process.communicate(timeout=5)
+            if process.poll() is None: process.terminate()
+            try: process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+            if run.exists():
+                self.cleanup_run(run)
         self.addCleanup(stop)
         return process, run, child_pid
 
-    def test_forwarded_signal_and_cleanup_preserve_evidence(self):
+    def test_forwarded_signal_removes_runtime_files_and_active_cleanup_is_refused(self):
         process, run, _ = self.start_sleeping_run()
-        active_cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=10)
+        active_cleanup = self.cleanup_run(run)
         self.assertNotEqual(active_cleanup.returncode, 0)
+        self.assertTrue((run / ".state").is_file())
+        self.assertTrue((run / "backing").is_dir())
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=15)
-        self.assertEqual(process.returncode, 128 + signal.SIGTERM)
-        manifest = self.manifest(run)
-        self.assertEqual(manifest["status"]["signal"], signal.SIGTERM)
-        self.assertEqual(manifest["phase"], "finished")
-        self.assertTrue(manifest["logs_complete"])
-        for _ in range(2):
-            cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=10)
-            self.assert_success(cleanup)
-            self.assertEqual((run / "output/keep").read_text(), "artifact")
-            self.assertEqual(self.manifest(run), manifest)
-            self.assertTrue((run / "stdout.log").exists())
-            self.assertTrue((run / "stderr.log").exists())
-            self.assertFalse((run / "mount").exists())
-            self.assertFalse((run / "backing").exists())
-        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+        _, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
+        self.assert_no_runtime_files()
 
-    def test_sigkill_recovery_cleanup(self):
+    def test_sigkill_recovery_explicitly_removes_stale_tempdir(self):
         process, run, child_pid = self.start_sleeping_run()
         process.kill()
         try: os.killpg(child_pid, signal.SIGKILL)
         except ProcessLookupError: pass
         process.communicate(timeout=10)
-        cleanup = subprocess.run([str(BINARY), "--cleanup", str(run)], capture_output=True, timeout=15)
-        self.assert_success(cleanup)
-        self.assertEqual((run / "output/keep").read_text(), "artifact")
-        self.assertTrue((run / "manifest.json").exists())
-        self.assertFalse((run / "mount").exists())
-        self.assertFalse((run / "backing").exists())
+        self.assertTrue((run / ".state").is_file())
+        self.assertTrue((run / "backing").is_dir())
+        self.assert_success(self.cleanup_run(run))
+        self.assertFalse(run.exists())
+        self.assert_no_runtime_files()
+
+    def test_concurrent_cleanup_has_one_winner_and_removes_only_stale_run(self):
+        process, run, child_pid = self.start_sleeping_run()
+        process.kill()
+        try: os.killpg(child_pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.communicate(timeout=10)
+        sibling = self.system_tmp / "unrelated-directory"
+        sibling.mkdir()
+        (sibling / "sentinel").write_text("preserve")
+        cleaners = [subprocess.Popen([str(BINARY), "--cleanup", str(run)], cwd=self.repo,
+                                     env=self.environment(), stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE) for _ in range(4)]
+        results = [(cleaner, cleaner.communicate(timeout=20)) for cleaner in cleaners]
+        self.assertEqual(sum(cleaner.returncode == 0 for cleaner, _ in results), 1, results)
+        self.assertFalse(run.exists())
+        self.assertEqual((sibling / "sentinel").read_text(), "preserve")
+        self.assertEqual(list(self.system_tmp.iterdir()), [sibling])
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
-    def test_default_xdg_run_directory(self):
-        result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", "print('xdg')"], cwd=self.repo, env=self.environment(), capture_output=True, timeout=30)
+    def test_keep_preserves_backing_reports_path_and_refuses_cleanup(self):
+        result, run = self.python("from pathlib import Path; Path('out/result').write_text('retained'); print('child-output')", keep=True)
         self.assert_success(result)
-        manifests = list((self.root / "data").rglob("manifest.json"))
-        self.assertEqual(len(manifests), 1)
-        self.assertEqual(json.loads(manifests[0].read_text())["tree_oid"], self.tree)
+        self.assertIsNotNone(run)
+        self.assertEqual(result.stdout, b"child-output\n")
+        self.assertEqual(result.stderr, f"git-on: kept temporary files at {run}\n".encode())
+        self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
+        self.assertTrue((run / ".state").is_file())
+        self.assertFalse((run / "mount").exists())
+        self.assertEqual((run / "backing/out/result").read_text(), "retained")
+        self.assertEqual(set(path.name for path in run.iterdir()), {".state", ".lock", "backing"})
+        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+        state = (run / ".state").read_bytes()
+        cleanup = self.cleanup_run(run)
+        self.assertNotEqual(cleanup.returncode, 0)
+        self.assertIn(b"kept", cleanup.stderr.lower())
+        self.assertEqual((run / ".state").read_bytes(), state)
+        self.assertEqual((run / "backing/out/result").read_text(), "retained")
+
+    def test_keep_exports_only_live_writable_paths_and_preserves_links(self):
+        result, run = self.python(r"""
+import os
+from pathlib import Path
+Path('out/original/subdir').mkdir(parents=True)
+Path('out/original/subdir/value').write_text('payload')
+os.chmod('out/original/subdir/value', 0o640)
+os.rename('out/original', 'out/renamed')
+Path('out/renamed/deleted').write_text('discard me')
+os.unlink('out/renamed/deleted')
+Path('out/removed-dir').mkdir()
+os.rmdir('out/removed-dir')
+Path('out/empty').mkdir()
+os.chmod('out/empty', 0o750)
+os.link('out/renamed/subdir/value', 'out/hardlink')
+os.symlink('renamed/subdir/value', 'out/symlink')
+os.symlink('../tracked.txt', 'out/lower-link')
+os.symlink('missing-target', 'out/dangling')
+Path('out/replaced').write_text('old')
+Path('out/replacement').write_text('new')
+os.replace('out/replacement', 'out/replaced')
+""", keep=True)
+        self.assert_success(result)
+        self.assertIsNotNone(run)
+        backing = run / "backing"
+        expected = {"out", "out/renamed", "out/renamed/subdir", "out/renamed/subdir/value",
+                    "out/empty", "out/hardlink", "out/symlink", "out/lower-link", "out/dangling",
+                    "out/replaced"}
+        actual = {str(path.relative_to(backing)) for path in backing.rglob('*')}
+        self.assertEqual(actual, expected)
+        target = backing / "out/renamed/subdir/value"
+        self.assertEqual(target.read_text(), "payload")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE((backing / "out/empty").stat().st_mode), 0o750)
+        self.assertEqual((backing / "out/hardlink").stat().st_ino, target.stat().st_ino)
+        self.assertEqual(target.stat().st_nlink, 2)
+        self.assertEqual(os.readlink(backing / "out/symlink"), "renamed/subdir/value")
+        self.assertEqual((backing / "out/symlink").read_text(), "payload")
+        self.assertEqual(os.readlink(backing / "out/lower-link"), "../tracked.txt")
+        self.assertEqual(os.readlink(backing / "out/dangling"), "missing-target")
+        self.assertEqual((backing / "out/replaced").read_text(), "new")
+        self.assertFalse((backing / "tracked.txt").exists())
+        self.assertFalse((backing / "out/protected.txt").exists())
+        self.assertFalse((run / "mount").exists())
+        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
+
+    def test_keep_preserves_artifacts_on_command_failure_and_signal(self):
+        for outcome in ["raise SystemExit(37)", "os.kill(os.getpid(), signal.SIGTERM)"]:
+            with self.subTest(outcome=outcome):
+                result, run = self.python("from pathlib import Path; import os,signal; Path('out/failure').write_text('saved'); " + outcome, keep=True)
+                expected = (37,) if outcome.startswith("raise") else (-signal.SIGTERM,)
+                self.assertIn(result.returncode, expected, result.stderr)
+                self.assertIsNotNone(run)
+                self.assertEqual((run / "backing/out/failure").read_text(), "saved")
+                self.assertFalse((run / "mount").exists())
+                self.assertIn(os.fsencode(run), result.stderr)
+                self.assertNotEqual(self.cleanup_run(run).returncode, 0)
+        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+
+    def test_keep_after_spawn_failure_retains_only_runtime_metadata_and_backing(self):
+        result, run = self.invoke("git-on-certainly-nonexistent-executable", keep=True)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIsNotNone(run)
+        self.assertIn(os.fsencode(run), result.stderr)
+        self.assertTrue((run / "backing").is_dir())
+        self.assertFalse((run / "mount").exists())
+        self.assertFalse((run / "stdout.log").exists())
+        self.assertFalse((run / "stderr.log").exists())
+        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
+
+    def test_only_tree_oid_is_injected_and_tmpdir_is_private_then_removed(self):
+        code = r"""
+import json, os, stat
+from pathlib import Path
+injected = {key: value for key, value in os.environ.items() if key.startswith('GIT_ON_')}
+assert injected == {'GIT_ON_TREE_OID': os.environ['EXPECTED_TREE']}, injected
+run = Path.cwd().parent
+assert Path.cwd().name == 'mount'
+assert run.parent == Path(os.environ['TMPDIR'])
+assert run.name.startswith('git-on-')
+assert stat.S_IMODE(run.stat().st_mode) == 0o700
+assert (run / '.state').is_file()
+assert (run / 'backing').is_dir()
+assert not (run / 'manifest.json').exists()
+assert not (run / 'stdout.log').exists()
+assert not (run / 'stderr.log').exists()
+assert not (run / 'output').exists()
+assert os.environ['UNRELATED_VARIABLE'] == 'inherited'
+print(run)
+"""
+        result, run = self.python(code, extra_env={"EXPECTED_TREE": self.tree, "UNRELATED_VARIABLE": "inherited"})
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assertFalse(Path(os.fsdecode(result.stdout).strip()).exists())
+        self.assertEqual(result.stderr, b"")
+        self.assert_no_runtime_files()
+
+    def test_obsolete_run_directory_env_does_not_select_storage(self):
+        old_run = self.root / "old-run"
+        old_run.mkdir()
+        sentinel = old_run / "sentinel"
+        sentinel.write_text("untouched")
+        result, run = self.python("from pathlib import Path; print(Path.cwd().parent)",
+                                  extra_env={"GIT_ON_RUN_DIR": str(old_run)})
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assertEqual(Path(os.fsdecode(result.stdout).strip()).parent, self.system_tmp)
+        self.assertEqual(list(old_run.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_text(), "untouched")
+        self.assert_no_runtime_files()
 
 
 @unittest.skipUnless(FUSE_AVAILABLE and OPTIONS.uv, "pass --uv with real FUSE for dependency integration")
@@ -949,11 +1410,11 @@ class UvTests(RepositoryTest):
                 git(self.repo, "add", "--force", "--all")
                 git(self.repo, "commit", "--quiet", "-m", f"add {example}")
                 command = ["uv", "run", "--locked", "--script", "main.py"] if example == "pep723" else ["uv", "run", "--locked", "main.py"]
-                result, run = self.invoke(*command, tree=f"HEAD:{example}", timeout=300)
+                result, run = self.invoke(*command, tree=f"HEAD:{example}", keep=True, timeout=300)
                 self.assert_success(result)
                 self.assertIn(b"cache-reused", result.stdout)
-                self.assertTrue(list((run / "output").rglob("*.nbc")), "Numba compiled cache must be retained")
-                self.assertTrue(list((run / "output").rglob("*.pyc")), "Local import bytecode must be retained")
+                self.assertTrue(list((run / "backing").rglob("*.nbc")), "Numba compiled cache must be retained")
+                self.assertTrue(list((run / "backing").rglob("*.pyc")), "Local import bytecode must be retained")
 
 
 if __name__ == "__main__":

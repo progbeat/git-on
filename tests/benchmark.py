@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import ExitStack
 from functools import lru_cache
 import hashlib
 import json
@@ -34,11 +35,10 @@ SNAPSHOT_METRICS = (
 )
 
 
-def snapshot_metrics(manifest):
-    """Require real runtime counters; never infer reads from file counts/timing."""
-    metrics = manifest.get("snapshot_metrics")
+def snapshot_metrics(metrics):
+    """Require explicit test-build counters; never infer reads from timing."""
     if not isinstance(metrics, dict):
-        raise ValueError("runner manifest has no snapshot_metrics object")
+        raise ValueError("test metrics channel did not return a JSON object")
     for name in SNAPSHOT_METRICS:
         value = metrics.get(name)
         if type(value) is not int or value < 0:
@@ -294,21 +294,41 @@ def signal_session(session, signum):
             pass
 
 
-def measured_process(argv, cwd, env, stdout, stderr, timeout, expected_stdout=None):
-    with stdout.open("wb") as out, stderr.open("wb") as err, selectors.DefaultSelector() as selector:
+def measured_process(argv, cwd, env, stdout, stderr, timeout, expected_stdout=None, metrics_path=None):
+    with ExitStack() as stack:
+        out = stack.enter_context(stdout.open("wb"))
+        err = stack.enter_context(stderr.open("wb"))
+        selector = stack.enter_context(selectors.DefaultSelector())
+        pass_fds = ()
+        metrics_write = None
+        if metrics_path is not None:
+            metrics_read, metrics_write = os.pipe()
+            metrics_source = stack.enter_context(os.fdopen(metrics_read, "rb", buffering=0))
+            metrics_out = stack.enter_context(metrics_path.open("wb"))
+            os.set_blocking(metrics_read, False)
+            selector.register(metrics_source, selectors.EVENT_READ, ("metrics", metrics_out))
+            env = dict(env, GIT_ON_TEST_METRICS_FD=str(metrics_write))
+            pass_fds = (metrics_write,)
         # Do not call Popen.poll()/wait(): wait4 owns child reaping and rusage.
+        # Only this external harness captures stdout; git-on inherits its fd.
         harness_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         start = time.monotonic_ns()
-        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=err, start_new_session=True)
+        try:
+            process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=err, start_new_session=True,
+                                       pass_fds=pass_fds)
+        finally:
+            if metrics_write is not None:
+                os.close(metrics_write)
+        stack.enter_context(process.stdout)
         os.set_blocking(process.stdout.fileno(), False)
-        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stdout, selectors.EVENT_READ, ("stdout", out))
         deadline = time.monotonic() + timeout
-        timed_out = interrupted = terminating = False
-        reaped = eof = False
+        timed_out = interrupted = terminating = killed = capture_incomplete = False
+        reaped = False
         received = bytearray()
         stdout_match_ns = None
-        while not (reaped and eof):
+        while not (reaped and not selector.get_map()):
             try:
                 if not reaped:
                     pid, status, usage = os.wait4(process.pid, os.WNOHANG)
@@ -316,32 +336,37 @@ def measured_process(argv, cwd, env, stdout, stderr, timeout, expected_stdout=No
                 for key, _ in selector.select(0.01):
                     chunk = os.read(key.fd, 65536)
                     if not chunk:
-                        selector.unregister(process.stdout)
-                        eof = True
+                        selector.unregister(key.fileobj)
                     else:
                         observed_ns = time.monotonic_ns()
-                        out.write(chunk)
-                        if expected_stdout is not None:
+                        kind, destination = key.data
+                        destination.write(chunk)
+                        if kind == "stdout" and expected_stdout is not None:
                             received.extend(chunk)
                             if received == expected_stdout and stdout_match_ns is None:
                                 stdout_match_ns = observed_ns
-                if time.monotonic() >= deadline and not (reaped and eof):
+                if time.monotonic() >= deadline and not (reaped and not selector.get_map()):
                     if not terminating:
                         timed_out = terminating = True
                         signal_session(process.pid, signal.SIGTERM)
                         deadline = time.monotonic() + 5
+                    elif killed and reaped:
+                        # Escaped descendants may retain inherited streams. Do
+                        # not call that a successful sample or wait indefinitely.
+                        capture_incomplete = bool(selector.get_map())
+                        break
                     else:
                         signal_session(process.pid, signal.SIGKILL)
+                        killed = True
                         deadline = time.monotonic() + 1
             except KeyboardInterrupt:
                 interrupted = terminating = True
                 signal_session(process.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 5
-        process.stdout.close()
         process.returncode = os.waitstatus_to_exitcode(status)
         return dict(started_ns=start, observed_exit_ns=time.monotonic_ns(),
                     returncode=process.returncode, timed_out=timed_out, interrupted=interrupted,
-                    stdout_match_ns=stdout_match_ns,
+                    capture_incomplete=capture_incomplete, stdout_match_ns=stdout_match_ns,
                     wait4_peak_rss_kib=usage.ru_maxrss, user_cpu_s=usage.ru_utime,
                     system_cpu_s=usage.ru_stime, harness_peak_rss_kib_before_spawn=harness_rss)
 
@@ -429,7 +454,7 @@ def benchmark(args):
                     binary_version=subprocess.check_output([str(binary), "--version"]).decode().strip(),
                     fixture_manifest=fixture_manifest, repeats=args.repeats, warmups=args.warmups,
                     timeout_s=args.timeout, seed=args.seed, cache_policy="uncontrolled OS cache; per-case warmups",
-                    object_metrics="Per-sample snapshot_metrics copied from the completed runner manifest.",
+                    object_metrics="Explicit inherited pipe from an opt-in test-metrics build; no runtime manifest or log capture.",
                     object_metrics_semantics="Application-level Git tree/header/blob fetches and decoded blob bytes, not physical disk I/O; revision resolution is outside these counters.",
                     lazy_access_gates="Digits: at most six ancestor trees and one header, exactly one seven-byte blob; caches stay within their byte limits.",
                     cat_child_startup_unavailable_reason="Unmodified cat has no child-start marker.",
@@ -441,10 +466,9 @@ def benchmark(args):
             rng.shuffle(ordered)
             for case in ordered:
                 tag = f"{len(samples):04d}-{case['case']}"
-                run = output / tag
                 env = environment()
-                env["GIT_ON_RUN_DIR"] = str(run)
                 stdout, stderr = output / f"{tag}.stdout", output / f"{tag}.stderr"
+                metrics_path = output / f"{tag}.metrics"
                 argv = [str(binary), case["tree_oid"], sys.executable, "-I", "-S", "-c", CHILD,
                         case["suite"], str(case["count"]), str(case.get("large_bytes", 0))]
                 expected_stdout = None
@@ -456,18 +480,19 @@ def benchmark(args):
                     expected_stdout = (digits + "\n").encode()
                     selection = dict(selected_number=digits, selected_path=path, selection_seed=args.seed)
                     argv = [str(binary), case["tree_oid"], cat, path]
-                measured = measured_process(argv, repo, env, stdout, stderr, args.timeout, expected_stdout)
+                measured = measured_process(argv, repo, env, stdout, stderr, args.timeout, expected_stdout, metrics_path)
                 sample = dict(event="sample", case=case, iteration=iteration, warmup=iteration < 0,
-                              evidence_dir=str(run), stdout=str(stdout), stderr=str(stderr), argv=argv,
+                              stdout=str(stdout), stderr=str(stderr), metrics_file=str(metrics_path), argv=argv,
                               **selection, **measured)
                 try:
-                    if measured["returncode"] or measured["timed_out"] or measured["interrupted"]:
+                    if (measured["returncode"] or measured["timed_out"] or measured["interrupted"]
+                            or measured["capture_incomplete"]):
                         raise RuntimeError("command failed, timed out, or was interrupted")
-                    manifest = json.loads((run / "manifest.json").read_text())
-                    if (manifest["status"]["runner_error"] or manifest["status"]["exit_code"] != 0
-                            or not manifest["logs_complete"]):
-                        raise RuntimeError("runner manifest does not record complete success")
-                    sample["snapshot_metrics"] = snapshot_metrics(manifest)
+                    try:
+                        metrics = json.loads(metrics_path.read_bytes())
+                    except ValueError as error:
+                        raise ValueError("missing or malformed test metrics; build with --features test-metrics") from error
+                    sample["snapshot_metrics"] = snapshot_metrics(metrics)
                     assert_lazy_reads(case, sample["snapshot_metrics"])
                     sample.update(observed_total_ms=(measured["observed_exit_ns"] - measured["started_ns"]) / 1e6,
                                   success=True, child_startup_ms=None, workload_ms=None,
@@ -489,15 +514,6 @@ def benchmark(args):
 
                 except (OSError, ValueError, KeyError, RuntimeError) as error:
                     sample.update(success=False, error=str(error), child_startup_ms=None, workload_ms=None)
-                    if measured["timed_out"] or measured["interrupted"]:
-                        # Only the runner's checked cleanup may unmount/release its pin.
-                        try:
-                            cleanup = subprocess.run([str(binary), "--cleanup", str(run)], env=env,
-                                                     capture_output=True, timeout=20)
-                            sample["cleanup_returncode"] = cleanup.returncode
-                            sample["cleanup_stderr"] = cleanup.stderr.decode(errors="replace")
-                        except subprocess.TimeoutExpired:
-                            sample["cleanup_error"] = "cleanup timed out; inspect retained run directory"
                 record(sample)
                 samples.append(sample)
                 metric = "verified_stdout_ms" if case["suite"] == "digits" else "child_startup_ms"
@@ -594,13 +610,32 @@ class SelfTests(unittest.TestCase):
             self.assertTrue(result["timed_out"])
             self.assertNotEqual(result["returncode"], 0)
 
+    def test_metrics_use_separate_explicit_inherited_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = environment()
+            script = "import os; os.write(int(os.environ['GIT_ON_TEST_METRICS_FD']), b'{\"tree_reads\":6}\\n'); print('123456')"
+            result = measured_process([sys.executable, "-I", "-S", "-c", script], root, env,
+                                      root / "out", root / "err", 5, b"123456\n", root / "metrics")
+            self.assertEqual(result["returncode"], 0, (root / "err").read_text())
+            self.assertEqual((root / "out").read_bytes(), b"123456\n")
+            self.assertEqual(json.loads((root / "metrics").read_bytes()), {"tree_reads": 6})
+            self.assertIsNotNone(result["stdout_match_ns"])
+            self.assertFalse(result["capture_incomplete"])
+            self.assertNotIn("GIT_ON_TEST_METRICS_FD", env)
+            # A normal, uninstrumented child must not silently pass the gate.
+            result = measured_process([sys.executable, "-I", "-S", "-c", "pass"], root, env,
+                                      root / "out", root / "err", 5, metrics_path=root / "metrics")
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual((root / "metrics").read_bytes(), b"")
+
     def test_metrics_validate_cache_bounds_and_reject_eager_reads(self):
         metrics = dict.fromkeys(SNAPSHOT_METRICS, 0)
         metrics.update(tree_reads=6, header_reads=1, blob_loads=1, blob_bytes=7,
                        blob_cache_bytes=7, blob_cache_entries=1, blob_cache_limit=1024,
                        tree_cache_bytes=512, tree_cache_entries=6, tree_cache_limit=1024)
         case = dict(suite="digits", digit_depth=6)
-        self.assertEqual(snapshot_metrics({"snapshot_metrics": metrics}), metrics)
+        self.assertEqual(snapshot_metrics(metrics), metrics)
         assert_lazy_reads(case, metrics)
         for name, value in [("tree_reads", 7), ("header_reads", 2), ("blob_loads", 2), ("blob_bytes", 14)]:
             with self.subTest(name=name):
@@ -610,11 +645,11 @@ class SelfTests(unittest.TestCase):
                             ("tree_reads", -1), ("blob_loads", True), ("cache_hits", None)]:
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
-                    snapshot_metrics({"snapshot_metrics": dict(metrics, **{name: value})})
+                    snapshot_metrics(dict(metrics, **{name: value}))
         with self.assertRaises(ValueError):
             snapshot_metrics({})
         with self.assertRaises(ValueError):
-            snapshot_metrics({"snapshot_metrics": {}})
+            snapshot_metrics(None)
 
     def test_summary_excludes_warmups_and_failures(self):
         sample = dict(case={"case": "x"}, success=True, warmup=False, child_startup_ms=3,
