@@ -9,8 +9,8 @@ Run commands against a Git revision without checking it out. Source files stay
 immutable; temporary writes follow that revision's `.gitignore` rules.
 
 ```sh
-git on HEAD python script.py
-git on HEAD:experiments uv run --locked experiment.py
+git on HEAD -- python script.py
+git on HEAD:experiments -- uv run --locked experiment.py
 ```
 
 [Installation](#installation) · [Quick start](#quick-start) ·
@@ -59,10 +59,10 @@ Run from an existing Git repository with a commit:
 
 ```sh
 # List the committed tree, ignoring local changes.
-git on HEAD ls
+git on HEAD -- ls
 
 # Run an older snapshot (requires at least two commits).
-git on HEAD~1 ls
+git on HEAD~1 -- ls
 
 # Show the command-line reference.
 git on --help
@@ -89,16 +89,23 @@ for runnable projects.
 
 ### Keep results
 
-Place `--keep` before the tree-ish to retain generated ignored files:
+Use `--keep` (or `-k`) and a command separator to retain generated ignored files:
 
 ```sh
-git on --keep HEAD:examples/uv-project uv run --locked main.py
+git on HEAD:examples/uv-project -k -- uv run --locked main.py
+git on --keep HEAD:examples/uv-project -- uv run --locked main.py
 ```
+
+Both flags work on either side of the revision.
+Every command requires `--`: put the revision and runner options before it,
+then the command and its literal arguments after it. The command's own `--`,
+`--keep` and `-k` are passed unchanged; see the
+[syntax reference](docs/usage.md#command-syntax).
 
 After unmounting, git-on prints the retained temporary directory on stderr.
 Generated files are under `backing/`; remove the directory when you are done.
 Each subsequent run starts fresh. Use ordinary shell redirection to save output,
-for example `git on HEAD ls > committed-files.txt`.
+for example `git on HEAD -- ls > committed-files.txt`.
 
 ## Support and limitations
 

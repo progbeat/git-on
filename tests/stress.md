@@ -1,6 +1,6 @@
 # Seeded real-FUSE filesystem stress
 
-`stress.py` runs an actual `git-on <tree> python ...` command against a real
+`stress.py` runs an actual `git-on <tree> -- python ...` command against a real
 FUSE mount. It executes a bounded, seeded stream of filesystem operations and
 compares it with a separate host-directory oracle. A missing `/dev/fuse`, missing
 mount helper, failed mount, operation mismatch, timeout, leaked runtime directory,

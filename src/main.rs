@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod cli;
+
 // Ephemeral recovery information only: no invocation history, arguments or logs.
 #[derive(Serialize, Deserialize)]
 struct Recovery {
@@ -592,7 +594,7 @@ fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
         if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: git on [--keep] [--] <tree-ish> <command> [args...]\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep retains generated files for debugging after unmount.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.");
+            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\nRunner options may appear on either side of the single local revision.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
             return Ok(ExitStatus::from_raw(0));
         }
         if args.first().is_some_and(|a| a == "--version") {
@@ -607,20 +609,14 @@ fn main() {
             cleanup(Path::new(&args[1]))?;
             return Ok(ExitStatus::from_raw(0));
         }
-        let mut offset = 0;
-        let keep = args.first().is_some_and(|a| a == "--keep");
-        if keep {
-            offset += 1;
+        match cli::parse_run_args(&args) {
+            Ok(run) => execute(run.tree.clone(), run.command.to_vec(), run.keep),
+            Err(error) => {
+                eprintln!("git-on: {error}");
+                eprintln!("usage: {}", cli::RUN_USAGE);
+                Ok(ExitStatus::from_raw(2 << 8))
+            }
         }
-        if args.get(offset).is_some_and(|a| a == "--") {
-            offset += 1;
-        }
-        let args = &args[offset..];
-        if args.len() < 2 {
-            eprintln!("usage: git on [--keep] [--] <tree-ish> <command> [args...]");
-            return Ok(ExitStatus::from_raw(2 << 8));
-        }
-        execute(args[0].clone(), args[1..].to_vec(), keep)
     })();
     match result {
         Ok(status) => {

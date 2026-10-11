@@ -45,7 +45,7 @@ seed and records the chosen six-digit number and path. It then runs the compiled
 external-command executable directly, equivalently:
 
 ```sh
-git-on <tree-OID> /usr/bin/cat 1/2/3/4/5/6
+git-on <tree-OID> -- /usr/bin/cat 1/2/3/4/5/6
 ```
 
 The actual `cat` path is resolved and recorded. Calling the executable directly

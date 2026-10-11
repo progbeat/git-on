@@ -601,7 +601,7 @@ def run_seed(args, seed, replay=None):
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_ON_")}
         env.update(TMPDIR=str(runtime), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                    PYTHONDONTWRITEBYTECODE="1")
-        command = [str(args.binary.resolve()), tree, sys.executable, str(Path(__file__).resolve()),
+        command = [str(args.binary.resolve()), tree, "--", sys.executable, str(Path(__file__).resolve()),
                    "--child", json.dumps(config), "--oracle", str(oracle), "--trace", str(trace)]
         if replay:
             command += ["--replay", str(replay.resolve())]

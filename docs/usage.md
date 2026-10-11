@@ -10,19 +10,56 @@ results](#standard-streams-and-temporary-writes) ·
 ## Command syntax
 
 ```text
-git on [--keep] [--] <tree-ish> <command> [args...]
+git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]
 git on --cleanup <temporary-directory>
 git on --help
 git on --version
 ```
 
-`git-on` is a Git external command: an executable named `git-on` on `PATH` makes `git
-on` available. It can also be invoked directly as `git-on`.
+`git-on` is a Git external command: an executable named `git-on` on `PATH` makes
+`git on` available. It can also be invoked directly as `git-on`.
 
-Runner flags must precede the tree-ish. Everything after it is a literal command and its
-arguments, including an argument spelled `--keep`. An optional `--` ends runner-option
-parsing before the tree-ish. No shell is introduced; to use shell syntax, explicitly run
-`sh -c '...'`.
+Every executed command requires `--`. Before the first separator, supply exactly
+one local revision and any `--keep`/`-k` options, in either order. Both spellings
+have the same effect; repeating them is harmless. `HEAD:path/to/subtree` remains
+one revision operand. Everything after that first separator is literal command
+argv: git-on does not parse the command's options or any subsequent `--`.
+
+```sh
+git on HEAD -- ls
+git on HEAD:examples/uv-project -k -- uv run --locked main.py
+git on --keep HEAD:examples/uv-project -- uv run --locked main.py
+```
+
+| Invocation | Interpretation |
+| --- | --- |
+| `git on HEAD --keep -- cmd -k --keep -- arg` | Keep files; pass `-k --keep -- arg` to `cmd` |
+| `git on -k HEAD -- cmd --keep` | Keep files; pass `--keep` to `cmd` |
+| `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
+| `git on HEAD cmd` | Usage error: missing command separator |
+| `git on repo HEAD -- cmd` | Usage error: currently exactly one local revision is accepted |
+| `git on HEAD --unknown -- cmd` | Usage error: unknown runner option |
+
+Missing `--`, missing or empty revision/command names, extra positional operands,
+and unknown runner options return 2 with a diagnostic before resolving Git
+objects or creating runtime state. Bundles such as `-kk` and values such as
+`--keep=true` are not runner flags. Tokens starting with `-` before the separator
+are treated as options; to select a revision with such a name, use its full
+object ID. The first `--` is always the command boundary and cannot escape a
+revision. Empty later arguments and non-UTF-8 argv bytes remain intact. No shell
+is introduced; to use shell syntax, explicitly run `sh -c '...'`.
+
+First-token `--help`/`-h`, `--version`, and `--cleanup` retain their separate
+existing handling. These modes do not execute a child command and do not require
+that separator. The same spellings after the separator are ordinary command
+argv.
+
+**Migrating from 0.1.x:** insert `--` before the command in every execution call:
+`git on REV command args` becomes `git on REV -- command args`, and
+`git on --keep REV command args` becomes `git on --keep REV -- command args`.
+The prefix position of `--keep` remains supported; only the separator is new.
+For a rare executable named `--keep`, use `git on REV -- --keep -- args`: the
+second `--` belongs to that executable.
 
 ## Filesystem behavior
 
@@ -94,10 +131,12 @@ By default, git-on unmounts and removes the writable layer after the command fin
 To retain newly written ignored files:
 
 ```sh
-git on --keep HEAD python script.py
+git on HEAD --keep -- python script.py
 ```
 
-`--keep` must appear before the tree-ish. After unmounting, git-on reports the retained
+The equivalent short form is `git on HEAD -k -- python script.py`; the prefix
+form `git on --keep HEAD -- python script.py` is also supported. After unmounting,
+git-on reports the retained
 temporary-directory path on stderr. Its `backing/` subdirectory contains the writable
 layer with its original paths, not a checkout of the selected tree; untouched tracked
 source files are not copied into it. The mount is removed. A small retention marker
@@ -178,7 +217,7 @@ output. Latency and RSS are measured, not promised as a machine-independent SLA.
 - **A script or recent edit is missing:** git-on reads the selected revision. Staged,
   unstaged, and untracked changes do not appear until committed and selected.
 - **Generated results disappear:** the writable layer is deleted by default. Use
-  `--keep` before the tree-ish, redirect output in the invoking shell, or have the
+  `--keep`/`-k` using the syntax above, redirect output in the invoking shell, or have the
   command save chosen files to an explicit host path.
 
 For errors after an interrupted run, see [recovery
