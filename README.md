@@ -27,7 +27,7 @@ git on HEAD:experiments -- uv run --locked experiment.py
 
 Prebuilt releases support **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseline),
 plus the shared zlib and GCC runtimes (`libz.so.1`, `libgcc_s.so.1`). Running git-on
-requires a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
+requires native Git, a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
 `fuse3` package. The installer needs `curl` and Python 3.8+.
 
 ### Install or update
@@ -108,6 +108,29 @@ Each subsequent run starts fresh. Use ordinary shell redirection to save output,
 for example `git on HEAD -- ls > committed-files.txt`.
 
 ## Support and limitations
+
+Run a remote revision from any directory, or select a configured remote from
+inside its local repository:
+
+```sh
+git on https://github.com/OWNER/REPO.git main -- python script.py
+git on origin main:experiments -k -- uv run --locked experiment.py
+git on --verify ssh://git@HOST/REPO.git signed-release -- ./check.sh
+git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on --verify HEAD -- ./check.sh
+```
+
+Remote runs fetch selected and subsequently demanded objects. They require native
+Git 2.45.1+, a server advertising object filters and allowing exact object
+requests, and existing HTTPS credentials or OpenSSH authentication. An unlocked
+SSH agent needs no passphrase prompt. One selected encrypted identity
+authenticates before mounting and lazy fetches reuse that SSH connection.
+
+`--verify` asks native Git to verify the exact commit or annotated tag before
+execution. Git controls formats and trust through your effective configuration,
+including `git -c`. Failed verification forbids execution. A signed tag binds its
+peeled tree; `REV:path` selects a directory inside that verified tree. Raw trees
+cannot be verified by searching history. Verification proves neither passed
+tests nor execution safety. See the [remote guide](docs/remote.md) for limits.
 
 git-on is **not a security sandbox**. Commands retain your user identity,
 environment, network access, and access to host files outside the mount. Run only

@@ -1,8 +1,75 @@
 # Review regression evidence
 
+## Remote/verification checkpoint: unfinished and unpublished
+
+The initial uncommitted implementation was independently reviewed in the saved
+Linux runtime. This checkpoint is not ready and has no real-FUSE or CI evidence.
+
+`RemoteTests.test_review_configuration_values_are_applied_once` initially failed
+with two `once` HTTP headers for one configured value, and now passes.
+`test_review_stalled_transport_cancels_and_cleans_descendants` initially timed out
+after two seconds; it now exits by SIGTERM, stops the transport group and cleans
+temporary state. A non-reaping container PID 1 may retain an adopted dead zombie;
+the check distinguishes that state from a live descendant.
+
+Independent review reproduced repeated insteadOf rewriting: native Git failed
+at a nonexistent first rewritten path while the loader reached a second path.
+`test_review_url_rewrites_are_applied_once_for_urls_and_remote_names` passes after
+pinning the once-rewritten URL. Review also showed 300 MiB of abandoned staging
+data survived a successful cache load. The focused staging-recovery and concurrent
+cache-bound tests pass after reconciliation under the writer flock.
+
+`test_review_named_remote_preserves_uploadpack_configuration` initially succeeded
+despite a configured nonexistent upload-pack command, failing its assertion. It
+now passes after preserving the remote name/options with a pinned private URL.
+
+`test_review_connection_loss_cannot_reconnect_with_explicit_proxy_option`
+reproduced a reconnect after owned-master loss before the fix and now passes
+with owned control settings and existing-socket mux proxy mode. The appended SSH
+section records additional short-option and signal regression evidence. Final
+independent re-review and exact-head real-FUSE CI remain publication requirements;
+the new mounted EIO and recovery cases have not run in the local runtime.
+
 Behavior fixes must retain a test of the original failure, not only a new happy
 path. This ledger separates observed red-before/green-after evidence from
 review hardening and tests whose real-mount execution awaits exact-head CI.
+
+## Remote reference ambiguity and literal subtree paths
+
+Independent review of the restored remote feature reproduced two additional
+loader defects. A branch and lightweight tag both named `main` at the same OID
+were accepted as unambiguous because resolution deduplicated by OID. A selected
+`main:deep/.` subtree was also accepted because `Path::components` normalized
+the dot away. Native Git rejects `HEAD:deep/.` and `HEAD:deep//`, while accepting
+`HEAD:`, `HEAD:deep` and `HEAD:deep/` for the corresponding root/directory.
+
+The permanent tests `review_same_oid_branch_and_tag_are_still_ambiguous` and
+`review_subtree_components_are_not_silently_normalized` in
+`tests/remote_source.rs` both failed before their fixes: `unwrap_err()` received
+an `Ok(Snapshot)` for the ambiguous short ref and interior-dot subtree. The
+focused command `cargo test --locked --test remote_source review_` exited 101.
+After retaining reference names during ambiguity checking and selecting literal
+subtree components, `cargo test --locked --test remote_source` passed all five
+tests. These checks use actual filtered upload-pack through disposable `file://`
+repositories and establish loader behavior; they do not claim real FUSE evidence.
+Explicit `refs/heads/main` and `refs/tags/main`, an empty subtree and a single
+trailing directory slash remain accepted.
+
+## Cancellation while a competing writer holds the remote cache
+
+Independent review held the persistent cache's flock in another process, started
+the actual runner against a disposable filtered `file://` server, then sent
+SIGTERM before mounting. The runner stayed alive for more than two seconds and
+only exited after the competing lock was released. The permanent test
+`review_waiting_for_cache_lock_is_cancellable` failed before the fix with
+"runner ignored SIGTERM while another writer held the cache lock" (exit 101).
+
+Cache locking now retries nonblocking flock while checking the same cancellation
+signal used by owned Git subprocesses. The regression retains the competing
+lock throughout cancellation and asserts SIGTERM status and removal of temporary
+run state. After the fix, all six `remote_source` tests passed, including this
+actual-binary startup check. This is local process/cancellation evidence without
+a FUSE mount; cancellation during mounted remote reads still requires CI.
 
 ## Reproduced runtime defects
 
@@ -216,3 +283,38 @@ Final package-log inspection confirmed dynamic libz.so.1 and libgcc_s.so.1
 requirements in addition to glibc. The missing-runtime-library probe test failed
 before the diagnostic improvement and passes afterward; the existing executable
 remains unchanged. README and installation guidance now list those runtimes.
+
+
+## SSH control precedence, direct commands and terminal interruption
+
+Independent review in the fresh runtime reproduced an unused-environment
+precedence defect: native `git ls-remote` succeeded with a valid
+`GIT_SSH_COMMAND` and `GIT_SSH=/does/not/exist`, while the restored source probe
+exited 1 with "GIT_SSH wrappers are unsupported". A PTY running the actual CLI
+with a disposable stalled transport exited 125 on terminal Ctrl-C and printed
+an empty authentication failure, rather than propagating SIGINT. The permanent
+`SshRegressionTests.test_unused_git_ssh_respects_command_and_configuration_precedence`
+and `test_terminal_interrupt_during_authentication_propagates_sigint` preserve
+those same focused reproductions and pass after respecting native command
+precedence and recording a foreground native child's terminating signal.
+
+The previously red
+`RemoteTests.test_review_connection_loss_cannot_reconnect_with_explicit_proxy_option`
+now passes. Owned first-value options, a final short `-S` before Git's host, and
+neutralization of short `-M` prevent user control flags from replacing the owned
+socket/master. Lazy commands use OpenSSH `-O proxy`, which requires that socket,
+instead of a competing ProxyCommand guard. Direct native transport experiments
+showed short `-M` could create a second authenticated connection even with
+`-O proxy`; the permanent short-control and lost-master tests count one
+connection and one encrypted-identity prompt. The caller's one-second
+ControlPersist setting cannot expire the run's owned master. Short `-J none`
+continues to work. A transparent `GIT_SSH` executable with spaces in its path
+preserves argv and the encrypted-identity one-prompt contract.
+
+`python3 tests/ssh_regressions.py` passed all seven focused cases. The existing
+known-red ProxyCommand case, encrypted-identity, unlocked-agent and external
+SIGTERM transport tests also passed (four cases). These are real disposable
+OpenSSH and PTY checks without FUSE. Busy/stale mounted cleanup and the final
+independent review still require completion; no actual mount or exact-head CI
+result is claimed here. Direct shell prefixes/compounds and non-OpenSSH variants
+are diagnosed precisely rather than claimed supported.

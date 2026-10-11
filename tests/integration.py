@@ -119,6 +119,9 @@ class CliTests(RepositoryTest):
             if arg != "--version":
                 self.assertIn(b"[--keep|-k] -- <command>", result.stdout)
                 self.assertIn(b"--keep, -k", result.stdout)
+                self.assertIn(b"--verify", result.stdout)
+                self.assertIn(b"One operand selects local REV; two select repository and REV", result.stdout)
+                self.assertIn(b"native Git", result.stdout)
                 self.assertIn(b"first -- is required before every command", result.stdout)
 
     def test_unknown_tree_never_executes(self):
@@ -151,7 +154,7 @@ class CliTests(RepositoryTest):
             ["missing-tree", "-k", "--unknown", "--", *command],
             ["missing-tree", "--keep=1", "--", *command],
             ["missing-tree", "-kk", "--", *command],
-            ["repository", "missing-tree", "--", *command],
+            ["repository", "missing-tree", "extra", "--", *command],
             ["--", "HEAD", "--", *command],
             ["--keep", "--help", "HEAD", "--", *command],
         ]:

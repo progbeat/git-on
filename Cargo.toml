@@ -1,6 +1,6 @@
 [package]
 name = "git-on"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
@@ -10,6 +10,11 @@ license = "MIT"
 default = []
 # Private benchmark instrumentation; normal builds expose no metrics channel.
 test-metrics = []
+
+[[example]]
+name = "source-probe"
+path = "tests/support/source_probe.rs"
+required-features = ["test-metrics"]
 
 [dependencies]
 anyhow = "1"

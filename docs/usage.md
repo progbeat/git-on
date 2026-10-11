@@ -10,7 +10,7 @@ results](#standard-streams-and-temporary-writes) ·
 ## Command syntax
 
 ```text
-git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]
+git on [--keep|-k|--verify] [repository] REV [--keep|-k|--verify] -- <command> [args...]
 git on --cleanup <temporary-directory>
 git on --help
 git on --version
@@ -20,7 +20,8 @@ git on --version
 `git on` available. It can also be invoked directly as `git-on`.
 
 Every executed command requires `--`. Before the first separator, supply exactly
-one local revision and any `--keep`/`-k` options, in either order. Both spellings
+one local revision, or a repository followed by a revision, and any
+`--keep`/`-k`/`--verify` options, in either order. Both keep spellings
 have the same effect; repeating them is harmless. `HEAD:path/to/subtree` remains
 one revision operand. Everything after that first separator is literal command
 argv: git-on does not parse the command's options or any subsequent `--`.
@@ -37,7 +38,7 @@ git on --keep HEAD:examples/uv-project -- uv run --locked main.py
 | `git on -k HEAD -- cmd --keep` | Keep files; pass `--keep` to `cmd` |
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
-| `git on repo HEAD -- cmd` | Usage error: currently exactly one local revision is accepted |
+| `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
 | `git on HEAD --unknown -- cmd` | Usage error: unknown runner option |
 
 Missing `--`, missing or empty revision/command names, extra positional operands,
@@ -62,6 +63,9 @@ For a rare executable named `--keep`, use `git on REV -- --keep -- args`: the
 second `--` belongs to that executable.
 
 ## Filesystem behavior
+
+For HTTPS/SSH URLs, named remotes, cache bounds and native signature verification,
+see [the remote guide](remote.md).
 
 The selected tree is resolved once to a full tree object ID. Commits, annotated tags
 pointing to commits, `HEAD:path`, and raw tree IDs work. The index, unstaged changes,

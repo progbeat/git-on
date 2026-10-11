@@ -253,6 +253,7 @@ struct TreeItem {
 }
 struct State {
     repo: Repository,
+    remote: Option<crate::remote::Remote>,
     trees: Cache<Arc<[TreeItem]>>,
     headers: Cache<u64>,
     blobs: Cache<Arc<[u8]>>,
@@ -261,12 +262,20 @@ struct State {
     spool_directory: PathBuf,
 }
 impl State {
+    fn ensure(&mut self, oid: Oid) -> Result<()> {
+        if let Some(remote) = &mut self.remote {
+            remote.ensure(oid)?;
+            self.repo.odb()?.refresh()?;
+        }
+        Ok(())
+    }
     fn tree(&mut self, oid: Oid) -> Result<Arc<[TreeItem]>> {
         if let Some(tree) = self.trees.get(oid) {
             self.metrics.cache_hits += 1;
             return Ok(tree);
         }
         self.metrics.tree_reads += 1;
+        self.ensure(oid)?;
         let (entries, weight) = {
             let tree = self.repo.find_tree(oid).context("read snapshot tree")?;
             let mut entries = Vec::with_capacity(tree.len());
@@ -304,6 +313,7 @@ impl State {
             return Ok(size);
         }
         self.metrics.header_reads += 1;
+        self.ensure(oid)?;
         let (size, kind) = self
             .repo
             .odb()?
@@ -327,6 +337,7 @@ impl State {
             BlobData::Memory(bytes)
         } else {
             self.metrics.blob_loads += 1;
+            self.ensure(oid)?;
             let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
             let bytes = blob.content();
             self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
@@ -364,6 +375,7 @@ impl State {
             return consume(&bytes);
         }
         self.metrics.blob_loads += 1;
+        self.ensure(oid)?;
         let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
         let bytes = blob.content();
         self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
@@ -409,22 +421,112 @@ impl Snapshot {
         repo_path: &Path,
         treeish: &OsStr,
         run_id: &str,
+        record: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&Path, &str, Oid) -> Result<()>,
+    {
+        Self::load_source_with_pin_record(
+            repo_path, None, treeish, false, repo_path, run_id, record,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_source_with_pin_record<F>(
+        repo_path: &Path,
+        source: Option<&OsStr>,
+        treeish: &OsStr,
+        verify: bool,
+        run_directory: &Path,
+        run_id: &str,
         mut record: F,
     ) -> Result<Self>
     where
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
         let spec = treeish.to_str().context("tree-ish must be valid UTF-8")?;
-        let repo = Repository::discover(repo_path).context("discover Git repository")?;
-        let tree_oid = {
-            let object = repo
-                .revparse_single(spec)
-                .with_context(|| format!("resolve tree-ish {spec:?}"))?;
-            object
-                .peel_to_tree()
-                .context("tree-ish does not resolve to a tree")?
-                .id()
+        let (revision, subtree) = if verify || source.is_some() {
+            match spec.split_once(':') {
+                Some((revision, path)) => (revision, Some(path)),
+                None => (spec, None),
+            }
+        } else {
+            (spec, None)
         };
+        let (repo, mut remote, oid, git) = if let Some(source) = source {
+            let (mut remote, advertisement) =
+                crate::remote::Remote::open(repo_path, source, run_directory)?;
+            let oid = crate::remote::Remote::resolve(&advertisement, revision)?;
+            remote.ensure(oid)?;
+            (Repository::open_bare(&remote.dir)?, Some(remote), oid, None)
+        } else {
+            let git = crate::git::Git::capture(repo_path)?;
+            let oid = git.resolve(OsStr::new(revision))?;
+            (
+                Repository::discover(repo_path).context("discover Git repository")?,
+                None,
+                oid,
+                Some(git),
+            )
+        };
+        let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {
+            if let Some(remote) = remote {
+                remote.ensure(oid)?;
+                repo.odb()?.refresh()?;
+            }
+            Ok(())
+        };
+        let object = repo.find_object(oid, None)?;
+        if verify {
+            let git = remote.as_ref().map(|r| &r.git).or(git.as_ref()).unwrap();
+            git.verify(
+                repo.path(),
+                oid,
+                object.kind().context("unknown Git object type")?,
+            )?;
+        }
+        drop(object);
+        let mut selected = oid;
+        let mut tag_depth = 0;
+        let mut tree_oid = loop {
+            ensure(&mut remote, selected)?;
+            let object = repo.find_object(selected, None)?;
+            match object.kind() {
+                Some(ObjectType::Tree) => break selected,
+                Some(ObjectType::Commit) => break object.as_commit().unwrap().tree_id(),
+                Some(ObjectType::Tag) => {
+                    tag_depth += 1;
+                    if tag_depth > 64 {
+                        bail!("annotated tag chain exceeds 64 objects");
+                    }
+                    selected = object.as_tag().unwrap().target_id();
+                }
+                _ => bail!("revision does not resolve to a tree"),
+            }
+        };
+        if let Some(subtree) = subtree {
+            if !subtree.is_empty() {
+                // Git accepts one trailing slash for a tree, but interior empty
+                // or dot components are literal invalid tree paths. Path's
+                // components() would silently normalize those spellings.
+                for name in subtree.strip_suffix('/').unwrap_or(subtree).split('/') {
+                    if name.is_empty() || name == "." || name == ".." {
+                        bail!("REV:path must select a relative directory without empty, . or .. components");
+                    }
+                    ensure(&mut remote, tree_oid)?;
+                    let tree = repo.find_tree(tree_oid)?;
+                    let entry = tree
+                        .get_name(name)
+                        .context("REV:path directory does not exist")?;
+                    if entry.kind() != Some(ObjectType::Tree) {
+                        bail!("REV:path must select a directory");
+                    }
+                    tree_oid = entry.id();
+                }
+            }
+        }
+        // libgit2 requires a reference target to exist. Fetch only the selected
+        // root tree, not its descendants, before installing the GC pin.
+        ensure(&mut remote, tree_oid)?;
         let pin_ref = format!("refs/git-on/{run_id}");
         if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
             bail!("invalid snapshot run ID");
@@ -445,6 +547,7 @@ impl Snapshot {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     repo,
+                    remote,
                     trees: Cache::new(TREE_CACHE_BYTES, TREE_CACHE_ENTRIES),
                     headers: Cache::new(HEADER_CACHE_ENTRIES * 8, HEADER_CACHE_ENTRIES),
                     blobs: Cache::new(BLOB_CACHE_BYTES, BLOB_CACHE_ENTRIES),
@@ -461,6 +564,18 @@ impl Snapshot {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("snapshot object cache poisoned"))
+    }
+    pub fn stop_remote_transport(&self) {
+        if let Ok(state) = self.state() {
+            if let Some(remote) = &state.remote {
+                remote.stop_transport();
+            }
+        }
+    }
+    pub fn remote_failure(&self) -> Option<String> {
+        self.state()
+            .ok()
+            .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
     fn metadata(item: &TreeItem, path: &Path) -> Result<Entry> {
         let kind = match item.mode {

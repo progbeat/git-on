@@ -341,6 +341,7 @@ fn cleanup(dir: &Path) -> Result<()> {
     }
     ensure_unmounted(&dir)?;
     release_pin(&state)?;
+    git_on::remote::stop_connection(&dir.join("ssh-control"));
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -400,7 +401,13 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
     }
     Ok(())
 }
-fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus> {
+fn execute(
+    tree: OsString,
+    args: Vec<OsString>,
+    keep: bool,
+    source: Option<OsString>,
+    verify: bool,
+) -> Result<ExitStatus> {
     let temp = tempfile::Builder::new()
         .prefix("git-on-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -437,9 +444,12 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
             libc::SIGCHLD,
             libc::SIGCONT,
         ])?;
-        let snapshot = Snapshot::load_with_pin_record(
+        let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
+            source.as_deref(),
             &tree,
+            verify,
+            &dir,
             &id,
             |git_dir, pin, oid| {
                 state.git_dir = Some(git_dir.into());
@@ -534,12 +544,18 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
         }
     })();
     if let Some(snapshot) = observed.take() {
+        if let Some(failure) = snapshot.remote_failure() {
+            result = Err(anyhow::anyhow!(
+                "remote object loading failed; execution incomplete: {failure}"
+            ));
+        }
         #[cfg(feature = "test-metrics")]
         if let Err(e) = report_metrics(&snapshot) {
             result = Err(e);
         }
         // On a busy mount retain the pin for explicit stale recovery.
         if mount_is_ours(&dir, &id).unwrap_or(true) {
+            snapshot.stop_remote_transport();
             std::mem::forget(snapshot);
         }
     }
@@ -552,6 +568,9 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
         }
         ensure_unmounted(&dir)?;
         release_pin(&state)?;
+        if dir.join("remote-repository").exists() {
+            fs::remove_dir_all(dir.join("remote-repository"))?;
+        }
         if keep {
             if let Some(export) = kept_export.as_ref() {
                 match export
@@ -594,7 +613,7 @@ fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
         if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\nRunner options may appear on either side of the single local revision.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
+            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nOne operand selects local REV; two select repository and REV.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\n--verify delegates exact commit/tag signature verification to native Git.\nRunner options may appear anywhere before the command boundary.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
             return Ok(ExitStatus::from_raw(0));
         }
         if args.first().is_some_and(|a| a == "--version") {
@@ -610,7 +629,13 @@ fn main() {
             return Ok(ExitStatus::from_raw(0));
         }
         match cli::parse_run_args(&args) {
-            Ok(run) => execute(run.tree.clone(), run.command.to_vec(), run.keep),
+            Ok(run) => execute(
+                run.tree.clone(),
+                run.command.to_vec(),
+                run.keep,
+                run.repository.cloned(),
+                run.verify,
+            ),
             Err(error) => {
                 eprintln!("git-on: {error}");
                 eprintln!("usage: {}", cli::RUN_USAGE);
@@ -630,6 +655,13 @@ fn main() {
             std::process::exit(status.code().unwrap_or(125));
         }
         Err(e) => {
+            if let Some(signal) = git_on::git::cancelled_signal() {
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+                std::process::exit(128 + signal);
+            }
             eprintln!("git-on: {e:#}");
             std::process::exit(125);
         }

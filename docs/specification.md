@@ -5,7 +5,7 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]` resolves the selected Git tree once and
+- `git on [options] [repository] REV -- <command> [args...]` resolves the selected Git tree once and
   launches the given argv from its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.
@@ -17,8 +17,8 @@ separate from that contract; a requirement is not a claim of a passing test.
   Caller-provided variables with such names remain ordinarily inherited.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
-  accept exactly one nonempty positional operand for the local tree-ish and
-  exact `--keep`/`-k` options. Options may appear on either side of the revision,
+  accept one nonempty operand for the local revision or two for repository and
+  revision, and exact `--keep`/`-k`/`--verify` options. Options may appear on either side of the revision,
   repeat, and combine idempotently. A token beginning with byte `-` that is not
   one of those options is an unknown option. Do not split or normalize the
   revision: `HEAD:path/to/subtree` is one unchanged operand.
@@ -26,7 +26,7 @@ separate from that contract; a requirement is not a claim of a passing test.
   command name beginning with `-`, unknown options, `--keep`, `-k`, and further
   `--` tokens. Empty later arguments and non-UTF-8 bytes are preserved. No shell
   or string re-tokenization is introduced.
-- A missing separator, missing/empty revision, extra positional operand,
+- A missing separator, missing/empty revision, more than two positional operands,
   unknown runner option, or missing/empty command name returns usage status 2
   with a clear diagnostic before Git resolution or runtime-state creation.
   First-token `--help`/`-h`, `--version` and `--cleanup` retain their separate
@@ -40,6 +40,10 @@ separate from that contract; a requirement is not a claim of a passing test.
   or experiment-recording layer. Callers may record output externally.
 
 ## Filesystem policy
+
+Remote demand, persistent cache lifetime, native verification, authentication
+limits and acceptance requirements are normative in [the remote guide](remote.md).
+The same FUSE and ignored-write contract below applies to local and remote runs.
 
 - Entries present in the selected tree are immutable. An ignore match does not
   permit changing, replacing, removing, renaming, or shadowing tracked entries.

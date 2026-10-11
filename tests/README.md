@@ -26,6 +26,37 @@ tests as skipped; this is not evidence that the filesystem works. `--uv` enables
 the dependency integration tests and must not be omitted when claiming complete
 coverage.
 
+## Remote transport and native verification
+
+`tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
+fixture certificates, identities, agents and signing keys. Native Git is the
+verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG;
+no user key or trust store is read or changed by these tests.
+
+```console
+cargo build --locked --features test-metrics --example source-probe --bin git-on
+python3 tests/remote.py
+python3 tests/ssh_regressions.py
+python3 tests/remote.py --require-fuse
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+```
+
+The source probe exercises the production loader without a mount and records
+received OIDs, requested objects, request/response bytes and loader metrics.
+Tests distinguish listing from stat, repeated reads and large ranges; compare
+cold and warm caches; use distinct trees for moving-ref/replacement checks; and
+cover native formats/trust, tag chains, inherited Git settings and server faults.
+SSH tests count ASKPASS and interactive PTY prompts and authenticated connections.
+The million fixture has exactly one million distinct seven-byte blobs at six
+digit paths; preparation verifies every leaf before measuring remote demand.
+
+The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
+mounts for remote writes, keep, cancellation, busy/stale recovery, external
+`git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
+FUSE for the remote million cold no-op/read and warm read. A loader success or
+an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
+availability is not required by these deterministic gates.
+
 ## Complete FUSE callback inventory
 
 The auditable [callback matrix](../docs/fuse-coverage.md) covers every method of

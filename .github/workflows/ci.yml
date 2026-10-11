@@ -20,6 +20,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
+      - name: Install native Git and disposable transport fixture dependencies
+        run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes git openssh-server openssl gnupg
+          git --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -31,6 +37,11 @@ jobs:
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests
+      - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
+        run: |
+          cargo build --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py
+          python3 tests/ssh_regressions.py
 
   real-fuse:
     # This job intentionally fails if the runner cannot open /dev/fuse or mount.
@@ -43,8 +54,9 @@ jobs:
           persist-credentials: false
       - name: Install FUSE and pinned uv
         run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes fuse3
+          sudo apt-get install --yes fuse3 git openssh-server openssl gnupg
           python3 -m pip install --user 'uv==0.8.22'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Require a usable FUSE device
@@ -63,6 +75,10 @@ jobs:
       - run: cargo build --locked
       - name: Real mount, adversarial operations, process lifecycle, and uv
         run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+      - name: Remote mounts, native git -c verification, writes and transport faults
+        run: |
+          cargo build --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py --require-fuse
 
       - name: Seeded bounded filesystem differential stress
         run: >-
@@ -88,15 +104,21 @@ jobs:
           persist-credentials: false
       - name: Install FUSE
         run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes fuse3
+          sudo apt-get install --yes fuse3 git openssl
           test -c /dev/fuse
           command -v fusermount3
       - name: Build optimized runner
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          cargo build --release --locked --features test-metrics
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+      - name: Remote million distinct-file cold and warm fetch gates through real FUSE
+        run: >-
+          python3 tests/remote.py --require-fuse --million
+          --probe target/release/examples/source-probe --binary target/release/git-on
+          RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
       - name: Check benchmark harness
         run: python3 tests/benchmark.py self-test
       - name: Prepare the million-file fixture outside timed runs

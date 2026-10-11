@@ -1,12 +1,14 @@
 use std::{ffi::OsString, fmt, os::unix::ffi::OsStrExt};
 
-pub const RUN_USAGE: &str = "git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]";
+pub const RUN_USAGE: &str = "git on [options] [repository] REV [--keep|-k] -- <command> [args...]";
 
 #[derive(Debug, PartialEq)]
 pub struct RunArgs<'a> {
     pub tree: &'a OsString,
+    pub repository: Option<&'a OsString>,
     pub command: &'a [OsString],
     pub keep: bool,
+    pub verify: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,9 +24,11 @@ impl fmt::Display for UsageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::MissingSeparator => "missing -- separator before the command",
-            Self::RevisionCount => "expected exactly one local revision before --",
+            Self::RevisionCount => "expected REV or repository REV before --",
             Self::EmptyRevision => "revision must not be empty",
-            Self::UnknownOption => "unknown runner option before -- (supported: --keep, -k)",
+            Self::UnknownOption => {
+                "unknown runner option before -- (supported: --keep, -k, --verify)"
+            }
             Self::MissingCommand => "expected a non-empty command after --",
         })
     }
@@ -37,9 +41,12 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, UsageError> {
         .ok_or(UsageError::MissingSeparator)?;
     let mut operands = Vec::new();
     let mut keep = false;
+    let mut verify = false;
     for arg in &args[..boundary] {
         if arg == "--keep" || arg == "-k" {
             keep = true;
+        } else if arg == "--verify" {
+            verify = true;
         } else if arg.is_empty() {
             return Err(UsageError::EmptyRevision);
         } else if arg.as_bytes().starts_with(b"-") {
@@ -48,10 +55,10 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, UsageError> {
             operands.push(arg);
         }
     }
-    // One positional operand currently selects a local revision. Command argv
-    // always starts after the delimiter, independently of operand cardinality.
-    let [tree] = operands.as_slice() else {
-        return Err(UsageError::RevisionCount);
+    let (repository, tree) = match operands.as_slice() {
+        [tree] => (None, *tree),
+        [repository, tree] => (Some(*repository), *tree),
+        _ => return Err(UsageError::RevisionCount),
     };
     let command = &args[boundary + 1..];
     if command.first().is_none_or(|arg| arg.is_empty()) {
@@ -59,8 +66,10 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, UsageError> {
     }
     Ok(RunArgs {
         tree,
+        repository,
         command,
         keep,
+        verify,
     })
 }
 
@@ -101,8 +110,6 @@ mod tests {
             vec!["HEAD", "cmd"],
             vec!["--keep", "HEAD", "cmd"],
             vec!["-k", "HEAD", "cmd"],
-            vec!["HEAD", "cmd", "--", "arg"],
-            vec!["HEAD", "--keep", "cmd", "--", "arg"],
         ] {
             assert!(parse_run_args(&arguments(&args)).is_err(), "{args:?}");
         }
@@ -130,6 +137,31 @@ mod tests {
         assert_run(&[tree, "--", "cmd"], tree, &["cmd"], false);
         assert_run(&[tree, "-k", "--", "cmd"], tree, &["cmd"], true);
     }
+    #[test]
+    fn remote_operands_verify_and_literal_command_tail() {
+        for source in [
+            "origin",
+            "https://example.invalid/repo.git",
+            "ssh://git@example.invalid/repo",
+        ] {
+            let args = arguments(&[
+                "--verify",
+                source,
+                "-k",
+                "main:deep",
+                "--",
+                "cmd",
+                "--verify",
+                "-k",
+                "--",
+            ]);
+            let parsed = parse_run_args(&args).unwrap();
+            assert_eq!(parsed.repository.unwrap(), source);
+            assert_eq!(parsed.tree, "main:deep");
+            assert!(parsed.keep && parsed.verify);
+            assert_eq!(parsed.command, arguments(&["cmd", "--verify", "-k", "--"]));
+        }
+    }
 
     #[test]
     fn malformed_prefix_and_missing_command_are_usage_errors() {
@@ -139,7 +171,10 @@ mod tests {
             (vec!["--"], UsageError::RevisionCount),
             (vec!["--", "HEAD", "cmd"], UsageError::RevisionCount),
             (vec!["--keep", "--", "cmd"], UsageError::RevisionCount),
-            (vec!["repo", "HEAD", "--", "cmd"], UsageError::RevisionCount),
+            (
+                vec!["repo", "HEAD", "extra", "--", "cmd"],
+                UsageError::RevisionCount,
+            ),
             (vec!["HEAD", "--"], UsageError::MissingCommand),
             (vec!["HEAD", "-k", "--", ""], UsageError::MissingCommand),
             (vec!["", "--", "cmd"], UsageError::EmptyRevision),

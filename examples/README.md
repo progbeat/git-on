@@ -29,6 +29,11 @@ The committed `.gitignore` permits `__pycache__/` and `.venv/` writes.
 
 After committing the examples in a repository, run either snapshot subtree:
 
+The same workload can select a configured remote:
+`git on origin main:examples/uv-project -k -- uv run --locked main.py`.
+Add `--verify` when native Git should verify the selected commit or annotated tag
+under your existing configuration. Verification does not assert passed tests.
+
 ```console
 git on HEAD:examples/pep723 -- uv run --locked --script main.py
 git on HEAD:examples/uv-project -- uv run --locked main.py
