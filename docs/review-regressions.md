@@ -125,3 +125,8 @@ The final invocation is also enclosed in a complete shell group.
 `test_final_invocation_truncation_cannot_drop_arguments` reproduced dropped
 arguments before that guard and now rejects every incomplete byte-prefix of the
 call while verifying argument preservation for the complete script.
+
+Final package-log inspection confirmed dynamic libz.so.1 and libgcc_s.so.1
+requirements in addition to glibc. The missing-runtime-library probe test failed
+before the diagnostic improvement and passes afterward; the existing executable
+remains unchanged. README and installation guidance now list those runtimes.

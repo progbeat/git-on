@@ -90,7 +90,10 @@ where master advances after the PR's version check finishes.
 ## Installing a published binary
 
 The installer needs Python 3.8+ and supports **Linux x86_64 with glibc 2.35+**
-(Ubuntu 22.04 baseline). It installs a prebuilt binary; Rust, a C compiler, jq,
+(Ubuntu 22.04 baseline), plus the shared zlib (`libz.so.1`) and GCC
+(`libgcc_s.so.1`) runtimes confirmed by the packaging job. Its executable probe
+catches missing runtime libraries before replacing an existing installation.
+It installs a prebuilt binary; Rust, a C compiler, jq,
 and sudo are not needed. The same command installs or updates to GitHub's latest
 stable release each time it runs:
 

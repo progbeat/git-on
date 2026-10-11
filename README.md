@@ -32,7 +32,8 @@ network access, and access to host files outside the mount. Run only code you tr
 
 ## Installation and support
 
-Prebuilt binaries target **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseline).
+Prebuilt binaries target **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseline),
+with the shared zlib (`libz.so.1`) and GCC (`libgcc_s.so.1`) runtimes.
 Running git-on requires a usable `/dev/fuse` and `fusermount3`, usually provided by
 your distribution's `fuse3` package. The installer needs `curl` and Python 3.8+;
 Rust is not needed to run a prebuilt binary.

@@ -296,7 +296,7 @@ def install(directory, archive, tag, bin_dir):
         result = subprocess.run(["/proc/self/fd/" + str(dir_fd) + "/" + staged, "--version"],
                                 pass_fds=(dir_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
         if result.returncode or result.stdout.decode("utf-8").strip() != "git-on " + tag[1:]:
-            fail("Downloaded executable failed its version check; existing installation is unchanged.")
+            fail("Downloaded executable failed its version check. It needs glibc 2.35+, libz.so.1 and libgcc_s.so.1; check your distribution runtime libraries. Existing installation is unchanged.")
         check_target(dir_fd)
         os.replace(staged, "git-on", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     finally:

@@ -210,6 +210,15 @@ else:
                                (root + '/README.md', 'file', b'readme')])
         self.assertIn('version check', self.run_script(success=False).stderr)
 
+    def test_missing_runtime_library_probe_preserves_old_binary(self):
+        root = 'git-on-v0.1.0-' + MOD.TARGET
+        self.release('0.1.0', [(root, 'dir', b''), (root + '/git-on', 'file',
+                              b'#!/bin/sh\necho "libz.so.1: cannot open shared object file" >&2\nexit 127\n'),
+                               (root + '/README.md', 'file', b'readme')])
+        result = self.run_script(success=False)
+        self.assertIn('libz.so.1', result.stderr)
+        self.assertIn('libgcc_s.so.1', result.stderr)
+
     def test_unsafe_archive_members_preserve_old_binary(self):
         root = 'git-on-v0.1.0-' + MOD.TARGET
         normal = [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
