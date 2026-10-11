@@ -93,3 +93,8 @@ python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
 ```
 
 The last command requires real FUSE and uv. GitHub Actions runs a separate required real-mount job, including locked uv/NumPy/Numba workloads, process lifecycle, concurrency, and adversarial filesystem operations. Missing mount capability is a failure, never an emulated pass. Unit tests do not substitute for kernel/FUSE integration evidence.
+
+For the reproducible million-file random-read baseline and measurement limits,
+see [performance benchmarks](tests/benchmark.md). The separate CI benchmark job
+runs the exact digit-tree workload with an optimized binary; successful output
+verification is not evidence that loading is lazy.

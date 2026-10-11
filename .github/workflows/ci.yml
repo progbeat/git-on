@@ -58,3 +58,41 @@ jobs:
       - run: cargo build --locked
       - name: Real mount, adversarial operations, process lifecycle, and uv
         run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+
+  million-file-baseline:
+    # Measurements, not a numerical performance gate or proof of lazy access.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+          test -c /dev/fuse
+          command -v fusermount3
+      - name: Build optimized runner
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo build --release --locked
+      - name: Check benchmark harness
+        run: python3 tests/benchmark.py self-test
+      - name: Prepare the million-file fixture outside timed runs
+        run: python3 tests/benchmark.py prepare --directory /tmp/git-on-million --digit-files 1000000
+      - name: Measure seeded random reads through a real mount
+        run: >-
+          python3 tests/benchmark.py run
+          --fixtures /tmp/git-on-million
+          --output benchmark-results
+          --binary target/release/git-on
+          --repeats 3 --warmups 0 --timeout 180 --seed 0
+      - name: Print measured baseline including failed trials
+        if: always()
+        run: |
+          if test -f benchmark-results/results.jsonl; then
+            cat benchmark-results/results.jsonl
+          fi

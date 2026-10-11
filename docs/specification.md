@@ -79,9 +79,11 @@ functional correctness:
 - Build exactly one million leaf files for six-digit strings `000000` through
   `999999`. The first five digits are nested directories and the sixth is the
   filename: `123456` maps to `1/2/3/4/5/6`. Each directory has ten entries.
-- The child script randomly chooses a number, reads the corresponding file, and
-  prints its content. Record the seed and chosen number so the workload can be
-  reproduced, and verify that stdout matches the selected file's content.
+- Each leaf contains its six-digit number (with a documented optional newline).
+  The benchmark harness chooses a seeded random number before timing, then runs
+  `git on <tree-OID> cat <digit-path>`. Record the seed and chosen number and
+  verify externally that stdout matches that number. No Python child script or
+  its interpreter startup is required in the measured workload.
 - Measure from git-on invocation until that correct stdout is observed, as well
   as child-start latency, total time, and peak memory where available. Fixture
   construction is excluded. Repeat trials and identify cold/warm cache state.
