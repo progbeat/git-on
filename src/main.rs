@@ -531,6 +531,14 @@ fn execute(
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
         let outcome = supervise(&mut child, &mut signals, &terminal);
+        if let Ok(status) = &outcome {
+            if let Some(signal) = status.signal() {
+                git_on::git::cancel_by_signal(signal);
+            }
+        }
+        // Escaped or terminated readers can leave a FUSE callback inside a
+        // native fetch. Stop it before unmounting or inspecting snapshot state.
+        git_on::git::stop_operations();
         if outcome.is_err() {
             kill_group(pid, libc::SIGKILL);
             let _ = child.wait();
@@ -543,6 +551,9 @@ fn execute(
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })();
+    // Also cover errors before the child could start. State inspection below
+    // must never wait behind an owned operation that the run no longer needs.
+    git_on::git::stop_operations();
     if let Some(snapshot) = observed.take() {
         if let Some(failure) = snapshot.remote_failure() {
             result = Err(anyhow::anyhow!(
@@ -570,6 +581,11 @@ fn execute(
         release_pin(&state)?;
         if dir.join("remote-repository").exists() {
             fs::remove_dir_all(dir.join("remote-repository"))?;
+        }
+        match fs::remove_file(dir.join(git_on::remote::SSH_CONTROL_OWNER_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove SSH recovery identity"),
         }
         if keep {
             if let Some(export) = kept_export.as_ref() {

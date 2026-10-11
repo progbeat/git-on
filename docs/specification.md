@@ -68,7 +68,8 @@ The same FUSE and ignored-write contract below applies to local and remote runs.
   this cleanup scope.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, and releasing the exact Git pin; it is not a run manifest or log.
+  locking, releasing the exact Git pin and identifying the owned SSH socket;
+  it is not a run manifest or log.
   `git on --cleanup <temporary-directory>` must refuse active or deliberately
   retained directories, avoid unrelated mounts and changed pin targets, and
   never terminate processes based on stale PIDs.

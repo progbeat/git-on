@@ -32,6 +32,7 @@ PARSER.add_argument('--probe', type=Path, default=ROOT / 'target/debug/examples/
 PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
+PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
 
 def run(argv, **kwargs):
@@ -65,11 +66,15 @@ class Fixture:
         self.requests = []
         self.denied_oids = set()
         self.deny_auth = False
+        self.stalled_oids = set()
+        self.stalled = threading.Event()
+        self.resume = threading.Event()
         self.children = []
         self.handles = []
     def git(self, *args, data=None, at=None):
         return run(['git', '-C', at or self.repo, *args], input=data, env=self.env).decode()
     def close(self):
+        self.resume.set()
         if hasattr(self,'server'): self.server.server_close()
         for process in reversed(self.children):
             if process.poll() is None:
@@ -91,6 +96,10 @@ class Fixture:
                 path, _, query = self.path.partition('?')
                 data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
                 wants = [x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)]
+                if fixture.stalled_oids.intersection(wants):
+                    fixture.stalled.set()
+                    if not fixture.resume.wait(timeout=30):
+                        self.send_error(504,'controlled transport stall timed out'); return
                 if fixture.deny_auth or fixture.denied_oids.intersection(wants):
                     status = 401 if fixture.deny_auth else 403
                     self.send_response(status); self.send_header('Content-Length', '0'); self.end_headers()
@@ -335,6 +344,7 @@ class RemoteTests(unittest.TestCase):
         retained=list(f.root.glob('git-on-*')); self.assertEqual(len(retained),1)
         self.assertEqual((retained[0]/'backing/out/result').read_text(),'kept')
         self.assertFalse((retained[0]/'remote-repository').exists())
+        self.assertFalse((retained[0]/'ssh-control-owner').exists())
         refused=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(retained[0])],capture_output=True,timeout=10)
         self.assertNotEqual(refused.returncode,0)
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sleep','30'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -472,8 +482,9 @@ class RemoteTests(unittest.TestCase):
         env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH'])
         for key in list(env):
             if key.startswith('GIT_CONFIG_KEY_') or key.startswith('GIT_CONFIG_VALUE_') or key=='GIT_CONFIG_COUNT': del env[key]
-        result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',url,signed+':deep','--','cat','file'],cwd=f.cwd,env=env,capture_output=True,timeout=30)
-        self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
+        for cwd,operands in ((f.cwd,[url,signed+':deep']),(f.repo,[signed+':deep'])):
+            result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',*operands,'--','cat','file'],cwd=cwd,env=env,capture_output=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
         shutil.rmtree(f.root/'cache')
         # The command catches EIO and returns 0. The runner must still report 125.
         f.denied_oids.add(f.blob)
@@ -575,6 +586,9 @@ class RemoteTests(unittest.TestCase):
         while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
         self.assertTrue(ready.exists())
         state=json.loads(ready.read_text()); directory=Path(state['run'])
+        control=['ssh','-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
+        self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        self.assertTrue((directory/'ssh-control-owner').is_file())
         def cleanup():
             with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
             if process.poll() is None: process.kill()
@@ -584,9 +598,11 @@ class RemoteTests(unittest.TestCase):
         active=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
         self.assertNotEqual(active.returncode,0); self.assertTrue((directory/'backing').exists())
         process.kill(); os.killpg(state['pid'],signal.SIGKILL); process.communicate(timeout=10)
+        self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertTrue((directory/'remote-repository').exists())
         stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
         self.assertEqual(stale.returncode,0,stale.stderr); self.assertFalse(directory.exists())
+        self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     def test_real_mount_remote_busy_retention_and_cleanup(self):
@@ -611,5 +627,82 @@ class RemoteTests(unittest.TestCase):
                 stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(stale.returncode,0,stale.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def stalled_mount_shutdown(self, binary, escaped, expect_old):
+        f=self.f; url=self.stall_url
+        shutil.rmtree(f.root/'cache',ignore_errors=True)
+        f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.blob}
+        ready=f.root/'stall-ready'; escaped_pid=f.root/'stall-escaped'; exit_file=f.root/'leader-exit'
+        for path in (ready,escaped_pid,exit_file): path.unlink(missing_ok=True)
+        reader="import os,time; from pathlib import Path; Path(os.environ['ESCAPED_PID']).write_text(str(os.getpid()))\ntry:\n open('deep/file').read()\nexcept OSError:\n pass\ntime.sleep(300)"
+        code="import json,os,subprocess,sys,time; from pathlib import Path; Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+        if escaped:
+            code+="subprocess.Popen([sys.executable,'-c',sys.argv[1]],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\nwhile not Path(os.environ['LEADER_EXIT']).exists(): time.sleep(.01)\n"
+        else: code+="open('deep/file').read()\n"
+        process=subprocess.Popen([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code,reader],cwd=f.cwd,env=dict(f.env,READY=str(ready),ESCAPED_PID=str(escaped_pid),LEADER_EXIT=str(exit_file)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process); directory=None
+        try:
+            self.assertTrue(f.stalled.wait(timeout=20),'lazy fetch never reached controlled server stall')
+            self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
+            if escaped: exit_file.write_text('exit successfully')
+            else: os.killpg(state['pid'],signal.SIGTERM)
+            try:
+                _,errors=process.communicate(timeout=8)
+                stayed_blocked=False
+            except subprocess.TimeoutExpired:
+                stayed_blocked=True
+                process.kill(); f.resume.set(); process.communicate(timeout=10)
+                errors=b'runner stayed blocked after child completion'
+            if expect_old:
+                self.assertTrue(stayed_blocked,'before-fix binary did not reproduce stalled shutdown: '+repr(errors))
+            else:
+                self.assertFalse(stayed_blocked,'runner stayed blocked after child completion')
+                self.assertEqual(process.returncode,125 if escaped else -signal.SIGTERM,errors)
+                if escaped: self.assertTrue(directory.exists(),'busy escaped cwd must preserve recovery state')
+                else: self.assertFalse(directory.exists(),'signaled command must clean its run')
+            print('shutdown regression evidence:',json.dumps(dict(binary=str(binary),escaped=escaped,before=expect_old,observed_stall=stayed_blocked)),flush=True)
+        finally:
+            f.resume.set(); f.stalled_oids.clear()
+            if process.poll() is None: process.kill(); process.communicate(timeout=10)
+            if ready.exists():
+                with contextlib.suppress(ProcessLookupError): os.killpg(json.loads(ready.read_text())['pid'],signal.SIGKILL)
+            if escaped_pid.exists():
+                with contextlib.suppress(ProcessLookupError): os.killpg(int(escaped_pid.read_text()),signal.SIGKILL)
+            if directory is not None and directory.exists():
+                cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+                self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+
+    def test_review_real_mount_stalled_lazy_fetch_shutdown(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; self.stall_url=f.https(); self.addCleanup(f.server.shutdown)
+        for escaped in (False,True):
+            with self.subTest(escaped=escaped):
+                if OPTIONS.before_binary: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
+                self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
+
+    def test_review_real_mount_caught_cache_fault_forces_runner_failure(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        code="import errno,os; from pathlib import Path; (Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('cache fault not observed')\n"
+        cases=([(OPTIONS.before_binary,0)] if OPTIONS.before_binary else [])+[(OPTIONS.binary,125)]
+        for binary,expected in cases:
+            shutil.rmtree(f.root/'cache',ignore_errors=True)
+            result=subprocess.run([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+            self.assertEqual(result.returncode,expected,result.stderr)
+            if expected==125:
+                self.assertIn(b'not-an-object',result.stderr)
+                self.assertIn(b'execution incomplete',result.stderr)
+            self.assertEqual(list(f.root.glob('git-on-*')),[])
+            print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
+
+    def test_native_failed_verification_never_executes_command(self):
+        f=self.f; signed,allowed=self.signing(); sentinel=f.root/'command-executed'
+        allowed.write_text('')
+        for revision in (signed,f.commit,f.tree):
+            result=subprocess.run([str(OPTIONS.binary.resolve()),'--verify',revision,'--',sys.executable,'-c',f'from pathlib import Path; Path({str(sentinel)!r}).touch()'],cwd=f.repo,env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,125,result.stderr)
+            self.assertTrue(b'execution forbidden' in result.stderr or b'raw trees' in result.stderr,result.stderr)
+            self.assertFalse(sentinel.exists())
+            self.assertEqual(list(f.root.glob('git-on-*')),[])
 
 if __name__=='__main__': unittest.main(argv=[__file__,*ARGS])

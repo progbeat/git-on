@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Focused SSH review regressions using disposable real OpenSSH fixtures."""
 import importlib.util
+import contextlib
+import json
 import os
 from pathlib import Path
 import pty
 import select
 import signal
+import shlex
+import socket
 import subprocess
 import time
 import unittest
+import uuid
 
 SPEC = importlib.util.spec_from_file_location('git_on_remote_fixtures', Path(__file__).with_name('remote.py'))
 remote = importlib.util.module_from_spec(SPEC)
@@ -170,6 +175,124 @@ class SshRegressionTests(unittest.TestCase):
         _, errors = process.communicate(timeout=10)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn(b'non-OpenSSH variants are unsupported', errors)
+
+    def test_stale_cleanup_never_follows_control_socket_symlink(self):
+        f = self.f
+        url = f.ssh()
+        user_host, port_and_path = url.removeprefix('ssh://').split(':', 1)
+        port = port_and_path.split('/', 1)[0]
+        unrelated = f.root / 'unrelated-master'
+        command = shlex.split(f.env['GIT_SSH_COMMAND']) + [
+            '-p', port, '-M', '-S', str(unrelated), '-o', 'ControlPersist=yes', '-fN', user_host]
+        remote.run(command, env=f.env)
+        self.addCleanup(lambda: subprocess.run(
+            ['ssh', '-F', '/dev/null', '-S', str(unrelated), '-O', 'exit', 'unused'],
+            capture_output=True, timeout=5))
+        check = ['ssh', '-F', '/dev/null', '-S', str(unrelated), '-O', 'check', 'unused']
+        self.assertEqual(subprocess.run(check, capture_output=True, timeout=5).returncode, 0)
+        stale = f.root / 'git-on-stale'
+        stale.mkdir(mode=0o700)
+        (stale / '.lock').touch()
+        (stale / '.state').write_text(json.dumps(dict(
+            format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
+            git_dir=None, tree_oid=None, pin_ref=None)))
+        (stale / 'ssh-control').symlink_to(unrelated)
+        cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(stale)],
+                                 env=f.env, capture_output=True, timeout=5)
+        self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+        self.assertFalse(stale.exists(), 'validated stale run was not removed')
+        self.assertEqual(subprocess.run(check, capture_output=True, timeout=5).returncode, 0,
+                         'stale cleanup stopped a connection outside its run directory')
+
+    def test_native_config_fifo_cancellation_stops_git_and_removes_state(self):
+        f = self.f
+        fifo = f.root / 'git-config-fifo'
+        os.mkfifo(fifo)
+        f.env['GIT_CONFIG_GLOBAL'] = str(fifo)
+        process = subprocess.Popen([
+            str(remote.OPTIONS.binary.resolve()), 'file://' + str(f.repo), 'HEAD', '--', 'true'],
+            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        f.children.append(process)
+        native_children = []
+        try:
+            deadline = time.monotonic() + 5
+            while not list(f.root.glob('git-on-*/.state')) and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(list(f.root.glob('git-on-*/.state')), 'runner state was never created')
+            deadline = time.monotonic() + 5
+            while not native_children and process.poll() is None and time.monotonic() < deadline:
+                for entry in Path('/proc').iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        parent = (entry / 'stat').read_text().rpartition(')')[2].split()[1]
+                        if parent == str(process.pid) and (entry / 'cmdline').read_bytes().startswith(b'git\x00config\x00'):
+                            native_children.append(int(entry.name))
+                    except (FileNotFoundError, PermissionError, ProcessLookupError):
+                        pass
+                if not native_children:
+                    time.sleep(.01)
+            self.assertTrue(native_children, 'real Git config reader did not start')
+            process.send_signal(signal.SIGTERM)
+            try:
+                _, errors = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.fail('effective native Git config capture ignored SIGTERM while reading a FIFO')
+            self.assertEqual(process.returncode, -signal.SIGTERM, errors)
+            self.assertEqual(list(f.root.glob('git-on-*')), [])
+            for pid in native_children:
+                proc = Path('/proc') / str(pid)
+                self.assertTrue(not proc.exists() or (proc / 'stat').read_text().rpartition(')')[2].split()[0] == 'Z',
+                                'owned Git config reader survived cancellation')
+        finally:
+            if process.poll() is None:
+                for pid in native_children:
+                    with contextlib.suppress(FileNotFoundError, ProcessLookupError):
+                        parent = (Path('/proc') / str(pid) / 'stat').read_text().rpartition(')')[2].split()[1]
+                        if parent == str(process.pid):
+                            os.killpg(pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+
+    def test_stale_cleanup_never_stops_replaced_or_unrecorded_real_socket(self):
+        f = self.f
+        url = f.ssh()
+        user_host, port_and_path = url.removeprefix('ssh://').split(':', 1)
+        port = port_and_path.split('/', 1)[0]
+        for owner_mode in ('replaced', 'missing', 'malformed'):
+            with self.subTest(owner_mode=owner_mode):
+                unrelated = f.root / ('unrelated-master-' + owner_mode)
+                remote.run(shlex.split(f.env['GIT_SSH_COMMAND']) + [
+                    '-p', port, '-M', '-S', str(unrelated), '-o', 'ControlPersist=yes', '-fN', user_host], env=f.env)
+                self.addCleanup(lambda path=unrelated: subprocess.run(
+                    ['ssh', '-F', '/dev/null', '-S', str(path), '-O', 'exit', 'unused'],
+                    capture_output=True, timeout=5))
+                stale = f.root / ('git-on-stale-' + owner_mode)
+                stale.mkdir(mode=0o700)
+                (stale / '.lock').touch()
+                (stale / '.state').write_text(json.dumps(dict(
+                    format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
+                    git_dir=None, tree_oid=None, pin_ref=None)))
+                target = stale / 'ssh-control'
+                if owner_mode == 'replaced':
+                    with socket.socket(socket.AF_UNIX) as original:
+                        original.bind(str(target))
+                    metadata = target.stat()
+                    (stale / 'ssh-control-owner').write_text(json.dumps(dict(
+                        format='git-on-ssh-control-v1', device=metadata.st_dev, inode=metadata.st_ino)))
+                    target.unlink()
+                elif owner_mode == 'malformed':
+                    (stale / 'ssh-control-owner').write_text('invalid recovery identity')
+                os.link(unrelated, target)
+                cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(stale)],
+                                         env=f.env, capture_output=True, timeout=5)
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                self.assertFalse(stale.exists(), 'validated stale run was not removed')
+                check = subprocess.run(['ssh', '-F', '/dev/null', '-S', str(unrelated), '-O', 'check', 'unused'],
+                                       capture_output=True, timeout=5)
+                self.assertEqual(check.returncode, 0, 'cleanup stopped a replaced/unrecorded external socket')
 
 
 if __name__ == '__main__':

@@ -71,6 +71,36 @@ run state. After the fix, all six `remote_source` tests passed, including this
 actual-binary startup check. This is local process/cancellation evidence without
 a FUSE mount; cancellation during mounted remote reads still requires CI.
 
+## Native configuration cancellation and owned SSH recovery identity
+
+Independent re-review reproduced a native Git startup stall at the authentic
+feature checkpoint `92377e27e32ac424d688ae8bcf0fbe6be0081c0c`. With
+`GIT_CONFIG_GLOBAL` naming a FIFO without a writer, the runner's direct
+configuration capture ignored SIGTERM for more than two seconds. The permanent
+`SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state`
+failed before the fix. Configuration capture and original Git-directory lookup
+now use the same owned, cancellable subprocess path as transport and verification.
+The regression asserts a real Git config child starts, the runner exits by
+SIGTERM, the child stops and temporary state disappears.
+
+The same review demonstrated that stale cleanup followed `ssh-control` symlinks
+and stopped an unrelated disposable master outside its run. A type-only socket
+guard fixed that case but still accepted a hardlinked/replaced real socket:
+the external master's native `ssh -O check` changed from 0 to 255. The permanent
+`test_stale_cleanup_never_follows_control_socket_symlink` and
+`test_stale_cleanup_never_stops_replaced_or_unrecorded_real_socket` preserve these
+failures, including missing and malformed recovery records. The loader records
+the owned socket's device/inode in a private ephemeral recovery file and keeps
+the same expected identity in memory. Shutdown checks that identity instead of
+trusting a mutable pathname. Normal and kept completion remove the marker;
+validated stale cleanup skips unrecorded or changed sockets.
+
+All ten focused SSH/configuration regressions passed after these fixes, and
+strict metrics clippy passed. Successful child completion also requests native
+operation shutdown before unmount/state locking through a separate flag; this
+does not invent a termination signal. Its real-mounted stalled-read and busy
+recovery evidence is tracked separately and requires exact-head FUSE CI.
+
 ## Reproduced runtime defects
 
 The independent review used `03f18c36fcb01f8d49cb196e250cee2bffd0f86a` as the
@@ -287,6 +317,22 @@ remains unchanged. README and installation guidance now list those runtimes.
 
 ## SSH control precedence, direct commands and terminal interruption
 
+The mounted shutdown regression replays the authentic feature checkpoint
+`92377e27e32ac424d688ae8bcf0fbe6be0081c0c` in the feature PR's real-FUSE CI.
+`test_review_real_mount_stalled_lazy_fetch_shutdown` holds an actual smart-HTTPS
+blob request while either signalling the foreground command or letting its
+leader exit with an escaped reader. It verifies that the old runner remains
+blocked, then requires bounded completion, correct status and recovery behavior
+from the fixed runner. The escaped reader retains its cwd so busy cleanup must
+preserve the run until it exits. Historical replay is conditional after squash
+merges; the permanent fixed-behavior cases always run with required real FUSE.
+Local loader/protocol results do not establish these mounted cases.
+
+`test_review_real_mount_caught_cache_fault_forces_runner_failure` additionally
+injects a real cache error after mounting, catches its EIO in a successful
+command, and compares the old runner's status 0 with the required fixed status
+125 and diagnostic. Exact-head CI supplies execution evidence for both cases.
+
 Independent review in the fresh runtime reproduced an unused-environment
 precedence defect: native `git ls-remote` succeeded with a valid
 `GIT_SSH_COMMAND` and `GIT_SSH=/does/not/exist`, while the restored source probe
@@ -318,3 +364,24 @@ OpenSSH and PTY checks without FUSE. Busy/stale mounted cleanup and the final
 independent review still require completion; no actual mount or exact-head CI
 result is claimed here. Direct shell prefixes/compounds and non-OpenSSH variants
 are diagnosed precisely rather than claimed supported.
+
+## Cache restoration errors must survive a caught filesystem failure
+
+Fresh independent cross-review reproduced a demanded cache error that escaped
+runner failure reporting. `Remote::ensure` returned errors from cache restoration
+before its fetch-only failure latch. With a disposable filtered server, the
+permanent `review_cache_restore_failure_is_latched` inserts an unusable cache
+entry after startup and demands an uncached subtree. Before the fix, the
+operation failed while `Snapshot::remote_failure()` remained `None`; the focused
+Rust regression exited 101 with "demanded cache failure was not latched for
+runner failure". The authentic before-fix feature checkpoint is
+`92377e27e32ac424d688ae8bcf0fbe6be0081c0c`.
+
+`Remote::ensure` now latches repository, ODB, cache and fetch failures alike,
+reports the first failure, and retains that original diagnostic across later
+demands. Removing the unusable cache entry cannot trigger another transport
+attempt after failure. The isolated regression avoids changing the process-wide
+cache environment of concurrent tests. `cargo test --locked --test
+remote_source` passed all seven cases after the fix. This loader regression
+verifies the flag consumed by runner completion; a caught EIO on an actual
+mount still needs the required real-FUSE acceptance run.

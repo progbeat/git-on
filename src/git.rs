@@ -16,11 +16,12 @@ pub struct Git {
 }
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(cwd)
             .args(["config", "--null", "--list", "--includes"])
-            .output()
-            .context("read effective Git configuration")?;
+            .stdin(Stdio::null());
+        let output = run(command, true).context("read effective Git configuration")?;
         if !output.status.success() {
             bail!(
                 "read effective Git configuration: {}",
@@ -42,17 +43,21 @@ impl Git {
         Ok(Self {
             cwd: cwd.to_path_buf(),
             config,
-            original_dir: Command::new("git")
-                .current_dir(cwd)
-                .args(["rev-parse", "--absolute-git-dir"])
-                .output()
-                .ok()
-                .filter(|x| x.status.success())
-                .map(|x| {
-                    PathBuf::from(OsString::from_vec(
-                        x.stdout.strip_suffix(b"\n").unwrap_or(&x.stdout).to_vec(),
-                    ))
-                }),
+            original_dir: {
+                let mut command = Command::new("git");
+                command
+                    .current_dir(cwd)
+                    .args(["rev-parse", "--absolute-git-dir"])
+                    .stdin(Stdio::null());
+                run(command, true)
+                    .ok()
+                    .filter(|x| x.status.success())
+                    .map(|x| {
+                        PathBuf::from(OsString::from_vec(
+                            x.stdout.strip_suffix(b"\n").unwrap_or(&x.stdout).to_vec(),
+                        ))
+                    })
+            },
         })
     }
     pub fn command(&self, dir: Option<&Path>) -> Command {
@@ -187,6 +192,16 @@ trait SplitByte {
 }
 static CANCELLED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicI32>> =
     std::sync::OnceLock::new();
+static OPERATIONS_STOPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// End owned native operations after the command finishes without inventing a
+/// termination signal. The runner process handles one command invocation.
+pub fn stop_operations() {
+    OPERATIONS_STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn operations_stopped() -> bool {
+    OPERATIONS_STOPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub fn cancelled_signal() -> Option<i32> {
     let signal = CANCELLED
         .get()
@@ -231,6 +246,9 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     cancellation()?;
     if let Some(signal) = cancelled_signal() {
         bail!("Git operation cancelled by signal {signal}");
+    }
+    if operations_stopped() {
+        bail!("Git operation stopped after command completion");
     }
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -280,6 +298,15 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
             let _ = child.wait();
             break Err(anyhow::anyhow!(
                 "Git operation cancelled by signal {signal}"
+            ));
+        }
+        if operations_stopped() {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            break Err(anyhow::anyhow!(
+                "Git operation stopped after command completion"
             ));
         }
         std::thread::sleep(Duration::from_millis(10));

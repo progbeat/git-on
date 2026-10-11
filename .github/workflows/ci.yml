@@ -51,6 +51,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Install FUSE and pinned uv
         run: |
@@ -77,8 +78,19 @@ jobs:
         run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
+          BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
+          BEFORE_ARGUMENT=()
+          # Replay the authentic pre-fix feature revision while reviewing this
+          # branch. Later squash merges retain the permanent green tests even
+          # when that intermediate commit is no longer in master's ancestry.
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-review-before "$BEFORE"
+            cargo build --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$PWD/target"
+            cp target/debug/git-on /tmp/git-on-review-before-bin
+            BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
+          fi
           cargo build --locked --features test-metrics --example source-probe --bin git-on
-          python3 tests/remote.py --require-fuse
+          python3 tests/remote.py --require-fuse "${BEFORE_ARGUMENT[@]}"
 
       - name: Seeded bounded filesystem differential stress
         run: >-

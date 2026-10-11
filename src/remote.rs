@@ -7,7 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, OpenOptionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
     },
     path::{Path, PathBuf},
@@ -16,6 +16,15 @@ use std::{
 
 pub const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DISK_CACHE_ENTRIES: usize = 4096;
+pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SocketOwner {
+    format: String,
+    device: u64,
+    inode: u64,
+}
 
 pub struct Remote {
     pub git: Git,
@@ -23,6 +32,7 @@ pub struct Remote {
     source: OsString,
     cache: DiskCache,
     socket: Option<PathBuf>,
+    socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
     failed: Option<String>,
 }
@@ -106,6 +116,7 @@ impl Remote {
             source: transport_source,
             cache,
             socket,
+            socket_owner: None,
             ssh,
             failed: None,
         };
@@ -120,12 +131,20 @@ impl Remote {
             .arg("--")
             .arg(&remote.source)
             .stdin(Stdio::inherit());
-        let out = crate::git::run(command, true).context("advertise remote refs")?;
+        let outcome = crate::git::run(command, true).context("advertise remote refs");
+        // Record an established master even if upload-pack or cancellation then
+        // fails. The in-memory identity protects Drop; the small private record
+        // lets validated stale cleanup identify the same socket after SIGKILL.
+        remote.record_socket_owner()?;
+        let out = outcome?;
         if !out.status.success() {
             bail!(
                 "remote ref advertisement/authentication failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+        }
+        if remote.socket.is_some() && remote.socket_owner.is_none() {
+            bail!("OpenSSH did not create the owned control socket");
         }
         let trace = fs::read_to_string(capabilities.path())?;
         if !trace.lines().any(|line| {
@@ -211,17 +230,23 @@ impl Remote {
         match matches.as_slice() { [(_, oid)] => Ok(*oid), [] => bail!("remote revision {revision:?} is not advertised; use HEAD, an exact ref, branch/tag name, or a full SHA-1 OID (ancestry/reflog syntax unsupported)"), _ => bail!("ambiguous remote revision {revision:?}; use refs/heads/ or refs/tags/") }
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
-        let repo = Repository::open_bare(&self.dir)?;
-        if repo.odb()?.exists(oid) {
-            return Ok(());
-        }
-        if self.cache.restore(&repo, oid)? {
-            return Ok(());
-        }
-        let outcome = self.fetch(&repo, oid);
+        let outcome = (|| {
+            let repo = Repository::open_bare(&self.dir)?;
+            if repo.odb()?.exists(oid) {
+                return Ok(());
+            }
+            if self.cache.restore(&repo, oid)? {
+                return Ok(());
+            }
+            self.fetch(&repo, oid)
+        })();
         if let Err(error) = &outcome {
-            self.failed = Some(format!("{error:#}"));
-            eprintln!("git-on: remote object loading failed: {error:#}");
+            // Cache/ODB failures are just as incomplete as a failed fetch. Keep
+            // the original failure even when later demands retry that operation.
+            if self.failed.is_none() {
+                self.failed = Some(format!("{error:#}"));
+                eprintln!("git-on: remote object loading failed: {error:#}");
+            }
         }
         outcome
     }
@@ -258,9 +283,37 @@ impl Remote {
     }
     /// Release the owned master even when the snapshot pin must remain for recovery.
     pub fn stop_transport(&self) {
-        if let Some(socket) = &self.socket {
-            stop_connection(socket);
+        if let (Some(socket), Some(owner)) = (&self.socket, &self.socket_owner) {
+            stop_owned_connection(socket, owner);
         }
+    }
+    fn record_socket_owner(&mut self) -> Result<()> {
+        let Some(socket) = &self.socket else {
+            return Ok(());
+        };
+        let metadata = match fs::symlink_metadata(socket) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("inspect owned SSH control socket"),
+        };
+        if !metadata.file_type().is_socket() {
+            bail!("owned SSH control path is not a socket");
+        }
+        let owner = SocketOwner {
+            format: "git-on-ssh-control-v1".into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        self.socket_owner = Some(owner.clone());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE))
+            .context("record owned SSH control socket")?;
+        serde_json::to_writer(&mut file, &owner)?;
+        std::io::Write::flush(&mut file)?;
+        Ok(())
     }
     pub fn failure(&self) -> Option<String> {
         self.failed.clone()
@@ -274,6 +327,29 @@ impl Drop for Remote {
 /// Stop only the control connection in a validated run's private directory.
 /// Recovery callers must validate and lock that run before invoking this.
 pub fn stop_connection(socket: &Path) {
+    let record = socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE);
+    if !fs::symlink_metadata(&record).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return;
+    }
+    let Some(owner) = File::open(record)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, SocketOwner>(file).ok())
+        .filter(|owner| owner.format == "git-on-ssh-control-v1")
+    else {
+        return;
+    };
+    stop_owned_connection(socket, &owner);
+}
+fn stop_owned_connection(socket: &Path, owner: &SocketOwner) {
+    // Type alone is insufficient: a socket may be hardlinked or replaced after
+    // a crash. Match the recorded identity and never follow symbolic links.
+    if !fs::symlink_metadata(socket).is_ok_and(|metadata| {
+        metadata.file_type().is_socket()
+            && metadata.dev() == owner.device
+            && metadata.ino() == owner.inode
+    }) {
+        return;
+    }
     let child = Command::new("ssh")
         .args(["-F", "/dev/null", "-S"])
         .arg(socket)
@@ -436,6 +512,9 @@ impl DiskCache {
         loop {
             if let Some(signal) = crate::git::cancelled_signal() {
                 bail!("remote cache lock cancelled by signal {signal}");
+            }
+            if crate::git::operations_stopped() {
+                bail!("remote cache lock stopped after command completion");
             }
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
