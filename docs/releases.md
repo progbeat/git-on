@@ -98,8 +98,7 @@ and sudo are not needed. The same command installs or updates to GitHub's latest
 stable release each time it runs:
 
 ```sh
-curl -fsSL --proto '=https' \
-  https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
 ```
 
 Stable binaries are published in [GitHub Releases](https://github.com/progbeat/git-on/releases).
@@ -129,8 +128,7 @@ Piping a script to a shell executes code from the repository. To inspect it firs
 download it, review it, then run the saved copy:
 
 ```sh
-curl -fSL --proto '=https' \
-  https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
@@ -168,9 +166,10 @@ archive, and checksum file share the GitHub repository's trust boundary. To pin
 the installer code as well as the binary version, inspect a copy from the matching
 release tag or an explicitly selected commit instead of the moving master URL.
 
-The bootstrap command permits HTTPS transport only. The script encloses its
-payload in a function and guards the final call, so an incomplete download cannot
-start installation or drop supplied arguments. See the installer regressions in
+The bootstrap uses an HTTPS URL with curl's default redirect and TLS settings.
+The installer's release downloader separately rejects non-HTTPS redirects.
+The script encloses its payload in a function and guards the final call, so an
+incomplete download cannot start installation or drop supplied arguments. See the installer regressions in
 the [test guide](../tests/README.md#installer-acceptance).
 
 Install the distribution's `fuse3` package separately when needed. A working

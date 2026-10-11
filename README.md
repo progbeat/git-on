@@ -35,8 +35,7 @@ requires a usable `/dev/fuse` and `fusermount3`, usually from your distribution'
 Install the latest stable release, or update using the same command:
 
 ```sh
-curl -fsSL --proto '=https' \
-  https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
 ```
 
 Run as your normal user. The installer verifies SHA-256 checksums and release
