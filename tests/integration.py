@@ -519,6 +519,471 @@ assert not Path('out/final-hard').exists()
 ''')
         self.assert_success(result)
 
+    def test_mknod_regular_files_follow_policy_and_special_nodes_are_refused(self):
+        result, _ = self.python(r'''
+import errno, os, socket, stat
+from pathlib import Path
+
+def denied(action, codes):
+    try: action()
+    except OSError as error: assert error.errno in codes, error
+    else: raise AssertionError('mknod unexpectedly succeeded')
+
+old_umask = os.umask(0o027)
+try:
+    for path in ['out/node', 'node.cache', 'nested/node.tmp']:
+        os.mknod(path, stat.S_IFREG | 0o666)
+        attrs = os.stat(path)
+        assert stat.S_ISREG(attrs.st_mode) and attrs.st_size == 0
+        assert stat.S_IMODE(attrs.st_mode) == 0o640, oct(attrs.st_mode)
+        assert (attrs.st_uid, attrs.st_gid) == (os.getuid(), os.getgid())
+        denied(lambda: os.mknod(path, stat.S_IFREG | 0o600), (errno.EEXIST,))
+        Path(path).write_bytes(b'mknod payload')
+        assert Path(path).read_bytes() == b'mknod payload'
+        os.unlink(path)
+        assert not os.path.lexists(path)
+finally:
+    os.umask(old_umask)
+
+for path in ['forbidden-node', 'keep.cache', 'nested/keep.tmp']:
+    denied(lambda: os.mknod(path, stat.S_IFREG | 0o600),
+           (errno.EROFS, errno.EACCES, errno.EPERM))
+    assert not os.path.lexists(path)
+for path in ['tracked.txt', 'out/protected.txt', 'tracked-link']:
+    original = Path(path).read_bytes()
+    attrs = os.lstat(path)
+    denied(lambda: os.mknod(path, stat.S_IFREG | 0o600), (errno.EEXIST,))
+    assert Path(path).read_bytes() == original
+    after = os.lstat(path)
+    assert (after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns) == (attrs.st_ino, attrs.st_mode, attrs.st_size, attrs.st_mtime_ns)
+for kind in [stat.S_IFIFO, stat.S_IFSOCK]:
+    path = 'out/special-' + str(kind)
+    denied(lambda: os.mknod(path, kind | 0o600), (errno.EPERM,))
+    assert not os.path.lexists(path)
+denied(lambda: os.mkfifo('out/fifo', 0o600), (errno.EPERM,))
+assert not os.path.lexists('out/fifo')
+with socket.socket(socket.AF_UNIX) as sock:
+    denied(lambda: sock.bind('out/socket'), (errno.EPERM,))
+assert not os.path.lexists('out/socket')
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_fsync_fdatasync_and_directory_sync_preserve_live_handles(self):
+        result, _ = self.python(r'''
+import os
+from pathlib import Path
+
+Path('out/syncdir').mkdir()
+for path in ['tracked.txt', 'out/protected.txt']:
+    expected = Path(path).read_bytes()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.fdatasync(fd)
+        assert os.pread(fd, 100, 0) == expected
+    finally: os.close(fd)
+fd = os.open('out/syncdir/value', os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    assert os.write(fd, b'before') == 6
+    os.fdatasync(fd)
+    assert Path('out/syncdir/value').read_bytes() == b'before'
+    duplicate = os.dup(fd)
+    os.close(duplicate)  # FLUSH must not invalidate the remaining description.
+    assert os.pwrite(fd, b'after!', 0) == 6
+    os.fsync(fd)
+    assert Path('out/syncdir/value').read_bytes() == b'after!'
+    os.unlink('out/syncdir/value')
+    assert os.pwrite(fd, b'open', 0) == 4
+    os.fsync(fd)
+    os.fdatasync(fd)
+    assert os.pread(fd, 20, 0) == b'openr!'
+    assert os.fstat(fd).st_nlink == 0
+finally: os.close(fd)
+for path in ['.', 'nested', 'out', 'out/syncdir']:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+        os.fdatasync(fd)
+    finally: os.close(fd)
+assert not Path('out/syncdir/value').exists()
+assert Path('tracked.txt').read_bytes() == b'committed\n'
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_statvfs_reports_coherent_backing_filesystem_capacity(self):
+        result, _ = self.python(r'''
+import os
+from pathlib import Path
+
+Path('out/capacity').write_bytes(b'x' * 8192)
+backing = os.statvfs(Path.cwd().parent / 'backing')
+for path in ['.', 'nested', 'tracked.txt', 'out/capacity']:
+    stats = os.statvfs(path)
+    for field in ['f_bsize', 'f_frsize', 'f_blocks', 'f_files']:
+        assert getattr(stats, field) == getattr(backing, field), (path, field, stats, backing)
+    assert stats.f_bsize > 0 and stats.f_frsize > 0 and stats.f_blocks > 0
+    assert 0 <= stats.f_bavail <= stats.f_bfree <= stats.f_blocks, stats
+    assert 0 <= stats.f_favail <= stats.f_ffree <= stats.f_files, stats
+    assert stats.f_namemax == 255
+    assert not stats.f_flag & os.ST_RDONLY
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        by_fd = os.fstatvfs(fd)
+        assert (by_fd.f_blocks, by_fd.f_bsize, by_fd.f_frsize) == (stats.f_blocks, stats.f_bsize, stats.f_frsize)
+    finally: os.close(fd)
+# Free counters are live host values and may change concurrently; they are not
+# asserted equal between separate requests on a shared CI runner.
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_renameat2_noreplace_and_rejected_flags_are_atomic(self):
+        result, _ = self.python(r'''
+import ctypes, errno, os
+from pathlib import Path
+
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = libc.renameat2
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                      ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+
+def rename(source, destination, flags, codes=()):
+    ctypes.set_errno(0)
+    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), flags)
+    if codes:
+        assert result == -1 and ctypes.get_errno() in codes, (source, destination, flags, result, ctypes.get_errno())
+    else:
+        assert result == 0, (source, destination, flags, ctypes.get_errno())
+
+Path('out/source').write_bytes(b'source')
+Path('out/destination').write_bytes(b'destination')
+source_ino = os.stat('out/source').st_ino
+destination_ino = os.stat('out/destination').st_ino
+for flags, codes in [(1, (errno.EEXIST,)), (2, (errno.EINVAL,)),
+                     (3, (errno.EINVAL,)), (8, (errno.EINVAL,))]:
+    # RENAME_EXCHANGE needs filesystem support; unknown flags can be rejected
+    # by the VFS before a request reaches the daemon.
+    rename('out/source', 'out/destination', flags, codes)
+    assert Path('out/source').read_bytes() == b'source'
+    assert Path('out/destination').read_bytes() == b'destination'
+    assert os.stat('out/source').st_ino == source_ino
+    assert os.stat('out/destination').st_ino == destination_ino
+rename('out/source', 'out/source', 1, (errno.EEXIST,))
+for target in ['tracked.txt', 'out/protected.txt']:
+    original = Path(target).read_bytes()
+    rename('out/source', target, 1, (errno.EEXIST, errno.EROFS))
+    assert Path(target).read_bytes() == original
+    assert Path('out/source').read_bytes() == b'source'
+for target in ['forbidden-rename', 'keep.cache', 'nested/keep.tmp']:
+    rename('out/source', target, 1, (errno.EROFS, errno.EACCES, errno.EPERM))
+    assert not os.path.lexists(target)
+    assert Path('out/source').read_bytes() == b'source'
+rename('out/source', 'out/new', 1)
+assert not Path('out/source').exists()
+assert Path('out/new').read_bytes() == b'source'
+assert os.stat('out/new').st_ino == source_ino
+Path('out/from-dir').mkdir()
+Path('out/from-dir/value').write_bytes(b'directory payload')
+Path('out/to-dir').mkdir()
+for flags, code in [(1, errno.EEXIST), (2, errno.EINVAL)]:
+    rename('out/from-dir', 'out/to-dir', flags, (code,))
+    assert Path('out/from-dir/value').read_bytes() == b'directory payload'
+    assert list(Path('out/to-dir').iterdir()) == []
+rename('out/from-dir', 'out/moved-dir', 1)
+assert not Path('out/from-dir').exists()
+assert Path('out/moved-dir/value').read_bytes() == b'directory payload'
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_readdir_pagination_and_seekdir_preserve_merged_entries(self):
+        for index in range(640):
+            self.put(f"out/paged/tracked-{index:04d}-" + "x" * 96, "tracked entry\n")
+        git(self.repo, "add", "--force", "out/paged")
+        git(self.repo, "commit", "--quiet", "-m", "paginated directory fixture")
+        result, _ = self.python(r'''
+import ctypes, os
+from pathlib import Path
+
+# Long names force multiple getdents/FUSE_READDIR replies, rather than merely
+# iterating several entries already buffered by libc.
+tracked = {('tracked-%04d-' % i + 'x' * 96).encode() for i in range(640)}
+mutable = {('mutable-%04d-' % i + 'y' * 96).encode() for i in range(640)}
+for name in mutable:
+    Path('out/paged', os.fsdecode(name)).write_bytes(b'upper')
+expected = tracked | mutable | {b'.', b'..'}
+libc = ctypes.CDLL(None, use_errno=True)
+class Dirent64(ctypes.Structure):
+    _fields_ = [('ino', ctypes.c_uint64), ('offset', ctypes.c_int64),
+                ('reclen', ctypes.c_ushort), ('kind', ctypes.c_ubyte),
+                ('name', ctypes.c_char * 256)]
+libc.opendir.argtypes = [ctypes.c_char_p]
+libc.opendir.restype = ctypes.c_void_p
+libc.readdir64.argtypes = [ctypes.c_void_p]
+libc.readdir64.restype = ctypes.POINTER(Dirent64)
+libc.telldir.argtypes = [ctypes.c_void_p]
+libc.telldir.restype = ctypes.c_long
+libc.seekdir.argtypes = [ctypes.c_void_p, ctypes.c_long]
+libc.seekdir.restype = None
+libc.rewinddir.argtypes = [ctypes.c_void_p]
+libc.rewinddir.restype = None
+libc.closedir.argtypes = [ctypes.c_void_p]
+libc.closedir.restype = ctypes.c_int
+directory = libc.opendir(b'out/paged')
+assert directory, ctypes.get_errno()
+
+def read_one():
+    ctypes.set_errno(0)
+    entry = libc.readdir64(directory)
+    if not entry:
+        assert ctypes.get_errno() == 0, ctypes.get_errno()
+        return None
+    entry = entry.contents
+    name = bytes(entry.name)
+    assert name in expected and entry.ino > 0, (name, entry.ino)
+    assert entry.kind == (4 if name in {b'.', b'..'} else 8), (name, entry.kind)
+    return name
+
+def read_rest():
+    result = []
+    while (name := read_one()) is not None:
+        result.append(name)
+    return result
+
+try:
+    prefix = [read_one() for _ in range(450)]
+    assert None not in prefix
+    cookie = libc.telldir(directory)
+    assert cookie >= 0
+    suffix = read_rest()
+    complete = prefix + suffix
+    assert len(complete) == len(expected) and set(complete) == expected
+    assert read_one() is None
+    libc.seekdir(directory, cookie)
+    assert read_rest() == suffix
+    libc.rewinddir(directory)
+    assert read_rest() == complete
+    # An independent open has its own offset and returns the same full set.
+    assert set(os.listdir(b'out/paged')) == expected - {b'.', b'..'}
+finally:
+    assert libc.closedir(directory) == 0
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_xattrs_are_unsupported_without_changing_files_or_directories(self):
+        result, _ = self.python(r'''
+import errno, os
+from pathlib import Path
+
+Path('out/xattr').write_bytes(b'upper xattr bytes')
+Path('out/xattrdir').mkdir()
+for path in ['out/xattr', 'tracked.txt', 'out/protected.txt', 'out/xattrdir', 'nested']:
+    before = os.stat(path)
+    content = Path(path).read_bytes() if Path(path).is_file() else sorted(os.listdir(path))
+    # Linux maps the unimplemented FUSE callbacks to EOPNOTSUPP and caches
+    # that result per operation; repeat to exercise the cached syscall path.
+    for _ in range(2):
+        for action in [lambda: os.getxattr(path, 'user.git_on_test'),
+                       lambda: os.listxattr(path),
+                       lambda: os.setxattr(path, 'user.git_on_test', b'value'),
+                       lambda: os.removexattr(path, 'user.git_on_test')]:
+            try: action()
+            except OSError as error: assert error.errno == errno.EOPNOTSUPP, (path, error)
+            else: raise AssertionError('unsupported xattr operation succeeded: ' + path)
+    after = os.stat(path)
+    assert (after.st_mode, after.st_size, after.st_mtime_ns) == (before.st_mode, before.st_size, before.st_mtime_ns)
+    assert (Path(path).read_bytes() if Path(path).is_file() else sorted(os.listdir(path))) == content
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_fallocate_and_unknown_ioctl_fail_without_changing_bytes(self):
+        result, _ = self.python(r'''
+import ctypes, errno, fcntl, os
+from pathlib import Path
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+libc.fallocate.restype = ctypes.c_int
+Path('out/allocate').write_bytes(b'unchanged allocation payload')
+fd = os.open('out/allocate', os.O_RDWR)
+try:
+    original = Path('out/allocate').read_bytes()
+    # Call fallocate directly: glibc posix_fallocate may emulate allocation
+    # with writes, which would not test the unsupported FUSE request.
+    for mode in [0, 1, 3]:  # ordinary, KEEP_SIZE, PUNCH_HOLE | KEEP_SIZE
+        ctypes.set_errno(0)
+        result = libc.fallocate(fd, mode, 0, 4096)
+        assert result == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (mode, result, ctypes.get_errno())
+        assert os.fstat(fd).st_size == len(original)
+        assert os.pread(fd, 4096, 0) == original
+finally: os.close(fd)
+for path in ['out/allocate', 'tracked.txt']:
+    original = Path(path).read_bytes()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for _ in range(2):
+            try: fcntl.ioctl(fd, 0x5a7f, 0)  # Private, argument-free _IO command.
+            except OSError as error: assert error.errno == errno.ENOTTY, error
+            else: raise AssertionError('unknown ioctl unexpectedly succeeded')
+        ctypes.set_errno(0)
+        assert libc.fallocate(fd, 0, 0, 4096) == -1
+        assert ctypes.get_errno() == errno.EBADF
+        assert os.pread(fd, 4096, 0) == original
+    finally: os.close(fd)
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_posix_and_flock_locks_use_local_kernel_fallback(self):
+        result, _ = self.python(r'''
+import errno, fcntl, json, os, subprocess, sys
+from pathlib import Path
+
+# Remote locking capabilities are not negotiated. These are kernel-local
+# locking contracts, not evidence that GETLK/SETLK callbacks were dispatched.
+Path('out/locked').write_bytes(b'lock payload')
+fd = os.open('out/locked', os.O_RDWR)
+child = r"""
+import ctypes, errno, fcntl, json, os, sys
+class Flock(ctypes.Structure):
+    _fields_ = [('kind', ctypes.c_short), ('whence', ctypes.c_short),
+                ('start', ctypes.c_int64), ('length', ctypes.c_int64),
+                ('pid', ctypes.c_int)]
+fd = os.open('out/locked', os.O_RDWR)
+try:
+    query = Flock(fcntl.F_WRLCK, os.SEEK_SET, 1, 3, 0)
+    reply = fcntl.fcntl(fd, fcntl.F_GETLK, bytes(query))
+    lock = Flock.from_buffer_copy(reply)
+    if sys.argv[1] == 'held':
+        assert lock.kind == fcntl.F_WRLCK
+        assert (lock.start, lock.length) == (1, 3)
+        try: fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 3, 1)
+        except OSError as error: assert error.errno in (errno.EACCES, errno.EAGAIN)
+        else: raise AssertionError('conflicting POSIX lock succeeded')
+        # A disjoint range remains usable while the first range is locked.
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 2, 5)
+        fcntl.lockf(fd, fcntl.LOCK_UN, 2, 5)
+        print(json.dumps(lock.pid))
+    else:
+        assert lock.kind == fcntl.F_UNLCK
+        fcntl.lockf(fd, fcntl.LOCK_EX, 3, 1)
+        fcntl.lockf(fd, fcntl.LOCK_UN, 3, 1)
+finally: os.close(fd)
+"""
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 3, 1)
+    check = subprocess.run([sys.executable, '-c', child, 'held'], capture_output=True, timeout=10)
+    assert check.returncode == 0, check.stderr
+    assert json.loads(check.stdout) == os.getpid()
+    fcntl.lockf(fd, fcntl.LOCK_UN, 3, 1)
+    check = subprocess.run([sys.executable, '-c', child, 'released'], capture_output=True, timeout=10)
+    assert check.returncode == 0, check.stderr
+    other = os.open('out/locked', os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try: fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error: assert error.errno in (errno.EACCES, errno.EAGAIN)
+        else: raise AssertionError('conflicting flock succeeded')
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(other, fcntl.LOCK_UN)
+    finally: os.close(other)
+    assert os.pread(fd, 20, 0) == b'lock payload'
+finally: os.close(fd)
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_poll_and_lseek_use_regular_file_kernel_fallbacks(self):
+        result, _ = self.python(r'''
+import errno, os, select
+from pathlib import Path
+
+Path('out/seek').write_bytes(b'0123456789')
+for path, flags in [('tracked.txt', os.O_RDONLY), ('out/seek', os.O_RDWR)]:
+    expected = Path(path).read_bytes()
+    fd = os.open(path, flags)
+    try:
+        assert os.lseek(fd, 3, os.SEEK_SET) == 3
+        assert os.lseek(fd, 2, os.SEEK_CUR) == 5
+        assert os.read(fd, 2) == expected[5:7]
+        assert os.lseek(fd, -2, os.SEEK_END) == len(expected) - 2
+        assert os.read(fd, 9) == expected[-2:]
+        # SET/CUR/END are handled by the VFS. DATA/HOLE reach LSEEK once;
+        # ENOSYS then enables Linux's all-data/EOF-hole fallback.
+        for _ in range(2):
+            assert os.lseek(fd, 2, os.SEEK_DATA) == 2
+            assert os.lseek(fd, 2, os.SEEK_HOLE) == len(expected)
+            for whence in [os.SEEK_DATA, os.SEEK_HOLE]:
+                try: os.lseek(fd, len(expected), whence)
+                except OSError as error: assert error.errno == errno.ENXIO
+                else: raise AssertionError('seek at EOF unexpectedly succeeded')
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLOUT)
+        # An unsupported POLL callback yields default regular-file readiness,
+        # including readable EOF; it does not turn poll into ENOSYS.
+        for _ in range(2):
+            events = dict(poller.poll(1000))
+            assert events.get(fd) == select.POLLIN | select.POLLOUT, events
+        assert os.pread(fd, len(expected) + 1, 0) == expected
+    finally: os.close(fd)
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_copy_file_range_kernel_fallback_preserves_offsets_and_snapshot(self):
+        result, _ = self.python(r'''
+import errno, os
+from pathlib import Path
+
+# The filesystem has no COPY_FILE_RANGE implementation. Linux falls back to
+# ordinary reads/writes after ENOSYS; syscall success is not callback coverage.
+payload = bytes(range(256)) * 257
+Path('out/copy-source').write_bytes(payload)
+for source in ['tracked.txt', 'out/copy-source']:
+    original = Path(source).read_bytes()
+    Path('out/copy-destination').write_bytes(b'prefix:')
+    src = os.open(source, os.O_RDONLY)
+    dst = os.open('out/copy-destination', os.O_RDWR)
+    try:
+        os.lseek(src, 2, os.SEEK_SET)
+        os.lseek(dst, 3, os.SEEK_SET)
+        done = 0
+        while done < len(original) - 2:
+            amount = os.copy_file_range(src, dst, len(original) - 2 - done, 1 + done, 7 + done)
+            assert 0 < amount <= len(original) - 2 - done, amount
+            done += amount
+        assert os.lseek(src, 0, os.SEEK_CUR) == 2
+        assert os.lseek(dst, 0, os.SEEK_CUR) == 3
+        assert Path('out/copy-destination').read_bytes() == b'prefix:' + original[1:-1]
+        assert os.copy_file_range(src, dst, 10, len(original), 0) == 0
+        assert os.lseek(src, 0, os.SEEK_SET) == 0
+        assert os.lseek(dst, 0, os.SEEK_SET) == 0
+        assert os.copy_file_range(src, dst, 3) == 3
+        assert os.lseek(src, 0, os.SEEK_CUR) == 3
+        assert os.lseek(dst, 0, os.SEEK_CUR) == 3
+        os.fsync(dst)
+        assert Path('out/copy-destination').read_bytes() == original[:3] + b'fix:' + original[1:-1]
+        protected = os.open('tracked.txt', os.O_RDONLY)
+        try:
+            try: os.copy_file_range(src, protected, 1, 0, 0)
+            except OSError as error: assert error.errno == errno.EBADF
+            else: raise AssertionError('copy into read-only tracked descriptor succeeded')
+        finally: os.close(protected)
+        assert Path(source).read_bytes() == original
+        assert Path('tracked.txt').read_bytes() == b'committed\n'
+    finally:
+        os.close(src)
+        os.close(dst)
+''')
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
     def test_nested_ignore_rules_and_tracked_precedence_survive_cold_lookups(self):
         self.put("nested/deeper/.gitignore", "!local.tmp\n*.cache\n!keep.cache\n")
         self.put("nested/deeper/protected.tmp", "nested tracked\n")

@@ -1,0 +1,118 @@
+# Releases and installation
+
+Every pull request into `master` is one release. Squash merging is supported and
+recommended: the resulting commit contains both the change and its release
+metadata. No separate release PR, manual tag, or CHANGELOG history is required.
+
+## Preparing a change
+
+1. Update `Cargo.toml` and the root `git-on` entry in `Cargo.lock` to exactly one
+   increment above **current master**, not merely the branch's original base.
+2. Replace `.github/release-notes.md` with `# VERSION`, `Bump: patch|minor|major`,
+   then concrete user-facing Markdown notes. Mention changed behavior, fixes,
+   compatibility implications and migration steps. This is the next release's
+   body, not an ever-growing changelog; previous notes live in GitHub Releases.
+3. Run `python3 tests/test_release_policy.py`, the normal checks, and
+   `python3 scripts/release_policy.py --base origin/master` after fetching master.
+4. When another PR merges first, update from master and recalculate the version.
+   Never reuse a released version. Multiple commits within one PR share one bump.
+
+Use patch for backwards-compatible bug fixes and documentation, testing or CI-only
+changes. Use minor for new backwards-compatible capabilities. Use major for
+breaking the documented CLI, filesystem, environment or platform contract.
+These rules also apply before 1.0: this project deliberately reserves major bumps
+for breaking changes instead of silently treating every 0.x release as breaking.
+CI can validate the numeric increment and notes; semantic classification requires
+review of the change. Agents are responsible for proposing the correct kind.
+
+Bootstrap is the only exception: a base with no Cargo package introduces `0.1.0`
+and `Bump: initial`. Later PRs cannot reuse this exception.
+
+## CI and automatic publication
+
+`release-policy` rejects unchanged, decreasing, skipped, malformed or mismatched
+versions, stale PR branches, lockfile mismatches and missing/placeholder notes.
+`package` builds on Ubuntu 22.04 using Rust 1.90.0, packages Linux x86_64 and tests
+the **extracted archive executable** against a real FUSE mount. The GNU binary's
+supported baseline is glibc 2.35, not arbitrary Linux. The build vendors libgit2;
+FUSE mounting still requires a usable `/dev/fuse` and `fusermount3` on the host.
+
+After a master push, the same workflow waits for `rust`, `real-fuse`,
+`lazy-performance`, `release-policy` and `package`. Only then its `release` job
+creates `vVERSION` at that exact tested commit, uploads the archive, SHA256SUMS
+and source/build metadata to a draft GitHub Release, then publishes it. It never
+checks out moving master to choose release contents. Release notes come from
+that commit. The token has read access in test/build jobs and contents-write only
+in the publishing job; no personal token, crates.io account or app is required.
+
+Tag creation is an atomic GitHub ref creation. A tag at another SHA is an error,
+never force-moved. Re-running the same commit resumes a draft with matching notes
+and assets; matching published releases are verified and left unchanged. Different
+commits can finish out of order without canceling each other's publication.
+The tag-created event is not used to trigger another workflow, because GitHub's
+GITHUB_TOKEN normally does not trigger such workflows.
+
+If publication fails, rerun the failed workflow for that exact master commit.
+A failure before upload completion leaves a draft, not a partially published
+release. Checksums detect corruption; they are not a separate cryptographic
+identity/signature. Reproducible archive metadata does not claim independently
+reproducible compilation across changing toolchains/runners.
+
+## Required repository settings
+
+CI code alone cannot prevent a merge. Configure protected master (or an equivalent
+active ruleset) to require pull requests, strict up-to-date branches and these
+checks from GitHub Actions: `rust`, `real-fuse`, `lazy-performance`,
+`release-policy`, `package`. Disallow force pushes/deletion and bypasses. Do not
+make `release` a PR-required check: it deliberately runs only after merging.
+Enable squash merging; do not merge multiple independent release changes in one
+master push. A failed release can be retried; no workflow silently republishes
+or moves an existing version.
+
+Setup is **not yet enforced** by this PR. On 2026-10-11 the private repository's
+rulesets endpoint returned “Upgrade to GitHub Pro or make this repository public
+to enable this feature.” Branch-protection inspection separately failed because
+the current integration lacks administration access. Neither visibility nor plan
+is changed by this implementation. Once the owner enables supported protection,
+verify a stale version PR really cannot merge. Strict protection closes the race
+where master advances after the PR's version check finishes.
+
+## Installing a published binary
+
+No binary release exists until the first successful master release workflow.
+Once published, download the desired version from
+[GitHub Releases](https://github.com/progbeat/git-on/releases). Private releases
+require repository access; they are not available to anonymous users. For example,
+with an already authenticated GitHub CLI:
+
+```sh
+version=0.1.0
+mkdir git-on-download && cd git-on-download
+gh release download "v$version" --repo progbeat/git-on \
+  --pattern "git-on-v$version-x86_64-unknown-linux-gnu.tar.gz" \
+  --pattern SHA256SUMS --pattern release.json
+sha256sum --check SHA256SUMS
+tar -xzf "git-on-v$version-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "git-on-v$version-x86_64-unknown-linux-gnu/git-on" "$HOME/.local/bin/git-on"
+# Ensure $HOME/.local/bin is on PATH.
+git on --version
+```
+
+Install the distribution's `fuse3` package separately. Do not run the command as
+root to bypass unavailable FUSE setup. Updating repeats the same verified download
+and replaces the executable; there is no background updater or curl-pipe-shell
+installer. Building from source remains supported with `cargo install --path .
+--locked` in an explicitly selected checkout.
+
+## Design references
+
+- [GitHub strict required checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
+- [GitHub token-trigger behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+- [Cargo compatibility guidance](https://doc.rust-lang.org/cargo/reference/semver.html)
+- [release-plz release PR flow](https://release-plz.dev/docs/usage/release-pr)
+- [cargo-dist configuration](https://axodotdev.github.io/cargo-dist/book/reference/config.html)
+
+release-plz's separate release-PR workflow and cargo-dist's broader distribution
+machinery are useful for other policies. This project's single supported target
+and required release on every merge currently use a smaller explicit pipeline.

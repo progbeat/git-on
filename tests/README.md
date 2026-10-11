@@ -26,6 +26,29 @@ tests as skipped; this is not evidence that the filesystem works. `--uv` enables
 the dependency integration tests and must not be omitted when claiming complete
 coverage.
 
+## Complete FUSE callback inventory
+
+The auditable [callback matrix](../docs/fuse-coverage.md) covers every method of
+our pinned `fuser::Filesystem` trait: implemented operations, inherited lifecycle
+methods, explicit unsupported replies, and platform exclusions. Its named tests
+separate wire-level callback assertions from actual Linux syscall behavior.
+
+```console
+python3 tests/check_fuse_coverage.py --self-test
+python3 tests/check_fuse_coverage.py
+cargo test --locked --test fuse_protocol
+```
+
+The guard requires downloaded locked Cargo dependencies. It fails on a changed
+trait fingerprint, missing/duplicate method, wrong classification, or missing
+named test. It does not infer branch coverage from a test name. The protocol
+suite supplies FUSE 7.31 packets to the actual `fuser` session/Overlay dispatcher
+over a local socket transport; it is deliberately not described as a kernel
+mount. It covers callbacks bypassed by kernel permissions or capability choices,
+unsupported defaults, credentials, invalid handles, pagination, and ordinary
+backing-store errors. The real-FUSE job separately tests kernel translation and
+fallbacks (including locks, polling, seeking, and copying).
+
 ## Filesystem mutation matrix
 
 The real-FUSE suite covers these categories separately, with exact byte and

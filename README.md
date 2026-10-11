@@ -12,6 +12,11 @@ git on 0123456789abcdef0123456789abcdef01234567 python -m pytest
 
 ## Installation and support
 
+Prebuilt versioned binaries and GitHub Release notes are produced by the automatic
+[release workflow](docs/releases.md). The first release becomes available after
+the initial implementation is merged and all release checks pass. See the linked
+guide for verified download, installation and upgrades.
+
 Supported: Linux, a working `/dev/fuse`, and `fusermount3` (typically the distribution's `fuse3` package). Build with current stable Rust and a C compiler:
 
 ```sh

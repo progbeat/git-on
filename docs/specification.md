@@ -52,6 +52,40 @@ separate from that contract; a requirement is not a claim of a passing test.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
+## FUSE operation coverage requirement
+
+Every callback in the locked `fuser::Filesystem` trait must have an explicit,
+reviewed entry in the [FUSE acceptance matrix](fuse-coverage.md). The inventory
+must distinguish application overrides, inherited lifecycle defaults, inherited
+unsupported handlers, and operations excluded by the supported Linux platform.
+A dependency update or newly added callback must fail the completeness guard
+until its contract and evidence are reviewed.
+
+For every Linux callback, tests must exercise actual fuser dispatch into the
+real filesystem or inherited handler and assert its reply/state contract.
+Supported operations require positive behavior and meaningful negative or
+boundary cases where applicable. Rejections must check that protected bytes and
+namespace state remain unchanged. Mount-bypassed operations, credentials and
+invalid handles may be tested using the protocol harness; such tests must never
+be reported as real mounts.
+
+Real-FUSE acceptance must additionally verify supported syscall behavior and
+intentional kernel fallbacks, including creation, synchronization, statistics,
+rename flags, directory pagination and unsupported optional operations.
+`DefaultPermissions`, unnegotiated capabilities and kernel caching must be
+documented when they bypass callbacks. In particular, syscall success does not
+prove that an unsupported callback is implemented, and ordinary file creation
+does not substitute for testing `mknod`.
+
+The matrix must map operations to existing named tests, distinguish default
+`ENOSYS` replies from Linux's observable fallback/errors, and record platform
+exclusions and limits. CI must check inventory/reference completeness and run
+both protocol tests and non-skipped real-FUSE tests on the exact revision under
+review. A passing inventory guard is not execution evidence; passing scenarios
+are not an assertion of exhaustive inputs, all host failures, or 100% branch
+coverage. Material discovered coverage gaps become regression cases before the
+affected behavior is claimed verified.
+
 ## Lazy access and performance
 
 The objective is minimal launch overhead and demand-driven work, including for

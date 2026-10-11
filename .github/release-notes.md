@@ -1,0 +1,12 @@
+# 0.1.0
+Bump: initial
+
+Initial Linux release of git-on.
+
+- Run an arbitrary command against a pinned Git tree without changing the working tree.
+- Load source directories and file contents on demand through FUSE.
+- Keep tracked paths immutable; allow temporary writes only where the selected tree's .gitignore permits them.
+- Inherit standard streams directly and optionally retain temporary writes with --keep.
+- Include real-mount mutation/lifecycle checks and reproducible lazy-access benchmarks.
+
+Requires Linux x86_64, glibc 2.35 or newer, a usable /dev/fuse and fusermount3. This is not a sandbox. See README for support boundaries and installation.
