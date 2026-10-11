@@ -96,7 +96,8 @@ class Fixture:
                 path, _, query = self.path.partition('?')
                 data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
                 wants = [x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)]
-                if fixture.stalled_oids.intersection(wants):
+                stalled_request = bool(fixture.stalled_oids.intersection(wants))
+                if stalled_request:
                     fixture.stalled.set()
                     if not fixture.resume.wait(timeout=30):
                         self.send_error(504,'controlled transport stall timed out'); return
@@ -118,9 +119,15 @@ class Fixture:
                     name, _, value = line.partition(b':')
                     if name.lower() == b'status': status = int(value.strip().split()[0])
                     else: fields.append((name.decode(), value.strip().decode()))
-                self.send_response(status)
-                for name, value in fields: self.send_header(name, value)
-                self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    for name, value in fields: self.send_header(name, value)
+                    self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
+                    # A cancellation regression deliberately closes the client
+                    # before the held server request can send its response.
+                    if not stalled_request: raise
+                    return
                 fixture.requests.append(dict(path=path, request_bytes=len(data), response_bytes=len(body), wants=[x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)], headers=self.headers.get_all('X-Git-On-Fixture', [])))
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert, key)
@@ -694,6 +701,65 @@ class RemoteTests(unittest.TestCase):
                 self.assertIn(b'execution incomplete',result.stderr)
             self.assertEqual(list(f.root.glob('git-on-*')),[])
             print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
+
+    def request_signal_behavior(self, binary, mode, expect_old):
+        f=self.f
+        shutil.rmtree(f.root/'cache',ignore_errors=True)
+        f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.blob}
+        ready=f.root/'request-ready'; handled=f.root/'request-handled'
+        ready.unlink(missing_ok=True); handled.unlink(missing_ok=True)
+        code="import json,os,signal,sys; from pathlib import Path\n"
+        if mode=='handled-exit':
+            code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\n raise SystemExit(0)\nsignal.signal(signal.SIGTERM,handle)\n"
+        elif mode=='handled-retry':
+            code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handle)\n"
+        code+="Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\nassert open('deep/file').read()=='expected\\n'\nprint('read completed')\n"
+        process=subprocess.Popen([str(binary.resolve()),self.signal_url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready),HANDLED=str(handled)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process); directory=None; state=None
+        try:
+            self.assertTrue(f.stalled.wait(timeout=20),'request did not reach controlled transport stall')
+            self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
+            os.killpg(state['pid'],signal.SIGINT if mode=='python-int' else signal.SIGTERM)
+            if mode=='handled-retry':
+                deadline=time.monotonic()+5
+                while not handled.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
+                stayed_blocked=not handled.exists()
+                if not stayed_blocked: f.resume.set()
+            else:
+                try:
+                    output,errors=process.communicate(timeout=5)
+                    stayed_blocked=False
+                except subprocess.TimeoutExpired:
+                    stayed_blocked=True
+            if expect_old:
+                self.assertTrue(stayed_blocked,'old binary did not reproduce pending requester signal')
+            else:
+                self.assertFalse(stayed_blocked,'pending requester signal did not interrupt native demand')
+                if mode=='handled-retry': output,errors=process.communicate(timeout=15)
+                self.assertEqual(process.returncode,-signal.SIGINT if mode=='python-int' else 0,errors)
+                if mode=='handled-retry': self.assertEqual(output,b'read completed\n')
+                if mode!='python-int': self.assertTrue(handled.exists(),'custom signal handler did not run')
+                self.assertNotIn(b'execution incomplete',errors)
+                self.assertFalse(directory.exists(),'completed command did not clean its run')
+            print('request signal regression evidence:',json.dumps(dict(binary=str(binary),mode=mode,before=expect_old,observed_stall=stayed_blocked)),flush=True)
+        finally:
+            if process.poll() is None:
+                if state is not None:
+                    with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
+                process.kill()
+            f.resume.set(); f.stalled_oids.clear()
+            process.communicate(timeout=15)
+            if directory is not None and directory.exists():
+                cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+                self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+
+    def test_review_real_mount_pending_request_signals_preserve_handlers(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; self.signal_url=f.https(); self.addCleanup(f.server.shutdown)
+        for mode in ('python-int','handled-exit','handled-retry'):
+            with self.subTest(mode=mode):
+                if OPTIONS.before_binary: self.request_signal_behavior(OPTIONS.before_binary,mode,True)
+                self.request_signal_behavior(OPTIONS.binary,mode,False)
 
     def test_native_failed_verification_never_executes_command(self):
         f=self.f; signed,allowed=self.signing(); sentinel=f.root/'command-executed'

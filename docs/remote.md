@@ -30,6 +30,15 @@ There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
 the runner fail even if the command catches EIO and exits successfully.
 
+A pending, unblocked and nonignored SIGINT, SIGTERM, SIGHUP or SIGQUIT in the
+task requesting a remote object interrupts that request with EINTR. The runner
+polls the requesting task's Linux `/proc` status while its owned Git operation
+or cache-lock acquisition waits, because fuser cannot dispatch an INTERRUPT
+request while a synchronous callback is blocked. This interruption cancels
+only the current demand and preserves the command's signal handler and actual
+exit status. It does not latch a transport failure; a handler may return and
+retry the read using the same pinned snapshot and owned SSH connection.
+
 Metadata lookup may fetch the requested blob to determine its size: ordinary
 upload-pack offers no header-only request. Listing does not fetch child sizes or
 payloads. Applicable `.gitignore` blobs are fetched on demand for write policy.

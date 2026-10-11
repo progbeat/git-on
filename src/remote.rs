@@ -243,7 +243,7 @@ impl Remote {
         if let Err(error) = &outcome {
             // Cache/ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if self.failed.is_none() {
+            if !crate::git::is_request_interruption(error) && self.failed.is_none() {
                 self.failed = Some(format!("{error:#}"));
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
@@ -264,7 +264,25 @@ impl Remote {
             .arg(&self.source)
             .arg(oid.to_string())
             .stdin(Stdio::null());
-        let out = crate::git::run(command, true).context("fetch exact remote object")?;
+        let out = match crate::git::run(command, true) {
+            Ok(out) => out,
+            Err(error) => {
+                if crate::git::is_request_interruption(&error) {
+                    // This private repository has one serialized native fetch.
+                    // Its owned group is gone before run returns. A forced
+                    // shutdown may interrupt Git's shallow-lock rollback.
+                    match fs::remove_file(self.dir.join("shallow.lock")) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error)
+                                .context("clean interrupted private Git shallow lock");
+                        }
+                    }
+                }
+                return Err(error).context("fetch exact remote object");
+            }
+        };
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
             bail!("remote fetch of exact object {oid} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}", error.trim());
@@ -516,6 +534,7 @@ impl DiskCache {
             if crate::git::operations_stopped() {
                 bail!("remote cache lock stopped after command completion");
             }
+            crate::git::check_request_interruption()?;
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
             }

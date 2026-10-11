@@ -167,7 +167,7 @@ impl Policy {
     pub fn allows(&self, path: &Path, is_dir: bool) -> bool {
         self.check(path, is_dir).unwrap_or(false)
     }
-    fn check(&self, path: &Path, is_dir: bool) -> Result<bool> {
+    pub(crate) fn check(&self, path: &Path, is_dir: bool) -> Result<bool> {
         if path.as_os_str().is_empty() {
             return Ok(false);
         }

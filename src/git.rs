@@ -2,10 +2,14 @@
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
+    cell::RefCell,
     ffi::{OsStr, OsString},
+    fs::File,
+    marker::PhantomData,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    rc::Rc,
 };
 
 #[derive(Debug)]
@@ -250,6 +254,7 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     if operations_stopped() {
         bail!("Git operation stopped after command completion");
     }
+    check_request_interruption()?;
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     if capture {
@@ -309,6 +314,9 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
                 "Git operation stopped after command completion"
             ));
         }
+        if let Err(error) = check_request_interruption() {
+            break stop_request_operation(&mut child).and(Err(error));
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
     if transfer {
@@ -335,6 +343,42 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         stderr: err,
     })
 }
+fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let pid = child.id() as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    // Let native Git roll back its locks. WNOWAIT preserves leader ownership
+    // until every remaining group member has been killed, preventing PID reuse.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            break;
+        }
+        if (result == 0 && unsafe { info.si_pid() } != 0) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    child
+        .wait()
+        .context("reap interrupted native Git operation")?;
+    Ok(())
+}
 fn set_foreground(fd: i32, group: libc::pid_t) -> std::io::Result<()> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -359,6 +403,292 @@ impl SplitByte for [u8] {
         match self.iter().position(|x| *x == b) {
             Some(n) => (&self[..n], Some(&self[n + 1..])),
             None => (self, None),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RequestInterrupted(i32);
+impl std::fmt::Display for RequestInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "filesystem requester interrupted by signal {}", self.0)
+    }
+}
+impl std::error::Error for RequestInterrupted {}
+
+thread_local! {
+    static REQUEST_STATUS: RefCell<Option<File>> = const { RefCell::new(None) };
+}
+
+/// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
+/// proc descriptor open prevents a reused task ID from changing this identity.
+pub(crate) struct RequestGuard {
+    previous: Option<File>,
+    _same_thread: PhantomData<Rc<()>>,
+}
+impl RequestGuard {
+    pub(crate) fn enter(pid: u32) -> Self {
+        let status = File::open(format!("/proc/{pid}/status")).ok();
+        Self {
+            previous: REQUEST_STATUS.with(|slot| slot.replace(status)),
+            _same_thread: PhantomData,
+        }
+    }
+}
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        REQUEST_STATUS.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn pending_request_signal(status: &[u8]) -> Option<i32> {
+    let mut pending = None;
+    let mut shared = None;
+    let mut blocked = None;
+    let mut ignored = None;
+    for line in status.split(|byte| *byte == b'\n') {
+        let (key, value) = line.split_once_byte(b':');
+        let Some(value) = value else {
+            continue;
+        };
+        let destination = match key {
+            b"SigPnd" => &mut pending,
+            b"ShdPnd" => &mut shared,
+            b"SigBlk" => &mut blocked,
+            b"SigIgn" => &mut ignored,
+            _ => continue,
+        };
+        *destination = std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok());
+    }
+    let actionable = (pending? | shared?) & !blocked? & !ignored?;
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
+        .into_iter()
+        .find(|signal| actionable & (1_u64 << (signal - 1)) != 0)
+}
+
+/// fuser dispatches synchronously and cannot process INTERRUPT while a native
+/// operation is blocked. Reply EINTR when this requester has a pending signal,
+/// then let its actual disposition/handler determine the command's outcome.
+/// This is per-request interruption, never global command cancellation.
+pub(crate) fn check_request_interruption() -> Result<()> {
+    use std::io::{Read, Seek};
+    let signal = REQUEST_STATUS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let status = slot.as_mut()?;
+        status.rewind().ok()?;
+        let mut bytes = Vec::new();
+        status.read_to_end(&mut bytes).ok()?;
+        pending_request_signal(&bytes)
+    });
+    if let Some(signal) = signal {
+        return Err(RequestInterrupted(signal).into());
+    }
+    Ok(())
+}
+pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
+    error.is::<RequestInterrupted>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::Child;
+    use std::time::{Duration, Instant};
+
+    struct Requester(Child);
+    impl Requester {
+        fn stopped(mode: &str) -> Self {
+            let script = "import ctypes,os,signal,sys,time\nmode=sys.argv[1]\nif mode=='caught': signal.signal(signal.SIGTERM,lambda *_:None)\nif mode=='ignored': signal.signal(signal.SIGTERM,signal.SIG_IGN)\nif mode=='blocked': signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGTERM})\nctypes.CDLL(None).prctl(15,b'\\xffrequester',0,0,0)\nprint('ready',flush=True)\nos.kill(os.getpid(),signal.SIGSTOP)\ntime.sleep(300)";
+            let mut child = Command::new("python3")
+                .args(["-c", script, mode])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            let requester = Self(child);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
+                if status
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line.starts_with(b"State:\tT"))
+                {
+                    return requester;
+                }
+                assert!(Instant::now() < deadline, "requester never stopped");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn signal(&self, signal: i32) {
+            assert_eq!(unsafe { libc::kill(self.0.id() as i32, signal) }, 0);
+        }
+    }
+    impl Drop for Requester {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn wait_for_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "owned operation never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn request_masks_preserve_blocked_ignored_and_caught_dispositions() {
+        let status = |pending, shared, blocked, ignored| {
+            format!("SigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\nSigCgt:\tffffffffffffffff\n")
+        };
+        let term = 1_u64 << (libc::SIGTERM - 1);
+        for (pending, shared) in [(term, 0), (0, term)] {
+            assert_eq!(
+                pending_request_signal(status(pending, shared, 0, 0).as_bytes()),
+                Some(libc::SIGTERM)
+            );
+            for (blocked, ignored) in [(term, 0), (0, term)] {
+                assert_eq!(
+                    pending_request_signal(status(pending, shared, blocked, ignored).as_bytes()),
+                    None
+                );
+            }
+        }
+        assert_eq!(pending_request_signal(b"SigPnd:\t4000\n"), None);
+        let mut long_status = b"Name:\t\xffrequester\nGroups:\t".to_vec();
+        long_status.extend(b"10000 ".repeat(4096));
+        long_status.extend_from_slice(b"\n");
+        long_status.extend_from_slice(status(0, term, 0, 0).as_bytes());
+        assert_eq!(pending_request_signal(&long_status), Some(libc::SIGTERM));
+        {
+            use std::io::Write;
+            let _request = RequestGuard::enter(0);
+            let mut held = tempfile::tempfile().unwrap();
+            held.write_all(&long_status).unwrap();
+            REQUEST_STATUS.with(|slot| slot.replace(Some(held)));
+            assert!(is_request_interruption(
+                &check_request_interruption().unwrap_err()
+            ));
+        }
+        let user = 1_u64 << (libc::SIGUSR1 - 1);
+        assert_eq!(
+            pending_request_signal(status(0, user, 0, 0).as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn request_scope_reads_real_dispositions_and_keeps_original_task_identity() {
+        for (mode, signal, interrupts) in [
+            ("default", libc::SIGTERM, true),
+            ("caught", libc::SIGTERM, true),
+            ("python-int", libc::SIGINT, true),
+            ("ignored", libc::SIGTERM, false),
+            ("blocked", libc::SIGTERM, false),
+        ] {
+            let requester = Requester::stopped(mode);
+            let _request = RequestGuard::enter(requester.0.id());
+            requester.signal(signal);
+            match check_request_interruption() {
+                Err(error) => assert!(interrupts && is_request_interruption(&error)),
+                Ok(()) => assert!(!interrupts, "missed pending {signal} in {mode}"),
+            }
+            {
+                let _nested = RequestGuard::enter(0);
+                check_request_interruption().unwrap();
+            }
+            assert_eq!(check_request_interruption().is_err(), interrupts);
+            // The held proc descriptor belongs to this task even after exit;
+            // later checks never reopen its numeric ID or cancel another task.
+            drop(requester);
+            check_request_interruption().unwrap();
+        }
+        check_request_interruption().unwrap();
+    }
+
+    #[test]
+    fn pending_request_signal_stops_only_its_owned_operation() {
+        let requester = Requester::stopped("caught");
+        let _request = RequestGuard::enter(requester.0.id());
+        let temporary = tempfile::tempdir().unwrap();
+        let started = temporary.path().join("native-pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 300", "request-test"])
+            .arg(&started);
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_for_pid(&started);
+                requester.signal(libc::SIGTERM);
+            });
+            run(command, true).unwrap_err()
+        });
+        assert!(is_request_interruption(&error));
+        let pid = std::fs::read_to_string(&started).unwrap();
+        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+        assert_eq!(cancelled_signal(), None);
+        assert!(!operations_stopped());
+        let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
+        assert!(status
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"State:\tT")));
+    }
+
+    #[test]
+    fn interrupted_owned_group_stops_even_with_ignored_term_or_early_leader_exit() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        for leader_exits in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let started = temporary.path().join("stubborn-pid");
+            let script = if leader_exits {
+                "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; exec sleep 300' stubborn \"$1\" & wait"
+            } else {
+                "trap \"\" TERM; echo $$ > \"$1\"; exec sleep 300"
+            };
+            let mut child = Command::new("sh")
+                .args(["-c", script, "owned-group-test"])
+                .arg(&started)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = wait_for_pid(&started);
+            stop_request_operation(&mut child).unwrap();
+            assert_eq!(
+                child.wait().unwrap().signal(),
+                Some(if leader_exits {
+                    libc::SIGTERM
+                } else {
+                    libc::SIGKILL
+                })
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+                if state.is_err() || state.unwrap().split_whitespace().nth(2) == Some("Z") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned descendant survived SIGKILL"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }

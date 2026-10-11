@@ -101,6 +101,44 @@ operation shutdown before unmount/state locking through a separate flag; this
 does not invent a termination signal. Its real-mounted stalled-read and busy
 recovery evidence is tracked separately and requires exact-head FUSE CI.
 
+## Pending requester signals during a stalled mounted fetch
+
+Actual real-FUSE CI run
+[38164674316](https://github.com/progbeat/git-on/actions/runs/38164674316)
+at `fd7367e01a9413c39eb4bebed4dde2e70e8f0c94` reproduced a remaining shutdown
+deadlock. The controlled server had received the lazy blob request, and SIGTERM
+was delivered to the blocked foreground child group. The runner still failed
+to finish within the permanent test's eight-second bound. The authentic
+before-fix binary reproduced both stalled cases; successful leader completion
+with an escaped reader passed after the separate operation-stop fix. The
+foreground signal case required an additional fix because the child could not
+exit until its blocked FUSE request received a reply. fuser 0.16 dispatches on
+one synchronous session thread and does not implement FUSE_INTERRUPT.
+
+Demand-capable callbacks now bind cancellation to their actual requesting task
+with a held `/proc/TID/status` descriptor. Existing native-operation and cache
+lock polls detect pending unblocked, nonignored INT/TERM/HUP/QUIT signals and
+abort only that request. The typed interruption propagates as EINTR and does
+not latch a remote failure or invent a command signal. Caught handlers can run
+and retry; the child's actual outcome remains authoritative. Native groups get
+a bounded SIGTERM cleanup interval, then SIGKILL before the unreaped leader is
+reaped. An interrupted private fetch removes only a leftover `shallow.lock`.
+
+Review also observed that a real stopped requester with the non-UTF-8 task name
+`\xffrequester` had a pending unblocked SIGTERM, while decoding its entire proc
+status as UTF-8 failed. The initial whole-record UTF-8 decoder would therefore
+miss that cancellation. The retained tests use this real task name; mask parsing
+now reads ASCII signal records from bytes. A constructed long Groups prefix
+checks parsing beyond 16 KiB; the held descriptor is read to completion without
+a length cutoff.
+
+All four focused `git::tests` passed locally: native signal dispositions and
+task identity, mask/encoding/length handling, active operation interruption
+without global cancellation, and termination of SIGTERM-ignoring groups with
+an early exiting leader. This local evidence does not replace the permanent
+real-FUSE replay, Python SIGINT, caught-handler completion or same-OID handler
+retry checks, which require the next exact-head CI run.
+
 ## Reproduced runtime defects
 
 The independent review used `03f18c36fcb01f8d49cb196e250cee2bffd0f86a` as the
