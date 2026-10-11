@@ -146,8 +146,15 @@ still verify isolated operand-count and unknown-option failures.
 
 Real-FUSE tests preserve exact binary streams and argv, both keep spellings on
 either side of `REV`, retained subtree writes and pin/unmount cleanup. Both
-stress and performance launchers use the mandatory separator. Final-head Linux
-CI must execute these suites; native macOS checks do not establish FUSE support.
+stress and performance launchers use the mandatory separator. Green-after is
+confirmed by [CI run 38151612805](https://github.com/progbeat/git-on/actions/runs/38151612805)
+at `01248000f6b38211f67222caf88e69b5fea8e720`: all 65 real-FUSE/uv integration
+tests pass without skips, and the direct-command rejection regression passes
+in the debug and installed binaries. All five mandatory suites pass, including
+strict Rust/clippy, FUSE protocol/inventory checks, stress, million-file demand
+gates, installer checks and packaged real-FUSE acceptance. Later commits require
+fresh exact-head CI. Native macOS checks do not establish FUSE support, and the
+benchmark timeout self-test also requires Linux `/proc`.
 
 ## Mutable directory link counts
 
