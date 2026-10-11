@@ -30,7 +30,8 @@ first `--` or the first token that does not start with `-`. If it reaches `--`,
 the preceding tokens must all be exact `--keep` or `-k` flags. The separator is
 consumed and every following token is literal command argv. Otherwise, the
 entire tail is literal argv, preserving the form without a separator. git-on
-never scans past a command name to find runner options.
+never scans past the first token without a leading `-`, or past a recognized
+separator, to find runner options.
 
 | Invocation | Interpretation |
 | --- | --- |
