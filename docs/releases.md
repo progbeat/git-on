@@ -98,21 +98,21 @@ and sudo are not needed. The same command installs or updates to GitHub's latest
 stable release each time it runs:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
+curl -fsSL --proto '=https' \
+  https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
 ```
 
-**Availability:** this public command becomes usable after the repository is
-public, this installer is merged to master, and the first successful master
-release workflow publishes the binary. No binary release exists before that
-workflow succeeds. While the repository is private, use authenticated access as
-described below. A missing release, private repository, or API rate limit produces
-an error before the current executable is replaced.
+Stable binaries are published in [GitHub Releases](https://github.com/progbeat/git-on/releases).
+Anonymous downloads require a public repository. For private releases or API
+rate limits, use your existing GitHub CLI authentication as described below.
+A failed release download leaves the current executable in place.
 
-For a pinned version or a different user-owned installation directory:
+To pin a version or choose another user-owned installation directory, first
+download the script as shown in the next section, then pass the desired option:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh -s -- --version 0.1.0
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh -s -- --bin-dir "$HOME/bin"
+sh install.sh --version 0.1.0
+sh install.sh --bin-dir "$HOME/bin"
 ```
 
 Both `0.1.0` and `v0.1.0` are accepted; prerelease versions are not. Omitting
@@ -129,13 +129,14 @@ Piping a script to a shell executes code from the repository. To inspect it firs
 download it, review it, then run the saved copy:
 
 ```sh
-curl -fSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
+curl -fSL --proto '=https' \
+  https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
 
 For a private repository, use an **already authenticated** GitHub CLI account with
-repository access. After the script is merged and a release exists:
+repository access:
 
 ```sh
 gh api --hostname github.com 'repos/progbeat/git-on/contents/install.sh?ref=master' \
@@ -154,7 +155,8 @@ limited. The normal mode does not read GitHub token environment variables.
 
 The installer resolves one release, checks its exact asset names, verifies the
 archive and build metadata against `SHA256SUMS`, and rejects unexpected archive
-members and links. It bounds compressed and expanded input sizes, reads only the
+members and links. New archives include the project's MIT `LICENSE`; the original
+v0.1.0 layout remains accepted. It bounds compressed and expanded input sizes, reads only the
 expected executable, and checks its reported version before an atomic replacement.
 A failed download, checksum, archive check, version probe, or replacement leaves
 the previous executable in place. Rerunning the same version is safe. Temporary
@@ -166,14 +168,28 @@ archive, and checksum file share the GitHub repository's trust boundary. To pin
 the installer code as well as the binary version, inspect a copy from the matching
 release tag or an explicitly selected commit instead of the moving master URL.
 
+The bootstrap command permits HTTPS transport only. The script encloses its
+payload in a function and guards the final call, so an incomplete download cannot
+start installation or drop supplied arguments. See the installer regressions in
+the [test guide](../tests/README.md#installer-acceptance).
+
 Install the distribution's `fuse3` package separately when needed. A working
 `fusermount3`, usable `/dev/fuse`, and permission to mount FUSE are required to run
 git-on. Missing FUSE setup produces an installation warning; it does not prevent
 installing a verified binary. Containers must expose the device and allow mounts.
 Do not run the installer as root to bypass unavailable FUSE setup.
 
-Building from source remains supported with `cargo install --path . --locked` in
-an explicitly selected checkout.
+### Building from source
+
+From a checkout of the revision you want to install, with Rust 1.89+ and a C
+compiler:
+
+```sh
+cargo install --path . --locked
+```
+
+Ensure Cargo's binary directory, normally `~/.cargo/bin`, is on `PATH`.
+The Linux/FUSE runtime requirements still apply.
 
 ## Design references
 

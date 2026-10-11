@@ -234,6 +234,36 @@ else:
                 self.run_script(success=False)
                 self.assertFalse((self.root / 'escape').exists())
 
+    def test_license_member_and_original_release_layout(self):
+        root = 'git-on-v0.1.0-' + MOD.TARGET
+        original = [(root, 'dir', b''),
+                    (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
+                    (root + '/README.md', 'file', b'readme')]
+        for extra in ([], [(root + '/LICENSE', 'file', (ROOT / 'LICENSE').read_bytes())]):
+            with self.subTest(licensed=bool(extra)):
+                directory, archive = self.release('0.1.0', original + extra)
+                MOD.verify(directory, 'v0.1.0', archive)
+                expanded, (offset, size) = MOD.unpack_binary(directory, archive)
+                with expanded.open('rb') as source:
+                    source.seek(offset)
+                    self.assertEqual(source.read(size), original[1][2])
+
+    def test_license_member_cannot_bypass_archive_checks(self):
+        root = 'git-on-v0.1.0-' + MOD.TARGET
+        original = [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\n'),
+                    (root + '/README.md', 'file', b'readme')]
+        license_member = (root + '/LICENSE', 'file', b'license')
+        cases = [[license_member, license_member],
+                 [(root + '/LICENSE', 'symlink', '/tmp/license')],
+                 [(root + '/LICENSE', 'hardlink', root + '/README.md')],
+                 [(root + '/LICENSE', 'file', bytes(MOD.MAX_METADATA + 1))]]
+        for extra in cases:
+            with self.subTest(extra=extra[0][:2], duplicate=len(extra) > 1):
+                directory, archive = self.release('0.1.0', original + extra)
+                with self.assertRaises(RuntimeError):
+                    MOD.unpack_binary(directory, archive)
+                self.assertEqual(self.old.read_bytes(), b'old executable\n')
+
     def test_reject_symlink_destination_and_parent(self):
         outside = self.root / 'outside'
         outside.write_bytes(b'keep')
@@ -444,6 +474,11 @@ def packaged_acceptance(distribution, destination):
     try:
         version = json.loads((distribution / 'release.json').read_text())['version']
         case.release(version, distribution=distribution)
+        archive = distribution / ('git-on-v' + version + '-' + MOD.TARGET + '.tar.gz')
+        with tarfile.open(archive, 'r:gz') as package:
+            license_file = package.extractfile(archive.name[:-7] + '/LICENSE')
+            if license_file is None or license_file.read() != (ROOT / 'LICENSE').read_bytes():
+                raise RuntimeError('Packaged license differs from the source license')
         case.run_script('--bin-dir', str(destination))
         case.run_script('--bin-dir', str(destination))
         binary = destination / 'git-on'

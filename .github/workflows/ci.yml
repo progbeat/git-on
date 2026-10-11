@@ -176,7 +176,7 @@ jobs:
           NAME="git-on-v${VERSION}-x86_64-unknown-linux-gnu"
           mkdir -p "staging/$NAME" dist unpacked
           install -m 755 target/release/git-on "staging/$NAME/git-on"
-          cp README.md "staging/$NAME/README.md"
+          cp README.md LICENSE "staging/$NAME/"
           tar --sort=name --mtime="@$(git show -s --format=%ct HEAD)" --owner=0 --group=0 --numeric-owner -C staging -cf - "$NAME" | gzip -n > "dist/$NAME.tar.gz"
           python3 - "$VERSION" "$COMMIT" <<'PY'
           import json, sys
@@ -186,6 +186,7 @@ jobs:
           (cd dist && sha256sum *.tar.gz release.json > SHA256SUMS)
           (cd dist && sha256sum --check SHA256SUMS)
           tar -xzf "dist/$NAME.tar.gz" -C unpacked
+          cmp LICENSE "unpacked/$NAME/LICENSE"
           echo "PACKAGED_BINARY=$PWD/unpacked/$NAME/git-on" >> "$GITHUB_ENV"
           test "$("unpacked/$NAME/git-on" --version)" = "git-on $VERSION"
       - name: Test install and repeat-update from the actual distribution
