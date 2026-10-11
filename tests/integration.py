@@ -79,7 +79,7 @@ class RepositoryTest(unittest.TestCase):
         return env
 
     def invoke(self, *command, tree="HEAD", keep=False, input=None, timeout=60, extra_env=None):
-        return self.invoke_argv([*(["--keep"] if keep else []), tree, *map(str, command)],
+        return self.invoke_argv([*(["--keep"] if keep else []), tree, "--", *map(str, command)],
                                 input=input, timeout=timeout, extra_env=extra_env)
 
     def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
@@ -119,6 +119,7 @@ class CliTests(RepositoryTest):
             if arg != "--version":
                 self.assertIn(b"[--keep|-k] -- <command>", result.stdout)
                 self.assertIn(b"--keep, -k", result.stdout)
+                self.assertIn(b"first -- is required before every command", result.stdout)
 
     def test_unknown_tree_never_executes(self):
         sentinel = self.root / "executed"
@@ -142,14 +143,17 @@ class CliTests(RepositoryTest):
         for args in [
             ["-k"], ["--"], ["HEAD"], ["HEAD", "--"],
             ["HEAD", "--keep", "--"], ["HEAD", "-k", "--"],
-            ["", *command], ["HEAD", ""], ["HEAD", "--", ""],
-            ["--unknown", "missing-tree", *command],
-            ["-kk", "missing-tree", *command],
-            ["--keep=1", "missing-tree", *command],
+            ["", "--", *command], ["HEAD", ""], ["HEAD", "--", ""],
+            ["--unknown", "missing-tree", "--", *command],
+            ["-kk", "missing-tree", "--", *command],
+            ["--keep=1", "missing-tree", "--", *command],
             ["missing-tree", "--unknown", "--", *command],
             ["missing-tree", "-k", "--unknown", "--", *command],
             ["missing-tree", "--keep=1", "--", *command],
             ["missing-tree", "-kk", "--", *command],
+            ["repository", "missing-tree", "--", *command],
+            ["--", "HEAD", "--", *command],
+            ["--keep", "--help", "HEAD", "--", *command],
         ]:
             with self.subTest(args=args):
                 result, run = self.invoke_argv(args)
@@ -158,6 +162,24 @@ class CliTests(RepositoryTest):
                 self.assertIsNone(run)
                 self.assertFalse(sentinel.exists())
                 self.assert_no_runtime_files()
+
+    def test_direct_command_syntax_is_rejected_before_execution(self):
+        sentinel = self.root / "executed"
+        command = [sys.executable, "-c", f"open({str(sentinel)!r}, 'w').close()"]
+        for prefix in (["HEAD"], ["--keep", "HEAD"], ["-k", "HEAD"], ["HEAD:subtree"]):
+            with self.subTest(prefix=prefix):
+                result, run = self.invoke_argv([*prefix, *command])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"missing -- separator", result.stderr)
+                self.assertIsNone(run)
+                self.assertFalse(sentinel.exists())
+                self.assert_no_runtime_files()
+        result, run = self.invoke_argv(["HEAD", *command, "--", "child-argument"])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"usage:", result.stderr)
+        self.assertIsNone(run)
+        self.assertFalse(sentinel.exists())
+        self.assert_no_runtime_files()
 
     def test_cleanup_rejects_unrelated_missing_and_symlinked_directories(self):
         unrelated = self.root / "unrelated"
@@ -206,7 +228,7 @@ class FuseTests(RepositoryTest):
         git(self.repo, "add", "executable.sh")
         git(self.repo, "commit", "--quiet", "-m", "executable fixture")
         code = "from pathlib import Path; import os,subprocess; assert os.access('executable.sh',os.X_OK); assert Path('tracked-link').is_symlink(); assert Path('tracked-link').read_text() == 'committed\\n'; subprocess.run(['./executable.sh'],check=True)"
-        result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(), capture_output=True, timeout=30)
+        result = subprocess.run([str(BINARY), "HEAD", "--", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(), capture_output=True, timeout=30)
         self.assert_success(result)
         self.assertEqual(result.stdout, b"executable\n")
 
@@ -225,30 +247,28 @@ class FuseTests(RepositoryTest):
         arguments = ["$(touch nope)", "a b", "; exit 5", "--keep", "-k", "--cleanup",
                      "--help", "--version", "--unknown", "--", ""]
         code = f"import os,sys; assert sys.argv[1:] == {arguments!r}; assert sys.stdin.buffer.read() == b'input\\x00bytes'; os.write(1,b'out\\x00\\xff\\n'); os.write(2,b'err\\x00\\xfe\\n')"
-        for prefix in (["HEAD"], ["HEAD", "--"]):
-            with self.subTest(prefix=prefix):
-                result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments],
-                                               input=b"input\x00bytes")
-                self.assert_success(result)
-                self.assertEqual(result.stdout, b"out\x00\xff\n")
-                self.assertEqual(result.stderr, b"err\x00\xfe\n")
-                self.assertIsNone(run)
-                self.assertFalse((self.repo / "nope").exists())
-                self.assert_no_runtime_files()
+        prefix = ["HEAD", "--"]
+        result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments],
+                                       input=b"input\x00bytes")
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"out\x00\xff\n")
+        self.assertEqual(result.stderr, b"err\x00\xfe\n")
+        self.assertIsNone(run)
+        self.assertFalse((self.repo / "nope").exists())
+        self.assert_no_runtime_files()
 
     def test_explicit_boundary_allows_dash_named_executable(self):
         executable = self.root / "--keep"
         executable.symlink_to(sys.executable)
         env = {"PATH": str(self.root) + os.pathsep + os.environ.get("PATH", "")}
-        for prefix in (["HEAD"], ["HEAD", "--"]):
-            with self.subTest(prefix=prefix):
-                result, run = self.invoke_argv([*prefix, "--keep", "-c", "print('literal-command')"],
-                                               extra_env=env)
-                self.assert_success(result)
-                self.assertEqual(result.stdout, b"literal-command\n")
-                self.assertEqual(result.stderr, b"")
-                self.assertIsNone(run)
-                self.assert_no_runtime_files()
+        prefix = ["HEAD", "--"]
+        result, run = self.invoke_argv([*prefix, "--keep", "-c", "print('literal-command')"],
+                                       extra_env=env)
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"literal-command\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
     def test_stdio_inherits_regular_file_descriptions_and_offsets(self):
         input_path, output_path = self.root / "stdin", self.root / "combined"
@@ -273,7 +293,7 @@ os.write(2, b'two')
 os.lseek(1, 0, os.SEEK_SET)
 os.write(1, b'P')
 """
-            result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c", code,
+            result = subprocess.run([str(BINARY), "HEAD", "--", sys.executable, "-c", code,
                                      json.dumps(expected)], cwd=self.repo,
                                     env=self.environment(), stdin=source,
                                     stdout=output, stderr=output, timeout=30)
@@ -287,7 +307,7 @@ os.write(1, b'P')
         read_fd, write_fd = os.pipe()
         os.close(read_fd)
         try:
-            result = subprocess.run([str(BINARY), "HEAD", sys.executable, "-c",
+            result = subprocess.run([str(BINARY), "HEAD", "--", sys.executable, "-c",
                                      "import os,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL); os.write(1,b'broken')"],
                                     cwd=self.repo, env=self.environment(), stdout=write_fd,
                                     stderr=subprocess.PIPE, timeout=30)
@@ -602,7 +622,7 @@ assert visible.st_blocks == backing.st_blocks, (visible, backing)
 assert os.pread(fd, 2, (1 << 20) - 1) == b'\0x'
 os.close(fd)
 '''
-        result = subprocess.run([str(BINARY), 'HEAD', sys.executable, '-c', code],
+        result = subprocess.run([str(BINARY), 'HEAD', '--', sys.executable, '-c', code],
                                 cwd=self.repo, env=self.environment(), capture_output=True,
                                 timeout=30,
                                 preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
@@ -1354,7 +1374,7 @@ assert Path(release).exists(), 'parent did not release concurrent runs'
 assert Path('out/shared').read_text() == index
 print(index)
 """
-                processes.append(subprocess.Popen([str(BINARY), "HEAD", sys.executable,
+                processes.append(subprocess.Popen([str(BINARY), "HEAD", "--", sys.executable,
                                                     "-c", code, str(index), str(ready), str(release)],
                                                    cwd=self.repo, env=self.environment(),
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE))
@@ -1431,7 +1451,7 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             os.chdir(self.repo)
             env = self.environment()
             env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
-            os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
+            os.execvpe("git", ["git", "on", "HEAD", "--", sys.executable, "-c", code], env)
         captured = bytearray()
         status = None
         sent = False
@@ -1474,7 +1494,7 @@ assert path.read_bytes() == b'abcX', path.read_bytes()
             os.chdir(self.repo)
             env = self.environment()
             env["PATH"] = str(BINARY.parent) + os.pathsep + env.get("PATH", "")
-            os.execvpe("git", ["git", "on", "HEAD", sys.executable, "-c", code], env)
+            os.execvpe("git", ["git", "on", "HEAD", "--", sys.executable, "-c", code], env)
         captured = bytearray()
         status = None
         stops = 0
@@ -1567,7 +1587,7 @@ assert sys.stdin.readline() == 'foreground-input\n'
 assert os.tcgetpgrp(0) == os.getpgrp()
 print('foreground-read-ok', flush=True)
 """
-            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code],
+            process = subprocess.Popen([str(BINARY), "HEAD", "--", sys.executable, "-c", code],
                                        cwd=self.repo, env=self.environment(), preexec_fn=os.setpgrp)
             reaped = False
             try:
@@ -1622,7 +1642,7 @@ with open('/dev/tty', 'rb', buffering=0) as tty:
     assert os.tcgetpgrp(tty.fileno()) == os.getpgrp(), 'running child did not receive foreground ownership'
 print('running-foreground-ok', flush=True)
 """
-            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code, str(ready)],
+            process = subprocess.Popen([str(BINARY), "HEAD", "--", sys.executable, "-c", code, str(ready)],
                                        cwd=self.repo, env=self.environment(), preexec_fn=os.setpgrp)
             reaped = False
             try:
@@ -1673,7 +1693,7 @@ print('redirected-terminal-ok', flush=True)
 """
             # Give the runner its own foreground job group, just as
             # `git on ... </dev/null` invoked by an interactive shell.
-            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code],
+            process = subprocess.Popen([str(BINARY), "HEAD", "--", sys.executable, "-c", code],
                                        cwd=self.repo, env=self.environment(),
                                        stdin=subprocess.DEVNULL, preexec_fn=os.setpgrp)
             reaped = False
@@ -1765,14 +1785,13 @@ assert p.exists()
     def test_non_utf8_command_argument_is_preserved(self):
         raw = b"-bad-\xff-name"
         code = f"import os,sys; assert list(map(os.fsencode, sys.argv[1:])) == {[raw, b'--', b'-k', b'--keep', b'']!r}"
-        for prefix in ([b"HEAD"], [b"HEAD", b"--"]):
-            with self.subTest(prefix=prefix):
-                result, run = self.invoke_argv([*prefix, os.fsencode(sys.executable), b"-c",
-                                               code.encode(), raw, b"--", b"-k", b"--keep", b""])
-                self.assert_success(result)
-                self.assertEqual(result.stderr, b"")
-                self.assertIsNone(run)
-                self.assert_no_runtime_files()
+        prefix = [b"HEAD", b"--"]
+        result, run = self.invoke_argv([*prefix, os.fsencode(sys.executable), b"-c",
+                                       code.encode(), raw, b"--", b"-k", b"--keep", b""])
+        self.assert_success(result)
+        self.assertEqual(result.stderr, b"")
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
 
     def test_ignore_decisions_match_git_for_complex_patterns(self):
         self.put(".gitignore", "out/\n*.tmp\n!keep.tmp\n/root-only.dat\nnested/a[0-9].bin\nnested/**/deep.bin\nescaped\\ space.dat\n\\#hash.dat\n\\!bang.dat\n*.trailing\\ \ndirs/\n!dirs/keep.txt\n{foo,bar}.dat\ntabbed\t\nnbsp\u00a0\n[unclosed\nx[[:digit:]].dat\n")
@@ -1810,7 +1829,7 @@ pending.write_text(json.dumps({'pid': os.getpid(), 'run': str(Path.cwd().parent)
 pending.replace(ready)
 time.sleep(300)
 """
-        process = subprocess.Popen([str(BINARY), *(["--keep"] if keep else []), "HEAD",
+        process = subprocess.Popen([str(BINARY), *(["--keep"] if keep else []), "HEAD", "--",
                                     sys.executable, "-c", code, str(ready)], cwd=self.repo,
                                    env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 20
@@ -1901,8 +1920,8 @@ time.sleep(300)
         expected = [os.fsencode(arg) for arg in arguments]
         code = f"from pathlib import Path; import os,sys; assert list(map(os.fsencode, sys.argv[1:])) == {expected!r}; Path('generated').mkdir(); Path('generated/result').write_text('retained'); print('child-output')"
         tree = "HEAD:subtree"
-        for prefix in (["--keep", tree], ["-k", tree], [tree, "--keep", "--"],
-                       [tree, "-k", "--"], ["-k", "--keep", "--", tree, "-k", "--keep", "--"]):
+        for prefix in (["--keep", tree, "--"], ["-k", tree, "--"], [tree, "--keep", "--"],
+                       [tree, "-k", "--"], ["-k", "--keep", tree, "-k", "--keep", "--"]):
             with self.subTest(prefix=prefix):
                 result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments])
                 self.assert_success(result)

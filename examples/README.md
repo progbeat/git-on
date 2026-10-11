@@ -30,8 +30,8 @@ The committed `.gitignore` permits `__pycache__/` and `.venv/` writes.
 After committing the examples in a repository, run either snapshot subtree:
 
 ```console
-git on HEAD:examples/pep723 uv run --locked --script main.py
-git on HEAD:examples/uv-project uv run --locked main.py
+git on HEAD:examples/pep723 -- uv run --locked --script main.py
+git on HEAD:examples/uv-project -- uv run --locked main.py
 ```
 
 The first example uses PEP 723 inline metadata and `main.py.lock`. The second

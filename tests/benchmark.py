@@ -469,7 +469,7 @@ def benchmark(args):
                 env = environment()
                 stdout, stderr = output / f"{tag}.stdout", output / f"{tag}.stderr"
                 metrics_path = output / f"{tag}.metrics"
-                argv = [str(binary), case["tree_oid"], sys.executable, "-I", "-S", "-c", CHILD,
+                argv = [str(binary), case["tree_oid"], "--", sys.executable, "-I", "-S", "-c", CHILD,
                         case["suite"], str(case["count"]), str(case.get("large_bytes", 0))]
                 expected_stdout = None
                 selection = {}
@@ -479,7 +479,7 @@ def benchmark(args):
                     path = "/".join(digits)
                     expected_stdout = (digits + "\n").encode()
                     selection = dict(selected_number=digits, selected_path=path, selection_seed=args.seed)
-                    argv = [str(binary), case["tree_oid"], cat, path]
+                    argv = [str(binary), case["tree_oid"], "--", cat, path]
                 measured = measured_process(argv, repo, env, stdout, stderr, args.timeout, expected_stdout, metrics_path)
                 sample = dict(event="sample", case=case, iteration=iteration, warmup=iteration < 0,
                               stdout=str(stdout), stderr=str(stderr), metrics_file=str(metrics_path), argv=argv,

@@ -5,7 +5,7 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on [--keep|-k] [--] <tree-ish> <command> [args...]` resolves the selected Git tree once and
+- `git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]` resolves the selected Git tree once and
   launches the given argv from its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.
@@ -15,29 +15,27 @@ separate from that contract; a requirement is not a claim of a passing test.
 - Only `GIT_ON_TREE_OID` is added or overridden in the child environment. No run
   ID, output-directory, or run-directory variable is synthesized or consumed.
   Caller-provided variables with such names remain ordinarily inherited.
-- Before the tree-ish, exact `--keep` and `-k` flags enable retention; they may
-  repeat. An optional `--` ends this prefix-option parsing and makes the next
-  token the revision, even when it begins with `-`. Unknown prefix options are
-  usage errors.
-- After the tree-ish, scan only the initial tokens beginning with byte `-`,
-  stopping at the first `--` or first token without that byte. If `--` is reached,
-  every preceding token in this block must be exactly `--keep` or `-k`; consume
-  those flags and that separator. Unknown options in that explicit block are
-  usage errors. Prefix and suffix retention flags combine idempotently.
-- If no such separator is reached, the entire tail is literal legacy command
-  argv. In particular, `REV -k command` runs the command named `-k`; it does not
-  enable retention. A separator later than a non-option command name is itself
-  an ordinary argument. After a recognized separator, every token is literal,
-  including `--keep`, `-k`, unknown options, and further `--` tokens.
-- Missing or empty revision/command names are usage errors (status 2), rejected
-  before revision resolution or runtime-state creation. Empty later arguments
-  and non-UTF-8 argv bytes are preserved. No shell or string re-tokenization is
-  introduced. First-token `--help`/`-h`, `--version` and `--cleanup` retain their
-  separate existing handling; these spellings elsewhere do not select modes.
-- The post-revision separator is a reserved syntax in 1.0. Calls that previously
-  used a command named `--`, or a dash-prefixed command followed by `--` before
-  any non-option argument, must insert the command boundary first:
-  `git on REV -- --keep -- args`. Ordinary `REV command args` remains compatible.
+- Every child-command invocation requires a `--` separator. The first `--`
+  always ends runner argument parsing; it cannot escape a revision. Before it,
+  accept exactly one nonempty positional operand for the local tree-ish and
+  exact `--keep`/`-k` options. Options may appear on either side of the revision,
+  repeat, and combine idempotently. A token beginning with byte `-` that is not
+  one of those options is an unknown option. Do not split or normalize the
+  revision: `HEAD:path/to/subtree` is one unchanged operand.
+- Everything after the first separator is literal command argv, including a
+  command name beginning with `-`, unknown options, `--keep`, `-k`, and further
+  `--` tokens. Empty later arguments and non-UTF-8 bytes are preserved. No shell
+  or string re-tokenization is introduced.
+- A missing separator, missing/empty revision, extra positional operand,
+  unknown runner option, or missing/empty command name returns usage status 2
+  with a clear diagnostic before Git resolution or runtime-state creation.
+  First-token `--help`/`-h`, `--version` and `--cleanup` retain their separate
+  existing handling and do not require a child-command separator. These
+  spellings after the separator are ordinary command argv.
+- Migration from 0.1.x requires inserting the separator before every command:
+  `git on REV command args` becomes `git on REV -- command args`, and
+  `git on --keep REV command` becomes `git on --keep REV -- command`.
+  Select a revision whose name starts with `-` using its full object ID.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
@@ -156,7 +154,7 @@ functional correctness:
   filename: `123456` maps to `1/2/3/4/5/6`. Each directory has ten entries.
 - Each leaf contains its six-digit number (with a documented optional newline).
   The benchmark harness chooses a seeded random number before timing, then runs
-  `git on <tree-OID> cat <digit-path>`. Record the seed and chosen number and
+  `git on <tree-OID> -- cat <digit-path>`. Record the seed and chosen number and
   verify externally that stdout matches that number. No Python child script or
   its interpreter startup is required in the measured workload.
 - Measure from git-on invocation until that correct stdout is observed, as well

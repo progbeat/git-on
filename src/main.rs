@@ -594,7 +594,7 @@ fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
         if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\nAfter the tree-ish, runner options require a following -- before the command.\nArguments after the command boundary are literal, including --keep and -k.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
+            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\nRunner options may appear on either side of the single local revision.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
             return Ok(ExitStatus::from_raw(0));
         }
         if args.first().is_some_and(|a| a == "--version") {
@@ -610,8 +610,9 @@ fn main() {
             return Ok(ExitStatus::from_raw(0));
         }
         match cli::parse_run_args(&args) {
-            Some(run) => execute(run.tree.clone(), run.command.to_vec(), run.keep),
-            None => {
+            Ok(run) => execute(run.tree.clone(), run.command.to_vec(), run.keep),
+            Err(error) => {
+                eprintln!("git-on: {error}");
                 eprintln!("usage: {}", cli::RUN_USAGE);
                 Ok(ExitStatus::from_raw(2 << 8))
             }

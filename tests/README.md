@@ -97,9 +97,10 @@ raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
 binary standard streams and inherited stdin; exit/signal return codes; direct
 terminal detection, PTY foreground ownership and stop/continue handling; missing
 executables; forwarded signals; default temporary-layer removal; `TMPDIR`
-selection; `--keep`/`-k` before the revision and before an explicit post-revision
-separator, exact argument forwarding after the first boundary, invalid syntax
-without runtime state, retention after unmount; absence of built-in logs, manifests,
+selection; mandatory command separators; `--keep`/`-k` on either side of the
+revision; exact argument forwarding after the first separator; rejected old direct
+command syntax, extra operands and unknown options without runtime state; retention
+after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
 active or deliberately retained state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
