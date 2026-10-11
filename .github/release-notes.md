@@ -1,13 +1,9 @@
-# 0.1.0
-Bump: initial
+# 0.1.1
+Bump: patch
 
-Initial Linux release of git-on.
+- Make the README easier to scan, with a compact installation command, practical examples, and links to detailed behavior and test guides.
+- Scope the CI badge and its link to master pushes; use a neutral information color for the Rust version badge.
+- Remove obsolete pre-release guidance and use the standard `curl -fsSL … | sh` installation command. The bootstrap now uses curl's default redirect and TLS settings; the installer's truncated-script protection, SHA-256 verification, and atomic replacement remain in place.
+- License git-on under MIT and include the license in release archives. The installer still accepts the original v0.1.0 archive layout.
 
-- Run an arbitrary command against a pinned Git tree without changing the working tree.
-- Load source directories and file contents on demand through FUSE.
-- Keep tracked paths immutable; allow temporary writes only where the selected tree's .gitignore permits them.
-- Inherit standard streams directly and optionally retain temporary writes with --keep.
-- Install or update to the latest stable prebuilt release with one command, verified checksums, and atomic replacement.
-- Include real-mount mutation/lifecycle checks and reproducible lazy-access benchmarks.
-
-Requires Linux x86_64, glibc 2.35 or newer, the shared zlib/libgcc runtimes, a usable /dev/fuse and fusermount3. This is not a sandbox. See README for support boundaries and installation.
+CLI behavior and Linux/FUSE requirements are unchanged. No migration is needed.

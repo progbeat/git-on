@@ -204,6 +204,8 @@ def unpack_binary(directory, archive):
                 fail("Expanded archive exceeds the size limit.")
             output.write(chunk)
     expected = {root, root + "/git-on", root + "/README.md"}
+    # v0.1.0 predates LICENSE in archives; retain pinned/repeat installation support.
+    allowed = expected | {root + "/LICENSE"}
     members = set()
     binary_range = None
     with expanded.open("rb") as source:
@@ -218,7 +220,7 @@ def unpack_binary(directory, archive):
             if len(header) != 512:
                 fail("Archive header was truncated.")
             member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
-            if member.name not in expected or member.name in members:
+            if member.name not in allowed or member.name in members:
                 fail("Archive has duplicate, missing, or unsafe paths.")
             members.add(member.name)
             if member.name == root:
@@ -235,7 +237,7 @@ def unpack_binary(directory, archive):
                 binary_range = (source.tell(), member.size)
             # No extension records, extraction paths, or sparse files are trusted.
             source.seek((member.size + 511) // 512 * 512, os.SEEK_CUR)
-        if members != expected:
+        if not expected <= members:
             fail("Archive has missing members.")
     return expanded, binary_range
 

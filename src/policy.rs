@@ -240,7 +240,7 @@ mod tests {
             RULE_CACHE_BYTES / (1024 * 1024),
             RULE_CACHE_ENTRIES
         );
-        assert!(include_str!("../README.md").contains(&expected));
+        assert!(include_str!("../docs/usage.md").contains(&expected));
     }
     #[test]
     fn policy_initialization_and_ancestor_loading_are_lazy() {

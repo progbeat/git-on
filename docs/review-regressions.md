@@ -45,6 +45,17 @@ truncate paths share backing-derived metadata refresh to prevent future drift.
 
 ## Release regressions
 
+- Adding MIT `LICENSE` to the release archive exposed the original installer's
+  exact three-member assumption. On master `a98e53f`, the new
+  `InstallerTests.test_license_member_and_original_release_layout` passed its
+  legacy case but rejected the licensed case with "unsafe paths". After allowing
+  that one optional regular file, both cases pass. The companion
+  `test_license_member_cannot_bypass_archive_checks` rejects duplicate, linked,
+  and oversized license members. The package acceptance check compares the
+  archive's license bytes with the source `LICENSE`.
+- The README cleanup moves detailed cache budgets to `docs/usage.md`.
+  `policy::tests::documented_ignore_cache_budget_matches_runtime` now checks that
+  document against the same runtime constants, preserving its original guard.
 - A failed GitHub upload can leave a `starter` asset. The original publisher
   treated it as complete and repeatedly failed its hash check. The reproducer
   failed before the fix and passes afterward in
