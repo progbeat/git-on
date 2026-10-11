@@ -827,7 +827,10 @@ mod tests {
     #[test]
     fn escaped_inherited_pipes_have_bounded_drain() {
         let start = Instant::now();
-        let (_,m,result)=capture("import os,time\np=os.fork()\nif p==0:\n os.setsid();time.sleep(3);os._exit(0)\nos._exit(0)",false);
+        let (_, m, result) = capture(
+            "import os,time\nr,w=os.pipe()\np=os.fork()\nif p==0:\n os.close(r);os.setsid();os.write(w,b'x');os.close(w);time.sleep(3);os._exit(0)\nos.close(w);assert os.read(r,1)==b'x';os.close(r);os._exit(0)",
+            false,
+        );
         assert!(result
             .unwrap_err()
             .to_string()
