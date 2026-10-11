@@ -22,3 +22,8 @@ operations or performance requirements are verified from a green subset.
 Release artifacts are generated only by the master workflow after all checks.
 Document changes in GitHub Release notes rather than maintaining a mandatory
 CHANGELOG. Never insert secrets or access tokens into notes, logs or fixtures.
+
+Every behavioral bug discovered in review must get a focused regression test.
+Demonstrate that it reproduces the old failure, then passes after the fix; keep
+that test in the permanent suite. Record red-before/green-after evidence instead
+of treating a code change or an unrelated passing suite as sufficient verification.

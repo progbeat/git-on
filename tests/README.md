@@ -103,3 +103,9 @@ active or deliberately retained state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
 runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
 retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.
+
+## Randomized filesystem differential stress
+
+See [stress.md](stress.md) for bounded seeded real-mount operation generation,
+exact namespace/content/metadata/error comparison, and trace replay. CI requires
+a real FUSE device for this suite; host-only oracle self-tests are separate.

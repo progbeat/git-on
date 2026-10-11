@@ -561,6 +561,15 @@ impl Overlay {
         self.allowed(&p, kind)?;
         Ok(p)
     }
+    fn adjust_parent_links(&mut self, path: &Path, delta: i32) {
+        if let Some(ino) = path.parent().and_then(|p| self.paths.get(p)).copied() {
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                if !node.immutable {
+                    node.attr.nlink = node.attr.nlink.saturating_add_signed(delta);
+                }
+            }
+        }
+    }
     fn touch_parent(&mut self, path: &Path) {
         if let Some(ino) = path.parent().and_then(|p| self.paths.get(p)).copied() {
             // A tracked directory's metadata belongs to the snapshot as well.
@@ -626,6 +635,9 @@ impl Overlay {
         );
         self.paths.insert(p.clone(), ino);
         self.upper_paths.insert(p.clone(), ino);
+        if kind == FileType::Directory {
+            self.adjust_parent_links(&p, 1);
+        }
         self.touch_parent(&p);
         Ok(ino)
     }
@@ -685,6 +697,12 @@ impl Overlay {
             .open(self.backing.join(ino.to_string()))
             .map_err(errno)
     }
+    fn record_data_change(attr: &mut FileAttr, metadata: &fs::Metadata) {
+        attr.size = metadata.len();
+        attr.blocks = metadata.blocks();
+        attr.mtime = SystemTime::now();
+        attr.ctime = attr.mtime;
+    }
     fn truncate(&mut self, ino: u64, size: u64) -> FsResult<()> {
         self.writable(ino)?;
         if self.node(ino)?.attr.kind != FileType::RegularFile {
@@ -693,12 +711,11 @@ impl Overlay {
         if size > i64::MAX as u64 {
             return Err(libc::EFBIG);
         }
-        self.disk_file(ino)?.set_len(size).map_err(errno)?;
+        let file = self.disk_file(ino)?;
+        file.set_len(size).map_err(errno)?;
+        let metadata = file.metadata().map_err(errno)?;
         let n = self.node_mut(ino)?;
-        n.attr.size = size;
-        n.attr.blocks = size.div_ceil(512);
-        n.attr.mtime = SystemTime::now();
-        n.attr.ctime = n.attr.mtime;
+        Self::record_data_change(&mut n.attr, &metadata);
         Ok(())
     }
     fn read_data(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> FsResult<Vec<u8>> {
@@ -790,16 +807,19 @@ impl Overlay {
         let mut written = 0;
         while written < data.len() {
             match file.write_at(&data[written..], offset + written as u64) {
-                Ok(0) => return Err(libc::EIO),
+                Ok(0) if written == 0 => return Err(libc::EIO),
+                Ok(0) => break,
                 Ok(n) => written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(errno(e)),
+                Err(e) if written == 0 => return Err(errno(e)),
+                // A short backing write followed by ENOSPC/EFBIG still changed
+                // the file. Report that progress and refresh visible metadata;
+                // a subsequent write can report the underlying capacity error.
+                Err(_) => break,
             }
         }
-        n.attr.size = n.attr.size.max(offset + written as u64);
-        n.attr.blocks = n.attr.size.div_ceil(512);
-        n.attr.mtime = SystemTime::now();
-        n.attr.ctime = n.attr.mtime;
+        let metadata = file.metadata().map_err(errno)?;
+        Self::record_data_change(&mut n.attr, &metadata);
         if !cached && flags & libc::O_SYNC == libc::O_SYNC {
             file.sync_all().map_err(errno)?;
         } else if !cached && flags & libc::O_DSYNC != 0 {
@@ -813,6 +833,13 @@ impl Overlay {
     fn remove_path(&mut self, p: &Path) {
         self.upper_paths.remove(p);
         if let Some(ino) = self.paths.remove(p) {
+            if self
+                .nodes
+                .get(&ino)
+                .is_some_and(|n| n.attr.kind == FileType::Directory)
+            {
+                self.adjust_parent_links(p, -1);
+            }
             if let Some(n) = self.nodes.get_mut(&ino) {
                 n.attr.nlink = n
                     .attr
@@ -927,6 +954,10 @@ impl Overlay {
             self.paths.insert(target, id);
         }
         self.node_mut(ino)?.attr.ctime = SystemTime::now();
+        if kind == FileType::Directory && from.parent() != to.parent() {
+            self.adjust_parent_links(&from, -1);
+            self.adjust_parent_links(&to, 1);
+        }
         self.touch_parent(&from);
         self.touch_parent(&to);
         Ok(())

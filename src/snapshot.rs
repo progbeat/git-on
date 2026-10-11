@@ -19,6 +19,95 @@ const TREE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const TREE_CACHE_ENTRIES: usize = 256;
 const HEADER_CACHE_ENTRIES: usize = 4096;
 
+/// Recognize complete pointer files, not ordinary source/documentation which
+/// happens to start with the LFS version line. Keep this bounded even for large
+/// blobs. Format: https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
+fn is_lfs_pointer(bytes: &[u8]) -> bool {
+    if bytes.len() >= 1024 || bytes.contains(&0) {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    // Like Git LFS's decoder, also recognize CRLF and a missing final newline.
+    let mut lines = text.lines();
+    if !matches!(
+        lines.next(),
+        Some(
+            "version https://git-lfs.github.com/spec/v1"
+                | "version https://hawser.github.com/spec/v1"
+                | "version http://git-media.io/v/2"
+        )
+    ) {
+        return false;
+    }
+    let valid_oid = |value: &str| {
+        value.strip_prefix("sha256:").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    let mut previous = None;
+    let mut oid = false;
+    let mut size = false;
+    let mut extension_priorities = [false; 10];
+    for line in lines {
+        let Some((key, value)) = line.split_once(' ') else {
+            return false;
+        };
+        if key.is_empty()
+            || !key.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte)
+            })
+            || value.is_empty()
+            || value.starts_with(' ')
+            || value.contains('\r')
+            || key == "version"
+            || previous.is_some_and(|last| last >= key)
+        {
+            return false;
+        }
+        previous = Some(key);
+        match key {
+            "oid" => {
+                if !valid_oid(value) {
+                    return false;
+                }
+                oid = true;
+            }
+            "size" => {
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) || value.parse::<i64>().is_err()
+                {
+                    return false;
+                }
+                size = true;
+            }
+            key if key.starts_with("ext-") => {
+                let Some((priority, name)) = key[4..].split_once('-') else {
+                    return false;
+                };
+                if priority.len() != 1
+                    || !priority.as_bytes()[0].is_ascii_digit()
+                    || name.is_empty()
+                    || !valid_oid(value)
+                {
+                    return false;
+                }
+                let priority = usize::from(priority.as_bytes()[0] - b'0');
+                if std::mem::replace(&mut extension_priorities[priority], true) {
+                    return false;
+                }
+            }
+            // The specification permits unknown keys; their syntax and order
+            // still have to be valid, and they cannot replace required fields.
+            _ => {}
+        }
+    }
+    oid && size
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     File,
@@ -262,9 +351,7 @@ impl State {
         Ok(BlobReader(reader))
     }
     fn validate_blob(bytes: &[u8]) -> Result<()> {
-        if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
-            || bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\r\n")
-        {
+        if is_lfs_pointer(bytes) {
             bail!("Git LFS pointer blobs are unsupported");
         }
         Ok(())
@@ -591,8 +678,14 @@ mod tests {
             let oid = if submodule {
                 repo.head().unwrap().target().unwrap()
             } else {
-                repo.blob(b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n")
-                    .unwrap()
+                repo.blob(
+                    format!(
+                        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1\n",
+                        "a".repeat(64)
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
             };
             let ordinary = repo.blob(b"works").unwrap();
             let mut builder = repo.treebuilder(None).unwrap();
@@ -617,6 +710,101 @@ mod tests {
             assert!(repo.find_reference("refs/git-on/demand").is_ok());
             drop(snap);
             assert!(repo.find_reference("refs/git-on/demand").is_err());
+        }
+    }
+    #[test]
+    fn lfs_detection_requires_complete_valid_pointer_structure() {
+        let hash = "0123456789abcdef".repeat(4);
+        let version = "version https://git-lfs.github.com/spec/v1\n";
+        let pointer = format!("{version}oid sha256:{hash}\nsize 123\n");
+        for valid in [
+            pointer.clone(),
+            pointer.replace('\n', "\r\n"),
+            pointer.trim_end_matches('\n').to_owned(),
+            pointer.replace("git-lfs", "hawser"),
+            pointer.replace("https://git-lfs.github.com/spec/v1", "http://git-media.io/v/2"),
+            pointer.replace("size 123", "size 0"),
+            format!("{version}ext-0-compress sha256:{hash}\next-1-encrypt sha256:{hash}\noid sha256:{hash}\nsize 123\n"),
+            format!("{pointer}x-note preserved metadata\n"),
+        ] {
+            assert!(is_lfs_pointer(valid.as_bytes()), "{valid:?}");
+            assert!(State::validate_blob(valid.as_bytes()).is_err());
+        }
+        for ordinary in [
+            String::new(),
+            version.to_owned(),
+            format!("{version}This is documentation, not a pointer.\n"),
+            format!("{version}oid sha256:{hash}\n"),
+            format!("{version}size 123\n"),
+            pointer.replace(&hash, "abc"),
+            pointer.replace(&hash, &"a".repeat(65)),
+            pointer.replace(&hash, &hash.to_uppercase()),
+            pointer.replace("sha256:", "sha1:"),
+            pointer.replace("size 123", "size -1"),
+            pointer.replace("size 123", "size 1.5"),
+            pointer.replace("size 123", "size 9223372036854775808"),
+            pointer.replace("size 123", "size 123 bytes"),
+            pointer.replace("size 123", "size  123"),
+            pointer.replace("size 123", "size\t123"),
+            pointer.replace("/spec/v1", "/spec/v2"),
+            format!("{version}size 123\noid sha256:{hash}\n"),
+            format!("{version}oid sha256:{hash}\noid sha256:{hash}\nsize 123\n"),
+            format!("{pointer}size 123\n"),
+            format!("{pointer}This is documentation, not a pointer.\n"),
+            format!("{version}ext-0-compress sha256:abc\noid sha256:{hash}\nsize 123\n"),
+            format!("{version}ext-0-compress sha256:{hash}\next-0-encrypt sha256:{hash}\noid sha256:{hash}\nsize 123\n"),
+            format!("{pointer}x-note contains\rcarriage return\n"),
+            format!("{pointer}x-note nul\0byte\n"),
+            format!("{pointer}x-note {}\n", "x".repeat(1024)),
+        ] {
+            assert!(!is_lfs_pointer(ordinary.as_bytes()), "{ordinary:?}");
+            assert!(State::validate_blob(ordinary.as_bytes()).is_ok());
+        }
+        for length in [1023, 1024] {
+            let prefix = format!("{pointer}x-note ");
+            let boundary = format!("{prefix}{}\n", "x".repeat(length - prefix.len() - 1));
+            assert_eq!(boundary.len(), length);
+            assert_eq!(is_lfs_pointer(boundary.as_bytes()), length < 1024);
+        }
+        let mut binary = pointer.into_bytes();
+        binary.extend_from_slice(b"x-note invalid UTF-8: \xff\n");
+        assert!(!is_lfs_pointer(&binary));
+        assert!(State::validate_blob(&binary).is_ok());
+    }
+    #[test]
+    fn lfs_prefix_in_ordinary_blobs_is_readable_through_both_read_paths() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let text =
+            b"version https://git-lfs.github.com/spec/v1\nThis is documentation, not a pointer.\n";
+        let ordinary = repo.blob(text).unwrap();
+        let pointer = repo
+            .blob(
+                format!(
+                    "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 123\n",
+                    "a".repeat(64)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        for first_open in [false, true] {
+            let snap = Snapshot::load(
+                tmp.path(),
+                OsStr::new("HEAD"),
+                if first_open { "lfs-open" } else { "lfs-read" },
+            )
+            .unwrap();
+            if first_open {
+                assert_eq!(snap.open(ordinary).unwrap().read(0, 4096).unwrap(), text);
+            } else {
+                assert_eq!(snap.read(ordinary, 0, 4096).unwrap(), text);
+            }
+            // Both the uncached and cached paths preserve the original bytes.
+            assert_eq!(snap.read(ordinary, 0, 4096).unwrap(), text);
+            assert_eq!(snap.open(ordinary).unwrap().read(0, 4096).unwrap(), text);
+            assert!(snap.read(pointer, 0, 4096).is_err());
+            assert!(snap.open(pointer).is_err());
+            assert_eq!(snap.read(ordinary, 0, 4096).unwrap(), text);
         }
     }
     #[test]

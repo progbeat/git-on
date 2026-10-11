@@ -127,7 +127,7 @@ class CliTests(RepositoryTest):
             with self.subTest(args=args):
                 result = subprocess.run([str(BINARY), *args], cwd=self.repo,
                                         env=self.environment(), capture_output=True, timeout=10)
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assert_no_runtime_files()
 
     def test_cleanup_rejects_unrelated_missing_and_symlinked_directories(self):
@@ -518,6 +518,49 @@ os.close(fd)
 assert not Path('out/final-hard').exists()
 ''')
         self.assert_success(result)
+
+    def test_partial_backing_write_and_sparse_blocks_remain_visible(self):
+        code = r'''
+import errno, os, resource
+from pathlib import Path
+
+path = Path('out/partial')
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+runner = os.getppid()
+original = resource.prlimit(runner, resource.RLIMIT_FSIZE)
+try:
+    # Limit the FUSE server's backing writes, not the client's write syscall.
+    # The server inherited SIGXFSZ ignored solely for this isolated regression.
+    resource.prlimit(runner, resource.RLIMIT_FSIZE, (3, original[1]))
+    assert os.write(fd, b'abcdef') == 3
+    try: os.write(fd, b'x')
+    except OSError as error: assert error.errno == errno.EFBIG, error
+    else: raise AssertionError('no-progress backing write did not fail')
+finally:
+    resource.prlimit(runner, resource.RLIMIT_FSIZE, original)
+assert os.fstat(fd).st_size == 3
+assert os.pread(fd, 10, 0) == b'abc'
+assert path.read_bytes() == b'abc'
+for size in [1 << 30, 0]:
+    os.ftruncate(fd, size)
+    visible = os.fstat(fd)
+    backing = os.stat(Path.cwd().parent / 'backing' / str(visible.st_ino))
+    assert visible.st_size == backing.st_size == size
+    assert visible.st_blocks == backing.st_blocks, (visible, backing)
+assert os.pwrite(fd, b'x', 1 << 20) == 1
+visible = os.fstat(fd)
+backing = os.stat(Path.cwd().parent / 'backing' / str(visible.st_ino))
+assert visible.st_size == backing.st_size
+assert visible.st_blocks == backing.st_blocks, (visible, backing)
+assert os.pread(fd, 2, (1 << 20) - 1) == b'\0x'
+os.close(fd)
+'''
+        result = subprocess.run([str(BINARY), 'HEAD', sys.executable, '-c', code],
+                                cwd=self.repo, env=self.environment(), capture_output=True,
+                                timeout=30,
+                                preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
+        self.assert_success(result)
+        self.assert_no_runtime_files()
 
     def test_mknod_regular_files_follow_policy_and_special_nodes_are_refused(self):
         result, _ = self.python(r'''

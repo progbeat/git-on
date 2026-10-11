@@ -57,6 +57,19 @@ def publish():
     if set(assets) - expected:
         raise RuntimeError("unexpected existing release assets")
     for path in files:
+        asset = assets.get(path.name)
+        if asset is not None and asset.get("state") == "starter":
+            # GitHub may leave an empty starter asset after an upload returns 502.
+            # Recheck the exact intended release immediately before draft-only repair.
+            current = api(f"repos/{repo}/releases/{release['id']}")
+            if not release["draft"] or not current["draft"]:
+                raise RuntimeError("published release has an incomplete asset; refusing mutation")
+            if current["tag_name"] != tag or current["body"].strip() != body.strip():
+                raise RuntimeError("release identity changed during retry")
+            gh("api", f"repos/{repo}/releases/assets/{asset['id']}", "--method", "DELETE", raw=True)
+            del assets[path.name]
+        elif asset is not None and asset.get("state") != "uploaded":
+            raise RuntimeError(f"unexpected asset state: {asset.get('state')}")
         if path.name in assets:
             with tempfile.TemporaryDirectory() as directory:
                 gh("release", "download", tag, "--repo", repo, "--pattern", path.name,

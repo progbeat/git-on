@@ -1,7 +1,7 @@
 # Releases and installation
 
-Every pull request into `master` is one release. Squash merging is supported and
-recommended: the resulting commit contains both the change and its release
+Every pull request into `master` is one release. Squash, ordinary merge and
+rebase merging are supported. Squash merging is recommended: the resulting commit contains both the change and its release
 metadata. No separate release PR, manual tag, or CHANGELOG history is required.
 
 ## Preparing a change
@@ -45,10 +45,20 @@ checks out moving master to choose release contents. Release notes come from
 that commit. The token has read access in test/build jobs and contents-write only
 in the publishing job; no personal token, crates.io account or app is required.
 
+Master validation compares against the push event's `before` SHA, so a rebased
+PR may contain a version bump followed by additional commits. Force pushes and
+branch-creation events are rejected by this release validation.
+
 Tag creation is an atomic GitHub ref creation. A tag at another SHA is an error,
 never force-moved. Re-running the same commit resumes a draft with matching notes
-and assets; matching published releases are verified and left unchanged. Different
+and assets. An incomplete `starter` upload can be removed and retried only while the
+verified release is still a draft; published assets are never repaired by deletion.
+Matching published releases are verified and left unchanged. Different
 commits can finish out of order without canceling each other's publication.
+GitHub may require additional workflow permissions when publishing an older
+commit after a newer commit changed workflow files. In that case publication
+fails visibly; this pipeline does not request a broader token or promise every
+historical release can be published with `contents: write` alone.
 The tag-created event is not used to trigger another workflow, because GitHub's
 GITHUB_TOKEN normally does not trigger such workflows.
 

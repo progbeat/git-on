@@ -14,6 +14,7 @@ import sys
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +137,18 @@ def test_names(path):
     return rust_test_names(source)
 
 
+def host_metadata(root):
+    # cargo test/build fetch host dependencies only. Unfiltered metadata also
+    # requests unused wasm/Windows packages, making an offline guard fail on a
+    # perfectly valid Linux build. Match the active compiler's host explicitly.
+    compiler = subprocess.check_output(["rustc", "-vV"], cwd=root, text=True)
+    hosts = re.findall(r"^host: (\S+)$", compiler, re.M)
+    require(len(hosts) == 1, "could not determine rustc host target")
+    return json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+         "--filter-platform", hosts[0]], cwd=root))
+
+
 def check(root=ROOT):
     lock = tomllib.loads((root / "Cargo.lock").read_text())
     packages = [p for p in lock["package"] if p["name"] == "fuser"]
@@ -143,8 +156,7 @@ def check(root=ROOT):
     locked = packages[0]
     require((locked["version"], locked.get("checksum")) == (FUSER_VERSION, FUSER_CHECKSUM),
             "fuser dependency changed; review callback contract, matrix and fingerprint")
-    metadata = json.loads(subprocess.check_output(
-        ["cargo", "metadata", "--locked", "--offline", "--format-version", "1"], cwd=root))
+    metadata = host_metadata(root)
     packages = [p for p in metadata["packages"] if p["name"] == "fuser"]
     require(len(packages) == 1 and packages[0]["version"] == FUSER_VERSION,
             "cargo metadata differs from reviewed fuser version")
@@ -230,6 +242,21 @@ const TEXT: &str = "#[test] fn quoted() {}";
 #[test]
 fn actual_test() {}'''
         self.assertEqual(rust_test_names(source), {"actual_test"})
+
+    def test_metadata_stays_offline_and_filters_compiler_host(self):
+        with patch.object(subprocess, "check_output", side_effect=[
+                "rustc 1.89.0\nhost: x86_64-unknown-linux-gnu\n", b'{"packages": []}']) as output:
+            self.assertEqual(host_metadata(ROOT), {"packages": []})
+            self.assertEqual(output.call_args_list[0].args[0], ["rustc", "-vV"])
+            self.assertEqual(output.call_args_list[1].args[0], [
+                "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+                "--filter-platform", "x86_64-unknown-linux-gnu"])
+
+    def test_missing_compiler_host_does_not_run_unfiltered_metadata(self):
+        with patch.object(subprocess, "check_output", return_value="rustc unknown\n") as output:
+            with self.assertRaises(ValueError):
+                host_metadata(ROOT)
+            self.assertEqual(output.call_count, 1)
 
 
 if __name__ == "__main__":

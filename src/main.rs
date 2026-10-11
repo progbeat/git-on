@@ -601,7 +601,8 @@ fn main() {
         }
         if args.first().is_some_and(|a| a == "--cleanup") {
             if args.len() != 2 {
-                bail!("usage: git on --cleanup <temporary-directory>");
+                eprintln!("usage: git on --cleanup <temporary-directory>");
+                return Ok(ExitStatus::from_raw(2 << 8));
             }
             cleanup(Path::new(&args[1]))?;
             return Ok(ExitStatus::from_raw(0));
@@ -642,6 +643,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Fork briefly inherits other threads' flock descriptions before exec.
+    // Keep process-spawning and lock-release assertions in separate test epochs.
+    static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn recovery(keep: bool) -> Recovery {
         Recovery {
             format: "git-on-temp-v1".into(),
@@ -654,6 +658,7 @@ mod tests {
     }
     #[test]
     fn recovery_refuses_active_and_kept_data() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("temp");
         private_dir(&dir).unwrap();
@@ -689,6 +694,7 @@ mod tests {
     }
     #[test]
     fn event_supervisor_preserves_exit_and_signal() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
         for script in ["exit 23", "kill -TERM $$"] {
             let mut signals = Signals::new([
                 SIGINT,

@@ -41,7 +41,9 @@ python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
 ```
 
 The checker resolves the dependency source with `cargo metadata --locked
---offline`. It verifies the locked version/checksum and reviewed trait-source
+--offline --filter-platform <rustc-host>`, deriving the host from `rustc -vV`.
+Filtering prevents an already-built Linux checkout from needing unused wasm or
+Windows dependency downloads. It verifies the locked version/checksum and reviewed trait-source
 fingerprint, enumerates every method including platform exclusions, compares
 the actual `Overlay` overrides and default handler classifications, and checks
 that named tests still exist. A dependency or trait change requires an explicit
@@ -64,6 +66,8 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-bounds | tests/fuse_protocol.rs | protocol_zero_length_sync_writes_and_setattr_times |
 | P-failures | tests/fuse_protocol.rs | protocol_backing_failures_propagate_without_namespace_insertion |
 | P-metadata | tests/fuse_protocol.rs | protocol_create_metadata_stale_setattr_and_directory_stream_lifetime |
+| P-partial | tests/fuse_protocol.rs | protocol_partial_backing_write_preserves_visible_progress |
+| P-sparse | tests/fuse_protocol.rs | protocol_sparse_allocation_matches_backing_after_truncate_and_write |
 | I-snapshot | tests/integration.py | FuseTests.test_snapshot_ignores_dirty_index_worktree_and_untracked_files |
 | I-file | tests/integration.py | FuseTests.test_file_operation_matrix_preserves_tracked_bytes |
 | I-directory | tests/integration.py | FuseTests.test_directory_and_rename_operation_matrix_is_atomic |
@@ -82,6 +86,7 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | I-lock | tests/integration.py | FuseTests.test_posix_and_flock_locks_use_local_kernel_fallback |
 | I-pollseek | tests/integration.py | FuseTests.test_poll_and_lseek_use_regular_file_kernel_fallbacks |
 | I-copy | tests/integration.py | FuseTests.test_copy_file_range_kernel_fallback_preserves_offsets_and_snapshot |
+| I-partial | tests/integration.py | FuseTests.test_partial_backing_write_and_sparse_blocks_remain_visible |
 <!-- TEST IDS END -->
 
 ## Callback matrix
@@ -99,8 +104,8 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | lookup | implemented | P-life, P-namespace | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
-| getattr | implemented | P-life, P-io, P-namespace, P-metadata | I-file, I-links | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; mounted metadata, size, mode and link-count assertions. |
-| setattr | implemented | P-access, P-bounds, P-metadata | I-file, I-directory | Owner/nonowner decisions, changed uid/gid, readonly/stale/mismatched handle and immutable rejection, size overflow, explicit/now times; mounted chmod/chown-self/utime and path/fd truncate. Linux does not supply macOS creation/backup times or file flags. |
+| getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. |
+| setattr | implemented | P-access, P-bounds, P-metadata, P-sparse | I-file, I-directory, I-partial | Owner/nonowner decisions, changed uid/gid, readonly/stale/mismatched handle and immutable rejection, size overflow, explicit/now times; sparse grow/shrink reports actual backing size/blocks; mounted chmod/chown-self/utime and path/fd truncate. Linux does not supply macOS creation/backup times or file flags. |
 | readlink | implemented | P-io | I-exec, I-links | Exact tracked target and EINVAL for regular inode; mutable, renamed and dangling links and immutable write-through boundaries on mounts. |
 | mknod | implemented | P-create, P-failures | I-mknod | Regular file, existing/disallowed name, special-node EPERM, missing backing and no namespace insertion; real umask/uid/gid and FIFO/socket refusal. Device nodes are not supported. |
 | mkdir | implemented | P-create, P-namespace | I-directory | Directory creation, umask, duplicate and forbidden names; real nested creation, metadata and later removal. |
@@ -110,8 +115,8 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
 | link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. |
 | open | implemented | P-io | I-file, I-exec | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. |
-| read | implemented | P-io, P-bounds | I-file, I-large | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; sequential/range reads and large-object behavior on mounts. |
-| write | implemented | P-io, P-bounds | I-file, I-mmap | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; append and mmap/current-description behavior on mounts. |
+| read | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-large, I-partial | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
+| write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
 | flush | implemented | P-io, P-bounds | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. Flush is not a persistence/fsync guarantee. |
 | release | implemented | P-io | I-sync, I-links | Subsequent use and repeat release of closed handle fail; mounted open-unlinked lifetime. Linux does not report RELEASE errors through close. |
 | fsync | implemented | P-io | I-sync | Data/full sync of writable and immutable handles; stale handle rejection; mounted fdatasync/fsync before and after unlink. |
@@ -148,8 +153,13 @@ different from exhaustive coverage of all argument combinations, kernel
 versions, races or host failures. In particular:
 
 - Deterministic missing-backing tests establish error propagation and atomic
-  namespace rejection. They are not simulations of every ENOSPC, EINTR, short
-  I/O, fsync media error or machine/power failure.
+  namespace rejection. An isolated `RLIMIT_FSIZE` regression limits the server's
+  backing file: a six-byte write makes three bytes of real progress, that prefix
+  remains readable with the correct visible size, and a later no-progress write
+  returns `EFBIG`. Separate sparse grow/shrink and offset-write assertions compare
+  visible size and allocated blocks with actual backing metadata. These are not
+  simulations of every `ENOSPC`, `EINTR`, short-I/O cause, fsync media error or
+  machine/power failure.
 - Inode/link-count integer exhaustion is not forced by constructing billions of
   paths; bounded handle/path rejection cases are tested directly instead.
 - macOS-only fields and operations, malformed wire parsing inside the third-party
@@ -158,3 +168,10 @@ versions, races or host failures. In particular:
 - A green inventory check does not prove runtime execution. Acceptance must cite
   the actual exact-revision protocol and non-skipped real-FUSE results. Counts of
   passing scenarios must never be presented as a branch-coverage percentage.
+
+## Directory link-count regression
+
+`protocol_mutable_directory_links_follow_namespace_changes` covers mutable
+parent link accounting through mkdir, rmdir, cross-parent rename, replacement
+and same-parent rename while preserving tracked-parent metadata. The randomized
+real-mount oracle in `tests/stress.py` also checks this after every operation.

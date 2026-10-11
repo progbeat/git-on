@@ -32,6 +32,7 @@ class PublicationTests(unittest.TestCase):
         self.refs = []
         self.releases = []
         self.assets = {}
+        self.starter = set()
         self.calls = []
 
     def fake(self, *args, raw=False, data=None):
@@ -50,9 +51,15 @@ class PublicationTests(unittest.TestCase):
                 self.releases = [release]
                 return release
             if '/assets?' in path:
-                return [{'name': n} for n in self.assets]
+                return [{'name': n, 'id': i, 'state': 'starter' if n in self.starter else 'uploaded'} for i, n in enumerate(self.assets)]
+            if '/releases/assets/' in path and '--method' in args and args[args.index('--method') + 1] == 'DELETE':
+                name = list(self.assets)[int(path.rsplit('/', 1)[1])]
+                del self.assets[name]
+                self.starter.discard(name)
+                return ''
             if path.endswith('/releases/1'):
-                self.releases[0].update(data)
+                if data is not None:
+                    self.releases[0].update(data)
                 return self.releases[0]
         if args[:2] == ('release', 'upload'):
             path = Path(args[3])
@@ -84,6 +91,23 @@ class PublicationTests(unittest.TestCase):
         self.run_publish()
         self.assertIn('archive.tar.gz', self.assets)
         self.assertFalse(self.releases[0]['draft'])
+
+    def test_resume_failed_upload_starter_asset(self):
+        self.run_publish()
+        self.releases[0]['draft'] = True
+        self.assets['archive.tar.gz'] = b''
+        self.starter.add('archive.tar.gz')
+        self.run_publish()
+        self.assertEqual(self.assets['archive.tar.gz'], b'archive')
+        self.assertFalse(self.releases[0]['draft'])
+
+    def test_published_starter_is_never_deleted(self):
+        self.run_publish()
+        self.starter.add('archive.tar.gz')
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, 'published release'):
+            self.run_publish()
+        self.assertFalse(any('DELETE' in args for args, _ in self.calls))
 
     def test_reject_tag_collision(self):
         self.refs = [{'ref': 'refs/tags/v0.1.0', 'object': {'type': 'commit', 'sha': 'b' * 40}}]

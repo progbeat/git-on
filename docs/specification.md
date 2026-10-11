@@ -162,6 +162,27 @@ functional correctness:
 A benchmark fixture that reuses Git objects must disclose this: it measures
 logical namespace growth but does not by itself model a million distinct blobs.
 
+## Review regressions and bounded randomized stress
+
+Every behavior defect found during review must gain a focused regression test
+that reproduces the defect before its fix and passes afterward. Preserve the
+trigger and assert the corrected observable result, including failed-operation
+postconditions. Record the old revision, reproducer and corrected evidence in
+[review regressions](review-regressions.md). Test and documentation defects need
+an appropriate guard or targeted check too. For nondeterministic races, retain
+the observed failure and explain the controlled regression strategy; never
+invent a deterministic red result or claim exhaustive interleaving coverage.
+
+A seeded randomized real-FUSE test must exercise bounded sequences of file and
+directory operations against a model or differential oracle. Compare operation
+results, applicable errors, contents, namespace and relevant metadata, including
+immutable-source and pinned-ignore protection, after each step. On failure,
+report the seed and executed operation trace for replay. Explicit limits on
+operation count, generated entries, file sizes and elapsed test time keep CI
+safe; these are test-harness limits, not quotas imposed on user commands.
+Random stress supplements targeted regressions and the callback matrix; it does
+not replace them or establish proof for all possible sequences.
+
 ## Implementation and verification
 
 The second implementation replaces the eager traversal with a shared pinned

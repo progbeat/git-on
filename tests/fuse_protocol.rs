@@ -671,3 +671,118 @@ fn protocol_create_metadata_stale_setattr_and_directory_stream_lifetime() {
     p.send(2, dir, u64s(&[u64::MAX]));
     p.err(3, dir, vec![0; 16], libc::ENOENT);
 }
+
+#[test]
+fn protocol_partial_backing_write_preserves_visible_progress() {
+    // RLIMIT_FSIZE and SIGXFSZ are process-wide. Isolate this regression from
+    // parallel test threads instead of changing their limits or dispositions.
+    const CHILD: &str = "GIT_ON_PARTIAL_WRITE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "protocol_partial_backing_write_preserves_visible_progress",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut p = Peer::new();
+    let (ino, fh) = p.create("partial.tmp");
+    let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut original) },
+        0
+    );
+    let limit = libc::rlimit {
+        rlim_cur: 3,
+        rlim_max: original.rlim_max,
+    };
+    let previous = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) }, 0);
+    let result = p.call(
+        16,
+        ino,
+        [io(fh, 0, 6, libc::O_RDWR), b"abcdef".to_vec()].concat(),
+    );
+    // A subsequent no-progress attempt reports the original capacity failure.
+    let failure = p.call(16, ino, [io(fh, 3, 1, libc::O_RDWR), vec![42]].concat());
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &original) }, 0);
+    unsafe {
+        libc::signal(libc::SIGXFSZ, previous);
+    }
+    assert_eq!(result, Ok(u32s(&[3, 0])));
+    assert_eq!(failure, Err(libc::EFBIG));
+    let attr = p.ok(3, ino, vec![0; 16]);
+    assert_eq!(num(&attr, 24), 3);
+    assert_eq!(
+        std::fs::read(p._temp.path().join("upper").join(ino.to_string())).unwrap(),
+        b"abc"
+    );
+    assert_eq!(p.ok(15, ino, io(fh, 0, 100, 0)), b"abc");
+}
+
+#[test]
+fn protocol_sparse_allocation_matches_backing_after_truncate_and_write() {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = Peer::new();
+    let (ino, fh) = p.create("sparse.tmp");
+    for size in [1 << 30, 0] {
+        let mut sa = vec![0; 88];
+        sa[..4].copy_from_slice(&8u32.to_ne_bytes());
+        sa[16..24].copy_from_slice(&(size as u64).to_ne_bytes());
+        let attr = p.ok(4, ino, sa);
+        let metadata =
+            std::fs::metadata(p._temp.path().join("upper").join(ino.to_string())).unwrap();
+        assert_eq!(num(&attr, 24), metadata.len());
+        assert_eq!(num(&attr, 32), metadata.blocks());
+    }
+    p.ok(
+        16,
+        ino,
+        [io(fh, 1 << 20, 1, libc::O_RDWR), vec![42]].concat(),
+    );
+    let attr = p.ok(3, ino, vec![0; 16]);
+    let metadata = std::fs::metadata(p._temp.path().join("upper").join(ino.to_string())).unwrap();
+    assert_eq!(num(&attr, 24), metadata.len());
+    assert_eq!(num(&attr, 32), metadata.blocks());
+    assert_eq!(p.ok(15, ino, io(fh, (1 << 20) - 1, 2, 0)), vec![0, 42]);
+}
+
+#[test]
+fn protocol_mutable_directory_links_follow_namespace_changes() {
+    let mut p = Peer::new();
+    let mkdir =
+        |p: &mut Peer, parent, name| num(&p.ok(9, parent, names(u32s(&[0o755, 0]), &[name])), 0);
+    let links = |p: &mut Peer, ino| {
+        let attr = p.ok(3, ino, vec![0; 16]);
+        u32::from_ne_bytes(attr[80..84].try_into().unwrap())
+    };
+    let root_before = links(&mut p, 1);
+    let cache = mkdir(&mut p, 1, "cache");
+    let left = mkdir(&mut p, cache, "left");
+    let right = mkdir(&mut p, cache, "right");
+    assert_eq!(links(&mut p, cache), 4);
+    assert_eq!(links(&mut p, 1), root_before);
+    let child = mkdir(&mut p, left, "child");
+    assert_eq!(links(&mut p, left), 3);
+    p.ok(12, left, names(u64s(&[right]), &["child", "child"]));
+    assert_eq!(links(&mut p, left), 2);
+    assert_eq!(links(&mut p, right), 3);
+    mkdir(&mut p, left, "replacement");
+    p.ok(12, right, names(u64s(&[left]), &["child", "replacement"]));
+    assert_eq!(links(&mut p, left), 3);
+    assert_eq!(links(&mut p, right), 2);
+    p.ok(12, left, names(u64s(&[left]), &["replacement", "renamed"]));
+    assert_eq!(links(&mut p, left), 3);
+    p.ok(11, left, names(vec![], &["renamed"]));
+    assert_eq!(links(&mut p, left), 2);
+    assert_eq!(links(&mut p, child), 0);
+}

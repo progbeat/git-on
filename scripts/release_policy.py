@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate one release per master change; no network or publishing side effects."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,19 @@ def validate(current, previous, locked, notes):
     return body
 
 
+def push_base(event_path):
+    event = json.loads(Path(event_path).read_text())
+    before, after = event.get("before", ""), event.get("after", "")
+    for value in (before, after):
+        if not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+            raise ValueError("push must have nonzero before/after commit IDs")
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    if after != head:
+        raise ValueError("push after SHA differs from checked-out commit")
+    subprocess.run(["git", "merge-base", "--is-ancestor", before, after], check=True)
+    return before
+
+
 def check(base):
     package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
     lock = tomllib.loads(Path("Cargo.lock").read_text())
@@ -58,6 +72,8 @@ def check(base):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--base")
+    mode.add_argument("--push-event", type=Path)
     args = parser.parse_args()
-    check(args.base)
+    check(push_base(args.push_event) if args.push_event else args.base)

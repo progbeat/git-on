@@ -234,6 +234,15 @@ mod tests {
         (tmp, snap, policy)
     }
     #[test]
+    fn documented_ignore_cache_budget_matches_runtime() {
+        let expected = format!(
+            "{} MiB / {} compiled ignore-rule entries",
+            RULE_CACHE_BYTES / (1024 * 1024),
+            RULE_CACHE_ENTRIES
+        );
+        assert!(include_str!("../README.md").contains(&expected));
+    }
+    #[test]
     fn policy_initialization_and_ancestor_loading_are_lazy() {
         let (_tmp, snapshot, policy) = fixture("*.log\n", "!keep.log\n");
         assert_eq!(snapshot.metrics().tree_reads, 0);
@@ -262,7 +271,7 @@ mod tests {
         assert!(repo.find_reference("refs/git-on/policy").is_err());
         for content in [
             b"*\n".as_slice(),
-            b"version https://git-lfs.github.com/spec/v1\n",
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsize 123\n",
         ] {
             let tmp = TempDir::new().unwrap();
             let repo = Repository::init(tmp.path()).unwrap();
