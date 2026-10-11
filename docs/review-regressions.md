@@ -89,3 +89,39 @@ harness issue, not a product sandbox guarantee. The retained self-test
 `test_relocated_symlink_cannot_read_external_sentinel` verifies that relocated
 links cannot expose the controlled external sentinel. The operation validation
 now accounts for resolved link targets before following them.
+
+## Installer archive metadata
+
+Independent installer review reproduced acceptance of a 16,567-byte compressed
+archive containing a hidden 16 MiB PAX extension record before the three expected
+members. The original tarfile iteration consumed the extension before member
+validation, bypassing the intended metadata bound. The fixed reader first bounds
+total gzip expansion, then checks raw tar headers and only copies the expected
+regular executable bytes. It rejects PAX/GNU extensions, sparse/contiguous-file
+types, unsafe paths, duplicate names, links and oversized members.
+
+`InstallerTests.test_hidden_extended_headers_and_unexpected_types_are_rejected`
+retains the focused rejection cases;
+`test_expanded_archive_and_readme_limits` checks expansion and member limits.
+Both passed after the fix. These offline fixtures do not make network requests
+or install outside their private temporary test directories.
+
+Independent review also found that a truncated curl-to-shell stream could end
+at a syntactically valid Python exception-handler boundary and still replace the
+old executable. `test_truncated_pipe_payload_never_starts_installation` reproduced
+six failing suffix boundaries before the fix, including actual replacement, and
+passes afterward. The complete heredoc now belongs to a shell function that is
+invoked only after its closing brace has been received. The ordinary complete
+pipe, repeated-installation and update paths remain covered.
+
+Malformed release asset names (a JSON list/object instead of a string) originally
+raised an unhandled TypeError. The metadata-shape regression reproduced that
+traceback before the type guard and now confirms a concise failure while the old
+binary remains unchanged.
+
+A follow-on truncation check showed that a bare final function name at EOF could
+run without forwarding the requested version, destination or authenticated mode.
+The final invocation is also enclosed in a complete shell group.
+`test_final_invocation_truncation_cannot_drop_arguments` reproduced dropped
+arguments before that guard and now rejects every incomplete byte-prefix of the
+call while verifying argument preservation for the complete script.

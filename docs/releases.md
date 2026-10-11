@@ -89,31 +89,88 @@ where master advances after the PR's version check finishes.
 
 ## Installing a published binary
 
-No binary release exists until the first successful master release workflow.
-Once published, download the desired version from
-[GitHub Releases](https://github.com/progbeat/git-on/releases). Private releases
-require repository access; they are not available to anonymous users. For example,
-with an already authenticated GitHub CLI:
+The installer needs Python 3.8+ and supports **Linux x86_64 with glibc 2.35+**
+(Ubuntu 22.04 baseline). It installs a prebuilt binary; Rust, a C compiler, jq,
+and sudo are not needed. The same command installs or updates to GitHub's latest
+stable release each time it runs:
 
 ```sh
-version=0.1.0
-mkdir git-on-download && cd git-on-download
-gh release download "v$version" --repo progbeat/git-on \
-  --pattern "git-on-v$version-x86_64-unknown-linux-gnu.tar.gz" \
-  --pattern SHA256SUMS --pattern release.json
-sha256sum --check SHA256SUMS
-tar -xzf "git-on-v$version-x86_64-unknown-linux-gnu.tar.gz"
-mkdir -p "$HOME/.local/bin"
-install -m 755 "git-on-v$version-x86_64-unknown-linux-gnu/git-on" "$HOME/.local/bin/git-on"
-# Ensure $HOME/.local/bin is on PATH.
-git on --version
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
 ```
 
-Install the distribution's `fuse3` package separately. Do not run the command as
-root to bypass unavailable FUSE setup. Updating repeats the same verified download
-and replaces the executable; there is no background updater or curl-pipe-shell
-installer. Building from source remains supported with `cargo install --path .
---locked` in an explicitly selected checkout.
+**Availability:** this public command becomes usable after the repository is
+public, this installer is merged to master, and the first successful master
+release workflow publishes the binary. No binary release exists before that
+workflow succeeds. While the repository is private, use authenticated access as
+described below. A missing release, private repository, or API rate limit produces
+an error before the current executable is replaced.
+
+For a pinned version or a different user-owned installation directory:
+
+```sh
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh -s -- --version 0.1.0
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh -s -- --bin-dir "$HOME/bin"
+```
+
+Both `0.1.0` and `v0.1.0` are accepted; prerelease versions are not. Omitting
+`--version` selects the latest stable release, even when git-on is already
+installed. An explicit older version intentionally downgrades. Nothing runs in
+the background, and the installer never edits shell profiles or installs system
+packages. The default destination is `$HOME/.local/bin/git-on`. Add that directory
+to `PATH` if prompted. Existing symlink/non-regular destinations, symlink directory
+components and directories writable by other users are refused.
+
+### Inspect first or use an authenticated private release
+
+Piping a script to a shell executes code from the repository. To inspect it first,
+download it, review it, then run the saved copy:
+
+```sh
+curl -fSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+For a private repository, use an **already authenticated** GitHub CLI account with
+repository access. After the script is merged and a release exists:
+
+```sh
+gh api --hostname github.com 'repos/progbeat/git-on/contents/install.sh?ref=master' \
+  -H 'Accept: application/vnd.github.raw+json' > install.sh
+# Review the saved script before running it.
+sh install.sh --github-cli
+```
+
+An authenticated source checkout can also run `sh install.sh --github-cli`.
+`--github-cli` uses existing gh authentication for metadata and release assets;
+it creates no credentials and puts no token into a URL, script, or log. It also
+works for authenticated public downloads when the anonymous GitHub API is rate
+limited. The normal mode does not read GitHub token environment variables.
+
+### Verification and update safety
+
+The installer resolves one release, checks its exact asset names, verifies the
+archive and build metadata against `SHA256SUMS`, and rejects unexpected archive
+members and links. It bounds compressed and expanded input sizes, reads only the
+expected executable, and checks its reported version before an atomic replacement.
+A failed download, checksum, archive check, version probe, or replacement leaves
+the previous executable in place. Rerunning the same version is safe. Temporary
+files are cleaned on ordinary failures and handled interruption signals; an
+uncatchable SIGKILL or power loss can leave temporary files.
+
+Checksums detect corruption; they are not independent signatures. The script,
+archive, and checksum file share the GitHub repository's trust boundary. To pin
+the installer code as well as the binary version, inspect a copy from the matching
+release tag or an explicitly selected commit instead of the moving master URL.
+
+Install the distribution's `fuse3` package separately when needed. A working
+`fusermount3`, usable `/dev/fuse`, and permission to mount FUSE are required to run
+git-on. Missing FUSE setup produces an installation warning; it does not prevent
+installing a verified binary. Containers must expose the device and allow mounts.
+Do not run the installer as root to bypass unavailable FUSE setup.
+
+Building from source remains supported with `cargo install --path . --locked` in
+an explicitly selected checkout.
 
 ## Design references
 

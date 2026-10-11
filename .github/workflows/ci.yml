@@ -135,6 +135,7 @@ jobs:
         run: |
           python3 tests/test_release_policy.py
           python3 tests/test_publish_release.py
+          python3 tests/test_installer.py
       - name: Validate against current master or the pre-push master SHA
         env:
           EVENT: ${{ github.event_name }}
@@ -187,8 +188,10 @@ jobs:
           tar -xzf "dist/$NAME.tar.gz" -C unpacked
           echo "PACKAGED_BINARY=$PWD/unpacked/$NAME/git-on" >> "$GITHUB_ENV"
           test "$("unpacked/$NAME/git-on" --version)" = "git-on $VERSION"
-      - name: Test the actual extracted distribution with real FUSE
-        run: python3 tests/integration.py --binary "$PACKAGED_BINARY" --require-fuse
+      - name: Test install and repeat-update from the actual distribution
+        run: python3 tests/test_installer.py --dist dist --install-dir "$PWD/installed"
+      - name: Test the installed distribution with real FUSE
+        run: python3 tests/integration.py --binary "$PWD/installed/git-on" --require-fuse
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ github.sha }}

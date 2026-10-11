@@ -109,3 +109,17 @@ retain the writable layer with `--keep` and inspect its `backing/__pycache__/` d
 See [stress.md](stress.md) for bounded seeded real-mount operation generation,
 exact namespace/content/metadata/error comparison, and trace replay. CI requires
 a real FUSE device for this suite; host-only oracle self-tests are separate.
+
+
+## Installer acceptance
+
+`python3 tests/test_installer.py` runs offline latest/pinned release selection,
+repeat installation, updates, checksum/download failure preservation, unsafe
+archives/destinations, platform checks, and atomic replacement regressions.
+A fake GitHub CLI fixture exercises the actual `sh install.sh` entrypoint without
+network access; unit-level transport fixtures cover the anonymous HTTPS path.
+
+The Ubuntu 22.04 `package` job passes the actual release assets to
+`python3 tests/test_installer.py --dist dist --install-dir "$PWD/installed"`, then
+runs the complete real-FUSE integration suite against `installed/git-on`.
+Installer fixtures are not a substitute for that packaged-binary mount test.
