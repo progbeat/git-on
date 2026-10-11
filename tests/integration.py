@@ -79,9 +79,12 @@ class RepositoryTest(unittest.TestCase):
         return env
 
     def invoke(self, *command, tree="HEAD", keep=False, input=None, timeout=60, extra_env=None):
+        return self.invoke_argv([*(["--keep"] if keep else []), tree, *map(str, command)],
+                                input=input, timeout=timeout, extra_env=extra_env)
+
+    def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
         before = set(self.system_tmp.glob("git-on-*"))
-        result = subprocess.run([str(BINARY), *(["--keep"] if keep else []), tree,
-                                 *map(str, command)], cwd=self.repo,
+        result = subprocess.run([str(BINARY), *args], cwd=self.repo,
                                 env=dict(self.environment(), **(extra_env or {})),
                                 input=input, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout)
@@ -109,10 +112,13 @@ class RepositoryTest(unittest.TestCase):
 
 class CliTests(RepositoryTest):
     def test_help_and_version(self):
-        for arg in ("--help", "--version"):
+        for arg in ("--help", "-h", "--version"):
             result = subprocess.run([str(BINARY), arg], capture_output=True, timeout=10)
             self.assert_success(result)
             self.assertTrue(b"git-on" in result.stdout or b"git on" in result.stdout)
+            if arg != "--version":
+                self.assertIn(b"[--keep|-k] -- <command>", result.stdout)
+                self.assertIn(b"--keep, -k", result.stdout)
 
     def test_unknown_tree_never_executes(self):
         sentinel = self.root / "executed"
@@ -128,6 +134,29 @@ class CliTests(RepositoryTest):
                 result = subprocess.run([str(BINARY), *args], cwd=self.repo,
                                         env=self.environment(), capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, 2, result.stderr)
+                self.assert_no_runtime_files()
+
+    def test_explicit_option_errors_never_resolve_tree_or_execute(self):
+        sentinel = self.root / "executed"
+        command = [sys.executable, "-c", f"open({str(sentinel)!r}, 'w').close()"]
+        for args in [
+            ["-k"], ["--"], ["HEAD"], ["HEAD", "--"],
+            ["HEAD", "--keep", "--"], ["HEAD", "-k", "--"],
+            ["", *command], ["HEAD", ""], ["HEAD", "--", ""],
+            ["--unknown", "missing-tree", *command],
+            ["-kk", "missing-tree", *command],
+            ["--keep=1", "missing-tree", *command],
+            ["missing-tree", "--unknown", "--", *command],
+            ["missing-tree", "-k", "--unknown", "--", *command],
+            ["missing-tree", "--keep=1", "--", *command],
+            ["missing-tree", "-kk", "--", *command],
+        ]:
+            with self.subTest(args=args):
+                result, run = self.invoke_argv(args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"usage:", result.stderr)
+                self.assertIsNone(run)
+                self.assertFalse(sentinel.exists())
                 self.assert_no_runtime_files()
 
     def test_cleanup_rejects_unrelated_missing_and_symlinked_directories(self):
@@ -193,15 +222,33 @@ class FuseTests(RepositoryTest):
         self.assert_success(result)
 
     def test_no_shell_inherited_stdin_and_exact_binary_stdio(self):
-        code = "import os,sys; assert sys.argv[1:] == ['$(touch nope)', 'a b', '; exit 5', '--keep', '--cleanup']; assert sys.stdin.buffer.read() == b'input\\x00bytes'; os.write(1,b'out\\x00\\xff\\n'); os.write(2,b'err\\x00\\xfe\\n')"
-        result, run = self.invoke(sys.executable, "-c", code, "$(touch nope)", "a b",
-                                  "; exit 5", "--keep", "--cleanup", input=b"input\x00bytes")
-        self.assert_success(result)
-        self.assertEqual(result.stdout, b"out\x00\xff\n")
-        self.assertEqual(result.stderr, b"err\x00\xfe\n")
-        self.assertIsNone(run)
-        self.assertFalse((self.repo / "nope").exists())
-        self.assert_no_runtime_files()
+        arguments = ["$(touch nope)", "a b", "; exit 5", "--keep", "-k", "--cleanup",
+                     "--help", "--version", "--unknown", "--", ""]
+        code = f"import os,sys; assert sys.argv[1:] == {arguments!r}; assert sys.stdin.buffer.read() == b'input\\x00bytes'; os.write(1,b'out\\x00\\xff\\n'); os.write(2,b'err\\x00\\xfe\\n')"
+        for prefix in (["HEAD"], ["HEAD", "--"]):
+            with self.subTest(prefix=prefix):
+                result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments],
+                                               input=b"input\x00bytes")
+                self.assert_success(result)
+                self.assertEqual(result.stdout, b"out\x00\xff\n")
+                self.assertEqual(result.stderr, b"err\x00\xfe\n")
+                self.assertIsNone(run)
+                self.assertFalse((self.repo / "nope").exists())
+                self.assert_no_runtime_files()
+
+    def test_explicit_boundary_allows_dash_named_executable(self):
+        executable = self.root / "--keep"
+        executable.symlink_to(sys.executable)
+        env = {"PATH": str(self.root) + os.pathsep + os.environ.get("PATH", "")}
+        for prefix in (["HEAD"], ["HEAD", "--"]):
+            with self.subTest(prefix=prefix):
+                result, run = self.invoke_argv([*prefix, "--keep", "-c", "print('literal-command')"],
+                                               extra_env=env)
+                self.assert_success(result)
+                self.assertEqual(result.stdout, b"literal-command\n")
+                self.assertEqual(result.stderr, b"")
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
 
     def test_stdio_inherits_regular_file_descriptions_and_offsets(self):
         input_path, output_path = self.root / "stdin", self.root / "combined"
@@ -1716,12 +1763,16 @@ assert p.exists()
         self.assert_no_runtime_files()
 
     def test_non_utf8_command_argument_is_preserved(self):
-        raw = b"bad-\xff-name"
-        code = "import os,sys; assert os.fsencode(sys.argv[1]) == bytes([98,97,100,45,255,45,110,97,109,101])"
-        result = subprocess.run([os.fsencode(BINARY), b"HEAD", os.fsencode(sys.executable), b"-c", code.encode(), raw], cwd=self.repo, env=self.environment(), capture_output=True, timeout=30)
-        self.assert_success(result)
-        self.assertEqual(result.stderr, b"")
-        self.assert_no_runtime_files()
+        raw = b"-bad-\xff-name"
+        code = f"import os,sys; assert list(map(os.fsencode, sys.argv[1:])) == {[raw, b'--', b'-k', b'--keep', b'']!r}"
+        for prefix in ([b"HEAD"], [b"HEAD", b"--"]):
+            with self.subTest(prefix=prefix):
+                result, run = self.invoke_argv([*prefix, os.fsencode(sys.executable), b"-c",
+                                               code.encode(), raw, b"--", b"-k", b"--keep", b""])
+                self.assert_success(result)
+                self.assertEqual(result.stderr, b"")
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
 
     def test_ignore_decisions_match_git_for_complex_patterns(self):
         self.put(".gitignore", "out/\n*.tmp\n!keep.tmp\n/root-only.dat\nnested/a[0-9].bin\nnested/**/deep.bin\nescaped\\ space.dat\n\\#hash.dat\n\\!bang.dat\n*.trailing\\ \ndirs/\n!dirs/keep.txt\n{foo,bar}.dat\ntabbed\t\nnbsp\u00a0\n[unclosed\nx[[:digit:]].dat\n")
@@ -1844,6 +1895,34 @@ time.sleep(300)
         self.assertIn(b"kept", cleanup.stderr.lower())
         self.assertEqual((run / ".state").read_bytes(), state)
         self.assertEqual((run / "backing/out/result").read_text(), "retained")
+
+    def test_keep_spellings_and_positions_retain_real_subtree_writes(self):
+        arguments = ["--keep", "-k", "--unknown", "--", "", b"-raw-\xff"]
+        expected = [os.fsencode(arg) for arg in arguments]
+        code = f"from pathlib import Path; import os,sys; assert list(map(os.fsencode, sys.argv[1:])) == {expected!r}; Path('generated').mkdir(); Path('generated/result').write_text('retained'); print('child-output')"
+        tree = "HEAD:subtree"
+        for prefix in (["--keep", tree], ["-k", tree], [tree, "--keep", "--"],
+                       [tree, "-k", "--"], ["-k", "--keep", "--", tree, "-k", "--keep", "--"]):
+            with self.subTest(prefix=prefix):
+                result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments])
+                self.assert_success(result)
+                self.assertIsNotNone(run)
+                self.assertEqual(result.stdout, b"child-output\n")
+                self.assertEqual(result.stderr, f"git-on: kept temporary files at {run}\n".encode())
+                self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
+                self.assertFalse((run / "mount").exists())
+                self.assertEqual((run / "backing/generated/result").read_text(), "retained")
+                self.assertFalse((run / "backing/source.txt").exists())
+                self.assertEqual(set(path.name for path in run.iterdir()), {".state", ".lock", "backing"})
+                self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+                state = (run / ".state").read_bytes()
+                cleanup = self.cleanup_run(run)
+                self.assertNotEqual(cleanup.returncode, 0)
+                self.assertIn(b"kept", cleanup.stderr.lower())
+                self.assertEqual((run / ".state").read_bytes(), state)
+                self.assertEqual((run / "backing/generated/result").read_text(), "retained")
+                shutil.rmtree(run)
+                self.assert_no_runtime_files()
 
     def test_keep_exports_only_live_writable_paths_and_preserves_links(self):
         result, run = self.python(r"""
@@ -1968,7 +2047,8 @@ class UvTests(RepositoryTest):
                 git(self.repo, "add", "--force", "--all")
                 git(self.repo, "commit", "--quiet", "-m", f"add {example}")
                 command = ["uv", "run", "--locked", "--script", "main.py"] if example == "pep723" else ["uv", "run", "--locked", "main.py"]
-                result, run = self.invoke(*command, tree=f"HEAD:{example}", keep=True, timeout=300)
+                flag = "-k" if example == "pep723" else "--keep"
+                result, run = self.invoke_argv([f"HEAD:{example}", flag, "--", *command], timeout=300)
                 self.assert_success(result)
                 self.assertIn(b"cache-reused", result.stdout)
                 self.assertTrue(list((run / "backing").rglob("*.nbc")), "Numba compiled cache must be retained")

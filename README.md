@@ -89,11 +89,16 @@ for runnable projects.
 
 ### Keep results
 
-Place `--keep` before the tree-ish to retain generated ignored files:
+Use `--keep` (or `-k`) and a command separator to retain generated ignored files:
 
 ```sh
-git on --keep HEAD:examples/uv-project uv run --locked main.py
+git on HEAD:examples/uv-project --keep -- uv run --locked main.py
 ```
+
+The earlier form `git on --keep HEAD command` also works, with either spelling.
+After the revision, runner options require `--` before the command. Command
+arguments such as `--keep` and `-k` are passed literally; see the
+[syntax reference](docs/usage.md#command-syntax).
 
 After unmounting, git-on prints the retained temporary directory on stderr.
 Generated files are under `backing/`; remove the directory when you are done.

@@ -44,8 +44,8 @@ one run; a later run starts fresh. To inspect the generated caches afterward,
 retain that layer explicitly:
 
 ```console
-git on --keep HEAD:examples/pep723 uv run --locked --script main.py
-git on --keep HEAD:examples/uv-project uv run --locked main.py
+git on HEAD:examples/pep723 -k -- uv run --locked --script main.py
+git on HEAD:examples/uv-project --keep -- uv run --locked main.py
 ```
 
 After unmounting, git-on prints the retained temporary-directory path on stderr.
