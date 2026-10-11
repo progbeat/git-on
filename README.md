@@ -1,6 +1,6 @@
 # git-on
 
-Run a command against one Git tree, with immutable source and temporary writes only where that tree's `.gitignore` permits them.
+Run a command against one Git tree, with immutable source and temporary writes only where that tree's `.gitignore` permits them. The design goal is lazy access and fast startup without unpacking the repository; the current implementation still has an [eager-loading gap](#required-lazy-access-and-current-implementation-gap).
 
 ```sh
 git on HEAD python script.py
@@ -20,7 +20,7 @@ cargo install --path . --locked
 
 Containers must expose the FUSE device and allow mounts. The program never changes system permissions or enables these capabilities for you. macOS and Windows are not supported. Git object access uses libgit2; Git itself is needed for the integration tests.
 
-## What the filesystem guarantees
+## Filesystem behavior
 
 The selected tree is resolved once to a full tree object ID. Commits, annotated tags pointing to commits, `HEAD:path`, and raw tree IDs work. The index, unstaged changes, untracked files, and later branch movement have no effect on the selected content. Commands start at the selected snapshot's root, even when invoked from a repository subdirectory.
 
@@ -29,20 +29,20 @@ The selected tree is resolved once to a full tree object ID. Commits, annotated 
 - Global ignore files, `.git/info/exclude`, the live working tree, and runtime-created `.gitignore` files cannot grant write access.
 - New ignored content uses a private per-run backing directory. It can be edited, deleted, or renamed only while respecting the same destination policy. Atomic temporary-file replacement works when both paths are allowed.
 - Git executable bits and symlinks are preserved. Hard links cannot provide write access to tracked content. Special device nodes and extended attributes are not supported. Ordinary rename and no-replace rename are supported; exchange/whiteout rename is rejected.
+- A denied filesystem operation returns an ordinary filesystem error to its caller. git-on does not terminate the application merely because an operation was denied; the application handles that error normally.
+- The writable layer is temporary and private to one run. Normal completion removes it; a new run starts empty. Abrupt termination can leave backing files until checked cleanup runs, as described below.
 
-For ordinary Python tools, commit patterns such as:
-
-```gitignore
-.venv/
-__pycache__/
-.pytest_cache/
-```
-
-Numba's normal `cache=True` cache can then live under `__pycache__` without a special environment override. A tool that writes a nonignored path fails rather than silently modifying source. A fresh run starts with a fresh writable layer; caches are reused during a run, not across runs. See `examples/` for locked uv script and project examples.
+The policy is language-independent. There are no special write exceptions for Python, uv, Numba, or any other tool. See [examples](examples/README.md) for optional application configurations.
 
 This is **not a security sandbox**. Commands inherit the caller's user identity and environment. Absolute paths, symlinks to outside the mount, network connections, and other accessible filesystems remain accessible. It protects the mounted snapshot, not the host. Do not run untrusted code on the strength of this filesystem policy.
 
-Submodules and Git LFS pointer blobs fail before command execution. They are never silently treated as usable checked-out content. Git filters and hooks are not run. The mount contains source-tree entries, not a synthetic `.git` checkout. Git SHA-256 repositories are not currently supported by the bundled libgit2. The current implementation loads source blobs into memory before mounting, so memory usage scales with the selected tree's content; use a subtree to scope large repositories.
+Submodules and Git LFS pointer blobs fail before command execution. They are never silently treated as usable checked-out content. Git filters and hooks are not run. The mount contains source-tree entries, not a synthetic `.git` checkout. Git SHA-256 repositories are not currently supported by the bundled libgit2.
+
+## Required lazy access and current implementation gap
+
+The [behavioral and performance specification](docs/specification.md) requires demand-driven access: start the command without recursively walking or materializing the selected tree, then load directory metadata and file contents as requested. A million-file tree must not require a million-file startup scan. Only the selected paths, applicable ignore rules, and Git storage decoding dependencies should require object access.
+
+**This requirement is not implemented yet.** The current runtime recursively loads every selected directory and source blob before mounting, then copies source bytes into filesystem nodes. Startup work and memory therefore scale with the entire selected tree. Passing the existing functional tests does not establish lazy behavior or large-repository performance. The specification records the required behavior and its acceptance checks; this documentation change does not fix the runtime.
 
 ## Durable run evidence
 

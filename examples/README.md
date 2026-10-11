@@ -1,4 +1,26 @@
-# Locked Python examples
+# Application examples
+
+These are optional configurations, not additional filesystem rules. git-on uses
+only the selected tree's `.gitignore` policy for new writes, regardless of the
+language or tool. Paths present in that tree remain immutable even if ignored.
+
+## Python cache and environment paths
+
+For a Python application that needs these paths, its committed `.gitignore` can
+include:
+
+```gitignore
+.venv/
+__pycache__/
+.pytest_cache/
+```
+
+These patterns permit new matching paths; omitting a required pattern means the
+corresponding write is denied. Numba's `cache=True` can use `__pycache__` under
+this ordinary policy without a special environment override. Add only patterns
+appropriate for your application.
+
+## Locked Python examples
 
 Both examples import a local module that uses NumPy and `@numba.njit(cache=True)`.
 They run that module in two separate Python processes, assert the second process
