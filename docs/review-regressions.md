@@ -135,9 +135,45 @@ a length cutoff.
 All four focused `git::tests` passed locally: native signal dispositions and
 task identity, mask/encoding/length handling, active operation interruption
 without global cancellation, and termination of SIGTERM-ignoring groups with
-an early exiting leader. This local evidence does not replace the permanent
-real-FUSE replay, Python SIGINT, caught-handler completion or same-OID handler
-retry checks, which require the next exact-head CI run.
+an early exiting leader.
+
+Actual real-FUSE CI run
+[38165994416](https://github.com/progbeat/git-on/actions/runs/38165994416)
+at `d040aae7470f0c6d0774fd8ffaebb07fc20972b7` then passed every permanent
+before/after cancellation replay: foreground SIGTERM, successful completion
+with an escaped reader, Python SIGINT, caught SIGTERM exiting successfully and
+caught SIGTERM retrying the same object after its handler ran. The caught cache
+fault also reproduced the old status 0 and required current status 125. The run
+failed separately when a test helper trimmed a binary OpenPGP export; these
+successful mounted cases do not imply that all checks passed at that head.
+
+## Binary output preserved by the transport fixture helper
+
+The same run `38165994416` failed
+`test_openpgp_invalid_and_unknown_trust_match_native_git` when GPG imported its
+disposable exported public key with an "Invalid packet" error. Review found the
+shared subprocess helper returned `stdout.strip()`, which can truncate valid
+binary signature bytes whose values happen to be whitespace. The production
+loader and native Git verification were not responsible for that corruption.
+
+The permanent `test_review_fixture_binary_stdout_is_preserved` failed before
+the fix: all twelve leading/trailing whitespace bytes around NUL/non-UTF-8 data
+were removed. Independent review reproduced the same loss with a raw 21-byte
+payload reduced to nine bytes. The helper now returns stdout unchanged; OID/ref
+text and the Git executable-directory path normalize text explicitly. The local
+Git blob oracle also compares unchanged bytes, including the final newline.
+GPG cleanup is registered when each disposable home is created, covering failed
+imports as well as normal completion.
+
+Independent review audited every shared-helper caller and the other binary
+oracle paths: signed commit `cat-file` output and smart-HTTP CGI responses already
+retain raw stdout, and the benchmark payload oracle explicitly disables text
+trimming. The permanent binary-helper test passed after the fix. The native
+OpenPGP unknown-trust/invalid-signature comparison and HTTPS cold/warm local
+equivalence tests also passed together (two tests, 1.258 seconds). The complete
+local remote suite then passed all 21 executable cases with eight explicit
+FUSE/million-selector skips, and all ten SSH/configuration regressions passed.
+The next exact-head CI run must still pass every required check.
 
 ## Reproduced runtime defects
 

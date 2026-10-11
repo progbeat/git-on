@@ -38,7 +38,7 @@ OPTIONS, ARGS = PARSER.parse_known_args()
 def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
-    return result.stdout.strip()
+    return result.stdout
 
 class Fixture:
     def __init__(self):
@@ -72,7 +72,7 @@ class Fixture:
         self.children = []
         self.handles = []
     def git(self, *args, data=None, at=None):
-        return run(['git', '-C', at or self.repo, *args], input=data, env=self.env).decode()
+        return run(['git', '-C', at or self.repo, *args], input=data, env=self.env).decode().strip()
     def close(self):
         self.resume.set()
         if hasattr(self,'server'): self.server.server_close()
@@ -86,7 +86,7 @@ class Fixture:
     def https(self):
         key, cert = self.root/'tls.key', self.root/'tls.crt'
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert])
-        backend = Path(run(['git', '--exec-path']).decode()) / 'git-http-backend'
+        backend = Path(run(['git', '--exec-path']).decode().strip()) / 'git-http-backend'
         fixture = self
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self): self.handle_git()
@@ -191,6 +191,10 @@ class Fixture:
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.addCleanup(self.f.close)
+    def test_review_fixture_binary_stdout_is_preserved(self):
+        payload=b' \t\r\n\v\f\x00\xffbinary\x80\x00 \t\r\n\v\f'
+        actual=run([sys.executable,'-c','import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())'],input=payload)
+        self.assertEqual(actual,payload)
     def test_https_cold_warm_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         process=f.probe(url); start=f.line(process)
@@ -210,8 +214,8 @@ class RemoteTests(unittest.TestCase):
         # Warm access needs advertisement/authentication but no object fetch.
         new=f.requests[requests:]
         self.assertEqual(len([x for x in new if x['path'].endswith('git-upload-pack')]), 1)
-        expected=f.git('show', f.commit+':deep/file')
-        self.assertEqual(expected, value['data'].strip())
+        expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
+        self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
     def test_review_configuration_values_are_applied_once(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
@@ -461,12 +465,14 @@ class RemoteTests(unittest.TestCase):
 
     def test_openpgp_invalid_and_unknown_trust_match_native_git(self):
         f=self.f; signing=f.root/'gpg-sign'; signing.mkdir(mode=0o700)
+        self.addCleanup(run,['gpgconf','--kill','all'],env=dict(f.env,GNUPGHOME=str(signing)))
         run(['gpg','--batch','--pinentry-mode','loopback','--passphrase','','--quick-generate-key','Fixture <fixture@example.invalid>','ed25519','sign','0'],env=dict(f.env,GNUPGHOME=str(signing)))
         wrapper=f.root/'gpg-oracle'; wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{signing}" exec gpg "$@"\n'); wrapper.chmod(0o700)
         f.git('config','gpg.program',str(wrapper)); f.git('config','user.signingkey','fixture@example.invalid')
         signed=f.git('commit-tree','-S',f.tree,data=b'trust fixture\n')
         public=run(['gpg','--batch','--export'],env=dict(f.env,GNUPGHOME=str(signing)))
         verification=f.root/'gpg-public'; verification.mkdir(mode=0o700)
+        self.addCleanup(run,['gpgconf','--kill','all'],env=dict(f.env,GNUPGHOME=str(verification)))
         run(['gpg','--batch','--import'],input=public,env=dict(f.env,GNUPGHOME=str(verification)))
         wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{verification}" exec gpg "$@"\n')
         f.cwd=f.repo
@@ -481,7 +487,6 @@ class RemoteTests(unittest.TestCase):
                 _,errors=process.communicate(timeout=20); self.assertNotEqual(process.returncode,0)
                 self.assertIn(b'execution forbidden',errors)
         self.assertEqual(subprocess.run(['git','-C',str(f.repo),'verify-commit',signed],env=f.env,capture_output=True).returncode,0)
-        for home in (signing,verification): run(['gpgconf','--kill','all'],env=dict(f.env,GNUPGHOME=str(home)))
 
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
