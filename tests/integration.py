@@ -1049,6 +1049,56 @@ print('foreground-read-ok', flush=True)
         self.assertIn(b"foreground-read-ok", captured)
         self.assertIn(b"controller-restored", captured)
 
+    def test_running_background_job_receives_foreground_without_sigcont(self):
+        ready = self.root / "running-background-ready"
+        def controller():
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            code = r"""
+import os, sys, time
+from pathlib import Path
+assert all(os.isatty(fd) for fd in (0, 1, 2))
+with open('/dev/tty', 'rb', buffering=0) as tty:
+    assert os.tcgetpgrp(tty.fileno()) != os.getpgrp(), 'job did not start in the background'
+    print('running-background-ready', flush=True)
+    Path(sys.argv[1]).touch()
+    # A running background job does not stop itself or read the terminal.
+    # Bash's fg changes terminal ownership without sending SIGCONT here.
+    time.sleep(.4)
+    assert os.tcgetpgrp(tty.fileno()) == os.getpgrp(), 'running child did not receive foreground ownership'
+print('running-foreground-ok', flush=True)
+"""
+            process = subprocess.Popen([str(BINARY), "HEAD", sys.executable, "-c", code, str(ready)],
+                                       cwd=self.repo, env=self.environment(), preexec_fn=os.setpgrp)
+            reaped = False
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() and time.monotonic() < deadline:
+                    assert process.poll() is None, 'background job exited before readiness'
+                    time.sleep(.005)
+                assert ready.exists(), 'background job did not become ready'
+                finished, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+                assert finished == 0, ('background job must still be running', status)
+                assert os.tcgetpgrp(0) == os.getpgrp(), 'background runner stole the terminal'
+                os.tcsetpgrp(0, process.pid)
+                # Deliberately no SIGCONT: terminal ownership alone must cause
+                # the runner to transfer the foreground to its existing child.
+                process.wait(timeout=10)
+                reaped = True
+                assert process.returncode == 0, process.returncode
+                assert os.tcgetpgrp(0) == process.pid, 'runner did not restore foreground group'
+            finally:
+                if not reaped:
+                    try: os.killpg(process.pid, signal.SIGCONT); process.terminate()
+                    except ProcessLookupError: pass
+                    try: process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                os.tcsetpgrp(0, os.getpgrp())
+        captured = self.assert_pty_controller(controller)
+        self.assertIn(b"running-background-ready", captured)
+        self.assertIn(b"running-foreground-ok", captured)
+
     def test_redirected_stdin_preserves_controlling_terminal_job_control(self):
         def controller():
             import termios

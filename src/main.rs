@@ -12,7 +12,7 @@ use std::{
     io::Write,
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, OpenOptionsExt},
+        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -358,9 +358,19 @@ fn supervise(
         if child_exited(pid)? {
             break;
         }
-        for signal in signals.wait() {
-            if matches!(signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT) {
-                kill_group(pid, signal);
+        // `fg` on an already-running background job need not send SIGCONT.
+        // Only background terminal jobs poll for that ownership transition;
+        // ordinary foreground/noninteractive commands block on signals.
+        if terminal
+            .descriptor()
+            .is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) != pid as libc::pid_t })
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        } else {
+            for signal in signals.wait() {
+                if matches!(signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT) {
+                    kill_group(pid, signal);
+                }
             }
         }
     }
@@ -389,7 +399,10 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus> {
-    let temp = tempfile::Builder::new().prefix("git-on-").tempdir()?;
+    let temp = tempfile::Builder::new()
+        .prefix("git-on-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let dir = fs::canonicalize(temp.path())?;
     let held_lock = lock(&dir, true)?;
     let _retained = temp.keep();
