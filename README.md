@@ -67,7 +67,7 @@ git on HEAD -- ls
 git on HEAD~1 -- ls
 
 # Show the command-line reference.
-git on --help
+git on -h
 ```
 
 Commands start at the selected tree's root, even when invoked from a repository
@@ -95,10 +95,10 @@ Use `--keep` (or `-k`) and a command separator to retain generated ignored files
 
 ```sh
 git on HEAD:examples/uv-project -k -- uv run --locked main.py
-git on --keep HEAD:examples/uv-project -- uv run --locked main.py
+git on HEAD:examples/uv-project --keep -- uv run --locked main.py
 ```
 
-Both flags work on either side of the revision.
+Put runner options after the revision.
 Every command requires `--`: put the revision and runner options before it,
 then the command and its literal arguments after it. The command's own `--`,
 `--keep` and `-k` are passed unchanged; see the
@@ -117,8 +117,8 @@ inside its local repository:
 ```sh
 git on https://github.com/OWNER/REPO.git main -- python script.py
 git on origin main:experiments -k -- uv run --locked experiment.py
-git on --verify ssh://git@HOST/REPO.git signed-release -- ./check.sh
-git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on --verify HEAD -- ./check.sh
+git on ssh://git@HOST/REPO.git signed-release --verify -- ./check.sh
+git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on HEAD --verify -- ./check.sh
 ```
 
 Remote runs fetch selected and subsequently demanded objects. They require native

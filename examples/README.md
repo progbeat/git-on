@@ -31,7 +31,7 @@ After committing the examples in a repository, run either snapshot subtree:
 
 The same workload can select a configured remote:
 `git on origin main:examples/uv-project -k -- uv run --locked main.py`.
-Add `--verify` when native Git should verify the selected commit or annotated tag
+Add `--verify` after REV when native Git should verify the selected commit or annotated tag
 under your existing configuration. Verification does not assert passed tests.
 
 ```console

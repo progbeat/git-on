@@ -1,7 +1,9 @@
 use std::{ffi::OsString, fmt, os::unix::ffi::OsStrExt};
 
-pub const RUN_USAGE: &str =
-    "git on [--keep|-k|--verify] [repository] REV [--keep|-k|--verify] -- <command> [args...]";
+pub const RUN_USAGE: &str = concat!(
+    "git on REV [OPTIONS] -- COMMAND [ARGS...]\n",
+    "       git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]"
+);
 
 #[derive(Debug, PartialEq)]
 pub struct RunArgs<'a> {

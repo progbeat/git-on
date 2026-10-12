@@ -128,8 +128,8 @@ raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
 binary standard streams and inherited stdin; exit/signal return codes; direct
 terminal detection, PTY foreground ownership and stop/continue handling; missing
 executables; forwarded signals; default temporary-layer removal; `TMPDIR`
-selection; mandatory command separators; `--keep`/`-k` on either side of the
-revision; exact argument forwarding after the first separator; rejected old direct
+selection; mandatory command separators; `--keep`/`-k` and compatibility argument
+parsing; exact argument forwarding after the first separator; rejected old direct
 command syntax, extra operands and unknown options without runtime state; retention
 after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of

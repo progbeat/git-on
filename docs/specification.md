@@ -5,8 +5,10 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on [options] [repository] REV -- <command> [args...]` resolves the selected Git tree once and
-  launches the given argv from its root without introducing a shell.
+- `git on REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision;
+  `git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` selects a source and
+  revision. Resolve the selected Git tree once and launch the given argv from
+  its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.
 - The command remains an ordinary program: standard streams, filesystem errors,
@@ -18,8 +20,8 @@ separate from that contract; a requirement is not a claim of a passing test.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
   accept one nonempty operand for the local revision or two for repository and
-  revision, and exact `--keep`/`-k`/`--verify` options. Options may appear on either side of the revision,
-  repeat, and combine idempotently. A token beginning with byte `-` that is not
+  revision, then exact `--keep`/`-k`/`--verify` options after REV. Options may
+  repeat and combine idempotently. A token beginning with byte `-` that is not
   one of those options is an unknown option. Do not split or normalize the
   revision: `HEAD:path/to/subtree` is one unchanged operand.
 - Everything after the first separator is literal command argv, including a
@@ -33,8 +35,8 @@ separate from that contract; a requirement is not a claim of a passing test.
   existing handling and do not require a child-command separator. These
   spellings after the separator are ordinary command argv.
 - Migration from 0.1.x requires inserting the separator before every command:
-  `git on REV command args` becomes `git on REV -- command args`, and
-  `git on --keep REV command` becomes `git on --keep REV -- command`.
+  `git on REV command args` becomes `git on REV -- command args`.
+  To retain generated files, use `git on REV --keep -- command args`.
   Select a revision whose name starts with `-` using its full object ID.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.

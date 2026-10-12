@@ -117,12 +117,20 @@ class CliTests(RepositoryTest):
             self.assert_success(result)
             self.assertTrue(b"git-on" in result.stdout or b"git on" in result.stdout)
             if arg != "--version":
-                self.assertIn(b"REV [--keep|-k|--verify] -- <command>", result.stdout)
+                self.assertIn(b"Usage: git on REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
+                self.assertIn(b"git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
                 self.assertIn(b"--keep, -k", result.stdout)
                 self.assertIn(b"--verify", result.stdout)
                 self.assertIn(b"One operand selects local REV; two select repository and REV", result.stdout)
                 self.assertIn(b"native Git", result.stdout)
+                self.assertIn(b"Runner options follow REV", result.stdout)
                 self.assertIn(b"first -- is required before every command", result.stdout)
+        env = dict(self.environment(), PATH=str(BINARY.parent) + os.pathsep + os.environ["PATH"])
+        result = subprocess.run(["git", "on", "-h"], cwd=self.repo, env=env,
+                                capture_output=True, timeout=10)
+        self.assert_success(result)
+        self.assertIn(b"Usage: git on REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
+        self.assertEqual(result.stderr, b"")
 
     def test_unknown_tree_never_executes(self):
         sentinel = self.root / "executed"

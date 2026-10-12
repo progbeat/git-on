@@ -10,9 +10,10 @@ results](#standard-streams-and-temporary-writes) ·
 ## Command syntax
 
 ```text
-git on [--keep|-k|--verify] [repository] REV [--keep|-k|--verify] -- <command> [args...]
+git on REV [OPTIONS] -- COMMAND [ARGS...]
+git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]
 git on --cleanup <temporary-directory>
-git on --help
+git on -h
 git on --version
 ```
 
@@ -20,8 +21,8 @@ git on --version
 `git on` available. It can also be invoked directly as `git-on`.
 
 Every executed command requires `--`. Before the first separator, supply exactly
-one local revision, or a repository followed by a revision, and any
-`--keep`/`-k`/`--verify` options, in either order. Both keep spellings
+one local revision, or a repository followed by a revision, then any
+`--keep`/`-k`/`--verify` options after REV. Both keep spellings
 have the same effect; repeating them is harmless. `HEAD:path/to/subtree` remains
 one revision operand. Everything after that first separator is literal command
 argv: git-on does not parse the command's options or any subsequent `--`.
@@ -29,13 +30,13 @@ argv: git-on does not parse the command's options or any subsequent `--`.
 ```sh
 git on HEAD -- ls
 git on HEAD:examples/uv-project -k -- uv run --locked main.py
-git on --keep HEAD:examples/uv-project -- uv run --locked main.py
+git on HEAD:examples/uv-project --keep -- uv run --locked main.py
 ```
 
 | Invocation | Interpretation |
 | --- | --- |
 | `git on HEAD --keep -- cmd -k --keep -- arg` | Keep files; pass `-k --keep -- arg` to `cmd` |
-| `git on -k HEAD -- cmd --keep` | Keep files; pass `--keep` to `cmd` |
+| `git on HEAD -k -- cmd --keep` | Keep files; pass `--keep` to `cmd` |
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
 | `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
@@ -50,15 +51,13 @@ object ID. The first `--` is always the command boundary and cannot escape a
 revision. Empty later arguments and non-UTF-8 argv bytes remain intact. No shell
 is introduced; to use shell syntax, explicitly run `sh -c '...'`.
 
-First-token `--help`/`-h`, `--version`, and `--cleanup` retain their separate
-existing handling. These modes do not execute a child command and do not require
-that separator. The same spellings after the separator are ordinary command
-argv.
+`git on -h`, `git on --version`, and `git on --cleanup` do not execute a child
+command and do not require that separator. Direct `git-on --help` also prints
+help. The same spellings after the separator are ordinary command argv.
 
 **Migrating from 0.1.x:** insert `--` before the command in every execution call:
-`git on REV command args` becomes `git on REV -- command args`, and
-`git on --keep REV command args` becomes `git on --keep REV -- command args`.
-The prefix position of `--keep` remains supported; only the separator is new.
+`git on REV command args` becomes `git on REV -- command args`.
+To retain generated files, use `git on REV --keep -- command args`.
 For a rare executable named `--keep`, use `git on REV -- --keep -- args`: the
 second `--` belongs to that executable.
 
@@ -138,8 +137,7 @@ To retain newly written ignored files:
 git on HEAD --keep -- python script.py
 ```
 
-The equivalent short form is `git on HEAD -k -- python script.py`; the prefix
-form `git on --keep HEAD -- python script.py` is also supported. After unmounting,
+The equivalent short form is `git on HEAD -k -- python script.py`. After unmounting,
 git-on reports the retained
 temporary-directory path on stderr. Its `backing/` subdirectory contains the writable
 layer with its original paths, not a checkout of the selected tree; untouched tracked

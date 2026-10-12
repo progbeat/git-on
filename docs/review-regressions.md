@@ -196,10 +196,10 @@ ASCII-selection failures. Resolution now compares line/tab/ref names as bytes
 and decodes an object ID only for a matched record. Both selected trees and blob
 contents passed after the fix.
 
-The parser already accepted `--verify` before or after REV; the defect was its
-help line listing only keep flags after REV. The existing CLI help acceptance
+The parser already accepted `--verify`; the defect was its help line listing
+only keep flags after REV. The existing CLI help acceptance
 assertion failed when required to show `REV [--keep|-k|--verify]`, then passed
-after making both option slots match the documented syntax. Native verification
+after including verification in the displayed post-REV options. Native verification
 behavior and command-tail parsing remain unchanged. All three focused loader
 regressions and the help acceptance passed after the fixes.
 
@@ -238,6 +238,27 @@ with only FUSE helpers on PATH and an absolute Python command. Mounted evidence
 still requires the next exact-head CI run. Runtime documentation now scopes the
 native Git dependency to remote execution, verification and the `git on`
 external-command invocation, preserving the additive 1.1.0 release classification.
+
+## Advertised execution syntax puts options after REV
+
+The requested presentation change uses `git on REV [OPTIONS] -- COMMAND [ARGS...]`
+and `git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` throughout help and
+user-facing documentation. Keep and verification examples use that order;
+existing compatibility parsing and its tests are retained without changing
+accepted argv or forwarding behavior.
+
+The revised `CliTests.test_help_and_version` failed against
+`f4a97e9c007d3d9c03dbfe6a7da5da0d271b8833` because help still advertised an
+option slot ahead of the operands. It now requires both canonical forms and
+the instruction that options follow REV. The same acceptance test executes
+`git on -h` through native Git, covering the working help spelling used in the
+touched README/usage examples. Git's long-help dispatch looks for a manpage
+instead of calling the external binary; no manpage or dispatch behavior is
+introduced by this presentation change.
+
+The focused help acceptance and all eight existing CLI parser tests passed
+after the change, including compatibility argument parsing and literal command
+tails. Required real-FUSE and distribution checks still run at the final head.
 
 ## Reproduced runtime defects
 
@@ -379,8 +400,8 @@ operand-count error although `-c` was encountered as an unknown runner option.
 The test now checks the agreed observable contract; dedicated parser cases
 still verify isolated operand-count and unknown-option failures.
 
-Real-FUSE tests preserve exact binary streams and argv, both keep spellings on
-either side of `REV`, retained subtree writes and pin/unmount cleanup. Both
+Real-FUSE tests preserve exact binary streams and argv, both keep spellings,
+compatibility argument parsing, retained subtree writes and pin/unmount cleanup. Both
 stress and performance launchers use the mandatory separator. Green-after is
 confirmed by [CI run 38151612805](https://github.com/progbeat/git-on/actions/runs/38151612805)
 at `01248000f6b38211f67222caf88e69b5fea8e720`: all 65 real-FUSE/uv integration

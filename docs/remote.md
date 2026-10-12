@@ -1,8 +1,9 @@
 # Remote execution and native verification
 
-`git on [options] [repository] REV -- command args` has one local revision
-operand or two operands for a source and revision. `--keep`, `-k`, and `--verify`
-work anywhere before the first `--`; the command tail stays literal. URLs work
+`git on REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision.
+`git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` selects a source and revision.
+Put `--keep`, `-k`, and `--verify` after REV and before the first `--`;
+the command tail stays literal. URLs work
 outside a checkout. A configured remote name requires its local repository.
 HTTPS, OpenSSH and scp-style SSH URLs use native Git transport; `file://` also
 supports local upload-pack fixtures. URL rewriting is applied once.
