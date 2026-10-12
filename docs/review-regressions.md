@@ -1,5 +1,44 @@
 # Review regression evidence
 
+## Approved release LTO profile
+
+The release profile now explicitly keeps optimization level 3 and enables fat
+LTO with one codegen unit. No clap feature, panic strategy, source behavior,
+runtime dependency, target CPU or lockfile change accompanies it. Rust crate
+optimization does not imply cross-language LTO of bundled C libgit2.
+
+A controlled comparison of the `d10b756` production source used Rust 1.89.0,
+the same checkout/target paths, four build jobs, the locked offline graph, and
+GNU strip 2.44. The target's release graph was cleaned between builds:
+
+| Measurement | Previous release defaults | Approved profile |
+| --- | ---: | ---: |
+| Unstripped executable | 3,407,608 bytes | 2,783,136 bytes |
+| `strip --strip-all` copy | 2,840,432 bytes | 2,443,096 bytes |
+| Clean build wall time | 50.8 seconds | 61.4 seconds |
+
+The stripped reduction is 397,336 bytes (14.0%); the unstripped reduction is
+18.3%. Stripping is a measurement operation: distribution stripping policy is
+unchanged. Help/version output matched byte-for-byte and shared runtime
+requirements stayed the same. A single paired build shows optimization/link
+cost, with dependency download time excluded and cache/order effects remaining;
+it is not a stable build-time guarantee. The reported largest child-process RSS
+was about 409 MiB in each build, not aggregate concurrent build memory.
+
+Seven interleaved production Snapshot trials each performed 500,000 warmed
+lookups and 500,000 64-byte reads, with identical checksums. Median lookup time
+was 176.1 → 164.7 ms (6.5% lower); read time was 3951.5 → 3989.8 ms (1.0% higher).
+These narrow in-process measurements exclude FUSE/network work and remain
+subject to scheduler/filesystem noise; they establish no general speed guarantee.
+
+The actual Rust 1.89 candidate passed all eight CLI cases, 14 disposable SSH
+regressions and 27 loader/remote cases. Eleven local remote cases were explicitly
+skipped because they require actual FUSE or the separate million-file selector.
+CI now links the locked release executable on Rust 1.89 and exercises the
+optimized profile through full real-FUSE integration, remote lifecycle, SSH,
+stress, million-file demand and packaged-binary gates. Final execution evidence
+belongs to the PR's exact-head checks; local skips are not FUSE evidence.
+
 ## Follow-up review of the published 8d6c02e checkpoint
 
 Focused tests reproduced three current-head defects before their fixes:
@@ -35,8 +74,9 @@ actual FUSE in CI; local skips are not execution evidence. The native helper
 gate uses CI's unprivileged fusermount route; a privileged direct mount bypasses
 that gate. SIGINT/TERM/HUP/QUIT startup and mounted-runtime cases remain separate.
 
-Binary-size experiments remain outside the PR: no profile or clap feature
-policy change is included in this follow-up.
+At this checkpoint binary-size experiments remained outside the PR. The
+subsequently approved release profile is recorded above; clap features remain
+unchanged.
 
 ## Remote/verification checkpoint: unfinished and unpublished
 

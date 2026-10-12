@@ -36,6 +36,9 @@ versions, stale PR branches, lockfile mismatches and missing/placeholder notes.
 the **extracted archive executable** against a real FUSE mount. The GNU binary's
 supported baseline is glibc 2.35, not arbitrary Linux. The build vendors libgit2;
 FUSE mounting still requires a usable `/dev/fuse` and `fusermount3` on the host.
+Release builds use optimization level 3, fat link-time optimization and one
+codegen unit to reduce the executable size. This increases release build/link
+work; debug builds and runtime dependencies are unchanged.
 
 After a master push, the same workflow waits for `rust`, `real-fuse`,
 `lazy-performance`, `release-policy` and `package`. Only then its `release` job

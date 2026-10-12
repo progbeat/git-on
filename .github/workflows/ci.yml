@@ -38,6 +38,7 @@ jobs:
         run: |
           rustup toolchain install 1.89.0 --profile minimal
           cargo +1.89.0 check --locked --all-targets --features test-metrics
+          cargo +1.89.0 build --release --locked --bin git-on
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests
@@ -77,9 +78,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - run: cargo build --locked
+      - run: cargo build --release --locked
       - name: Real mount, adversarial operations, process lifecycle, and uv
-        run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+        run: python3 tests/integration.py --binary target/release/git-on --require-fuse --uv
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
           BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
@@ -89,23 +90,24 @@ jobs:
           # when that intermediate commit is no longer in master's ancestry.
           if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" HEAD; then
             git worktree add --detach /tmp/git-on-review-before "$BEFORE"
-            cargo build --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$PWD/target"
-            cp target/debug/git-on /tmp/git-on-review-before-bin
+            cargo build --release --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$PWD/target"
+            cp target/release/git-on /tmp/git-on-review-before-bin
             BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
           fi
           LIFECYCLE_BEFORE=8d6c02ede7a6f5d377e2c47c5b2177ee46a477eb
           if git cat-file -e "$LIFECYCLE_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$LIFECYCLE_BEFORE" HEAD; then
             git worktree add --detach /tmp/git-on-lifecycle-before "$LIFECYCLE_BEFORE"
-            cargo build --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$PWD/target"
-            cp target/debug/git-on /tmp/git-on-lifecycle-before-bin
+            cargo build --release --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$PWD/target"
+            cp target/release/git-on /tmp/git-on-lifecycle-before-bin
             BEFORE_ARGUMENT+=(--before-lifecycle-binary /tmp/git-on-lifecycle-before-bin)
           fi
-          cargo build --locked --features test-metrics --example source-probe --bin git-on
-          python3 tests/remote.py --require-fuse "${BEFORE_ARGUMENT[@]}"
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on "${BEFORE_ARGUMENT[@]}"
+          python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on
 
       - name: Seeded bounded filesystem differential stress
         run: >-
-          python3 tests/stress.py --binary target/debug/git-on --require-fuse
+          python3 tests/stress.py --binary target/release/git-on --require-fuse
           --seed 0x5eed --seed 0xc0ffee --operations 400 --max-nodes 64
           --max-file-bytes 65536 --timeout 90 --trace-dir stress-artifacts
       - name: Retain reproducible stress traces

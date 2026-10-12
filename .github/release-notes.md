@@ -1,6 +1,8 @@
 # 1.1.0
 Bump: minor
 
+- Reduce optimized executable size with fat LTO and one codegen unit, retaining optimization level 3, existing CLI features and runtime requirements. Release builds require more optimization/link work.
+
 - Execute an HTTPS/SSH revision outside a checkout or select a configured remote: `git on origin main -- command args`. One operand still selects a local revision; two select repository and revision. Put keep and verification options after REV; the command tail remains literal after `--`.
 - Fetch exact objects on demand with a persistent cache bounded to 256 MiB and 4096 objects. Concurrent eviction preserves active run copies. Active temporary objects and ignored writes have no runner quota. No full checkout or full-clone fallback is introduced.
 - Reuse an authenticated OpenSSH connection for lazy fetches. An unlocked agent needs no passphrase prompt; one selected encrypted identity authenticates before mounting. Lost connections and filter/OID rejection fail with precise diagnostics.

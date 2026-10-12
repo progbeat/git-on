@@ -29,3 +29,8 @@ signal-hook = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

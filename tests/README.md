@@ -108,6 +108,11 @@ claim the mounted command is sandboxed from the host filesystem.
 
 ## Lazy access and lifecycle
 
+Required CI exercises the release profile through the full real-FUSE integration,
+remote lifecycle and differential stress suites, as well as the packaged binary
+and performance job. The Rust 1.89 gate also links the locked release executable;
+debug Rust/CLI/transport suites remain separate checks.
+
 The ordinary integration binary has no metrics channel. Black-box laziness
 regressions use unreachable or deliberately unavailable sibling objects to check
 that unrelated content is not visited, while separate workloads exercise lookup,
