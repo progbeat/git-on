@@ -146,6 +146,9 @@ impl Git {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        // Native Git owns acceptance, including the caller's configured trust threshold.
+        // Its default can accept unknown-trust OpenPGP; a git-on threshold here
+        // would silently replace that policy.
         let status = run(command, false)?.status;
         if !status.success() {
             bail!("native Git {operation} failed for {oid}; execution forbidden");

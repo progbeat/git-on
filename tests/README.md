@@ -47,6 +47,11 @@ received OIDs, requested objects, request/response bytes and loader metrics.
 Tests distinguish listing from stat, repeated reads and large ranges; compare
 cold and warm caches; use distinct trees for moving-ref/replacement checks; and
 cover native formats/trust, tag chains, inherited Git settings and server faults.
+OpenPGP cases use a disposable public-only keyring to compare unknown-trust
+commit/tag acceptance with native Git's default and rejection with configured
+`gpg.minTrustLevel=fully`. Repository policy and inherited `git -c` must reject
+before executing a sentinel command for local and remote inputs; required FUSE
+checks also verify the accepted default actually executes against pinned bytes.
 SSH tests count ASKPASS and interactive PTY prompts and authenticated connections.
 The native job-control suite runs an actual interactive Bash in a Linux PTY,
 stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,

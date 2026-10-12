@@ -768,3 +768,38 @@ build and copy from a separate
 `/tmp/git-on-historical-target`; the reviewed head keeps its own target directory.
 The same real-FUSE assertions remain required in the replacement exact-head CI
 run. Other green jobs in the failed run do not replace that acceptance.
+
+## Native Git trust policy is the verification acceptance policy
+
+The owner reconciled issue #4 with native Git policy delegation after review
+discussion `r4245809531`. This is acceptance clarification and test hardening,
+not a discovered runtime trust-policy defect. git-on intentionally adds no
+signer allowlist or trust threshold to native Git's result under the caller's
+effective configuration. A source comment beside that decision records why.
+
+A disposable public-only GnuPG keyring on Git 2.52.0 / GnuPG 2.4.7 produced
+`GOODSIG` and `TRUST_UNDEFINED` for an actual signed commit and annotated tag.
+Both `verify-commit` and `verify-tag` returned 0 by default and with
+`gpg.minTrustLevel=undefined`, and 1 with `marginal` or `fully`. This confirms
+the configured threshold applies to those operations; it is not inferred from
+Git's different default for signature verification during merges. See
+[Git's configuration documentation](https://git-scm.com/docs/git-config#Documentation/git-config.txt-gpgminTrustLevel).
+
+`test_openpgp_invalid_and_unknown_trust_match_native_git` now checks native
+default acceptance of both commit and tag while retaining invalid-signature
+rejection. `test_openpgp_configured_trust_rejection_prevents_local_and_remote_execution`
+requires native rejection of the same good, unknown-trust signatures with
+`gpg.minTrustLevel=fully`. All eight local/remote, commit/tag, repository/`git -c`
+cases must return runner status 125 with the native verification-failure
+diagnostic, no sentinel execution and no retained run state. The inherited
+`git -c` case overrides a permissive repository setting and exercises effective
+configuration replay into the private remote repository. These focused cases
+passed against the unchanged `0cbbcf3d9ded0af5d9394e80caaad7e08a188662` runtime;
+no artificial red-before runtime result is claimed.
+
+`test_real_mount_openpgp_default_policy_executes_unknown_trust_commit_and_tag`
+additionally requires actual command execution and expected pinned file bytes
+for both default-accepted object kinds with local and remote operands. It is
+explicitly skipped without required FUSE and must pass in exact-head real-FUSE
+CI. Local source-probe acceptance and rejected-command checks are distinct from
+that mounted evidence.

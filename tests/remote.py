@@ -651,30 +651,85 @@ class RemoteTests(unittest.TestCase):
         value,_=f.operation(process,'read file'); self.assertEqual(value['data'],'expected\n'); f.finish(process)
         self.assertEqual(f.git('rev-parse','HEAD'),different)
 
-    def test_openpgp_invalid_and_unknown_trust_match_native_git(self):
+    def openpgp_signing(self):
         f=self.f; signing=f.root/'gpg-sign'; signing.mkdir(mode=0o700)
         self.addCleanup(run,['gpgconf','--kill','all'],env=dict(f.env,GNUPGHOME=str(signing)))
         run(['gpg','--batch','--pinentry-mode','loopback','--passphrase','','--quick-generate-key','Fixture <fixture@example.invalid>','ed25519','sign','0'],env=dict(f.env,GNUPGHOME=str(signing)))
         wrapper=f.root/'gpg-oracle'; wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{signing}" exec gpg "$@"\n'); wrapper.chmod(0o700)
         f.git('config','gpg.program',str(wrapper)); f.git('config','user.signingkey','fixture@example.invalid')
         signed=f.git('commit-tree','-S',f.tree,data=b'trust fixture\n')
+        f.git('tag','-s','-m','trust fixture tag','openpgp-policy-tag',signed)
+        tag=f.git('rev-parse','refs/tags/openpgp-policy-tag')
         public=run(['gpg','--batch','--export'],env=dict(f.env,GNUPGHOME=str(signing)))
         verification=f.root/'gpg-public'; verification.mkdir(mode=0o700)
         self.addCleanup(run,['gpgconf','--kill','all'],env=dict(f.env,GNUPGHOME=str(verification)))
         run(['gpg','--batch','--import'],input=public,env=dict(f.env,GNUPGHOME=str(verification)))
         wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{verification}" exec gpg "$@"\n')
+        return signed,tag
+
+    def test_openpgp_invalid_and_unknown_trust_match_native_git(self):
+        f=self.f; signed,tag=self.openpgp_signing()
         f.cwd=f.repo
+        for operation,oid in (('verify-commit',signed),('verify-tag',tag)):
+            native=subprocess.run(['git','-C',str(f.repo),operation,'--raw',oid],env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(native.returncode,0,native.stderr)
+            self.assertIn(b'[GNUPG:] TRUST_UNDEFINED ',native.stderr)
+            process=f.probe('local',oid,verify=True)
+            self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
         raw=subprocess.run(['git','-C',str(f.repo),'cat-file','commit',signed],env=f.env,capture_output=True,check=True).stdout
         invalid=f.git('hash-object','-t','commit','-w','--stdin',data=raw.replace(b'trust fixture',b'changed fixture'))
-        for oid in (signed,invalid):
-            native=subprocess.run(['git','-C',str(f.repo),'verify-commit',oid],env=f.env,capture_output=True)
-            process=f.probe('local',oid,verify=True)
-            if native.returncode==0:
-                self.assertIn(b'unknown',native.stderr.lower()); f.line(process); f.finish(process)
-            else:
-                _,errors=process.communicate(timeout=20); self.assertNotEqual(process.returncode,0)
-                self.assertIn(b'execution forbidden',errors)
-        self.assertEqual(subprocess.run(['git','-C',str(f.repo),'verify-commit',signed],env=f.env,capture_output=True).returncode,0)
+        native=subprocess.run(['git','-C',str(f.repo),'verify-commit','--raw',invalid],env=f.env,capture_output=True,timeout=20)
+        self.assertNotEqual(native.returncode,0,native.stderr)
+        self.assertIn(b'[GNUPG:] BADSIG ',native.stderr)
+        process=f.probe('local',invalid,verify=True)
+        _,errors=process.communicate(timeout=20); self.assertNotEqual(process.returncode,0)
+        self.assertIn(b'execution forbidden',errors)
+
+    def test_openpgp_configured_trust_rejection_prevents_local_and_remote_execution(self):
+        f=self.f; signed,tag=self.openpgp_signing(); url=f.https(); self.addCleanup(f.server.shutdown)
+        sentinel=f.root/'command-executed'
+        command=[sys.executable,'-c','from pathlib import Path; import sys; Path(sys.argv[1]).touch()',str(sentinel)]
+        env=dict(f.env,PATH=str(OPTIONS.binary.parent)+':'+f.env['PATH'])
+        for policy in ('repository','git-c'):
+            # The -c case must override a permissive repository setting, then
+            # survive Git::capture and replay into the remote private repository.
+            f.git('config','gpg.minTrustLevel','fully' if policy=='repository' else 'undefined')
+            config=[] if policy=='repository' else ['-c','gpg.minTrustLevel=fully']
+            runner=[str(OPTIONS.binary)] if policy=='repository' else ['git',*config,'on']
+            for operation,oid in (('verify-commit',signed),('verify-tag',tag)):
+                native=subprocess.run(['git','-C',str(f.repo),*config,operation,'--raw',oid],env=f.env,capture_output=True,timeout=20)
+                self.assertEqual(native.returncode,1,native.stderr)
+                self.assertIn(b'[GNUPG:] GOODSIG ',native.stderr)
+                self.assertIn(b'[GNUPG:] TRUST_UNDEFINED ',native.stderr)
+                for source,operands in (('local',[oid]),('remote',[url,oid])):
+                    with self.subTest(policy=policy,operation=operation,source=source):
+                        result=subprocess.run([*runner,*operands,'--verify','--',*command],cwd=f.repo,env=env,capture_output=True,timeout=30)
+                        self.assertEqual(result.returncode,125,result.stderr)
+                        self.assertIn(f'native Git {operation} failed'.encode(),result.stderr)
+                        self.assertIn(b'execution forbidden',result.stderr)
+                        self.assertNotIn(b'mount snapshot',result.stderr)
+                        self.assertFalse(sentinel.exists(),'trust-rejected command executed')
+                        self.assertEqual(result.stdout,b'')
+                        self.assertEqual(list(f.root.glob('git-on-*')),[])
+                        print('configured native trust rejection evidence:',json.dumps(dict(policy=policy,operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_executed=sentinel.exists())),flush=True)
+
+    def test_real_mount_openpgp_default_policy_executes_unknown_trust_commit_and_tag(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; signed,tag=self.openpgp_signing(); url=f.https(); self.addCleanup(f.server.shutdown)
+        sentinel=f.root/'command-executed'
+        code='from pathlib import Path; import sys; Path(sys.argv[1]).write_bytes(Path("deep/file").read_bytes())'
+        for operation,oid in (('verify-commit',signed),('verify-tag',tag)):
+            native=subprocess.run(['git','-C',str(f.repo),operation,'--raw',oid],env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(native.returncode,0,native.stderr)
+            self.assertIn(b'[GNUPG:] TRUST_UNDEFINED ',native.stderr)
+            for source,operands in (('local',[oid]),('remote',[url,oid])):
+                with self.subTest(operation=operation,source=source):
+                    sentinel.unlink(missing_ok=True)
+                    result=subprocess.run([str(OPTIONS.binary),*operands,'--verify','--',sys.executable,'-c',code,str(sentinel)],cwd=f.repo,env=f.env,capture_output=True,timeout=30)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(sentinel.read_bytes(),b'expected\n')
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    print('native default trust execution evidence:',json.dumps(dict(operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_bytes=sentinel.stat().st_size)),flush=True)
 
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')

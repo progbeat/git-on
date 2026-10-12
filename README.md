@@ -129,7 +129,8 @@ authenticates before mounting and lazy fetches reuse that SSH connection.
 
 `--verify` asks native Git to verify the exact commit or annotated tag before
 execution. Git controls formats and trust through your effective configuration,
-including `git -c`. Failed verification forbids execution. A signed tag binds its
+including `git -c`; git-on adds no signer allowlist or trust threshold. Failed
+verification forbids execution. A signed tag binds its
 peeled tree; `REV:path` selects a directory inside that verified tree. Raw trees
 cannot be verified by searching history. Verification proves neither passed
 tests nor execution safety. See the [remote guide](docs/remote.md) for limits.

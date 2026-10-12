@@ -139,10 +139,15 @@ Verify an annotated tag as that exact tag, then peel its recorded targets to a
 tree. The target commit need not carry a second signature. A lightweight tag
 resolves to its commit, which must verify. Support at most 64 nested annotated
 tags. Raw tree/blob IDs fail clearly, with no history search for another object.
-Any failed native verification forbids mounting and execution. Git's successful
-verification can accept an OpenPGP signature with unknown trust; git-on applies
-no additional trust policy. Disable replacements in native Git and read exact ODB
-objects in the loader.
+Any failed native verification forbids mounting and execution. Acceptance is
+exactly native Git's result under the caller's effective configuration; git-on
+adds no signer allowlist or trust threshold. Git's default OpenPGP verification
+can accept a valid signature with unknown trust. Configure Git's
+`gpg.minTrustLevel` (for example, `fully`) when the calling workflow requires a
+stricter threshold: if native Git rejects the object, git-on rejects it before
+mounting or execution. The calling workflow chooses and validates the configured
+policy it uses as execution approval. Disable replacements in native Git and read
+exact ODB objects in the loader.
 
 For verified `REV:path`, verify REV first and select a relative directory inside
 its bound tree. Colon-based searches such as `:/message` are unsupported in this
