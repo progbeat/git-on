@@ -680,3 +680,74 @@ cache environment of concurrent tests. `cargo test --locked --test
 remote_source` passed all seven cases after the fix. This loader regression
 verifies the flag consumed by runner completion; a caught EIO on an actual
 mount still needs the required real-FUSE acceptance run.
+
+## PR 5: SSH boundaries, ignore-acquisition errno, and authentication job control
+
+The authentic before-fix head for these three defects is
+`e42774399dba61d02c80235ef54bf61c3abd9e63`. Its commit/tree/blob hashes and
+ancestry were restored and verified before building an unchanged executable
+and metrics source probe. The permanent CI replay builds that exact revision
+in a detached worktree, copies both artifacts, then rebuilds the reviewed head.
+
+`SshRegressionTests.test_user_control_path_expansion_cannot_hide_master_options_after_connection_loss`
+expands `-oControlPath="$GIT_ON_SSH_CONTROL_PATH"` in the caller's direct SSH
+command before `-M` or `-vvM`, authenticates against a disposable OpenSSH server,
+and explicitly closes the owned master before demanding an uncached blob.
+The unchanged source probe failed the unencrypted cases with a replacement TCP
+connection (observed connection count 4 to 6). Encrypted-key cases additionally
+exposed replacement authentication during initial object acquisition. The fixed
+probe passes all four cases, counts one accepted authentication and, for an
+encrypted key, one ASKPASS invocation, and fails the demand without a new
+connection. The selected command is expanded once; Git's outer argv count
+defines the structural boundary instead of a caller-visible value. The
+`--before-boundary-probe` replay requires the specific lost-master reconnect
+observation, not an arbitrary setup/authentication error.
+
+Independent review also found that a caller-supplied positional SSH host and
+quoted `git-upload-pack REPOSITORY #` command turned the injected control options
+into remote command text. The initial structural-boundary fix still reproduced
+this: after forcibly closing the master, a lazy read succeeded with accepted
+authentications increasing from 1 to 3. The permanent
+`test_user_ssh_host_and_remote_command_cannot_swallow_owned_control_options`
+replays that reconnect on the authentic old head (TCP connections 2 to 4), then
+requires rejection before authentication. The wrapper rejects unconsumed
+positional operands and option terminators, including `-M-`/`--M` that would
+normalize to `--` when removing master flags.
+`test_ssh_tag_option_values_resembling_control_flags_remain_literal` uses an
+OpenSSH `Match tagged` identity to prove `-P -M` and `-P -O` preserve their tag
+values. Both subcases fail on the authentic old probe: the stripped `-M` tag
+causes public-key denial and `-O` is incorrectly rejected as a control command.
+Both pass after recognizing `-P` as an option consuming one operand. This
+additional test explicitly skips only on OpenSSH versions without tag support.
+
+`filesystem::tests::missing_ignore_object_is_io_error_for_file_and_directory_creation`
+removes a real loose `.gitignore` object before policy demand. Inserting only
+this regression into the unchanged before-fix source produces
+`[Err(30), Err(30)]` instead of `[Err(5), Err(5)]`; the corrected source passes
+both file and directory creation checks without inserting namespace or backing
+entries. Policy loader errors now use `snapshot_errno`, retaining EINTR for
+request interruption and EROFS for an ordinary healthy-policy denial.
+`RemoteTests.test_review_real_mount_ignore_acquisition_faults_report_eio`
+requires actual FUSE and repeats create/mkdir with an exact remote ignore-object
+403 response and a real invalid cache entry. `--before-policy-binary` checks
+the original EROFS result and the corrected EIO result, failure diagnostics,
+runner status 125 and absence of a created path.
+`test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
+the ignore request, signals its requesting task, observes exact libc syscall
+EINTR before releasing the server, and verifies its handler and successful
+retry. EINTR preservation is expected on both revisions. These mount-dependent
+tests are explicitly skipped locally without `/dev/fuse`; those skips are not
+mount evidence and the required real-FUSE CI job must supply it.
+
+`tests/native_job_control.py` uses an interactive Bash in a Linux PTY and an
+actual encrypted-key OpenSSH passphrase reader. On the unchanged executable,
+Ctrl-Z stops native Git while git-on remains running, keeps the native group
+foregrounded and never returns the shell prompt; the focused test fails at that
+prompt assertion. The corrected executable passes `fg`, repeated stop/resume,
+`bg` followed by terminal-input stop and `fg`, and Ctrl-C after resume. It checks
+process/session/foreground groups, native unsigned-commit verification failure
+before command execution, final status and process/socket/run cleanup. Native
+Git stops are consumed separately with `waitid(WSTOPPED|WNOHANG)`, leaving exit
+status ownership with `Child::try_wait`. `--before-binary` requires the exact
+old stopped-Git/running-runner/no-prompt state before running the green suite.
+These PTY checks do not need FUSE and do not stand in for real mounts.

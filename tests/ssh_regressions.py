@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Focused SSH review regressions using disposable real OpenSSH fixtures."""
+import argparse
 import importlib.util
 import contextlib
 import json
@@ -13,6 +14,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import unittest
 import uuid
@@ -22,13 +24,21 @@ remote = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(remote)
 
 
+PARSER = argparse.ArgumentParser(add_help=False)
+PARSER.add_argument('--before-boundary-probe', type=Path,
+                    help='Authentic pre-boundary-fix source probe for focused red-before replay')
+SSH_OPTIONS, remote.ARGS = PARSER.parse_known_args(remote.ARGS)
+if SSH_OPTIONS.before_boundary_probe is not None:
+    SSH_OPTIONS.before_boundary_probe = SSH_OPTIONS.before_boundary_probe.resolve()
+
+
 class SshRegressionTests(unittest.TestCase):
     def setUp(self):
         self.f = remote.Fixture()
         self.addCleanup(self.f.close)
 
-    def loaded_read(self, url):
-        f = self.f
+    def loaded_read(self, url, fixture=None):
+        f = self.f if fixture is None else fixture
         process = f.probe(url)
         f.line(process)
         data, _ = f.operation(process, 'read deep/file')
@@ -274,6 +284,152 @@ class SshRegressionTests(unittest.TestCase):
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
+    def boundary_connection_loss(self, encrypted, master, before_probe=None, user_host=False):
+        f = remote.Fixture()
+        self.addCleanup(f.close)
+        url = f.ssh(encrypted=encrypted)
+        if user_host:
+            f.env['GIT_SSH_COMMAND'] += self.user_host_command(f, url)
+        else:
+            f.env['GIT_SSH_COMMAND'] += ' -oControlPath="$GIT_ON_SSH_CONTROL_PATH" ' + master
+        if before_probe is None:
+            process = f.probe(url)
+        else:
+            process = subprocess.Popen([str(before_probe), url, 'HEAD'], cwd=f.cwd, env=f.env,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, bufsize=0)
+            f.children.append(process)
+        f.line(process)
+        sockets = list(f.root.glob('*/ssh-control'))
+        self.assertEqual(len(sockets), 1)
+        control = ['ssh', '-F', '/dev/null', '-S', str(sockets[0]), '-O', 'exit', 'git-on-control']
+        initial_log = (f.root / 'sshd.log').read_text()
+        try:
+            remote.run(control, timeout=5)
+            deadline = time.monotonic() + 5
+            while sockets[0].exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertFalse(sockets[0].exists(), 'owned master did not release its socket')
+            # Send exit too: the broken implementation can read successfully
+            # after creating a replacement master instead of returning an error.
+            process.stdin.write(b'read deep/file\nexit\n')
+            process.stdin.flush()
+            output, errors = process.communicate(timeout=10)
+            return dict(initial_log=initial_log, log=(f.root / 'sshd.log').read_text(),
+                        output=output, errors=errors, status=process.returncode,
+                        sockets=list(f.root.glob('*/ssh-control')),
+                        prompts=(f.root / 'prompts').read_text().splitlines() if encrypted else [])
+        finally:
+            # A red-before replay can leave a newly created master whose socket
+            # no longer matches the original identity.
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            subprocess.run(control, capture_output=True, timeout=5)
+
+    def test_user_control_path_expansion_cannot_hide_master_options_after_connection_loss(self):
+        # The run's socket path is intentionally visible to the selected SSH
+        # command. Matching that value must never act as an argv delimiter.
+        if SSH_OPTIONS.before_boundary_probe is not None:
+            for master in ('-M', '-vvM'):
+                with self.subTest(before=True, master=master):
+                    # An unlocked fixture authenticates any replacement TCP
+                    # connection. With an encrypted identity the old code can
+                    # already fail during startup, before the forced loss.
+                    observed = self.boundary_connection_loss(False, master,
+                                                              SSH_OPTIONS.before_boundary_probe)
+                    before = observed['initial_log'].count('Connection from ')
+                    after = observed['log'].count('Connection from ')
+                    self.assertGreater(after, before,
+                                       'old probe did not reproduce a TCP reconnect after owned master loss')
+                    self.assertGreater(observed['log'].count('Accepted publickey'),
+                                       observed['initial_log'].count('Accepted publickey'),
+                                       'old probe did not authenticate its replacement connection')
+                    self.assertEqual(observed['status'], 0, observed['errors'])
+                    self.assertIn('expected\n', [json.loads(line).get('data')
+                                                 for line in observed['output'].splitlines()])
+                    print(f'RED pre-fix SSH boundary {master}: forced master loss caused '
+                          f'TCP connections {before} -> {after} and a successful lazy read', file=sys.stderr)
+        for encrypted in (False, True):
+            for master in ('-M', '-vvM'):
+                with self.subTest(encrypted=encrypted, master=master):
+                    observed = self.boundary_connection_loss(encrypted, master)
+                    self.assertEqual(observed['log'].count('Connection from '),
+                                     observed['initial_log'].count('Connection from '),
+                                     'lost owned master caused a replacement TCP connection:\n' + observed['log'])
+                    self.assertEqual(observed['log'].count('Accepted publickey'), 1)
+                    self.assertNotEqual(observed['status'], 0, observed['errors'])
+                    self.assertIn(b'remote fetch of exact object', observed['errors'])
+                    self.assertEqual(observed['sockets'], [])
+                    if encrypted:
+                        self.assertEqual(observed['prompts'], ['prompt'])
+
+    @staticmethod
+    def user_host_command(f, url):
+        user_host, port_and_path = url.removeprefix('ssh://').split(':', 1)
+        port = port_and_path.split('/', 1)[0]
+        # A remote shell comment swallows everything Git/git-on append after
+        # the caller's host. Without rejecting that host, -O proxy is ineffective.
+        upload_pack = 'git-upload-pack ' + shlex.quote(str(f.repo)) + ' #'
+        return ' -p ' + port + ' ' + shlex.quote(user_host) + ' ' + shlex.quote(upload_pack)
+
+    def test_user_ssh_host_and_remote_command_cannot_swallow_owned_control_options(self):
+        if SSH_OPTIONS.before_boundary_probe is not None:
+            observed = self.boundary_connection_loss(False, '', SSH_OPTIONS.before_boundary_probe,
+                                                      user_host=True)
+            before = observed['initial_log'].count('Connection from ')
+            after = observed['log'].count('Connection from ')
+            self.assertGreater(after, before,
+                               'old user-host probe did not reconnect after owned master loss')
+            self.assertGreater(observed['log'].count('Accepted publickey'),
+                               observed['initial_log'].count('Accepted publickey'))
+            self.assertEqual(observed['status'], 0, observed['errors'])
+            self.assertIn('expected\n', [json.loads(line).get('data')
+                                         for line in observed['output'].splitlines()])
+            print(f'RED pre-fix SSH user host: forced master loss caused TCP connections '
+                  f'{before} -> {after} and a successful lazy read', file=sys.stderr)
+        f = self.f
+        url = f.ssh()
+        f.env['GIT_SSH_COMMAND'] += self.user_host_command(f, url)
+        process = f.probe(url)
+        output, errors = process.communicate(timeout=10)
+        self.assertNotEqual(process.returncode, 0, output)
+        self.assertIn(b'Git supplies the host and remote command', errors)
+        self.assertNotIn('Accepted publickey', (f.root / 'sshd.log').read_text())
+        self.assertEqual(list(f.root.glob('*/ssh-control')), [])
+
+    def test_ssh_tag_option_values_resembling_control_flags_remain_literal(self):
+        capability = subprocess.run(['ssh', '-F', '/dev/null', '-G', '-P', '-M', 'git-on-tag-check'],
+                                    capture_output=True, timeout=5)
+        if capability.returncode:
+            self.skipTest('installed OpenSSH does not support -P tags')
+        for tag in ('-M', '-O'):
+            with self.subTest(tag=tag):
+                f = remote.Fixture()
+                self.addCleanup(f.close)
+                url = f.ssh()
+                config = f.root / 'tagged_config'
+                config.write_text('Host *\n    IdentityFile none\nMatch tagged ' + tag +
+                                  '\n    IdentityFile ' + str(f.root / 'identity') + '\n')
+                f.env['GIT_SSH_COMMAND'] = (f'ssh -F {config} -o IdentitiesOnly=yes '
+                                          f'-o UserKnownHostsFile={f.root}/known_hosts '
+                                          '-o StrictHostKeyChecking=yes -P ' + shlex.quote(tag))
+                if SSH_OPTIONS.before_boundary_probe is not None:
+                    before = subprocess.Popen([str(SSH_OPTIONS.before_boundary_probe), url, 'HEAD'],
+                                              cwd=f.cwd, env=f.env, stdin=subprocess.PIPE,
+                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    f.children.append(before)
+                    _, errors = before.communicate(timeout=10)
+                    self.assertNotEqual(before.returncode, 0)
+                    expected = (b'Permission denied (publickey)' if tag == '-M' else
+                                b'SSH control commands (-O) are owned by the runner')
+                    self.assertIn(expected, errors)
+                    self.assertNotIn('Accepted publickey', (f.root / 'sshd.log').read_text())
+                    self.assertEqual(list(f.root.glob('*/ssh-control')), [])
+                    print(f'RED pre-fix SSH -P {tag}: literal option value was misparsed '
+                          'and startup failed before authentication', file=sys.stderr)
+                self.loaded_read(url, f)
+
     def test_short_proxy_jump_option_remains_usable_for_lazy_reads(self):
         f = self.f
         url = f.ssh(encrypted=True)
@@ -282,6 +438,20 @@ class SshRegressionTests(unittest.TestCase):
         f.env['GIT_SSH_COMMAND'] += ' -J none'
         self.loaded_read(url)
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
+
+    def test_user_master_flag_clusters_cannot_become_option_terminator(self):
+        f = self.f
+        url = f.ssh()
+        original = f.env['GIT_SSH_COMMAND']
+        for flags in ('--', '-M-', '--M'):
+            with self.subTest(flags=flags):
+                f.env['GIT_SSH_COMMAND'] = original + ' ' + flags
+                process = f.probe(url)
+                _, errors = process.communicate(timeout=10)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn(b'may not end option parsing before Git supplies its host', errors)
+                self.assertNotIn('Accepted publickey', (f.root / 'sshd.log').read_text())
+                self.assertEqual(list(f.root.glob('*/ssh-control')), [])
 
     def test_terminal_interrupt_during_authentication_propagates_sigint(self):
         f = self.f

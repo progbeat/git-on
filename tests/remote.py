@@ -37,10 +37,11 @@ PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
+PARSER.add_argument('--before-policy-binary', type=Path, help='Authentic e427743 binary for ignore-acquisition errno red-before replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
 # Artifact arguments are relative to the invoking harness, not a forked
 # fixture's cwd. Resolve them before any child changes directories.
-for artifact in ('probe','binary','before_binary','before_lifecycle_binary'):
+for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary'):
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
@@ -1089,6 +1090,95 @@ class RemoteTests(unittest.TestCase):
                 self.assertIn(b'execution incomplete',result.stderr)
             self.assertEqual(list(f.root.glob('git-on-*')),[])
             print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
+
+    def ignore_policy_fixture(self):
+        f=self.f
+        f.ignore=f.git('hash-object','-w','--stdin',data=b'created.tmp\ncreated-dir/\n')
+        f.tree=f.git('mktree',data=f'100644 blob {f.ignore}\t.gitignore\n100644 blob {f.other}\tother\n'.encode())
+        f.commit=f.git('commit-tree',f.tree,data=b'ignore acquisition fixture\n')
+        f.git('update-ref','refs/heads/main',f.commit)
+        url=f.https(); self.addCleanup(f.server.shutdown)
+        return url
+
+    def test_review_real_mount_ignore_acquisition_faults_report_eio(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; url=self.ignore_policy_fixture()
+        cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
+        for binary,expected in cases:
+            for fault in ('transport','cache'):
+                for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
+                    with self.subTest(binary=str(binary),fault=fault,operation=operation):
+                        shutil.rmtree(f.root/'cache',ignore_errors=True)
+                        f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
+                        code="import json,os,sys; from pathlib import Path\n"
+                        if fault=='cache':
+                            code+="(Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\n"
+                        code+="try:\n"
+                        code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
+                        code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
+                        result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                        self.assertEqual(result.returncode,125,result.stderr)
+                        self.assertEqual(json.loads(result.stdout),{'errno':expected,'exists':False},result.stderr)
+                        self.assertIn(b'execution incomplete',result.stderr)
+                        if fault=='transport':
+                            self.assertTrue(any(f.ignore in request['wants'] and request.get('status')==403 for request in f.requests),f.requests)
+                            self.assertIn(f.ignore.encode(),result.stderr)
+                        else: self.assertIn(b'not-an-object',result.stderr)
+                        self.assertEqual(list(f.root.glob('git-on-*')),[])
+                        print('ignore acquisition errno regression evidence:',json.dumps(dict(binary=str(binary),before=expected==errno.EROFS,fault=fault,operation=operation,errno=expected)),flush=True)
+        # With healthy rules, policy denial retains its distinct EROFS meaning.
+        f.denied_oids.clear(); shutil.rmtree(f.root/'cache',ignore_errors=True)
+        code="import errno,os\nfor operation in (lambda: os.open('denied',os.O_CREAT|os.O_WRONLY,0o600),lambda: os.mkdir('denied-dir')):\n try: operation()\n except OSError as error: assert error.errno==errno.EROFS,error\n else: raise AssertionError('unignored mutation allowed')\nfd=os.open('created.tmp',os.O_CREAT|os.O_WRONLY,0o600); os.close(fd)\nos.mkdir('created-dir')\n"
+        result=subprocess.run([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; url=self.ignore_policy_fixture()
+        cases=([OPTIONS.before_policy_binary] if OPTIONS.before_policy_binary else [])+[OPTIONS.binary]
+        for binary in cases:
+            for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
+                with self.subTest(binary=str(binary),operation=operation):
+                    shutil.rmtree(f.root/'cache',ignore_errors=True)
+                    f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.ignore}
+                    ready=f.root/'ignore-request-ready'; handled=f.root/'ignore-request-handled'
+                    observed=f.root/'ignore-request-errno'; release=f.root/'ignore-request-release'
+                    for marker in (ready,handled,observed,release): marker.unlink(missing_ok=True)
+                    # ctypes observes the original syscall errno; Python's open
+                    # and mkdir wrappers otherwise retry EINTR automatically.
+                    code="import ctypes,errno,json,os,signal,sys,time; from pathlib import Path\nlibc=ctypes.CDLL(None,use_errno=True)\ndef handler(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handler)\nPath(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+                    code+=("result=libc.open(os.fsencode(sys.argv[1]),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n" if operation=='create' else "result=libc.mkdir(os.fsencode(sys.argv[1]),0o700)\n")
+                    code+="error=ctypes.get_errno()\nassert result==-1,(result,error)\nassert error==errno.EINTR,error\nassert not os.path.lexists(sys.argv[1])\nPath(os.environ['OBSERVED']).write_text(str(error))\nwhile not Path(os.environ['RELEASE']).exists(): time.sleep(.01)\n"
+                    code+=("fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else "os.mkdir(sys.argv[1])\n")
+                    env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed),RELEASE=str(release))
+                    process=subprocess.Popen([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                    f.children.append(process); state=None
+                    try:
+                        self.assertTrue(f.stalled.wait(timeout=20),'ignore request did not reach controlled acquisition stall')
+                        self.assertTrue(ready.exists()); state=json.loads(ready.read_text())
+                        os.kill(state['pid'],signal.SIGTERM)
+                        deadline=time.monotonic()+5
+                        while not observed.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
+                        self.assertTrue(observed.exists(),'ignore request failed to reply EINTR before server release')
+                        self.assertEqual(int(observed.read_text()),errno.EINTR)
+                        self.assertTrue(handled.exists(),'requester signal handler did not run')
+                        f.resume.set(); release.touch()
+                        _,errors=process.communicate(timeout=20)
+                        self.assertEqual(process.returncode,0,errors)
+                        self.assertNotIn(b'execution incomplete',errors)
+                        self.assertEqual(list(f.root.glob('git-on-*')),[])
+                        print('ignore interruption regression evidence:',json.dumps(dict(binary=str(binary),operation=operation,errno=errno.EINTR,retry_succeeded=True)),flush=True)
+                    finally:
+                        f.resume.set(); f.stalled_oids.clear(); release.touch()
+                        if process.poll() is None:
+                            if state is not None:
+                                with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
+                            process.kill()
+                        process.communicate(timeout=20)
+                        if state is not None and Path(state['run']).exists():
+                            cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',state['run']],capture_output=True,timeout=20)
+                            self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
     def request_signal_behavior(self, binary, mode, expect_old):
         f=self.f

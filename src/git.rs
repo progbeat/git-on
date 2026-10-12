@@ -316,10 +316,18 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         if let Err(error) = check_request_interruption() {
             break stop_request_operation(&mut child).and(Err(error));
         }
+        if let Some(fd) = tty_fd {
+            if let Err(error) = relay_native_job_control(child.id(), fd, parent_group) {
+                break stop_request_operation(&mut child).and(Err(error));
+            }
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
-    if transfer {
-        let _ = set_foreground(tty_fd.unwrap(), parent_group);
+    // A background resume must leave the terminal with the invoking shell.
+    if let Some(fd) = tty_fd {
+        if unsafe { libc::tcgetpgrp(fd) } == child.id() as libc::pid_t {
+            let _ = set_foreground(fd, parent_group);
+        }
     }
     let status = outcome?;
     use std::os::unix::process::ExitStatusExt;
@@ -341,6 +349,54 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         stdout: out,
         stderr: err,
     })
+}
+/// Native Git owns a separate group while authenticating/verifying. Observe
+/// stops without consuming its exit status, then suspend the caller's job so
+/// its shell can report the stop and perform ordinary `fg`/`bg` transitions.
+fn relay_native_job_control(pid: u32, fd: i32, parent_group: libc::pid_t) -> Result<()> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result =
+        unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WSTOPPED | libc::WNOHANG) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        // WSTOPPED alone can report an exited child as ECHILD. Child::try_wait
+        // remains the sole owner of the exit status on the next iteration.
+        if error.raw_os_error() == Some(libc::ECHILD)
+            || error.kind() == std::io::ErrorKind::Interrupted
+        {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let group = pid as libc::pid_t;
+    let foreground = unsafe { libc::tcgetpgrp(fd) };
+    if foreground == parent_group {
+        // `fg` can foreground an already-running background job without
+        // sending SIGCONT. Pass ownership on during the normal polling loop.
+        set_foreground(fd, group)?;
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(());
+    }
+    let stop = unsafe { info.si_status() };
+    if foreground == parent_group && matches!(stop, libc::SIGTTIN | libc::SIGTTOU) {
+        // A pending background-I/O stop raced the shell's `fg` transition.
+        unsafe { libc::kill(-group, libc::SIGCONT) };
+        return Ok(());
+    }
+    if unsafe { libc::tcgetpgrp(fd) } == group {
+        set_foreground(fd, parent_group)?;
+    }
+    unsafe {
+        libc::kill(-parent_group, libc::SIGSTOP);
+    }
+    // Only `fg` grants the caller's job the terminal. A `bg` resume leaves
+    // it with the shell, so another terminal read can stop the job normally.
+    if unsafe { libc::tcgetpgrp(fd) } == parent_group {
+        set_foreground(fd, group)?;
+    }
+    unsafe { libc::kill(-group, libc::SIGCONT) };
+    Ok(())
 }
 fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
     use std::time::{Duration, Instant};

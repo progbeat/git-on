@@ -33,6 +33,8 @@ requested unadvertised OID names the OID and includes Git's server diagnostic.
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
 the runner fail even if the command catches EIO and exits successfully.
+This includes `.gitignore` object and cache acquisition during file/directory
+creation. A healthy policy denying a write instead returns EROFS.
 
 A pending, unblocked and nonignored SIGINT, SIGTERM, SIGHUP or SIGQUIT in the
 task requesting a remote object interrupts that request with EINTR. The runner
@@ -85,15 +87,21 @@ ControlMaster socket. An unlocked agent needs zero key passphrase prompts; an
 ordinary selected encrypted identity authenticates once. Lazy fetches reuse the
 master, enable BatchMode and forbid replacement TCP connections. Connection loss
 fails clearly. Existing OpenSSH host-key policy controls first-contact prompts.
+During native Git authentication, Ctrl-Z stops the invoking job and returns
+control to its shell. `fg` resumes Git with the terminal; `bg` leaves the shell
+foregrounded, so another authentication read can stop the job until `fg`.
 
 Select the identity using SSH configuration, `GIT_SSH_COMMAND`,
 `core.sshCommand`, or a transparent `GIT_SSH` executable forwarding OpenSSH argv,
-in that native Git precedence order. Direct SSH commands preserve quoting and
-variable expansion. Shell prefixes, compounds, command substitutions and
+in that native Git precedence order. Direct SSH commands contain an executable
+and options, preserving quoting and variable expansion. Git supplies the host
+and remote command; caller positional operands are rejected before authentication.
+Shell prefixes, compounds, command substitutions and
 non-OpenSSH variants are unsupported and fail before authentication. The runner
 owns control options, including short `-M`/`-S`; caller `-O` control commands
-are rejected. Its master remains available for the run lifetime, and lazy reads
-require the existing socket through OpenSSH mux proxy mode. Normal completion
+are rejected. Expanding the owned socket path in caller options cannot bypass
+control-option sanitization. Its master remains available for the run lifetime,
+and lazy reads require the existing socket through OpenSSH mux proxy mode. Normal completion
 and busy-mount retention close the owned master. Recovery records the socket's
 exact device/inode and only closes a matching real socket; changed or symbolic
 paths and absent or invalid records are skipped. Uncatchable termination before

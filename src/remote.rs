@@ -189,24 +189,15 @@ impl Remote {
             "fetch.writeCommitGraph=false",
         ]);
         if let (Some(socket), Some(ssh)) = (&self.socket, &self.ssh) {
-            // Git appends its own SSH argv to this shell command. The function
-            // keeps shell expansion of direct commands, removes short -M (which
-            // bypasses first-value -o precedence), and leaves all other argv in
-            // order. A final -S before Git's host overrides short user -S flags.
+            // Git appends argv to the outer function, so its argument count
+            // gives the inner function a structural user/Git boundary. User
+            // shell expansion cannot impersonate that boundary. Remove short
+            // -M (which bypasses first-value -o precedence) and place the owned
+            // -S/-O after user options and before Git's host.
             let mut text = OsString::from(SSH_WRAPPER);
-            text.push("; git_on_ssh ");
+            text.push("; git_on_ssh() { git_on_git_argc=$#; git_on_ssh_command ");
             text.push(ssh);
-            text.push(" ");
-            let mut boundary = OsString::from("-oControlPath=");
-            boundary.push(socket);
-            text.push(shell_quote(&boundary));
-            text.push(" -S ");
-            text.push(shell_quote(socket.as_os_str()));
-            if !initial {
-                // OpenSSH's mux proxy mode requires the existing socket. Unlike
-                // ProxyCommand=false this also works with -J jump-host options.
-                text.push(" -O proxy");
-            }
+            text.push(" \"$@\"; }; git_on_ssh");
             command
                 .env("GIT_ON_SSH_CONTROL_PATH", socket)
                 .env("GIT_ON_SSH_INITIAL", if initial { "1" } else { "0" });
@@ -632,49 +623,67 @@ fn validate_ssh_command(command: &OsStr) -> Result<()> {
     Ok(())
 }
 // This is a direct command wrapper, as used by Git for GIT_SSH_COMMAND. Shell
-// prefixes and compounds cannot safely identify the OpenSSH option boundary.
+// prefixes and compounds cannot safely identify the OpenSSH executable.
 // Transparent GIT_SSH executables that forward OpenSSH argv remain supported.
-const SSH_WRAPPER: &str = r#"git_on_ssh() {
+const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     executable=$1; shift
     case "$executable" in
         env|exec|command|sh|bash|dash|zsh|ksh|*=*)
             echo 'git-on: SSH command must name an OpenSSH executable or an argv-forwarding wrapper directly; shell prefixes are unsupported' >&2
             exit 125 ;;
     esac
-    remaining=$#; scan=1; skip=0
+    remaining=$(($# - git_on_git_argc)); skip=0
     while [ "$remaining" -gt 0 ]; do
         argument=$1; shift; remaining=$((remaining - 1)); drop=0
-        if [ "$argument" = "-oControlPath=$GIT_ON_SSH_CONTROL_PATH" ]; then scan=0; fi
-        if [ "$scan" = 1 ]; then
-            if [ "$skip" = 1 ]; then
-                skip=0
-            else
-                case "$argument" in
-                    --)
+        if [ "$skip" = 1 ]; then
+            skip=0
+        else
+            case "$argument" in
+                --)
+                    echo 'git-on: SSH command may not end option parsing before Git supplies its host' >&2
+                    exit 125 ;;
+                -*)
+                    flags=${argument#-}; kept=-
+                    while [ -n "$flags" ]; do
+                        flag=${flags%"${flags#?}"}; flags=${flags#?}
+                        case "$flag" in
+                            M) ;;
+                            O)
+                                echo 'git-on: SSH control commands (-O) are owned by the runner' >&2
+                                exit 125 ;;
+                            B|b|c|D|E|e|F|I|i|J|L|l|m|o|p|P|Q|R|S|W|w)
+                                kept=$kept$flag$flags
+                                if [ -z "$flags" ]; then skip=1; fi
+                                flags= ;;
+                            *) kept=$kept$flag ;;
+                        esac
+                    done
+                    argument=$kept
+                    if [ "$argument" = '--' ]; then
                         echo 'git-on: SSH command may not end option parsing before Git supplies its host' >&2
-                        exit 125 ;;
-                    -*)
-                        flags=${argument#-}; kept=-
-                        while [ -n "$flags" ]; do
-                            flag=${flags%"${flags#?}"}; flags=${flags#?}
-                            case "$flag" in
-                                M) ;;
-                                O)
-                                    echo 'git-on: SSH control commands (-O) are owned by the runner' >&2
-                                    exit 125 ;;
-                                B|b|c|D|E|e|F|I|i|J|L|l|m|o|p|Q|R|S|W|w)
-                                    kept=$kept$flag$flags
-                                    if [ -z "$flags" ]; then skip=1; fi
-                                    flags= ;;
-                                *) kept=$kept$flag ;;
-                            esac
-                        done
-                        argument=$kept
-                        if [ "$argument" = '-' ]; then drop=1; fi ;;
-                esac
-            fi
+                        exit 125
+                    fi
+                    if [ "$argument" = '-' ]; then drop=1; fi ;;
+                *)
+                    echo 'git-on: SSH command may contain only an executable and options; Git supplies the host and remote command' >&2
+                    exit 125 ;;
+            esac
         fi
         if [ "$drop" = 0 ]; then set -- "$@" "$argument"; fi
+    done
+    if [ "$skip" = 1 ]; then
+        echo 'git-on: SSH option is missing its argument' >&2
+        exit 125
+    fi
+    set -- "$@" -S "$GIT_ON_SSH_CONTROL_PATH"
+    if [ "$GIT_ON_SSH_INITIAL" != 1 ]; then
+        # Mux proxy mode requires the existing socket, including with -J.
+        set -- "$@" -O proxy
+    fi
+    remaining=$git_on_git_argc
+    while [ "$remaining" -gt 0 ]; do
+        argument=$1; shift; remaining=$((remaining - 1))
+        set -- "$@" "$argument"
     done
     if [ "$GIT_ON_SSH_INITIAL" = 1 ]; then
         exec "$executable" -o "ControlPath=$GIT_ON_SSH_CONTROL_PATH" -o ControlMaster=auto -o ControlPersist=yes "$@"
@@ -682,19 +691,6 @@ const SSH_WRAPPER: &str = r#"git_on_ssh() {
         exec "$executable" -o "ControlPath=$GIT_ON_SSH_CONTROL_PATH" -o ControlMaster=no -o BatchMode=yes "$@"
     fi
 }"#;
-
-fn shell_quote(arg: &OsStr) -> OsString {
-    let mut out = vec![b'\''];
-    for b in arg.as_bytes() {
-        if *b == b'\'' {
-            out.extend(b"'\\''");
-        } else {
-            out.push(*b);
-        }
-    }
-    out.push(b'\'');
-    OsString::from_vec(out)
-}
 
 /// Persistent loose objects are copied into each run's private repository.
 /// Eviction cannot invalidate active readers; temporary run storage has no quota.

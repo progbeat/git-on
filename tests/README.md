@@ -37,6 +37,7 @@ no user key or trust store is read or changed by these tests.
 cargo build --locked --features test-metrics --example source-probe --bin git-on
 python3 tests/remote.py
 python3 tests/ssh_regressions.py
+python3 tests/native_job_control.py
 python3 tests/remote.py --require-fuse
 python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
 ```
@@ -47,6 +48,13 @@ Tests distinguish listing from stat, repeated reads and large ranges; compare
 cold and warm caches; use distinct trees for moving-ref/replacement checks; and
 cover native formats/trust, tag chains, inherited Git settings and server faults.
 SSH tests count ASKPASS and interactive PTY prompts and authenticated connections.
+The native job-control suite runs an actual interactive Bash in a Linux PTY,
+stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,
+checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
+It fails unsigned native verification after authentication and needs no mount.
+The real-FUSE job additionally replays the authentic `e427743` executable and
+source probe for the SSH argument-boundary, ignore-acquisition errno, and native
+job-control regressions before requiring the fixed behavior.
 The million fixture has exactly one million distinct seven-byte blobs at six
 digit paths; preparation verifies every leaf before measuring remote demand.
 

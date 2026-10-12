@@ -556,13 +556,7 @@ impl Overlay {
         if self
             .policy
             .check(p, kind == FileType::Directory)
-            .map_err(|error| {
-                if crate::git::is_request_interruption(&error) {
-                    libc::EINTR
-                } else {
-                    libc::EROFS
-                }
-            })?
+            .map_err(snapshot_errno)?
         {
             Ok(())
         } else {
@@ -1500,6 +1494,35 @@ mod tests {
     use super::*;
     use git2::Repository;
     use tempfile::TempDir;
+
+    #[test]
+    fn missing_ignore_object_is_io_error_for_file_and_directory_creation() {
+        let (temp, mut overlay) = fixture();
+        let repo = Repository::open(temp.path().join("repo")).unwrap();
+        let tree = repo.find_tree(overlay._snapshot.tree_oid).unwrap();
+        let ignore = tree.get_name(".gitignore").unwrap().id().to_string();
+        // Remove the actual loose object before policy demand, without replacing
+        // the object loader or injecting an artificial policy error.
+        fs::remove_file(
+            repo.path()
+                .join("objects")
+                .join(&ignore[..2])
+                .join(&ignore[2..]),
+        )
+        .unwrap();
+        let outcomes = [
+            ("new.tmp", FileType::RegularFile),
+            ("cache", FileType::Directory),
+        ]
+        .map(|(name, kind)| {
+            let outcome = overlay.make(1, OsStr::new(name), kind, 0o700, 0, 0, Vec::new());
+            assert!(!overlay.paths.contains_key(Path::new(name)));
+            outcome
+        });
+        assert_eq!(outcomes, [Err(libc::EIO), Err(libc::EIO)]);
+        assert_eq!(overlay.nodes.len(), 1);
+        assert_eq!(fs::read_dir(&overlay.backing).unwrap().count(), 0);
+    }
 
     fn fixture() -> (TempDir, Overlay) {
         let temp = tempfile::tempdir().unwrap();
