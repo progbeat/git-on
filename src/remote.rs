@@ -2,16 +2,20 @@
 use crate::git::Git;
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
+    io::{Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, FromRawFd},
+        net::UnixStream,
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 pub const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -37,6 +41,8 @@ struct ControlClient {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<[u8; 32]>,
 }
 
 pub struct Remote {
@@ -421,44 +427,127 @@ fn stop_owned_connection(socket: &Path, owner: &SocketOwner) -> Result<()> {
     if remove_disconnected_socket(socket, owner)? {
         return Ok(());
     }
-    let executable = match &owner.client {
-        Some(client) => client.executable()?,
-        // Old v1 records did not contain executable provenance. Preserve their
-        // guarded standard-client recovery, without interpreting shell text.
-        None => PathBuf::from("ssh"),
-    };
+    if let Some(client) = &owner.client {
+        client.validate()?;
+    }
     if !owned_socket(socket, owner) {
         return Ok(());
     }
-    let mut child = Command::new(&executable)
-        .args(["-F", "/dev/null", "-S"])
-        .arg(socket)
-        .args(["-O", "exit", "git-on-control"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("start owned SSH shutdown client")?;
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("wait for owned SSH shutdown client")?
-        {
-            break status;
+    // A digest followed by exec(path), or even an open executable fd, still
+    // permits replacement/in-place mutation between validation and execution.
+    // Send OpenSSH's mux terminate request ourselves: shutdown executes no
+    // selected-client bytes, including script wrappers or legacy PATH clients.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    if let Err(error) = terminate_owned_master(socket, owner, deadline) {
+        if remove_disconnected_socket(socket, owner)? {
+            return Ok(());
         }
-        if start.elapsed() > std::time::Duration::from_secs(1) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("owned SSH shutdown client timed out; retain the run for --cleanup");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    while owned_socket(socket, owner) && start.elapsed() < std::time::Duration::from_secs(1) {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        return Err(error).context("owned SSH mux shutdown failed; retain the run for --cleanup");
+    }
+    while owned_socket(socket, owner) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
     if owned_socket(socket, owner) && !remove_disconnected_socket(socket, owner)? {
-        bail!("owned SSH shutdown did not close its control socket ({status}); retain the run for --cleanup");
+        bail!("owned SSH shutdown did not close its control socket; retain the run for --cleanup");
+    }
+    Ok(())
+}
+fn terminate_owned_master(socket: &Path, owner: &SocketOwner, deadline: Instant) -> Result<()> {
+    let mut stream = loop {
+        if !owned_socket(socket, owner) {
+            bail!("owned SSH socket changed before shutdown");
+        }
+        mux_remaining(deadline)?;
+        let (stream, error) = connect_control_endpoint(socket)?;
+        match error {
+            None => {
+                if !owned_socket(socket, owner) {
+                    bail!("owned SSH socket changed during shutdown connection");
+                }
+                stream.set_nonblocking(false)?;
+                break stream;
+            }
+            Some(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINPROGRESS | libc::EAGAIN | libc::EINTR)
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Some(error) => return Err(error).context("connect to owned SSH control endpoint"),
+        }
+    };
+    exchange_mux_shutdown(&mut stream, deadline)
+}
+fn mux_remaining(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("owned SSH mux shutdown timed out");
+    }
+    Ok(remaining)
+}
+fn mux_write(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(mux_remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => bail!("owned SSH control endpoint closed during shutdown"),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("write owned SSH mux shutdown"),
+        }
+    }
+    Ok(())
+}
+fn mux_read(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(mux_remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => bail!("owned SSH control endpoint closed during shutdown"),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("read owned SSH mux shutdown"),
+        }
+    }
+    Ok(())
+}
+fn mux_packet(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>> {
+    let mut length = [0; 4];
+    mux_read(stream, &mut length, deadline)?;
+    let length = u32::from_be_bytes(length) as usize;
+    // Bound an unsupported/malformed local peer before allocating its packet.
+    if !(8..=65536).contains(&length) {
+        bail!("invalid owned SSH mux packet length {length}");
+    }
+    let mut packet = vec![0; length];
+    mux_read(stream, &mut packet, deadline)?;
+    Ok(packet)
+}
+fn exchange_mux_shutdown(stream: &mut UnixStream, deadline: Instant) -> Result<()> {
+    // OpenSSH PROTOCOL.mux: version 4 HELLO, then TERMINATE with request id 0.
+    // No session, authentication, TCP connection or external client is created.
+    mux_write(stream, &[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4], deadline)?;
+    let hello = mux_packet(stream, deadline)?;
+    if hello[..8] != [0, 0, 0, 1, 0, 0, 0, 4] {
+        bail!("unsupported owned SSH mux greeting");
+    }
+    let mut extensions = &hello[8..];
+    while !extensions.is_empty() {
+        for _ in 0..2 {
+            let length = extensions
+                .get(..4)
+                .context("invalid owned SSH mux greeting extension")?;
+            let length = u32::from_be_bytes(length.try_into()?) as usize;
+            extensions = extensions
+                .get(4..)
+                .and_then(|bytes| bytes.get(length..))
+                .context("invalid owned SSH mux greeting extension")?;
+        }
+    }
+    mux_write(stream, &[0, 0, 0, 8, 0x10, 0, 0, 5, 0, 0, 0, 0], deadline)?;
+    let reply = mux_packet(stream, deadline)?;
+    if reply != [0x80, 0, 0, 1, 0, 0, 0, 0] {
+        bail!("owned SSH master refused or returned an invalid shutdown acknowledgement");
     }
     Ok(())
 }
@@ -474,6 +563,18 @@ fn remove_disconnected_socket(socket: &Path, owner: &SocketOwner) -> Result<bool
     Ok(true)
 }
 fn endpoint_absent(socket: &Path) -> Result<bool> {
+    let (_stream, error) = connect_control_endpoint(socket)?;
+    let Some(error) = error else {
+        return Ok(false);
+    };
+    match error.raw_os_error() {
+        Some(libc::ECONNREFUSED | libc::ENOENT) => Ok(true),
+        // A busy live listener is not evidence that its endpoint disappeared.
+        Some(libc::EINPROGRESS | libc::EAGAIN) => Ok(false),
+        _ => Err(error).context("inspect owned SSH control endpoint"),
+    }
+}
+fn connect_control_endpoint(socket: &Path) -> Result<(UnixStream, Option<std::io::Error>)> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let path = socket.as_os_str().as_bytes();
@@ -493,24 +594,15 @@ fn endpoint_absent(socket: &Path) -> Result<bool> {
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error()).context("inspect owned SSH control endpoint");
     }
-    let file = unsafe { File::from_raw_fd(descriptor) };
+    let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
     let result = unsafe {
         libc::connect(
-            file.as_raw_fd(),
+            stream.as_raw_fd(),
             (&address as *const libc::sockaddr_un).cast(),
             std::mem::size_of_val(&address) as libc::socklen_t,
         )
     };
-    if result == 0 {
-        return Ok(false);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ECONNREFUSED | libc::ENOENT) => Ok(true),
-        // A busy live listener is not evidence that its endpoint disappeared.
-        Some(libc::EINPROGRESS | libc::EAGAIN) => Ok(false),
-        _ => Err(error).context("inspect owned SSH control endpoint"),
-    }
+    Ok((stream, (result != 0).then(std::io::Error::last_os_error)))
 }
 impl ControlClient {
     fn resolve(cwd: &Path, ssh: &OsStr) -> Result<Self> {
@@ -550,7 +642,8 @@ impl ControlClient {
             cwd.join(selected)
         })
         .context("resolve selected SSH executable path")?;
-        let metadata = fs::symlink_metadata(&path)?;
+        let mut file = client_file(&path)?;
+        let metadata = file.metadata()?;
         if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
             bail!("selected SSH shutdown client must be a regular executable file");
         }
@@ -561,15 +654,16 @@ impl ControlClient {
             size: metadata.len(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
+            content_sha256: Some(client_digest(&mut file)?),
         })
     }
-    fn executable(&self) -> Result<PathBuf> {
+    fn validate(&self) -> Result<()> {
         let path = PathBuf::from(OsString::from_vec(self.path.clone()));
         if !path.is_absolute() || self.path.contains(&0) {
             bail!("invalid recorded SSH shutdown executable path; retain the run for --cleanup");
         }
-        let metadata =
-            fs::symlink_metadata(&path).context("inspect recorded SSH shutdown executable")?;
+        let mut file = client_file(&path).context("inspect recorded SSH shutdown executable")?;
+        let metadata = file.metadata()?;
         if !metadata.file_type().is_file()
             || metadata.permissions().mode() & 0o111 == 0
             || metadata.dev() != self.device
@@ -580,8 +674,32 @@ impl ControlClient {
         {
             bail!("recorded SSH shutdown executable changed; retain the run for --cleanup");
         }
-        Ok(path)
+        let digest = self.content_sha256.context(
+            "recorded SSH shutdown executable lacks a content fingerprint; close the owned master with a trusted client, then retry --cleanup",
+        )?;
+        if client_digest(&mut file)? != digest {
+            bail!("recorded SSH shutdown executable changed; retain the run for --cleanup");
+        }
+        Ok(())
     }
+}
+fn client_file(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?)
+}
+fn client_digest(file: &mut File) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    let mut bytes = [0; 8192];
+    loop {
+        let count = file.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&bytes[..count]);
+    }
+    Ok(digest.finalize().into())
 }
 fn validate_ssh_command(command: &OsStr) -> Result<()> {
     let mut quote = 0;
@@ -865,6 +983,72 @@ impl DiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mux_shutdown_rejects_invalid_greetings_before_termination() {
+        for greeting in [
+            vec![0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 5],
+            vec![0, 1, 0, 1],
+            vec![0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 4, 0],
+        ] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut hello = [0; 12];
+                server.read_exact(&mut hello).unwrap();
+                server.write_all(&greeting).unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut termination = [0; 12];
+                assert_eq!(server.read(&mut termination).unwrap(), 0);
+            });
+            assert!(
+                exchange_mux_shutdown(&mut client, Instant::now() + Duration::from_secs(1))
+                    .is_err()
+            );
+            drop(client);
+            peer.join().unwrap();
+        }
+    }
+    #[test]
+    fn mux_shutdown_rejects_nonmatching_acknowledgements() {
+        for reply in [[0x80, 0, 0, 1, 0, 0, 0, 1], [0x80, 0, 0, 2, 0, 0, 0, 0]] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut request = [0; 12];
+                server.read_exact(&mut request).unwrap();
+                server
+                    .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                    .unwrap();
+                server.read_exact(&mut request).unwrap();
+                server.write_all(&8u32.to_be_bytes()).unwrap();
+                server.write_all(&reply).unwrap();
+            });
+            assert!(
+                exchange_mux_shutdown(&mut client, Instant::now() + Duration::from_secs(1))
+                    .is_err()
+            );
+            peer.join().unwrap();
+        }
+    }
+    #[test]
+    fn mux_shutdown_deadline_cannot_be_extended_by_partial_packets() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut hello = [0; 12];
+            server.read_exact(&mut hello).unwrap();
+            for byte in [0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4] {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert!(exchange_mux_shutdown(&mut client, start + Duration::from_millis(60)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(client);
+        peer.join().unwrap();
+    }
     fn total(root: &Path) -> u64 {
         fs::read_dir(root)
             .unwrap()

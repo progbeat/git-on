@@ -60,6 +60,14 @@ It fails unsigned native verification after authentication and needs no mount.
 The real-FUSE job additionally replays the authentic `e427743` executable and
 source probe for the SSH argument-boundary, ignore-acquisition errno, and native
 job-control regressions before requiring the fixed behavior.
+SSH shutdown regressions additionally replay `87a11d5`: equal-length client
+rewrites with restored mtime must never execute a sentinel script and must
+retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
+changes the pathname only after file validation, demonstrating the old race;
+fixed shutdown must not reach that spawn at all. Existing outside-PATH ELF and
+transparent-wrapper checks continue to require actual OpenSSH master closure.
+Rust mux tests bound malformed packets, reply identity and a trickling peer's
+total deadline; these socket-pair checks are distinct from actual SSH and FUSE.
 The million fixture has exactly one million distinct seven-byte blobs at six
 digit paths; preparation verifies every leaf before measuring remote demand.
 

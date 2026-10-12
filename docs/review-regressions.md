@@ -803,3 +803,53 @@ for both default-accepted object kinds with local and remote operands. It is
 explicitly skipped without required FUSE and must pass in exact-head real-FUSE
 CI. Local source-probe acceptance and rejected-command checks are distinct from
 that mounted evidence.
+
+## SSH shutdown must not execute mutable client contents
+
+Review `r4246168532` found that the client record at authentic head
+`87a11d5bbc85b9b8b46a55d054a0e1a6538d5203` checked only metadata. An equal-length
+in-place rewrite followed by restoration of mtime preserved device, inode,
+length and timestamps, yet normal shutdown executed the changed script. The
+standalone replay observed its harmless sentinel, runner/probe failure and a
+still-live owned master, pin and run. The permanent
+`test_equal_length_restored_mtime_client_change_retains_live_master_pin_and_run`
+reproduces execution of that sentinel on both normal completion and stale
+recovery before requiring the fixed behavior: no sentinel, a visible changed-
+client failure, retained resources and successful cleanup after byte restoration.
+
+`test_shutdown_never_executes_selected_path_after_validation` isolates the
+pathname check/use race with a Linux/glibc `execvp`/`posix_spawn` interposer. The
+fixture arms only after actual SSH startup, writes the same harmless equal-length
+script immediately at the old shutdown spawn boundary and restores mtime.
+The authentic old runtime executed the sentinel. Fixed shutdown does not reach
+the armed spawn, leaves the selected file unchanged and closes the actual master
+without running any selected-client bytes. Setup errors are not accepted as red
+evidence. CI builds the authentic old executable and probe in the separate
+historical target, copies both and replays all three observed failures.
+
+Client contents now have a streaming SHA-256 fingerprint. File metadata and
+contents are checked from one no-follow fd; this detects restored-mtime edits
+but is deliberately not followed by executable-path or mutable-fd execution.
+Instead, the runner sends OpenSSH's documented mux-v4 termination request over
+the identity-checked owned Unix socket. This avoids script-interpreter/fd
+execution pitfalls and introduces no shutdown child, new authentication or TCP
+connection. Clients must be readable executable files. An older metadata-only
+client record cannot validate contents, so a live master must first be closed
+with a trusted client; its already-dead owned endpoint remains cleanable.
+
+The permanent outside-PATH ELF and transparent-script tests still close real
+masters on completion/recovery. Invalid or missing fingerprints retain state.
+`mux_shutdown_rejects_invalid_greetings_before_termination`,
+`mux_shutdown_rejects_nonmatching_acknowledgements` and
+`mux_shutdown_deadline_cannot_be_extended_by_partial_packets` guard packet bounds,
+protocol/reply checks and the shared deadline. Socket-pair results are not real
+SSH or mount evidence; real-FUSE, full lifecycle and unchanged earlier review
+regressions still require successful exact-head CI.
+
+During parallel local validation the existing stalled-transport test once read
+a live `/proc` state immediately after the Git leader was reaped; its isolated
+replay passed. Group SIGKILL delivery to another member is asynchronous. That
+test now opens a pidfd before cancellation and requires its bounded death,
+without confusing an outstanding kill with a survivor or relying on container
+PID 1 to reap zombies. This is an observed test-timing correction, not a claimed
+new transport cancellation defect or a fabricated deterministic red schedule.

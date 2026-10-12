@@ -422,15 +422,19 @@ class RemoteTests(unittest.TestCase):
         deadline=time.monotonic()+5
         while not pid.exists() and time.monotonic()<deadline: time.sleep(.01)
         self.assertTrue(pid.exists())
+        transport_fd=os.pidfd_open(int(pid.read_text()))
+        self.addCleanup(os.close,transport_fd)
         process.send_signal(signal.SIGTERM)
         try: process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
-            os.kill(int(pid.read_text()),signal.SIGKILL)
+            signal.pidfd_send_signal(transport_fd,signal.SIGKILL)
             raise
         self.assertEqual(process.returncode,-signal.SIGTERM)
-        proc=Path('/proc/'+pid.read_text().strip())
-        # Some container PID 1 implementations do not reap adopted zombies.
-        self.assertTrue(not proc.exists() or (proc/'stat').read_text().split()[2]=='Z')
+        # Reaping the Git leader can precede delivery of its group's SIGKILL to
+        # the transport. Observe this process's bounded death, without PID reuse
+        # or depending on whether the container's PID 1 reaps adopted zombies.
+        self.assertTrue(select.select([transport_fd],[],[],2)[0],
+                        'owned stalled transport survived cancellation')
         self.assertEqual(list(f.root.glob('git-on-*')),[])
     def test_startup_transport_all_handled_signals(self):
         f=self.f; wrapper=f.root/'hanging-selected-ssh'; pid=f.root/'transport-pid'

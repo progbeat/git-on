@@ -27,9 +27,16 @@ SPEC.loader.exec_module(remote)
 PARSER = argparse.ArgumentParser(add_help=False)
 PARSER.add_argument('--before-boundary-probe', type=Path,
                     help='Authentic pre-boundary-fix source probe for focused red-before replay')
+PARSER.add_argument('--before-client-probe', type=Path,
+                    help='Authentic 87a11d5 source probe for changed-client red-before replay')
+PARSER.add_argument('--before-client-binary', type=Path,
+                    help='Authentic 87a11d5 binary for changed-client recovery red-before replay')
 SSH_OPTIONS, remote.ARGS = PARSER.parse_known_args(remote.ARGS)
-if SSH_OPTIONS.before_boundary_probe is not None:
-    SSH_OPTIONS.before_boundary_probe = SSH_OPTIONS.before_boundary_probe.resolve()
+for artifact in ('before_boundary_probe','before_client_probe','before_client_binary'):
+    selected=getattr(SSH_OPTIONS,artifact)
+    if selected is not None: setattr(SSH_OPTIONS,artifact,selected.resolve())
+if (SSH_OPTIONS.before_client_probe is None) != (SSH_OPTIONS.before_client_binary is None):
+    PARSER.error('client replay requires both --before-client-probe and --before-client-binary')
 
 
 class SshRegressionTests(unittest.TestCase):
@@ -118,6 +125,96 @@ class SshRegressionTests(unittest.TestCase):
             with self.subTest(selection=selection):
                 self.shutdown_selected_client_outside_path(selection, True)
 
+    def client_rewrite_shutdown(self, mode, before=False):
+        f=remote.Fixture(); self.addCleanup(f.close)
+        url=f.ssh(); ssh=str(Path(shutil.which('ssh')).resolve())
+        command=shlex.quote(ssh)+f.env.pop('GIT_SSH_COMMAND')[3:]
+        executable=f.root/'selected ssh wrapper'
+        original=('#!/bin/sh\nexec '+command+' "$@"\n').encode()
+        executable.write_bytes(original); executable.chmod(0o700); metadata=executable.stat()
+        f.env['GIT_SSH']=str(executable)
+        marker=f.root/'changed-client-executed'
+        replacement=('#!/bin/sh\n: > '+shlex.quote(str(marker))+'\nexit 0\n').encode()
+        self.assertLess(len(replacement)+2,len(original))
+        replacement+=b'#'+b' '*(len(original)-len(replacement)-2)+b'\n'
+        armed=f.root/'armed'; payload=f.root/'replacement'; payload.write_bytes(replacement)
+        if mode=='spawn-race':
+            library=f.root/'shutdown-race.so'
+            remote.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',
+                        Path(__file__).parent/'support/shutdown_exec_race.c','-ldl','-o',library])
+            f.env.update(LD_PRELOAD=str(library),GIT_ON_REVIEW_CLIENT_PATH=str(executable),
+                         GIT_ON_REVIEW_CLIENT_ARMED=str(armed),GIT_ON_REVIEW_CLIENT_REPLACEMENT=str(payload))
+        probe=SSH_OPTIONS.before_client_probe if before else remote.OPTIONS.probe
+        binary=SSH_OPTIONS.before_client_binary if before else remote.OPTIONS.binary
+        process=subprocess.Popen([str(probe),url,'HEAD'],cwd=f.cwd,env=f.env,stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        f.children.append(process); f.line(process)
+        self.assertFalse(marker.exists(),'fixture changed the client before shutdown')
+        directory=next(f.root.glob('*/ssh-control')).parent
+        control=[ssh,'-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
+        checked=subprocess.run(control,capture_output=True,check=True,timeout=5)
+        descriptor=os.pidfd_open(int(re.search(rb'pid=(\d+)',checked.stderr).group(1)))
+        pin=['git','--git-dir='+str(directory/'remote-repository'),'show-ref','--verify','refs/git-on/probe']
+        try:
+            if mode=='recovery':
+                process.kill(); process.communicate(timeout=10)
+                self.assertEqual(process.returncode,-signal.SIGKILL)
+            if mode=='spawn-race': armed.touch()
+            else:
+                executable.write_bytes(replacement)
+                os.utime(executable,ns=(metadata.st_atime_ns,metadata.st_mtime_ns))
+                current=executable.stat()
+                self.assertEqual((current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns),
+                                 (metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns))
+            (directory/'.lock').touch()
+            (directory/'.state').write_text(json.dumps(dict(format='git-on-temp-v1',id='probe',keep=False,
+                       git_dir=str(directory/'remote-repository'),tree_oid=f.tree,pin_ref='refs/git-on/probe')))
+            if mode=='recovery':
+                result=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
+                status,errors=result.returncode,result.stderr
+            else:
+                process.stdin.write(b'exit\n'); process.stdin.flush()
+                _,errors=process.communicate(timeout=10); status=process.returncode
+            if before:
+                self.assertTrue(marker.exists(),'authentic baseline did not execute the changed client')
+                if mode=='spawn-race': self.assertFalse(armed.exists(),'baseline did not reach the armed spawn race')
+                print(f'RED 87a11d5 client {mode}: changed equal-length client executed after metadata validation',file=sys.stderr)
+            else:
+                self.assertFalse(marker.exists(),'shutdown executed changed client bytes')
+            if mode=='spawn-race' and not before:
+                self.assertEqual(status,0,errors)
+                self.assertTrue(armed.exists(),'shutdown attempted to execute the selected pathname')
+                self.assertEqual(executable.read_bytes(),original)
+                self.assertFalse(directory.exists())
+                self.assertTrue(select.select([descriptor],[],[],2)[0])
+            else:
+                self.assertNotEqual(status,0,errors)
+                if not before: self.assertIn(b'executable changed',errors)
+                self.assertTrue(directory.exists())
+                self.assertFalse(select.select([descriptor],[],[],0)[0])
+                self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+                self.assertEqual(subprocess.run(pin,capture_output=True,timeout=5).returncode,0)
+                executable.write_bytes(original); os.utime(executable,ns=(metadata.st_atime_ns,metadata.st_mtime_ns))
+                cleanup=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
+                self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+                self.assertFalse(directory.exists())
+                self.assertTrue(select.select([descriptor],[],[],2)[0])
+        finally:
+            if process.poll() is None: process.kill(); process.communicate(timeout=10)
+            if not select.select([descriptor],[],[],0)[0]:
+                with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGTERM)
+            os.close(descriptor)
+
+    def test_equal_length_restored_mtime_client_change_retains_live_master_pin_and_run(self):
+        for mode in ('drop','recovery'):
+            with self.subTest(mode=mode):
+                if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown(mode,before=True)
+                self.client_rewrite_shutdown(mode)
+
+    def test_shutdown_never_executes_selected_path_after_validation(self):
+        if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown('spawn-race',before=True)
+        self.client_rewrite_shutdown('spawn-race')
+
     def test_changed_client_and_invalid_recovery_record_preserve_owned_connection(self):
         f = self.f
         url = f.ssh()
@@ -154,12 +251,14 @@ class SshRegressionTests(unittest.TestCase):
                 format='git-on-temp-v1', id='probe', keep=False,
                 git_dir=str(directory / 'remote-repository'), tree_oid=f.tree, pin_ref='refs/git-on/probe')))
             executable.unlink(); backup.rename(executable)
-            for invalid in ('relative', 'unknown-field', 'invalid-type', 'directory', 'symlink', 'in-place'):
+            for invalid in ('relative', 'unknown-field', 'invalid-type', 'missing-digest', 'bad-digest', 'directory', 'symlink', 'in-place'):
                 with self.subTest(record=invalid):
                     changed = json.loads(json.dumps(record))
                     if invalid == 'relative': changed['client']['path'] = list(b'ssh')
                     elif invalid == 'unknown-field': changed['client']['command'] = 'do not execute'
                     elif invalid == 'invalid-type': changed['client']['path'] = 'not byte provenance'
+                    elif invalid == 'missing-digest': changed['client'].pop('content_sha256')
+                    elif invalid == 'bad-digest': changed['client']['content_sha256'][0] ^= 255
                     elif invalid == 'in-place':
                         original = executable.read_bytes()
                         metadata = executable.stat()

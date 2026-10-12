@@ -118,6 +118,14 @@ jobs:
             SSH_BEFORE_ARGUMENT=(--before-boundary-probe /tmp/git-on-review-e427-probe)
             JOB_BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-e427-bin)
           fi
+          CLIENT_BEFORE=87a11d5bbc85b9b8b46a55d054a0e1a6538d5203
+          if git cat-file -e "$CLIENT_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$CLIENT_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-client-before "$CLIENT_BEFORE"
+            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-client-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-client-before-bin
+            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-client-before-probe
+            SSH_BEFORE_ARGUMENT+=(--before-client-binary /tmp/git-on-client-before-bin --before-client-probe /tmp/git-on-client-before-probe)
+          fi
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
           python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on "${BEFORE_ARGUMENT[@]}"
           python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on "${SSH_BEFORE_ARGUMENT[@]}"

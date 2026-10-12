@@ -108,13 +108,24 @@ paths and absent or invalid records are skipped. Uncatchable termination before
 initial advertisement finishes can leave an unrecorded connection; stale cleanup
 skips it rather than guessing ownership. Ordinary completion and cancellation
 close recorded connections.
-Shutdown reuses the selected client even when it is outside `PATH`. The private
-socket record retains only its canonical executable path and file identity, not
-SSH arguments, configuration or credentials. A changed or unavailable client
-causes a visible cleanup failure and retains the socket, pin and run directory.
+Shutdown validates the selected client's canonical path, file identity and
+SHA-256 content fingerprint, including for clients outside `PATH`. Selected
+clients must be readable regular executable files. The private record stores
+those identities, not executable contents, SSH arguments, configuration or
+credentials. Equal-length edits with restored timestamps still fail validation.
+A changed or unavailable client causes a visible cleanup failure and retains
+the socket, pin and run directory. After validation, shutdown sends the OpenSSH
+mux version 4 termination request directly over the owned control socket; it
+never executes the selected client or wrapper again. This removes the pathname
+check/use race without relying on a mutable executable fd or changing wrapper
+interpretation. The exchange has a single one-second deadline and bounded
+packets; unsupported greetings, refusals and stalls retain recovery state.
 Restore that client, or close the identified socket with a trusted OpenSSH client,
 then retry checked cleanup. An already dead owned endpoint can be removed after
-its socket identity is checked again.
+its socket identity is checked again. Older metadata-only client records lack a
+content fingerprint: close their live master with a trusted client before
+retrying cleanup. Legacy records without any selected-client entry can still
+close their identity-checked master through the same direct mux protocol.
 Multiple encrypted identities, separately authenticated jump hosts and
 interactive credential helpers can need extra initial interaction. The one-prompt guarantee covers a directly reachable
 host and one selected identity. Lazy fetches disable Git/OpenSSH terminal/askpass
