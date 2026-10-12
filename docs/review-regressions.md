@@ -39,6 +39,18 @@ optimized profile through full real-FUSE integration, remote lifecycle, SSH,
 stress, million-file demand and packaged-binary gates. Final execution evidence
 belongs to the PR's exact-head checks; local skips are not FUSE evidence.
 
+The first optimized CI run exposed a harness defect with relative artifact
+arguments: the encrypted-key PTY child resolved the probe after changing to its
+fixture directory. Failed exec then reentered the inherited unittest loop,
+producing nested errors instead of an SSH prompt. The same ordering existed in
+the Ctrl-C PTY runner. The encrypted-key test failed with a relative probe before
+the fix; both PTY cases pass afterward. Artifact paths are now resolved once
+before any fixture chdir. The permanent
+`test_fixture_exec_failure_exits_without_reentering_test_runner` reproduced child
+status 1 and a nested unittest traceback before handling failed exec; it now
+requires status 127, a bounded diagnostic and no test-runner reentry. This changes
+the harness, not the released executable or measured size.
+
 ## Follow-up review of the published 8d6c02e checkpoint
 
 Focused tests reproduced three current-head defects before their fixes:

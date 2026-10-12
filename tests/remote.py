@@ -38,11 +38,27 @@ PARSER.add_argument('--million', action='store_true')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
+# Artifact arguments are relative to the invoking harness, not a forked
+# fixture's cwd. Resolve them before any child changes directories.
+for artifact in ('probe','binary','before_binary','before_lifecycle_binary'):
+    selected=getattr(OPTIONS,artifact)
+    if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
 def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
+
+def exec_fixture_child(argv, cwd, env):
+    try:
+        os.chdir(cwd)
+        os.execve(argv[0], argv, env)
+    except BaseException as error:
+        try: os.write(2,('fixture exec failed: '+str(error)[:1024]+'\n').encode())
+        except BaseException: pass
+    # A forked fixture must never return to the inherited unittest loop, even
+    # when chdir/exec or writing its diagnostic fails.
+    os._exit(127)
 
 class Fixture:
     def __init__(self):
@@ -195,6 +211,36 @@ class Fixture:
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.addCleanup(self.f.close)
+    def test_fixture_exec_failure_exits_without_reentering_test_runner(self):
+        f=self.f; pid,fd=pty.fork(); reaped=False; transcript=bytearray()
+        if pid==0:
+            exec_fixture_child([str(f.root/'missing-fixture-executable')],f.cwd,f.env)
+            os._exit(99)
+        try:
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                ready,_,_=select.select([fd],[],[],.05)
+                if ready:
+                    with contextlib.suppress(OSError): transcript.extend(os.read(fd,65536))
+                done,status=os.waitpid(pid,os.WNOHANG)
+                if done:
+                    reaped=True; break
+            self.assertTrue(reaped,'failed fixture exec did not exit')
+            # Exit can race the select timeout; after reap, drain any diagnostic
+            # already queued in the PTY before checking it.
+            while select.select([fd],[],[],0)[0]:
+                try: chunk=os.read(fd,65536)
+                except OSError: break
+                if not chunk: break
+                transcript.extend(chunk)
+            self.assertEqual(os.waitstatus_to_exitcode(status),127,transcript)
+            self.assertIn(b'fixture exec failed:',transcript)
+            self.assertNotIn(b'Traceback',transcript)
+        finally:
+            if not reaped:
+                with contextlib.suppress(ProcessLookupError): os.kill(pid,signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError): os.waitpid(pid,0)
+            os.close(fd)
     def test_review_fixture_binary_stdout_is_preserved(self):
         payload=b' \t\r\n\v\f\x00\xffbinary\x80\x00 \t\r\n\v\f'
         actual=run([sys.executable,'-c','import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())'],input=payload)
@@ -694,8 +740,7 @@ class RemoteTests(unittest.TestCase):
         for key in ('SSH_ASKPASS','SSH_ASKPASS_REQUIRE','DISPLAY'): env.pop(key,None)
         pid,fd=pty.fork()
         if pid==0:
-            os.chdir(f.cwd)
-            os.execve(str(OPTIONS.probe.resolve()),[str(OPTIONS.probe.resolve()),url,'HEAD'],env)
+            exec_fixture_child([str(OPTIONS.probe),url,'HEAD'],f.cwd,env)
         transcript=bytearray()
         reaped=False
         def await_bytes(needle):

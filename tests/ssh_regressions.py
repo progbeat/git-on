@@ -292,9 +292,8 @@ class SshRegressionTests(unittest.TestCase):
         f.env['GIT_SSH_COMMAND'] = str(wrapper)
         pid, descriptor = pty.fork()
         if pid == 0:
-            os.chdir(f.cwd)
-            binary = str(remote.OPTIONS.binary.resolve())
-            os.execve(binary, [binary, 'ssh://fixture@example.invalid/repo', 'HEAD', '--', 'true'], f.env)
+            binary = str(remote.OPTIONS.binary)
+            remote.exec_fixture_child([binary, 'ssh://fixture@example.invalid/repo', 'HEAD', '--', 'true'], f.cwd, f.env)
         reaped = False
         transport_group = None
         output = b''
