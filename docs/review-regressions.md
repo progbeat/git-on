@@ -1,8 +1,400 @@
 # Review regression evidence
 
+## Approved release LTO profile
+
+The release profile now explicitly keeps optimization level 3 and enables fat
+LTO with one codegen unit. No clap feature, panic strategy, source behavior,
+runtime dependency, target CPU or lockfile change accompanies it. Rust crate
+optimization does not imply cross-language LTO of bundled C libgit2.
+
+A controlled comparison of the `d10b756` production source used Rust 1.89.0,
+the same checkout/target paths, four build jobs, the locked offline graph, and
+GNU strip 2.44. The target's release graph was cleaned between builds:
+
+| Measurement | Previous release defaults | Approved profile |
+| --- | ---: | ---: |
+| Unstripped executable | 3,407,608 bytes | 2,783,136 bytes |
+| `strip --strip-all` copy | 2,840,432 bytes | 2,443,096 bytes |
+| Clean build wall time | 50.8 seconds | 61.4 seconds |
+
+The stripped reduction is 397,336 bytes (14.0%); the unstripped reduction is
+18.3%. Stripping is a measurement operation: distribution stripping policy is
+unchanged. Help/version output matched byte-for-byte and shared runtime
+requirements stayed the same. A single paired build shows optimization/link
+cost, with dependency download time excluded and cache/order effects remaining;
+it is not a stable build-time guarantee. The reported largest child-process RSS
+was about 409 MiB in each build, not aggregate concurrent build memory.
+
+Seven interleaved production Snapshot trials each performed 500,000 warmed
+lookups and 500,000 64-byte reads, with identical checksums. Median lookup time
+was 176.1 → 164.7 ms (6.5% lower); read time was 3951.5 → 3989.8 ms (1.0% higher).
+These narrow in-process measurements exclude FUSE/network work and remain
+subject to scheduler/filesystem noise; they establish no general speed guarantee.
+
+The actual Rust 1.89 candidate passed all eight CLI cases, 14 disposable SSH
+regressions and 27 loader/remote cases. Eleven local remote cases were explicitly
+skipped because they require actual FUSE or the separate million-file selector.
+CI now links the locked release executable on Rust 1.89 and exercises the
+optimized profile through full real-FUSE integration, remote lifecycle, SSH,
+stress, million-file demand and packaged-binary gates. Final execution evidence
+belongs to the PR's exact-head checks; local skips are not FUSE evidence.
+
+The first optimized CI run exposed a harness defect with relative artifact
+arguments: the encrypted-key PTY child resolved the probe after changing to its
+fixture directory. Failed exec then reentered the inherited unittest loop,
+producing nested errors instead of an SSH prompt. The same ordering existed in
+the Ctrl-C PTY runner. The encrypted-key test failed with a relative probe before
+the fix; both PTY cases pass afterward. Artifact paths are now resolved once
+before any fixture chdir. The permanent
+`test_fixture_exec_failure_exits_without_reentering_test_runner` reproduced child
+status 1 and a nested unittest traceback before handling failed exec; it now
+requires status 127, a bounded diagnostic and no test-runner reentry. This changes
+the harness, not the released executable or measured size.
+
+## Follow-up review of the published 8d6c02e checkpoint
+
+Focused tests reproduced three current-head defects before their fixes:
+
+| Defect | Permanent regression | Observed before | Required after |
+| --- | --- | --- | --- |
+| Peeled tag helper selected as an exact ref | `RemoteTests.test_review_peeled_tag_advertisement_rows_are_not_selectable_refs` | Both verified and unverified selection succeeded; both native signatures were valid, so verification silently selected the peeled commit | Reject the helper before fetching objects; the real tag remains selectable |
+| Signal consumed before cancellation registration | `tests::review_signal_before_first_native_git_is_not_lost` | Real SIGTERM was observed before the first native Git call, which still started and blocked on a config FIFO; bounded test failed | Cancel before spawning Git; concurrent first operations also cancel and are reaped |
+| Shutdown ignores selected SSH executable outside PATH | `SshRegressionTests.test_selected_ssh_client_outside_path_closes_master_on_drop` and `test_selected_ssh_client_outside_path_closes_master_on_stale_recovery` | All six GIT_SSH_COMMAND, GIT_SSH and core.sshCommand combinations authenticated/read successfully but left the exact master alive after deleting the run directory | Close the owned master with the selected executable during normal and stale cleanup |
+
+These are real native Git and disposable OpenSSH reproductions, not transport
+mocks. A pidfd identifies the exact disposable master. Shutdown now records
+only canonical executable provenance, never the SSH command/configuration or
+credentials. Changed or malformed provenance retains the owned socket and pin
+with a visible failure; restoring it allows recovery. A dead owned endpoint is
+reconciled only after its socket identity is checked again. The older mandatory
+Git dependency finding is stale: the permanent local unverified test passes
+with an empty PATH, including ancestry, subtrees, replacements and 70 tags.
+
+Actual-FUSE tests additionally replay `8d6c02e` for ignored SSH shutdown errors:
+the old runner returns 0 and removes recovery while its master remains alive;
+the fixed runner returns 125, preserves the exact pin/socket, and succeeds after
+the client is restored. CI conditionally builds that authentic ancestor; after
+a squash merge, permanent current-behavior tests still run without history.
+
+SIGKILL lifecycle observations cover blocked native configuration before
+mounting, native helper completion after mounting but before command spawn,
+and mounted command runtime. They distinguish released kernel locks from
+retained pins, private objects, raw writable bytes and live child/master
+processes. No cleanup handler can run under SIGKILL. External fixture cleanup
+stops captured processes before checked stale recovery. The mount cases require
+actual FUSE in CI; local skips are not execution evidence. The native helper
+gate uses CI's unprivileged fusermount route; a privileged direct mount bypasses
+that gate. SIGINT/TERM/HUP/QUIT startup and mounted-runtime cases remain separate.
+
+At this checkpoint binary-size experiments remained outside the PR. The
+subsequently approved release profile is recorded above; clap features remain
+unchanged.
+
+## Remote/verification checkpoint: unfinished and unpublished
+
+The initial uncommitted implementation was independently reviewed in the saved
+Linux runtime. This checkpoint is not ready and has no real-FUSE or CI evidence.
+
+`RemoteTests.test_review_configuration_values_are_applied_once` initially failed
+with two `once` HTTP headers for one configured value, and now passes.
+`test_review_stalled_transport_cancels_and_cleans_descendants` initially timed out
+after two seconds; it now exits by SIGTERM, stops the transport group and cleans
+temporary state. A non-reaping container PID 1 may retain an adopted dead zombie;
+the check distinguishes that state from a live descendant.
+
+Independent review reproduced repeated insteadOf rewriting: native Git failed
+at a nonexistent first rewritten path while the loader reached a second path.
+`test_review_url_rewrites_are_applied_once_for_urls_and_remote_names` passes after
+pinning the once-rewritten URL. Review also showed 300 MiB of abandoned staging
+data survived a successful cache load. The focused staging-recovery and concurrent
+cache-bound tests pass after reconciliation under the writer flock.
+
+`test_review_named_remote_preserves_uploadpack_configuration` initially succeeded
+despite a configured nonexistent upload-pack command, failing its assertion. It
+now passes after preserving the remote name/options with a pinned private URL.
+
+`test_review_connection_loss_cannot_reconnect_with_explicit_proxy_option`
+reproduced a reconnect after owned-master loss before the fix and now passes
+with owned control settings and existing-socket mux proxy mode. The appended SSH
+section records additional short-option and signal regression evidence. Final
+independent re-review and exact-head real-FUSE CI remain publication requirements;
+the new mounted EIO and recovery cases have not run in the local runtime.
+
 Behavior fixes must retain a test of the original failure, not only a new happy
 path. This ledger separates observed red-before/green-after evidence from
 review hardening and tests whose real-mount execution awaits exact-head CI.
+
+## Remote reference ambiguity and literal subtree paths
+
+Independent review of the restored remote feature reproduced two additional
+loader defects. A branch and lightweight tag both named `main` at the same OID
+were accepted as unambiguous because resolution deduplicated by OID. A selected
+`main:deep/.` subtree was also accepted because `Path::components` normalized
+the dot away. Native Git rejects `HEAD:deep/.` and `HEAD:deep//`, while accepting
+`HEAD:`, `HEAD:deep` and `HEAD:deep/` for the corresponding root/directory.
+
+The permanent tests `review_same_oid_branch_and_tag_are_still_ambiguous` and
+`review_subtree_components_are_not_silently_normalized` in
+`tests/remote_source.rs` both failed before their fixes: `unwrap_err()` received
+an `Ok(Snapshot)` for the ambiguous short ref and interior-dot subtree. The
+focused command `cargo test --locked --test remote_source review_` exited 101.
+After retaining reference names during ambiguity checking and selecting literal
+subtree components, `cargo test --locked --test remote_source` passed all five
+tests. These checks use actual filtered upload-pack through disposable `file://`
+repositories and establish loader behavior; they do not claim real FUSE evidence.
+Explicit `refs/heads/main` and `refs/tags/main`, an empty subtree and a single
+trailing directory slash remain accepted.
+
+## Cancellation while a competing writer holds the remote cache
+
+Independent review held the persistent cache's flock in another process, started
+the actual runner against a disposable filtered `file://` server, then sent
+SIGTERM before mounting. The runner stayed alive for more than two seconds and
+only exited after the competing lock was released. The permanent test
+`review_waiting_for_cache_lock_is_cancellable` failed before the fix with
+"runner ignored SIGTERM while another writer held the cache lock" (exit 101).
+
+Cache locking now retries nonblocking flock while checking the same cancellation
+signal used by owned Git subprocesses. The regression retains the competing
+lock throughout cancellation and asserts SIGTERM status and removal of temporary
+run state. After the fix, all six `remote_source` tests passed, including this
+actual-binary startup check. This is local process/cancellation evidence without
+a FUSE mount; cancellation during mounted remote reads still requires CI.
+
+## Native configuration cancellation and owned SSH recovery identity
+
+Independent re-review reproduced a native Git startup stall at the authentic
+feature checkpoint `92377e27e32ac424d688ae8bcf0fbe6be0081c0c`. With
+`GIT_CONFIG_GLOBAL` naming a FIFO without a writer, the runner's direct
+configuration capture ignored SIGTERM for more than two seconds. The permanent
+`SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state`
+failed before the fix. Configuration capture and original Git-directory lookup
+now use the same owned, cancellable subprocess path as transport and verification.
+The regression asserts a real Git config child starts, the runner exits by
+SIGTERM, the child stops and temporary state disappears.
+
+The same review demonstrated that stale cleanup followed `ssh-control` symlinks
+and stopped an unrelated disposable master outside its run. A type-only socket
+guard fixed that case but still accepted a hardlinked/replaced real socket:
+the external master's native `ssh -O check` changed from 0 to 255. The permanent
+`test_stale_cleanup_never_follows_control_socket_symlink` and
+`test_stale_cleanup_never_stops_replaced_or_unrecorded_real_socket` preserve these
+failures, including missing and malformed recovery records. The loader records
+the owned socket's device/inode in a private ephemeral recovery file and keeps
+the same expected identity in memory. Shutdown checks that identity instead of
+trusting a mutable pathname. Normal and kept completion remove the marker;
+validated stale cleanup skips unrecorded or changed sockets.
+
+All ten focused SSH/configuration regressions passed after these fixes, and
+strict metrics clippy passed. Successful child completion also requests native
+operation shutdown before unmount/state locking through a separate flag; this
+does not invent a termination signal. Its real-mounted stalled-read and busy
+recovery evidence is tracked separately and requires exact-head FUSE CI.
+
+## Pending requester signals during a stalled mounted fetch
+
+Actual real-FUSE CI run
+[38164674316](https://github.com/progbeat/git-on/actions/runs/38164674316)
+at `fd7367e01a9413c39eb4bebed4dde2e70e8f0c94` reproduced a remaining shutdown
+deadlock. The controlled server had received the lazy blob request, and SIGTERM
+was delivered to the blocked foreground child group. The runner still failed
+to finish within the permanent test's eight-second bound. The authentic
+before-fix binary reproduced both stalled cases; successful leader completion
+with an escaped reader passed after the separate operation-stop fix. The
+foreground signal case required an additional fix because the child could not
+exit until its blocked FUSE request received a reply. fuser 0.16 dispatches on
+one synchronous session thread and does not implement FUSE_INTERRUPT.
+
+Demand-capable callbacks now bind cancellation to their actual requesting task
+with a held `/proc/TID/status` descriptor. Existing native-operation and cache
+lock polls detect pending unblocked, nonignored INT/TERM/HUP/QUIT signals and
+abort only that request. The typed interruption propagates as EINTR and does
+not latch a remote failure or invent a command signal. Caught handlers can run
+and retry; the child's actual outcome remains authoritative. Native groups get
+a bounded SIGTERM cleanup interval, then SIGKILL before the unreaped leader is
+reaped. An interrupted private fetch removes only a leftover `shallow.lock`.
+
+Review also observed that a real stopped requester with the non-UTF-8 task name
+`\xffrequester` had a pending unblocked SIGTERM, while decoding its entire proc
+status as UTF-8 failed. The initial whole-record UTF-8 decoder would therefore
+miss that cancellation. The retained tests use this real task name; mask parsing
+now reads ASCII signal records from bytes. A constructed long Groups prefix
+checks parsing beyond 16 KiB; the held descriptor is read to completion without
+a length cutoff.
+
+All four focused `git::tests` passed locally: native signal dispositions and
+task identity, mask/encoding/length handling, active operation interruption
+without global cancellation, and termination of SIGTERM-ignoring groups with
+an early exiting leader.
+
+Actual real-FUSE CI run
+[38165994416](https://github.com/progbeat/git-on/actions/runs/38165994416)
+at `d040aae7470f0c6d0774fd8ffaebb07fc20972b7` then passed every permanent
+before/after cancellation replay: foreground SIGTERM, successful completion
+with an escaped reader, Python SIGINT, caught SIGTERM exiting successfully and
+caught SIGTERM retrying the same object after its handler ran. The caught cache
+fault also reproduced the old status 0 and required current status 125. The run
+failed separately when a test helper trimmed a binary OpenPGP export; these
+successful mounted cases do not imply that all checks passed at that head.
+
+## Binary output preserved by the transport fixture helper
+
+The same run `38165994416` failed
+`test_openpgp_invalid_and_unknown_trust_match_native_git` when GPG imported its
+disposable exported public key with an "Invalid packet" error. Review found the
+shared subprocess helper returned `stdout.strip()`, which can truncate valid
+binary signature bytes whose values happen to be whitespace. The production
+loader and native Git verification were not responsible for that corruption.
+
+The permanent `test_review_fixture_binary_stdout_is_preserved` failed before
+the fix: all twelve leading/trailing whitespace bytes around NUL/non-UTF-8 data
+were removed. Independent review reproduced the same loss with a raw 21-byte
+payload reduced to nine bytes. The helper now returns stdout unchanged; OID/ref
+text and the Git executable-directory path normalize text explicitly. The local
+Git blob oracle also compares unchanged bytes, including the final newline.
+GPG cleanup is registered when each disposable home is created, covering failed
+imports as well as normal completion.
+
+Independent review audited every shared-helper caller and the other binary
+oracle paths: signed commit `cat-file` output and smart-HTTP CGI responses already
+retain raw stdout, and the benchmark payload oracle explicitly disables text
+trimming. The permanent binary-helper test passed after the fix. The native
+OpenPGP unknown-trust/invalid-signature comparison and HTTPS cold/warm local
+equivalence tests also passed together (two tests, 1.258 seconds). The complete
+local remote suite then passed all 21 executable cases with eight explicit
+FUSE/million-selector skips, and all ten SSH/configuration regressions passed.
+The next exact-head CI run must still pass every required check.
+
+## Explicit remote refs, byte names and displayed verification options
+
+The follow-up review at `77428030eed52d440b682eb55e9249f63a5d5e8b`
+identified three reproducible selection/presentation defects. Real disposable
+Git upload-pack advertisements confirmed that HEAD and `refs/heads/main` remain
+valid explicit selections even with branches/tags named HEAD or full-ref-looking
+short names such as `refs/heads/refs/heads/main`. Native Git fetched their literal
+targets, while the source probe rejected both as ambiguous. The retained HTTPS
+`test_review_explicit_remote_refs_do_not_expand_as_short_names` reproduced both
+failures against distinct colliding trees before the fix, then pinned and read
+the intended original tree afterward. Short branch/tag ambiguity is preserved.
+
+Native Git also accepted a valid unrelated `refs/heads/unrelated-\xff` byte name
+and advertised it unchanged. The old resolver decoded the whole advertisement
+and rejected valid ASCII HEAD/full-ref selection as "remote refs are not UTF-8".
+`test_review_unrelated_non_utf8_remote_ref_preserves_ascii_selection` retains
+that native byte-ref creation, checks the raw advertisement and reproduces both
+ASCII-selection failures. Resolution now compares line/tab/ref names as bytes
+and decodes an object ID only for a matched record. Both selected trees and blob
+contents passed after the fix.
+
+The parser already accepted `--verify`; the defect was its help line listing
+only keep flags after REV. The existing CLI help acceptance
+assertion failed when required to show `REV [--keep|-k|--verify]`, then passed
+after including verification in the displayed post-REV options. Native verification
+behavior and command-tail parsing remain unchanged. All three focused loader
+regressions and the help acceptance passed after the fixes.
+
+## Local unverified execution retains the 1.0.0 runtime contract
+
+Follow-up review identified that local execution without `--verify` now called
+native Git configuration capture and revision resolution unconditionally.
+Independent comparison of unchanged snapshot modules from authentic master
+`b411e5d00018be66475116c3373eff9e21d2a69e` and feature head
+`77428030eed52d440b682eb55e9249f63a5d5e8b` reproduced the regression using the
+same compiled libgit2/dependencies and disposable repositories. With PATH set
+to an empty directory, master loaded and read `HEAD`, `HEAD:deep`, `HEAD^`, an
+annotated tag and a 70-tag chain; the feature failed each selection with
+"read effective Git configuration: start native Git operation: No such file
+or directory". Replacement refs pointing HEAD at a different tree did not
+redirect the master's exact object reads.
+
+A second comparison with native Git available exposed an additional legacy
+compatibility change: master read the 70-tag chain successfully, while the
+feature failed with "annotated tag chain exceeds 64 objects". The new bound
+belongs to remote/verified resolution, not existing unverified local execution.
+The project's release policy requires a minor release to preserve its documented
+environment contract; the 1.0.0 runtime requirements did not include native Git
+for direct local binary invocation.
+
+Local unverified selection now uses the original libgit2 discovery,
+`revparse_single` and `peel_to_tree` path before the shared exact-tree pin/setup.
+Remote and verified resolution retain native Git and exact commit/tag signature
+binding. Independent replay against the fixed source passed all five former
+failures with no Git on PATH, including replacements and the 70-tag chain.
+The permanent `test_review_local_unverified_loader_needs_no_native_git` covers
+the Git-free loader, selectors, ancestry, replacements and the 70-tag chain,
+and passed independently after the fix. The mounted
+`test_review_local_unverified_run_without_native_git` runs the actual binary
+with only FUSE helpers on PATH and an absolute Python command. Mounted evidence
+still requires the next exact-head CI run. Runtime documentation now scopes the
+native Git dependency to remote execution, verification and the `git on`
+external-command invocation, preserving the additive 1.1.0 release classification.
+
+## Advertised execution syntax puts options after REV
+
+The requested presentation change uses `git on REV [OPTIONS] -- COMMAND [ARGS...]`
+and `git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` throughout help and
+user-facing documentation. Keep and verification examples use that order;
+existing compatibility parsing and its tests are retained without changing
+accepted argv or forwarding behavior.
+
+The revised `CliTests.test_help_and_version` failed against
+`f4a97e9c007d3d9c03dbfe6a7da5da0d271b8833` because help still advertised an
+option slot ahead of the operands. It now requires both canonical forms and
+the instruction that options follow REV. The same acceptance test executes
+`git on -h` through native Git, covering the working help spelling used in the
+touched README/usage examples. Git's long-help dispatch looks for a manpage
+instead of calling the external binary; no manpage or dispatch behavior is
+introduced by this presentation change.
+
+The focused help acceptance and all eight existing CLI parser tests passed
+after the change, including compatibility argument parsing and literal command
+tails. Required real-FUSE and distribution checks still run at the final head.
+
+## Clap CLI migration preserves raw argv and control modes
+
+The CLI uses clap 4.6.7's builder API with `std`, `help`, `usage` and
+`error-context`, and no derive feature. One argument definition produces
+structured help and contextual errors. The advertised form is
+`git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]`; keep/verification
+examples continue to put options after REV. Git's manpage interception is
+separate, so help examples use `git on -h` or direct `git-on --help`.
+
+Execution splits the first literal `--` from raw OS arguments before parsing.
+Clap sees only the prefix. Command names and later arguments, including empty
+strings, non-UTF-8 bytes, help flags and later separators, remain untouched.
+Existing first-token help/version precedence, version bytes, literal cleanup
+paths, repeated flags and accepted compatibility forms are preserved.
+
+Independent comparison against the unchanged parser at
+`9b4f54951a2998ca33dc69aa6db4284aeb7b40db` matched 187,505 cases, including
+interspersed flags, two-operand selection and byte-exact command tails. Review
+also reproduced two native clap defaults that need compatibility guards:
+short-option bundles were accepted, and an Append positional accepted more than
+two total values when flags interrupted its occurrences. Existing exact-token
+regressions and the retained `interspersed_flags_do_not_relax_total_operand_limit`
+plus black-box no-runtime cases require usage status 2 for those inputs. The
+guards derive flag spellings from the argument definition and validate the
+complete operand count. Eleven parser tests and eight CLI acceptance cases
+passed on Rust 1.89, including actual `git on -h` dispatch and raw cleanup paths.
+
+The actual locked graph passed normal/metrics Rust tests (86 each) and strict
+clippy on Rust 1.89. CI also checks every locked target with test metrics at that
+MSRV. The only four added packages are clap/clap_builder 4.6.7, clap_lex 1.1.1
+and anstyle 1.0.14. No additional shared runtime library is introduced.
+
+Release sizes use the same checkout path, Rust 1.89.0, default release profile,
+target directory and strip command (`strip --strip-all`). The before revision
+is the exact pre-clap head above; only the CLI/dependency migration changes the
+after build.
+
+| Measurement | Before | After | Increase |
+| --- | ---: | ---: | ---: |
+| Release binary, unstripped | 2,755,920 bytes | 3,328,000 bytes | 572,080 bytes (20.8%) |
+| Same binary, symbols stripped | 2,307,952 bytes | 2,783,088 bytes | 475,136 bytes (20.6%) |
+
+Independent CLI review found no remaining behavior defect. Actual FUSE,
+performance and installed-distribution evidence still requires all checks at
+the final published head.
 
 ## Reproduced runtime defects
 
@@ -144,8 +536,8 @@ operand-count error although `-c` was encountered as an unknown runner option.
 The test now checks the agreed observable contract; dedicated parser cases
 still verify isolated operand-count and unknown-option failures.
 
-Real-FUSE tests preserve exact binary streams and argv, both keep spellings on
-either side of `REV`, retained subtree writes and pin/unmount cleanup. Both
+Real-FUSE tests preserve exact binary streams and argv, both keep spellings,
+compatibility argument parsing, retained subtree writes and pin/unmount cleanup. Both
 stress and performance launchers use the mandatory separator. Green-after is
 confirmed by [CI run 38151612805](https://github.com/progbeat/git-on/actions/runs/38151612805)
 at `01248000f6b38211f67222caf88e69b5fea8e720`: all 65 real-FUSE/uv integration
@@ -216,3 +608,248 @@ Final package-log inspection confirmed dynamic libz.so.1 and libgcc_s.so.1
 requirements in addition to glibc. The missing-runtime-library probe test failed
 before the diagnostic improvement and passes afterward; the existing executable
 remains unchanged. README and installation guidance now list those runtimes.
+
+
+## SSH control precedence, direct commands and terminal interruption
+
+The mounted shutdown regression replays the authentic feature checkpoint
+`92377e27e32ac424d688ae8bcf0fbe6be0081c0c` in the feature PR's real-FUSE CI.
+`test_review_real_mount_stalled_lazy_fetch_shutdown` holds an actual smart-HTTPS
+blob request while either signalling the foreground command or letting its
+leader exit with an escaped reader. It verifies that the old runner remains
+blocked, then requires bounded completion, correct status and recovery behavior
+from the fixed runner. The escaped reader retains its cwd so busy cleanup must
+preserve the run until it exits. Historical replay is conditional after squash
+merges; the permanent fixed-behavior cases always run with required real FUSE.
+Local loader/protocol results do not establish these mounted cases.
+
+`test_review_real_mount_caught_cache_fault_forces_runner_failure` additionally
+injects a real cache error after mounting, catches its EIO in a successful
+command, and compares the old runner's status 0 with the required fixed status
+125 and diagnostic. Exact-head CI supplies execution evidence for both cases.
+
+Independent review in the fresh runtime reproduced an unused-environment
+precedence defect: native `git ls-remote` succeeded with a valid
+`GIT_SSH_COMMAND` and `GIT_SSH=/does/not/exist`, while the restored source probe
+exited 1 with "GIT_SSH wrappers are unsupported". A PTY running the actual CLI
+with a disposable stalled transport exited 125 on terminal Ctrl-C and printed
+an empty authentication failure, rather than propagating SIGINT. The permanent
+`SshRegressionTests.test_unused_git_ssh_respects_command_and_configuration_precedence`
+and `test_terminal_interrupt_during_authentication_propagates_sigint` preserve
+those same focused reproductions and pass after respecting native command
+precedence and recording a foreground native child's terminating signal.
+
+The previously red
+`RemoteTests.test_review_connection_loss_cannot_reconnect_with_explicit_proxy_option`
+now passes. Owned first-value options, a final short `-S` before Git's host, and
+neutralization of short `-M` prevent user control flags from replacing the owned
+socket/master. Lazy commands use OpenSSH `-O proxy`, which requires that socket,
+instead of a competing ProxyCommand guard. Direct native transport experiments
+showed short `-M` could create a second authenticated connection even with
+`-O proxy`; the permanent short-control and lost-master tests count one
+connection and one encrypted-identity prompt. The caller's one-second
+ControlPersist setting cannot expire the run's owned master. Short `-J none`
+continues to work. A transparent `GIT_SSH` executable with spaces in its path
+preserves argv and the encrypted-identity one-prompt contract.
+
+`python3 tests/ssh_regressions.py` passed all seven focused cases. The existing
+known-red ProxyCommand case, encrypted-identity, unlocked-agent and external
+SIGTERM transport tests also passed (four cases). These are real disposable
+OpenSSH and PTY checks without FUSE. Busy/stale mounted cleanup and the final
+independent review still require completion; no actual mount or exact-head CI
+result is claimed here. Direct shell prefixes/compounds and non-OpenSSH variants
+are diagnosed precisely rather than claimed supported.
+
+## Cache restoration errors must survive a caught filesystem failure
+
+Fresh independent cross-review reproduced a demanded cache error that escaped
+runner failure reporting. `Remote::ensure` returned errors from cache restoration
+before its fetch-only failure latch. With a disposable filtered server, the
+permanent `review_cache_restore_failure_is_latched` inserts an unusable cache
+entry after startup and demands an uncached subtree. Before the fix, the
+operation failed while `Snapshot::remote_failure()` remained `None`; the focused
+Rust regression exited 101 with "demanded cache failure was not latched for
+runner failure". The authentic before-fix feature checkpoint is
+`92377e27e32ac424d688ae8bcf0fbe6be0081c0c`.
+
+`Remote::ensure` now latches repository, ODB, cache and fetch failures alike,
+reports the first failure, and retains that original diagnostic across later
+demands. Removing the unusable cache entry cannot trigger another transport
+attempt after failure. The isolated regression avoids changing the process-wide
+cache environment of concurrent tests. `cargo test --locked --test
+remote_source` passed all seven cases after the fix. This loader regression
+verifies the flag consumed by runner completion; a caught EIO on an actual
+mount still needs the required real-FUSE acceptance run.
+
+## PR 5: SSH boundaries, ignore-acquisition errno, and authentication job control
+
+The authentic before-fix head for these three defects is
+`e42774399dba61d02c80235ef54bf61c3abd9e63`. Its commit/tree/blob hashes and
+ancestry were restored and verified before building an unchanged executable
+and metrics source probe. The permanent CI replay builds that exact revision
+in a detached worktree, copies both artifacts, then rebuilds the reviewed head.
+
+`SshRegressionTests.test_user_control_path_expansion_cannot_hide_master_options_after_connection_loss`
+expands `-oControlPath="$GIT_ON_SSH_CONTROL_PATH"` in the caller's direct SSH
+command before `-M` or `-vvM`, authenticates against a disposable OpenSSH server,
+and explicitly closes the owned master before demanding an uncached blob.
+The unchanged source probe failed the unencrypted cases with a replacement TCP
+connection (observed connection count 4 to 6). Encrypted-key cases additionally
+exposed replacement authentication during initial object acquisition. The fixed
+probe passes all four cases, counts one accepted authentication and, for an
+encrypted key, one ASKPASS invocation, and fails the demand without a new
+connection. The selected command is expanded once; Git's outer argv count
+defines the structural boundary instead of a caller-visible value. The
+`--before-boundary-probe` replay requires the specific lost-master reconnect
+observation, not an arbitrary setup/authentication error.
+
+Independent review also found that a caller-supplied positional SSH host and
+quoted `git-upload-pack REPOSITORY #` command turned the injected control options
+into remote command text. The initial structural-boundary fix still reproduced
+this: after forcibly closing the master, a lazy read succeeded with accepted
+authentications increasing from 1 to 3. The permanent
+`test_user_ssh_host_and_remote_command_cannot_swallow_owned_control_options`
+replays that reconnect on the authentic old head (TCP connections 2 to 4), then
+requires rejection before authentication. The wrapper rejects unconsumed
+positional operands and option terminators, including `-M-`/`--M` that would
+normalize to `--` when removing master flags.
+`test_ssh_tag_option_values_resembling_control_flags_remain_literal` uses an
+OpenSSH `Match tagged` identity to prove `-P -M` and `-P -O` preserve their tag
+values. Both subcases fail on the authentic old probe: the stripped `-M` tag
+causes public-key denial and `-O` is incorrectly rejected as a control command.
+Both pass after recognizing `-P` as an option consuming one operand. This
+additional test explicitly skips only on OpenSSH versions without tag support.
+
+`filesystem::tests::missing_ignore_object_is_io_error_for_file_and_directory_creation`
+removes a real loose `.gitignore` object before policy demand. Inserting only
+this regression into the unchanged before-fix source produces
+`[Err(30), Err(30)]` instead of `[Err(5), Err(5)]`; the corrected source passes
+both file and directory creation checks without inserting namespace or backing
+entries. Policy loader errors now use `snapshot_errno`, retaining EINTR for
+request interruption and EROFS for an ordinary healthy-policy denial.
+`RemoteTests.test_review_real_mount_ignore_acquisition_faults_report_eio`
+requires actual FUSE and repeats create/mkdir with an exact remote ignore-object
+403 response and a real invalid cache entry. `--before-policy-binary` checks
+the original EROFS result and the corrected EIO result, failure diagnostics,
+runner status 125 and absence of a created path.
+`test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
+the ignore request, signals its requesting task, observes exact libc syscall
+EINTR before releasing the server, and verifies its handler and successful
+retry. EINTR preservation is expected on both revisions. These mount-dependent
+tests are explicitly skipped locally without `/dev/fuse`; those skips are not
+mount evidence and the required real-FUSE CI job must supply it.
+
+`tests/native_job_control.py` uses an interactive Bash in a Linux PTY and an
+actual encrypted-key OpenSSH passphrase reader. On the unchanged executable,
+Ctrl-Z stops native Git while git-on remains running, keeps the native group
+foregrounded and never returns the shell prompt; the focused test fails at that
+prompt assertion. The corrected executable passes `fg`, repeated stop/resume,
+`bg` followed by terminal-input stop and `fg`, and Ctrl-C after resume. It checks
+process/session/foreground groups, native unsigned-commit verification failure
+before command execution, final status and process/socket/run cleanup. Native
+Git stops are consumed separately with `waitid(WSTOPPED|WNOHANG)`, leaving exit
+status ownership with `Child::try_wait`. `--before-binary` requires the exact
+old stopped-Git/running-runner/no-prompt state before running the green suite.
+These PTY checks do not need FUSE and do not stand in for real mounts.
+
+The first full CI replay at `7f8483516165ff3a412560843ea2d4a3e2b8eee5`
+([run 38214579320](https://github.com/progbeat/git-on/actions/runs/38214579320))
+exposed an artifact-isolation defect in the replay recipe. Historical worktrees
+overwrote the same top-level `target/release/git-on`; after compiling e427,
+Cargo marked the reviewed head fresh in 0.05 seconds. The four retained
+create/mkdir transport/cache assertions then observed EROFS from that old
+executable instead of the required EIO. All four baseline EROFS observations
+and both old/new EINTR retries were recorded, but this failed run cannot establish
+the fixed behavior. A local Rust 1.89 replay confirmed the same contamination:
+the historical build took 17.24 seconds, the subsequent reviewed build took
+0.05 seconds, and its executable hash still matched the historical artifact
+instead of the separately saved correct executable. Historical artifacts now
+build and copy from a separate
+`/tmp/git-on-historical-target`; the reviewed head keeps its own target directory.
+The same real-FUSE assertions remain required in the replacement exact-head CI
+run. Other green jobs in the failed run do not replace that acceptance.
+
+## Native Git trust policy is the verification acceptance policy
+
+The owner reconciled issue #4 with native Git policy delegation after review
+discussion `r4245809531`. This is acceptance clarification and test hardening,
+not a discovered runtime trust-policy defect. git-on intentionally adds no
+signer allowlist or trust threshold to native Git's result under the caller's
+effective configuration. A source comment beside that decision records why.
+
+A disposable public-only GnuPG keyring on Git 2.52.0 / GnuPG 2.4.7 produced
+`GOODSIG` and `TRUST_UNDEFINED` for an actual signed commit and annotated tag.
+Both `verify-commit` and `verify-tag` returned 0 by default and with
+`gpg.minTrustLevel=undefined`, and 1 with `marginal` or `fully`. This confirms
+the configured threshold applies to those operations; it is not inferred from
+Git's different default for signature verification during merges. See
+[Git's configuration documentation](https://git-scm.com/docs/git-config#Documentation/git-config.txt-gpgminTrustLevel).
+
+`test_openpgp_invalid_and_unknown_trust_match_native_git` now checks native
+default acceptance of both commit and tag while retaining invalid-signature
+rejection. `test_openpgp_configured_trust_rejection_prevents_local_and_remote_execution`
+requires native rejection of the same good, unknown-trust signatures with
+`gpg.minTrustLevel=fully`. All eight local/remote, commit/tag, repository/`git -c`
+cases must return runner status 125 with the native verification-failure
+diagnostic, no sentinel execution and no retained run state. The inherited
+`git -c` case overrides a permissive repository setting and exercises effective
+configuration replay into the private remote repository. These focused cases
+passed against the unchanged `0cbbcf3d9ded0af5d9394e80caaad7e08a188662` runtime;
+no artificial red-before runtime result is claimed.
+
+`test_real_mount_openpgp_default_policy_executes_unknown_trust_commit_and_tag`
+additionally requires actual command execution and expected pinned file bytes
+for both default-accepted object kinds with local and remote operands. It is
+explicitly skipped without required FUSE and must pass in exact-head real-FUSE
+CI. Local source-probe acceptance and rejected-command checks are distinct from
+that mounted evidence.
+
+## SSH shutdown must not execute mutable client contents
+
+Review `r4246168532` found that the client record at authentic head
+`87a11d5bbc85b9b8b46a55d054a0e1a6538d5203` checked only metadata. An equal-length
+in-place rewrite followed by restoration of mtime preserved device, inode,
+length and timestamps, yet normal shutdown executed the changed script. The
+standalone replay observed its harmless sentinel, runner/probe failure and a
+still-live owned master, pin and run. The permanent
+`test_equal_length_restored_mtime_client_change_retains_live_master_pin_and_run`
+reproduces execution of that sentinel on both normal completion and stale
+recovery before requiring the fixed behavior: no sentinel, a visible changed-
+client failure, retained resources and successful cleanup after byte restoration.
+
+`test_shutdown_never_executes_selected_path_after_validation` isolates the
+pathname check/use race with a Linux/glibc `execvp`/`posix_spawn` interposer. The
+fixture arms only after actual SSH startup, writes the same harmless equal-length
+script immediately at the old shutdown spawn boundary and restores mtime.
+The authentic old runtime executed the sentinel. Fixed shutdown does not reach
+the armed spawn, leaves the selected file unchanged and closes the actual master
+without running any selected-client bytes. Setup errors are not accepted as red
+evidence. CI builds the authentic old executable and probe in the separate
+historical target, copies both and replays all three observed failures.
+
+Client contents now have a streaming SHA-256 fingerprint. File metadata and
+contents are checked from one no-follow fd; this detects restored-mtime edits
+but is deliberately not followed by executable-path or mutable-fd execution.
+Instead, the runner sends OpenSSH's documented mux-v4 termination request over
+the identity-checked owned Unix socket. This avoids script-interpreter/fd
+execution pitfalls and introduces no shutdown child, new authentication or TCP
+connection. Clients must be readable executable files. An older metadata-only
+client record cannot validate contents, so a live master must first be closed
+with a trusted client; its already-dead owned endpoint remains cleanable.
+
+The permanent outside-PATH ELF and transparent-script tests still close real
+masters on completion/recovery. Invalid or missing fingerprints retain state.
+`mux_shutdown_rejects_invalid_greetings_before_termination`,
+`mux_shutdown_rejects_nonmatching_acknowledgements` and
+`mux_shutdown_deadline_cannot_be_extended_by_partial_packets` guard packet bounds,
+protocol/reply checks and the shared deadline. Socket-pair results are not real
+SSH or mount evidence; real-FUSE, full lifecycle and unchanged earlier review
+regressions still require successful exact-head CI.
+
+During parallel local validation the existing stalled-transport test once read
+a live `/proc` state immediately after the Git leader was reaped; its isolated
+replay passed. Group SIGKILL delivery to another member is asynchronous. That
+test now opens a pidfd before cancellation and requires its bounded death,
+without confusing an outstanding kill with a survivor or relying on container
+PID 1 to reap zombies. This is an observed test-timing correction, not a claimed
+new transport cancellation defect or a fabricated deterministic red schedule.

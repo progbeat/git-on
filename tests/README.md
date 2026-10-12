@@ -26,6 +26,58 @@ tests as skipped; this is not evidence that the filesystem works. `--uv` enables
 the dependency integration tests and must not be omitted when claiming complete
 coverage.
 
+## Remote transport and native verification
+
+`tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
+fixture certificates, identities, agents and signing keys. Native Git is the
+verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG;
+no user key or trust store is read or changed by these tests.
+
+```console
+cargo build --locked --features test-metrics --example source-probe --bin git-on
+python3 tests/remote.py
+python3 tests/ssh_regressions.py
+python3 tests/native_job_control.py
+python3 tests/remote.py --require-fuse
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+```
+
+The source probe exercises the production loader without a mount and records
+received OIDs, requested objects, request/response bytes and loader metrics.
+Tests distinguish listing from stat, repeated reads and large ranges; compare
+cold and warm caches; use distinct trees for moving-ref/replacement checks; and
+cover native formats/trust, tag chains, inherited Git settings and server faults.
+OpenPGP cases use a disposable public-only keyring to compare unknown-trust
+commit/tag acceptance with native Git's default and rejection with configured
+`gpg.minTrustLevel=fully`. Repository policy and inherited `git -c` must reject
+before executing a sentinel command for local and remote inputs; required FUSE
+checks also verify the accepted default actually executes against pinned bytes.
+SSH tests count ASKPASS and interactive PTY prompts and authenticated connections.
+The native job-control suite runs an actual interactive Bash in a Linux PTY,
+stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,
+checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
+It fails unsigned native verification after authentication and needs no mount.
+The real-FUSE job additionally replays the authentic `e427743` executable and
+source probe for the SSH argument-boundary, ignore-acquisition errno, and native
+job-control regressions before requiring the fixed behavior.
+SSH shutdown regressions additionally replay `87a11d5`: equal-length client
+rewrites with restored mtime must never execute a sentinel script and must
+retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
+changes the pathname only after file validation, demonstrating the old race;
+fixed shutdown must not reach that spawn at all. Existing outside-PATH ELF and
+transparent-wrapper checks continue to require actual OpenSSH master closure.
+Rust mux tests bound malformed packets, reply identity and a trickling peer's
+total deadline; these socket-pair checks are distinct from actual SSH and FUSE.
+The million fixture has exactly one million distinct seven-byte blobs at six
+digit paths; preparation verifies every leaf before measuring remote demand.
+
+The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
+mounts for remote writes, keep, cancellation, busy/stale recovery, external
+`git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
+FUSE for the remote million cold no-op/read and warm read. A loader success or
+an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
+availability is not required by these deterministic gates.
+
 ## Complete FUSE callback inventory
 
 The auditable [callback matrix](../docs/fuse-coverage.md) covers every method of
@@ -77,6 +129,11 @@ claim the mounted command is sandboxed from the host filesystem.
 
 ## Lazy access and lifecycle
 
+Required CI exercises the release profile through the full real-FUSE integration,
+remote lifecycle and differential stress suites, as well as the packaged binary
+and performance job. The Rust 1.89 gate also links the locked release executable;
+debug Rust/CLI/transport suites remain separate checks.
+
 The ordinary integration binary has no metrics channel. Black-box laziness
 regressions use unreachable or deliberately unavailable sibling objects to check
 that unrelated content is not visited, while separate workloads exercise lookup,
@@ -97,8 +154,8 @@ raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
 binary standard streams and inherited stdin; exit/signal return codes; direct
 terminal detection, PTY foreground ownership and stop/continue handling; missing
 executables; forwarded signals; default temporary-layer removal; `TMPDIR`
-selection; mandatory command separators; `--keep`/`-k` on either side of the
-revision; exact argument forwarding after the first separator; rejected old direct
+selection; mandatory command separators; `--keep`/`-k` and compatibility argument
+parsing; exact argument forwarding after the first separator; rejected old direct
 command syntax, extra operands and unknown options without runtime state; retention
 after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
@@ -106,6 +163,18 @@ active or deliberately retained state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
 runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
 retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.
+
+Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
+during startup transport and after the mounted child starts. SIGKILL observations
+kill only the runner first: assert the exact mount remains in `mountinfo`, fresh
+directory access returns `ENOTCONN`, the child group and SSH master survive,
+private files and the exact pin remain, and run/cache flocks are available.
+External fixture cleanup stops the owned child before checked stale recovery;
+recovery must remove the mount and private state and close the recorded master.
+A native fusermount wrapper holds helper completion after the actual mount to
+exercise SIGKILL before the child can start. Each scenario uses private fixtures,
+bounded waits and external cleanup. These are crash-recovery observations, not a
+promise that cleanup handlers execute under SIGKILL or that `auto_unmount` is set.
 
 ## Randomized filesystem differential stress
 

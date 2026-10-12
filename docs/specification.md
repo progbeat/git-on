@@ -5,8 +5,10 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on [--keep|-k] <tree-ish> [--keep|-k] -- <command> [args...]` resolves the selected Git tree once and
-  launches the given argv from its root without introducing a shell.
+- `git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]` selects a local
+  revision, or a source and revision when REPOSITORY is supplied.
+  Resolve the selected Git tree once and launch the given argv from
+  its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.
 - The command remains an ordinary program: standard streams, filesystem errors,
@@ -17,29 +19,33 @@ separate from that contract; a requirement is not a claim of a passing test.
   Caller-provided variables with such names remain ordinarily inherited.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
-  accept exactly one nonempty positional operand for the local tree-ish and
-  exact `--keep`/`-k` options. Options may appear on either side of the revision,
-  repeat, and combine idempotently. A token beginning with byte `-` that is not
+  accept one nonempty operand for the local revision or two for repository and
+  revision, then exact `--keep`/`-k`/`--verify` options after REV. Options may
+  repeat and combine idempotently. A token beginning with byte `-` that is not
   one of those options is an unknown option. Do not split or normalize the
   revision: `HEAD:path/to/subtree` is one unchanged operand.
 - Everything after the first separator is literal command argv, including a
   command name beginning with `-`, unknown options, `--keep`, `-k`, and further
   `--` tokens. Empty later arguments and non-UTF-8 bytes are preserved. No shell
   or string re-tokenization is introduced.
-- A missing separator, missing/empty revision, extra positional operand,
+- A missing separator, missing/empty revision, more than two positional operands,
   unknown runner option, or missing/empty command name returns usage status 2
   with a clear diagnostic before Git resolution or runtime-state creation.
   First-token `--help`/`-h`, `--version` and `--cleanup` retain their separate
   existing handling and do not require a child-command separator. These
   spellings after the separator are ordinary command argv.
 - Migration from 0.1.x requires inserting the separator before every command:
-  `git on REV command args` becomes `git on REV -- command args`, and
-  `git on --keep REV command` becomes `git on --keep REV -- command`.
+  `git on REV command args` becomes `git on REV -- command args`.
+  To retain generated files, use `git on REV --keep -- command args`.
   Select a revision whose name starts with `-` using its full object ID.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
 ## Filesystem policy
+
+Remote demand, persistent cache lifetime, native verification, authentication
+limits and acceptance requirements are normative in [the remote guide](remote.md).
+The same FUSE and ignored-write contract below applies to local and remote runs.
 
 - Entries present in the selected tree are immutable. An ignore match does not
   permit changing, replacing, removing, renaming, or shadowing tracked entries.
@@ -64,7 +70,8 @@ separate from that contract; a requirement is not a claim of a passing test.
   this cleanup scope.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, and releasing the exact Git pin; it is not a run manifest or log.
+  locking, releasing the exact Git pin and identifying the owned SSH socket;
+  it is not a run manifest or log.
   `git on --cleanup <temporary-directory>` must refuse active or deliberately
   retained directories, avoid unrelated mounts and changed pin targets, and
   never terminate processes based on stale PIDs.

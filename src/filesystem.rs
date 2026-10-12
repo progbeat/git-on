@@ -25,6 +25,13 @@ type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
+fn snapshot_errno(error: anyhow::Error) -> i32 {
+    if crate::git::is_request_interruption(&error) {
+        libc::EINTR
+    } else {
+        libc::EIO
+    }
+}
 
 struct Node {
     attr: FileAttr,
@@ -335,7 +342,7 @@ impl Overlay {
         let entry = self
             ._snapshot
             .entry(path)
-            .map_err(|_| libc::EIO)?
+            .map_err(snapshot_errno)?
             .ok_or(libc::ENOENT)?;
         let ino = if let Some(ino) = self.paths.get(path) {
             *ino
@@ -417,7 +424,7 @@ impl Overlay {
             (parent, FileType::Directory, OsString::from("..")),
         ];
         if self.node(ino)?.immutable {
-            for (name, entry) in self._snapshot.children(&path).map_err(|_| libc::EIO)? {
+            for (name, entry) in self._snapshot.children(&path).map_err(snapshot_errno)? {
                 let kind = match entry.kind {
                     EntryKind::Directory => FileType::Directory,
                     EntryKind::Symlink => FileType::Symlink,
@@ -546,7 +553,11 @@ impl Overlay {
         }
     }
     fn allowed(&self, p: &Path, kind: FileType) -> FsResult<()> {
-        if self.policy.allows(p, kind == FileType::Directory) {
+        if self
+            .policy
+            .check(p, kind == FileType::Directory)
+            .map_err(snapshot_errno)?
+        {
             Ok(())
         } else {
             Err(libc::EROFS)
@@ -554,7 +565,8 @@ impl Overlay {
     }
     fn fresh(&self, parent: u64, name: &OsStr, kind: FileType) -> FsResult<PathBuf> {
         let p = self.child(parent, name)?;
-        if self.paths.contains_key(&p) || self._snapshot.entry(&p).map_err(|_| libc::EIO)?.is_some()
+        if self.paths.contains_key(&p)
+            || self._snapshot.entry(&p).map_err(snapshot_errno)?.is_some()
         {
             return Err(libc::EEXIST);
         }
@@ -754,10 +766,10 @@ impl Overlay {
                 return self
                     ._snapshot
                     .read(oid, offset as u64, count as u32)
-                    .map_err(|_| libc::EIO);
+                    .map_err(snapshot_errno);
             }
             if self.handles[&fh].reader.is_none() {
-                let reader = self._snapshot.open(oid).map_err(|_| libc::EIO)?;
+                let reader = self._snapshot.open(oid).map_err(snapshot_errno)?;
                 self.handles.get_mut(&fh).ok_or(libc::EBADF)?.reader = Some(reader);
             }
             self.handles[&fh]
@@ -765,7 +777,7 @@ impl Overlay {
                 .as_ref()
                 .ok_or(libc::EIO)?
                 .read(offset as u64, count as u32)
-                .map_err(|_| libc::EIO)
+                .map_err(snapshot_errno)
         }
     }
     fn write_data(
@@ -997,7 +1009,8 @@ impl Drop for Overlay {
 }
 
 impl Filesystem for Overlay {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         let result = (|| {
             let p = self.child(parent, name)?;
             let ino = self.ensure(&p)?;
@@ -1089,14 +1102,15 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         let result = (|| {
             let n = self.node(ino)?;
             if n.attr.kind != FileType::Symlink {
                 return Err(libc::EINVAL);
             }
             if let Some(oid) = n.oid {
-                self._snapshot.read_link(oid).map_err(|_| libc::EIO)
+                self._snapshot.read_link(oid).map_err(snapshot_errno)
             } else {
                 Ok(n.bytes.clone())
             }
@@ -1116,6 +1130,7 @@ impl Filesystem for Overlay {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         if mode & libc::S_IFMT != 0 && mode & libc::S_IFMT != libc::S_IFREG {
             reply.error(libc::EPERM);
             return;
@@ -1145,6 +1160,7 @@ impl Filesystem for Overlay {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.make(
             parent,
             name,
@@ -1161,13 +1177,15 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.remove(parent, name, false) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.remove(parent, name, true) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1181,6 +1199,7 @@ impl Filesystem for Overlay {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         if target.as_os_str().as_bytes().contains(&0) {
             reply.error(libc::EINVAL);
             return;
@@ -1203,7 +1222,7 @@ impl Filesystem for Overlay {
     }
     fn rename(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -1211,6 +1230,7 @@ impl Filesystem for Overlay {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.rename_path(parent, name, newparent, newname, flags) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1218,12 +1238,13 @@ impl Filesystem for Overlay {
     }
     fn link(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         newparent: u64,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.hardlink(ino, newparent, newname) {
             Ok(()) => {
                 self.nodes.get_mut(&ino).unwrap().lookups += 1;
@@ -1250,6 +1271,7 @@ impl Filesystem for Overlay {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         let result = (|| {
             let ino = self.make(
                 parent,
@@ -1273,7 +1295,7 @@ impl Filesystem for Overlay {
     }
     fn read(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -1282,6 +1304,7 @@ impl Filesystem for Overlay {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         match self.read_data(ino, fh, offset, size) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
@@ -1353,7 +1376,8 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn opendir(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         let result = self.open_directory(ino, flags);
         match result {
             Ok(fh) => reply.opened(fh, 0),
@@ -1470,6 +1494,35 @@ mod tests {
     use super::*;
     use git2::Repository;
     use tempfile::TempDir;
+
+    #[test]
+    fn missing_ignore_object_is_io_error_for_file_and_directory_creation() {
+        let (temp, mut overlay) = fixture();
+        let repo = Repository::open(temp.path().join("repo")).unwrap();
+        let tree = repo.find_tree(overlay._snapshot.tree_oid).unwrap();
+        let ignore = tree.get_name(".gitignore").unwrap().id().to_string();
+        // Remove the actual loose object before policy demand, without replacing
+        // the object loader or injecting an artificial policy error.
+        fs::remove_file(
+            repo.path()
+                .join("objects")
+                .join(&ignore[..2])
+                .join(&ignore[2..]),
+        )
+        .unwrap();
+        let outcomes = [
+            ("new.tmp", FileType::RegularFile),
+            ("cache", FileType::Directory),
+        ]
+        .map(|(name, kind)| {
+            let outcome = overlay.make(1, OsStr::new(name), kind, 0o700, 0, 0, Vec::new());
+            assert!(!overlay.paths.contains_key(Path::new(name)));
+            outcome
+        });
+        assert_eq!(outcomes, [Err(libc::EIO), Err(libc::EIO)]);
+        assert_eq!(overlay.nodes.len(), 1);
+        assert_eq!(fs::read_dir(&overlay.backing).unwrap().count(), 0);
+    }
 
     fn fixture() -> (TempDir, Overlay) {
         let temp = tempfile::tempdir().unwrap();

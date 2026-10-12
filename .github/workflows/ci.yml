@@ -20,6 +20,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
+      - name: Install native Git and disposable transport fixture dependencies
+        run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes git openssh-server openssl gnupg
+          git --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -28,9 +34,20 @@ jobs:
       - run: python3 tests/check_fuse_coverage.py
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
       - run: cargo test --locked --all-targets --features test-metrics
+      - name: Check the locked graph at Rust 1.89 MSRV
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 check --locked --all-targets --features test-metrics
+          cargo +1.89.0 build --release --locked --bin git-on
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests
+      - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
+        run: |
+          cargo build --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py
+          python3 tests/ssh_regressions.py
+          python3 tests/native_job_control.py
 
   real-fuse:
     # This job intentionally fails if the runner cannot open /dev/fuse or mount.
@@ -40,11 +57,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Install FUSE and pinned uv
         run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes fuse3
+          sudo apt-get install --yes fuse3 git openssh-server openssl gnupg
           python3 -m pip install --user 'uv==0.8.22'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Require a usable FUSE device
@@ -60,13 +79,61 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - run: cargo build --locked
+      - run: cargo build --release --locked
       - name: Real mount, adversarial operations, process lifecycle, and uv
-        run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+        run: python3 tests/integration.py --binary target/release/git-on --require-fuse --uv
+      - name: Remote mounts, native git -c verification, writes and transport faults
+        run: |
+          BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
+          BEFORE_ARGUMENT=()
+          # Historical worktrees must never overwrite the reviewed binaries.
+          # Cargo can consider HEAD fresh after another worktree writes the
+          # same top-level executable in a shared target directory.
+          BEFORE_TARGET=/tmp/git-on-historical-target
+          # Replay the authentic pre-fix feature revision while reviewing this
+          # branch. Later squash merges retain the permanent green tests even
+          # when that intermediate commit is no longer in master's ancestry.
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-review-before "$BEFORE"
+            cargo build --release --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-before-bin
+            BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
+          fi
+          LIFECYCLE_BEFORE=8d6c02ede7a6f5d377e2c47c5b2177ee46a477eb
+          if git cat-file -e "$LIFECYCLE_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$LIFECYCLE_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-lifecycle-before "$LIFECYCLE_BEFORE"
+            cargo build --release --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-lifecycle-before-bin
+            BEFORE_ARGUMENT+=(--before-lifecycle-binary /tmp/git-on-lifecycle-before-bin)
+          fi
+          REVIEW_BEFORE=e42774399dba61d02c80235ef54bf61c3abd9e63
+          SSH_BEFORE_ARGUMENT=()
+          JOB_BEFORE_ARGUMENT=()
+          if git cat-file -e "$REVIEW_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$REVIEW_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-review-e427 "$REVIEW_BEFORE"
+            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-review-e427/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-e427-bin
+            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-review-e427-probe
+            BEFORE_ARGUMENT+=(--before-policy-binary /tmp/git-on-review-e427-bin)
+            SSH_BEFORE_ARGUMENT=(--before-boundary-probe /tmp/git-on-review-e427-probe)
+            JOB_BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-e427-bin)
+          fi
+          CLIENT_BEFORE=87a11d5bbc85b9b8b46a55d054a0e1a6538d5203
+          if git cat-file -e "$CLIENT_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$CLIENT_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-client-before "$CLIENT_BEFORE"
+            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-client-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-client-before-bin
+            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-client-before-probe
+            SSH_BEFORE_ARGUMENT+=(--before-client-binary /tmp/git-on-client-before-bin --before-client-probe /tmp/git-on-client-before-probe)
+          fi
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on "${BEFORE_ARGUMENT[@]}"
+          python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on "${SSH_BEFORE_ARGUMENT[@]}"
+          python3 tests/native_job_control.py --binary target/release/git-on "${JOB_BEFORE_ARGUMENT[@]}"
 
       - name: Seeded bounded filesystem differential stress
         run: >-
-          python3 tests/stress.py --binary target/debug/git-on --require-fuse
+          python3 tests/stress.py --binary target/release/git-on --require-fuse
           --seed 0x5eed --seed 0xc0ffee --operations 400 --max-nodes 64
           --max-file-bytes 65536 --timeout 90 --trace-dir stress-artifacts
       - name: Retain reproducible stress traces
@@ -88,15 +155,21 @@ jobs:
           persist-credentials: false
       - name: Install FUSE
         run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes fuse3
+          sudo apt-get install --yes fuse3 git openssl
           test -c /dev/fuse
           command -v fusermount3
       - name: Build optimized runner
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          cargo build --release --locked --features test-metrics
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+      - name: Remote million distinct-file cold and warm fetch gates through real FUSE
+        run: >-
+          python3 tests/remote.py --require-fuse --million
+          --probe target/release/examples/source-probe --binary target/release/git-on
+          RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
       - name: Check benchmark harness
         run: python3 tests/benchmark.py self-test
       - name: Prepare the million-file fixture outside timed runs

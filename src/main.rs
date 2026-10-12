@@ -340,6 +340,7 @@ fn cleanup(dir: &Path) -> Result<()> {
         clean_unmount(&dir.join("mount"))?;
     }
     ensure_unmounted(&dir)?;
+    git_on::remote::stop_connection(&dir.join("ssh-control"))?;
     release_pin(&state)?;
     fs::remove_dir_all(dir)?;
     Ok(())
@@ -400,7 +401,17 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
     }
     Ok(())
 }
-fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus> {
+fn execute(
+    tree: OsString,
+    args: Vec<OsString>,
+    keep: bool,
+    source: Option<OsString>,
+    verify: bool,
+) -> Result<ExitStatus> {
+    let mut signals = subscribe_signals()?;
+    if let Some(signal) = git_on::git::cancelled_signal() {
+        return Ok(ExitStatus::from_raw(signal));
+    }
     let temp = tempfile::Builder::new()
         .prefix("git-on-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -429,17 +440,12 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
             }
         }
         save(&dir, &state)?;
-        let mut signals = Signals::new([
-            SIGINT,
-            SIGTERM,
-            SIGHUP,
-            SIGQUIT,
-            libc::SIGCHLD,
-            libc::SIGCONT,
-        ])?;
-        let snapshot = Snapshot::load_with_pin_record(
+        let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
+            source.as_deref(),
             &tree,
+            verify,
+            &dir,
             &id,
             |git_dir, pin, oid| {
                 state.git_dir = Some(git_dir.into());
@@ -521,6 +527,14 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
         let outcome = supervise(&mut child, &mut signals, &terminal);
+        if let Ok(status) = &outcome {
+            if let Some(signal) = status.signal() {
+                git_on::git::cancel_by_signal(signal);
+            }
+        }
+        // Escaped or terminated readers can leave a FUSE callback inside a
+        // native fetch. Stop it before unmounting or inspecting snapshot state.
+        git_on::git::stop_operations();
         if outcome.is_err() {
             kill_group(pid, libc::SIGKILL);
             let _ = child.wait();
@@ -533,17 +547,38 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })();
+    // Also cover errors before the child could start. State inspection below
+    // must never wait behind an owned operation that the run no longer needs.
+    git_on::git::stop_operations();
+    let mut transport_cleanup_failure = None;
     if let Some(snapshot) = observed.take() {
+        if let Some(failure) = snapshot.remote_failure() {
+            result = Err(anyhow::anyhow!(
+                "remote object loading failed; execution incomplete: {failure}"
+            ));
+        }
         #[cfg(feature = "test-metrics")]
         if let Err(e) = report_metrics(&snapshot) {
             result = Err(e);
         }
-        // On a busy mount retain the pin for explicit stale recovery.
-        if mount_is_ours(&dir, &id).unwrap_or(true) {
+        if let Err(error) = snapshot.stop_remote_transport() {
+            transport_cleanup_failure = Some(error);
+        }
+        // A busy mount or failed owned transport shutdown keeps the pin and
+        // recovery identity available for explicit stale cleanup.
+        if transport_cleanup_failure.is_some() || mount_is_ours(&dir, &id).unwrap_or(true) {
             std::mem::forget(snapshot);
         }
     }
     let cleanup_result = (|| -> Result<()> {
+        if let Some(error) = transport_cleanup_failure {
+            return Err(error).with_context(|| {
+                format!(
+                    "owned SSH shutdown failed; recovery state retained at {}",
+                    dir.display()
+                )
+            });
+        }
         if mount_is_ours(&dir, &id)? {
             bail!(
                 "temporary mount remains at {}; use --cleanup after stopping its users",
@@ -551,7 +586,17 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
             );
         }
         ensure_unmounted(&dir)?;
+        // Also cover errors before an observed Snapshot could be returned.
+        git_on::remote::stop_connection(&dir.join("ssh-control"))?;
         release_pin(&state)?;
+        if dir.join("remote-repository").exists() {
+            fs::remove_dir_all(dir.join("remote-repository"))?;
+        }
+        match fs::remove_file(dir.join(git_on::remote::SSH_CONTROL_OWNER_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove SSH recovery identity"),
+        }
         if keep {
             if let Some(export) = kept_export.as_ref() {
                 match export
@@ -590,31 +635,35 @@ fn execute(tree: OsString, args: Vec<OsString>, keep: bool) -> Result<ExitStatus
     }
     result
 }
+fn subscribe_signals() -> std::io::Result<Signals> {
+    git_on::git::initialize_cancellation()?;
+    Signals::new([
+        SIGINT,
+        SIGTERM,
+        SIGHUP,
+        SIGQUIT,
+        libc::SIGCHLD,
+        libc::SIGCONT,
+    ])
+}
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
-        if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\nRunner options may appear on either side of the single local revision.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
-            return Ok(ExitStatus::from_raw(0));
-        }
-        if args.first().is_some_and(|a| a == "--version") {
-            println!("git-on {}", env!("CARGO_PKG_VERSION"));
-            return Ok(ExitStatus::from_raw(0));
-        }
-        if args.first().is_some_and(|a| a == "--cleanup") {
-            if args.len() != 2 {
-                eprintln!("usage: git on --cleanup <temporary-directory>");
-                return Ok(ExitStatus::from_raw(2 << 8));
+        match cli::parse(&args) {
+            Ok(cli::Invocation::Cleanup(directory)) => {
+                cleanup(Path::new(&directory))?;
+                Ok(ExitStatus::from_raw(0))
             }
-            cleanup(Path::new(&args[1]))?;
-            return Ok(ExitStatus::from_raw(0));
-        }
-        match cli::parse_run_args(&args) {
-            Ok(run) => execute(run.tree.clone(), run.command.to_vec(), run.keep),
+            Ok(cli::Invocation::Run(run)) => execute(
+                run.tree,
+                run.command.to_vec(),
+                run.keep,
+                run.repository,
+                run.verify,
+            ),
             Err(error) => {
-                eprintln!("git-on: {error}");
-                eprintln!("usage: {}", cli::RUN_USAGE);
-                Ok(ExitStatus::from_raw(2 << 8))
+                error.print()?;
+                Ok(ExitStatus::from_raw(error.exit_code() << 8))
             }
         }
     })();
@@ -630,6 +679,13 @@ fn main() {
             std::process::exit(status.code().unwrap_or(125));
         }
         Err(e) => {
+            if let Some(signal) = git_on::git::cancelled_signal() {
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+                std::process::exit(128 + signal);
+            }
             eprintln!("git-on: {e:#}");
             std::process::exit(125);
         }
@@ -642,6 +698,154 @@ mod tests {
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn review_signal_before_first_native_git_is_not_lost() {
+        const CHILD_FIFO: &str = "GIT_ON_TEST_EARLY_SIGNAL_FIFO";
+        const CHILD_MODE: &str = "GIT_ON_TEST_EARLY_SIGNAL_MODE";
+        if let Some(fifo) = env::var_os(CHILD_FIFO) {
+            let directory = Path::new(&fifo).parent().unwrap();
+            if env::var_os(CHILD_MODE).is_some_and(|mode| mode == "concurrent") {
+                let barrier = std::sync::Barrier::new(4);
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            let error = git_on::git::Git::capture(directory).unwrap_err();
+                            assert!(format!("{error:#}").contains("cancelled by signal"));
+                        });
+                    }
+                });
+                eprintln!("four concurrent first native Git operations cancelled");
+            } else {
+                let mut signals = subscribe_signals().unwrap();
+                assert_eq!(unsafe { libc::raise(SIGTERM) }, 0);
+                assert!(signals.pending().any(|signal| signal == SIGTERM));
+                eprintln!("real SIGTERM observed before first native Git operation");
+                let error = git_on::git::Git::capture(directory).unwrap_err();
+                assert!(format!("{error:#}").contains("cancelled by signal"));
+            }
+            assert_eq!(git_on::git::cancelled_signal(), Some(SIGTERM));
+            return;
+        }
+
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+        for mode in ["early", "concurrent"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let fifo = temporary.path().join("config-fifo");
+            let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+            let native_git = env::split_paths(&env::var_os("PATH").unwrap())
+                .map(|directory| directory.join("git"))
+                .find(|candidate| {
+                    fs::metadata(candidate).is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                })
+                .map(|path| fs::canonicalize(path).unwrap())
+                .expect("real native Git required for the cancellation regression");
+            let programs = temporary.path().join("programs");
+            fs::create_dir(&programs).unwrap();
+            let started = temporary.path().join("native-started");
+            let wrapper = programs.join("git");
+            let quoted_git = native_git.to_string_lossy().replace('\'', "'\\''");
+            fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\necho $$ >> '{}'\nexec '{}' \"$@\"\n",
+                    started.display(),
+                    quoted_git
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+            let stdout = tempfile::tempfile().unwrap();
+            let stderr = tempfile::tempfile().unwrap();
+            let mut child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::review_signal_before_first_native_git_is_not_lost",
+                    "--nocapture",
+                ])
+                .env(CHILD_FIFO, &fifo)
+                .env(CHILD_MODE, mode)
+                .env("PATH", programs)
+                .env("GIT_CONFIG_GLOBAL", &fifo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .stdout(stdout.try_clone().unwrap())
+                .stderr(stderr.try_clone().unwrap())
+                .spawn()
+                .unwrap();
+            let mut deadline =
+                Instant::now() + Duration::from_secs(if mode == "early" { 2 } else { 5 });
+            let mut native_pids = Vec::new();
+            let mut delivered = false;
+            let mut native_observed = false;
+            let status = loop {
+                if let Ok(records) = fs::read_to_string(&started) {
+                    native_pids = records
+                        .lines()
+                        .filter_map(|pid| pid.parse::<u32>().ok())
+                        .collect();
+                }
+                let actual_git = !native_pids.is_empty()
+                    && native_pids.iter().all(|pid| {
+                        fs::read_link(format!("/proc/{pid}/exe")).ok().as_ref() == Some(&native_git)
+                            && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|args| {
+                                args.split(|byte| *byte == 0).nth(1) == Some(b"config".as_slice())
+                            })
+                    });
+                native_observed |= actual_git;
+                if mode == "concurrent" && native_pids.len() == 4 && actual_git && !delivered {
+                    assert_eq!(unsafe { libc::kill(child.id() as i32, SIGTERM) }, 0);
+                    delivered = true;
+                    deadline = Instant::now() + Duration::from_secs(2);
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if status.is_none() {
+                for pid in &native_pids {
+                    kill_group(*pid, libc::SIGKILL);
+                }
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+            use std::io::{Read, Seek};
+            let mut stderr = stderr;
+            stderr.rewind().unwrap();
+            let mut diagnostics = String::new();
+            stderr.read_to_string(&mut diagnostics).unwrap();
+            assert!(diagnostics.contains(if mode == "early" {
+                "real SIGTERM observed before first native Git operation"
+            } else {
+                "four concurrent first native Git operations cancelled"
+            }));
+            assert!(
+            status.is_some(),
+            "early SIGTERM was lost; real native Git observed={native_observed} and blocked on config FIFO: {diagnostics}"
+        );
+            assert!(status.unwrap().success(), "{diagnostics}");
+            if mode == "early" {
+                assert!(!started.exists(), "cancelled invocation started native Git");
+            } else {
+                assert!(delivered && native_observed && native_pids.len() == 4);
+                for pid in native_pids {
+                    assert!(
+                        !Path::new(&format!("/proc/{pid}")).exists(),
+                        "native Git survived cancellation"
+                    );
+                }
+            }
+        }
+    }
     fn recovery(keep: bool) -> Recovery {
         Recovery {
             format: "git-on-temp-v1".into(),

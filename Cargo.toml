@@ -1,6 +1,6 @@
 [package]
 name = "git-on"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
@@ -11,15 +11,27 @@ default = []
 # Private benchmark instrumentation; normal builds expose no metrics channel.
 test-metrics = []
 
+[[example]]
+name = "source-probe"
+path = "tests/support/source_probe.rs"
+required-features = ["test-metrics"]
+
 [dependencies]
 anyhow = "1"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 gix-glob = "0.29"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 signal-hook = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

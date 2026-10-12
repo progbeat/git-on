@@ -117,9 +117,21 @@ class CliTests(RepositoryTest):
             self.assert_success(result)
             self.assertTrue(b"git-on" in result.stdout or b"git on" in result.stdout)
             if arg != "--version":
-                self.assertIn(b"[--keep|-k] -- <command>", result.stdout)
-                self.assertIn(b"--keep, -k", result.stdout)
+                self.assertIn(b"Usage: git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
+                self.assertIn(b"Arguments:", result.stdout)
+                self.assertIn(b"Options:", result.stdout)
+                self.assertIn(b"-k, --keep", result.stdout)
+                self.assertIn(b"--verify", result.stdout)
+                self.assertIn(b"Local REV, or REPOSITORY REV", result.stdout)
+                self.assertIn(b"native Git", result.stdout)
+                self.assertIn(b"Runner options follow REV", result.stdout)
                 self.assertIn(b"first -- is required before every command", result.stdout)
+        env = dict(self.environment(), PATH=str(BINARY.parent) + os.pathsep + os.environ["PATH"])
+        result = subprocess.run(["git", "on", "-h"], cwd=self.repo, env=env,
+                                capture_output=True, timeout=10)
+        self.assert_success(result)
+        self.assertIn(b"Usage: git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
+        self.assertEqual(result.stderr, b"")
 
     def test_unknown_tree_never_executes(self):
         sentinel = self.root / "executed"
@@ -151,17 +163,43 @@ class CliTests(RepositoryTest):
             ["missing-tree", "-k", "--unknown", "--", *command],
             ["missing-tree", "--keep=1", "--", *command],
             ["missing-tree", "-kk", "--", *command],
-            ["repository", "missing-tree", "--", *command],
+            ["repository", "missing-tree", "extra", "--", *command],
+            ["repository", "-k", "missing-tree", "extra", "--", *command],
+            ["repository", "missing-tree", "--verify", "extra", "--", *command],
+            ["repository", "-k", "missing-tree", "--verify", "extra", "--", *command],
+            ["--verify=true", "missing-tree", "--", *command],
+            ["-V", "missing-tree", "--", *command],
+            ["--ver", "missing-tree", "--", *command],
             ["--", "HEAD", "--", *command],
             ["--keep", "--help", "HEAD", "--", *command],
         ]:
             with self.subTest(args=args):
                 result, run = self.invoke_argv(args)
                 self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn(b"usage:", result.stderr)
+                self.assertIn(b"Usage:", result.stderr)
                 self.assertIsNone(run)
                 self.assertFalse(sentinel.exists())
                 self.assert_no_runtime_files()
+
+    def test_control_modes_preserve_first_token_precedence_and_literal_paths(self):
+        for args in (["--help", "--nope"], ["-h", "--version", "--"],
+                     ["--version", "--help", "junk"]):
+            result, run = self.invoke_argv(args)
+            self.assert_success(result)
+            self.assertEqual(result.stderr, b"")
+            self.assertIsNone(run)
+            if args[0] == "--version":
+                version = subprocess.run([str(BINARY), "--version"], capture_output=True, check=True).stdout
+                self.assertEqual(result.stdout, version)
+            else:
+                self.assertIn(b"Options:", result.stdout)
+            self.assert_no_runtime_files()
+        for path in ("--", "--help", "--version", "-k", "", b"path-\xff"):
+            result, run = self.invoke_argv(["--cleanup", path])
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertIsNone(run)
+            self.assert_no_runtime_files()
 
     def test_direct_command_syntax_is_rejected_before_execution(self):
         sentinel = self.root / "executed"
@@ -176,7 +214,7 @@ class CliTests(RepositoryTest):
                 self.assert_no_runtime_files()
         result, run = self.invoke_argv(["HEAD", *command, "--", "child-argument"])
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(b"usage:", result.stderr)
+        self.assertIn(b"Usage:", result.stderr)
         self.assertIsNone(run)
         self.assertFalse(sentinel.exists())
         self.assert_no_runtime_files()
@@ -211,6 +249,25 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_review_local_unverified_run_without_native_git(self):
+        programs = self.root / "fuse-only"
+        programs.mkdir()
+        for name in ("fusermount3", "fusermount"):
+            helper = shutil.which(name)
+            if helper:
+                (programs / name).symlink_to(helper)
+        self.assertIsNone(shutil.which("git", path=str(programs)))
+        for revision, path, expected in (("HEAD", "tracked.txt", b"committed\n"),
+                                         ("HEAD:subtree", "source.txt", b"subtree source\n")):
+            with self.subTest(revision=revision):
+                result, run = self.python(
+                    f'import sys; sys.stdout.buffer.write(open({path!r},"rb").read())',
+                    tree=revision, extra_env={"PATH": str(programs)})
+                self.assert_success(result)
+                self.assertEqual(result.stdout, expected)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
+
     def test_snapshot_ignores_dirty_index_worktree_and_untracked_files(self):
         self.put("tracked.txt", "staged\n")
         git(self.repo, "add", "tracked.txt")
