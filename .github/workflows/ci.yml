@@ -86,20 +86,24 @@ jobs:
         run: |
           BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
           BEFORE_ARGUMENT=()
+          # Historical worktrees must never overwrite the reviewed binaries.
+          # Cargo can consider HEAD fresh after another worktree writes the
+          # same top-level executable in a shared target directory.
+          BEFORE_TARGET=/tmp/git-on-historical-target
           # Replay the authentic pre-fix feature revision while reviewing this
           # branch. Later squash merges retain the permanent green tests even
           # when that intermediate commit is no longer in master's ancestry.
           if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" HEAD; then
             git worktree add --detach /tmp/git-on-review-before "$BEFORE"
-            cargo build --release --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$PWD/target"
-            cp target/release/git-on /tmp/git-on-review-before-bin
+            cargo build --release --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-before-bin
             BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
           fi
           LIFECYCLE_BEFORE=8d6c02ede7a6f5d377e2c47c5b2177ee46a477eb
           if git cat-file -e "$LIFECYCLE_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$LIFECYCLE_BEFORE" HEAD; then
             git worktree add --detach /tmp/git-on-lifecycle-before "$LIFECYCLE_BEFORE"
-            cargo build --release --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$PWD/target"
-            cp target/release/git-on /tmp/git-on-lifecycle-before-bin
+            cargo build --release --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-lifecycle-before-bin
             BEFORE_ARGUMENT+=(--before-lifecycle-binary /tmp/git-on-lifecycle-before-bin)
           fi
           REVIEW_BEFORE=e42774399dba61d02c80235ef54bf61c3abd9e63
@@ -107,9 +111,9 @@ jobs:
           JOB_BEFORE_ARGUMENT=()
           if git cat-file -e "$REVIEW_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$REVIEW_BEFORE" HEAD; then
             git worktree add --detach /tmp/git-on-review-e427 "$REVIEW_BEFORE"
-            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-review-e427/Cargo.toml --target-dir "$PWD/target"
-            cp target/release/git-on /tmp/git-on-review-e427-bin
-            cp target/release/examples/source-probe /tmp/git-on-review-e427-probe
+            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-review-e427/Cargo.toml --target-dir "$BEFORE_TARGET"
+            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-e427-bin
+            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-review-e427-probe
             BEFORE_ARGUMENT+=(--before-policy-binary /tmp/git-on-review-e427-bin)
             SSH_BEFORE_ARGUMENT=(--before-boundary-probe /tmp/git-on-review-e427-probe)
             JOB_BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-e427-bin)

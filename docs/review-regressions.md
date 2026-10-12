@@ -751,3 +751,20 @@ Git stops are consumed separately with `waitid(WSTOPPED|WNOHANG)`, leaving exit
 status ownership with `Child::try_wait`. `--before-binary` requires the exact
 old stopped-Git/running-runner/no-prompt state before running the green suite.
 These PTY checks do not need FUSE and do not stand in for real mounts.
+
+The first full CI replay at `7f8483516165ff3a412560843ea2d4a3e2b8eee5`
+([run 38214579320](https://github.com/progbeat/git-on/actions/runs/38214579320))
+exposed an artifact-isolation defect in the replay recipe. Historical worktrees
+overwrote the same top-level `target/release/git-on`; after compiling e427,
+Cargo marked the reviewed head fresh in 0.05 seconds. The four retained
+create/mkdir transport/cache assertions then observed EROFS from that old
+executable instead of the required EIO. All four baseline EROFS observations
+and both old/new EINTR retries were recorded, but this failed run cannot establish
+the fixed behavior. A local Rust 1.89 replay confirmed the same contamination:
+the historical build took 17.24 seconds, the subsequent reviewed build took
+0.05 seconds, and its executable hash still matched the historical artifact
+instead of the separately saved correct executable. Historical artifacts now
+build and copy from a separate
+`/tmp/git-on-historical-target`; the reviewed head keeps its own target directory.
+The same real-FUSE assertions remain required in the replacement exact-head CI
+run. Other green jobs in the failed run do not replace that acceptance.
