@@ -10,8 +10,7 @@ results](#standard-streams-and-temporary-writes) ·
 ## Command syntax
 
 ```text
-git on REV [OPTIONS] -- COMMAND [ARGS...]
-git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]
+git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]
 git on --cleanup <temporary-directory>
 git on -h
 git on --version

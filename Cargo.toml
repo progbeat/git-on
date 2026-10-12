@@ -18,6 +18,7 @@ required-features = ["test-metrics"]
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 gix-glob = "0.29"

@@ -5,9 +5,9 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 ## Command and revision
 
-- `git on REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision;
-  `git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` selects a source and
-  revision. Resolve the selected Git tree once and launch the given argv from
+- `git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]` selects a local
+  revision, or a source and revision when REPOSITORY is supplied.
+  Resolve the selected Git tree once and launch the given argv from
   its root without introducing a shell.
 - The selected tree, not the index or working directory, determines source
   contents throughout the run. Later changes to refs do not change that tree.

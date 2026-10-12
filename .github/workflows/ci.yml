@@ -34,6 +34,10 @@ jobs:
       - run: python3 tests/check_fuse_coverage.py
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
       - run: cargo test --locked --all-targets --features test-metrics
+      - name: Check the locked graph at Rust 1.89 MSRV
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 check --locked --all-targets --features test-metrics
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests

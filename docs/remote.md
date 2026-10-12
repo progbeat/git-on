@@ -1,7 +1,7 @@
 # Remote execution and native verification
 
-`git on REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision.
-`git on REPOSITORY REV [OPTIONS] -- COMMAND [ARGS...]` selects a source and revision.
+`git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision,
+or a source and revision when REPOSITORY is supplied.
 Put `--keep`, `-k`, and `--verify` after REV and before the first `--`;
 the command tail stays literal. URLs work
 outside a checkout. A configured remote name requires its local repository.

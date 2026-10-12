@@ -628,34 +628,21 @@ fn execute(
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
-        if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-            println!("Usage: {}\n       git on --cleanup <temporary-directory>\n\nRun argv with inherited standard I/O on a lazy immutable Git snapshot.\nOne operand selects local REV; two select repository and REV.\nNew paths must be ignored by the snapshot's .gitignore. Linux/FUSE3 required.\nTemporary backing uses the system temporary directory (TMPDIR).\n--keep, -k retain generated files for debugging after unmount.\n--verify delegates exact commit/tag signature verification to native Git.\nRunner options follow REV and precede the command boundary.\nThe first -- is required before every command; all following argv is literal.\nGIT_ON_TREE_OID identifies the pinned source tree.\nExit: child status; runner failure 125; usage 2.", cli::RUN_USAGE);
-            return Ok(ExitStatus::from_raw(0));
-        }
-        if args.first().is_some_and(|a| a == "--version") {
-            println!("git-on {}", env!("CARGO_PKG_VERSION"));
-            return Ok(ExitStatus::from_raw(0));
-        }
-        if args.first().is_some_and(|a| a == "--cleanup") {
-            if args.len() != 2 {
-                eprintln!("usage: git on --cleanup <temporary-directory>");
-                return Ok(ExitStatus::from_raw(2 << 8));
+        match cli::parse(&args) {
+            Ok(cli::Invocation::Cleanup(directory)) => {
+                cleanup(Path::new(&directory))?;
+                Ok(ExitStatus::from_raw(0))
             }
-            cleanup(Path::new(&args[1]))?;
-            return Ok(ExitStatus::from_raw(0));
-        }
-        match cli::parse_run_args(&args) {
-            Ok(run) => execute(
-                run.tree.clone(),
+            Ok(cli::Invocation::Run(run)) => execute(
+                run.tree,
                 run.command.to_vec(),
                 run.keep,
-                run.repository.cloned(),
+                run.repository,
                 run.verify,
             ),
             Err(error) => {
-                eprintln!("git-on: {error}");
-                eprintln!("usage: {}", cli::RUN_USAGE);
-                Ok(ExitStatus::from_raw(2 << 8))
+                error.print()?;
+                Ok(ExitStatus::from_raw(error.exit_code() << 8))
             }
         }
     })();

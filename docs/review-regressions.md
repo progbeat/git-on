@@ -260,6 +260,52 @@ The focused help acceptance and all eight existing CLI parser tests passed
 after the change, including compatibility argument parsing and literal command
 tails. Required real-FUSE and distribution checks still run at the final head.
 
+## Clap CLI migration preserves raw argv and control modes
+
+The CLI uses clap 4.6.7's builder API with `std`, `help`, `usage` and
+`error-context`, and no derive feature. One argument definition produces
+structured help and contextual errors. The advertised form is
+`git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]`; keep/verification
+examples continue to put options after REV. Git's manpage interception is
+separate, so help examples use `git on -h` or direct `git-on --help`.
+
+Execution splits the first literal `--` from raw OS arguments before parsing.
+Clap sees only the prefix. Command names and later arguments, including empty
+strings, non-UTF-8 bytes, help flags and later separators, remain untouched.
+Existing first-token help/version precedence, version bytes, literal cleanup
+paths, repeated flags and accepted compatibility forms are preserved.
+
+Independent comparison against the unchanged parser at
+`9b4f54951a2998ca33dc69aa6db4284aeb7b40db` matched 187,505 cases, including
+interspersed flags, two-operand selection and byte-exact command tails. Review
+also reproduced two native clap defaults that need compatibility guards:
+short-option bundles were accepted, and an Append positional accepted more than
+two total values when flags interrupted its occurrences. Existing exact-token
+regressions and the retained `interspersed_flags_do_not_relax_total_operand_limit`
+plus black-box no-runtime cases require usage status 2 for those inputs. The
+guards derive flag spellings from the argument definition and validate the
+complete operand count. Eleven parser tests and eight CLI acceptance cases
+passed on Rust 1.89, including actual `git on -h` dispatch and raw cleanup paths.
+
+The actual locked graph passed normal/metrics Rust tests (86 each) and strict
+clippy on Rust 1.89. CI also checks every locked target with test metrics at that
+MSRV. The only four added packages are clap/clap_builder 4.6.7, clap_lex 1.1.1
+and anstyle 1.0.14. No additional shared runtime library is introduced.
+
+Release sizes use the same checkout path, Rust 1.89.0, default release profile,
+target directory and strip command (`strip --strip-all`). The before revision
+is the exact pre-clap head above; only the CLI/dependency migration changes the
+after build.
+
+| Measurement | Before | After | Increase |
+| --- | ---: | ---: | ---: |
+| Release binary, unstripped | 2,755,920 bytes | 3,328,000 bytes | 572,080 bytes (20.8%) |
+| Same binary, symbols stripped | 2,307,952 bytes | 2,783,088 bytes | 475,136 bytes (20.6%) |
+
+Independent CLI review found no remaining behavior defect. Actual FUSE,
+performance and installed-distribution evidence still requires all checks at
+the final published head.
+
 ## Reproduced runtime defects
 
 The independent review used `03f18c36fcb01f8d49cb196e250cee2bffd0f86a` as the
