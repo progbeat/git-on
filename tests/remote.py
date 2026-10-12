@@ -6,6 +6,8 @@ executes the installed CLI through actual mounts. No transport is mocked.
 """
 import argparse
 import contextlib
+import errno
+import fcntl
 import http.server
 import json
 import os
@@ -15,6 +17,7 @@ import pwd
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -33,6 +36,7 @@ PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
+PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
 
 def run(argv, **kwargs):
@@ -304,6 +308,29 @@ class RemoteTests(unittest.TestCase):
         commit=f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'commit-tree','-S',f.tree,data=b'signed fixture\n')
         f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'tag','-s','-m','signed tag','signed',commit)
         return commit,allowed
+    def test_review_peeled_tag_advertisement_rows_are_not_selectable_refs(self):
+        f=self.f; signed,_=self.signing()
+        url=f.https(); self.addCleanup(f.server.shutdown)
+        advertisement=run(['git','ls-remote','--symref','--',url],env=f.env)
+        tag=f.git('rev-parse','refs/tags/signed')
+        self.assertNotEqual(tag,signed)
+        self.assertIn(f'{tag}\trefs/tags/signed\n'.encode(),advertisement)
+        self.assertIn(f'{signed}\trefs/tags/signed^{{}}\n'.encode(),advertisement)
+        # Both native signatures verify: silently accepting the helper would
+        # otherwise succeed while verifying a different selected object.
+        for kind,oid in (('tag',tag),('commit',signed)):
+            oracle=subprocess.run(['git','-C',str(f.repo),'verify-'+kind,oid],env=f.env,capture_output=True,timeout=10)
+            self.assertEqual(oracle.returncode,0,oracle.stderr)
+        for verify in (False,True):
+            with self.subTest(verify=verify):
+                process=f.probe(url,'refs/tags/signed',verify=verify)
+                self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
+                requests=len(f.requests)
+                process=f.probe(url,'refs/tags/signed^{}',verify=verify)
+                _,errors=process.communicate(timeout=20)
+                self.assertNotEqual(process.returncode,0,'peeled advertisement helper accepted as an exact ref')
+                self.assertIn(b'not advertised',errors)
+                self.assertFalse(any(x['wants'] for x in f.requests[requests:]),'unsupported selector fetched objects')
     def test_native_ssh_signature_tag_tree_path_replacements_and_failures(self):
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
         replacement_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
@@ -358,6 +385,68 @@ class RemoteTests(unittest.TestCase):
         # Some container PID 1 implementations do not reap adopted zombies.
         self.assertTrue(not proc.exists() or (proc/'stat').read_text().split()[2]=='Z')
         self.assertEqual(list(f.root.glob('git-on-*')),[])
+    def test_startup_transport_all_handled_signals(self):
+        f=self.f; wrapper=f.root/'hanging-selected-ssh'; pid=f.root/'transport-pid'
+        wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid}.new"\nmv "{pid}.new" "{pid}"\nexec sleep 300\n'); wrapper.chmod(0o700)
+        f.env['GIT_SSH_COMMAND']=str(wrapper)
+        for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP,signal.SIGQUIT):
+            with self.subTest(signal=sig):
+                pid.unlink(missing_ok=True)
+                process=subprocess.Popen([str(OPTIONS.binary.resolve()),'ssh://fixture@example.invalid/repo','HEAD','--','true'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                f.children.append(process)
+                deadline=time.monotonic()+5
+                while not pid.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
+                self.assertTrue(pid.exists(),'owned startup transport never began')
+                owned=int(pid.read_text())
+                try:
+                    process.send_signal(sig); _,errors=process.communicate(timeout=5)
+                    self.assertEqual(process.returncode,-sig,errors)
+                    proc=Path(f'/proc/{owned}/stat')
+                    self.assertTrue(not proc.exists() or proc.read_text().split()[2]=='Z')
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                finally:
+                    if process.poll() is None:
+                        with contextlib.suppress(ProcessLookupError): os.kill(owned,signal.SIGKILL)
+                        process.kill(); process.communicate(timeout=5)
+    def test_sigkill_during_native_config_startup_requires_external_process_cleanup(self):
+        f=self.f; native=str(Path(shutil.which('git')).resolve())
+        config=f.root/'config-fifo'; os.mkfifo(config,0o600)
+        programs=f.root/'native-git-wrapper'; programs.mkdir()
+        pidfile=f.root/'native-git-pid'; wrapper=programs/'git'
+        wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$$" > "{pidfile}.new"\nmv "{pidfile}.new" "{pidfile}"\nexec "{native}" "$@"\n'); wrapper.chmod(0o700)
+        process=subprocess.Popen([str(OPTIONS.binary.resolve()),'file://'+str(f.repo),'HEAD','--','true'],
+            cwd=f.cwd,env=dict(f.env,PATH=str(programs)+os.pathsep+f.env['PATH'],GIT_CONFIG_GLOBAL=str(config)),
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process); native_pid=None; descriptor=None; directory=None
+        def dispose():
+            if descriptor is not None and not select.select([descriptor],[],[],0)[0]:
+                with contextlib.suppress(ProcessLookupError): os.killpg(native_pid,signal.SIGKILL)
+            if process.poll() is None: process.kill()
+            process.communicate(timeout=10)
+            if directory is not None and directory.exists():
+                subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
+            if descriptor is not None: os.close(descriptor)
+        self.addCleanup(dispose)
+        deadline=time.monotonic()+5
+        while not pidfile.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
+        self.assertTrue(pidfile.exists(),'actual native Git did not start')
+        native_pid=int(pidfile.read_text()); descriptor=os.pidfd_open(native_pid)
+        self.assertEqual(os.getpgid(native_pid),native_pid)
+        directory,=f.root.glob('git-on-*')
+        process.kill(); self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
+        self.assertFalse(select.select([descriptor],[],[],.1)[0],'startup native operation unexpectedly stopped with runner death')
+        state=json.loads((directory/'.state').read_text())
+        self.assertIsNone(state['pin_ref']); self.assertFalse((directory/'ssh-control-owner').exists())
+        self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
+        with (directory/'.lock').open('rb') as held: fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        # This live pidfd identifies only the disposable child captured above.
+        os.killpg(native_pid,signal.SIGKILL)
+        self.assertTrue(select.select([descriptor],[],[],5)[0])
+        process.communicate(timeout=5)
+        cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
+        self.assertEqual(cleanup.returncode,0,cleanup.stderr); self.assertFalse(directory.exists())
+        print('SIGKILL startup evidence:',json.dumps(dict(native_child_survives=True,mount_present=False,
+              pin_present=False,ssh_owner_present=False,run_lock_released=True,explicit_recovery_succeeded=True)),flush=True)
     def test_ssh_encrypted_identity_one_prompt_and_transport_reuse(self):
         f=self.f; url=f.ssh(encrypted=True)
         process=f.probe(url); f.line(process)
@@ -643,7 +732,7 @@ class RemoteTests(unittest.TestCase):
     def test_real_mount_remote_active_cleanup_and_sigkill_stale_recovery(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.ssh(); ready=f.root/'remote-ready'
-        code="import json,os,time; from pathlib import Path; Path('out').mkdir(); Path('out/result').write_text('recover'); Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)})); time.sleep(300)"
+        code="import json,os,time; from pathlib import Path; Path('out').mkdir(); Path('out/result').write_text('recover'); ready=Path(os.environ['READY']); pending=ready.with_suffix('.new'); pending.write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)})); pending.replace(ready); time.sleep(300)"
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         f.children.append(process)
         deadline=time.monotonic()+20
@@ -651,7 +740,15 @@ class RemoteTests(unittest.TestCase):
         self.assertTrue(ready.exists())
         state=json.loads(ready.read_text()); directory=Path(state['run'])
         control=['ssh','-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
-        self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        checked=subprocess.run(control,capture_output=True,timeout=5)
+        self.assertEqual(checked.returncode,0,checked.stderr)
+        master=int(re.search(rb'pid=(\d+)',checked.stderr).group(1))
+        master_fd=os.pidfd_open(master)
+        def dispose_master():
+            if not select.select([master_fd],[],[],0)[0]:
+                with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(master_fd,signal.SIGTERM)
+            os.close(master_fd)
+        self.addCleanup(dispose_master)
         self.assertTrue((directory/'ssh-control-owner').is_file())
         def cleanup():
             with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
@@ -661,13 +758,202 @@ class RemoteTests(unittest.TestCase):
         self.addCleanup(cleanup)
         active=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
         self.assertNotEqual(active.returncode,0); self.assertTrue((directory/'backing').exists())
-        process.kill(); os.killpg(state['pid'],signal.SIGKILL); process.communicate(timeout=10)
+        recovery=json.loads((directory/'.state').read_text())
+        pin=recovery['pin_ref']
+        self.assertEqual(f.git('rev-parse',pin,at=directory/'remote-repository'),recovery['tree_oid'])
+        mountpoint=directory/'mount'
+        def mounted():
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery['id'] in line
+                       for line in Path('/proc/self/mountinfo').read_text().splitlines())
+        self.assertTrue(mounted())
+        self.assertEqual((mountpoint/'out/result').read_bytes(),b'recover')
+        # Kill the runner alone first. Its child has its own group and no
+        # parent-death signal; an external owner must stop that exact fixture.
+        process.kill(); self.assertEqual(process.wait(timeout=10),-signal.SIGKILL)
+        self.assertTrue(mounted(),'SIGKILL unexpectedly removed the mount')
+        self.assertEqual(os.getpgid(state['pid']),state['pid'])
+        self.assertNotEqual(Path(f"/proc/{state['pid']}/stat").read_text().split()[2],'Z')
+        inaccessible=subprocess.run([sys.executable,'-c',
+            'import json,os,sys\ntry: os.listdir(sys.argv[1])\nexcept OSError as e: print(json.dumps({"errno":e.errno}))\nelse: raise AssertionError("disconnected mount remained readable")',str(mountpoint)],
+            capture_output=True,timeout=5)
+        self.assertEqual(inaccessible.returncode,0,inaccessible.stderr)
+        self.assertEqual(json.loads(inaccessible.stdout)['errno'],errno.ENOTCONN)
         self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        self.assertFalse(select.select([master_fd],[],[],0)[0])
         self.assertTrue((directory/'remote-repository').exists())
+        self.assertTrue(any(path.is_file() and path.read_bytes()==b'recover'
+                            for path in (directory/'backing').iterdir()),'raw writable payload was lost')
+        self.assertTrue((directory/'ssh-control-owner').is_file())
+        self.assertEqual(f.git('rev-parse',pin,at=directory/'remote-repository'),recovery['tree_oid'])
+        # Kernel flock ownership ends with the killed process. Cached objects
+        # remain reusable; active-run objects and pin remain in private storage.
+        for lockfile in (directory/'.lock',f.root/'cache/git-on/objects-v1/lock'):
+            with lockfile.open('rb') as held:
+                fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                fcntl.flock(held,fcntl.LOCK_UN)
+        print('SIGKILL runtime evidence:',json.dumps(dict(mount_remaining=mounted(),
+              mount_errno=errno.ENOTCONN,child_alive=True,ssh_master_alive=True,
+              run_and_pin_retained=True,locks_released=True)),flush=True)
+        os.killpg(state['pid'],signal.SIGKILL); process.communicate(timeout=10)
         stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
         self.assertEqual(stale.returncode,0,stale.stderr); self.assertFalse(directory.exists())
+        self.assertFalse(mounted())
         self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        self.assertTrue(select.select([master_fd],[],[],5)[0],'recorded owned master survived stale recovery')
         self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def test_real_mount_all_handled_signals_close_owned_ssh_and_remove_state(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; url=f.ssh(); ready=f.root/'child-ready'
+        for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP,signal.SIGQUIT):
+            with self.subTest(signal=sig):
+                ready.unlink(missing_ok=True)
+                process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sh','-c',
+                    'printf "%s" "$$" > "$1.new"; mv "$1.new" "$1"; exec sleep 300','fixture',str(ready)],
+                    cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                f.children.append(process)
+                deadline=time.monotonic()+20
+                while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
+                self.assertTrue(ready.exists(),'mounted child never began')
+                child=int(ready.read_text()); directory,=f.root.glob('git-on-*')
+                control=['ssh','-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
+                self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+                try:
+                    process.send_signal(sig); _,errors=process.communicate(timeout=10)
+                    self.assertEqual(process.returncode,-sig,errors)
+                    self.assertFalse(directory.exists())
+                    self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
+                    self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+                    proc=Path(f'/proc/{child}/stat')
+                    self.assertTrue(not proc.exists() or proc.read_text().split()[2]=='Z')
+                finally:
+                    if process.poll() is None:
+                        with contextlib.suppress(ProcessLookupError): os.killpg(child,signal.SIGKILL)
+                        process.kill(); process.communicate(timeout=5)
+                    if directory.exists():
+                        subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+
+    def test_real_mount_sigkill_after_helper_mount_before_child_spawn(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        f=self.f; url=f.ssh(); helper=shutil.which('fusermount3')
+        self.assertIsNotNone(helper)
+        gates=f.root/'mount-helper'; gates.mkdir()
+        ready=f.root/'mount-helper-ready'; child=f.root/'unexpected-child'
+        wrapper=gates/'fusermount3'
+        # Perform the real native mount and pass its FUSE descriptor as usual,
+        # then hold the helper exit. This fixes the boundary deterministically:
+        # a mounted kernel filesystem, before spawn_mount2 returns or child argv.
+        wrapper.write_text(f'#!/bin/sh\nif [ -z "$_FUSE_COMMFD" ]; then exec "{helper}" "$@"; fi\n"{helper}" "$@" || exit $?\nfor point do :; done\nprintf "%s\\n%s\\n" "$$" "$point" > "{ready}.new"\nmv "{ready}.new" "{ready}"\nexec sleep 300\n')
+        wrapper.chmod(0o700)
+        process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sh','-c',
+            'printf started > "$1"','fixture',str(child)],cwd=f.cwd,
+            env=dict(f.env,PATH=str(gates)+os.pathsep+f.env['PATH']),
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        f.children.append(process); directory=None; helper_pid=None; helper_fd=None
+        def dispose():
+            nonlocal directory
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError): os.killpg(process.pid,signal.SIGKILL)
+            if helper_fd is not None and not select.select([helper_fd],[],[],0)[0]:
+                with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(helper_fd,signal.SIGKILL)
+            process.communicate(timeout=10)
+            if directory is None:
+                candidates=list(f.root.glob('git-on-*'))
+                if len(candidates)==1: directory=candidates[0]
+            if directory is not None and directory.exists():
+                subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+            if helper_fd is not None: os.close(helper_fd)
+        self.addCleanup(dispose)
+        deadline=time.monotonic()+20
+        while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
+        self.assertTrue(ready.exists(),'native fusermount helper did not reach held mount boundary')
+        helper_text,point=ready.read_text().splitlines(); helper_pid=int(helper_text)
+        helper_fd=os.pidfd_open(helper_pid)
+        mountpoint=Path(point); directory=mountpoint.parent
+        state=json.loads((directory/'.state').read_text())
+        def mounted():
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+state['id'] in line
+                       for line in Path('/proc/self/mountinfo').read_text().splitlines())
+        self.assertTrue(mounted()); self.assertFalse(child.exists())
+        process.kill(); self.assertEqual(process.wait(timeout=10),-signal.SIGKILL)
+        self.assertTrue(mounted()); self.assertFalse(child.exists())
+        control=['ssh','-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
+        self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        # The held helper belongs only to this isolated fixture. It has no FUSE
+        # descriptor after native fusermount exited and cannot serve the mount.
+        signal.pidfd_send_signal(helper_fd,signal.SIGKILL)
+        process.communicate(timeout=10)
+        stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+        self.assertEqual(stale.returncode,0,stale.stderr)
+        self.assertFalse(mounted()); self.assertFalse(directory.exists())
+        self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
+        print('SIGKILL mount boundary evidence:',json.dumps(dict(child_started=False,
+              mount_remaining_after_kill=True,ssh_master_retained=True,recovery_removed_mount_and_state=True)),flush=True)
+
+    def test_review_real_mount_failed_ssh_shutdown_retains_recovery_and_pin(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        if OPTIONS.before_lifecycle_binary:
+            with self.assertRaisesRegex(AssertionError,'0 != 125'):
+                self.failed_ssh_shutdown_retains_recovery_and_pin(OPTIONS.before_lifecycle_binary)
+            print('RED-BEFORE mounted SSH shutdown: old runner returned0 and removed recovery for a live master',flush=True)
+        self.failed_ssh_shutdown_retains_recovery_and_pin(OPTIONS.binary)
+
+    def failed_ssh_shutdown_retains_recovery_and_pin(self,binary):
+        f=Fixture(); self.addCleanup(f.close)
+        url=f.ssh(); ssh=str(Path(shutil.which('ssh')).resolve())
+        selected=f.root/'selected-client'; original=f.root/'original-client'
+        command=shlex.quote(ssh)+f.env.pop('GIT_SSH_COMMAND')[3:]
+        selected.write_text('#!/bin/sh\nexec '+command+' "$@"\n'); selected.chmod(0o700)
+        f.env['GIT_SSH']=str(selected)
+        programs=f.root/'git-only-path'; programs.mkdir()
+        (programs/'git').symlink_to(Path(shutil.which('git')).resolve())
+        f.env['PATH']=str(programs)
+        self.assertIsNone(shutil.which('ssh',path=f.env['PATH']))
+        ready=f.root/'child-ready'; release=f.root/'child-release'
+        code='import os,time; from pathlib import Path; ready=Path(os.environ["READY"]); pending=ready.with_suffix(".new"); pending.write_text(str(Path.cwd().parent)); pending.replace(ready)\nwhile not Path(os.environ["RELEASE"]).exists(): time.sleep(.01)'
+        # The mounted CLI also needs native fusermount on PATH. Keep SSH absent.
+        fusermount=Path(shutil.which('fusermount3')).resolve()
+        (programs/'fusermount3').symlink_to(fusermount)
+        process=subprocess.Popen([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],
+            cwd=f.cwd,env=dict(f.env,READY=str(ready),RELEASE=str(release)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process); directory=None; master_fd=None
+        def dispose():
+            if original.exists(): original.replace(selected)
+            release.touch()
+            if process.poll() is None: process.terminate()
+            try: process.communicate(timeout=10)
+            except subprocess.TimeoutExpired: process.kill(); process.communicate(timeout=5)
+            if directory is not None and directory.exists():
+                subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+            if master_fd is not None:
+                if not select.select([master_fd],[],[],0)[0]:
+                    with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(master_fd,signal.SIGTERM)
+                os.close(master_fd)
+        self.addCleanup(dispose)
+        deadline=time.monotonic()+20
+        while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
+        self.assertTrue(ready.exists(),'mounted child never began')
+        directory=Path(ready.read_text()); state=json.loads((directory/'.state').read_text())
+        checked=subprocess.run([ssh,'-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control'],capture_output=True,timeout=5)
+        self.assertEqual(checked.returncode,0,checked.stderr)
+        master_fd=os.pidfd_open(int(re.search(rb'pid=(\d+)',checked.stderr).group(1)))
+        selected.rename(original)
+        selected.write_text('#!/bin/sh\nexit 99\n'); selected.chmod(0o700)
+        release.touch(); _,errors=process.communicate(timeout=15)
+        if binary==OPTIONS.before_lifecycle_binary:
+            self.assertFalse(select.select([master_fd],[],[],0)[0],'old runner closed master through a client unexpectedly on PATH')
+            self.assertFalse(directory.exists(),'old runner unexpectedly retained recovery')
+        self.assertEqual(process.returncode,125,errors)
+        self.assertIn(b'recorded SSH shutdown executable changed',errors)
+        self.assertIn(str(directory).encode(),errors)
+        self.assertTrue((directory/'ssh-control-owner').is_file())
+        self.assertFalse(select.select([master_fd],[],[],0)[0])
+        self.assertEqual(f.git('rev-parse',state['pin_ref'],at=directory/'remote-repository'),state['tree_oid'])
+        self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
+        original.replace(selected)
+        stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
+        self.assertEqual(stale.returncode,0,stale.stderr); self.assertFalse(directory.exists())
+        self.assertTrue(select.select([master_fd],[],[],5)[0])
 
     def test_real_mount_remote_busy_retention_and_cleanup(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')

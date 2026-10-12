@@ -1,5 +1,43 @@
 # Review regression evidence
 
+## Follow-up review of the published 8d6c02e checkpoint
+
+Focused tests reproduced three current-head defects before their fixes:
+
+| Defect | Permanent regression | Observed before | Required after |
+| --- | --- | --- | --- |
+| Peeled tag helper selected as an exact ref | `RemoteTests.test_review_peeled_tag_advertisement_rows_are_not_selectable_refs` | Both verified and unverified selection succeeded; both native signatures were valid, so verification silently selected the peeled commit | Reject the helper before fetching objects; the real tag remains selectable |
+| Signal consumed before cancellation registration | `tests::review_signal_before_first_native_git_is_not_lost` | Real SIGTERM was observed before the first native Git call, which still started and blocked on a config FIFO; bounded test failed | Cancel before spawning Git; concurrent first operations also cancel and are reaped |
+| Shutdown ignores selected SSH executable outside PATH | `SshRegressionTests.test_selected_ssh_client_outside_path_closes_master_on_drop` and `test_selected_ssh_client_outside_path_closes_master_on_stale_recovery` | All six GIT_SSH_COMMAND, GIT_SSH and core.sshCommand combinations authenticated/read successfully but left the exact master alive after deleting the run directory | Close the owned master with the selected executable during normal and stale cleanup |
+
+These are real native Git and disposable OpenSSH reproductions, not transport
+mocks. A pidfd identifies the exact disposable master. Shutdown now records
+only canonical executable provenance, never the SSH command/configuration or
+credentials. Changed or malformed provenance retains the owned socket and pin
+with a visible failure; restoring it allows recovery. A dead owned endpoint is
+reconciled only after its socket identity is checked again. The older mandatory
+Git dependency finding is stale: the permanent local unverified test passes
+with an empty PATH, including ancestry, subtrees, replacements and 70 tags.
+
+Actual-FUSE tests additionally replay `8d6c02e` for ignored SSH shutdown errors:
+the old runner returns 0 and removes recovery while its master remains alive;
+the fixed runner returns 125, preserves the exact pin/socket, and succeeds after
+the client is restored. CI conditionally builds that authentic ancestor; after
+a squash merge, permanent current-behavior tests still run without history.
+
+SIGKILL lifecycle observations cover blocked native configuration before
+mounting, native helper completion after mounting but before command spawn,
+and mounted command runtime. They distinguish released kernel locks from
+retained pins, private objects, raw writable bytes and live child/master
+processes. No cleanup handler can run under SIGKILL. External fixture cleanup
+stops captured processes before checked stale recovery. The mount cases require
+actual FUSE in CI; local skips are not execution evidence. The native helper
+gate uses CI's unprivileged fusermount route; a privileged direct mount bypasses
+that gate. SIGINT/TERM/HUP/QUIT startup and mounted-runtime cases remain separate.
+
+Binary-size experiments remain outside the PR: no profile or clap feature
+policy change is included in this follow-up.
+
 ## Remote/verification checkpoint: unfinished and unpublished
 
 The initial uncommitted implementation was independently reviewed in the saved

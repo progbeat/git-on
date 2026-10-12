@@ -177,6 +177,15 @@ it. A busy stale mount requires stopping processes using it first. Cleanup does 
 processes by stale PID. A surviving pin intentionally prevents garbage collection until
 cleanup releases it.
 
+SIGKILL is uncatchable and does not forward a signal to the command. The command
+may keep running in its own process group. git-on does not enable FUSE
+`auto_unmount`; killing the runner after mounting leaves a disconnected mount
+whose fresh directory accesses fail with `ENOTCONN`. Temporary files, pins and a
+recorded remote SSH master may remain. Stop the command and any other mount users
+first, then use the cleanup command above. The same recovery can be necessary if
+the runner dies during mount setup before launching the command. Cleanup does
+not stop surviving commands or infer process ownership from old PIDs.
+
 ## Lazy access and performance
 
 The [behavioral and performance specification](specification.md) defines the contract.

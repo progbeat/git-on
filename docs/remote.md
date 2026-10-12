@@ -10,7 +10,8 @@ supports local upload-pack fixtures. URL rewriting is applied once.
 
 Remote revisions accept HEAD, an advertised full ref, an unambiguous branch/tag
 name or a full SHA-1 OID. Ancestry, reflog and abbreviated-ID syntax require local
-objects and are unsupported remotely. Resolve the ref once, then request only
+objects and are unsupported remotely. Peeled tag advertisement rows ending in
+`^{}` are helpers, not selectable refs. Resolve the ref once, then request only
 that OID. Match HEAD and full refs literally; expand only short names to branch
 and tag candidates. Unrelated non-UTF-8 ref names do not prevent ASCII selection.
 Ref movement cannot change the selected tree. SHA-256 repositories,
@@ -60,6 +61,16 @@ Completion removes the temporary remote repository and owned SSH connection.
 `--keep` preserves generated files under `backing/` using existing retention and
 cleanup rules. Busy mounts preserve recovery state for stale-run cleanup.
 
+SIGKILL cannot run cleanup handlers. The runner does not request FUSE
+`auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected
+and fresh directory access fails with `ENOTCONN`. The command's separate process
+group and an established persistent SSH master can survive. Run directories,
+private objects and exact Git pins remain; kernel file locks are released when
+their owning descriptors close. Stop the command and other mount users yourself,
+then run `git on --cleanup <temporary-directory>` to unmount and release recorded
+resources. Recovery never kills processes using stale PID records. A kill during
+mount setup can leave the same disconnected mount even before the command starts.
+
 ## Authentication
 
 Use the caller's effective system/global/repository configuration, expanded
@@ -89,6 +100,13 @@ paths and absent or invalid records are skipped. Uncatchable termination before
 initial advertisement finishes can leave an unrecorded connection; stale cleanup
 skips it rather than guessing ownership. Ordinary completion and cancellation
 close recorded connections.
+Shutdown reuses the selected client even when it is outside `PATH`. The private
+socket record retains only its canonical executable path and file identity, not
+SSH arguments, configuration or credentials. A changed or unavailable client
+causes a visible cleanup failure and retains the socket, pin and run directory.
+Restore that client, or close the identified socket with a trusted OpenSSH client,
+then retry checked cleanup. An already dead owned endpoint can be removed after
+its socket identity is checked again.
 Multiple encrypted identities, separately authenticated jump hosts and
 interactive credential helpers can need extra initial interaction. The one-prompt guarantee covers a directly reachable
 host and one selected identity. Lazy fetches disable Git/OpenSSH terminal/askpass

@@ -7,8 +7,8 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt},
-        io::AsRawFd,
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::{AsRawFd, FromRawFd},
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -24,6 +24,19 @@ struct SocketOwner {
     format: String,
     device: u64,
     inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client: Option<ControlClient>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlClient {
+    path: Vec<u8>,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
 }
 
 pub struct Remote {
@@ -34,6 +47,7 @@ pub struct Remote {
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
+    control_client: Option<ControlClient>,
     failed: Option<String>,
 }
 impl Remote {
@@ -110,6 +124,10 @@ impl Remote {
                 bail!("persistent SSH requires the OpenSSH variant (ssh or auto); non-OpenSSH variants are unsupported");
             }
         }
+        let control_client = ssh
+            .as_deref()
+            .map(|ssh| ControlClient::resolve(cwd, ssh))
+            .transpose()?;
         let mut remote = Self {
             git,
             dir,
@@ -118,6 +136,7 @@ impl Remote {
             socket,
             socket_owner: None,
             ssh,
+            control_client,
             failed: None,
         };
         // Authentication and host-key interaction happen here, before mounting.
@@ -221,6 +240,11 @@ impl Remote {
             };
             let (oid, name) = line.split_at(separator);
             let name = &name[1..];
+            // Annotated tags also advertise a peeled-object helper. It is not
+            // a ref: selecting it would change which exact object is verified.
+            if name.ends_with(b"^{}") {
+                continue;
+            }
             if names.iter().any(|n| n.as_bytes() == name) && !oid.starts_with(b"ref:") {
                 matches.push((
                     name,
@@ -306,10 +330,11 @@ impl Remote {
         Ok(())
     }
     /// Release the owned master even when the snapshot pin must remain for recovery.
-    pub fn stop_transport(&self) {
+    pub fn stop_transport(&self) -> Result<()> {
         if let (Some(socket), Some(owner)) = (&self.socket, &self.socket_owner) {
-            stop_owned_connection(socket, owner);
+            stop_owned_connection(socket, owner)?;
         }
+        Ok(())
     }
     fn record_socket_owner(&mut self) -> Result<()> {
         let Some(socket) = &self.socket else {
@@ -327,6 +352,7 @@ impl Remote {
             format: "git-on-ssh-control-v1".into(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            client: self.control_client.clone(),
         };
         self.socket_owner = Some(owner.clone());
         let mut file = OpenOptions::new()
@@ -345,53 +371,225 @@ impl Remote {
 }
 impl Drop for Remote {
     fn drop(&mut self) {
-        self.stop_transport();
+        if let Err(error) = self.stop_transport() {
+            eprintln!("git-on: owned SSH shutdown failed: {error:#}");
+        }
     }
 }
 /// Stop only the control connection in a validated run's private directory.
 /// Recovery callers must validate and lock that run before invoking this.
-pub fn stop_connection(socket: &Path) {
+pub fn stop_connection(socket: &Path) -> Result<()> {
     let record = socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE);
     if !fs::symlink_metadata(&record).is_ok_and(|metadata| metadata.file_type().is_file()) {
-        return;
+        return Ok(());
     }
-    let Some(owner) = File::open(record)
+    let Some(value) = File::open(record)
         .ok()
-        .and_then(|file| serde_json::from_reader::<_, SocketOwner>(file).ok())
-        .filter(|owner| owner.format == "git-on-ssh-control-v1")
+        .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok())
     else {
-        return;
+        return Ok(());
     };
-    stop_owned_connection(socket, &owner);
+    let Some((device, inode)) = value
+        .get("device")
+        .and_then(|x| x.as_u64())
+        .zip(value.get("inode").and_then(|x| x.as_u64()))
+    else {
+        return Ok(());
+    };
+    if value.get("format").and_then(|x| x.as_str()) != Some("git-on-ssh-control-v1") {
+        return Ok(());
+    }
+    let identity = SocketOwner {
+        format: "git-on-ssh-control-v1".into(),
+        device,
+        inode,
+        client: None,
+    };
+    if !owned_socket(socket, &identity) {
+        return Ok(());
+    }
+    // Once socket ownership is established, malformed client provenance is a
+    // recoverable shutdown failure, not permission to unlink a live socket.
+    let owner = serde_json::from_value::<SocketOwner>(value)
+        .context("invalid owned SSH recovery record; retain the run for --cleanup")?;
+    stop_owned_connection(socket, &owner)
 }
-fn stop_owned_connection(socket: &Path, owner: &SocketOwner) {
+fn owned_socket(socket: &Path, owner: &SocketOwner) -> bool {
     // Type alone is insufficient: a socket may be hardlinked or replaced after
     // a crash. Match the recorded identity and never follow symbolic links.
-    if !fs::symlink_metadata(socket).is_ok_and(|metadata| {
+    fs::symlink_metadata(socket).is_ok_and(|metadata| {
         metadata.file_type().is_socket()
             && metadata.dev() == owner.device
             && metadata.ino() == owner.inode
-    }) {
-        return;
+    })
+}
+fn stop_owned_connection(socket: &Path, owner: &SocketOwner) -> Result<()> {
+    if !owned_socket(socket, owner) {
+        return Ok(());
     }
-    let child = Command::new("ssh")
+    if remove_disconnected_socket(socket, owner)? {
+        return Ok(());
+    }
+    let executable = match &owner.client {
+        Some(client) => client.executable()?,
+        // Old v1 records did not contain executable provenance. Preserve their
+        // guarded standard-client recovery, without interpreting shell text.
+        None => PathBuf::from("ssh"),
+    };
+    if !owned_socket(socket, owner) {
+        return Ok(());
+    }
+    let mut child = Command::new(&executable)
         .args(["-F", "/dev/null", "-S"])
         .arg(socket)
         .args(["-O", "exit", "git-on-control"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut child) = child {
-        let start = std::time::Instant::now();
-        while child.try_wait().ok().flatten().is_none() {
-            if start.elapsed() > std::time::Duration::from_secs(1) {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        .spawn()
+        .context("start owned SSH shutdown client")?;
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("wait for owned SSH shutdown client")?
+        {
+            break status;
         }
+        if start.elapsed() > std::time::Duration::from_secs(1) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("owned SSH shutdown client timed out; retain the run for --cleanup");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    while owned_socket(socket, owner) && start.elapsed() < std::time::Duration::from_secs(1) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if owned_socket(socket, owner) && !remove_disconnected_socket(socket, owner)? {
+        bail!("owned SSH shutdown did not close its control socket ({status}); retain the run for --cleanup");
+    }
+    Ok(())
+}
+fn remove_disconnected_socket(socket: &Path, owner: &SocketOwner) -> Result<bool> {
+    if !endpoint_absent(socket)? {
+        return Ok(false);
+    }
+    // SIGKILL of a master can leave a pathname after the listener closes.
+    // Recheck ownership immediately before removing only that stale node.
+    if owned_socket(socket, owner) {
+        fs::remove_file(socket).context("remove disconnected owned SSH control socket")?;
+    }
+    Ok(true)
+}
+fn endpoint_absent(socket: &Path) -> Result<bool> {
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path = socket.as_os_str().as_bytes();
+    if path.len() >= address.sun_path.len() || path.contains(&0) {
+        bail!("invalid owned SSH socket pathname");
+    }
+    for (destination, byte) in address.sun_path.iter_mut().zip(path) {
+        *destination = *byte as libc::c_char;
+    }
+    let descriptor = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect owned SSH control endpoint");
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let result = unsafe {
+        libc::connect(
+            file.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ECONNREFUSED | libc::ENOENT) => Ok(true),
+        // A busy live listener is not evidence that its endpoint disappeared.
+        Some(libc::EINPROGRESS | libc::EAGAIN) => Ok(false),
+        _ => Err(error).context("inspect owned SSH control endpoint"),
+    }
+}
+impl ControlClient {
+    fn resolve(cwd: &Path, ssh: &OsStr) -> Result<Self> {
+        // Use the same shell expansion/quoting as the supported direct command,
+        // but emit only its executable. No command arguments are persisted.
+        let mut script = OsString::from(
+            r#"git_on_client() {
+            case "$1" in env|exec|command|sh|bash|dash|zsh|ksh|*=*)
+                echo 'git-on: SSH shell prefixes are unsupported' >&2; exit 125;; esac
+            command -v "$1"
+        }; git_on_client "#,
+        );
+        script.push(ssh);
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(cwd)
+            .args([OsStr::new("-c"), &script])
+            .stdin(Stdio::null());
+        let output =
+            crate::git::run(command, true).context("resolve selected SSH shutdown client")?;
+        if !output.status.success() {
+            bail!(
+                "selected SSH executable cannot be resolved: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let selected = PathBuf::from(OsString::from_vec(
+            output
+                .stdout
+                .strip_suffix(b"\n")
+                .unwrap_or(&output.stdout)
+                .to_vec(),
+        ));
+        let path = fs::canonicalize(if selected.is_absolute() {
+            selected
+        } else {
+            cwd.join(selected)
+        })
+        .context("resolve selected SSH executable path")?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            bail!("selected SSH shutdown client must be a regular executable file");
+        }
+        Ok(Self {
+            path: path.as_os_str().as_bytes().to_vec(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        })
+    }
+    fn executable(&self) -> Result<PathBuf> {
+        let path = PathBuf::from(OsString::from_vec(self.path.clone()));
+        if !path.is_absolute() || self.path.contains(&0) {
+            bail!("invalid recorded SSH shutdown executable path; retain the run for --cleanup");
+        }
+        let metadata =
+            fs::symlink_metadata(&path).context("inspect recorded SSH shutdown executable")?;
+        if !metadata.file_type().is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.len() != self.size
+            || metadata.mtime() != self.modified_seconds
+            || metadata.mtime_nsec() != self.modified_nanoseconds
+        {
+            bail!("recorded SSH shutdown executable changed; retain the run for --cleanup");
+        }
+        Ok(path)
     }
 }
 fn validate_ssh_command(command: &OsStr) -> Result<()> {

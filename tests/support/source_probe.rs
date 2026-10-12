@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     let source = args.first().context("source required")?;
     let revision = args.get(1).context("revision required")?;
     let run = tempfile::tempdir()?;
-    let snapshot = Snapshot::load_source_with_pin_record(
+    let loaded = Snapshot::load_source_with_pin_record(
         &env::current_dir()?,
         (source != "local").then_some(source.as_os_str()),
         revision,
@@ -35,7 +35,20 @@ fn main() -> Result<()> {
         run.path(),
         "probe",
         |_, _, _| Ok(()),
-    )?;
+    );
+    let snapshot = match loaded {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Err(cleanup) = git_on::remote::stop_connection(&run.path().join("ssh-control")) {
+                let retained = run.keep();
+                return Err(anyhow::anyhow!(
+                    "{error:#}; shutdown: {cleanup:#}; probe recovery retained at {}",
+                    retained.display()
+                ));
+            }
+            return Err(error);
+        }
+    };
     report(&snapshot)?;
     let mut opened = None;
     for operation in io::stdin().lock().lines() {
@@ -83,6 +96,14 @@ fn main() -> Result<()> {
             anyhow::bail!("unknown probe operation");
         }
         report(&snapshot)?;
+    }
+    if let Err(error) = snapshot.stop_remote_transport() {
+        // Keep the owned socket identity and pin reachable after a failed
+        // explicit shutdown; Drop cannot report failure to a caller.
+        std::mem::forget(snapshot);
+        let retained = run.keep();
+        return Err(error)
+            .with_context(|| format!("probe recovery retained at {}", retained.display()));
     }
     drop(snapshot);
     Ok(())

@@ -194,8 +194,8 @@ impl Git {
 trait SplitByte {
     fn split_once_byte(&self, b: u8) -> (&[u8], Option<&[u8]>);
 }
-static CANCELLED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicI32>> =
-    std::sync::OnceLock::new();
+static CANCELLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static CANCELLATION_HANDLERS: std::sync::OnceLock<std::io::Result<()>> = std::sync::OnceLock::new();
 static OPERATIONS_STOPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// End owned native operations after the command finishes without inventing a
@@ -207,10 +207,7 @@ pub fn operations_stopped() -> bool {
     OPERATIONS_STOPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 pub fn cancelled_signal() -> Option<i32> {
-    let signal = CANCELLED
-        .get()
-        .map(|x| x.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(0);
+    let signal = CANCELLED.load(std::sync::atomic::Ordering::Relaxed);
     (signal != 0).then_some(signal)
 }
 /// Stop owned native operations when the foreground command is interrupted.
@@ -219,25 +216,27 @@ pub fn cancel_by_signal(signal: i32) {
         signal,
         libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
     ) {
-        if let Some(value) = CANCELLED.get() {
-            value.store(signal, std::sync::atomic::Ordering::Relaxed);
-        }
+        CANCELLED.store(signal, std::sync::atomic::Ordering::Relaxed);
     }
 }
-fn cancellation() -> Result<()> {
-    if CANCELLED.get().is_none() {
-        let value = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let value = CANCELLED.get_or_init(|| value).clone();
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-            let value = value.clone();
-            unsafe {
-                signal_hook::low_level::register(signal, move || {
-                    value.store(signal, std::sync::atomic::Ordering::Relaxed);
-                })?;
+/// Register the cancellation latch before other subscribers can consume a
+/// signal. Concurrent first callers wait for all four handlers, including a
+/// registration failure, rather than observing partly initialized handlers.
+pub fn initialize_cancellation() -> std::io::Result<()> {
+    CANCELLATION_HANDLERS
+        .get_or_init(|| {
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                unsafe {
+                    signal_hook::low_level::register(signal, move || {
+                        CANCELLED.store(signal, std::sync::atomic::Ordering::Relaxed);
+                    })?;
+                }
             }
-        }
-    }
-    Ok(())
+            Ok(())
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
 }
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
@@ -247,7 +246,7 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         os::unix::{io::AsRawFd, process::CommandExt},
         time::Duration,
     };
-    cancellation()?;
+    initialize_cancellation()?;
     if let Some(signal) = cancelled_signal() {
         bail!("Git operation cancelled by signal {signal}");
     }

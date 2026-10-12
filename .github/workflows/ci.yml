@@ -93,6 +93,13 @@ jobs:
             cp target/debug/git-on /tmp/git-on-review-before-bin
             BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
           fi
+          LIFECYCLE_BEFORE=8d6c02ede7a6f5d377e2c47c5b2177ee46a477eb
+          if git cat-file -e "$LIFECYCLE_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$LIFECYCLE_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-lifecycle-before "$LIFECYCLE_BEFORE"
+            cargo build --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$PWD/target"
+            cp target/debug/git-on /tmp/git-on-lifecycle-before-bin
+            BEFORE_ARGUMENT+=(--before-lifecycle-binary /tmp/git-on-lifecycle-before-bin)
+          fi
           cargo build --locked --features test-metrics --example source-probe --bin git-on
           python3 tests/remote.py --require-fuse "${BEFORE_ARGUMENT[@]}"
 

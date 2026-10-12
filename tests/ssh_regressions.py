@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import pty
 import select
+import re
 import signal
 import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -35,6 +37,180 @@ class SshRegressionTests(unittest.TestCase):
         f.finish(process)
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
         self.assertEqual(list(f.root.glob('*/ssh-control')), [])
+
+    def shutdown_selected_client_outside_path(self, selection, recovery):
+        f = remote.Fixture()
+        self.addCleanup(f.close)
+        url = f.ssh()
+        ssh = str(Path(shutil.which('ssh')).resolve())
+        git = str(Path(shutil.which('git')).resolve())
+        command = shlex.quote(ssh) + f.env.pop('GIT_SSH_COMMAND')[3:]
+        if selection == 'GIT_SSH':
+            executable = f.root / 'selected ssh wrapper'
+            executable.write_text('#!/bin/sh\nexec ' + command + ' "$@"\n')
+            executable.chmod(0o700)
+            f.env['GIT_SSH'] = str(executable)
+        elif selection == 'core.sshCommand':
+            f.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.sshCommand', GIT_CONFIG_VALUE_0=command)
+        else:
+            f.env['GIT_SSH_COMMAND'] = command
+        programs = f.root / 'git-only-path'
+        programs.mkdir()
+        (programs / 'git').symlink_to(git)
+        f.env['PATH'] = str(programs)
+        self.assertIsNone(shutil.which('ssh', path=f.env['PATH']))
+        process = f.probe(url)
+        f.line(process)
+        f.operation(process, 'read deep/file')
+        sockets = list(f.root.glob('*/ssh-control'))
+        self.assertEqual(len(sockets), 1)
+        directory = sockets[0].parent
+        checked = subprocess.run([ssh, '-F', '/dev/null', '-S', str(sockets[0]), '-O', 'check', 'git-on-control'],
+                                 capture_output=True, check=True, timeout=5)
+        pid = int(re.search(rb'pid=(\d+)', checked.stderr).group(1))
+        descriptor = os.pidfd_open(pid)
+        try:
+            self.assertFalse(select.select([descriptor], [], [], 0)[0])
+            if recovery:
+                process.kill()
+                process.communicate(timeout=10)
+                self.assertEqual(process.returncode, -signal.SIGKILL)
+                # This fixture exercises validated unmounted stale recovery;
+                # actual SIGKILL mount behavior belongs to --require-fuse CI.
+                (directory / '.lock').touch()
+                (directory / '.state').write_text(json.dumps(dict(
+                    format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
+                    git_dir=None, tree_oid=None, pin_ref=None)))
+                cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
+                                         env=f.env, capture_output=True, timeout=10)
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            else:
+                f.finish(process)
+            self.assertFalse(directory.exists())
+            self.assertTrue(select.select([descriptor], [], [], 2)[0],
+                            'owned master survived shutdown with the selected SSH client outside PATH')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+            if not select.select([descriptor], [], [], 0)[0]:
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            os.close(descriptor)
+
+    def test_selected_ssh_client_outside_path_closes_master_on_drop(self):
+        for selection in ('GIT_SSH_COMMAND', 'GIT_SSH', 'core.sshCommand'):
+            with self.subTest(selection=selection):
+                self.shutdown_selected_client_outside_path(selection, False)
+
+    def test_selected_ssh_client_outside_path_closes_master_on_stale_recovery(self):
+        for selection in ('GIT_SSH_COMMAND', 'GIT_SSH', 'core.sshCommand'):
+            with self.subTest(selection=selection):
+                self.shutdown_selected_client_outside_path(selection, True)
+
+    def test_changed_client_and_invalid_recovery_record_preserve_owned_connection(self):
+        f = self.f
+        url = f.ssh()
+        ssh = str(Path(shutil.which('ssh')).resolve())
+        command = shlex.quote(ssh) + f.env.pop('GIT_SSH_COMMAND')[3:]
+        executable = f.root / 'selected ssh wrapper'
+        executable.write_text('#!/bin/sh\nexec ' + command + ' "$@"\n')
+        executable.chmod(0o700)
+        f.env['GIT_SSH'] = str(executable)
+        process = f.probe(url)
+        f.line(process)
+        directory = next(f.root.glob('*/ssh-control')).parent
+        record_path = directory / 'ssh-control-owner'
+        record = json.loads(record_path.read_text())
+        self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
+        control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
+        checked = subprocess.run(control, capture_output=True, check=True, timeout=5)
+        descriptor = os.pidfd_open(int(re.search(rb'pid=(\d+)', checked.stderr).group(1)))
+        backup = f.root / 'original selected client'
+        executable.rename(backup)
+        executable.write_text('#!/bin/sh\nexit 0\n')
+        executable.chmod(0o700)
+        try:
+            process.stdin.write(b'exit\n'); process.stdin.flush()
+            _, errors = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn(b'probe recovery retained', errors)
+            self.assertTrue(directory.exists())
+            self.assertFalse(select.select([descriptor], [], [], 0)[0])
+            pin = ['git', '--git-dir=' + str(directory / 'remote-repository'), 'show-ref', '--verify', 'refs/git-on/probe']
+            self.assertEqual(subprocess.run(pin, capture_output=True, timeout=5).returncode, 0)
+            (directory / '.lock').touch()
+            (directory / '.state').write_text(json.dumps(dict(
+                format='git-on-temp-v1', id='probe', keep=False,
+                git_dir=str(directory / 'remote-repository'), tree_oid=f.tree, pin_ref='refs/git-on/probe')))
+            executable.unlink(); backup.rename(executable)
+            for invalid in ('relative', 'unknown-field', 'invalid-type', 'directory', 'symlink', 'in-place'):
+                with self.subTest(record=invalid):
+                    changed = json.loads(json.dumps(record))
+                    if invalid == 'relative': changed['client']['path'] = list(b'ssh')
+                    elif invalid == 'unknown-field': changed['client']['command'] = 'do not execute'
+                    elif invalid == 'invalid-type': changed['client']['path'] = 'not byte provenance'
+                    elif invalid == 'in-place':
+                        original = executable.read_bytes()
+                        metadata = executable.stat()
+                        executable.write_bytes(original + b'# changed\n')
+                    else:
+                        executable.rename(backup)
+                        if invalid == 'directory': executable.mkdir()
+                        else: executable.symlink_to(backup)
+                    record_path.write_text(json.dumps(changed))
+                    cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
+                                             env=f.env, capture_output=True, timeout=10)
+                    self.assertEqual(cleanup.returncode, 125, cleanup.stderr)
+                    self.assertTrue(directory.exists())
+                    self.assertFalse(select.select([descriptor], [], [], 0)[0])
+                    self.assertEqual(subprocess.run(control, capture_output=True, timeout=5).returncode, 0)
+                    self.assertEqual(subprocess.run(pin, capture_output=True, timeout=5).returncode, 0)
+                    if invalid in ('directory', 'symlink'):
+                        if invalid == 'directory': executable.rmdir()
+                        else: executable.unlink()
+                        backup.rename(executable)
+                    elif invalid == 'in-place':
+                        executable.write_bytes(original)
+                        os.utime(executable, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+            record_path.write_text(json.dumps(record))
+            cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
+                                     env=f.env, capture_output=True, timeout=10)
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            self.assertFalse(directory.exists())
+            self.assertTrue(select.select([descriptor], [], [], 2)[0])
+        finally:
+            if process.poll() is None: process.kill(); process.communicate(timeout=10)
+            if not select.select([descriptor], [], [], 0)[0]:
+                with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            os.close(descriptor)
+
+    def test_sigkilled_master_stale_socket_does_not_block_recovery(self):
+        f = self.f
+        process = f.probe(f.ssh())
+        f.line(process)
+        directory = next(f.root.glob('*/ssh-control')).parent
+        checked = subprocess.run(['ssh', '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control'],
+                                 capture_output=True, check=True, timeout=5)
+        descriptor = os.pidfd_open(int(re.search(rb'pid=(\d+)', checked.stderr).group(1)))
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            self.assertTrue(select.select([descriptor], [], [], 2)[0])
+            self.assertTrue((directory / 'ssh-control').exists(), 'SIGKILL fixture did not leave its socket node')
+            process.kill(); process.communicate(timeout=10)
+            (directory / '.lock').touch()
+            (directory / '.state').write_text(json.dumps(dict(
+                format='git-on-temp-v1', id='probe', keep=False,
+                git_dir=str(directory / 'remote-repository'), tree_oid=f.tree, pin_ref='refs/git-on/probe')))
+            cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
+                                     env=f.env, capture_output=True, timeout=10)
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            self.assertFalse(directory.exists())
+        finally:
+            if process.poll() is None: process.kill(); process.communicate(timeout=10)
+            if not select.select([descriptor], [], [], 0)[0]:
+                with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            os.close(descriptor)
 
     def test_unused_git_ssh_respects_command_and_configuration_precedence(self):
         f = self.f

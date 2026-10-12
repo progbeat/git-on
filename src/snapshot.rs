@@ -576,13 +576,13 @@ impl Snapshot {
             .lock()
             .map_err(|_| anyhow::anyhow!("snapshot object cache poisoned"))
     }
-    pub fn stop_remote_transport(&self) {
+    pub fn stop_remote_transport(&self) -> Result<()> {
         crate::git::stop_operations();
-        if let Ok(state) = self.state() {
-            if let Some(remote) = &state.remote {
-                remote.stop_transport();
-            }
+        let state = self.state()?;
+        if let Some(remote) = &state.remote {
+            remote.stop_transport()?;
         }
+        Ok(())
     }
     pub fn remote_failure(&self) -> Option<String> {
         self.state()

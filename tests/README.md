@@ -138,6 +138,18 @@ recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurre
 runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
 retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.
 
+Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
+during startup transport and after the mounted child starts. SIGKILL observations
+kill only the runner first: assert the exact mount remains in `mountinfo`, fresh
+directory access returns `ENOTCONN`, the child group and SSH master survive,
+private files and the exact pin remain, and run/cache flocks are available.
+External fixture cleanup stops the owned child before checked stale recovery;
+recovery must remove the mount and private state and close the recorded master.
+A native fusermount wrapper holds helper completion after the actual mount to
+exercise SIGKILL before the child can start. Each scenario uses private fixtures,
+bounded waits and external cleanup. These are crash-recovery observations, not a
+promise that cleanup handlers execute under SIGKILL or that `auto_unmount` is set.
+
 ## Randomized filesystem differential stress
 
 See [stress.md](stress.md) for bounded seeded real-mount operation generation,
