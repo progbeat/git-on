@@ -458,7 +458,7 @@ impl Snapshot {
             let oid = crate::remote::Remote::resolve(&advertisement, revision)?;
             remote.ensure(oid)?;
             (Repository::open_bare(&remote.dir)?, Some(remote), oid, None)
-        } else {
+        } else if verify {
             let git = crate::git::Git::capture(repo_path)?;
             let oid = git.resolve(OsStr::new(revision))?;
             (
@@ -467,6 +467,17 @@ impl Snapshot {
                 oid,
                 Some(git),
             )
+        } else {
+            // Preserve the original local runtime contract: unverified loads
+            // use bundled libgit2 without invoking or configuring native Git.
+            let repo = Repository::discover(repo_path).context("discover Git repository")?;
+            let tree_oid = repo
+                .revparse_single(spec)
+                .with_context(|| format!("resolve tree-ish {spec:?}"))?
+                .peel_to_tree()
+                .context("tree-ish does not resolve to a tree")?
+                .id();
+            (repo, None, tree_oid, None)
         };
         let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {
             if let Some(remote) = remote {

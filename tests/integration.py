@@ -117,7 +117,7 @@ class CliTests(RepositoryTest):
             self.assert_success(result)
             self.assertTrue(b"git-on" in result.stdout or b"git on" in result.stdout)
             if arg != "--version":
-                self.assertIn(b"[--keep|-k] -- <command>", result.stdout)
+                self.assertIn(b"REV [--keep|-k|--verify] -- <command>", result.stdout)
                 self.assertIn(b"--keep, -k", result.stdout)
                 self.assertIn(b"--verify", result.stdout)
                 self.assertIn(b"One operand selects local REV; two select repository and REV", result.stdout)
@@ -214,6 +214,25 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_review_local_unverified_run_without_native_git(self):
+        programs = self.root / "fuse-only"
+        programs.mkdir()
+        for name in ("fusermount3", "fusermount"):
+            helper = shutil.which(name)
+            if helper:
+                (programs / name).symlink_to(helper)
+        self.assertIsNone(shutil.which("git", path=str(programs)))
+        for revision, path, expected in (("HEAD", "tracked.txt", b"committed\n"),
+                                         ("HEAD:subtree", "source.txt", b"subtree source\n")):
+            with self.subTest(revision=revision):
+                result, run = self.python(
+                    f'import sys; sys.stdout.buffer.write(open({path!r},"rb").read())',
+                    tree=revision, extra_env={"PATH": str(programs)})
+                self.assert_success(result)
+                self.assertEqual(result.stdout, expected)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
+
     def test_snapshot_ignores_dirty_index_worktree_and_untracked_files(self):
         self.put("tracked.txt", "staged\n")
         git(self.repo, "add", "tracked.txt")

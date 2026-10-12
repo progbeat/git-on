@@ -195,6 +195,58 @@ class RemoteTests(unittest.TestCase):
         payload=b' \t\r\n\v\f\x00\xffbinary\x80\x00 \t\r\n\v\f'
         actual=run([sys.executable,'-c','import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())'],input=payload)
         self.assertEqual(actual,payload)
+    def test_review_explicit_remote_refs_do_not_expand_as_short_names(self):
+        f=self.f
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        other=f.git('commit-tree',other_tree,data=b'collision fixture\n')
+        for name in ('refs/heads/HEAD','refs/tags/HEAD','refs/heads/refs/heads/main','refs/tags/refs/heads/main'):
+            f.git('update-ref',name,other)
+        url=f.https(); self.addCleanup(f.server.shutdown)
+        advertisement=run(['git','ls-remote','--symref','--',url],env=f.env)
+        for revision in ('HEAD','refs/heads/main'):
+            with self.subTest(revision=revision):
+                self.assertIn(f'{f.commit}\t{revision}\n'.encode(),advertisement)
+                process=f.probe(url,revision)
+                self.assertEqual(f.line(process)['tree'],f.tree)
+                value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n')
+                f.finish(process)
+    def test_review_unrelated_non_utf8_remote_ref_preserves_ascii_selection(self):
+        f=self.f; name=b'refs/heads/unrelated-\xff'
+        f.git('update-ref',os.fsdecode(name),f.commit)
+        url=f.https(); self.addCleanup(f.server.shutdown)
+        advertisement=run(['git','ls-remote','--symref','--',url],env=f.env)
+        self.assertIn(f.commit.encode()+b'\t'+name+b'\n',advertisement)
+        for revision in ('HEAD','refs/heads/main'):
+            with self.subTest(revision=revision):
+                process=f.probe(url,revision)
+                self.assertEqual(f.line(process)['tree'],f.tree)
+                value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n')
+                f.finish(process)
+    def test_review_local_unverified_loader_needs_no_native_git(self):
+        f=self.f; f.cwd=f.repo
+        f.git('tag','-a','-m','local annotated tag','local-tag',f.commit)
+        # A replacement ref must not redirect the exact libgit2 object reads.
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        replacement=f.git('commit-tree',other_tree,data=b'replacement fixture\n')
+        f.git('update-ref','refs/replace/'+f.commit,replacement)
+        child=f.git('commit-tree',f.tree,'-p',f.commit,data=b'local ancestry fixture\n')
+        f.git('update-ref','refs/heads/main',child)
+        f.git('update-ref','refs/replace/'+child,replacement)
+        nested=f.commit; kind='commit'
+        for depth in range(70):
+            nested=f.git('hash-object','-t','tag','-w','--stdin',data=f'object {nested}\ntype {kind}\ntag local-depth-{depth}\ntagger Fixture <fixture@example.invalid> 0 +0000\n\nlegacy local tag\n'.encode())
+            kind='tag'
+        revisions=(('HEAD',f.tree,'deep/file'),('HEAD:deep',f.subtree,'file'),
+                   ('HEAD^',f.tree,'deep/file'),('HEAD~1',f.tree,'deep/file'),
+                   (f.tree,f.tree,'deep/file'),('local-tag',f.tree,'deep/file'),
+                   (nested,f.tree,'deep/file'))
+        empty_path=f.root/'no-programs'; empty_path.mkdir(); f.env['PATH']=str(empty_path)
+        for revision,tree,path in revisions:
+            with self.subTest(revision=revision):
+                process=f.probe('local',revision)
+                self.assertEqual(f.line(process)['tree'],tree)
+                value,_=f.operation(process,'read '+path); self.assertEqual(value['data'],'expected\n')
+                f.finish(process)
     def test_https_cold_warm_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         process=f.probe(url); start=f.line(process)

@@ -10,7 +10,9 @@ supports local upload-pack fixtures. URL rewriting is applied once.
 Remote revisions accept HEAD, an advertised full ref, an unambiguous branch/tag
 name or a full SHA-1 OID. Ancestry, reflog and abbreviated-ID syntax require local
 objects and are unsupported remotely. Resolve the ref once, then request only
-that OID. Ref movement cannot change the selected tree. SHA-256 repositories,
+that OID. Match HEAD and full refs literally; expand only short names to branch
+and tag candidates. Unrelated non-UTF-8 ref names do not prevent ASCII selection.
+Ref movement cannot change the selected tree. SHA-256 repositories,
 submodules and Git LFS remain unsupported.
 
 ## Object demand and cache lifetime
@@ -94,6 +96,10 @@ control-socket paths must fit Linux's length limit. Cancellation terminates owne
 transport subprocesses and follows the normal unmount/cleanup path.
 
 ## Native signature verification
+
+Local execution without `--verify` retains its bundled-libgit2 revision resolver
+and does not require or invoke native Git. Remote execution and all `--verify`
+runs use native Git as described here.
 
 `--verify` resolves one commit or annotated tag OID, then calls native
 `git verify-commit OID` or `git verify-tag OID`. Native Git's exit status decides

@@ -27,8 +27,10 @@ git on HEAD:experiments -- uv run --locked experiment.py
 
 Prebuilt releases support **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseline),
 plus the shared zlib and GCC runtimes (`libz.so.1`, `libgcc_s.so.1`). Running git-on
-requires native Git, a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
-`fuse3` package. The installer needs `curl` and Python 3.8+.
+requires a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
+`fuse3` package. Direct local unverified runs use bundled libgit2 and need no Git
+executable. Remote runs and `--verify` require native Git; invoking the `git on`
+external command also uses Git. The installer needs `curl` and Python 3.8+.
 
 ### Install or update
 

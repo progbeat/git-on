@@ -175,6 +175,70 @@ local remote suite then passed all 21 executable cases with eight explicit
 FUSE/million-selector skips, and all ten SSH/configuration regressions passed.
 The next exact-head CI run must still pass every required check.
 
+## Explicit remote refs, byte names and displayed verification options
+
+The follow-up review at `77428030eed52d440b682eb55e9249f63a5d5e8b`
+identified three reproducible selection/presentation defects. Real disposable
+Git upload-pack advertisements confirmed that HEAD and `refs/heads/main` remain
+valid explicit selections even with branches/tags named HEAD or full-ref-looking
+short names such as `refs/heads/refs/heads/main`. Native Git fetched their literal
+targets, while the source probe rejected both as ambiguous. The retained HTTPS
+`test_review_explicit_remote_refs_do_not_expand_as_short_names` reproduced both
+failures against distinct colliding trees before the fix, then pinned and read
+the intended original tree afterward. Short branch/tag ambiguity is preserved.
+
+Native Git also accepted a valid unrelated `refs/heads/unrelated-\xff` byte name
+and advertised it unchanged. The old resolver decoded the whole advertisement
+and rejected valid ASCII HEAD/full-ref selection as "remote refs are not UTF-8".
+`test_review_unrelated_non_utf8_remote_ref_preserves_ascii_selection` retains
+that native byte-ref creation, checks the raw advertisement and reproduces both
+ASCII-selection failures. Resolution now compares line/tab/ref names as bytes
+and decodes an object ID only for a matched record. Both selected trees and blob
+contents passed after the fix.
+
+The parser already accepted `--verify` before or after REV; the defect was its
+help line listing only keep flags after REV. The existing CLI help acceptance
+assertion failed when required to show `REV [--keep|-k|--verify]`, then passed
+after making both option slots match the documented syntax. Native verification
+behavior and command-tail parsing remain unchanged. All three focused loader
+regressions and the help acceptance passed after the fixes.
+
+## Local unverified execution retains the 1.0.0 runtime contract
+
+Follow-up review identified that local execution without `--verify` now called
+native Git configuration capture and revision resolution unconditionally.
+Independent comparison of unchanged snapshot modules from authentic master
+`b411e5d00018be66475116c3373eff9e21d2a69e` and feature head
+`77428030eed52d440b682eb55e9249f63a5d5e8b` reproduced the regression using the
+same compiled libgit2/dependencies and disposable repositories. With PATH set
+to an empty directory, master loaded and read `HEAD`, `HEAD:deep`, `HEAD^`, an
+annotated tag and a 70-tag chain; the feature failed each selection with
+"read effective Git configuration: start native Git operation: No such file
+or directory". Replacement refs pointing HEAD at a different tree did not
+redirect the master's exact object reads.
+
+A second comparison with native Git available exposed an additional legacy
+compatibility change: master read the 70-tag chain successfully, while the
+feature failed with "annotated tag chain exceeds 64 objects". The new bound
+belongs to remote/verified resolution, not existing unverified local execution.
+The project's release policy requires a minor release to preserve its documented
+environment contract; the 1.0.0 runtime requirements did not include native Git
+for direct local binary invocation.
+
+Local unverified selection now uses the original libgit2 discovery,
+`revparse_single` and `peel_to_tree` path before the shared exact-tree pin/setup.
+Remote and verified resolution retain native Git and exact commit/tag signature
+binding. Independent replay against the fixed source passed all five former
+failures with no Git on PATH, including replacements and the 70-tag chain.
+The permanent `test_review_local_unverified_loader_needs_no_native_git` covers
+the Git-free loader, selectors, ancestry, replacements and the 70-tag chain,
+and passed independently after the fix. The mounted
+`test_review_local_unverified_run_without_native_git` runs the actual binary
+with only FUSE helpers on PATH and an absolute Python command. Mounted evidence
+still requires the next exact-head CI run. Runtime documentation now scopes the
+native Git dependency to remote execution, verification and the `git on`
+external-command invocation, preserving the additive 1.1.0 release classification.
+
 ## Reproduced runtime defects
 
 The independent review used `03f18c36fcb01f8d49cb196e250cee2bffd0f86a` as the

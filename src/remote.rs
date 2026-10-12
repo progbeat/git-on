@@ -207,21 +207,27 @@ impl Remote {
         if revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(Oid::from_str(revision)?);
         }
-        let refs = std::str::from_utf8(advertisement).context("remote refs are not UTF-8")?;
-        let names = [
-            revision.to_owned(),
-            format!("refs/heads/{revision}"),
-            format!("refs/tags/{revision}"),
-        ];
+        let mut names = vec![revision.to_owned()];
+        if revision != "HEAD" && !revision.starts_with("refs/") {
+            names.extend([
+                format!("refs/heads/{revision}"),
+                format!("refs/tags/{revision}"),
+            ]);
+        }
         let mut matches = Vec::new();
-        for line in refs.lines() {
-            let Some((oid, name)) = line.split_once('\t') else {
+        for line in advertisement.split(|byte| *byte == b'\n') {
+            let Some(separator) = line.iter().position(|byte| *byte == b'\t') else {
                 continue;
             };
-            if names.iter().any(|n| n == name) && !oid.starts_with("ref:") {
+            let (oid, name) = line.split_at(separator);
+            let name = &name[1..];
+            if names.iter().any(|n| n.as_bytes() == name) && !oid.starts_with(b"ref:") {
                 matches.push((
                     name,
-                    Oid::from_str(oid).context("remote SHA-256 repositories are unsupported")?,
+                    Oid::from_str(
+                        std::str::from_utf8(oid).context("remote object ID is not ASCII")?,
+                    )
+                    .context("remote SHA-256 repositories are unsupported")?,
                 ));
             }
         }
