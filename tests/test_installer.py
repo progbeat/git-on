@@ -532,6 +532,37 @@ else:
         self.assertNotIn('PATH selects', result.stdout)
         self.assertNotIn('export PATH=', result.stdout)
 
+    def test_symlinked_path_directory_selects_installed_binary_without_guidance(self):
+        alias = self.root / 'bin directory alias'
+        alias.symlink_to(self.bin, target_is_directory=True)
+        self.env['PATH'] = str(alias) + os.pathsep + self.env['PATH']
+        result = self.run_script()
+        selected = shutil.which('git-on', path=self.env['PATH'])
+        self.assertEqual(selected, str(alias / 'git-on'))
+        self.assertTrue(os.path.samefile(selected, self.old))
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertTrue(alias.is_symlink())
+
+    def test_symlinked_path_directory_does_not_hide_an_earlier_executable(self):
+        alias = self.root / 'bin directory alias'
+        alias.symlink_to(self.bin, target_is_directory=True)
+        earlier = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
+        earlier.write_bytes(content)
+        earlier.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(alias) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
+        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
+        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertFalse(marker.exists())
+        self.assertEqual(earlier.read_bytes(), content)
+        self.assertTrue(alias.is_symlink())
+
     def test_owner_write_missing_names_directory_mode_and_safe_alternative(self):
         self.bin.chmod(0o555)
         self.addCleanup(lambda: self.bin.chmod(0o755))

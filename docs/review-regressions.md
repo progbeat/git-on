@@ -1310,3 +1310,26 @@ Red/green results are in
 `target/git-operands-green/copilot-converter-anonymous-output.txt`.
 The original real-codec reproduction is recorded in
 `target/converter-staging-substitution-red/proof.json`.
+
+## Installer PATH directory aliases (Copilot follow-up)
+
+At authentic head `302a3753`, the installer compared PATH directory spellings
+before examining the selected executable. Two permanent shell-entrypoint tests
+failed: an alias directory already selecting the installed binary received a
+redundant prepend instruction, while an earlier executable before that alias
+received no shadow warning. The fixtures use real directory symlinks and
+verified offline release packages; a marker proves the earlier executable is
+never run by these diagnostics.
+
+The installer now checks the selected executable's `samefile` identity first.
+Directory identity also determines whether a missing-location hint is needed.
+Aliases selecting the installation emit neither warning nor prepend advice;
+an earlier different binary is identified, and genuinely absent installation
+directories still receive shell-quoted PATH guidance.
+
+Both focused regressions and all 35 installer tests pass. The authentic script
+is retained at `target/git-operands-red/install-302a-before.sh` with SHA-256
+`263feedb7c189a3ac57cee027ee82d0a0fa50aaee85a230886d0e5f201291cfc`.
+Red/green evidence is in
+`target/git-operands-{red,green}/copilot-installer-path-directory-alias.txt`.
+Runtime source, version, executable and animation are unchanged.

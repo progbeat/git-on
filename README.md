@@ -186,7 +186,7 @@ release or CI support guarantee. Containers need `/dev/fuse` and permission to m
 Git executable bits and symlinks are preserved. Submodules and Git LFS content
 fail when accessed; unrelated files remain usable. Git SHA-256 repositories are
 unsupported. The mount contains source files without a synthetic `.git` checkout;
-Reading the snapshot does not run checkout filters or worktree hooks. Native
+reading the snapshot does not run checkout filters or worktree hooks. Native
 fetches honor configured Git hooks, which run as ordinary user programs outside
 the mount. Fetch destination refs are written only in git-on's private repository.
 
