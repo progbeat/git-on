@@ -390,6 +390,16 @@ def main(argv=None):
     if not any(os.path.abspath(entry or os.curdir) == str(bin_dir)
                for entry in os.environ.get("PATH", "").split(os.pathsep)):
         print("For this shell: export PATH=" + shlex.quote(str(bin_dir)) + ':"$PATH"; git on --version')
+    else:
+        selected = shutil.which("git-on")
+        try:
+            shadowed = selected is not None and not os.path.samefile(selected, destination)
+        except OSError:
+            shadowed = False
+        if shadowed:
+            print("PATH selects " + shlex.quote(os.path.abspath(selected))
+                  + " before this installation; run " + shlex.quote(str(destination))
+                  + " --version to use the installed binary.")
     if not shutil.which("fusermount3"):
         print("Before running git on: install your distribution's fuse3 package (fusermount3 is missing).")
     try:

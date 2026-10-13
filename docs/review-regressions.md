@@ -959,3 +959,51 @@ After correcting the help and documentation, all 11 `CliTests` and all 12 Rust
 `cli::tests` pass; parser behavior and operand grammar are unchanged. Evidence
 is in `target/git-operands-{red,green}/copilot-option-placement.log` and
 `target/git-operands-green/copilot-cli-unit.log`.
+
+## Installer PATH precedence (Copilot follow-up)
+
+At authentic head `e94360c1a`, installation succeeded silently when PATH selected
+an earlier executable named `git-on`. The preserved installer has SHA-256
+`a767f86485298f686a2b70be25257703f03fa5558fb54406f71a324ff6f63c22`.
+`test_success_identifies_an_earlier_executable_without_running_it` failed against
+that script before the correction. It now requires the actual shadowing path
+and a shell-quoted command that directly checks the newly installed binary.
+
+The installer checks PATH selection with `which` and file identity with
+`samefile`; it never executes the earlier binary or edits PATH or profiles.
+`test_no_shadow_warning_when_installed_binary_is_first_on_path` and
+`test_path_alias_of_installed_binary_is_not_a_shadow` cover the non-shadowing
+cases, and the existing missing-directory guidance remains covered. All 33
+installer tests pass after the correction; shell syntax and diff checks pass.
+The authentic old script is `target/git-operands-red/installer-shadow-before.sh`,
+with evidence in
+`target/git-operands-{red,green}/copilot-installer-path-shadow.txt`.
+
+## Hash-prefixed alternates: rejected Copilot finding
+
+Copilot claimed that skipping an unquoted `#` component in
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` differed from native Git. The claim was
+rejected after checking Git itself: host Git 2.55.0 ignores `#alternate-objects`
+and `:#alternate-objects::`, but reads objects through `"#alternate-objects"`.
+The minimum supported
+[Git 2.45.1 source](https://github.com/git/git/blob/v2.45.1/object-file.c#L530-L579)
+also treats a leading `#` as a comment before checking quoted paths, and
+[`prepare_alt_odb`](https://github.com/git/git/blob/v2.45.1/object-file.c#L885-L894)
+uses that parser for environment alternates with `PATH_SEP`.
+
+`test_local_hash_prefixed_alternate_components_match_native_git` keeps the
+commit, tree and blob exclusively in a real hash-prefixed alternate directory.
+It compares native tree resolution and file reads with actual FUSE command
+execution for five variants: unquoted, quoted, empty components around either
+form, and a comment followed by a quoted path. Native-rejected variants require
+runner status 125 and no command execution; accepted variants must read the
+exact alternate bytes. Every variant leaves caller refs, object files and run
+cleanup unchanged.
+
+All five variants pass against the unchanged authentic release executable with
+SHA-256 `7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f`;
+evidence is `target/git-operands-green/copilot-hash-alternate-native-oracle.txt`.
+There is no runtime fix or authentic red-before defect to claim for this
+finding. The original native oracle rejected the proposed acceptance behavior
+before invoking the runner, so that failed experiment is not runtime regression
+evidence.

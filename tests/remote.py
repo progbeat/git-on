@@ -643,6 +643,56 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout,b'quoted alternate\n')
             self.assertEqual(list(f.root.glob('git-on-*')),[])
+    def test_local_hash_prefixed_alternate_components_match_native_git(self):
+        if not OPTIONS.require_fuse: self.skipTest('actual FUSE execution explicitly required')
+        f=self.f; f.cwd=f.repo; original=dict(f.env)
+        objects=f.repo/'#alternate-objects'; objects.mkdir()
+        writer=dict(original,GIT_OBJECT_DIRECTORY=str(objects))
+        def write(*args,data):
+            return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
+        payload=b'literal hash alternate\n'
+        blob=write('hash-object','-w','--stdin',data=payload)
+        tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=write('commit-tree',tree,data=b'hash-prefixed alternate fixture\n')
+        def object_files(directory):
+            return {str(path.relative_to(directory)):path.read_bytes()
+                    for path in directory.rglob('*') if path.is_file()}
+        before_refs=run(['git','-C',f.repo,'for-each-ref'],env=original)
+        before_objects={directory:object_files(directory) for directory in (f.repo/'objects',objects)}
+        marker=f.root/'command-output'
+        code='from pathlib import Path; import sys; data=Path("file").read_bytes(); Path(sys.argv[1]).write_bytes(data); sys.stdout.buffer.write(data)'
+        cases=(('unquoted','#alternate-objects',False),
+               ('quoted','"#alternate-objects"',True),
+               ('empty-components',':#alternate-objects::',False),
+               ('quoted-with-empty-components',':"#alternate-objects"::',True),
+               ('comment-then-quoted','#ignored:"#alternate-objects"',True))
+        for name,value,accepted in cases:
+            with self.subTest(component=name):
+                env=dict(original,GIT_ALTERNATE_OBJECT_DIRECTORIES=value)
+                native_tree=subprocess.run(['git','-C',f.cwd,'rev-parse','--verify',commit+'^{tree}'],
+                                           env=env,capture_output=True,timeout=10)
+                native_file=subprocess.run(['git','-C',f.cwd,'show',commit+':file'],
+                                           env=env,capture_output=True,timeout=10)
+                self.assertEqual(native_tree.returncode==0,accepted,native_tree.stderr)
+                self.assertEqual(native_file.returncode==0,accepted,native_file.stderr)
+                if accepted:
+                    self.assertEqual(native_tree.stdout.decode().strip(),tree)
+                    self.assertEqual(native_file.stdout,payload)
+                marker.unlink(missing_ok=True)
+                result=subprocess.run([str(OPTIONS.binary),commit,'--',sys.executable,'-c',code,str(marker)],
+                                      cwd=f.cwd,env=env,capture_output=True,timeout=20)
+                self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=original),before_refs)
+                for directory in before_objects:
+                    self.assertEqual(object_files(directory),before_objects[directory])
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                if accepted:
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(result.stdout,payload)
+                    self.assertEqual(marker.read_bytes(),payload)
+                else:
+                    self.assertEqual(result.returncode,125,result.stderr)
+                    self.assertEqual(result.stdout,b'')
+                    self.assertFalse(marker.exists(),'rejected native object environment executed its command')
     def test_local_relative_object_environments_follow_native_worktree_setup(self):
         f=self.f; worktree=f.root/'worktree'
         run(['git','init','--quiet',worktree],env=f.env)

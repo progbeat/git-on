@@ -492,6 +492,46 @@ else:
         self.env['PATH'] = str(self.bin) + '/' + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
         self.assertNotIn('export PATH=', self.run_script().stdout)
 
+    def test_success_identifies_an_earlier_executable_without_running_it(self):
+        earlier = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
+        earlier.write_bytes(content)
+        earlier.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
+        result = self.run_script()
+        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
+        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
+        self.assertEqual(earlier.read_bytes(), content)
+        self.assertFalse(marker.exists())
+
+    def test_no_shadow_warning_when_installed_binary_is_first_on_path(self):
+        later = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        later.write_bytes(b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\n')
+        later.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.bin) + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(self.old))
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_path_alias_of_installed_binary_is_not_a_shadow(self):
+        alias = self.fakebin / 'git-on'
+        alias.symlink_to(self.old)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(alias))
+        self.assertTrue(os.path.samefile(alias, self.old))
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+
     def test_owner_write_missing_names_directory_mode_and_safe_alternative(self):
         self.bin.chmod(0o555)
         self.addCleanup(lambda: self.bin.chmod(0o755))
