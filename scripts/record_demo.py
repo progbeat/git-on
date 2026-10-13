@@ -95,18 +95,29 @@ class RecordingDestination:
             self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self.check()
 
+    def check_staging_entry(self, staging_fd, name):
+        try:
+            current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise self.refuse() from None
+        pinned = os.fstat(staging_fd)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise self.refuse()
+
     def publish(self, staging_fd, staging_name):
         self.check(staging_name)
         for name in os.listdir(staging_fd):
             source = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
             if not stat.S_ISREG(source.st_mode):
                 raise RuntimeError(f"Unsupported recording artifact: {name}")
+        self.check_staging_entry(staging_fd, staging_name)
         try:
             rename_noreplace(staging_name, "capture", self.fd)
         except FileExistsError:
             raise self.refuse() from None
-        # The whole group is visible now. Never roll it back: another writer
-        # may already have added or replaced an entry inside it.
+        # A different directory can replace the source name during rename.
+        # Detect that after publication without rolling back foreign entries.
+        self.check_staging_entry(staging_fd, "capture")
         self.published = True
         self.check(require_empty=False)
 
@@ -216,10 +227,17 @@ def _record(binary, target):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
-        size = (staging / "demo.gif").stat().st_size
+        gif_fd = os.open("demo.gif", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=staging_fd)
+        with os.fdopen(gif_fd, "rb") as gif:
+            if not stat.S_ISREG(os.fstat(gif.fileno()).st_mode):
+                raise RuntimeError("Unsupported recording artifact: demo.gif")
+            contents = gif.read()
+        size = len(contents)
         info["gif_bytes"] = size
-        info["gif_sha256"] = hashlib.sha256((staging / "demo.gif").read_bytes()).hexdigest()
-        with (staging / "demo.json").open("x") as metadata:
+        info["gif_sha256"] = hashlib.sha256(contents).hexdigest()
+        metadata_fd = os.open("demo.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o600, dir_fd=staging_fd)
+        with os.fdopen(metadata_fd, "w") as metadata:
             metadata.write(json.dumps(info, indent=2) + "\n")
         if size > 5 * 1024 * 1024:
             raise RuntimeError("GIF exceeds the 5 MiB repository-asset budget: do not commit it or open a PR")

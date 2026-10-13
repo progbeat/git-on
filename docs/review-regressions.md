@@ -1333,3 +1333,29 @@ is retained at `target/git-operands-red/install-302a-before.sh` with SHA-256
 Red/green evidence is in
 `target/git-operands-{red,green}/copilot-installer-path-directory-alias.txt`.
 Runtime source, version, executable and animation are unchanged.
+
+## Authenticate recording staging during publication (Copilot follow-up)
+
+At authentic head `d78a95c7`, three permanent regressions fail: replacing the
+staging directory before publication or at the rename syscall boundary produces
+false success, while replacement after a successful recorder process redirects
+the GIF read and creates metadata inside the foreign directory. The fixtures
+perform real directory moves and the native atomic publication operation; the
+successful-process fixture supplies observed tree/status/cleanup events without
+running VHS or mounting FUSE. Its ordinary-success baseline already passes.
+
+GIF reading and exclusive metadata creation now use the held staging FD, with
+no-follow opening and regular-file validation for the GIF. Size and digest come
+from the same read. Publication checks the source directory's device/inode
+before rename and checks `capture` against the held staging FD afterward, before
+reporting success. A substitution exactly at rename may move the foreign
+directory; it is detected without rollback or deletion, and diagnostics report
+the retained owned stage through its FD. All 23 recorder tests pass, preserving
+both foreign bytes and owned logs/metadata in the controlled failures.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-d78a-before.py` with SHA-256
+`6701a0368fe09a801dd8ff9f8d08bbdd301ab903816856d27214d73760d1b00b`.
+Red/green evidence is in
+`target/git-operands-{red,green}/copilot-recording-stage-identity.txt`.
+Runtime source, version, executable and animation are unchanged.

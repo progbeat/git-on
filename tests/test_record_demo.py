@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Protect existing recording artifacts without running VHS or mounting FUSE."""
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import errno
+import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -47,7 +49,7 @@ class RecordingDestinationTests(unittest.TestCase):
         return patch.object(MOD.os, "listdir", side_effect=lambda fd:
                             names if fd == staging_fd else real_listdir(fd))
 
-    def attempt_recording(self, dependency_probe=None, recorder_failure=None):
+    def attempt_recording(self, dependency_probe=None, recorder_failure=None, output_probe=None):
         real_open = os.open
 
         def fixture_open(path, *args, **kwargs):
@@ -58,7 +60,7 @@ class RecordingDestinationTests(unittest.TestCase):
         with patch.object(MOD.shutil, "which", return_value="fixture-tool",
                           side_effect=dependency_probe) as dependencies, \
                 patch.object(MOD.os, "open", side_effect=fixture_open) as opened, \
-                patch.object(MOD, "output", return_value="fixture version"), \
+                patch.object(MOD, "output", return_value="fixture version", side_effect=output_probe), \
                 patch.object(MOD.platform, "node", return_value="fixture-host"), \
                 patch.object(MOD.platform, "platform", return_value="fixture-platform"), \
                 patch.object(MOD.subprocess, "Popen", side_effect=recorder_failure or RuntimeError(
@@ -69,6 +71,43 @@ class RecordingDestinationTests(unittest.TestCase):
             except Exception as caught:
                 error = caught
         return error, dependencies, opened, recorder
+
+    def successful_recording(self, replace_stage=None):
+        def successful_vhs(*args, **kwargs):
+            stage = Path(os.readlink(kwargs["cwd"]))
+            (stage / "demo.gif").write_bytes(b"owned animation fixture")
+            kwargs["stdout"].write("owned VHS diagnostics\n")
+            kwargs["stdout"].flush()
+            runtime = Path(kwargs["env"]["TMPDIR"])
+            run = runtime / "git-on-fixture"
+            (run / "mount").mkdir(parents=True)
+            executable = run / "mount/sl"
+            executable.write_bytes(b"generated SL fixture")
+            executable.chmod(0o755)
+            (run / ".state").write_text(json.dumps({"tree_oid": MOD.TREE}))
+
+            class SuccessfulVhs:
+                returncode = None
+                observed = False
+
+                def poll(self):
+                    if not self.observed:
+                        self.observed = True
+                        return None
+                    if self.returncode is None:
+                        shutil.rmtree(run)
+                        Path(kwargs["env"]["GIT_ON_DEMO_STATUS"]).write_text("0\n0\n")
+                        if replace_stage is not None:
+                            replace_stage(stage)
+                        self.returncode = 0
+                    return self.returncode
+
+            return SuccessfulVhs()
+
+        with redirect_stdout(io.StringIO()):
+            return self.attempt_recording(
+                recorder_failure=successful_vhs,
+                output_probe=lambda *args: MOD.TREE if "rev-parse" in args else "fixture version")
 
     def assert_rejected_before_probes(self, attempt):
         error, dependencies, opened, recorder = attempt
@@ -397,6 +436,89 @@ class RecordingDestinationTests(unittest.TestCase):
             renamed.assert_called_once()
             linked.assert_not_called()
             unlinked.assert_not_called()
+
+    def test_publication_rejects_replaced_staging_directory_before_rename(self):
+        artifacts = {"demo.gif": b"owned animation", "vhs.log": b"owned diagnostics"}
+        owned = self.root / "retained-owned-stage"
+        with self.staged_publication(artifacts) as (target, staging, fd):
+            staging.rename(owned)
+            staging.mkdir()
+            (staging / "foreign.txt").write_bytes(b"another writer's artifact")
+            with patch.object(MOD, "rename_noreplace", wraps=MOD.rename_noreplace) as renamed:
+                with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                    target.publish(fd, staging.name)
+            renamed.assert_not_called()
+            self.assertFalse(target.published)
+            self.assertFalse((self.destination / "capture").exists())
+            self.assertEqual((staging / "foreign.txt").read_bytes(), b"another writer's artifact")
+            self.assertEqual({path.name: path.read_bytes() for path in owned.iterdir()}, artifacts)
+
+    def test_publication_detects_source_substitution_at_atomic_rename(self):
+        artifacts = {"demo.gif": b"owned animation", "vhs.log": b"owned diagnostics"}
+        owned = self.root / "retained-owned-stage"
+        real_rename = MOD.rename_noreplace
+        with self.staged_publication(artifacts) as (target, staging, fd):
+            def substitute_source(*args, **kwargs):
+                staging.rename(owned)
+                staging.mkdir()
+                (staging / "foreign.txt").write_bytes(b"another writer's artifact")
+                return real_rename(*args, **kwargs)
+
+            with patch.object(MOD, "rename_noreplace", side_effect=substitute_source):
+                with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                    target.publish(fd, staging.name)
+            self.assertFalse(target.published, "foreign publication was reported as an owned capture")
+            capture = self.destination / "capture"
+            self.assertEqual(list(capture.iterdir()), [capture / "foreign.txt"])
+            self.assertEqual((capture / "foreign.txt").read_bytes(), b"another writer's artifact")
+            self.assertEqual({path.name: path.read_bytes() for path in owned.iterdir()}, artifacts)
+            diagnostics = io.StringIO()
+            with redirect_stderr(diagnostics):
+                target.report_retained_staging(fd, staging.name)
+            self.assertIn(str(owned), diagnostics.getvalue())
+
+    def test_successful_recording_uses_held_staging_for_gif_and_metadata(self):
+        self.maxDiff = None
+        owned = self.root / "retained-owned-stage"
+        foreign = None
+
+        def substitute_finished_stage(stage):
+            nonlocal foreign
+            stage.rename(owned)
+            stage.mkdir()
+            foreign = stage
+            (foreign / "demo.gif").write_bytes(b"another writer's animation")
+            (foreign / "foreign.txt").write_bytes(b"another writer's artifact")
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            error, _, _, recorder = self.successful_recording(substitute_finished_stage)
+        recorder.assert_called_once()
+        foreign_location = foreign if foreign.exists() else self.destination / "capture"
+        self.assertEqual({path.name: path.read_bytes() for path in foreign_location.iterdir()}, {
+            "demo.gif": b"another writer's animation", "foreign.txt": b"another writer's artifact"})
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("Refusing to overwrite", str(error))
+        self.assertFalse((self.destination / "capture").exists())
+        metadata = json.loads((owned / "demo.json").read_text())
+        self.assertEqual(metadata["gif_bytes"], len(b"owned animation fixture"))
+        self.assertEqual(metadata["gif_sha256"], hashlib.sha256(b"owned animation fixture").hexdigest())
+        self.assertEqual((owned / "vhs.log").read_text(), "owned VHS diagnostics\n")
+        self.assertIn(str(owned), diagnostics.getvalue())
+
+    def test_successful_recording_publishes_consistent_artifacts_and_provenance(self):
+        error, _, _, recorder = self.successful_recording()
+        self.assertIsNone(error)
+        recorder.assert_called_once()
+        capture = self.destination / "capture"
+        self.assertEqual(list(self.destination.iterdir()), [capture])
+        self.assertEqual((capture / "demo.gif").read_bytes(), b"owned animation fixture")
+        self.assertEqual((capture / "vhs.log").read_text(), "owned VHS diagnostics\n")
+        metadata = json.loads((capture / "demo.json").read_text())
+        self.assertEqual(metadata["gif_bytes"], len(b"owned animation fixture"))
+        self.assertEqual(metadata["gif_sha256"], hashlib.sha256(b"owned animation fixture").hexdigest())
+        self.assertTrue(metadata["generated_sl_removed_with_snapshot"])
+        self.assertEqual(metadata["upstream_tree"], MOD.TREE)
 
     def test_failed_recording_preserves_replacement_staging_directory_and_owned_log(self):
         owned = self.root / "held-owned-stage"

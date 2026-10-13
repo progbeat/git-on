@@ -73,6 +73,8 @@ Choose a new or empty output directory: the helper refuses any existing
 contents before recording. It publishes all generated files together as its
 `capture/` subdirectory with an atomic no-replace directory rename, preserving
 competing output rather than deleting individual files during rollback.
+It verifies that the published directory is the one held by the recorder and
+uses that held directory for reading the animation and writing its metadata.
 If recording or publication fails, it preserves the incomplete staging directory
 and reports its actual path and `vhs.log` for inspection. Choose a fresh output
 directory for the next attempt; failed output is never deleted automatically.
