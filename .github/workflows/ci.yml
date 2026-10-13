@@ -82,6 +82,8 @@ jobs:
       - run: cargo build --release --locked
       - name: Real mount, adversarial operations, process lifecycle, and uv
         run: python3 tests/integration.py --binary target/release/git-on --require-fuse --uv
+      - name: All four write policies on real FUSE
+        run: python3 tests/write_policy.py --binary target/release/git-on --require-fuse
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
           BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
@@ -198,6 +200,8 @@ jobs:
 
   release-policy:
     runs-on: ubuntu-24.04
+    outputs:
+      release_required: ${{ steps.policy.outputs.release_required }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -209,7 +213,9 @@ jobs:
           python3 tests/test_release_policy.py
           python3 tests/test_publish_release.py
           python3 tests/test_installer.py
+          python3 tests/test_record_demo.py
       - name: Validate against current master or the pre-push master SHA
+        id: policy
         env:
           EVENT: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
@@ -274,7 +280,7 @@ jobs:
           retention-days: 7
 
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.release-policy.outputs.release_required == 'true'
     needs: [rust, real-fuse, lazy-performance, release-policy, package]
     runs-on: ubuntu-24.04
     permissions:
@@ -296,6 +302,7 @@ jobs:
       - name: Verify and publish this tested version
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REQUIRED: ${{ needs.release-policy.outputs.release_required }}
         run: |
           python3 scripts/release_policy.py --push-event "$GITHUB_EVENT_PATH"
           (cd dist && sha256sum --check SHA256SUMS)

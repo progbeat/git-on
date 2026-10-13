@@ -1,4 +1,5 @@
 use clap::{builder::OsStringValueParser, error::ErrorKind, Arg, ArgAction, Command};
+use git_on::policy::WritePolicy;
 use std::{ffi::OsString, os::unix::ffi::OsStrExt};
 
 pub const RUN_USAGE: &str = "git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]";
@@ -10,6 +11,7 @@ pub struct RunArgs<'a> {
     pub command: &'a [OsString],
     pub keep: bool,
     pub verify: bool,
+    pub write_policy: WritePolicy,
 }
 
 #[derive(Debug, PartialEq)]
@@ -32,12 +34,12 @@ fn command(mode: Mode) -> Command {
         .bin_name("git on")
         .display_name("git-on")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Run argv with inherited standard I/O on a lazy immutable Git snapshot")
+        .about("Run argv with inherited standard I/O on a lazy Git snapshot")
         .disable_help_flag(true)
         .disable_version_flag(true)
         .args_override_self(true)
         .override_usage(RUN_USAGE)
-        .after_help("Runner options follow REV. The first -- is required before every command; all following argv is literal.\nNew paths must be ignored by the snapshot's .gitignore. Linux /dev/fuse and fusermount3 are required.\nTemporary backing uses the system temporary directory (TMPDIR). GIT_ON_TREE_OID identifies the pinned source tree.\nCleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
+        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand is resolved by native git rev-parse; two operands are passed unchanged to native git fetch. Git owns repository and revision syntax.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nLinux /dev/fuse and fusermount3 are required. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
     if mode != Mode::Cleanup {
         command = command
             .arg(
@@ -54,13 +56,22 @@ fn command(mode: Mode) -> Command {
                     .help("Verify the exact commit/tag signature with native Git"),
             )
             .arg(
+                Arg::new("write-policy")
+                    .long("write-policy")
+                    .require_equals(true)
+                    .value_name("POLICY")
+                    .value_parser(["none", "ignored", "untracked", "all"])
+                    .default_value("ignored")
+                    .help("Temporary writes: none, ignored, untracked, or all"),
+            )
+            .arg(
                 Arg::new("operands")
                     .value_name("REV")
                     .num_args(1..=2)
                     .action(ArgAction::Append)
                     .required(true)
                     .value_parser(OsStringValueParser::new())
-                    .help("Local REV, or REPOSITORY REV for a URL or configured remote"),
+                    .help("Local REV, or REPOSITORY REV passed unchanged to native Git"),
             );
     }
     if mode != Mode::Run {
@@ -132,38 +143,41 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, clap::Error> {
         )
     })?;
     let prefix = &args[..boundary];
+    let mut options = Vec::new();
+    let mut operands = Vec::new();
     for arg in prefix {
-        if arg.is_empty() {
-            return Err(command.error(ErrorKind::InvalidValue, "revision must not be empty"));
-        }
-        if arg.as_bytes().starts_with(b"-")
-            && !command.get_arguments().any(|definition| {
-                definition
-                    .get_long()
-                    .is_some_and(|long| arg.as_bytes().strip_prefix(b"--") == Some(long.as_bytes()))
-                    || definition
-                        .get_short()
-                        .is_some_and(|short| arg.as_bytes() == [b'-', short as u8])
-            })
-        {
-            // Clap normally accepts short bundles and '-' positional values.
-            // Preserve this CLI's exact flag spellings, derived from its schema.
-            return Err(command.error(
-                ErrorKind::UnknownArgument,
-                format!("unexpected argument {arg:?} found"),
-            ));
+        if command.get_arguments().any(|definition| {
+            definition.get_long().is_some_and(|long| {
+                let Some(value) = arg.as_bytes().strip_prefix(b"--") else {
+                    return false;
+                };
+                value == long.as_bytes()
+                    || (value.split(|byte| *byte == b'=').next() == Some(long.as_bytes())
+                        && value.contains(&b'='))
+            }) || definition
+                .get_short()
+                .is_some_and(|short| arg.as_bytes() == [b'-', short as u8])
+        }) {
+            options.push(arg.clone());
+        } else {
+            operands.push(arg.clone());
         }
     }
+    // Parse only our own options. A synthetic boundary protects every other
+    // token from Clap interpretation; Git receives its original bytes, even
+    // for an empty or option-looking repository/revision.
     let matches = command.clone().try_get_matches_from(
-        std::iter::once(OsString::from("git-on")).chain(prefix.iter().cloned()),
+        std::iter::once(OsString::from("git-on"))
+            .chain(options)
+            .chain(std::iter::once(OsString::from("--")))
+            .chain(operands),
     )?;
     let operands: Vec<_> = matches
         .get_many::<OsString>("operands")
         .unwrap()
         .cloned()
         .collect();
-    // Clap's per-occurrence arity does not bound Append values when options
-    // interrupt a positional. Count the complete operand sequence before Git.
+    // One local Git operand or a repository/refspec pair selects one snapshot.
     let (repository, tree) = match operands.as_slice() {
         [tree] => (None, tree.clone()),
         [repository, tree] => (Some(repository.clone()), tree.clone()),
@@ -187,6 +201,11 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, clap::Error> {
         command: command_tail,
         keep: matches.get_flag("keep"),
         verify: matches.get_flag("verify"),
+        write_policy: matches
+            .get_one::<String>("write-policy")
+            .unwrap()
+            .parse()
+            .unwrap(),
     })
 }
 
@@ -255,6 +274,50 @@ mod tests {
         assert_run(&[tree, "-k", "--", "cmd"], tree, &["cmd"], true);
     }
     #[test]
+    fn write_policy_accepts_exact_values_and_keeps_command_tail_literal() {
+        for policy in ["none", "ignored", "untracked", "all"] {
+            let option = format!("--write-policy={policy}");
+            for prefix in [vec!["HEAD", &option], vec![&option, "HEAD"]] {
+                let mut args = arguments(&prefix);
+                args.extend(arguments(&["--", "cmd", "--write-policy=none"]));
+                let parsed = parse_run_args(&args).unwrap();
+                assert_eq!(parsed.write_policy, policy.parse().unwrap());
+                assert_eq!(parsed.command, arguments(&["cmd", "--write-policy=none"]));
+            }
+        }
+        let args = arguments(&[
+            "origin",
+            "HEAD",
+            "--write-policy=none",
+            "--write-policy=untracked",
+            "--write-policy=all",
+            "--",
+            "cmd",
+        ]);
+        assert_eq!(
+            parse_run_args(&args).unwrap().write_policy,
+            WritePolicy::All
+        );
+        let args = arguments(&["HEAD", "--", "cmd"]);
+        assert_eq!(
+            parse_run_args(&args).unwrap().write_policy,
+            WritePolicy::Ignored
+        );
+        for option in [
+            "--write-policy=",
+            "--write-policy=other",
+            "--write-policy=ALL",
+            "--write-policy",
+        ] {
+            assert_eq!(
+                parse_run_args(&arguments(&["HEAD", option, "--", "cmd"]))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+        }
+    }
+    #[test]
     fn remote_operands_verify_and_literal_command_tail() {
         for source in [
             "origin",
@@ -292,7 +355,6 @@ mod tests {
             vec!["repo", "HEAD", "extra", "--", "cmd"],
             vec!["HEAD", "--"],
             vec!["HEAD", "-k", "--", ""],
-            vec!["", "--", "cmd"],
         ] {
             let error = parse_run_args(&arguments(&args)).unwrap_err();
             assert_eq!(error.exit_code(), 2, "{args:?}");
@@ -301,25 +363,25 @@ mod tests {
     }
 
     #[test]
-    fn unknown_options_are_rejected_on_either_side_of_revision() {
-        for flag in [
-            "--unknown",
-            "--help",
-            "--version",
-            "--cleanup",
-            "-kk",
-            "--keep=1",
-            "-",
-        ] {
+    fn git_operands_are_not_validated_as_runner_options() {
+        for flag in ["--unknown", "--help", "--version", "--cleanup", "-kk", "-"] {
             for args in [
                 vec![flag, "HEAD", "--", "cmd"],
                 vec!["HEAD", flag, "--", "cmd"],
             ] {
-                let error = parse_run_args(&arguments(&args)).unwrap_err();
-                assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{args:?}");
-                assert_eq!(error.exit_code(), 2, "{args:?}");
+                let raw = arguments(&args);
+                let parsed = parse_run_args(&raw).unwrap();
+                assert_eq!(parsed.repository.as_ref(), Some(&raw[0]), "{args:?}");
+                assert_eq!(parsed.tree, raw[1], "{args:?}");
             }
         }
+        for operands in [vec![""], vec!["", "HEAD"], vec!["repo", ""]] {
+            let mut args = arguments(&operands);
+            args.extend(arguments(&["--", "cmd"]));
+            let parsed = parse_run_args(&args).unwrap();
+            assert_eq!(parsed.tree, operands[operands.len() - 1]);
+        }
+        assert!(parse_run_args(&arguments(&["HEAD", "--keep=1", "--", "cmd"])).is_err());
     }
 
     #[test]
@@ -344,10 +406,12 @@ mod tests {
             "--".into(),
             "cmd".into(),
         ];
+        let parsed = parse_run_args(&args).unwrap();
         assert_eq!(
-            parse_run_args(&args).unwrap_err().kind(),
-            ErrorKind::UnknownArgument
+            parsed.repository.as_deref(),
+            Some(std::ffi::OsStr::new("HEAD"))
         );
+        assert_eq!(parsed.tree, args[1]);
     }
     #[test]
     fn interspersed_flags_do_not_relax_total_operand_limit() {

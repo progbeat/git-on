@@ -209,9 +209,224 @@ class Fixture:
         _, errors = process.communicate(timeout=20)
         if process.returncode: raise AssertionError(errors.decode())
 
+class RemoteDiagnosticsTests(unittest.TestCase):
+    """Controlled native-tool failures exercise diagnostics without network access."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='git-on-diagnostics-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.tools = self.root / 'tools'; self.tools.mkdir()
+        self.native_git = shutil.which('git')
+        self.env = {k:v for k,v in os.environ.items() if not k.startswith(('GIT_', 'SSH_'))}
+        self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
+                        XDG_CACHE_HOME=str(self.root / 'cache'), TMPDIR=str(self.root),
+                        LC_ALL='C')
+
+    def native_version(self, version, ssh_failure=False):
+        wrapper = self.tools / 'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import json, os, sys
+args = sys.argv[1:]
+with open({str(self.root / 'native-requests')!r}, 'a') as output:
+    output.write(json.dumps(args) + '\\n')
+if args == ['--version']:
+    print('git version ' + {version!r}); sys.exit(0)
+if {ssh_failure!r} and 'ls-remote' in args and '--get-url' not in args:
+    sys.stderr.write('git@github.com: Permission denied (publickey).\\n'); sys.exit(128)
+os.execv({self.native_git!r}, [{self.native_git!r}, *args])
+''')
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.tools) + os.pathsep + os.environ['PATH']
+
+    def failure(self, source='https://github.com/owner/repository.git'):
+        result = subprocess.run([str(OPTIONS.probe), source, 'HEAD'], cwd=self.root,
+                                env=self.env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(list(self.root.glob('git-on-*')), [])
+        return result.stderr.decode()
+
+    def test_missing_native_git_names_requirement_and_safe_next_step(self):
+        self.env['PATH'] = str(self.tools)
+        error = self.failure()
+        for detail in ('native Git', 'not found on PATH', '2.45.1', 'install'):
+            self.assertIn(detail, error)
+
+    def test_old_native_git_reports_detected_version_without_weakening_requirement(self):
+        self.native_version('2.43.0')
+        error = self.failure()
+        for detail in ('2.43.0', '2.45.1', 'upgrade', 'PATH'):
+            self.assertIn(detail, error)
+
+    def test_local_verification_without_native_git_has_safe_install_advice(self):
+        repository = self.root / 'repository'
+        run([self.native_git, 'init', '--quiet', str(repository)], env=self.env)
+        run([self.native_git, '-C', str(repository), '-c', 'user.name=Fixture',
+             '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet',
+             '--allow-empty', '-m', 'verification fixture'], env=self.env)
+        self.env['PATH'] = str(self.tools)
+        result = subprocess.run([str(OPTIONS.probe), 'local', 'HEAD', '--verify'],
+                                cwd=repository, env=self.env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        for detail in ('native Git', 'not found on PATH', 'revision resolution', 'install'):
+            self.assertIn(detail, result.stderr.decode())
+        self.assertEqual(list(self.root.glob('git-on-*')), [])
+
+    def test_github_publickey_failure_offers_conditional_https_without_retry(self):
+        for source in ('git@github.com:owner/repository.git',
+                       'ssh://git@github.com/owner/repository.git'):
+            with self.subTest(source=source):
+                self.native_version('2.45.1', ssh_failure=True)
+                (self.root / 'native-requests').unlink(missing_ok=True)
+                error = self.failure(source)
+                for detail in ('publickey', 'if this GitHub repository is public',
+                               'https://github.com/owner/repository.git',
+                               'private', 'credentials'):
+                    self.assertIn(detail, error)
+                requests = (self.root / 'native-requests').read_text()
+                self.assertNotIn('https://github.com/owner/repository.git', requests)
+
+
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.addCleanup(self.f.close)
+    def fetched_oid(self, source, revision):
+        """Native fetch is the oracle; the caller repository is never its target."""
+        f=self.f
+        with tempfile.TemporaryDirectory(dir=f.root,prefix='fetch-oracle-') as directory:
+            f.git('init','--bare','--quiet',directory,at=f.root)
+            result=subprocess.run(['git','-C',directory,'fetch','--no-tags',
+                                   '--filter=tree:0','--refmap=','--',source,revision],
+                                  env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            rows=(Path(directory)/'FETCH_HEAD').read_bytes().splitlines()
+            selected=[row.split(b'\t',1)[0].decode() for row in rows
+                      if b'\tnot-for-merge\t' not in row]
+            self.assertEqual(len(selected),1,rows)
+            return selected[0]
+    def test_fetch_accepts_native_short_ref_names_and_refspecs(self):
+        f=self.f; source='file://'+str(f.repo)
+        f.git('update-ref','refs/tags/release',f.commit)
+        for revision in ('heads/main','tags/release','+main','',
+                         'main:refs/heads/private-copy','main:deep'):
+            with self.subTest(revision=revision):
+                self.assertEqual(self.fetched_oid(source,revision),f.commit)
+                process=f.probe(source,revision)
+                initial=f.line(process)
+                self.assertEqual(initial['tree'],f.tree)
+                self.assertEqual(set(initial['objects']),{f.commit,f.tree})
+                value,read=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n')
+                self.assertNotIn(f.other,read['objects'])
+                f.finish(process)
+    def test_fetch_accepts_relative_absolute_and_non_utf8_repository_paths(self):
+        f=self.f
+        weird=f.root/os.fsdecode(b'server-\xff.git')
+        weird.symlink_to(f.repo,target_is_directory=True)
+        for source in (str(f.repo),'../server.git',str(weird)):
+            with self.subTest(source=source):
+                process=f.probe(source,'main')
+                self.assertEqual(f.line(process)['tree'],f.tree)
+                value,_=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_fetch_branch_tag_collision_follows_native_precedence(self):
+        f=self.f; source='file://'+str(f.repo)
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        other=f.git('commit-tree',other_tree,data=b'tag collision fixture\n')
+        f.git('update-ref','refs/tags/main',other)
+        for revision in ('main','heads/main','tags/main'):
+            with self.subTest(revision=revision):
+                oid=self.fetched_oid(source,revision)
+                process=f.probe(source,revision)
+                self.assertEqual(f.line(process)['tree'],f.git('rev-parse',oid+'^{tree}'))
+                f.finish(process)
+    def test_fetch_colon_is_a_literal_refspec_and_does_not_touch_caller_refs(self):
+        f=self.f; source='file://'+str(f.repo)
+        f.cwd=f.repo
+        before=f.git('for-each-ref','--format=%(refname) %(objectname)')
+        process=f.probe(source,'main:refs/heads/private-copy')
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        f.finish(process)
+        self.assertEqual(f.git('for-each-ref','--format=%(refname) %(objectname)'),before)
+    def test_native_fetch_reference_hook_sees_private_refs_and_repository(self):
+        f=self.f; f.cwd=f.repo; hooks=f.root/'hooks'; hooks.mkdir(); log=f.root/'hook-log'
+        hook=hooks/'reference-transaction'
+        hook.write_text(f'''#!{sys.executable}
+import json, os, sys
+with open({str(log)!r}, 'a') as output:
+    output.write(json.dumps(dict(phase=sys.argv[1], git_dir=os.environ.get('GIT_DIR'),
+                                cwd=os.getcwd(), changes=sys.stdin.read())) + '\\n')
+''')
+        hook.chmod(0o700)
+        f.git('config','core.hooksPath',str(hooks))
+        before=f.git('for-each-ref','--format=%(refname) %(objectname)')
+        process=f.probe('file://'+str(f.repo),'main:refs/heads/private-copy')
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n'); f.finish(process)
+        self.assertEqual(f.git('for-each-ref','--format=%(refname) %(objectname)'),before)
+        transactions=[json.loads(line) for line in log.read_text().splitlines()]
+        selected=[entry for entry in transactions if 'refs/heads/private-copy' in entry['changes']]
+        self.assertTrue(selected,transactions)
+        self.assertTrue({'prepared','committed'}.issubset({entry['phase'] for entry in selected}))
+        for entry in selected:
+            git_dir=Path(entry['git_dir'])
+            if not git_dir.is_absolute(): git_dir=Path(entry['cwd'])/git_dir
+            self.assertNotEqual(git_dir.resolve(),f.repo.resolve())
+            self.assertEqual(git_dir.name,'remote-repository')
+            self.assertFalse(git_dir.exists(),'private hook target survived completed run')
+    def test_fetch_invalid_revision_reports_native_git_error(self):
+        f=self.f; source='file://'+str(f.repo)
+        for revision in ('missing-branch','main:bad..destination'):
+            with self.subTest(revision=revision):
+                process=f.probe(source,revision)
+                _,errors=process.communicate(timeout=20)
+                self.assertNotEqual(process.returncode,0)
+                self.assertTrue(b"couldn't find remote ref" in errors or b'invalid refspec' in errors,errors)
+                self.assertNotIn(b'not advertised',errors)
+    def test_fetch_non_utf8_ref_is_passed_to_git_unchanged(self):
+        f=self.f; revision=os.fsdecode(b'branch-\xff')
+        f.git('update-ref','refs/heads/'+revision,f.commit)
+        process=f.probe('file://'+str(f.repo),revision)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_native_fetch_receives_the_original_source_and_refspec(self):
+        f=self.f; native=shutil.which('git'); tools=f.root/'logged-tools'; tools.mkdir()
+        log=f.root/'git-argv'; wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import json, os, sys
+with open({str(log)!r}, 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\\n')
+os.execv({native!r}, [{native!r}, *sys.argv[1:]])
+''')
+        wrapper.chmod(0o700)
+        config=f.root/'rewrite-config'
+        config.write_text(f'[url "file://{f.root}/"]\ninsteadOf = fixture:\n')
+        f.env.update(GIT_CONFIG_GLOBAL=str(config),PATH=str(tools)+os.pathsep+f.env['PATH'])
+        source='fixture:server.git'; revision='+heads/main:refs/heads/private-copy'
+        process=f.probe(source,revision)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n'); f.finish(process)
+        calls=[json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('fetch' in call and call[-3:]==['--',source,revision]
+                            for call in calls),calls)
+    def test_fetch_multiple_selected_objects_and_blob_never_execute_command(self):
+        f=self.f; source='file://'+str(f.repo)
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        other=f.git('commit-tree',other_tree,data=b'second fetch target\n')
+        f.git('update-ref','refs/heads/other',other)
+        sentinel=f.root/'executed'
+        for revision in ('refs/heads/*:refs/remotes/private/*',f.blob):
+            with self.subTest(revision=revision):
+                result=subprocess.run([str(OPTIONS.binary),source,revision,'--',
+                                       sys.executable,'-c',
+                                       f'from pathlib import Path; Path({str(sentinel)!r}).touch()'],
+                                      cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+                self.assertEqual(result.returncode,125,result.stderr)
+                self.assertNotIn(b'Usage:',result.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
     def test_fixture_exec_failure_exits_without_reentering_test_runner(self):
         f=self.f; pid,fd=pty.fork(); reaped=False; transcript=bytearray()
         if pid==0:
@@ -273,7 +488,7 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n')
                 f.finish(process)
-    def test_review_local_unverified_loader_needs_no_native_git(self):
+    def test_local_unverified_loader_resolves_native_git_revisions(self):
         f=self.f; f.cwd=f.repo
         f.git('tag','-a','-m','local annotated tag','local-tag',f.commit)
         # A replacement ref must not redirect the exact libgit2 object reads.
@@ -291,13 +506,221 @@ class RemoteTests(unittest.TestCase):
                    ('HEAD^',f.tree,'deep/file'),('HEAD~1',f.tree,'deep/file'),
                    (f.tree,f.tree,'deep/file'),('local-tag',f.tree,'deep/file'),
                    (nested,f.tree,'deep/file'))
-        empty_path=f.root/'no-programs'; empty_path.mkdir(); f.env['PATH']=str(empty_path)
         for revision,tree,path in revisions:
             with self.subTest(revision=revision):
                 process=f.probe('local',revision)
                 self.assertEqual(f.line(process)['tree'],tree)
                 value,_=f.operation(process,'read '+path); self.assertEqual(value['data'],'expected\n')
                 f.finish(process)
+    def test_local_abbreviations_and_non_utf8_tree_paths_use_native_git(self):
+        f=self.f; f.cwd=f.repo
+        name=b'deep-\xff'
+        tree=f.git('mktree',data=b'040000 tree '+f.subtree.encode()+b'\t'+name+b'\n')
+        commit=f.git('commit-tree',tree,data=b'non-UTF8 local path\n')
+        f.git('update-ref','refs/heads/main',commit)
+        for revision,expected,path in ((commit[:12],tree,'deep-'+os.fsdecode(b'\xff')+'/file'),
+                                       (os.fsdecode(b'HEAD:'+name),f.subtree,'file')):
+            with self.subTest(revision=revision):
+                resolved=f.git('rev-parse','--verify',revision)
+                native=f.git('rev-parse','--verify',resolved+'^{tree}')
+                self.assertEqual(native,expected)
+                process=f.probe('local',revision)
+                self.assertEqual(f.line(process)['tree'],expected)
+                # The probe's text-operation protocol is UTF-8; select the
+                # non-UTF8 subtree via Git, then read its ordinary child.
+                if path=='file':
+                    value,_=f.operation(process,'read file')
+                    self.assertEqual(value['data'],'expected\n')
+                f.finish(process)
+    def test_local_native_object_database_environment_is_used_for_exact_reads(self):
+        f=self.f; f.cwd=f.repo; original=dict(f.env)
+        objects=f.root/'external-objects'; objects.mkdir()
+        writer=dict(original,GIT_OBJECT_DIRECTORY=str(objects))
+        def write(*args,data):
+            return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
+        blob=write('hash-object','-w','--stdin',data=b'external object database\n')
+        tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=write('commit-tree',tree,data=b'external ODB fixture\n')
+        self.assertNotEqual(commit,f.commit)
+        for variable in ('GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES'):
+            with self.subTest(variable=variable):
+                f.env=dict(original,**{variable:str(objects)})
+                self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
+                process=f.probe('local',commit)
+                self.assertEqual(f.line(process)['tree'],tree)
+                value,_=f.operation(process,'read file')
+                self.assertEqual(value['data'],'external object database\n'); f.finish(process)
+                if OPTIONS.require_fuse:
+                    result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                          cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(result.stdout,b'external object database\n')
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+    def test_local_namespace_environment_does_not_leave_snapshot_pins(self):
+        f=self.f; f.cwd=f.repo; unscoped=dict(f.env)
+        f.env['GIT_NAMESPACE']='snapshot-input-namespace'
+        def refs():
+            return run(['git','-C',f.repo,'for-each-ref','--format=%(refname) %(objectname)'],
+                       env=unscoped)
+        before=refs()
+        self.assertEqual(f.git('rev-parse','--verify','HEAD'),f.commit)
+        process=f.probe('local','HEAD')
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n'); f.finish(process)
+        self.assertEqual(refs(),before)
+        if OPTIONS.require_fuse:
+            result=subprocess.run([str(OPTIONS.binary),'HEAD','--','cat','deep/file'],
+                                  cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,b'expected\n')
+            self.assertEqual(refs(),before)
+            self.assertEqual(list(f.root.glob('git-on-*')),[])
+    def test_local_common_directory_reads_and_releases_pins_in_the_native_repository(self):
+        f=self.f; f.cwd=f.repo; unscoped=dict(f.env); common=f.root/'common.git'
+        run(['git','clone','--bare','--no-local','--quiet',f.repo,common],env=f.env)
+        f.git('config','user.name','Common Repository',at=common)
+        f.git('config','user.email','common@example.invalid',at=common)
+        blob=f.git('hash-object','-w','--stdin',data=b'common repository\n',at=common)
+        tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode(),at=common)
+        commit=f.git('commit-tree',tree,data=b'common directory fixture\n',at=common)
+        f.git('update-ref','refs/heads/main',commit,at=common)
+        def refs(repository):
+            return run(['git','-C',repository,'for-each-ref','--format=%(refname) %(objectname)'],
+                       env=unscoped)
+        before={repository:refs(repository) for repository in (f.repo,common)}
+        f.env.update(GIT_DIR=str(f.repo),GIT_COMMON_DIR=str(common))
+        self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
+        process=f.probe('local',commit)
+        self.assertEqual(f.line(process)['tree'],tree)
+        value,_=f.operation(process,'read file')
+        self.assertEqual(value['data'],'common repository\n'); f.finish(process)
+        for repository in before: self.assertEqual(refs(repository),before[repository])
+        if OPTIONS.require_fuse:
+            result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                  cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,b'common repository\n')
+            for repository in before: self.assertEqual(refs(repository),before[repository])
+            ready=f.root/'common-ready'
+            code=f'import os,time; from pathlib import Path; assert Path("file").read_text() == "common repository\\n"; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(30)'
+            process=subprocess.Popen([str(OPTIONS.binary),commit,'--',sys.executable,'-c',code],
+                                     cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            f.children.append(process)
+            deadline=time.monotonic()+10
+            while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
+            self.assertTrue(ready.exists(),'common-directory snapshot did not execute its command')
+            child=int(ready.read_text()); runs=list(f.root.glob('git-on-*'))
+            self.assertEqual(len(runs),1)
+            process.kill(); process.wait(timeout=5)
+            with contextlib.suppress(ProcessLookupError): os.kill(child,signal.SIGTERM)
+            process.communicate(timeout=5)
+            cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(runs[0])],
+                                   cwd=f.cwd,env=unscoped,capture_output=True,timeout=15)
+            self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+            self.assertFalse(runs[0].exists())
+            for repository in before: self.assertEqual(refs(repository),before[repository])
+    def test_local_c_quoted_alternate_with_colon_and_non_utf8_path_matches_native_git(self):
+        f=self.f; f.cwd=f.repo; objects=f.root/os.fsdecode(b'alternate:objects-\xff'); objects.mkdir()
+        writer=dict(f.env,GIT_OBJECT_DIRECTORY=str(objects))
+        def write(*args,data):
+            return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
+        blob=write('hash-object','-w','--stdin',data=b'quoted alternate\n')
+        tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=write('commit-tree',tree,data=b'quoted alternate fixture\n')
+        quoted='"'+''.join('\\%03o'%byte if byte<32 or byte>=127 else
+                           '\\'+chr(byte) if byte in (34,92) else chr(byte)
+                           for byte in os.fsencode(objects))+'"'
+        f.env['GIT_ALTERNATE_OBJECT_DIRECTORIES']=quoted
+        self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
+        process=f.probe('local',commit)
+        self.assertEqual(f.line(process)['tree'],tree)
+        value,_=f.operation(process,'read file')
+        self.assertEqual(value['data'],'quoted alternate\n'); f.finish(process)
+        if OPTIONS.require_fuse:
+            result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                  cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,b'quoted alternate\n')
+            self.assertEqual(list(f.root.glob('git-on-*')),[])
+    def test_local_relative_object_environments_follow_native_worktree_setup(self):
+        f=self.f; worktree=f.root/'worktree'
+        run(['git','init','--quiet',worktree],env=f.env)
+        subdir=worktree/'nested'; subdir.mkdir()
+        outside=f.root/'explicit-context'; outside.mkdir()
+        for mode in ('object-directory','alternate','quoted-alternate','mixed-alternates','explicit-worktree'):
+            with self.subTest(mode=mode):
+                objects=(outside if mode=='explicit-worktree' else f.root)/('relative-'+mode)
+                objects.mkdir()
+                if mode=='object-directory':
+                    # Discovery first sees the relative location from the
+                    # invocation directory; object reads use Git's setup cwd.
+                    (worktree/objects.name).mkdir()
+                writer=dict(f.env,GIT_OBJECT_DIRECTORY=str(objects))
+                def write(*args,data):
+                    return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
+                payload=('native relative '+mode+'\n').encode()
+                blob=write('hash-object','-w','--stdin',data=payload)
+                tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+                commit=write('commit-tree',tree,data=b'relative object environment\n')
+                relative=objects.name if mode=='explicit-worktree' else '../'+objects.name
+                env=dict(f.env)
+                if mode=='object-directory': env['GIT_OBJECT_DIRECTORY']=relative
+                elif mode=='alternate': env['GIT_ALTERNATE_OBJECT_DIRECTORIES']=relative
+                elif mode=='mixed-alternates':
+                    env['GIT_ALTERNATE_OBJECT_DIRECTORIES']='missing:"'+relative+'":missing-again'
+                else: env['GIT_ALTERNATE_OBJECT_DIRECTORIES']='"'+relative+'"'
+                cwd=outside if mode=='explicit-worktree' else subdir
+                if mode=='explicit-worktree':
+                    env.update(GIT_DIR=str(worktree/'.git'),GIT_WORK_TREE=str(worktree))
+                native=run(['git','-C',cwd,'rev-parse','--verify','--end-of-options',commit+'^{tree}'],env=env).decode().strip()
+                self.assertEqual(native,tree)
+                before=run(['git','-C',worktree,'for-each-ref'],env=f.env)
+                previous_cwd,previous_env=f.cwd,f.env
+                try:
+                    f.cwd,f.env=cwd,env
+                    process=f.probe('local',commit)
+                    self.assertEqual(f.line(process)['tree'],tree)
+                    value,_=f.operation(process,'read file')
+                    self.assertEqual(value['data'].encode(),payload); f.finish(process)
+                    if OPTIONS.require_fuse:
+                        result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                              cwd=cwd,env=env,capture_output=True,timeout=20)
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(result.stdout,payload)
+                finally: f.cwd,f.env=previous_cwd,previous_env
+                self.assertEqual(run(['git','-C',worktree,'for-each-ref'],env=f.env),before)
+    def test_local_relative_alternates_keep_native_bare_invocation_context(self):
+        f=self.f; objects=f.root/'bare-relative-objects'; objects.mkdir()
+        writer=dict(f.env,GIT_OBJECT_DIRECTORY=str(objects))
+        def write(*args,data):
+            return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
+        blob=write('hash-object','-w','--stdin',data=b'bare relative alternate\n')
+        tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=write('commit-tree',tree,data=b'bare alternate environment\n')
+        subdir=f.repo/'nested'; subdir.mkdir()
+        for mode,cwd,relative in (('bare-root',f.repo,'../'+objects.name),
+                                  ('bare-subdirectory',subdir,'../../'+objects.name),
+                                  ('explicit-bare-directory',f.cwd,'../'+objects.name)):
+            with self.subTest(mode=mode):
+                env=dict(f.env,GIT_ALTERNATE_OBJECT_DIRECTORIES='"'+relative+'"')
+                if mode=='explicit-bare-directory': env['GIT_DIR']=str(f.repo)
+                self.assertEqual(run(['git','-C',cwd,'rev-parse','--verify',commit+'^{tree}'],env=env).decode().strip(),tree)
+                before=run(['git','-C',f.repo,'for-each-ref'],env=f.env)
+                previous_cwd,previous_env=f.cwd,f.env
+                try:
+                    f.cwd,f.env=cwd,env
+                    process=f.probe('local',commit)
+                    self.assertEqual(f.line(process)['tree'],tree)
+                    value,_=f.operation(process,'read file')
+                    self.assertEqual(value['data'],'bare relative alternate\n'); f.finish(process)
+                    if OPTIONS.require_fuse:
+                        result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                              cwd=cwd,env=env,capture_output=True,timeout=20)
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(result.stdout,b'bare relative alternate\n')
+                finally: f.cwd,f.env=previous_cwd,previous_env
+                self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
     def test_https_cold_warm_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         process=f.probe(url); start=f.line(process)
@@ -314,9 +737,11 @@ class RemoteTests(unittest.TestCase):
         self.assertNotIn(f.other, read['objects']); f.finish(process)
         requests=len(f.requests)
         warm=f.probe(url, f.commit); f.line(warm); f.operation(warm,'read deep/file'); f.finish(warm)
-        # Warm access needs advertisement/authentication but no object fetch.
+        # Native Git still resolves the exact user fetch operand. Cached trees
+        # and payloads need no requests beyond advertisement and that fetch.
         new=f.requests[requests:]
-        self.assertEqual(len([x for x in new if x['path'].endswith('git-upload-pack')]), 1)
+        self.assertEqual(len([x for x in new if x['path'].endswith('git-upload-pack')]), 2)
+        self.assertEqual({oid for request in new for oid in request['wants']},{f.commit})
         expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
         self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
@@ -376,21 +801,27 @@ class RemoteTests(unittest.TestCase):
                 process=f.probe(url,'refs/tags/signed^{}',verify=verify)
                 _,errors=process.communicate(timeout=20)
                 self.assertNotEqual(process.returncode,0,'peeled advertisement helper accepted as an exact ref')
-                self.assertIn(b'not advertised',errors)
+                self.assertIn(b'invalid refspec',errors)
                 self.assertFalse(any(x['wants'] for x in f.requests[requests:]),'unsupported selector fetched objects')
-    def test_native_ssh_signature_tag_tree_path_replacements_and_failures(self):
+    def test_native_ssh_signature_tag_refspec_replacements_and_failures(self):
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
         replacement_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
         replacement=f.git('commit-tree',replacement_tree,data=b'different replacement\n')
         f.git('update-ref','refs/replace/'+signed,replacement)
-        for revision in (signed,signed+':deep','signed','signed:deep'):
+        for revision in (signed,'signed','+refs/tags/signed',
+                         'refs/tags/signed:refs/tags/private-copy'):
             process=f.probe(url,revision,verify=True); report=f.line(process)
-            self.assertEqual(report['tree'],f.subtree if ':' in revision else f.tree)
-            value,_=f.operation(process,'read file' if ':' in revision else 'read deep/file')
+            self.assertEqual(report['tree'],f.tree)
+            value,_=f.operation(process,'read deep/file')
             self.assertEqual(value['data'],'expected\n'); f.finish(process)
         # Local verification uses the same effective inherited git -c settings.
         f.cwd=f.repo
-        process=f.probe('local',signed+':deep',verify=True); f.line(process); f.operation(process,'read file'); f.finish(process)
+        process=f.probe('local',signed,verify=True); f.line(process); f.operation(process,'read deep/file'); f.finish(process)
+        # Native Git resolves REV:path to its tree, which cannot carry a
+        # signature. Do not silently verify a different revision prefix.
+        process=f.probe('local',signed+':deep',verify=True)
+        _,errors=process.communicate(timeout=20)
+        self.assertNotEqual(process.returncode,0); self.assertIn(b'raw trees',errors)
         raw=subprocess.run(['git','-C',str(f.repo),'--no-replace-objects','cat-file','commit',signed],capture_output=True,check=True,env=f.env).stdout
         invalid=f.git('hash-object','-t','commit','-w','--stdin',data=raw.replace(b'signed fixture',b'altered fixture'))
         for revision in (invalid,f.commit,f.tree,f.blob):
@@ -400,6 +831,27 @@ class RemoteTests(unittest.TestCase):
         allowed.write_text('')
         process=f.probe('local',signed,verify=True); _,errors=process.communicate(timeout=20)
         self.assertNotEqual(process.returncode,0); self.assertIn(b'execution forbidden',errors)
+    def test_local_verification_keeps_native_object_database_environment(self):
+        f=self.f; self.signing(); original=dict(f.env); f.cwd=f.repo
+        objects=f.root/'signed-external-objects'; objects.mkdir()
+        defaults=f.repo/'objects'
+        writer=dict(original,GIT_OBJECT_DIRECTORY=str(objects),
+                    GIT_ALTERNATE_OBJECT_DIRECTORIES=str(defaults))
+        signed=run(['git','-C',f.repo,'-c','user.signingkey='+str(f.root/'signature'),
+                    'commit-tree','-S',f.tree],input=b'external signed commit\n',
+                   env=writer).decode().strip()
+        cases=(writer,dict(original,GIT_ALTERNATE_OBJECT_DIRECTORIES=str(objects)))
+        for env in cases:
+            with self.subTest(variables={key:value for key,value in env.items()
+                                         if key in ('GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES')}):
+                f.env=env
+                native=subprocess.run(['git','-C',f.repo,'verify-commit',signed],
+                                      env=f.env,capture_output=True,timeout=10)
+                self.assertEqual(native.returncode,0,native.stderr)
+                process=f.probe('local',signed,verify=True)
+                self.assertEqual(f.line(process)['tree'],f.tree)
+                value,_=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n'); f.finish(process)
     def test_native_openpgp_verification_uses_git_configuration(self):
         f=self.f; home=f.root/'gnupg'; home.mkdir(mode=0o700)
         env=dict(f.env,GNUPGHOME=str(home))
@@ -607,7 +1059,9 @@ class RemoteTests(unittest.TestCase):
         # distinct fault from an absent OID, and cannot cause an eager fallback.
         f.denied_oids.add(unreachable)
         process=f.probe(url,unreachable); _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0); self.assertIn(unreachable.encode(),errors)
+        self.assertNotEqual(process.returncode,0); self.assertIn(b'HTTP 403',errors)
+        self.assertTrue(any(unreachable in request['wants'] and request.get('status')==403
+                            for request in f.requests),f.requests)
         f.denied_oids.clear(); f.git('config','uploadpack.allowAnySHA1InWant','true')
         for denied in (f.subtree,f.blob):
             shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -636,10 +1090,7 @@ class RemoteTests(unittest.TestCase):
                 name=f'signed-nested-{depth}'
                 f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'tag','-s','-m','nested signed',name,target)
                 process=f.probe('local',name,verify=True)
-                if depth==63: self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
-                else:
-                    _,errors=process.communicate(timeout=20)
-                    self.assertNotEqual(process.returncode,0); self.assertIn(b'exceeds 64',errors)
+                self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
 
     def test_native_verifier_moving_ref_keeps_exact_distinct_tree(self):
         f=self.f; signed,allowed=self.signing(); f.cwd=f.repo
@@ -650,9 +1101,9 @@ class RemoteTests(unittest.TestCase):
         verifier.write_text(f'#!/bin/sh\ngit --git-dir="{f.repo}" update-ref refs/heads/main {different}\nexec ssh-keygen "$@"\n')
         verifier.chmod(0o700)
         f.env.update(GIT_CONFIG_COUNT='3',GIT_CONFIG_KEY_2='gpg.ssh.program',GIT_CONFIG_VALUE_2=str(verifier))
-        process=f.probe('local','HEAD:deep',verify=True)
-        self.assertEqual(f.line(process)['tree'],f.subtree)
-        value,_=f.operation(process,'read file'); self.assertEqual(value['data'],'expected\n'); f.finish(process)
+        process=f.probe('local','HEAD',verify=True)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n'); f.finish(process)
         self.assertEqual(f.git('rev-parse','HEAD'),different)
 
     def openpgp_signing(self):
@@ -741,8 +1192,8 @@ class RemoteTests(unittest.TestCase):
         env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH'])
         for key in list(env):
             if key.startswith('GIT_CONFIG_KEY_') or key.startswith('GIT_CONFIG_VALUE_') or key=='GIT_CONFIG_COUNT': del env[key]
-        for cwd,operands in ((f.cwd,[url,signed+':deep']),(f.repo,[signed+':deep'])):
-            result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',*operands,'--','cat','file'],cwd=cwd,env=env,capture_output=True,timeout=30)
+        for cwd,operands in ((f.cwd,[url,signed]),(f.repo,[signed])):
+            result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',*operands,'--','cat','deep/file'],cwd=cwd,env=env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
         shutil.rmtree(f.root/'cache')
         # The command catches EIO and returns 0. The runner must still report 125.
@@ -775,7 +1226,7 @@ class RemoteTests(unittest.TestCase):
         start=len(f.requests)
         process=f.probe(url); f.line(process); value,_=f.operation(process,'read '+path); f.finish(process)
         self.assertEqual(value['data'],selected+'\n')
-        self.assertFalse(any(x['wants'] for x in f.requests[start:]))
+        self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},{commit})
         if OPTIONS.require_fuse:
             for index,command in enumerate((['true'],['cat',path],['cat',path])):
                 if index<2: shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -784,7 +1235,7 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'' if command[0]=='true' else (selected+'\n').encode())
                 demands={oid for x in f.requests[begin:] for oid in x['wants']}
-                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']) if index==1 else set())
+                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']) if index==1 else {commit})
         print('remote million evidence:',json.dumps(dict(fixture=fixture,selected=selected,objects=read['objects'],requests=f.requests)),flush=True)
 
     def test_ssh_denied_authentication_stops_before_mount(self):

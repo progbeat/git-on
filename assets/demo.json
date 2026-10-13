@@ -1,0 +1,120 @@
+{
+  "recorded_at_utc": "2026-10-13T03:18:03.543442+00:00",
+  "host": "vmi3099253",
+  "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.39",
+  "upstream": "https://github.com/mtoyoda/sl.git",
+  "upstream_commit": "923e7d7ebc5c1f009755bdeb789ac25658ccce03",
+  "executed_revision": "923e7d7ebc5c1f009755bdeb789ac25658ccce03",
+  "git_on_version": "git-on 1.2.0",
+  "git_on_binary_sha256": "7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f",
+  "git": "git version 2.55.0",
+  "vhs": "vhs version v0.12.1 (24fa225)",
+  "tape_sha256": "ef0d8dcf862c33ff80fff8ea11faddd8f9056be97db79464b14991785bc9a91d",
+  "upstream_tree": "56a5fd07310088f1e6372d81455c8489c66ea00b",
+  "generated_sl_removed_with_snapshot": true,
+  "recorded_command_exit_status": 0,
+  "gif_bytes": 2122802,
+  "gif_sha256": "b65264964b59731b96e6d061b64ce1c279d2a882a7275fca827e10048c8fa3a2",
+  "git_on_build_profile": "release",
+  "git_on_source_sha256": "ff2c340f57110af2f66ed7b82acb7394e80d92d83b41398287f14c76e19f6458",
+  "git_on_source_hash_format": "SHA-256 of UTF-8 JSON source_files map; sorted keys; compact separators comma and colon; no trailing newline",
+  "git_on_source_files": {
+    "src/cli.rs": "dd7d97b43574a8c637d04c708279a6ac0000840642082af503b0dc8bd5d15f64",
+    "src/filesystem.rs": "4c227edbcd2027538385f8357c3635f2ccf74d7ee80c26488f83ec1b9e7106bd",
+    "src/git.rs": "8d9783da8b6c994ecc191e98dafbde8c7b72be5434f3afecf0bf1c4886cef860",
+    "src/lib.rs": "73b08e9acf2c8c705177f15c5fa0d9b4b7143524080bdca1475a9ac31d5faf43",
+    "src/main.rs": "b71e84984c6bc13ba087096ff5388776889f420fdc07945786b8a8e4be885263",
+    "src/policy.rs": "94b928a54cfc3d8d6fdfe865148b7598e33c1630eccc92b5c6451643135e2706",
+    "src/remote.rs": "8de127e0b8c999d7d4be5ddfdee4484f83a864d5e15b0aa41d667b9ec4622f65",
+    "src/snapshot.rs": "b1ea25811530884f479e5f8a5d0e359d1ea42280e751df3077d7fb2fdc3924b7",
+    "src/wildmatch.rs": "72bae078592f99ba885d41c8be23ef8f4ae3f19c79050b9c055498e6a4faf968",
+    "Cargo.toml": "f327ba9f399c4342c70c177c6fe52fffd687894711984f66f86d144921b300e6",
+    "Cargo.lock": "75efb1641ac36c25c16ddda53d0ca50221fccee8e96294b235bd60d4fc7eb3d3",
+    "tests/support/source_probe.rs": "ae053783f532ff6fc09b5e6511d05d37c58182b7f4067b40e2e1b0ea01be962f"
+  },
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "raw_gif_bytes": 2420901,
+  "raw_gif_sha256": "bc1bb924a5e977f7b076886c394d096da990fceea3433105f27a52dda538f20c",
+  "gif_dimensions": [
+    896,
+    728
+  ],
+  "gif_duration_seconds": 18.88,
+  "style": "Neon",
+  "typing": {
+    "baseline_ms": 45,
+    "independent_noise_ms": [
+      -8,
+      8
+    ],
+    "seed": 923,
+    "typed_characters": 111,
+    "backspaces": 6
+  },
+  "optimization": {
+    "tool": "gifsicle 1.96",
+    "arguments": [
+      "--careful",
+      "-O3"
+    ],
+    "lossless_verified": true,
+    "verification": "gifdiff --ignore-redundancy; identical decoded RGB frames and accumulated durations, dimensions and loop setting"
+  },
+  "inspection": {
+    "first_last_frames_identical": true,
+    "widths_px": [
+      896,
+      768,
+      640,
+      375
+    ],
+    "complete_command_frame": 119,
+    "complete_command_time_seconds": 8.4,
+    "phases": [
+      "initial prompt",
+      "typing",
+      "master edit",
+      "complete pinned command",
+      "real compiler output",
+      "train motion",
+      "final prompt",
+      "loop seam"
+    ]
+  },
+  "display_format": "animated_webp",
+  "animation_bytes": 1642408,
+  "animation_sha256": "8b6adcd23b76e6cdf2071c4ed95228f2bec1ef303e44cb06efe0eff491f5b725",
+  "webp_conversion": {
+    "source_gif_bytes": 2122802,
+    "webp_bytes": 1642408,
+    "webp_sha256": "8b6adcd23b76e6cdf2071c4ed95228f2bec1ef303e44cb06efe0eff491f5b725",
+    "dimensions": [
+      896,
+      728
+    ],
+    "loop": 0,
+    "duration_ms": 18880,
+    "lossless_rgb_and_timeline": true,
+    "first_last_identical": true,
+    "encoder": "Pillow 11.3.0; libwebp 1.5.0",
+    "settings": {
+      "lossless": true,
+      "quality": 100,
+      "method": 6,
+      "minimize_size": true,
+      "allow_mixed": false
+    },
+    "decoder_browser": "HeadlessChrome/155.0.8059.39",
+    "browser_playback_checked_widths_px": [
+      768,
+      375
+    ]
+  },
+  "animation_storage": {
+    "branch": "demo-media",
+    "commit": "9eb6cb9419c950f0d046a42c5c8da726e4b3760e",
+    "file": "demo.webp",
+    "url": "https://raw.githubusercontent.com/progbeat/git-on/9eb6cb9419c950f0d046a42c5c8da726e4b3760e/demo.webp",
+    "parentless_commit": true
+  }
+}

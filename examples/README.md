@@ -1,8 +1,10 @@
 # Application examples
 
-These are optional configurations, not additional filesystem rules. git-on uses
-only the selected tree's `.gitignore` policy for new writes, regardless of the
-language or tool. Paths present in that tree remain immutable even if ignored.
+These are optional configurations, not additional filesystem rules. In default
+`ignored` mode, git-on uses only the selected tree's `.gitignore` policy for new
+writes, regardless of the language or tool. Paths present in that tree remain
+immutable even if ignored. See the [four write policies](../docs/usage.md#filesystem-behavior)
+for read-only runs or writes independent of ignore rules.
 
 ## Python cache and environment paths
 
@@ -29,15 +31,23 @@ The committed `.gitignore` permits `__pycache__/` and `.venv/` writes.
 
 After committing the examples in a repository, run either snapshot subtree:
 
-The same workload can select a configured remote:
-`git on origin main:examples/uv-project -k -- uv run --locked main.py`.
-Add `--verify` after REV when native Git should verify the selected commit or annotated tag
-under your existing configuration. Verification does not assert passed tests.
-
 ```console
 git on HEAD:examples/pep723 -- uv run --locked --script main.py
 git on HEAD:examples/uv-project -- uv run --locked main.py
 ```
+
+The same workload can fetch a configured remote and change directory inside the
+snapshot before invoking uv:
+
+```console
+git on origin main -k -- sh -c 'cd examples/uv-project && uv run --locked main.py'
+```
+
+With two positional operands, Git interprets the second as a fetch refspec;
+`main:examples/uv-project` would name a destination ref, not a subtree.
+Add `--verify` after the revision/refspec when native Git should verify the selected
+commit or annotated tag under your existing configuration. Verification does not
+assert passed tests.
 
 The first example uses PEP 723 inline metadata and `main.py.lock`. The second
 uses `pyproject.toml` and `uv.lock`. Both pin NumPy 2.2.6 and Numba 0.61.2; the

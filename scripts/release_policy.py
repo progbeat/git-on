@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one release per master change; no network or publishing side effects."""
+"""Require a release for binary changes; no network or publishing side effects."""
 import argparse
 import json
 import os
@@ -7,6 +7,116 @@ from pathlib import Path
 import re
 import subprocess
 import tomllib
+
+
+def package_in_lock(lock):
+    own = [p for p in lock["package"] if p["name"] == "git-on" and "source" not in p]
+    if len(own) != 1:
+        raise ValueError("expected exactly one local git-on package in Cargo.lock")
+    return own[0]
+
+
+def binary_manifest(manifest):
+    # Keep unrecognized Cargo settings conservative. Only known descriptive and
+    # test/example-only settings are removed; edition, features, profiles,
+    # target dependencies, build scripts and patch overrides remain significant.
+    result = {key: value for key, value in manifest.items()
+              if key not in {"dev-dependencies", "example", "test", "bench"}}
+    result["package"] = {key: value for key, value in manifest["package"].items()
+                         if key not in {"version", "authors", "description", "documentation", "homepage",
+                                        "repository", "readme", "keywords", "categories", "license",
+                                        "license-file", "publish", "metadata", "exclude", "include",
+                                        "autoexamples", "autotests", "autobenches"}}
+    if "target" in result:
+        result["target"] = {target: {key: value for key, value in settings.items()
+                                     if key != "dev-dependencies"}
+                            for target, settings in result["target"].items()}
+        result["target"] = {target: settings for target, settings in result["target"].items() if settings}
+        if not result["target"]:
+            del result["target"]
+    if "profile" in result:
+        result["profile"] = {name: settings for name, settings in result["profile"].items()
+                             if name not in {"dev", "test", "bench"}}
+        if not result["profile"]:
+            del result["profile"]
+    return result
+
+
+def runtime_dependency_names(manifest):
+    tables = [manifest, *manifest.get("target", {}).values()]
+    return {value.get("package", name) if isinstance(value, dict) else name
+            for table in tables for kind in ("dependencies", "build-dependencies")
+            for name, value in table.get(kind, {}).items()}
+
+
+def binary_lock(manifest, lock):
+    """Compare the runtime/build dependency closure, excluding test-only crates."""
+    packages = lock["package"]
+    own = package_in_lock(lock)
+    runtime_names = runtime_dependency_names(manifest)
+    pending = [item for item in own.get("dependencies", []) if item.split()[0] in runtime_names]
+    found = {}
+    while pending:
+        dependency = pending.pop()
+        parts = dependency.split(maxsplit=2)
+        candidates = [p for p in packages if p["name"] == parts[0]
+                      and (len(parts) < 2 or p["version"] == parts[1])
+                      and (len(parts) < 3 or p.get("source") == parts[2].strip("()"))]
+        if len(candidates) != 1:
+            raise ValueError(f"cannot resolve locked dependency {dependency!r}")
+        package = candidates[0]
+        identity = (package["name"], package["version"], package.get("source", ""))
+        if identity not in found:
+            found[identity] = {**package, "dependencies": sorted(package.get("dependencies", []))}
+            pending.extend(package.get("dependencies", []))
+    return found
+
+
+def distribution_build(workflow):
+    # The package job is the authoritative distribution build. Test-only jobs
+    # and the publication job cannot change its executable. Inherited env and
+    # run defaults also affect compilation (for example RUSTFLAGS or shell).
+    # Comparing their complete YAML blocks is deliberately conservative and
+    # requires no external YAML parser in the policy job.
+    match = re.search(r"^  package:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*\n|\Z)", workflow,
+                      re.M | re.S)
+    inherited = re.findall(r"^(?:env|defaults):[^\n]*(?:\n(?:[ \t].*|[ \t]*|\#.*))*", workflow, re.M)
+    return (match.group(1) if match else "", tuple(inherited))
+
+
+def release_reasons(base, current_manifest, current_lock):
+    def old_text(name):
+        listing = subprocess.check_output(["git", "ls-tree", "--name-only", base, "--", name], text=True).strip()
+        return subprocess.check_output(["git", "show", f"{base}:{name}"], text=True) if listing else None
+
+    old_manifest_text = old_text("Cargo.toml")
+    if old_manifest_text is None:
+        return None, ["initial Cargo package"]
+    old_manifest = tomllib.loads(old_manifest_text)
+    old_lock_text = old_text("Cargo.lock")
+    # Both sides of a rename matter: moving src/ into examples/ still removes
+    # released source. Include untracked files so the local pre-commit check
+    # agrees with CI after those files are added.
+    changed = subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z", base, "--"], text=True).split("\0")
+    changed += subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], text=True).split("\0")
+    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml"}
+    for manifest in (old_manifest, current_manifest):
+        if isinstance(manifest["package"].get("build"), str):
+            build_paths.add(manifest["package"]["build"])
+        for kind in ("bin", "lib"):
+            targets = manifest.get(kind, []) if kind == "bin" else [manifest.get(kind, {})]
+            build_paths.update(target["path"] for target in targets if "path" in target)
+    reasons = [path for path in changed if path.startswith(("src/", ".cargo/")) or path in build_paths]
+    if binary_manifest(current_manifest) != binary_manifest(old_manifest):
+        reasons.append("Cargo.toml binary settings")
+    if old_lock_text is None or binary_lock(current_manifest, current_lock) != binary_lock(old_manifest, tomllib.loads(old_lock_text)):
+        reasons.append("Cargo.lock runtime/build dependencies")
+    workflow_name = ".github/workflows/ci.yml"
+    if workflow_name in changed:
+        current_workflow = Path(workflow_name).read_text() if Path(workflow_name).exists() else ""
+        if distribution_build(current_workflow) != distribution_build(old_text(workflow_name) or ""):
+            reasons.append("distribution build job")
+    return old_manifest["package"]["version"], reasons
 
 
 def version(text):
@@ -51,23 +161,38 @@ def push_base(event_path):
 
 
 def check(base):
-    package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+    manifest = tomllib.loads(Path("Cargo.toml").read_text())
+    package = manifest["package"]
     lock = tomllib.loads(Path("Cargo.lock").read_text())
-    own = [p for p in lock["package"] if p["name"] == "git-on" and "source" not in p]
-    if len(own) != 1:
-        raise ValueError("expected exactly one local git-on package in Cargo.lock")
+    own = package_in_lock(lock)
+    version(package["version"])
+    if own["version"] != package["version"]:
+        raise ValueError("Cargo.lock git-on version differs from Cargo.toml")
     # A missing file is the bootstrap case; an invalid ref must never become one.
     subprocess.run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], check=True, stdout=subprocess.DEVNULL)
-    listing = subprocess.check_output(["git", "ls-tree", "--name-only", base, "--", "Cargo.toml"], text=True).strip()
-    old = None
-    if listing:
-        old = tomllib.loads(subprocess.check_output(["git", "show", f"{base}:Cargo.toml"], text=True))["package"]["version"]
-    body = validate(package["version"], old, own[0]["version"], Path(".github/release-notes.md").read_text())
-    Path("release-body.md").write_text(body + "\n")
-    print(f"Validated {old or '(initial)'} -> {package['version']}")
+    old, reasons = release_reasons(base, manifest, lock)
+    required = bool(reasons)
+    body_path = Path("release-body.md")
+    body_path.unlink(missing_ok=True)
+    if required:
+        body = validate(package["version"], old, own["version"], Path(".github/release-notes.md").read_text())
+        body_path.write_text(body + "\n")
+        print(f"Validated {old or '(initial)'} -> {package['version']}: {', '.join(reasons)}")
+    else:
+        if package["version"] != old:
+            raise ValueError("no binary changes: keep the current master version and skip publication")
+        notes_name = ".github/release-notes.md"
+        base_notes_path = subprocess.check_output(["git", "ls-tree", "--name-only", base, "--", notes_name])
+        base_notes = subprocess.check_output(["git", "show", f"{base}:{notes_name}"]) if base_notes_path else None
+        notes_path = Path(notes_name)
+        current_notes = notes_path.read_bytes() if notes_path.exists() else None
+        if current_notes != base_notes:
+            raise ValueError("no binary changes: keep the current master release notes and skip publication")
+        print(f"No binary changes; retain {package['version']} and skip publication")
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a") as stream:
-            stream.write(f"version={package['version']}\n")
+            stream.write(f"version={package['version']}\nrelease_required={str(required).lower()}\n")
+    return required
 
 
 if __name__ == "__main__":

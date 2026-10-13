@@ -1,25 +1,41 @@
 # Releases and installation
 
-Every pull request into `master` is one release. Squash, ordinary merge and
-rebase merging are supported. Squash merging is recommended: the resulting commit contains both the change and its release
+Changes to the released CLI, its runtime dependencies or binary build settings
+require one binary release. Documentation, GIFs, tests, standalone examples and
+`install.sh` alone do not change the binary version or publish a release.
+Squash, ordinary merge and rebase merging are supported. Squash merging is
+recommended: the resulting commit contains both a binary change and its release
 metadata. No separate release PR, manual tag, or CHANGELOG history is required.
 
 ## Preparing a change
 
-1. Update `Cargo.toml` and the root `git-on` entry in `Cargo.lock` to exactly one
+1. Determine whether the change affects the binary. For a release, update
+   `Cargo.toml` and the root `git-on` entry in `Cargo.lock` to exactly one
    increment above **current master**, not merely the branch's original base.
-2. Replace `.github/release-notes.md` with `# VERSION`, `Bump: patch|minor|major`,
+2. For a release, replace `.github/release-notes.md` with `# VERSION`, `Bump: patch|minor|major`,
    then concrete user-facing Markdown notes. Mention changed behavior, fixes,
    compatibility implications and migration steps. This is the next release's
    body, not an ever-growing changelog; previous notes live in GitHub Releases.
 3. Run `python3 tests/test_release_policy.py`, the normal checks, and
    `python3 scripts/release_policy.py --base origin/master` after fetching master.
-4. When another PR merges first, update from master and recalculate the version.
+4. When another PR merges first, update from master and recalculate any required version.
    Never reuse a released version. Multiple commits within one PR share one bump.
 
-Use patch for backwards-compatible bug fixes and documentation, testing or CI-only
-changes. Use minor for new backwards-compatible capabilities. Use major for
+Nonrelease changes retain current master's package version and release notes;
+an unnecessary version bump is rejected. Mixed binary/documentation changes
+share one release. The policy compares `src/`, explicit binary/library and build
+script paths, Rust toolchain and `.cargo/` settings, Cargo binary settings, the
+runtime/build dependency closure in `Cargo.lock`, and the distribution `package`
+job, including inherited workflow `env` and `defaults` settings. Package-job
+edits are treated conservatively because a step can change the distributed
+executable. Test-only dependency updates and edits to other CI jobs
+do not require a binary release unless they also change binary inputs.
+
+Use patch for backwards-compatible binary bug fixes. Use minor for new
+backwards-compatible capabilities, such as an optional write policy. Use major for
 breaking the documented CLI, filesystem, environment or platform contract.
+Correcting git-on's custom argument handling to restore the intended native Git
+semantics is a bug fix; a release that also adds write policies uses a minor bump.
 These rules also apply before 1.0: this project deliberately reserves major bumps
 for breaking changes instead of silently treating every 0.x release as breaking.
 CI can validate the numeric increment and notes; semantic classification requires
@@ -30,8 +46,12 @@ and `Bump: initial`. Later PRs cannot reuse this exception.
 
 ## CI and automatic publication
 
-`release-policy` rejects unchanged, decreasing, skipped, malformed or mismatched
-versions, stale PR branches, lockfile mismatches and missing/placeholder notes.
+`release-policy` determines whether a binary release is required. For a release
+it rejects unchanged, decreasing, skipped, malformed or mismatched versions and
+missing/placeholder notes. All PRs reject stale branches and package/lockfile
+version mismatches. Nonrelease PRs must retain the current master version.
+All required checks, including `package`, run on every PR regardless of this
+decision; no path filter hides a required check.
 `package` builds on Ubuntu 22.04 using Rust 1.90.0, packages Linux x86_64 and tests
 the **extracted archive executable** against a real FUSE mount. The GNU binary's
 supported baseline is glibc 2.35, not arbitrary Linux. The build vendors libgit2;
@@ -41,7 +61,9 @@ codegen unit to reduce the executable size. This increases release build/link
 work; debug builds and runtime dependencies are unchanged.
 
 After a master push, the same workflow waits for `rust`, `real-fuse`,
-`lazy-performance`, `release-policy` and `package`. Only then its `release` job
+`lazy-performance`, `release-policy` and `package`. If the validated policy says
+no binary release is needed, `release` is skipped and existing versions are not
+republished. Otherwise, only then its `release` job
 creates `vVERSION` at that exact tested commit, uploads the archive, SHA256SUMS
 and source/build metadata to a draft GitHub Release, then publishes it. It never
 checks out moving master to choose release contents. Release notes come from
@@ -82,12 +104,10 @@ Enable squash merging; do not merge multiple independent release changes in one
 master push. A failed release can be retried; no workflow silently republishes
 or moves an existing version.
 
-Setup is **not yet enforced** by this PR. On 2026-10-11 the private repository's
-rulesets endpoint returned “Upgrade to GitHub Pro or make this repository public
-to enable this feature.” Branch-protection inspection separately failed because
-the current integration lacks administration access. Neither visibility nor plan
-is changed by this implementation. Once the owner enables supported protection,
-verify a stale version PR really cannot merge. Strict protection closes the race
+On 2026-10-12, the public repository's active `master-protection` ruleset requires
+pull requests, squash merges, resolved review threads and the five strict status
+checks listed above, and forbids deletion and force pushes. Repository settings
+are managed separately from this workflow. Strict protection closes the race
 where master advances after the PR's version check finishes.
 
 ## Installing a published binary
@@ -123,7 +143,11 @@ installed. An explicit older version intentionally downgrades. Nothing runs in
 the background, and the installer never edits shell profiles or installs system
 packages. The default destination is `$HOME/.local/bin/git-on`. Add that directory
 to `PATH` if prompted. Existing symlink/non-regular destinations, symlink directory
-components and directories writable by other users are refused.
+components and directories with group-write or other-write mode bits are
+refused. These bits describe permissions, not proof that another user has
+effective access. Diagnostics show the directory's path, mode and owner.
+For a user-owned personal directory with unnecessary group writing, consider
+removing just that permission; otherwise select a separate `--bin-dir`.
 
 ### Inspect first or use an authenticated private release
 
@@ -203,4 +227,4 @@ The Linux/FUSE runtime requirements still apply.
 
 release-plz's separate release-PR workflow and cargo-dist's broader distribution
 machinery are useful for other policies. This project's single supported target
-and required release on every merge currently use a smaller explicit pipeline.
+and release-on-binary-change policy use a smaller explicit pipeline.

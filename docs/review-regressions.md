@@ -1,5 +1,85 @@
 # Review regression evidence
 
+## Native Git operand compatibility (1.2.0 bug fixes)
+
+Repository and revision arguments were always intended to use Git's syntax.
+These corrections restore that contract; the release's minor version increase
+is for the additional write policies. They do not introduce a new grammar or
+require a major version increase.
+
+The authentic pre-fix binaries from `85c1b15` were copied before editing the
+runtime sources. Five focused cases failed in 14 subcases against those
+binaries, including native ref spellings, direct local repository paths,
+branch/tag precedence and literal destination refspecs. The same permanent
+cases pass after delegation to native Git. Each fixture compares its selection
+or error with Git itself rather than prescribing a second interpretation.
+
+| Reproduced failure | Permanent regression | Result after fix |
+| --- | --- | --- |
+| Native ref forms such as `heads/main`, `tags/v1`, `+main` and destination refspecs were rejected or reinterpreted | `test_fetch_accepts_native_short_ref_names_and_refspecs`, `test_fetch_colon_is_a_literal_refspec_and_does_not_touch_caller_refs` | Native fetch selects the object and updates only private destination refs |
+| Local and non-UTF-8 source paths were rejected; a branch/tag collision used custom ambiguity rules | `test_fetch_accepts_relative_absolute_and_non_utf8_repository_paths`, `test_fetch_branch_tag_collision_follows_native_precedence` | Exact operand bytes and native precedence are preserved |
+| Invalid or non-UTF-8 revision operands never reached Git | `test_fetch_invalid_revision_reports_native_git_error`, `test_fetch_non_utf8_ref_is_passed_to_git_unchanged`, `test_native_fetch_receives_the_original_source_and_refspec` | Git receives unchanged operands and supplies the diagnostic |
+| A cold fetch into a destination ref made later tree demand negotiate from an incomplete private commit | `test_fetch_accepts_native_short_ref_names_and_refspecs`, `test_two_operands_fetch_literal_refspec_from_local_paths_into_a_private_snapshot` | Demand fetching obtains the exact missing object without advertising incomplete history |
+| Native resolution found objects in an external ODB, but subsequent reads or verification lost that environment | `test_local_native_object_database_environment_is_used_for_exact_reads`, `test_local_verification_keeps_native_object_database_environment` | Reads and signature verification use the Git-selected object locations |
+| Namespace/common-directory environments left temporary pins after completion or stale recovery | `test_local_namespace_environment_does_not_leave_snapshot_pins`, `test_local_common_directory_reads_and_releases_pins_in_the_native_repository` | Pins are removed from the actual common directory on completion and after SIGKILL recovery |
+| C-quoted alternate paths containing a colon or non-UTF-8 bytes resolved in Git but failed during snapshot reads | `test_local_c_quoted_alternate_with_colon_and_non_utf8_path_matches_native_git` | Private aliases preserve native object access without scanning or copying the ODB |
+| Copilot found relative alternates used the invocation cwd after native Git had changed repository context; relative primary object directories had the same defect | `test_local_relative_object_environments_follow_native_worktree_setup`, `test_local_relative_alternates_keep_native_bare_invocation_context` | Four native-valid subcases failed against the preserved binary; all eight worktree/bare/explicit-context cases pass with native object-location queries and real FUSE |
+
+Local runtime regressions were reproduced before their individual fixes, then
+rerun against immutable copies of the final executable and source probe. Those
+copies also passed 72 real-FUSE integration/uv tests and all nine write-policy
+tests. The full remote suite passed through real HTTPS/OpenSSH and FUSE,
+including the cold/warm million-file demand gate; the later object-environment
+fixes concern local repositories. Native fetch hooks are exercised explicitly
+by `test_native_fetch_reference_hook_sees_private_refs_and_repository`.
+
+The first exact-head CI run (`fb2556d`) reproduced a protocol-fixture defect:
+`protocol_all_copy_up_setattr_links_rename_and_whiteouts` failed with EACCES and
+`protocol_all_setattr_on_unlinked_original_read_handle` with EPERM. The fixture
+sent UID/GID 1000 while tracked entries belonged to the actual runner process.
+It now defaults to that process's effective IDs. Credential tests still use
+distinct owner, stranger, group and root identities and retain their rejection
+assertions. Both focused cases and all 17 protocol cases pass locally in normal
+and `test-metrics` builds; the subsequent CI run checks the corrected fixture
+under the runner's different UID. Production permission checks are unchanged.
+
+## Four write policies and release classification (1.2.0)
+
+The base for this change is current master `c42f818f1b4e2ccf4d940c2a77e98e2ad1eb931b`
+(1.1.0). A separate detached checkout and target directory replayed its actual
+binary: the new policy argument failed with usage status 2, and the focused
+missing-command diagnostic assertion failed against its generic `spawn command`
+message. Both tests pass with the new implementation. Installer and release
+regressions were also run before replacing their implementations.
+
+| Reproduced failure | Permanent regression | Result after fix |
+| --- | --- | --- |
+| Installer refused owned mode 0775 without path/mode/owner or conditional advice | `test_owned_group_writable_directory_has_precise_conditional_advice`, `test_other_writable_directory_is_distinguished_from_group_write`, `test_foreign_owner_never_gets_permission_change_advice` | Precise reasons, safe single-directory advice only where appropriate, permissions unchanged |
+| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible `--bin-dir` alternative |
+| Old Git 2.43.0 and missing Git diagnostics omitted detected version or next steps | `RemoteDiagnosticsTests` in `tests/remote.py` | Requirement stays 2.45.1+, with detected version/PATH guidance |
+| GitHub SSH publickey failure offered no public HTTPS alternative | `RemoteDiagnosticsTests` | Conditional HTTPS hint; no automatic retry or weakened authentication |
+| Version preflight before configuration capture blocked on a real Git 2.55 global-config FIFO | `SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state` | Restored configuration-first ordering; original lifecycle assertion passes |
+| Docs/test-only changes required a binary release; nonrelease publication could inspect old assets | `tests/test_release_policy.py`, `tests/test_publish_release.py` | Retain version, emit skip decision, avoid artifact/API access |
+| Copilot found nonrelease checks accepted changed, removed or newly added release notes despite the retention contract | `test_nonrelease_changes_must_retain_release_notes_bytes`, `test_nonrelease_cannot_add_previously_absent_release_notes`, `test_nonrelease_can_retain_absent_release_notes` | Four cases fail before the fix; all 32 release-policy and 12 publisher tests pass with baseline bytes and file presence enforced |
+| Workflow-level RUSTFLAGS/defaults could change the binary without requiring a release | `test_inherited_workflow_rustflags_requires_bump`, `test_inherited_workflow_run_defaults_requires_bump` | Inherited build settings require a bump |
+
+Two defects reproduced during development of `all` are separate from the
+1.1.0 baseline, which had no `all` option. Renaming a listed source directory
+unnecessarily demanded unvisited child headers (EIO with an unavailable child
+blob). `all_directory_rename_never_demands_listed_child_headers` now proves
+lazy remapping without that access. Changing metadata through a read descriptor
+after unlinking a source file returned ENOENT; the focused real-mount
+`WritePolicyTests.test_all_open_unlinked_source_allows_descriptor_metadata_changes`
+failed before its fix and passes afterward. Unit and protocol regressions also
+cover that anonymous copied-up inode.
+
+`tests/write_policy.py --require-fuse` checks four policies, default compatibility,
+tracked-parent protection, dirty host index/worktree selection, mutations, links,
+metadata, kept artifacts and interrupt cleanup. Protocol tests independently
+exercise fuser dispatch. Test results on one host do not replace exact-head CI
+or verification on another required host. The SL recording provenance names
+the actual recording host; it is not evidence of a recording on `brick`.
+
 ## Approved release LTO profile
 
 The release profile now explicitly keeps optimization level 3 and enables fat
@@ -853,3 +933,29 @@ test now opens a pidfd before cancellation and requires its bounded death,
 without confusing an outstanding kill with a survivor or relying on container
 PID 1 to reap zombies. This is an observed test-timing correction, not a claimed
 new transport cancellation defect or a fabricated deterministic red schedule.
+
+## Recording artifacts and CLI option placement (Copilot follow-up)
+
+The authentic recording helper at `8660e5e2` protected only `demo.gif` and
+`demo.json`. Five permanent destination tests failed before its fix: opening
+`vhs.log` truncated both an existing log and an unrelated file reached through
+a log symlink, while directories containing a video, dangling artifact symlink
+or earlier capture still reached the mocked VHS launch and gained a new log.
+These reproductions use real temporary files with mocked dependencies and VHS;
+they do not claim a new real recording or FUSE execution.
+
+All six `tests/test_record_demo.py` tests pass after rejecting a nonempty output
+directory before dependency, FUSE or executable probes. Existing files, directory
+contents and symlink targets remain unchanged; new and empty directories still
+reach normal dependency checks. The default output is now the disposable
+`target/sl-recording` directory. CI runs this permanent suite. Local red/green
+logs are retained as `target/git-operands-{red,green}/copilot-recording-destination.txt`.
+
+The CLI parser already accepted runner options before, between and after Git
+operands, but help and normative documentation said they must follow `REV`.
+The strengthened `CliTests.test_help_and_version` failed against the authentic
+release executable with SHA-256 `1f96f5445474149ca71d554c63a6d1388956cd0f2fb2c3427c73fcc48e22f996`.
+After correcting the help and documentation, all 11 `CliTests` and all 12 Rust
+`cli::tests` pass; parser behavior and operand grammar are unchanged. Evidence
+is in `target/git-operands-{red,green}/copilot-option-placement.log` and
+`target/git-operands-green/copilot-cli-unit.log`.

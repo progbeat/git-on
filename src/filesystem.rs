@@ -2,7 +2,7 @@
 //! writable layer. During a mount, user-controlled names never become host
 //! filesystem paths. Optional post-unmount export resolves names with no-follow
 //! directory descriptors and never traverses generated symlinks.
-use crate::policy::Policy;
+use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use fuser::{
@@ -114,10 +114,15 @@ fn export_metadata(file: &File, attr: &FileAttr) -> Result<()> {
 pub struct Overlay {
     _snapshot: Snapshot,
     policy: Policy,
+    write_policy: WritePolicy,
     backing: PathBuf,
     paths: BTreeMap<PathBuf, u64>,
     inode_paths: HashMap<u64, PathBuf>,
     upper_paths: BTreeMap<PathBuf, u64>,
+    // Namespace changes stay separate from the pinned source. Directory
+    // redirects preserve lazy access to unvisited descendants after rename.
+    whiteouts: BTreeSet<PathBuf>,
+    redirects: BTreeMap<PathBuf, PathBuf>,
     directory_refs: HashMap<u64, usize>,
     nodes: HashMap<u64, Node>,
     handles: HashMap<u64, Handle>,
@@ -130,6 +135,13 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new(snapshot: Snapshot, backing: PathBuf) -> Result<Self> {
+        Self::with_write_policy(snapshot, backing, WritePolicy::Ignored)
+    }
+    pub fn with_write_policy(
+        snapshot: Snapshot,
+        backing: PathBuf,
+        write_policy: WritePolicy,
+    ) -> Result<Self> {
         fs::create_dir_all(&backing).context("create writable backing directory")?;
         let meta = fs::symlink_metadata(&backing)?;
         anyhow::ensure!(
@@ -138,7 +150,7 @@ impl Overlay {
         );
         fs::set_permissions(&backing, fs::Permissions::from_mode(0o700))?;
         snapshot.set_spool_directory(&backing)?;
-        let policy = Policy::new(&snapshot)?;
+        let policy = Policy::with_mode(&snapshot, write_policy)?;
         let snapshot_time = SystemTime::now();
         let mut paths = BTreeMap::new();
         let mut nodes = HashMap::new();
@@ -166,10 +178,13 @@ impl Overlay {
         Ok(Self {
             _snapshot: snapshot,
             policy,
+            write_policy,
             backing,
             paths,
             inode_paths: HashMap::from([(1, PathBuf::new())]),
             upper_paths: BTreeMap::new(),
+            whiteouts: BTreeSet::new(),
+            redirects: BTreeMap::new(),
             directory_refs: HashMap::new(),
             nodes,
             handles: HashMap::new(),
@@ -331,6 +346,17 @@ impl Overlay {
         }
         Ok(())
     }
+    fn lower_path(&self, path: &Path) -> Option<PathBuf> {
+        for ancestor in path.ancestors() {
+            if let Some(source) = self.redirects.get(ancestor) {
+                return Some(source.join(path.strip_prefix(ancestor).ok()?));
+            }
+            if self.whiteouts.contains(ancestor) {
+                return None;
+            }
+        }
+        Some(path.to_path_buf())
+    }
     /// Materialize inode metadata only for the requested pathname. No sibling
     /// blobs or descendant trees are loaded as a side effect.
     fn ensure(&mut self, path: &Path) -> FsResult<u64> {
@@ -339,9 +365,10 @@ impl Overlay {
                 return Ok(*ino);
             }
         }
+        let source = self.lower_path(path).ok_or(libc::ENOENT)?;
         let entry = self
             ._snapshot
-            .entry(path)
+            .entry(&source)
             .map_err(snapshot_errno)?
             .ok_or(libc::ENOENT)?;
         let ino = if let Some(ino) = self.paths.get(path) {
@@ -376,7 +403,7 @@ impl Overlay {
                 immutable: true,
                 oid: Some(entry.oid),
                 lookups: 0,
-                snapshot_path: Some(path.to_path_buf()),
+                snapshot_path: Some(source),
                 bytes: Vec::new(),
                 file: None,
             },
@@ -423,14 +450,19 @@ impl Overlay {
             (ino, FileType::Directory, OsString::from(".")),
             (parent, FileType::Directory, OsString::from("..")),
         ];
-        if self.node(ino)?.immutable {
-            for (name, entry) in self._snapshot.children(&path).map_err(snapshot_errno)? {
+        if let Some(source) = self.node(ino)?.snapshot_path.clone() {
+            for (name, entry) in self._snapshot.children(&source).map_err(snapshot_errno)? {
+                let child_path = path.join(&name);
+                if self.upper_paths.contains_key(&child_path)
+                    || self.lower_path(&child_path).is_none()
+                {
+                    continue;
+                }
                 let kind = match entry.kind {
                     EntryKind::Directory => FileType::Directory,
                     EntryKind::Symlink => FileType::Symlink,
                     EntryKind::File => FileType::RegularFile,
                 };
-                let child_path = path.join(&name);
                 let child = if let Some(id) = self.paths.get(&child_path) {
                     *id
                 } else {
@@ -521,7 +553,12 @@ impl Overlay {
         self.nodes.get_mut(&ino).ok_or(libc::ENOENT)
     }
     fn path(&self, ino: u64) -> FsResult<PathBuf> {
-        if let Some(path) = &self.node(ino)?.snapshot_path {
+        self.node(ino)?;
+        if let Some(path) = self
+            .inode_paths
+            .get(&ino)
+            .filter(|path| self.paths.get(*path) == Some(&ino))
+        {
             return Ok(path.clone());
         }
         self.paths
@@ -546,11 +583,89 @@ impl Overlay {
         Ok(self.path(parent)?.join(name))
     }
     fn writable(&self, ino: u64) -> FsResult<()> {
-        if self.node(ino)?.immutable {
+        let node = self.node(ino)?;
+        if self.write_policy == WritePolicy::None
+            || (node.immutable && self.write_policy != WritePolicy::All)
+        {
             Err(libc::EROFS)
         } else {
             Ok(())
         }
+    }
+    /// Copy only this inode on its first mutation. A directory retains its
+    /// source origin so its untouched descendants continue to load on demand.
+    fn copy_up(&mut self, ino: u64, preserve_content: bool) -> FsResult<()> {
+        self.writable(ino)?;
+        let node = self.node(ino)?;
+        if !node.immutable {
+            return Ok(());
+        }
+        let kind = node.attr.kind;
+        let oid = node.oid.ok_or(libc::EIO)?;
+        let unlinked = node.attr.nlink == 0;
+        let path = match self.path(ino) {
+            Ok(path) => Some(path),
+            Err(libc::ENOENT) if unlinked => None,
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        let file = if kind == FileType::RegularFile {
+            let disk_path = self.backing.join(ino.to_string());
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&disk_path)
+                .map_err(errno)?;
+            let copied = (|| {
+                if preserve_content && node.attr.size != 0 {
+                    let reader = self._snapshot.open(oid).map_err(snapshot_errno)?;
+                    let mut offset = 0;
+                    while offset < node.attr.size {
+                        let data = reader
+                            .read(offset, (node.attr.size - offset).min(64 * 1024) as u32)
+                            .map_err(snapshot_errno)?;
+                        if data.is_empty() {
+                            return Err(libc::EIO);
+                        }
+                        std::io::Write::write_all(&mut file, &data).map_err(errno)?;
+                        offset += data.len() as u64;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = copied {
+                drop(file);
+                let _ = fs::remove_file(disk_path);
+                return Err(error);
+            }
+            if unlinked {
+                fs::remove_file(&disk_path).map_err(errno)?;
+            }
+            Some(file)
+        } else {
+            if kind == FileType::Symlink {
+                bytes = self._snapshot.read_link(oid).map_err(snapshot_errno)?;
+            }
+            None
+        };
+        let keep_file = unlinked || self.handles.values().any(|handle| handle.ino == ino);
+        let node = self.node_mut(ino)?;
+        node.immutable = false;
+        node.oid = None;
+        node.bytes = bytes;
+        if keep_file {
+            node.file = file;
+        }
+        if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+            self.upper_paths.insert(path, ino);
+        }
+        for handle in self.handles.values_mut().filter(|handle| handle.ino == ino) {
+            handle.reader = None;
+        }
+        Ok(())
     }
     fn allowed(&self, p: &Path, kind: FileType) -> FsResult<()> {
         if self
@@ -565,9 +680,15 @@ impl Overlay {
     }
     fn fresh(&self, parent: u64, name: &OsStr, kind: FileType) -> FsResult<PathBuf> {
         let p = self.child(parent, name)?;
-        if self.paths.contains_key(&p)
-            || self._snapshot.entry(&p).map_err(snapshot_errno)?.is_some()
-        {
+        let tracked = match self.lower_path(&p) {
+            Some(source) => self
+                ._snapshot
+                .entry(&source)
+                .map_err(snapshot_errno)?
+                .is_some(),
+            None => false,
+        };
+        if self.paths.contains_key(&p) || tracked {
             return Err(libc::EEXIST);
         }
         self.allowed(&p, kind)?;
@@ -576,7 +697,7 @@ impl Overlay {
     fn adjust_parent_links(&mut self, path: &Path, delta: i32) {
         if let Some(ino) = path.parent().and_then(|p| self.paths.get(p)).copied() {
             if let Some(node) = self.nodes.get_mut(&ino) {
-                if !node.immutable {
+                if !node.immutable || self.write_policy == WritePolicy::All {
                     node.attr.nlink = node.attr.nlink.saturating_add_signed(delta);
                 }
             }
@@ -586,6 +707,14 @@ impl Overlay {
         if let Some(ino) = path.parent().and_then(|p| self.paths.get(p)).copied() {
             // A tracked directory's metadata belongs to the snapshot as well.
             if let Some(node) = self.nodes.get_mut(&ino) {
+                if self.write_policy == WritePolicy::All && node.immutable {
+                    node.immutable = false;
+                    node.oid = None;
+                    let parent = path.parent().expect("namespace path has parent");
+                    if !parent.as_os_str().is_empty() {
+                        self.upper_paths.insert(parent.to_path_buf(), ino);
+                    }
+                }
                 if !node.immutable {
                     node.attr.mtime = SystemTime::now();
                     node.attr.ctime = node.attr.mtime;
@@ -687,6 +816,8 @@ impl Overlay {
         }
         if flags & libc::O_TRUNC != 0 {
             self.truncate(ino, 0)?;
+        } else if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            self.copy_up(ino, true)?;
         }
         if !self.node(ino)?.immutable && self.node(ino)?.file.is_none() {
             let file = self.disk_file(ino)?;
@@ -723,6 +854,7 @@ impl Overlay {
         if size > i64::MAX as u64 {
             return Err(libc::EFBIG);
         }
+        self.copy_up(ino, size != 0)?;
         let file = self.disk_file(ino)?;
         file.set_len(size).map_err(errno)?;
         let metadata = file.metadata().map_err(errno)?;
@@ -839,11 +971,32 @@ impl Overlay {
         }
         Ok(written as u32)
     }
-    fn empty(&self, p: &Path) -> bool {
-        !self.paths.keys().any(|q| q != p && q.starts_with(p))
+    fn empty(&self, p: &Path) -> FsResult<bool> {
+        if self.paths.keys().any(|q| q != p && q.starts_with(p)) {
+            return Ok(false);
+        }
+        if let Some(source) = self.lower_path(p) {
+            if self
+                ._snapshot
+                .entry(&source)
+                .map_err(snapshot_errno)?
+                .is_some()
+            {
+                for (name, _) in self._snapshot.children(&source).map_err(snapshot_errno)? {
+                    if self.lower_path(&p.join(name)).is_some() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
     fn remove_path(&mut self, p: &Path) {
         self.upper_paths.remove(p);
+        if self.write_policy == WritePolicy::All {
+            self.whiteouts.insert(p.to_path_buf());
+            self.redirects.remove(p);
+        }
         if let Some(ino) = self.paths.remove(p) {
             if self
                 .nodes
@@ -867,6 +1020,9 @@ impl Overlay {
                 }
             }
             self.touch_parent(p);
+            if self.inode_paths.get(&ino).is_some_and(|path| path == p) {
+                self.inode_paths.remove(&ino);
+            }
         }
         // Keep inode objects and open descriptors for outstanding kernel inode
         // references and open-unlinked handles; all are reclaimed at unmount.
@@ -882,7 +1038,7 @@ impl Overlay {
         if !directory && kind == FileType::Directory {
             return Err(libc::EISDIR);
         }
-        if directory && !self.empty(&p) {
+        if directory && !self.empty(&p)? {
             return Err(libc::ENOTEMPTY);
         }
         self.allowed(&p, kind)?;
@@ -918,7 +1074,12 @@ impl Overlay {
         if kind == FileType::Directory && to.starts_with(&from) {
             return Err(libc::EINVAL);
         }
-        if let Some(dst) = self.paths.get(&to).copied() {
+        let destination = match self.ensure(&to) {
+            Ok(destination) => Some(destination),
+            Err(libc::ENOENT) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(dst) = destination {
             self.writable(dst)?;
             if flags & 1 != 0 {
                 return Err(libc::EEXIST);
@@ -933,36 +1094,87 @@ impl Overlay {
             if kind != FileType::Directory && dk == FileType::Directory {
                 return Err(libc::EISDIR);
             }
-            if dk == FileType::Directory && !self.empty(&to) {
+            if dk == FileType::Directory && !self.empty(&to)? {
                 return Err(libc::ENOTEMPTY);
             }
         }
+        let cached: Vec<_> = self
+            .paths
+            .keys()
+            .filter(|old| *old == &from || old.starts_with(&from))
+            .cloned()
+            .collect();
         let mut moves = Vec::new();
-        for (old, id) in &self.paths {
-            if old == &from || old.starts_with(&from) {
-                self.writable(*id)?;
-                let target = to.join(old.strip_prefix(&from).map_err(|_| libc::EIO)?);
-                let k = self.node(*id)?.attr.kind;
-                self.allowed(old, k)?;
+        for old in cached {
+            let id = self.paths[&old];
+            let target = to.join(old.strip_prefix(&from).map_err(|_| libc::EIO)?);
+            if let Some(node) = self.nodes.get(&id) {
+                let k = node.attr.kind;
+                self.writable(id)?;
+                self.allowed(&old, k)?;
                 self.allowed(&target, k)?;
-                if let Some(other) = self.paths.get(&target) {
-                    if target != to && !target.starts_with(&from) && *other != *id {
-                        return Err(libc::EEXIST);
-                    }
-                }
-                moves.push((old.clone(), target, *id));
+            } else if self.write_policy != WritePolicy::All {
+                return Err(libc::EIO);
             }
+            if let Some(other) = self.paths.get(&target) {
+                if target != to && !target.starts_with(&from) && *other != id {
+                    return Err(libc::EEXIST);
+                }
+            }
+            moves.push((old, target, id));
         }
-        // Every validation above precedes the first namespace mutation.
-        if self.paths.contains_key(&to) {
+        let origin = if kind == FileType::Directory {
+            self.node(ino)?.snapshot_path.clone()
+        } else {
+            None
+        };
+        // Every namespace validation precedes copy-up or a visible mutation.
+        self.copy_up(ino, true)?;
+        if destination.is_some() {
             self.remove_path(&to);
+        }
+        if self.write_policy == WritePolicy::All {
+            let moved_whiteouts: Vec<_> = self
+                .whiteouts
+                .iter()
+                .filter(|path| *path != &from && path.starts_with(&from))
+                .map(|path| to.join(path.strip_prefix(&from).expect("whiteout descendant")))
+                .collect();
+            let moved_redirects: Vec<_> = self
+                .redirects
+                .iter()
+                .filter(|(path, _)| *path != &from && path.starts_with(&from))
+                .map(|(path, source)| {
+                    (
+                        to.join(path.strip_prefix(&from).expect("redirect descendant")),
+                        source.clone(),
+                    )
+                })
+                .collect();
+            self.whiteouts
+                .retain(|path| !path.starts_with(&from) && !path.starts_with(&to));
+            self.redirects
+                .retain(|path, _| !path.starts_with(&from) && !path.starts_with(&to));
+            self.whiteouts.insert(from.clone());
+            self.whiteouts.extend(moved_whiteouts);
+            self.redirects.extend(moved_redirects);
+            if let Some(origin) = origin {
+                self.redirects.insert(to.clone(), origin);
+            } else {
+                // A generated directory must not inherit an overwritten lower
+                // destination's hidden children.
+                self.whiteouts.insert(to.clone());
+            }
         }
         for (old, _, _) in &moves {
             self.paths.remove(old);
             self.upper_paths.remove(old);
         }
         for (_, target, id) in moves {
-            self.upper_paths.insert(target.clone(), id);
+            if self.nodes.get(&id).is_some_and(|node| !node.immutable) {
+                self.upper_paths.insert(target.clone(), id);
+            }
+            self.inode_paths.insert(id, target.clone());
             self.paths.insert(target, id);
         }
         self.node_mut(ino)?.attr.ctime = SystemTime::now();
@@ -981,6 +1193,10 @@ impl Overlay {
             return Err(libc::EPERM);
         }
         let path = self.fresh(parent, name, kind)?;
+        if self.node(ino)?.attr.nlink == 0 {
+            return Err(libc::ENOENT);
+        }
+        self.copy_up(ino, true)?;
         let n = self.node_mut(ino)?;
         if n.attr.nlink == 0 {
             return Err(libc::ENOENT);
@@ -1056,6 +1272,7 @@ impl Filesystem for Overlay {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         let result = (|| {
             self.writable(ino)?;
             if let Some(fh) = fh {
@@ -1076,6 +1293,8 @@ impl Filesystem for Overlay {
             }
             if let Some(size) = size {
                 self.truncate(ino, size)?;
+            } else {
+                self.copy_up(ino, true)?;
             }
             let n = self.node_mut(ino)?;
             if let Some(mode) = mode {
@@ -1253,7 +1472,8 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let _request = crate::git::RequestGuard::enter(req.pid());
         // No keep-cache or writeback-cache flags: normal page-cache semantics
         // preserve executable mappings and shared mmap write-through handles.
         match self.open_file(ino, flags) {
@@ -1460,7 +1680,14 @@ impl Filesystem for Overlay {
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
         let result = (|| {
             let n = self.node(ino)?;
-            if mask & libc::W_OK != 0 && n.immutable && n.attr.kind != FileType::Directory {
+            if mask & libc::W_OK != 0
+                && (self.write_policy == WritePolicy::None
+                    || (matches!(
+                        self.write_policy,
+                        WritePolicy::Ignored | WritePolicy::Untracked
+                    ) && n.immutable
+                        && n.attr.kind != FileType::Directory))
+            {
                 return Err(libc::EROFS);
             }
             let bits = if req.uid() == n.attr.uid {
@@ -1553,6 +1780,309 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+    fn fixture_policy(mode: WritePolicy) -> (TempDir, Overlay) {
+        let (temp, overlay) = fixture();
+        let snapshot = overlay._snapshot.clone();
+        drop(overlay);
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), mode).unwrap();
+        (temp, overlay)
+    }
+    #[test]
+    fn all_copies_up_tracked_bytes_and_preserves_existing_read_handles() {
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
+        let ino = overlay.ensure(Path::new("tracked.tmp")).unwrap();
+        let original_oid = overlay.nodes[&ino].oid.unwrap();
+        let read = overlay.open_file(ino, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            overlay.read_data(ino, read, 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        let write = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay
+            .write_data(ino, write, 0, b"edited", 0, libc::O_RDWR)
+            .unwrap();
+        assert_eq!(
+            overlay.read_data(ino, read, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+        overlay
+            .rename_path(1, OsStr::new("tracked.tmp"), 1, OsStr::new("renamed"), 0)
+            .unwrap();
+        assert_eq!(overlay.ensure(Path::new("tracked.tmp")), Err(libc::ENOENT));
+        assert_eq!(overlay.ensure(Path::new("renamed")).unwrap(), ino);
+        assert_eq!(
+            overlay.read_data(ino, read, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+        assert_eq!(
+            overlay._snapshot.read(original_oid, 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        overlay.remove(1, OsStr::new("renamed"), false).unwrap();
+        assert_eq!(overlay.ensure(Path::new("renamed")), Err(libc::ENOENT));
+        assert_eq!(
+            overlay.read_data(ino, read, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+        let new = file(&mut overlay, 1, "tracked.tmp");
+        assert_ne!(new, ino);
+    }
+    #[test]
+    fn none_denies_ignored_creation_without_loading_rules() {
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::None);
+        let before = overlay._snapshot.metrics();
+        assert_eq!(
+            overlay.make(
+                1,
+                OsStr::new("fresh.tmp"),
+                FileType::RegularFile,
+                0o600,
+                0,
+                0,
+                Vec::new()
+            ),
+            Err(libc::EROFS)
+        );
+        assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
+        let ino = overlay.ensure(Path::new("tracked.tmp")).unwrap();
+        assert_eq!(overlay.open_file(ino, libc::O_RDWR), Err(libc::EROFS));
+    }
+    #[test]
+    fn untracked_mutates_new_paths_inside_tracked_directories_and_protects_originals() {
+        let (_temp, mut overlay) = directory_fixture();
+        overlay.write_policy = WritePolicy::Untracked;
+        overlay.policy = Policy::with_mode(&overlay._snapshot, WritePolicy::Untracked).unwrap();
+        let source = overlay.ensure(Path::new("source")).unwrap();
+        let original = overlay.ensure(Path::new("source/file")).unwrap();
+        let new = file(&mut overlay, source, "not-ignored");
+        let handle = overlay.open_file(new, libc::O_RDWR).unwrap();
+        overlay
+            .write_data(new, handle, 0, b"new bytes", 0, libc::O_RDWR)
+            .unwrap();
+        overlay
+            .rename_path(
+                source,
+                OsStr::new("not-ignored"),
+                source,
+                OsStr::new("renamed"),
+                0,
+            )
+            .unwrap();
+        overlay.truncate(new, 3).unwrap();
+        assert_eq!(overlay.read_data(new, handle, 0, 100).unwrap(), b"new");
+        assert_eq!(
+            overlay.rename_path(source, OsStr::new("renamed"), source, OsStr::new("file"), 0),
+            Err(libc::EROFS)
+        );
+        assert_eq!(
+            overlay.rename_path(1, OsStr::new("source"), 1, OsStr::new("moved"), 0),
+            Err(libc::EROFS)
+        );
+        assert_eq!(
+            overlay.remove(1, OsStr::new("source"), true),
+            Err(libc::EROFS)
+        );
+        assert_eq!(
+            overlay.remove(source, OsStr::new("file"), false),
+            Err(libc::EROFS)
+        );
+        assert_eq!(overlay.open_file(original, libc::O_RDWR), Err(libc::EROFS));
+        assert_eq!(
+            overlay.hardlink(original, source, OsStr::new("original-alias")),
+            Err(libc::EROFS)
+        );
+        overlay
+            .hardlink(new, source, OsStr::new("new-alias"))
+            .unwrap();
+        overlay
+            .remove(source, OsStr::new("renamed"), false)
+            .unwrap();
+        assert_eq!(overlay.ensure(Path::new("source/new-alias")).unwrap(), new);
+        assert_eq!(overlay.ensure(Path::new("source/file")).unwrap(), original);
+        assert!(overlay.whiteouts.is_empty());
+        assert!(overlay.redirects.is_empty());
+    }
+    #[test]
+    fn untracked_does_not_demand_missing_ignore_objects() {
+        let (temp, mut overlay) = fixture_policy(WritePolicy::Untracked);
+        let repo = Repository::open(temp.path().join("repo")).unwrap();
+        let oid = repo
+            .find_tree(overlay._snapshot.tree_oid)
+            .unwrap()
+            .get_name(".gitignore")
+            .unwrap()
+            .id()
+            .to_string();
+        fs::remove_file(repo.path().join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        let before = overlay._snapshot.metrics();
+        let generated = file(&mut overlay, 1, "ordinary-unignored-path");
+        assert!(!overlay.nodes[&generated].immutable);
+        assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
+        assert_eq!(
+            overlay.remove(1, OsStr::new("tracked.tmp"), false),
+            Err(libc::EROFS)
+        );
+    }
+    fn directory_fixture() -> (TempDir, Overlay) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let content = repo.blob(b"original").unwrap();
+        let mut nested = repo.treebuilder(None).unwrap();
+        nested.insert("leaf", content, 0o100644).unwrap();
+        let nested = nested.write().unwrap();
+        let mut source = repo.treebuilder(None).unwrap();
+        source.insert("file", content, 0o100644).unwrap();
+        source.insert("nested", nested, 0o040000).unwrap();
+        let source = source.write().unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", source, 0o040000).unwrap();
+        tree.insert("destination", empty, 0o040000).unwrap();
+        tree.insert("untouched", source, 0o040000).unwrap();
+        let oid = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "directory-cow").unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        (temp, overlay)
+    }
+    #[test]
+    fn all_directory_rename_preserves_lazy_origins_and_moves_child_whiteouts() {
+        let (temp, mut overlay) = directory_fixture();
+        let source = overlay.ensure(Path::new("source")).unwrap();
+        let before = overlay._snapshot.metrics();
+        overlay
+            .rename_path(1, OsStr::new("source"), 1, OsStr::new("destination"), 0)
+            .unwrap();
+        assert_eq!(
+            overlay._snapshot.metrics().tree_reads,
+            before.tree_reads + 1,
+            "only validate the empty destination, never traverse source descendants"
+        );
+        assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
+        assert_eq!(overlay.ensure(Path::new("source")), Err(libc::ENOENT));
+        assert_eq!(overlay.ensure(Path::new("destination")).unwrap(), source);
+        assert!(!overlay.paths.contains_key(Path::new("destination/file")));
+        let file = overlay.ensure(Path::new("destination/file")).unwrap();
+        let read = overlay.open_file(file, libc::O_RDONLY).unwrap();
+        assert_eq!(overlay.read_data(file, read, 0, 100).unwrap(), b"original");
+        overlay.remove(source, OsStr::new("file"), false).unwrap();
+        let directory = overlay.open_directory(source, libc::O_RDONLY).unwrap();
+        assert!(!overlay.directories[&directory]
+            .iter()
+            .any(|(_, _, name)| name == "file"));
+        overlay.close_handle(source, directory);
+        overlay
+            .rename_path(1, OsStr::new("destination"), 1, OsStr::new("again"), 0)
+            .unwrap();
+        assert_eq!(overlay.ensure(Path::new("again/file")), Err(libc::ENOENT));
+        let leaf = overlay.ensure(Path::new("again/nested/leaf")).unwrap();
+        let handle = overlay.open_file(leaf, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            overlay.read_data(leaf, handle, 0, 100).unwrap(),
+            b"original"
+        );
+        let before_export = overlay._snapshot.metrics();
+        overlay.export_upper(&temp.path().join("kept")).unwrap();
+        assert!(temp.path().join("kept/again").is_dir());
+        assert!(!temp.path().join("kept/again/nested/leaf").exists());
+        assert_eq!(
+            overlay._snapshot.metrics().blob_loads,
+            before_export.blob_loads
+        );
+        assert_eq!(
+            overlay._snapshot.metrics().tree_reads,
+            before_export.tree_reads
+        );
+    }
+    #[test]
+    fn all_directory_rename_never_demands_listed_child_headers() {
+        let (temp, mut overlay) = directory_fixture();
+        let source = overlay.ensure(Path::new("source")).unwrap();
+        let handle = overlay.open_directory(source, libc::O_RDONLY).unwrap();
+        let reserved = overlay.paths[Path::new("source/file")];
+        assert!(!overlay.nodes.contains_key(&reserved));
+        let repo = Repository::open(temp.path().join("repo")).unwrap();
+        let oid = repo
+            .find_tree(overlay._snapshot.tree_oid)
+            .unwrap()
+            .get_path(Path::new("source/file"))
+            .unwrap()
+            .id()
+            .to_string();
+        fs::remove_file(repo.path().join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        let before = overlay._snapshot.metrics();
+        overlay
+            .rename_path(1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
+            .unwrap();
+        assert_eq!(overlay.paths[Path::new("moved/file")], reserved);
+        assert!(!overlay.nodes.contains_key(&reserved));
+        assert_eq!(
+            overlay._snapshot.metrics().header_reads,
+            before.header_reads
+        );
+        assert_eq!(overlay.ensure(Path::new("moved/file")), Err(libc::EIO));
+        overlay.close_handle(source, handle);
+    }
+    #[test]
+    fn all_replaces_unseen_tracked_destinations_without_resurrecting_lower_entries() {
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
+        let fresh = file(&mut overlay, 1, "fresh");
+        assert!(!overlay.paths.contains_key(Path::new("tracked.tmp")));
+        overlay
+            .rename_path(1, OsStr::new("fresh"), 1, OsStr::new("tracked.tmp"), 0)
+            .unwrap();
+        assert_eq!(overlay.ensure(Path::new("tracked.tmp")).unwrap(), fresh);
+        let directory = overlay.open_directory(1, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            overlay.directories[&directory]
+                .iter()
+                .filter(|(_, _, name)| name == "tracked.tmp")
+                .count(),
+            1
+        );
+        overlay.close_handle(1, directory);
+        overlay.remove(1, OsStr::new("tracked.tmp"), false).unwrap();
+        assert_eq!(overlay.ensure(Path::new("tracked.tmp")), Err(libc::ENOENT));
+    }
+    #[test]
+    fn all_unlinked_original_read_inode_can_acquire_private_metadata() {
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
+        let file = overlay.ensure(Path::new("tracked.tmp")).unwrap();
+        let handle = overlay.open_file(file, libc::O_RDONLY).unwrap();
+        overlay.remove(1, OsStr::new("tracked.tmp"), false).unwrap();
+        overlay.copy_up(file, true).unwrap();
+        overlay.truncate(file, 6).unwrap();
+        assert_eq!(overlay.read_data(file, handle, 0, 100).unwrap(), b"pinned");
+        assert!(!overlay.backing.join(file.to_string()).exists());
+        assert!(!overlay.upper_paths.contains_key(Path::new("tracked.tmp")));
+        assert_eq!(overlay.nodes[&file].attr.nlink, 0);
+    }
+    #[test]
+    fn all_truncate_to_zero_skips_source_content_and_directory_errors_are_atomic() {
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
+        let file = overlay.ensure(Path::new("tracked.tmp")).unwrap();
+        let before = overlay._snapshot.metrics();
+        let handle = overlay
+            .open_file(file, libc::O_RDWR | libc::O_TRUNC)
+            .unwrap();
+        assert!(overlay.read_data(file, handle, 0, 100).unwrap().is_empty());
+        assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
+        let (_temp, mut overlay) = directory_fixture();
+        assert_eq!(
+            overlay.remove(1, OsStr::new("source"), true),
+            Err(libc::ENOTEMPTY)
+        );
+        assert_eq!(
+            overlay.rename_path(1, OsStr::new("destination"), 1, OsStr::new("source"), 0),
+            Err(libc::ENOTEMPTY)
+        );
+        assert!(overlay.whiteouts.is_empty());
+        assert!(overlay.upper_paths.is_empty());
+        assert!(overlay.ensure(Path::new("source/file")).is_ok());
     }
     fn dir(fs: &mut Overlay, name: &str) -> u64 {
         fs.make(

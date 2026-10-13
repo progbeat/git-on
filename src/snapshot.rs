@@ -1,14 +1,17 @@
 //! Immutable, demand-loaded objects from the pinned Git tree.
 use anyhow::{bail, Context, Result};
-use git2::{ObjectType, Oid, Repository};
+use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
-    fs::File,
+    fs::{self, File},
     io::Write,
-    os::unix::{ffi::OsStringExt, fs::FileExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{symlink, FileExt},
+    },
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, Weak},
 };
@@ -128,6 +131,95 @@ struct Pin {
     git_dir: PathBuf,
     name: String,
     oid: Oid,
+}
+
+/// libgit2 handles relative object environments before Git's repository setup
+/// and splits alternate paths on every colon. Adapt native Git's selected
+/// locations to private ASCII aliases without copying any objects.
+fn local_object_bridge(
+    git: &crate::git::Git,
+    repo: &Repository,
+    run_directory: &Path,
+) -> Result<Option<tempfile::TempDir>> {
+    let alternates = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    if alternates.is_none() && std::env::var_os("GIT_OBJECT_DIRECTORY").is_none() {
+        return Ok(None);
+    }
+    let primary = git.output(
+        None,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-path"),
+            OsStr::new("objects"),
+        ],
+    )?;
+    let mut locations = vec![PathBuf::from(OsString::from_vec(
+        primary.strip_suffix(b"\n").unwrap_or(&primary).to_vec(),
+    ))];
+    let mut cwd = git.cwd.canonicalize()?;
+    if alternates.is_some() {
+        let prefix = git.output(
+            None,
+            &[OsStr::new("rev-parse"), OsStr::new("--show-prefix")],
+        )?;
+        // Git moves from a worktree subdirectory to its top level. Bare
+        // invocations and explicit GIT_DIR calls outside a worktree retain the
+        // invocation cwd, even when --show-cdup prints a worktree path.
+        if !prefix.strip_suffix(b"\n").unwrap_or(&prefix).is_empty() {
+            let cdup = git.output(None, &[OsStr::new("rev-parse"), OsStr::new("--show-cdup")])?;
+            cwd = cwd
+                .join(PathBuf::from(OsString::from_vec(
+                    cdup.strip_suffix(b"\n").unwrap_or(&cdup).to_vec(),
+                )))
+                .canonicalize()?;
+        }
+    }
+    let mut remaining = alternates
+        .as_ref()
+        .map_or(&[][..], |value| value.as_bytes());
+    while !remaining.is_empty() {
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b':')
+            .unwrap_or(remaining.len());
+        let decoded = remaining
+            .starts_with(b"\"")
+            .then(|| gix_quote::ansi_c::undo(remaining.into()))
+            .and_then(Result::ok);
+        let (value, consumed) = if remaining.starts_with(b"#") {
+            (Vec::new(), end)
+        } else if let Some((value, consumed)) = decoded {
+            (value.as_ref().to_vec(), consumed)
+        } else {
+            // Native Git likewise falls back to the ordinary component when
+            // quoting is broken; missing paths are ignored by its ODB loader.
+            (remaining[..end].to_vec(), end)
+        };
+        remaining = &remaining[consumed..];
+        if !remaining.is_empty() {
+            remaining = &remaining[1..];
+        }
+        if !value.is_empty() {
+            let path = PathBuf::from(OsString::from_vec(value));
+            if let Ok(path) = cwd.join(path).canonicalize() {
+                locations.push(path);
+            }
+        }
+    }
+    let bridge = tempfile::Builder::new()
+        .prefix("local-object-bridge-")
+        .tempdir_in(run_directory)?;
+    let private = Repository::init_bare(bridge.path())?;
+    let mut aliases = String::new();
+    for (index, location) in locations.into_iter().enumerate() {
+        let name = format!("alternate-{index}");
+        symlink(location, bridge.path().join(&name))?;
+        aliases.push_str(&format!("../{name}\n"));
+    }
+    fs::write(bridge.path().join("objects/info/alternates"), aliases)?;
+    repo.set_odb(&private.odb()?)?;
+    Ok(Some(bridge))
 }
 impl Drop for Pin {
     fn drop(&mut self) {
@@ -260,6 +352,7 @@ struct State {
     readers: BTreeMap<Oid, Weak<BlobData>>,
     metrics: SnapshotMetrics,
     spool_directory: PathBuf,
+    _local_object_bridge: Option<tempfile::TempDir>,
 }
 impl State {
     fn ensure(&mut self, oid: Oid) -> Result<()> {
@@ -443,41 +536,34 @@ impl Snapshot {
     where
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
-        let spec = treeish.to_str().context("tree-ish must be valid UTF-8")?;
-        let (revision, subtree) = if verify || source.is_some() {
-            match spec.split_once(':') {
-                Some((revision, path)) => (revision, Some(path)),
-                None => (spec, None),
-            }
-        } else {
-            (spec, None)
-        };
-        let (repo, mut remote, oid, git) = if let Some(source) = source {
-            let (mut remote, advertisement) =
-                crate::remote::Remote::open(repo_path, source, run_directory)?;
-            let oid = crate::remote::Remote::resolve(&advertisement, revision)?;
-            remote.ensure(oid)?;
-            (Repository::open_bare(&remote.dir)?, Some(remote), oid, None)
-        } else if verify {
-            let git = crate::git::Git::capture(repo_path)?;
-            let oid = git.resolve(OsStr::new(revision))?;
+        let (repo, mut remote, oid, git, local_bridge) = if let Some(source) = source {
+            let (remote, oid) =
+                crate::remote::Remote::open(repo_path, source, treeish, run_directory)?;
             (
-                Repository::discover(repo_path).context("discover Git repository")?,
-                None,
+                Repository::open_bare(&remote.dir)?,
+                Some(remote),
                 oid,
-                Some(git),
+                None,
+                None,
             )
         } else {
-            // Preserve the original local runtime contract: unverified loads
-            // use bundled libgit2 without invoking or configuring native Git.
-            let repo = Repository::discover(repo_path).context("discover Git repository")?;
-            let tree_oid = repo
-                .revparse_single(spec)
-                .with_context(|| format!("resolve tree-ish {spec:?}"))?
-                .peel_to_tree()
-                .context("tree-ish does not resolve to a tree")?
-                .id();
-            (repo, None, tree_oid, None)
+            let git = crate::git::Git::capture(repo_path)?;
+            let oid = git.resolve(treeish)?;
+            // Native Git resolved the operand in the caller's object namespace.
+            // Keep that environment for subsequent lazy libgit2 object reads.
+            let repo = Repository::open_ext(
+                git.repository_dir()?,
+                RepositoryOpenFlags::FROM_ENV,
+                &[] as &[&OsStr],
+            )
+            .context("open selected Git repository and object environment")?;
+            // GIT_NAMESPACE scopes upload-pack/receive-pack refs in native Git,
+            // while libgit2 also applies it to ordinary reference operations.
+            // Keep the GC pin in the same ref namespace as native update-ref,
+            // so normal release and recorded stale cleanup find that pin.
+            repo.remove_namespace()?;
+            let bridge = local_object_bridge(&git, &repo, run_directory)?;
+            (repo, None, oid, Some(git), bridge)
         };
         let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {
             if let Some(remote) = remote {
@@ -497,44 +583,18 @@ impl Snapshot {
         }
         drop(object);
         let mut selected = oid;
-        let mut tag_depth = 0;
-        let mut tree_oid = loop {
+        let tree_oid = loop {
             ensure(&mut remote, selected)?;
             let object = repo.find_object(selected, None)?;
             match object.kind() {
                 Some(ObjectType::Tree) => break selected,
                 Some(ObjectType::Commit) => break object.as_commit().unwrap().tree_id(),
                 Some(ObjectType::Tag) => {
-                    tag_depth += 1;
-                    if tag_depth > 64 {
-                        bail!("annotated tag chain exceeds 64 objects");
-                    }
                     selected = object.as_tag().unwrap().target_id();
                 }
                 _ => bail!("revision does not resolve to a tree"),
             }
         };
-        if let Some(subtree) = subtree {
-            if !subtree.is_empty() {
-                // Git accepts one trailing slash for a tree, but interior empty
-                // or dot components are literal invalid tree paths. Path's
-                // components() would silently normalize those spellings.
-                for name in subtree.strip_suffix('/').unwrap_or(subtree).split('/') {
-                    if name.is_empty() || name == "." || name == ".." {
-                        bail!("REV:path must select a relative directory without empty, . or .. components");
-                    }
-                    ensure(&mut remote, tree_oid)?;
-                    let tree = repo.find_tree(tree_oid)?;
-                    let entry = tree
-                        .get_name(name)
-                        .context("REV:path directory does not exist")?;
-                    if entry.kind() != Some(ObjectType::Tree) {
-                        bail!("REV:path must select a directory");
-                    }
-                    tree_oid = entry.id();
-                }
-            }
-        }
         // libgit2 requires a reference target to exist. Fetch only the selected
         // root tree, not its descendants, before installing the GC pin.
         ensure(&mut remote, tree_oid)?;
@@ -542,12 +602,19 @@ impl Snapshot {
         if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
             bail!("invalid snapshot run ID");
         }
-        record(repo.path(), &pin_ref, tree_oid)?;
+        // Ordinary refs live in the common directory, including an explicit
+        // GIT_COMMON_DIR override. Record that actual owner so release/recovery
+        // do not require the original process environment to find the pin.
+        let pin_git_dir = repo
+            .commondir()
+            .canonicalize()
+            .context("resolve pin reference storage")?;
+        record(&pin_git_dir, &pin_ref, tree_oid)?;
         repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
             .context("pin snapshot tree against garbage collection")?;
         let git_dir = repo.path().to_path_buf();
         let pin = Pin {
-            git_dir: git_dir.clone(),
+            git_dir: pin_git_dir,
             name: pin_ref.clone(),
             oid: tree_oid,
         };
@@ -565,6 +632,7 @@ impl Snapshot {
                     readers: BTreeMap::new(),
                     metrics: SnapshotMetrics::default(),
                     spool_directory: std::env::temp_dir(),
+                    _local_object_bridge: local_bridge,
                 }),
                 _pin: pin,
             }),

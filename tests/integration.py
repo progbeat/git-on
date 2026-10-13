@@ -124,7 +124,7 @@ class CliTests(RepositoryTest):
                 self.assertIn(b"--verify", result.stdout)
                 self.assertIn(b"Local REV, or REPOSITORY REV", result.stdout)
                 self.assertIn(b"native Git", result.stdout)
-                self.assertIn(b"Runner options follow REV", result.stdout)
+                self.assertIn(b"Runner options may appear anywhere before the first --", result.stdout)
                 self.assertIn(b"first -- is required before every command", result.stdout)
         env = dict(self.environment(), PATH=str(BINARY.parent) + os.pathsep + os.environ["PATH"])
         result = subprocess.run(["git", "on", "-h"], cwd=self.repo, env=env,
@@ -155,23 +155,15 @@ class CliTests(RepositoryTest):
         for args in [
             ["-k"], ["--"], ["HEAD"], ["HEAD", "--"],
             ["HEAD", "--keep", "--"], ["HEAD", "-k", "--"],
-            ["", "--", *command], ["HEAD", ""], ["HEAD", "--", ""],
-            ["--unknown", "missing-tree", "--", *command],
-            ["-kk", "missing-tree", "--", *command],
+            ["HEAD", ""], ["HEAD", "--", ""],
             ["--keep=1", "missing-tree", "--", *command],
-            ["missing-tree", "--unknown", "--", *command],
-            ["missing-tree", "-k", "--unknown", "--", *command],
             ["missing-tree", "--keep=1", "--", *command],
-            ["missing-tree", "-kk", "--", *command],
             ["repository", "missing-tree", "extra", "--", *command],
             ["repository", "-k", "missing-tree", "extra", "--", *command],
             ["repository", "missing-tree", "--verify", "extra", "--", *command],
             ["repository", "-k", "missing-tree", "--verify", "extra", "--", *command],
             ["--verify=true", "missing-tree", "--", *command],
-            ["-V", "missing-tree", "--", *command],
-            ["--ver", "missing-tree", "--", *command],
             ["--", "HEAD", "--", *command],
-            ["--keep", "--help", "HEAD", "--", *command],
         ]:
             with self.subTest(args=args):
                 result, run = self.invoke_argv(args)
@@ -180,6 +172,53 @@ class CliTests(RepositoryTest):
                 self.assertIsNone(run)
                 self.assertFalse(sentinel.exists())
                 self.assert_no_runtime_files()
+
+    def test_unknown_dash_operands_are_git_inputs_instead_of_runner_usage_errors(self):
+        sentinel = self.root / "executed"
+        command = [sys.executable, "-c", f"open({str(sentinel)!r}, 'w').close()"]
+        for operands in (["--unknown", "missing-tree"], ["-kk", "missing-tree"],
+                         ["missing-tree", "--unknown"],
+                         ["missing-tree", "-kk"], ["-V", "missing-tree"],
+                         ["--ver", "missing-tree"], ["missing-tree", "--help"]):
+            with self.subTest(operands=operands):
+                result, run = self.invoke_argv([*operands, "--", *command])
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertNotIn(b"Usage: git on", result.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertIsNone(run)
+                self.assertEqual(list(self.system_tmp.iterdir()), [])
+                self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+
+    def test_empty_revision_is_rejected_by_git_before_command_execution(self):
+        sentinel = self.root / "executed"
+        result, run = self.invoke_argv([
+            "", "--", sys.executable, "-c",
+            f"open({str(sentinel)!r}, 'w').close()",
+        ])
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertNotIn(b"Usage:", result.stderr)
+        self.assertIn(b"fatal:", result.stderr)
+        self.assertIsNone(run)
+        self.assertFalse(sentinel.exists())
+        self.assert_no_runtime_files()
+
+    def test_git_rejection_of_an_option_looking_repository_path_is_preserved(self):
+        (self.repo / "--source").symlink_to(self.repo, target_is_directory=True)
+        branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
+        native = subprocess.run(["git", "ls-remote", "--symref", "--", "--source"],
+                                cwd=self.repo, env=self.environment(), capture_output=True, timeout=10)
+        self.assertNotEqual(native.returncode, 0)
+        sentinel = self.root / "executed"
+        result, run = self.invoke_argv([
+            "--source", branch, "--", sys.executable, "-c",
+            f"open({str(sentinel)!r}, 'w').close()",
+        ])
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(native.stderr.strip(), result.stderr)
+        self.assertNotIn(b"Usage: git on", result.stderr)
+        self.assertFalse(sentinel.exists())
+        self.assertIsNone(run)
+        self.assertEqual(list(self.system_tmp.iterdir()), [])
 
     def test_control_modes_preserve_first_token_precedence_and_literal_paths(self):
         for args in (["--help", "--nope"], ["-h", "--version", "--"],
@@ -249,7 +288,7 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
-    def test_review_local_unverified_run_without_native_git(self):
+    def test_local_unverified_run_requires_native_git_for_revision_resolution(self):
         programs = self.root / "fuse-only"
         programs.mkdir()
         for name in ("fusermount3", "fusermount"):
@@ -263,10 +302,68 @@ class FuseTests(RepositoryTest):
                 result, run = self.python(
                     f'import sys; sys.stdout.buffer.write(open({path!r},"rb").read())',
                     tree=revision, extra_env={"PATH": str(programs)})
-                self.assert_success(result)
-                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertIn(b"native Git", result.stderr)
+                self.assertIn(b"PATH", result.stderr)
+                self.assertEqual(result.stdout, b"")
                 self.assertIsNone(run)
                 self.assert_no_runtime_files()
+
+    def test_native_git_abbreviation_reflog_and_non_utf8_subtree_are_mounted(self):
+        self.put("history.txt", "second commit\n")
+        git(self.repo, "add", "history.txt")
+        git(self.repo, "commit", "--quiet", "-m", "native revision syntax")
+        parent = git(self.repo, "rev-parse", "HEAD^")
+        for revision in (parent[:12], "HEAD^", "HEAD~1", "HEAD@{1}"):
+            with self.subTest(revision=revision):
+                expected_tree = git(self.repo, "rev-parse", revision + "^{tree}")
+                result, run = self.python(
+                    "from pathlib import Path; import os; "
+                    "assert Path('tracked.txt').read_text() == 'committed\\n'; "
+                    "assert not Path('history.txt').exists(); "
+                    f"assert os.environ['GIT_ON_TREE_OID'] == {expected_tree!r}",
+                    tree=revision,
+                )
+                self.assert_success(result)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
+        raw_name = b"tree-\xff"
+        directory = self.repo / os.fsdecode(raw_name)
+        directory.mkdir()
+        (directory / "value").write_text("non-UTF8 directory\n")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "--quiet", "-m", "non-UTF8 tree path")
+        result, run = self.invoke_argv([
+            b"HEAD:" + raw_name, "--", sys.executable, "-c",
+            "from pathlib import Path; assert Path('value').read_text() == 'non-UTF8 directory\\n'",
+        ])
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
+
+    def test_two_operands_fetch_literal_refspec_from_local_paths_into_a_private_snapshot(self):
+        git(self.repo, "config", "uploadpack.allowFilter", "true")
+        git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+        branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
+        before = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)")
+        raw_alias = self.root / os.fsdecode(b"repository-\xff")
+        raw_alias.symlink_to(self.repo, target_is_directory=True)
+        cases = [(source, branch + ":refs/heads/private-copy")
+                 for source in (str(self.repo), ".", str(raw_alias))]
+        cases.append((str(self.repo), ""))
+        for source, revision in cases:
+            with self.subTest(source=source, revision=revision):
+                result, run = self.invoke_argv([
+                    source, revision, "--", sys.executable, "-c",
+                    "from pathlib import Path; import os; "
+                    "assert Path('tracked.txt').read_text() == 'committed\\n'; "
+                    "assert not Path('.git').exists(); "
+                    f"assert os.environ['GIT_ON_TREE_OID'] == {self.tree!r}",
+                ])
+                self.assert_success(result)
+                self.assertIsNone(run)
+                self.assertEqual(list(self.system_tmp.iterdir()), [])
+                self.assertEqual(git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)"), before)
 
     def test_snapshot_ignores_dirty_index_worktree_and_untracked_files(self):
         self.put("tracked.txt", "staged\n")
@@ -2062,6 +2159,8 @@ os.replace('out/replacement', 'out/replaced')
     def test_keep_after_spawn_failure_retains_only_runtime_metadata_and_backing(self):
         result, run = self.invoke("git-on-certainly-nonexistent-executable", keep=True)
         self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(b'cannot start command "git-on-certainly-nonexistent-executable"', result.stderr)
+        self.assertIn(b'check the command on PATH', result.stderr)
         self.assertIsNotNone(run)
         self.assertIn(os.fsencode(run), result.stderr)
         self.assertTrue((run / "backing").is_dir())

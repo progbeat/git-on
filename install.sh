@@ -12,11 +12,14 @@ import hashlib
 import gzip
 import json
 import os
+import pwd
+import grp
 from pathlib import Path
 import platform
 import re
 import shutil
 import secrets
+import shlex
 import signal
 import stat
 import subprocess
@@ -242,22 +245,66 @@ def unpack_binary(directory, archive):
     return expanded, binary_range
 
 
+def describe_directory(directory, info):
+    try:
+        owner = pwd.getpwuid(info.st_uid).pw_name
+    except KeyError:
+        owner = "unknown"
+    try:
+        group = grp.getgrgid(info.st_gid).gr_name
+    except KeyError:
+        group = "unknown"
+    return (str(directory) + " has mode " + format(stat.S_IMODE(info.st_mode), "04o")
+            + " (" + stat.filemode(info.st_mode) + "), owner " + owner
+            + " (uid " + str(info.st_uid) + "), group " + group
+            + " (gid " + str(info.st_gid) + ")")
+
+
 def open_bin_dir(directory):
     # Pin every path component with O_NOFOLLOW. A renamed/replaced ancestor
     # cannot redirect the final write between a path check and os.replace.
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    component = Path("/")
     try:
         for part in directory.parts[1:]:
+            component = component / part
             try:
                 os.mkdir(part, 0o755, dir_fd=fd)
             except FileExistsError:
                 pass
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                fail("Cannot create installation directory " + str(component) + ": " + str(error)
+                     + "; parent " + describe_directory(component.parent, os.fstat(fd))
+                     + ". Choose an accessible directory you own using --bin-dir.")
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                try:
+                    details = describe_directory(component, os.stat(part, dir_fd=fd, follow_symlinks=False))
+                except OSError:
+                    details = str(component)
+                fail("Cannot open installation directory " + details + ": " + str(error)
+                     + ". Choose an accessible directory you own using --bin-dir.")
             os.close(fd)
             fd = next_fd
         info = os.fstat(fd)
         if info.st_uid != os.geteuid() or info.st_mode & 0o022:
-            fail("Installation directory must be owned by you and not writable by other users.")
+            reasons = []
+            if info.st_uid != os.geteuid():
+                reasons.append("different owner (current uid " + str(os.geteuid()) + ")")
+            if info.st_mode & 0o020:
+                reasons.append("group-write is enabled")
+            if info.st_mode & 0o002:
+                reasons.append("other-write is enabled")
+            advice = "Choose a directory you own without group/other write permission using --bin-dir."
+            # A group-write bit is a policy failure, not proof that another user
+            # actually has access. Offer a manual change only for the owned dir.
+            if info.st_uid == os.geteuid() and info.st_mode & 0o020 and not info.st_mode & 0o002:
+                advice = ("For your personal directory, if group-write is not needed, run: chmod g-w -- "
+                          + shlex.quote(str(directory)) + "; otherwise choose a separate --bin-dir.")
+            fail("Installation directory " + describe_directory(directory, info) + ": " + "; ".join(reasons)
+                 + ". It must be owned by you, accessible for installation, with group-write and other-write bits disabled. "
+                 + advice)
         result, fd = fd, None
         return result
     finally:
@@ -281,7 +328,15 @@ def install(directory, archive, tag, bin_dir):
     staged = ".git-on-install-" + secrets.token_hex(16)
     try:
         check_target(dir_fd)
-        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+        try:
+            fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+        except OSError as error:
+            info = os.fstat(dir_fd)
+            missing = ["owner-" + name for bit, name in ((0o200, "write"), (0o100, "search"))
+                       if not info.st_mode & bit]
+            reason = ("; " + " and ".join(missing) + " permission is missing") if missing else ""
+            fail("Cannot stage git-on in installation directory " + describe_directory(bin_dir, info)
+                 + ": " + str(error) + reason + ". Choose an accessible directory you own using --bin-dir; existing installation is unchanged.")
         with os.fdopen(fd, "wb") as output, expanded.open("rb") as source:
             source.seek(offset)
             remaining = size
@@ -332,11 +387,9 @@ def main(argv=None):
         verify(directory, tag, archive)
         destination = install(directory, archive, tag, bin_dir)
     print("Installed git-on " + tag + " to " + str(destination))
-    print("Run this same installer again to update to the latest stable release.")
-    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        print("Add " + str(bin_dir) + " to your PATH, then run: git on --version")
-    elif shutil.which("git-on") != str(destination):
-        print("Another git-on comes first on PATH; move " + str(bin_dir) + " ahead of it.")
+    if not any(os.path.abspath(entry or os.curdir) == str(bin_dir)
+               for entry in os.environ.get("PATH", "").split(os.pathsep)):
+        print("For this shell: export PATH=" + shlex.quote(str(bin_dir)) + ':"$PATH"; git on --version')
     if not shutil.which("fusermount3"):
         print("Before running git on: install your distribution's fuse3 package (fusermount3 is missing).")
     try:
@@ -345,7 +398,6 @@ def main(argv=None):
         usable_fuse = False
     if not usable_fuse:
         print("Before running git on: provide a usable /dev/fuse; containers also need permission to mount FUSE.")
-    print("No system packages, shell profiles, or FUSE permissions were changed.")
 
 
 def interrupted(signum, frame):

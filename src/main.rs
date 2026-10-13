@@ -407,6 +407,7 @@ fn execute(
     keep: bool,
     source: Option<OsString>,
     verify: bool,
+    write_policy: git_on::policy::WritePolicy,
 ) -> Result<ExitStatus> {
     let mut signals = subscribe_signals()?;
     if let Some(signal) = git_on::git::cancelled_signal() {
@@ -415,7 +416,10 @@ fn execute(
     let temp = tempfile::Builder::new()
         .prefix("git-on-")
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()?;
+        .tempdir()
+        .with_context(|| {
+            format!("cannot create a private snapshot in {}; check the directory's write/search permissions and available space, or choose another TMPDIR", env::temp_dir().display())
+        })?;
     let dir = fs::canonicalize(temp.path())?;
     let held_lock = lock(&dir, true)?;
     let _retained = temp.keep();
@@ -457,7 +461,7 @@ fn execute(
         observed = Some(snapshot.clone());
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
-        let mut overlay = Overlay::new(snapshot, dir.join("backing"))?;
+        let mut overlay = Overlay::with_write_policy(snapshot, dir.join("backing"), write_policy)?;
         if keep {
             kept_export = Some(overlay.enable_keep_export(dir.join("kept")));
         }
@@ -467,18 +471,20 @@ fn execute(
         {
             return Ok(ExitStatus::from_raw(signal));
         }
-        let session = fuser::spawn_mount2(
-            overlay,
-            dir.join("mount"),
-            &[
-                fuser::MountOption::FSName(format!("git-on:{id}")),
-                fuser::MountOption::Subtype("git-on".into()),
-                fuser::MountOption::NoSuid,
-                fuser::MountOption::NoDev,
-                fuser::MountOption::DefaultPermissions,
-            ],
-        )
-        .context("mount snapshot (Linux /dev/fuse and fusermount3 required)")?;
+        let mut mount_options = vec![
+            fuser::MountOption::FSName(format!("git-on:{id}")),
+            fuser::MountOption::Subtype("git-on".into()),
+            fuser::MountOption::NoSuid,
+            fuser::MountOption::NoDev,
+            fuser::MountOption::DefaultPermissions,
+        ];
+        if write_policy == git_on::policy::WritePolicy::None {
+            mount_options.push(fuser::MountOption::RO);
+        }
+        let session = fuser::spawn_mount2(overlay, dir.join("mount"), &mount_options)
+        .with_context(|| {
+            format!("cannot mount snapshot at {}; check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support", dir.join("mount").display())
+        })?;
         let mut session = Mounted {
             session: Some(session),
             mountpoint: dir.join("mount"),
@@ -521,7 +527,17 @@ fn execute(
                 if transfer {
                     let _ = foreground(tty_fd.unwrap(), unsafe { libc::getpgrp() });
                 }
-                return Err(e).context("spawn command");
+                let next_step = match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        "check the command on PATH, its path inside the selected revision, and its interpreter"
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        "check the executable bit committed in the selected revision and the host mount's execution permissions"
+                    }
+                    _ => "check the command path and its runtime requirements",
+                };
+                return Err(e)
+                    .with_context(|| format!("cannot start command {:?}; {next_step}", args[0]));
             }
         };
         let pid = child.id();
@@ -660,6 +676,7 @@ fn main() {
                 run.keep,
                 run.repository,
                 run.verify,
+                run.write_policy,
             ),
             Err(error) => {
                 error.print()?;

@@ -38,6 +38,7 @@ python3 tests/check_fuse_coverage.py
 cargo test --locked --test fuse_protocol
 cargo test --locked --all-targets
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
 ```
 
 The checker resolves the dependency source with `cargo metadata --locked
@@ -68,6 +69,10 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-metadata | tests/fuse_protocol.rs | protocol_create_metadata_stale_setattr_and_directory_stream_lifetime |
 | P-partial | tests/fuse_protocol.rs | protocol_partial_backing_write_preserves_visible_progress |
 | P-sparse | tests/fuse_protocol.rs | protocol_sparse_allocation_matches_backing_after_truncate_and_write |
+| P-none | tests/fuse_protocol.rs | protocol_none_denies_supported_mutations_and_preserves_source |
+| P-untracked | tests/fuse_protocol.rs | protocol_untracked_writes_unignored_paths_and_keeps_source_immutable |
+| P-cow | tests/fuse_protocol.rs | protocol_all_copy_up_setattr_links_rename_and_whiteouts |
+| P-unlinked-cow | tests/fuse_protocol.rs | protocol_all_setattr_on_unlinked_original_read_handle |
 | I-snapshot | tests/integration.py | FuseTests.test_snapshot_ignores_dirty_index_worktree_and_untracked_files |
 | I-file | tests/integration.py | FuseTests.test_file_operation_matrix_preserves_tracked_bytes |
 | I-directory | tests/integration.py | FuseTests.test_directory_and_rename_operation_matrix_is_atomic |
@@ -90,6 +95,12 @@ The short IDs below keep the matrix readable. References are machine-checked.
 <!-- TEST IDS END -->
 
 ## Callback matrix
+
+The original entries below preserve default `ignored` acceptance. Supplemental
+`P-none`, `P-untracked`, `P-cow` and `P-unlinked-cow` exercise actual protocol
+dispatch for policy denials, unignored creation, tracked copy-up, namespace
+whiteouts and open-unlinked metadata. The real-mount four-mode suite above
+additionally checks Linux syscall behavior; these are separate evidence layers.
 
 `implemented` means an `Overlay` override. `inherited` means a supported fuser
 lifecycle default. `unsupported` means the inherited handler replies `ENOSYS`

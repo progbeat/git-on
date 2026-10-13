@@ -26,7 +26,7 @@ class PublicationTests(unittest.TestCase):
         Path('dist/archive.tar.gz').write_bytes(b'archive')
         Path('release-body.md').write_text('Release notes\n')
         self.env = patch.dict(os.environ, {'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_SHA': SHA,
-             'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'})
+             'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master', 'RELEASE_REQUIRED': 'true'})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.refs = []
@@ -122,6 +122,23 @@ class PublicationTests(unittest.TestCase):
     def test_reject_wrong_event(self):
         with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'pull_request'}), self.assertRaises(RuntimeError):
             self.run_publish()
+        self.assertFalse(self.calls)
+
+    def test_nonrelease_push_skips_old_version_without_api_calls(self):
+        self.run_publish()
+        self.calls.clear()
+        # A docs push may carry the existing version but has another source SHA.
+        # The skip must happen before inspecting/recreating its old artifacts.
+        with patch.dict(os.environ, {'RELEASE_REQUIRED': 'false', 'GITHUB_SHA': 'b' * 40}):
+            self.run_publish()
+        self.assertFalse(self.calls)
+        self.assertFalse(self.releases[0]['draft'])
+
+    def test_missing_release_decision_cannot_publish(self):
+        with patch.dict(os.environ):
+            del os.environ['RELEASE_REQUIRED']
+            with self.assertRaisesRegex(RuntimeError, 'release decision'):
+                self.run_publish()
         self.assertFalse(self.calls)
 
     def test_reject_changed_asset(self):
