@@ -1162,3 +1162,79 @@ and the FUSE inventory guard pass. The authentic executable is retained at
 `target/cleanup-forensics-authentic-before`; diagnostic and controlled red/green
 evidence is in `target/cleanup-forensics-replay.log` and
 `target/cleanup-forensics-{controlled-red,controlled-green,ssh-green,signals-green}.log`.
+
+## Recording rollback ownership race (Copilot follow-up)
+
+At authentic head `1ba282f3`, the recorder's per-artifact rollback checked a
+published link's device and inode, then unlinked its public name. A competing
+writer could replace that entry between those operations. The permanent
+`test_rollback_cannot_delete_a_competitor_arriving_after_ownership_check`
+reproduces this with actual files: after a real first hard link and an injected
+second-publication ENOSPC, the fixture atomically replaces the first entry at
+the final unlink boundary. The old helper deletes the competing animation.
+
+Recording publication now validates every staged entry, then moves the entire
+private artifact directory to `OUTPUT/capture/` with Linux
+`renameat2(RENAME_NOREPLACE)` through the held destination directory FD. There
+are no partially published artifact links and no public-name rollback. An
+existing capture, including one created after preflight, remains untouched.
+Once the group becomes visible, cleanup is disarmed even if the requested
+parent pathname subsequently changes; it preserves both the published group
+and another writer's recreation of the old staging name.
+
+All 17 recording tests pass. They exercise the real atomic directory move,
+complete artifact bytes, existing and late competing captures, file/symlink
+collisions, ENOSPC without partial publication, unsupported entries rejected
+before publication, parent-path replacement, and foreign entries arriving
+after publication. The ownership-race test also runs unchanged against the
+authentic old helper: its legacy unlink-boundary schedule fails, while the
+corrected helper preserves a competing recording at its single atomic
+publication boundary. This helper-only change does not alter runtime source,
+the release executable, or the already recorded animation.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-1ba-before.py` with SHA-256
+`7f9b277ab262e913e67d08fde23397e0927d108114e448821409f5198cf88072`.
+The focused red result is in
+`target/git-operands-red/copilot-recording-rollback-toctou-red.txt`; the complete
+green suite is in
+`target/git-operands-green/copilot-recording-grouped-publication-green.txt`.
+
+## Distinct runtime and dev copies in the release lock closure
+
+At authentic head `1ba282f3`, `binary_lock` selected root dependency edges only
+by crate name. If runtime code used `shared` 1.x and tests used a renamed
+`shared` 2.x, both copies and their transitive dependencies entered the binary
+closure. Five permanent subcases failed before the correction: a dev-copy and
+dev-transitive update, then renamed runtime, build, target-runtime and
+target-build declarations. Every dev-only update incorrectly required a binary
+release despite unchanged executable inputs.
+
+The policy now selects root edges from runtime/build declarations and their
+package/version requirements, then traverses the exact locked dependency
+closure. It follows Cargo's
+[version requirement rules](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#version-requirement-syntax)
+for caret, tilde, wildcard, comparisons, intersections and prereleases. When
+declarations cannot identify one locked root edge, classification fails with a
+clear ambiguity error: the lockfile does not retain root dependency kinds, so
+overlapping runtime/dev constraints cannot be guessed safely. Classification
+continues to use only the Python standard library and performs no Cargo
+resolution, downloads or network calls.
+
+All 37 policy tests and 12 publication tests pass. Permanent checks retain the
+five dev-only cases, a runtime/transitive update requiring a release, ambiguity
+rejection and comparator boundaries. An isolated native Cargo oracle additionally
+used only local path packages and `cargo metadata --offline`: its mixed
+runtime/dev graph matched the selected closure, and all 42 version comparisons
+matched Cargo. Native Cargo rejected the proposed partial-equality prerelease
+change (`=1.2, >=1.2.3-alpha` for `1.2.3-alpha`); that discarded hypothesis is
+not a claimed old defect or red result.
+
+The authentic policy is retained at
+`target/git-operands-red/release_policy-1ba-before.py` with SHA-256
+`4e04317791a09a31a022edd0faed0d9662a088e083ef590d3d390e6b825434dd`.
+Red/green logs are in
+`target/git-operands-{red,green}/copilot-dev-runtime-collision.txt`; publication
+results are in `target/git-operands-green/copilot-dev-runtime-publisher.txt`.
+The native offline oracle is recorded in
+`target/policy-cargo-offline-oracle/proof.json`.

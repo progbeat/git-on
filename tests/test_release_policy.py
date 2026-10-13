@@ -265,6 +265,82 @@ class ChangeClassificationTests(unittest.TestCase):
                      'name = "test-only"\nversion = "2.0.0"')
         self.run_policy(False)
 
+    def mixed_version_baseline(self, declaration='[dependencies]\nshared = "1"\n'):
+        self.write('Cargo.toml', '[package]\nname = "git-on"\nversion = "1.1.0"\n'
+                   + declaration + '[dev-dependencies]\nshared-tests = { package = "shared", version = "2" }\n')
+        self.write('Cargo.lock', '[[package]]\nname = "git-on"\nversion = "1.1.0"\n'
+                   'dependencies = ["shared 1.0.0", "shared 2.0.0"]\n'
+                   '[[package]]\nname = "shared"\nversion = "1.0.0"\n'
+                   'dependencies = ["runtime-leaf"]\n'
+                   '[[package]]\nname = "shared"\nversion = "2.0.0"\n'
+                   'dependencies = ["test-leaf"]\n'
+                   '[[package]]\nname = "runtime-leaf"\nversion = "1.0.0"\n'
+                   '[[package]]\nname = "test-leaf"\nversion = "1.0.0"\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'runtime and dev copies of one crate')
+        self.base = self.git('rev-parse', 'HEAD')
+
+    def test_dev_only_copy_of_runtime_crate_needs_no_release(self):
+        self.mixed_version_baseline()
+        self.replace('Cargo.lock', 'shared 2.0.0', 'shared 2.0.1')
+        self.replace('Cargo.lock', 'name = "shared"\nversion = "2.0.0"',
+                     'name = "shared"\nversion = "2.0.1"')
+        self.replace('Cargo.lock', 'name = "test-leaf"\nversion = "1.0.0"',
+                     'name = "test-leaf"\nversion = "1.0.1"')
+        self.run_policy(False)
+
+    def test_renamed_build_and_target_dependencies_exclude_dev_copy(self):
+        for declaration in [
+            '[dependencies]\nrenamed = { package = "shared", version = "1" }\n',
+            '[build-dependencies]\nshared = "1"\n',
+            '[target.\'cfg(unix)\'.dependencies]\nshared = "1"\n',
+            '[target.\'cfg(unix)\'.build-dependencies]\nshared = "1"\n',
+        ]:
+            with self.subTest(declaration=declaration):
+                self.mixed_version_baseline(declaration)
+                self.replace('Cargo.lock', 'shared 2.0.0', 'shared 2.0.1')
+                self.replace('Cargo.lock', 'name = "shared"\nversion = "2.0.0"',
+                             'name = "shared"\nversion = "2.0.1"')
+                self.run_policy(False)
+
+    def test_runtime_copy_and_transitive_changes_still_require_release(self):
+        self.mixed_version_baseline()
+        self.replace('Cargo.lock', 'shared 1.0.0', 'shared 1.0.1')
+        self.replace('Cargo.lock', 'name = "shared"\nversion = "1.0.0"',
+                     'name = "shared"\nversion = "1.0.1"')
+        self.replace('Cargo.lock', 'name = "runtime-leaf"\nversion = "1.0.0"',
+                     'name = "runtime-leaf"\nversion = "1.0.1"')
+        self.run_policy(True, success=False)
+        self.bump()
+        self.run_policy(True)
+
+    def test_overlapping_runtime_and_dev_version_edges_require_clarification(self):
+        self.mixed_version_baseline('[dependencies]\nshared = ">=1, <3"\n')
+        self.replace('Cargo.lock', 'shared 2.0.0', 'shared 2.0.1')
+        self.replace('Cargo.lock', 'name = "shared"\nversion = "2.0.0"',
+                     'name = "shared"\nversion = "2.0.1"')
+        result = self.run_policy(False, success=False)
+        self.assertIn('cannot unambiguously classify runtime/build dependency', result.stderr)
+        self.assertNotIn('expected exactly one', result.stderr)
+
+    def test_cargo_requirement_boundaries_select_locked_runtime_version(self):
+        for requirement, selected, rejected in [
+            ('1', '1.9.0', '2.0.0'), ('0.2', '0.2.9', '0.3.0'),
+            ('0.0.3', '0.0.3', '0.0.4'), ('~1.2', '1.2.9', '1.3.0'),
+            ('1.*', '1.9.0', '2.0.0'), ('1.2.*', '1.2.9', '1.3.0'),
+            ('>=1.2, <1.5', '1.4.9', '1.5.0'), ('>1.2', '1.3.0', '1.2.9'),
+            ('=1.2', '1.2.9', '1.3.0'), ('1', '1.1.0', '1.1.0-alpha'),
+            ('1.0.0-alpha.2', '1.0.0-alpha.10', '1.0.1-alpha'),
+            ('1.0.0-alpha', '1.2.0', '1.0.0-0'),
+            ('=1.2.3+build', '1.2.3+different', '1.2.4'),
+            ('=1.2, >=1.2.3-alpha', '1.2.3', '1.2.3-alpha'),
+            ('^1.2, >=1.2.3-alpha', '1.2.3-alpha', '1.2.3-0'),
+        ]:
+            with self.subTest(requirement=requirement):
+                self.assertTrue(MOD.cargo_version_matches(requirement, selected))
+                self.assertFalse(MOD.cargo_version_matches(requirement, rejected))
+        self.assertFalse(MOD.cargo_version_matches('>=1.2, =1.2.3-alpha', '1.2.3-alpha'))
+
     def test_release_profile_change_requires_bump(self):
         with (self.root / 'Cargo.toml').open('a') as stream:
             stream.write('\n[profile.release]\nlto = "fat"\n')

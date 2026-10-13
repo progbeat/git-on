@@ -66,18 +66,21 @@ provenance distinguishes its hash from the original capture tape's hash.
 ```sh
 cargo build --release --locked
 python3 scripts/record_demo.py --binary target/release/git-on --output target/sl-recording
-uv run --no-project --with pillow==11.3.0 python scripts/convert_demo.py --gif target/sl-recording/demo.gif --output target/sl-recording/demo.webp
+uv run --no-project --with pillow==11.3.0 python scripts/convert_demo.py --gif target/sl-recording/capture/demo.gif --output target/sl-recording/capture/demo.webp
 ```
 
 Choose a new or empty output directory: the helper refuses any existing
-contents before recording. During execution it checks the live FUSE recovery
+contents before recording. It publishes all generated files together as its
+`capture/` subdirectory with an atomic no-replace directory rename, preserving
+competing output rather than deleting individual files during rollback.
+During execution it checks the live FUSE recovery
 state against the reviewed tree, observes the generated executable inside the
 mount, and records the shell's real exit status through a private prompt hook.
 Afterward it checks that the run and executable were removed. This status hook
 does not modify the displayed command or output. `demo.json` records the actual
 host, time, Git version, git-on binary hash, VHS version, tape hash, external
 commit/tree, cleanup result, GIF size and SHA-256. Relative tape outputs,
-screenshots, the MP4 and ASCII recording stay in the requested output directory.
+screenshots, the MP4 and ASCII recording stay in its published `capture/` directory.
 `vhs.log` contains recorder diagnostics. The VHS settings and `PS1` affect only
 the recording process, never the user's terminal configuration.
 The checked-in provenance additionally records the release build's source hash

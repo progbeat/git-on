@@ -4,9 +4,11 @@
 Requires VHS 0.12.1, ttyd, ffmpeg, Chromium, Source Code Pro,
 make/gcc/ncurses headers,
 Git 2.45.1+, and a usable FUSE device. Read upstream source before recording.
+Successful recordings appear together under OUTPUT/capture/.
 """
 import argparse
 from contextlib import ExitStack
+import ctypes
 import datetime
 import hashlib
 import json
@@ -25,6 +27,22 @@ COMMIT = "923e7d7ebc5c1f009755bdeb789ac25658ccce03"
 TREE = "56a5fd07310088f1e6372d81455c8489c66ea00b"
 
 
+def rename_noreplace(source, destination, directory_fd):
+    """Publish a directory atomically without replacing an existing entry."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        raise RuntimeError("Recording publication requires Linux renameat2") from None
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                         ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(directory_fd, os.fsencode(source), directory_fd,
+                 os.fsencode(destination), 1) != 0:  # RENAME_NOREPLACE
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
 def output(*argv):
     return subprocess.check_output(argv, text=True).strip()
 
@@ -33,6 +51,7 @@ class RecordingDestination:
     def __init__(self, path):
         self.path = path
         self.fd = None
+        self.published = False
 
     def refuse(self):
         return RuntimeError(f"Refusing to overwrite recording artifacts: destination changed or is not empty: {self.path}")
@@ -75,32 +94,22 @@ class RecordingDestination:
 
     def publish(self, staging_fd, staging_name):
         self.check(staging_name)
-        artifacts = []
         for name in os.listdir(staging_fd):
             source = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
             if not stat.S_ISREG(source.st_mode):
                 raise RuntimeError(f"Unsupported recording artifact: {name}")
-            artifacts.append((name, source.st_dev, source.st_ino))
-        published = []
         try:
-            for artifact in artifacts:
-                name, _, _ = artifact
-                try:
-                    os.link(name, name, src_dir_fd=staging_fd, dst_dir_fd=self.fd, follow_symlinks=False)
-                except FileExistsError:
-                    raise self.refuse() from None
-                published.append(artifact)
-            self.check(require_empty=False)
-        except BaseException:
-            # Roll back our links without removing another writer's replacement.
-            for name, device, inode in reversed(published):
-                try:
-                    current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-                    if (current.st_dev, current.st_ino) == (device, inode):
-                        os.unlink(name, dir_fd=self.fd)
-                except FileNotFoundError:
-                    pass
-            raise
+            rename_noreplace(staging_name, "capture", self.fd)
+        except FileExistsError:
+            raise self.refuse() from None
+        # The whole group is visible now. Never roll it back: another writer
+        # may already have added or replaced an entry inside it.
+        self.published = True
+        self.check(require_empty=False)
+
+    def discard_staging(self, name):
+        if not self.published:
+            shutil.rmtree(f"/proc/self/fd/{self.fd}/{name}")
 
 
 def record(binary, destination):
@@ -130,11 +139,10 @@ def _record(binary, target):
         "vhs": output("vhs", "--version"),
         "tape_sha256": hashlib.sha256((ROOT / "assets/demo.tape").read_bytes()).hexdigest(),
     }
-    with tempfile.TemporaryDirectory(prefix="git-on-demo-") as temporary, \
-            tempfile.TemporaryDirectory(prefix=".git-on-recording-", dir=f"/proc/self/fd/{target.fd}") as recording, \
-            ExitStack() as cleanup:
+    with tempfile.TemporaryDirectory(prefix="git-on-demo-") as temporary, ExitStack() as cleanup:
         private = Path(temporary)
-        staging = Path(recording)
+        staging = Path(tempfile.mkdtemp(prefix=".git-on-recording-", dir=f"/proc/self/fd/{target.fd}"))
+        cleanup.callback(target.discard_staging, staging.name)
         staging_fd = os.open(staging.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target.fd)
         cleanup.callback(os.close, staging_fd)
         tools = private / "bin"
@@ -206,13 +214,13 @@ def _record(binary, target):
         if size > 5 * 1024 * 1024:
             raise RuntimeError("GIF exceeds the 5 MiB repository-asset budget: do not commit it or open a PR")
         target.publish(staging_fd, staging.name)
-    print(f"Recorded actual SL/FUSE execution on {info['host']}: {size:,} bytes")
+    print(f"Recorded actual SL/FUSE execution on {info['host']}: {size:,} bytes in {target.path / 'capture'}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/git-on")
     parser.add_argument("--output", type=Path, default=ROOT / "target/sl-recording",
-                        help="New or empty recording directory (default: target/sl-recording)")
+                        help="New or empty parent directory; artifacts appear in capture/ (default: target/sl-recording)")
     args = parser.parse_args()
     record(args.binary.resolve(), args.output.resolve())

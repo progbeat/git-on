@@ -42,29 +42,106 @@ def binary_manifest(manifest):
     return result
 
 
-def runtime_dependency_names(manifest):
+def runtime_dependencies(manifest):
     tables = [manifest, *manifest.get("target", {}).values()]
-    return {value.get("package", name) if isinstance(value, dict) else name
+    return [(value.get("package", name) if isinstance(value, dict) else name, value)
             for table in tables for kind in ("dependencies", "build-dependencies")
-            for name, value in table.get(kind, {}).items()}
+            for name, value in table.get(kind, {}).items()]
+
+
+def cargo_version_matches(requirement, locked):
+    """Match Cargo's version comparators without resolving or downloading crates."""
+    pattern = r"(\^|~|>=|<=|>|<|=)?\s*([0-9xX*]+(?:\.[0-9xX*]+){0,2})(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?"
+
+    def parse(text):
+        match = re.fullmatch(pattern, text.strip())
+        if match is None:
+            raise ValueError(f"cannot classify Cargo version requirement {text!r}")
+        operator, core, pre, _ = match.groups()
+        numbers = []
+        wildcard = False
+        for part in core.split("."):
+            if part in ("*", "x", "X"):
+                wildcard = True
+            elif wildcard or (len(part) > 1 and part.startswith("0")):
+                raise ValueError(f"cannot classify Cargo version requirement {text!r}")
+            else:
+                numbers.append(int(part))
+        if pre and len(numbers) != 3:
+            raise ValueError(f"cannot classify Cargo version requirement {text!r}")
+        # Stable versions sort after every prerelease. Numeric identifiers sort
+        # before textual identifiers, with numeric rather than lexical order.
+        identifiers = []
+        for part in pre.split(".") if pre else []:
+            if not part or (part.isdigit() and len(part) > 1 and part.startswith("0")):
+                raise ValueError(f"cannot classify Cargo version requirement {text!r}")
+            identifiers.append((0, int(part)) if part.isdigit() else (1, part))
+        prerelease = tuple(identifiers) if pre else ((2, ""),)
+        return operator or ("=" if wildcard else "^"), tuple(numbers), prerelease, bool(pre)
+
+    _, candidate, candidate_pre, has_pre = parse(locked)
+    if len(candidate) != 3:
+        raise ValueError(f"invalid locked Cargo version {locked!r}")
+    if requirement.strip() in ("*", "x", "X"):
+        return not has_pre
+    comparators = [parse(part) for part in requirement.split(",")]
+    if any(not numbers for _, numbers, _, _ in comparators):
+        raise ValueError(f"cannot classify Cargo version requirement {requirement!r}")
+    for operator, numbers, pre, _ in comparators:
+        precision = len(numbers)
+        prefix = candidate[:precision]
+        exact = prefix == numbers and candidate_pre == pre
+        greater = prefix > numbers or (precision == 3 and prefix == numbers and candidate_pre > pre)
+        less = prefix < numbers or (precision == 3 and prefix == numbers and candidate_pre < pre)
+        if operator in ("=", ">", ">=", "<", "<="):
+            matches = {"=": exact, ">": greater, ">=": exact or greater,
+                       "<": less, "<=": exact or less}[operator]
+        elif operator == "~":
+            matches = candidate[:min(precision, 2)] == numbers[:2] and (
+                (precision == 3 and candidate[2] > numbers[2])
+                or (prefix == numbers and candidate_pre >= pre))
+        else:
+            boundary = next((index + 1 for index, number in enumerate(numbers) if number), precision)
+            matches = candidate[:boundary] == numbers[:boundary] and prefix >= numbers and (
+                precision < 3 or prefix != numbers or candidate_pre >= pre)
+        if not matches:
+            return False
+    return not has_pre or any(numbers == candidate and pre_is_requested
+                              for _, numbers, _, pre_is_requested in comparators)
 
 
 def binary_lock(manifest, lock):
     """Compare the runtime/build dependency closure, excluding test-only crates."""
     packages = lock["package"]
     own = package_in_lock(lock)
-    runtime_names = runtime_dependency_names(manifest)
-    pending = [item for item in own.get("dependencies", []) if item.split()[0] in runtime_names]
-    found = {}
-    while pending:
-        dependency = pending.pop()
+
+    def resolve(dependency):
         parts = dependency.split(maxsplit=2)
         candidates = [p for p in packages if p["name"] == parts[0]
                       and (len(parts) < 2 or p["version"] == parts[1])
                       and (len(parts) < 3 or p.get("source") == parts[2].strip("()"))]
         if len(candidates) != 1:
             raise ValueError(f"cannot resolve locked dependency {dependency!r}")
-        package = candidates[0]
+        return candidates[0]
+
+    root_edges = [(item, resolve(item)) for item in own.get("dependencies", [])]
+    pending = []
+    for name, declaration in runtime_dependencies(manifest):
+        candidates = [(item, package) for item, package in root_edges if package["name"] == name]
+        if len(candidates) > 1:
+            requirement = declaration if isinstance(declaration, str) else declaration.get("version")
+            if requirement is not None:
+                candidates = [(item, package) for item, package in candidates
+                              if cargo_version_matches(requirement, package["version"])]
+            if isinstance(declaration, dict) and "path" in declaration:
+                candidates = [(item, package) for item, package in candidates if "source" not in package]
+        if len(candidates) != 1:
+            raise ValueError(f"cannot unambiguously classify runtime/build dependency {name!r}; "
+                             "Cargo.lock does not identify its dependency kind")
+        pending.extend(item for item, _ in candidates)
+    found = {}
+    while pending:
+        package = resolve(pending.pop())
         identity = (package["name"], package["version"], package.get("source", ""))
         if identity not in found:
             found[identity] = {**package, "dependencies": sorted(package.get("dependencies", []))}

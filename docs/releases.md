@@ -30,6 +30,9 @@ job, including inherited workflow `env` and `defaults` settings. Package-job
 edits are treated conservatively because a step can change the distributed
 executable. Test-only dependency updates and edits to other CI jobs
 do not require a binary release unless they also change binary inputs.
+When a crate has separate runtime/build and dev versions, classification matches
+the declared runtime/build version to its locked edge. If the manifest and lock
+cannot identify one edge, validation fails explicitly instead of guessing its kind.
 
 Use patch for backwards-compatible binary bug fixes. Use minor for new
 backwards-compatible capabilities, such as an optional write policy. Use major for
