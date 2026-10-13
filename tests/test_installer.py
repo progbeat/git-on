@@ -12,6 +12,8 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
+import grp
 import shutil
 import signal
 import time
@@ -22,6 +24,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.sh'
@@ -39,6 +42,8 @@ class InstallerTests(unittest.TestCase):
         self.releases.mkdir()
         self.bin = self.root / 'home with spaces/.local/bin'
         self.bin.mkdir(parents=True)
+        # Keep fixture acceptance independent of the caller's group-write umask.
+        self.bin.chmod(0o755)
         self.old = self.bin / 'git-on'
         self.old.write_bytes(b'old executable\n')
         self.fakebin = self.root / 'tools'
@@ -435,7 +440,136 @@ else:
             MOD.supported_host()
         self.assertIn('absolute path', self.run_script('--bin-dir', 'relative', success=False).stderr)
         self.bin.chmod(0o777)
-        self.assertIn('not writable by other users', self.run_script(success=False).stderr)
+        error = self.run_script(success=False).stderr
+        self.assertIn('group-write is enabled', error)
+        self.assertIn('other-write is enabled', error)
+
+    def test_owned_group_writable_directory_has_precise_conditional_advice(self):
+        self.bin.chmod(0o775)
+        info = self.bin.stat()
+        result = self.run_script(success=False)
+        for detail in (str(self.bin), '0775', pwd.getpwuid(info.st_uid).pw_name,
+                       grp.getgrgid(info.st_gid).gr_name, 'group-write', 'chmod g-w',
+                       'if group-write is not needed', '--bin-dir'):
+            self.assertIn(detail, result.stderr)
+        self.assertNotIn('other users have access', result.stderr)
+        self.assertNotIn('chmod -R', result.stderr)
+        self.assertNotIn('sudo chmod', result.stderr)
+        self.assertEqual(stat.S_IMODE(self.bin.stat().st_mode), 0o775)
+
+    def test_other_writable_directory_is_distinguished_from_group_write(self):
+        self.bin.chmod(0o757)
+        result = self.run_script(success=False)
+        self.assertIn('0757', result.stderr)
+        self.assertIn('other-write', result.stderr)
+        self.assertNotIn('group-write is enabled', result.stderr)
+        self.assertNotIn('chmod g-w', result.stderr)
+        self.assertIn('--bin-dir', result.stderr)
+        self.assertEqual(stat.S_IMODE(self.bin.stat().st_mode), 0o757)
+
+    def test_foreign_owner_never_gets_permission_change_advice(self):
+        info = self.bin.stat()
+        foreign = SimpleNamespace(st_uid=info.st_uid + 100000, st_gid=info.st_gid,
+                                  st_mode=stat.S_IFDIR | 0o775)
+        with patch.object(MOD.os, 'fstat', return_value=foreign):
+            with self.assertRaises(RuntimeError) as outcome:
+                MOD.open_bin_dir(self.bin)
+        message = str(outcome.exception)
+        for detail in (str(self.bin), '0775', str(foreign.st_uid), 'different owner',
+                       'group-write', '--bin-dir'):
+            self.assertIn(detail, message)
+        self.assertNotIn('chmod', message)
+
+    def test_success_has_shell_quoted_path_advice_only_when_missing(self):
+        result = self.run_script()
+        self.assertIn('export PATH=', result.stdout)
+        self.assertIn('"$PATH"', result.stdout)
+        self.assertNotIn('Run this same installer again', result.stdout)
+        self.env['PATH'] = str(self.bin) + os.pathsep + self.env['PATH']
+        result = self.run_script()
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertNotIn('to your PATH', result.stdout)
+        self.env['PATH'] = str(self.bin) + '/' + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
+        self.assertNotIn('export PATH=', self.run_script().stdout)
+
+    def test_success_identifies_an_earlier_executable_without_running_it(self):
+        earlier = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
+        earlier.write_bytes(content)
+        earlier.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
+        result = self.run_script()
+        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
+        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
+        self.assertEqual(earlier.read_bytes(), content)
+        self.assertFalse(marker.exists())
+
+    def test_no_shadow_warning_when_installed_binary_is_first_on_path(self):
+        later = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        later.write_bytes(b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\n')
+        later.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.bin) + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(self.old))
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_path_alias_of_installed_binary_is_not_a_shadow(self):
+        alias = self.fakebin / 'git-on'
+        alias.symlink_to(self.old)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(alias))
+        self.assertTrue(os.path.samefile(alias, self.old))
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+
+    def test_symlinked_path_directory_selects_installed_binary_without_guidance(self):
+        alias = self.root / 'bin directory alias'
+        alias.symlink_to(self.bin, target_is_directory=True)
+        self.env['PATH'] = str(alias) + os.pathsep + self.env['PATH']
+        result = self.run_script()
+        selected = shutil.which('git-on', path=self.env['PATH'])
+        self.assertEqual(selected, str(alias / 'git-on'))
+        self.assertTrue(os.path.samefile(selected, self.old))
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertNotIn('PATH selects', result.stdout)
+        self.assertTrue(alias.is_symlink())
+
+    def test_symlinked_path_directory_does_not_hide_an_earlier_executable(self):
+        alias = self.root / 'bin directory alias'
+        alias.symlink_to(self.bin, target_is_directory=True)
+        earlier = self.fakebin / 'git-on'
+        marker = self.root / 'shadow-was-executed'
+        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
+        earlier.write_bytes(content)
+        earlier.chmod(0o755)
+        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(alias) + os.pathsep + os.environ['PATH']
+        result = self.run_script()
+        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
+        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
+        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
+        self.assertNotIn('export PATH=', result.stdout)
+        self.assertFalse(marker.exists())
+        self.assertEqual(earlier.read_bytes(), content)
+        self.assertTrue(alias.is_symlink())
+
+    def test_owner_write_missing_names_directory_mode_and_safe_alternative(self):
+        self.bin.chmod(0o555)
+        self.addCleanup(lambda: self.bin.chmod(0o755))
+        error = self.run_script(success=False).stderr
+        for detail in (str(self.bin), '0555', 'owner-write', '--bin-dir'):
+            self.assertIn(detail, error)
+        self.assertNotIn('chmod', error)
 
     def test_version_timeout_cleans_staging_and_preserves_old_binary(self):
         directory, archive = self.release('0.1.0')

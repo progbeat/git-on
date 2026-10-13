@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 use fuser::{Session, SessionACL};
 use git2::Repository;
-use git_on::{filesystem::Overlay, snapshot::Snapshot};
+use git_on::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread::JoinHandle;
@@ -62,6 +62,9 @@ struct Peer {
 }
 impl Peer {
     fn new() -> Self {
+        Self::with_policy(WritePolicy::Ignored)
+    }
+    fn with_policy(policy: WritePolicy) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -78,7 +81,8 @@ impl Peer {
         let oid = tree.write().unwrap();
         let snapshot =
             Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "protocol").unwrap();
-        let overlay = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), policy).unwrap();
         let mut fds = [-1; 2];
         assert_eq!(
             unsafe {
@@ -119,8 +123,10 @@ impl Peer {
             fd,
             task: Some(task),
             unique: 0,
-            uid: 1000,
-            gid: 1000,
+            // Tracked entries belong to the mounting process, including CI's
+            // runner UID. Credential tests override these IDs explicitly.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
             _temp: temp,
         };
         let init = p.ok(
@@ -303,6 +309,179 @@ fn protocol_file_io_sync_and_stale_handles() {
 }
 
 #[test]
+fn protocol_none_denies_supported_mutations_and_preserves_source() {
+    let mut p = Peer::with_policy(WritePolicy::None);
+    let tracked = p.lookup(1, "tracked");
+    let read = p.open(tracked, libc::O_RDONLY);
+    let before = p.ok(3, tracked, vec![0; 16]);
+    p.err(14, tracked, u32s(&[libc::O_RDWR as u32, 0]), libc::EROFS);
+    p.err(34, 1, u32s(&[libc::W_OK as u32, 0]), libc::EROFS);
+    p.err(34, tracked, u32s(&[libc::W_OK as u32, 0]), libc::EROFS);
+    p.err(
+        35,
+        1,
+        names(u32s(&[libc::O_RDWR as u32, 0o600, 0, 0]), &["fresh.tmp"]),
+        libc::EROFS,
+    );
+    p.err(
+        8,
+        1,
+        names(u32s(&[libc::S_IFREG | 0o600, 0, 0, 0]), &["node.tmp"]),
+        libc::EROFS,
+    );
+    p.err(9, 1, names(u32s(&[0o700, 0]), &["cache"]), libc::EROFS);
+    p.err(6, 1, names(vec![], &["link.tmp", "tracked"]), libc::EROFS);
+    p.err(13, 1, names(u64s(&[tracked]), &["alias.tmp"]), libc::EROFS);
+    p.err(10, 1, names(vec![], &["tracked"]), libc::EROFS);
+    p.err(
+        12,
+        1,
+        names(u64s(&[1]), &["tracked", "renamed.tmp"]),
+        libc::EROFS,
+    );
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&1u32.to_ne_bytes());
+    setattr[68..72].copy_from_slice(&0o600u32.to_ne_bytes());
+    p.err(4, tracked, setattr, libc::EROFS);
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"original\n");
+    assert_eq!(p.ok(3, tracked, vec![0; 16]), before);
+    for name in [
+        "fresh.tmp",
+        "node.tmp",
+        "cache",
+        "link.tmp",
+        "alias.tmp",
+        "renamed.tmp",
+    ] {
+        p.err(1, 1, names(vec![], &[name]), libc::ENOENT);
+    }
+}
+
+#[test]
+fn protocol_untracked_writes_unignored_paths_and_keeps_source_immutable() {
+    let mut p = Peer::with_policy(WritePolicy::Untracked);
+    let tracked = p.lookup(1, "tracked");
+    let read = p.open(tracked, libc::O_RDONLY);
+    let before = p.ok(3, tracked, vec![0; 16]);
+    let (generated, handle) = p.create("not-ignored");
+    p.ok(
+        16,
+        generated,
+        [io(handle, 0, 7, libc::O_RDWR), b"private".to_vec()].concat(),
+    );
+    assert_eq!(p.ok(15, generated, io(handle, 0, 100, 0)), b"private");
+    let directory = num(
+        &p.ok(9, 1, names(u32s(&[0o700, 0]), &["generated-directory"])),
+        0,
+    );
+    p.ok(
+        6,
+        directory,
+        names(vec![], &["generated-link", "../tracked"]),
+    );
+    p.ok(
+        13,
+        directory,
+        names(u64s(&[generated]), &["generated-alias"]),
+    );
+    p.ok(12, 1, names(u64s(&[1]), &["not-ignored", "renamed"]));
+    p.err(
+        12,
+        1,
+        names(u64s(&[1]), &["renamed", "tracked"]),
+        libc::EROFS,
+    );
+    p.err(
+        12,
+        1,
+        names(u64s(&[1]), &["tracked", "new-source-name"]),
+        libc::EROFS,
+    );
+    p.err(10, 1, names(vec![], &["tracked"]), libc::EROFS);
+    p.err(14, tracked, u32s(&[libc::O_RDWR as u32, 0]), libc::EROFS);
+    p.err(34, tracked, u32s(&[libc::W_OK as u32, 0]), libc::EROFS);
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&1u32.to_ne_bytes());
+    setattr[68..72].copy_from_slice(&0o600u32.to_ne_bytes());
+    p.err(4, tracked, setattr, libc::EROFS);
+    p.ok(10, 1, names(vec![], &["renamed"]));
+    assert_eq!(p.ok(15, generated, io(handle, 0, 100, 0)), b"private");
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"original\n");
+    assert_eq!(p.ok(3, tracked, vec![0; 16]), before);
+}
+
+#[test]
+fn protocol_all_copy_up_setattr_links_rename_and_whiteouts() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let tracked = p.lookup(1, "tracked");
+    let read = p.open(tracked, libc::O_RDONLY);
+    p.ok(34, tracked, u32s(&[libc::W_OK as u32, 0]));
+    let write = p.open(tracked, libc::O_RDWR);
+    p.ok(
+        16,
+        tracked,
+        [io(write, 0, 7, libc::O_RDWR), b"changed".to_vec()].concat(),
+    );
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"changedl\n");
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&(1u32 | 8).to_ne_bytes());
+    setattr[16..24].copy_from_slice(&7u64.to_ne_bytes());
+    setattr[68..72].copy_from_slice(&0o640u32.to_ne_bytes());
+    p.ok(4, tracked, setattr);
+    p.ok(13, 1, names(u64s(&[tracked]), &["alias"]));
+    p.ok(12, 1, names(u64s(&[1]), &["tracked", "renamed"]));
+    p.err(1, 1, names(vec![], &["tracked"]), libc::ENOENT);
+    assert_eq!(p.lookup(1, "renamed"), tracked);
+    assert_eq!(p.lookup(1, "alias"), tracked);
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"changed");
+    p.ok(10, 1, names(vec![], &["renamed"]));
+    p.ok(10, 1, names(vec![], &["alias"]));
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"changed");
+    p.release(tracked, read);
+    p.release(tracked, write);
+    let (replacement, _) = p.create("tracked");
+    assert_ne!(replacement, tracked);
+    let link = p.lookup(1, "link");
+    p.ok(12, 1, names(u64s(&[1]), &["link", "moved-link"]));
+    assert_eq!(p.ok(5, link, vec![]), b"tracked");
+    p.err(1, 1, names(vec![], &["link"]), libc::ENOENT);
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&1u32.to_ne_bytes());
+    setattr[68..72].copy_from_slice(&0o700u32.to_ne_bytes());
+    p.ok(4, 1, setattr);
+    let directory = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let entries = dirents(&p.ok(28, 1, io(directory, 0, 4096, 0)));
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(_, name)| name == b"tracked")
+            .count(),
+        1
+    );
+    assert!(!entries
+        .iter()
+        .any(|(_, name)| name == b"link" || name == b"alias" || name == b"renamed"));
+}
+
+#[test]
+fn protocol_all_setattr_on_unlinked_original_read_handle() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let tracked = p.lookup(1, "tracked");
+    let read = p.open(tracked, libc::O_RDONLY);
+    p.ok(10, 1, names(vec![], &["tracked"]));
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&(1u32 | 64).to_ne_bytes());
+    setattr[8..16].copy_from_slice(&read.to_ne_bytes());
+    setattr[68..72].copy_from_slice(&0o600u32.to_ne_bytes());
+    p.ok(4, tracked, setattr);
+    assert_eq!(p.ok(15, tracked, io(read, 0, 100, 0)), b"original\n");
+    p.err(1, 1, names(vec![], &["tracked"]), libc::ENOENT);
+    let attr = p.ok(3, tracked, vec![0; 16]);
+    assert_eq!(u32::from_ne_bytes(attr[80..84].try_into().unwrap()), 0);
+    p.release(tracked, read);
+}
+
+#[test]
 fn protocol_creation_links_removal_and_rename_flags() {
     let mut p = Peer::new();
     let mknod = |name: &str, mode| names(u32s(&[mode, 0, 0o022, 0]), &[name]);
@@ -376,22 +555,44 @@ fn protocol_directory_pagination_sync_statfs_and_bad_handles() {
 
 #[test]
 fn protocol_access_and_setattr_credentials_and_boundaries() {
+    // Exercise an ordinary owner even when the test process itself is root.
+    access_and_setattr_credentials_and_boundaries(unsafe { libc::geteuid() }.max(1), unsafe {
+        libc::getegid()
+    });
+}
+
+#[test]
+fn protocol_access_and_setattr_distinct_uid_and_gid() {
+    // Synthetic wire credentials are independent of the host process IDs.
+    // The second pair makes stranger_gid equal owner_uid: mixing the UID/GID
+    // payloads would incorrectly turn the UID rejection into a permitted no-op.
+    for (owner_uid, owner_gid) in [(1000, 1001), (1, 0)] {
+        access_and_setattr_credentials_and_boundaries(owner_uid, owner_gid);
+    }
+}
+
+fn access_and_setattr_credentials_and_boundaries(owner_uid: u32, owner_gid: u32) {
     let mut p = Peer::new();
+    assert_ne!(owner_uid, 0);
+    let stranger_uid = if owner_uid == 1 { 2 } else { 1 };
+    let stranger_gid = if owner_gid == 0 { 1 } else { 0 };
+    p.uid = owner_uid;
+    p.gid = owner_gid;
     let (ino, fh) = p.create("mode.tmp");
     let access = |mask| u32s(&[mask, 0]);
     p.ok(34, ino, access((libc::R_OK | libc::W_OK) as u32));
     p.err(34, ino, access(libc::X_OK as u32), libc::EACCES);
-    p.uid = 1001;
+    p.uid = stranger_uid;
     p.err(34, ino, access(libc::R_OK as u32), libc::EACCES);
     let mut setattr = vec![0; 88];
     setattr[..4].copy_from_slice(&1u32.to_ne_bytes());
     setattr[68..72].copy_from_slice(&0o640u32.to_ne_bytes());
     p.err(4, ino, setattr.clone(), libc::EPERM);
-    p.uid = 1000;
+    p.uid = owner_uid;
     p.ok(4, ino, setattr);
-    p.uid = 1001;
+    p.uid = stranger_uid;
     p.ok(34, ino, access(libc::R_OK as u32));
-    p.gid = 1001;
+    p.gid = stranger_gid;
     p.err(34, ino, access(libc::R_OK as u32), libc::EACCES);
     p.uid = 0;
     p.ok(34, ino, access(libc::R_OK as u32));
@@ -400,12 +601,41 @@ fn protocol_access_and_setattr_credentials_and_boundaries() {
     p.err(34, tracked, access(libc::W_OK as u32), libc::EROFS);
     p.ok(34, 1, access(libc::X_OK as u32));
     p.err(34, u64::MAX, access(0), libc::ENOENT);
-    p.uid = 1000;
-    p.gid = 1000;
+    p.uid = owner_uid;
+    p.gid = owner_gid;
     let mut setattr = vec![0; 88];
     setattr[..4].copy_from_slice(&(2u32).to_ne_bytes());
-    setattr[76..80].copy_from_slice(&1001u32.to_ne_bytes());
+    setattr[76..80].copy_from_slice(&stranger_uid.to_ne_bytes());
     p.err(4, ino, setattr, libc::EPERM);
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&4u32.to_ne_bytes());
+    setattr[80..84].copy_from_slice(&stranger_gid.to_ne_bytes());
+    p.err(4, ino, setattr, libc::EPERM);
+    for caller_uid in [owner_uid, 0] {
+        p.uid = caller_uid;
+        for (valid, offset, owner_id, stranger_id) in [
+            (2u32, 76, owner_uid, stranger_uid),
+            (4u32, 80, owner_gid, stranger_gid),
+        ] {
+            let mut setattr = vec![0; 88];
+            setattr[..4].copy_from_slice(&valid.to_ne_bytes());
+            setattr[offset..offset + 4].copy_from_slice(&owner_id.to_ne_bytes());
+            p.ok(4, ino, setattr.clone());
+            let before = p.ok(3, ino, vec![0; 16]);
+            assert_eq!(
+                u32::from_ne_bytes(before[84..88].try_into().unwrap()),
+                owner_uid
+            );
+            assert_eq!(
+                u32::from_ne_bytes(before[88..92].try_into().unwrap()),
+                owner_gid
+            );
+            setattr[offset..offset + 4].copy_from_slice(&stranger_id.to_ne_bytes());
+            p.err(4, ino, setattr, libc::EPERM);
+            assert_eq!(p.ok(3, ino, vec![0; 16]), before);
+        }
+    }
+    p.uid = owner_uid;
     let mut setattr = vec![0; 88];
     setattr[..4].copy_from_slice(&(8u32 | 64).to_ne_bytes());
     setattr[8..16].copy_from_slice(&fh.to_ne_bytes());
@@ -617,11 +847,12 @@ fn protocol_create_metadata_stale_setattr_and_directory_stream_lifetime() {
         u32::from_ne_bytes(attr[76..80].try_into().unwrap()) & 0o777,
         0o640
     );
-    assert_eq!(u32::from_ne_bytes(attr[84..88].try_into().unwrap()), 1000);
-    assert_eq!(u32::from_ne_bytes(attr[88..92].try_into().unwrap()), 1000);
+    assert_eq!(u32::from_ne_bytes(attr[84..88].try_into().unwrap()), p.uid);
+    assert_eq!(u32::from_ne_bytes(attr[88..92].try_into().unwrap()), p.gid);
     let mut sa = vec![0; 88];
     sa[..4].copy_from_slice(&4u32.to_ne_bytes());
-    sa[80..84].copy_from_slice(&1001u32.to_ne_bytes());
+    let different_gid: u32 = if p.gid == 0 { 1 } else { 0 };
+    sa[80..84].copy_from_slice(&different_gid.to_ne_bytes());
     p.err(4, ino, sa, libc::EPERM);
     let mut sa = vec![0; 88];
     sa[..4].copy_from_slice(&(8u32 | 64).to_ne_bytes());

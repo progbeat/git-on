@@ -22,6 +22,88 @@ pub const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DISK_CACHE_ENTRIES: usize = 4096;
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 
+fn require_native_git(cwd: &Path) -> Result<()> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .arg("--version")
+        .stdin(Stdio::null());
+    let output = crate::git::run(command, true).map_err(|error| {
+        let missing = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
+        error.context(if missing {
+            "native Git was not found on PATH; remote execution requires Git 2.45.1 or newer; install a supported Git with your distribution tools and check PATH"
+        } else {
+            "cannot run native Git --version; remote execution requires Git 2.45.1 or newer; check the Git executable on PATH"
+        })
+    })?;
+    if !output.status.success() {
+        bail!("native Git --version failed: {}; remote execution requires Git 2.45.1 or newer; check the Git executable on PATH", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let detected = String::from_utf8_lossy(&output.stdout);
+    let version = detected
+        .strip_prefix("git version ")
+        .and_then(|value| value.split_whitespace().next());
+    let numbers = version
+        .map(|value| {
+            value
+                .split('.')
+                .take(3)
+                .map(str::parse::<u32>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .ok()
+        .flatten()
+        .filter(|numbers| numbers.len() == 3);
+    let Some(numbers) = numbers else {
+        bail!("unrecognized native Git version {:?}; remote execution requires Git 2.45.1 or newer; install a supported Git and check PATH", detected.trim());
+    };
+    if numbers.as_slice() < [2, 45, 1].as_slice() {
+        bail!("detected native Git {}; remote execution requires Git 2.45.1 or newer to disable automatic promisor fetches; upgrade Git with your distribution tools or select a supported Git on PATH", version.unwrap());
+    }
+    Ok(())
+}
+
+fn github_https_alternative(source: &str) -> Option<String> {
+    let path = source.strip_prefix("git@github.com:").or_else(|| {
+        let (authority, path) = source.strip_prefix("ssh://")?.split_once('/')?;
+        matches!(
+            authority,
+            "git@github.com" | "git@github.com:22" | "github.com" | "github.com:22"
+        )
+        .then_some(path)
+    })?;
+    let components: Vec<_> = path.split('/').collect();
+    // Only a plain GitHub owner/repository path becomes a suggested URL. Never
+    // reinterpret arbitrary hosts, URL credentials, query strings or escapes.
+    if components.len() != 2
+        || components.iter().any(|component| {
+            component.is_empty()
+                || matches!(*component, "." | "..")
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return None;
+    }
+    Some(format!("https://github.com/{path}"))
+}
+
+fn authentication_advice(stderr: &str, https_alternative: Option<&str>) -> String {
+    if !stderr.to_ascii_lowercase().contains("publickey") {
+        return String::new();
+    }
+    let mut advice = String::from("; check your existing SSH key/agent and repository access");
+    if let Some(url) = https_alternative {
+        advice.push_str(&format!("; if this GitHub repository is public, try {url} instead (public HTTPS needs no SSH key; private HTTPS still requires your existing credentials)"));
+    }
+    advice
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SocketOwner {
@@ -49,6 +131,7 @@ pub struct Remote {
     pub git: Git,
     pub dir: PathBuf,
     source: OsString,
+    https_alternative: Option<String>,
     cache: DiskCache,
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
@@ -57,65 +140,55 @@ pub struct Remote {
     failed: Option<String>,
 }
 impl Remote {
-    pub fn open(cwd: &Path, source: &OsStr, run: &Path) -> Result<(Self, Vec<u8>)> {
-        let mut git = Git::capture(cwd)?;
-        let version = git.output(None, &[OsStr::new("--version")])?;
-        let version = std::str::from_utf8(&version)?
-            .split_whitespace()
-            .nth(2)
-            .context("unrecognized native Git version")?;
-        let numbers: Vec<u32> = version
-            .split('.')
-            .take(3)
-            .map(|x| x.parse().unwrap_or(0))
-            .collect();
-        if numbers.as_slice() < [2, 45, 1].as_slice() {
-            bail!("remote execution requires native Git 2.45.1 or newer to disable automatic promisor fetches");
-        }
-        let url = if source.as_bytes().contains(&b':') {
-            source.to_os_string()
-        } else {
-            let out = git
-                .output(
-                    None,
-                    &[
-                        OsStr::new("remote"),
-                        OsStr::new("get-url"),
-                        OsStr::new("--"),
-                        source,
-                    ],
-                )
-                .context("repository must be an HTTPS/SSH URL or configured remote name")?;
-            OsString::from_vec(out.strip_suffix(b"\n").unwrap_or(&out).to_vec())
-        };
-        let out = if source.as_bytes().contains(&b':') {
-            git.output(
-                None,
-                &[
-                    OsStr::new("ls-remote"),
-                    OsStr::new("--get-url"),
-                    OsStr::new("--"),
-                    &url,
-                ],
-            )?
-        } else {
-            url.as_bytes().to_vec()
-        };
-        let url = OsString::from_vec(out.strip_suffix(b"\n").unwrap_or(&out).to_vec());
-        let transport_source = if source.as_bytes().contains(&b':') {
-            url.clone()
-        } else {
-            git.pin_remote_url(source, &url);
-            source.to_os_string()
-        };
-        let text = url.to_str().context("remote URL must be UTF-8")?;
-        let ssh_transport =
-            text.starts_with("ssh://") || (!text.contains("://") && text.contains(':'));
-        if !ssh_transport && !text.starts_with("https://") && !text.starts_with("file://") {
-            bail!("unsupported remote transport; use HTTPS, SSH, or a configured file:// fixture remote");
-        }
+    pub fn open(cwd: &Path, source: &OsStr, revision: &OsStr, run: &Path) -> Result<(Self, Oid)> {
+        // Capture effective configuration first: even `git --version` can read
+        // it. Preserve the first native operation's cancellation/TTY lifecycle.
+        let git = Git::capture(cwd).map_err(|error| {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }) {
+                error.context("remote execution requires native Git 2.45.1 or newer; install a supported Git with your distribution tools and check PATH")
+            } else {
+                error
+            }
+        })?;
+        require_native_git(cwd)?;
+        // Git owns repository spelling, named remotes and URL rewriting. This
+        // native query is only used to configure the optional owned SSH master;
+        // every network operation still receives the original source operand.
+        let url = git.output(
+            None,
+            &[
+                OsStr::new("ls-remote"),
+                OsStr::new("--get-url"),
+                OsStr::new("--"),
+                source,
+            ],
+        )?;
+        let url = url.strip_suffix(b"\n").unwrap_or(&url);
+        let text = String::from_utf8_lossy(url);
+        let ssh_transport = ["ssh://", "git+ssh://", "ssh+git://"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            || (!text.contains("://")
+                && !text.contains("::")
+                && text
+                    .find(':')
+                    .is_some_and(|colon| text.find('/').is_none_or(|slash| colon < slash)));
         let dir = run.join("remote-repository");
-        Repository::init_bare(&dir)?;
+        let repo = Repository::init_bare(&dir)?;
+        // Native Git uses the original source as an implicit promisor remote
+        // name. An absolute path is a valid fetch operand but an invalid remote
+        // name, so provide separate owned metadata for filtered connectivity.
+        // It has no URL: GIT_NO_LAZY_FETCH forbids automatic object loading, and
+        // every explicit demand below still passes the original source to Git.
+        repo.config()?.set_bool(
+            &format!("remote.git-on-owned-{}.promisor", uuid::Uuid::new_v4()),
+            true,
+        )?;
+        drop(repo);
         let cache = DiskCache::standard()?;
         let socket = ssh_transport.then(|| run.join("ssh-control"));
         let ssh = socket
@@ -137,7 +210,8 @@ impl Remote {
         let mut remote = Self {
             git,
             dir,
-            source: transport_source,
+            source: source.to_os_string(),
+            https_alternative: github_https_alternative(&text),
             cache,
             socket,
             socket_owner: None,
@@ -163,23 +237,26 @@ impl Remote {
         remote.record_socket_owner()?;
         let out = outcome?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             bail!(
-                "remote ref advertisement/authentication failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                "remote ref advertisement/authentication failed: {}{}",
+                stderr.trim(),
+                authentication_advice(&stderr, remote.https_alternative.as_deref())
             );
         }
         if remote.socket.is_some() && remote.socket_owner.is_none() {
             bail!("OpenSSH did not create the owned control socket");
         }
-        let trace = fs::read_to_string(capabilities.path())?;
-        if !trace.lines().any(|line| {
-            line.split_whitespace()
-                .any(|word| word == "filter" || word == "filter\\0")
+        let trace = fs::read(capabilities.path())?;
+        if !trace.split(|byte| *byte == b'\n').any(|line| {
+            line.split(u8::is_ascii_whitespace)
+                .any(|word| word == b"filter" || word == b"filter\\0")
         }) {
             bail!("remote server does not advertise object filtering; full-clone fallback is forbidden");
         }
         remote.failed = None;
-        Ok((remote, out.stdout))
+        let oid = remote.fetch_selected(revision)?;
+        Ok((remote, oid))
     }
     fn command(&self, initial: bool) -> Result<Command> {
         if let Some(error) = &self.failed {
@@ -193,6 +270,11 @@ impl Remote {
             "maintenance.auto=false",
             "-c",
             "fetch.writeCommitGraph=false",
+            // A fetched destination ref names a commit, but its trees and
+            // blobs may still be absent. Advertising that commit as a 'have'
+            // can make the server omit an explicitly demanded descendant.
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
         ]);
         if let (Some(socket), Some(ssh)) = (&self.socket, &self.ssh) {
             // Git appends argv to the outer function, so its argument count
@@ -219,42 +301,53 @@ impl Remote {
         }
         Ok(command)
     }
-    pub fn resolve(advertisement: &[u8], revision: &str) -> Result<Oid> {
-        if revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(Oid::from_str(revision)?);
+    fn fetch_selected(&self, revision: &OsStr) -> Result<Oid> {
+        // A fetch refspec belongs to native Git, including its leading '+',
+        // namespace abbreviation and destination. All resulting refs and
+        // FETCH_HEAD live in this owned bare repository, never in the caller.
+        let mut command = self.command(false)?;
+        command
+            .args(["fetch", "--no-tags", "--depth=1", "--filter=tree:0"])
+            .arg("--")
+            .arg(&self.source)
+            .arg(revision)
+            .stdin(Stdio::null());
+        let out = crate::git::run(command, true).context("fetch selected remote revision")?;
+        let error = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            bail!(
+                "native Git fetch failed: {}{}",
+                error.trim(),
+                authentication_advice(&error, self.https_alternative.as_deref())
+            );
         }
-        let mut names = vec![revision.to_owned()];
-        if revision != "HEAD" && !revision.starts_with("refs/") {
-            names.extend([
-                format!("refs/heads/{revision}"),
-                format!("refs/tags/{revision}"),
-            ]);
+        if error.contains("filtering not recognized") || error.contains("filter capability") {
+            bail!(
+                "remote server does not support object filtering; full-clone fallback is forbidden"
+            );
         }
-        let mut matches = Vec::new();
-        for line in advertisement.split(|byte| *byte == b'\n') {
-            let Some(separator) = line.iter().position(|byte| *byte == b'\t') else {
-                continue;
-            };
-            let (oid, name) = line.split_at(separator);
-            let name = &name[1..];
-            // Annotated tags also advertise a peeled-object helper. It is not
-            // a ref: selecting it would change which exact object is verified.
-            if name.ends_with(b"^{}") {
-                continue;
+        let head = fs::read(self.dir.join("FETCH_HEAD")).context("read native Git fetch result")?;
+        let mut selected = None;
+        for line in head
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let oid = line.split(|byte| *byte == b'\t').next().unwrap();
+            let oid = Oid::from_str(std::str::from_utf8(oid)?).context(
+                "native Git fetched a non-SHA-1 object (SHA-256 repositories unsupported)",
+            )?;
+            if selected.is_some_and(|selected| selected != oid) {
+                bail!("native Git fetch selected multiple objects; a snapshot requires exactly one selected object");
             }
-            if names.iter().any(|n| n.as_bytes() == name) && !oid.starts_with(b"ref:") {
-                matches.push((
-                    name,
-                    Oid::from_str(
-                        std::str::from_utf8(oid).context("remote object ID is not ASCII")?,
-                    )
-                    .context("remote SHA-256 repositories are unsupported")?,
-                ));
-            }
+            selected = Some(oid);
         }
-        matches.sort();
-        matches.dedup();
-        match matches.as_slice() { [(_, oid)] => Ok(*oid), [] => bail!("remote revision {revision:?} is not advertised; use HEAD, an exact ref, branch/tag name, or a full SHA-1 OID (ancestry/reflog syntax unsupported)"), _ => bail!("ambiguous remote revision {revision:?}; use refs/heads/ or refs/tags/") }
+        let oid = selected.context("native Git fetch selected no object to mount")?;
+        let repo = Repository::open_bare(&self.dir)?;
+        if !repo.odb()?.exists(oid) {
+            bail!("native Git fetch did not supply selected object {oid}");
+        }
+        self.cache.store(&repo, oid)?;
+        Ok(oid)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
         let outcome = (|| {
@@ -312,7 +405,7 @@ impl Remote {
         };
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
-            bail!("remote fetch of exact object {oid} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}", error.trim());
+            bail!("remote fetch of exact object {oid} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}{}", error.trim(), authentication_advice(&error, self.https_alternative.as_deref()));
         }
         if error.contains("filtering not recognized") || error.contains("filter capability") {
             bail!(
@@ -558,7 +651,14 @@ fn remove_disconnected_socket(socket: &Path, owner: &SocketOwner) -> Result<bool
     // SIGKILL of a master can leave a pathname after the listener closes.
     // Recheck ownership immediately before removing only that stale node.
     if owned_socket(socket, owner) {
-        fs::remove_file(socket).context("remove disconnected owned SSH control socket")?;
+        match fs::remove_file(socket) {
+            Ok(()) => {}
+            // OpenSSH may remove its own node after the ownership check.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("remove disconnected owned SSH control socket")
+            }
+        }
     }
     Ok(true)
 }

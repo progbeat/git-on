@@ -1,5 +1,85 @@
 # Review regression evidence
 
+## Native Git operand compatibility (1.2.0 bug fixes)
+
+Repository and revision arguments were always intended to use Git's syntax.
+These corrections restore that contract; the release's minor version increase
+is for the additional write policies. They do not introduce a new grammar or
+require a major version increase.
+
+The authentic pre-fix binaries from `85c1b15` were copied before editing the
+runtime sources. Five focused cases failed in 14 subcases against those
+binaries, including native ref spellings, direct local repository paths,
+branch/tag precedence and literal destination refspecs. The same permanent
+cases pass after delegation to native Git. Each fixture compares its selection
+or error with Git itself rather than prescribing a second interpretation.
+
+| Reproduced failure | Permanent regression | Result after fix |
+| --- | --- | --- |
+| Native ref forms such as `heads/main`, `tags/v1`, `+main` and destination refspecs were rejected or reinterpreted | `test_fetch_accepts_native_short_ref_names_and_refspecs`, `test_fetch_colon_is_a_literal_refspec_and_does_not_touch_caller_refs` | Native fetch selects the object and updates only private destination refs |
+| Local and non-UTF-8 source paths were rejected; a branch/tag collision used custom ambiguity rules | `test_fetch_accepts_relative_absolute_and_non_utf8_repository_paths`, `test_fetch_branch_tag_collision_follows_native_precedence` | Exact operand bytes and native precedence are preserved |
+| Invalid or non-UTF-8 revision operands never reached Git | `test_fetch_invalid_revision_reports_native_git_error`, `test_fetch_non_utf8_ref_is_passed_to_git_unchanged`, `test_native_fetch_receives_the_original_source_and_refspec` | Git receives unchanged operands and supplies the diagnostic |
+| A cold fetch into a destination ref made later tree demand negotiate from an incomplete private commit | `test_fetch_accepts_native_short_ref_names_and_refspecs`, `test_two_operands_fetch_literal_refspec_from_local_paths_into_a_private_snapshot` | Demand fetching obtains the exact missing object without advertising incomplete history |
+| Native resolution found objects in an external ODB, but subsequent reads or verification lost that environment | `test_local_native_object_database_environment_is_used_for_exact_reads`, `test_local_verification_keeps_native_object_database_environment` | Reads and signature verification use the Git-selected object locations |
+| Namespace/common-directory environments left temporary pins after completion or stale recovery | `test_local_namespace_environment_does_not_leave_snapshot_pins`, `test_local_common_directory_reads_and_releases_pins_in_the_native_repository` | Pins are removed from the actual common directory on completion and after SIGKILL recovery |
+| C-quoted alternate paths containing a colon or non-UTF-8 bytes resolved in Git but failed during snapshot reads | `test_local_c_quoted_alternate_with_colon_and_non_utf8_path_matches_native_git` | Private aliases preserve native object access without scanning or copying the ODB |
+| Copilot found relative alternates used the invocation cwd after native Git had changed repository context; relative primary object directories had the same defect | `test_local_relative_object_environments_follow_native_worktree_setup`, `test_local_relative_alternates_keep_native_bare_invocation_context` | Four native-valid subcases failed against the preserved binary; all eight worktree/bare/explicit-context cases pass with native object-location queries and real FUSE |
+
+Local runtime regressions were reproduced before their individual fixes, then
+rerun against immutable copies of the final executable and source probe. Those
+copies also passed 72 real-FUSE integration/uv tests and all nine write-policy
+tests. The full remote suite passed through real HTTPS/OpenSSH and FUSE,
+including the cold/warm million-file demand gate; the later object-environment
+fixes concern local repositories. Native fetch hooks are exercised explicitly
+by `test_native_fetch_reference_hook_sees_private_refs_and_repository`.
+
+The first exact-head CI run (`fb2556d`) reproduced a protocol-fixture defect:
+`protocol_all_copy_up_setattr_links_rename_and_whiteouts` failed with EACCES and
+`protocol_all_setattr_on_unlinked_original_read_handle` with EPERM. The fixture
+sent UID/GID 1000 while tracked entries belonged to the actual runner process.
+It now defaults to that process's effective IDs. Credential tests still use
+distinct owner, stranger, group and root identities and retain their rejection
+assertions. Both focused cases and all 17 protocol cases pass locally in normal
+and `test-metrics` builds; the subsequent CI run checks the corrected fixture
+under the runner's different UID. Production permission checks are unchanged.
+
+## Four write policies and release classification (1.2.0)
+
+The base for this change is current master `c42f818f1b4e2ccf4d940c2a77e98e2ad1eb931b`
+(1.1.0). A separate detached checkout and target directory replayed its actual
+binary: the new policy argument failed with usage status 2, and the focused
+missing-command diagnostic assertion failed against its generic `spawn command`
+message. Both tests pass with the new implementation. Installer and release
+regressions were also run before replacing their implementations.
+
+| Reproduced failure | Permanent regression | Result after fix |
+| --- | --- | --- |
+| Installer refused owned mode 0775 without path/mode/owner or conditional advice | `test_owned_group_writable_directory_has_precise_conditional_advice`, `test_other_writable_directory_is_distinguished_from_group_write`, `test_foreign_owner_never_gets_permission_change_advice` | Precise reasons, safe single-directory advice only where appropriate, permissions unchanged |
+| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible `--bin-dir` alternative |
+| Old Git 2.43.0 and missing Git diagnostics omitted detected version or next steps | `RemoteDiagnosticsTests` in `tests/remote.py` | Requirement stays 2.45.1+, with detected version/PATH guidance |
+| GitHub SSH publickey failure offered no public HTTPS alternative | `RemoteDiagnosticsTests` | Conditional HTTPS hint; no automatic retry or weakened authentication |
+| Version preflight before configuration capture blocked on a real Git 2.55 global-config FIFO | `SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state` | Restored configuration-first ordering; original lifecycle assertion passes |
+| Docs/test-only changes required a binary release; nonrelease publication could inspect old assets | `tests/test_release_policy.py`, `tests/test_publish_release.py` | Retain version, emit skip decision, avoid artifact/API access |
+| Copilot found nonrelease checks accepted changed, removed or newly added release notes despite the retention contract | `test_nonrelease_changes_must_retain_release_notes_bytes`, `test_nonrelease_cannot_add_previously_absent_release_notes`, `test_nonrelease_can_retain_absent_release_notes` | Four cases fail before the fix; all 32 release-policy and 12 publisher tests pass with baseline bytes and file presence enforced |
+| Workflow-level RUSTFLAGS/defaults could change the binary without requiring a release | `test_inherited_workflow_rustflags_requires_bump`, `test_inherited_workflow_run_defaults_requires_bump` | Inherited build settings require a bump |
+
+Two defects reproduced during development of `all` are separate from the
+1.1.0 baseline, which had no `all` option. Renaming a listed source directory
+unnecessarily demanded unvisited child headers (EIO with an unavailable child
+blob). `all_directory_rename_never_demands_listed_child_headers` now proves
+lazy remapping without that access. Changing metadata through a read descriptor
+after unlinking a source file returned ENOENT; the focused real-mount
+`WritePolicyTests.test_all_open_unlinked_source_allows_descriptor_metadata_changes`
+failed before its fix and passes afterward. Unit and protocol regressions also
+cover that anonymous copied-up inode.
+
+`tests/write_policy.py --require-fuse` checks four policies, default compatibility,
+tracked-parent protection, dirty host index/worktree selection, mutations, links,
+metadata, kept artifacts and interrupt cleanup. Protocol tests independently
+exercise fuser dispatch. Test results on one host do not replace exact-head CI
+or verification on another required host. The SL recording provenance names
+the actual recording host; it is not evidence of a recording on `brick`.
+
 ## Approved release LTO profile
 
 The release profile now explicitly keeps optimization level 3 and enables fat
@@ -853,3 +933,429 @@ test now opens a pidfd before cancellation and requires its bounded death,
 without confusing an outstanding kill with a survivor or relying on container
 PID 1 to reap zombies. This is an observed test-timing correction, not a claimed
 new transport cancellation defect or a fabricated deterministic red schedule.
+
+## Recording artifacts and CLI option placement (Copilot follow-up)
+
+The authentic recording helper at `8660e5e2` protected only `demo.gif` and
+`demo.json`. Five permanent destination tests failed before its fix: opening
+`vhs.log` truncated both an existing log and an unrelated file reached through
+a log symlink, while directories containing a video, dangling artifact symlink
+or earlier capture still reached the mocked VHS launch and gained a new log.
+These reproductions use real temporary files with mocked dependencies and VHS;
+they do not claim a new real recording or FUSE execution.
+
+All six `tests/test_record_demo.py` tests pass after rejecting a nonempty output
+directory before dependency, FUSE or executable probes. Existing files, directory
+contents and symlink targets remain unchanged; new and empty directories still
+reach normal dependency checks. The default output is now the disposable
+`target/sl-recording` directory. CI runs this permanent suite. Local red/green
+logs are retained as `target/git-operands-{red,green}/copilot-recording-destination.txt`.
+
+The CLI parser already accepted runner options before, between and after Git
+operands, but help and normative documentation said they must follow `REV`.
+The strengthened `CliTests.test_help_and_version` failed against the authentic
+release executable with SHA-256 `1f96f5445474149ca71d554c63a6d1388956cd0f2fb2c3427c73fcc48e22f996`.
+After correcting the help and documentation, all 11 `CliTests` and all 12 Rust
+`cli::tests` pass; parser behavior and operand grammar are unchanged. Evidence
+is in `target/git-operands-{red,green}/copilot-option-placement.log` and
+`target/git-operands-green/copilot-cli-unit.log`.
+
+## Installer PATH precedence (Copilot follow-up)
+
+At authentic head `e94360c1a`, installation succeeded silently when PATH selected
+an earlier executable named `git-on`. The preserved installer has SHA-256
+`a767f86485298f686a2b70be25257703f03fa5558fb54406f71a324ff6f63c22`.
+`test_success_identifies_an_earlier_executable_without_running_it` failed against
+that script before the correction. It now requires the actual shadowing path
+and a shell-quoted command that directly checks the newly installed binary.
+
+The installer checks PATH selection with `which` and file identity with
+`samefile`; it never executes the earlier binary or edits PATH or profiles.
+`test_no_shadow_warning_when_installed_binary_is_first_on_path` and
+`test_path_alias_of_installed_binary_is_not_a_shadow` cover the non-shadowing
+cases, and the existing missing-directory guidance remains covered. All 33
+installer tests pass after the correction; shell syntax and diff checks pass.
+The authentic old script is `target/git-operands-red/installer-shadow-before.sh`,
+with evidence in
+`target/git-operands-{red,green}/copilot-installer-path-shadow.txt`.
+
+## Hash-prefixed alternates: rejected Copilot finding
+
+Copilot claimed that skipping an unquoted `#` component in
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` differed from native Git. The claim was
+rejected after checking Git itself: host Git 2.55.0 ignores `#alternate-objects`
+and `:#alternate-objects::`, but reads objects through `"#alternate-objects"`.
+The minimum supported
+[Git 2.45.1 source](https://github.com/git/git/blob/v2.45.1/object-file.c#L530-L579)
+also treats a leading `#` as a comment before checking quoted paths, and
+[`prepare_alt_odb`](https://github.com/git/git/blob/v2.45.1/object-file.c#L885-L894)
+uses that parser for environment alternates with `PATH_SEP`.
+
+`test_local_hash_prefixed_alternate_components_match_native_git` keeps the
+commit, tree and blob exclusively in a real hash-prefixed alternate directory.
+It compares native tree resolution and file reads with actual FUSE command
+execution for five variants: unquoted, quoted, empty components around either
+form, and a comment followed by a quoted path. Native-rejected variants require
+runner status 125 and no command execution; accepted variants must read the
+exact alternate bytes. Every variant leaves caller refs, object files and run
+cleanup unchanged.
+
+All five variants pass against the unchanged authentic release executable with
+SHA-256 `7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f`;
+evidence is `target/git-operands-green/copilot-hash-alternate-native-oracle.txt`.
+There is no runtime fix or authentic red-before defect to claim for this
+finding. The original native oracle rejected the proposed acceptance behavior
+before invoking the runner, so that failed experiment is not runtime regression
+evidence.
+
+## WebP converter output preservation (Copilot follow-up)
+
+At authentic head `b00fb876`, the converter's `exists()` check missed a dangling
+output symlink. With a real 8×6 two-frame GIF and Pillow 11.3.0/libwebp 1.5.0,
+`test_dangling_output_symlink_does_not_create_its_target` failed because the
+encoder created the link's previously absent target. A second controlled
+interleaving created another writer's output during source decoding;
+`test_output_created_during_source_decode_is_not_overwritten` failed because the
+encoder replaced those bytes. The preserved original helper is
+`target/git-operands-red/convert-demo-before.py`.
+
+The converter now rejects existing entries, including dangling symlinks, and
+passes an exclusively created `xb` file handle to the actual WebP encoder.
+All six permanent `tests/test_convert_demo.py` tests pass: occupied regular,
+symlink and directory outputs remain intact, competing output creation is
+rejected, and the tiny real conversion preserves RGB pixels, dimensions,
+70/130 ms frame timing and loop count. CI runs the suite in an isolated Python
+environment with pinned Pillow 11.3.0; missing codec support fails the tests.
+Evidence is retained in
+`target/git-operands-{red,green}/copilot-converter-output.txt`.
+
+## Output-directory substitution and failed encoding (Copilot follow-up)
+
+The authentic helpers at `403a29da` reproduced two further failures. A
+dependency callback replaced the initially empty recording destination with a
+symlink after preflight; `test_destination_replaced_after_preflight_cannot_clobber_outside_log`
+failed because the old helper truncated the outside directory's existing log.
+A controlled encoder wrote partial bytes and then raised;
+`test_encoder_failure_removes_partial_output_and_allows_retry` failed because
+the final WebP filename remained occupied. Both are deterministic isolated-file
+reproductions, rather than claims of another full terminal recording.
+
+Recording now pins the accepted directory with a no-follow FD, writes only into
+a private staging directory on that filesystem, and launches VHS with a pinned
+staging cwd. Publication uses exclusive hard links into the held destination
+FD and checks the pathname's identity. The ten recording tests preserve outside
+files after early and late directory substitution, preserve a competing artifact
+during publication, and retain every generated byte for new and existing empty
+destinations. A failed VHS run reports that its staged artifacts were not
+published instead of pointing to a log that cleanup removes.
+
+Conversion encodes and validates in a private sibling staging directory before
+exclusive hard-link publication. Failed encodes remove their owned temporary
+files, leave the final name available for retry, and preserve another writer's
+output. All eight conversion tests pass, including the real tiny-GIF pixel,
+timing and loop checks. Authentic helper copies and red/green logs are under
+`target/git-operands-{red,green}/copilot-record_demo-followup.txt` and
+`target/git-operands-{red,green}/copilot-convert_demo-followup.txt`; the original
+scripts are `record_demo-403-before.py` and `convert_demo-403-before.py` in the
+red directory.
+
+## Distinct UID/GID protocol coverage: rejected Copilot finding
+
+Copilot's proposed substitution of `stranger_gid` for the existing UID field
+was rejected against the locked
+[fuser 0.16.0 attribute flags](https://github.com/cberner/fuser/blob/v0.16.0/src/ll/fuse_abi.rs#L115-L126)
+and [setattr ABI](https://github.com/cberner/fuser/blob/v0.16.0/src/ll/fuse_abi.rs#L514-L551):
+`FATTR_UID` has value 2 with the UID field at offset 76; `FATTR_GID` has value 4
+with the GID field at offset 80.
+The original `stranger_uid` assertion correctly tested the UID field.
+
+`protocol_access_and_setattr_distinct_uid_and_gid` additionally exercises
+UID/GID pairs `(1000, 1001)` and `(1, 0)`, preserving owner, group, stranger and
+root access assertions. Owner/root UID and GID no-ops succeed; real changes
+return EPERM and retain attributes. All 18 protocol cases pass in normal and
+metrics builds with unchanged runtime source and executable. The proposed
+incorrect substitution fails the new case; that red result rejects the proposed
+change and is not evidence of an old runtime defect.
+
+The proposed-change failure is recorded in
+`target/git-operands-red/copilot-setattr-proposed-change/regression.log`.
+Protocol, distinct-credential, strict-clippy, coverage and release-policy green
+results are retained in `target/git-operands-green/copilot-setattr-*.txt`.
+
+## Native Git dependency and release classification
+
+Copilot's `39c11087` review correctly identified that the former direct local
+Git-free path is removed. The native resolver requirement is intentional:
+the requested compatibility contract makes Git itself the only authority for
+repository and revision interpretation. Preserving a second resolver would
+violate that requirement. The requested release classification explicitly
+treats this restoration as a bug fix, including the local dependency change;
+the additional write policies determine the single minor bump to 1.2.0.
+
+The specification, release rules and migration notes now state this consequence
+explicitly. `test_local_unverified_run_requires_native_git_for_revision_resolution`
+already checks the required executable and diagnostic. This clarification does
+not claim a new runtime defect or red-before/green-after behavior change.
+
+## Multi-artifact recording publication rollback (Copilot follow-up)
+
+At authentic head `39c11087`, four permanent recording tests failed. A collision
+on the second artifact and a simulated disk-space error both left the first
+published hard link behind. When another writer replaced the first link before
+a later collision, the helper preserved that replacement but left a second
+owned artifact behind. A later unsupported directory was rejected only after
+an earlier regular file had already been published.
+
+Publication now validates every staged entry before creating any destination
+link. It records successfully created links and, on failure, rolls them back
+through the held destination FD only when the current no-follow entry still
+has the staged source's device and inode. Missing entries and another writer's
+replacement are preserved; the competing name that caused a collision is never
+owned by this publication. Staged source files remain unchanged.
+
+All 14 `tests/test_record_demo.py` tests pass after the correction, including
+four new controlled real-file regressions and the existing ten destination
+checks. The unsupported-entry case requires zero link calls; the two-artifact
+cases exercise a real first link before a second collision or injected ENOSPC;
+the three-artifact replacement case preserves both competing files while
+removing the remaining owned link. These fixtures do not run VHS or mount FUSE
+and do not claim exhaustive concurrent interleaving coverage. Runtime source,
+release binary and the published animation are unaffected by this helper fix.
+
+The authentic helper has SHA-256
+`8b67221857e2a63a7688cb29c401bd83d82bd6993f2f8f63aa2f3f5241c60ef2` and
+is preserved at `target/git-operands-red/record_demo-39-before.py`. Red/green
+results are in
+`target/git-operands-{red,green}/copilot-recording-publication-rollback.txt`.
+
+## Owned SSH socket disappearance during signal cleanup
+
+The real-FUSE job for `39c11087` failed the SIGQUIT subcase of
+`test_real_mount_all_handled_signals_close_owned_ssh_and_remove_state`: the
+runner returned the expected signal status but retained its temporary directory.
+The authentic release executable with SHA-256
+`7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f`
+also reproduced that assertion locally on the fourth focused replay, for SIGINT.
+
+An isolated copy of the same runtime, instrumented only to print its existing
+cleanup error before reraising the signal, reproduced the failure on its fifth
+replay. It reported `remove disconnected owned SSH control socket: No such file
+or directory` and no remaining mount. OpenSSH had removed its own socket between
+the runner's final ownership check and unlink. The original signal-specific
+core-dump hypothesis therefore did not explain this failure.
+
+`remove_disconnected_socket` now treats `NotFound` from that final unlink as an
+already completed removal. Other errors continue to retain recovery state.
+The permanent
+`SshRegressionTests.test_owned_socket_removed_during_unlink_does_not_block_recovery`
+uses a real closed Unix socket and valid private recovery state. A test-only
+`LD_PRELOAD` fixture removes the socket during the runner's unlink call, after
+its ownership check. This controlled interleaving failed against the authentic
+executable with status 125 and ENOENT, then passed after the correction. A
+separate injected EACCES case requires status 125 and preserves the socket and
+recovery state; ordinary recovery succeeds after that injection is removed.
+
+All 21 SSH regressions pass with the corrected metrics executable. Twelve
+bounded real-FUSE replays additionally passed all four handled signals, for
+48 signal completions; this is not exhaustive interleaving coverage. Formatting
+and the FUSE inventory guard pass. The authentic executable is retained at
+`target/cleanup-forensics-authentic-before`; diagnostic and controlled red/green
+evidence is in `target/cleanup-forensics-replay.log` and
+`target/cleanup-forensics-{controlled-red,controlled-green,ssh-green,signals-green}.log`.
+
+## Recording rollback ownership race (Copilot follow-up)
+
+At authentic head `1ba282f3`, the recorder's per-artifact rollback checked a
+published link's device and inode, then unlinked its public name. A competing
+writer could replace that entry between those operations. The permanent
+`test_rollback_cannot_delete_a_competitor_arriving_after_ownership_check`
+reproduces this with actual files: after a real first hard link and an injected
+second-publication ENOSPC, the fixture atomically replaces the first entry at
+the final unlink boundary. The old helper deletes the competing animation.
+
+Recording publication now validates every staged entry, then moves the entire
+private artifact directory to `OUTPUT/capture/` with Linux
+`renameat2(RENAME_NOREPLACE)` through the held destination directory FD. There
+are no partially published artifact links and no public-name rollback. An
+existing capture, including one created after preflight, remains untouched.
+Once the group becomes visible, cleanup is disarmed even if the requested
+parent pathname subsequently changes; it preserves both the published group
+and another writer's recreation of the old staging name.
+
+All 17 recording tests pass. They exercise the real atomic directory move,
+complete artifact bytes, existing and late competing captures, file/symlink
+collisions, ENOSPC without partial publication, unsupported entries rejected
+before publication, parent-path replacement, and foreign entries arriving
+after publication. The ownership-race test also runs unchanged against the
+authentic old helper: its legacy unlink-boundary schedule fails, while the
+corrected helper preserves a competing recording at its single atomic
+publication boundary. This helper-only change does not alter runtime source,
+the release executable, or the already recorded animation.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-1ba-before.py` with SHA-256
+`7f9b277ab262e913e67d08fde23397e0927d108114e448821409f5198cf88072`.
+The focused red result is in
+`target/git-operands-red/copilot-recording-rollback-toctou-red.txt`; the complete
+green suite is in
+`target/git-operands-green/copilot-recording-grouped-publication-green.txt`.
+
+## Distinct runtime and dev copies in the release lock closure
+
+At authentic head `1ba282f3`, `binary_lock` selected root dependency edges only
+by crate name. If runtime code used `shared` 1.x and tests used a renamed
+`shared` 2.x, both copies and their transitive dependencies entered the binary
+closure. Five permanent subcases failed before the correction: a dev-copy and
+dev-transitive update, then renamed runtime, build, target-runtime and
+target-build declarations. Every dev-only update incorrectly required a binary
+release despite unchanged executable inputs.
+
+The policy now selects root edges from runtime/build declarations and their
+package/version requirements, then traverses the exact locked dependency
+closure. It follows Cargo's
+[version requirement rules](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#version-requirement-syntax)
+for caret, tilde, wildcard, comparisons, intersections and prereleases. When
+declarations cannot identify one locked root edge, classification fails with a
+clear ambiguity error: the lockfile does not retain root dependency kinds, so
+overlapping runtime/dev constraints cannot be guessed safely. Classification
+continues to use only the Python standard library and performs no Cargo
+resolution, downloads or network calls.
+
+All 37 policy tests and 12 publication tests pass. Permanent checks retain the
+five dev-only cases, a runtime/transitive update requiring a release, ambiguity
+rejection and comparator boundaries. An isolated native Cargo oracle additionally
+used only local path packages and `cargo metadata --offline`: its mixed
+runtime/dev graph matched the selected closure, and all 42 version comparisons
+matched Cargo. Native Cargo rejected the proposed partial-equality prerelease
+change (`=1.2, >=1.2.3-alpha` for `1.2.3-alpha`); that discarded hypothesis is
+not a claimed old defect or red result.
+
+The authentic policy is retained at
+`target/git-operands-red/release_policy-1ba-before.py` with SHA-256
+`4e04317791a09a31a022edd0faed0d9662a088e083ef590d3d390e6b825434dd`.
+Red/green logs are in
+`target/git-operands-{red,green}/copilot-dev-runtime-collision.txt`; publication
+results are in `target/git-operands-green/copilot-dev-runtime-publisher.txt`.
+The native offline oracle is recorded in
+`target/policy-cargo-offline-oracle/proof.json`.
+
+## Preserve failed recording staging (Copilot follow-up)
+
+At authentic head `9bccb75b`, the recorder recursively removed its staging
+pathname after a failed recording. A competing writer could rename the original
+held directory and create a different directory at that name. The permanent
+`test_failed_recording_preserves_replacement_staging_directory_and_owned_log`
+reproduces the failure with actual directories and files: its recorder fixture
+writes owned diagnostics and a partial animation, moves that staging directory,
+creates a replacement containing a foreign file, then fails. The authentic
+helper deletes the replacement directory and the foreign file.
+
+Failed staging is now deliberately retained for inspection. The helper performs
+no recursive or name-based deletion of recording artifacts on failure. Before
+closing the held staging FD it reports that directory's actual location and
+points to `vhs.log` when present, including after the directory has been renamed.
+A retry requires a fresh output directory; existing artifacts are rejected
+before dependency probes. Successful recordings still appear together through
+the single atomic move to `OUTPUT/capture/`.
+
+All 19 recording tests pass. The new controlled replacement case preserves both
+the original owned diagnostics/animation and the competing directory. A second
+failure case retains the actual log from a renderer returning status 17 and
+checks that retrying the same output cannot overwrite it. Publication-failure
+tests now retain their staged files rather than expecting an empty output
+directory. Runtime source, release version, executable and published media are
+unaffected.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-9bcc-before.py` with SHA-256
+`6261db70db8a893016c942d1356077b214fc2b39d4aad9e37489afa56731e411`.
+The focused red result is in
+`target/git-operands-red/copilot-recording-failed-staging-red.txt`; the complete
+green suite is in
+`target/git-operands-green/copilot-recording-retained-failure-green.txt`.
+
+## Anonymous WebP output avoids replacement-directory cleanup
+
+The converter at authentic head `9bccb75b` had the same staging-name cleanup
+defect. After a genuine Pillow encoding of an 8×6 two-frame GIF, a controlled
+fixture moved the owned staging directory and recreated its original name with
+a foreign recording. Validation then failed. `TemporaryDirectory` recursively
+deleted that replacement and its foreign file, while the renamed owned
+animation survived. The permanent
+`test_failed_validation_preserves_a_replacement_staging_directory` failed against
+the authentic helper because those competing bytes disappeared.
+
+The converter now opens an anonymous `O_TMPFILE` inode through a held destination
+directory FD. Pillow writes to its file handle; validation decodes a `BytesIO`
+copy, leaving the publication descriptor owned by the helper. A successful
+conversion publishes that inode with an exclusive `linkat` operation through
+`/proc/self/fd`. Closing descriptors handles failures without named staging
+directories or recursive deletion. The helper requires Linux, `/proc/self/fd`
+and `O_TMPFILE` support on the destination filesystem, and reports an explicit
+error when anonymous output is unsupported. It has no named-file fallback.
+
+All ten conversion tests pass with real Pillow 11.3.0/libwebp 1.5.0, including
+the existing eight output-preservation/codec cases, foreign-directory survival
+after failed validation, and unsupported-filesystem failure without artifacts.
+An actual CLI conversion also preserved all decoded RGB pixels, dimensions,
+70/130 ms frame durations and loop count; publication returned the expected
+size and SHA-256. Runtime source, version, executable and the large published
+animation are unchanged.
+
+The authentic converter is retained at
+`target/git-operands-red/convert_demo-9bcc-before.py` with SHA-256
+`919af473a91c5d2fdce80e98b117690c433a71598a3c4488f6c23be34a7cd14f`.
+Red/green results are in
+`target/git-operands-red/copilot-converter-staging-substitution.txt` and
+`target/git-operands-green/copilot-converter-anonymous-output.txt`.
+The original real-codec reproduction is recorded in
+`target/converter-staging-substitution-red/proof.json`.
+
+## Installer PATH directory aliases (Copilot follow-up)
+
+At authentic head `302a3753`, the installer compared PATH directory spellings
+before examining the selected executable. Two permanent shell-entrypoint tests
+failed: an alias directory already selecting the installed binary received a
+redundant prepend instruction, while an earlier executable before that alias
+received no shadow warning. The fixtures use real directory symlinks and
+verified offline release packages; a marker proves the earlier executable is
+never run by these diagnostics.
+
+The installer now checks the selected executable's `samefile` identity first.
+Directory identity also determines whether a missing-location hint is needed.
+Aliases selecting the installation emit neither warning nor prepend advice;
+an earlier different binary is identified, and genuinely absent installation
+directories still receive shell-quoted PATH guidance.
+
+Both focused regressions and all 35 installer tests pass. The authentic script
+is retained at `target/git-operands-red/install-302a-before.sh` with SHA-256
+`263feedb7c189a3ac57cee027ee82d0a0fa50aaee85a230886d0e5f201291cfc`.
+Red/green evidence is in
+`target/git-operands-{red,green}/copilot-installer-path-directory-alias.txt`.
+Runtime source, version, executable and animation are unchanged.
+
+## Authenticate recording staging during publication (Copilot follow-up)
+
+At authentic head `d78a95c7`, three permanent regressions fail: replacing the
+staging directory before publication or at the rename syscall boundary produces
+false success, while replacement after a successful recorder process redirects
+the GIF read and creates metadata inside the foreign directory. The fixtures
+perform real directory moves and the native atomic publication operation; the
+successful-process fixture supplies observed tree/status/cleanup events without
+running VHS or mounting FUSE. Its ordinary-success baseline already passes.
+
+GIF reading and exclusive metadata creation now use the held staging FD, with
+no-follow opening and regular-file validation for the GIF. Size and digest come
+from the same read. Publication checks the source directory's device/inode
+before rename and checks `capture` against the held staging FD afterward, before
+reporting success. A substitution exactly at rename may move the foreign
+directory; it is detected without rollback or deletion, and diagnostics report
+the retained owned stage through its FD. All 23 recorder tests pass, preserving
+both foreign bytes and owned logs/metadata in the controlled failures.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-d78a-before.py` with SHA-256
+`6701a0368fe09a801dd8ff9f8d08bbdd301ab903816856d27214d73760d1b00b`.
+Red/green evidence is in
+`target/git-operands-{red,green}/copilot-recording-stage-identity.txt`.
+Runtime source, version, executable and animation are unchanged.

@@ -321,6 +321,45 @@ class SshRegressionTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor, signal.SIGTERM)
             os.close(descriptor)
 
+    def test_owned_socket_removed_during_unlink_does_not_block_recovery(self):
+        f = self.f
+        library = f.root / 'socket-unlink-race.so'
+        remote.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
+                    Path(__file__).parent / 'support/ssh_socket_unlink_race.c', '-ldl', '-o', library])
+        for mode in ('removed', 'denied'):
+            with self.subTest(mode=mode):
+                directory = f.root / ('git-on-stale-' + mode)
+                directory.mkdir(mode=0o700)
+                (directory / '.lock').touch()
+                (directory / '.state').write_text(json.dumps(dict(
+                    format='git-on-temp-v1', id='socket-unlink-race', keep=False,
+                    git_dir=None, tree_oid=None, pin_ref=None)))
+                control = directory / 'ssh-control'
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
+                    endpoint.bind(str(control))
+                identity = control.stat()
+                (directory / 'ssh-control-owner').write_text(json.dumps(dict(
+                    format='git-on-ssh-control-v1', device=identity.st_dev,
+                    inode=identity.st_ino, client=None)))
+                marker = f.root / ('unlink-interleaving-' + mode)
+                env = dict(f.env, LD_PRELOAD=str(library), GIT_ON_REVIEW_UNLINK_PATH=str(control),
+                           GIT_ON_REVIEW_UNLINK_MARKER=str(marker), GIT_ON_REVIEW_UNLINK_MODE=mode)
+                result = subprocess.run([str(remote.OPTIONS.binary), '--cleanup', str(directory)],
+                                        env=env, capture_output=True, timeout=10)
+                self.assertTrue(marker.exists(), 'controlled unlink interleaving was not reached')
+                if mode == 'removed':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(directory.exists(), 'already removed owned socket blocked recovery')
+                else:
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertIn(b'remove disconnected owned SSH control socket', result.stderr)
+                    self.assertTrue(control.exists(), 'failed unlink discarded the owned socket')
+                    self.assertTrue((directory / '.state').exists(), 'failed unlink discarded recovery state')
+                    cleanup = subprocess.run([str(remote.OPTIONS.binary), '--cleanup', str(directory)],
+                                             env=f.env, capture_output=True, timeout=10)
+                    self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                    self.assertFalse(directory.exists())
+
     def test_unused_git_ssh_respects_command_and_configuration_precedence(self):
         f = self.f
         url = f.ssh()

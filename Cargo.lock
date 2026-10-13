@@ -228,13 +228,14 @@ dependencies = [
 
 [[package]]
 name = "git-on"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "fuser",
  "git2",
  "gix-glob",
+ "gix-quote",
  "libc",
  "serde",
  "serde_json",
@@ -276,7 +277,7 @@ dependencies = [
  "gix-error",
  "gix-parallel",
  "gix-path",
- "gix-utils",
+ "gix-utils 0.5.0",
  "libc",
 ]
 
@@ -291,7 +292,7 @@ dependencies = [
  "gix-fs",
  "gix-path",
  "gix-trace",
- "gix-utils",
+ "gix-utils 0.5.0",
 ]
 
 [[package]]
@@ -316,10 +317,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-quote"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96fc2ff2ec8cc0c92807f02eab1f00eb02619fc2810d13dc42679492fcc36757"
+dependencies = [
+ "bstr",
+ "gix-utils 0.3.6",
+ "thiserror",
+]
+
+[[package]]
 name = "gix-trace"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "133f2de116104d637541831b6acb157898556d5eeec363ab2eb1c583adc6bb56"
+
+[[package]]
+name = "gix-utils"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0da1c46491b49458a446cc76f0085860f8164c2290742e0aa8c653ce67240a97"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "unicode-normalization",
+]
 
 [[package]]
 name = "gix-utils"
@@ -773,6 +796,26 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.7",
 ]
 
 [[package]]

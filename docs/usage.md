@@ -20,10 +20,14 @@ git on --version
 `git on` available. It can also be invoked directly as `git-on`.
 
 Every executed command requires `--`. Before the first separator, supply exactly
-one local revision, or a repository followed by a revision, then any
-`--keep`/`-k`/`--verify` options after REV. Both keep spellings
-have the same effect; repeating them is harmless. `HEAD:path/to/subtree` remains
-one revision operand. Everything after that first separator is literal command
+one local revision, or a repository followed by a revision. Recognized
+`--keep`/`-k`/`--verify` and `--write-policy=none|ignored|untracked|all` options may
+appear anywhere before that separator, interspersed with the operands.
+Both keep spellings have the same effect; repeating them is harmless. With one
+operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`. With two,
+native `git fetch` receives the unchanged repository and revision/refspec;
+`main:destination` is a fetch refspec, not a remote directory selector.
+Everything after that first separator is literal command
 argv: git-on does not parse the command's options or any subsequent `--`.
 
 ```sh
@@ -39,15 +43,16 @@ git on HEAD:examples/uv-project --keep -- uv run --locked main.py
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
 | `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
-| `git on HEAD --unknown -- cmd` | Usage error: unknown runner option |
+| `git on /path/to/repo.git heads/main -- cmd` | Native Git fetch selects the branch from a local repository |
+| `git on origin +main:refs/heads/private-copy -- cmd` | Fetch refspec; destination exists only in the temporary repository |
 
-Missing `--`, missing or empty revision/command names, extra positional operands,
-and unknown runner options return 2 with a diagnostic before resolving Git
-objects or creating runtime state. Bundles such as `-kk` and values such as
-`--keep=true` are not runner flags. Tokens starting with `-` before the separator
-are treated as options; to select a revision with such a name, use its full
-object ID. The first `--` is always the command boundary and cannot escape a
-revision. Empty later arguments and non-UTF-8 argv bytes remain intact. No shell
+Missing `--`, missing revision operands, extra positional operands, malformed
+git-on options and missing/empty command names return 2 before Git resolution.
+Only recognized git-on options are parsed; other tokens are unchanged Git
+operands, including empty and option-looking strings. Git supplies repository
+and revision errors, reported as runner failures (125). Values such as
+`--keep=true` are malformed git-on options. The first `--` is always the command
+boundary. Empty arguments and non-UTF-8 argv bytes remain intact. No shell
 is introduced; to use shell syntax, explicitly run `sh -c '...'`.
 
 `git on -h`, `git on --version`, and `git on --cleanup` do not execute a child
@@ -62,14 +67,35 @@ second `--` belongs to that executable.
 
 ## Filesystem behavior
 
-For HTTPS/SSH URLs, named remotes, cache bounds and native signature verification,
+For repository operands, native fetch semantics, cache bounds and signature verification,
 see [the remote guide](remote.md).
 
 The selected tree is resolved once to a full tree object ID. Commits, annotated tags
 pointing to commits, `HEAD:path`, and raw tree IDs work. The index, unstaged changes,
 untracked files, and later branch movement have no effect on the selected content.
 Commands start at the selected snapshot's root, even when invoked from a repository
-subdirectory.
+subdirectory. The write policy is selected per invocation:
+
+| Policy | Behavior |
+| --- | --- |
+| `ignored` (default) | New paths must be ignored by the selected tree; tracked entries remain immutable. |
+| `none` | The whole mount is read-only, including ignored paths and metadata. |
+| `untracked` | New paths are writable regardless of ignore rules; selected-tree entries and their parent directories remain protected. |
+| `all` | Create, edit, delete, or rename snapshot files through a private copy-on-write layer. |
+
+```sh
+git on HEAD --write-policy=none -- cat README.md
+git on HEAD --write-policy=ignored -- python script.py
+git on HEAD --write-policy=untracked -- sh -c 'printf result > result.txt'
+git on HEAD --write-policy=all -- sh -c 'cc source.c -o program && ./program'
+```
+
+Git objects, the index, and your working copy stay unchanged in every mode.
+`untracked` refers to absence from the selected Git tree, even when a path exists
+in your host index or working copy. New files may be created inside a source
+directory; renaming, deleting or replacing that directory is refused so its
+tracked contents remain protected.
+The following ignore-rule restrictions apply to `ignored`:
 
 - All paths present in the tree are immutable: contents, metadata, names, links, and
   directory entries cannot be replaced, removed, renamed, or shadowed.
@@ -105,8 +131,12 @@ the host. Do not run untrusted code on the strength of this filesystem policy.
 Submodules fail when their metadata is accessed; Git LFS pointer blobs fail when their
 contents are read. Unused unsupported entries do not prevent starting a command or
 reading unrelated files. Directory listings can show submodule names. They are never
-silently treated as usable checked-out content. Git filters and hooks are not run. The
-mount contains source-tree entries, not a synthetic `.git` checkout. Git SHA-256
+silently treated as usable checked-out content. Snapshot reads use committed bytes
+without checkout filters or a synthetic `.git` working copy. Native Git fetch
+uses inherited Git configuration and may invoke its configured hooks while
+updating refs in the private repository. Like configured credential/transport
+helpers and the executed command, those programs run with the caller's identity
+and can access host paths outside the mount. Git SHA-256
 repositories are not currently supported by the bundled libgit2.
 
 ## Standard streams and temporary writes
@@ -122,7 +152,7 @@ selected tree ID. The rest of the caller's environment is inherited. No `GIT_ON_
 `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed. If callers already
 set those names, they remain ordinary inherited variables.
 
-New ignored files use a private directory in the system temporary location, respecting
+Generated and copied-up modified files use a private directory in the system temporary location, respecting
 `TMPDIR`. Storage uses ordinary filesystem-backed files, not a private memory
 filesystem, and there is no git-on disk quota. If the system's temporary location is
 itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesystem
@@ -130,7 +160,7 @@ capacity and operating-system resource limits still apply. Temporary directories
 private to the current user.
 
 By default, git-on unmounts and removes the writable layer after the command finishes.
-To retain newly written ignored files:
+To retain generated files and, in `all`, modified source files:
 
 ```sh
 git on HEAD --keep -- python script.py
@@ -145,6 +175,13 @@ remains so recovery cleanup cannot mistake intentionally kept files for disposab
 state. A later invocation still starts with an empty writable layer. Remove the retained
 directory yourself when finished with it. Alternatively, write or copy chosen results to
 an explicit host path from the command.
+
+In `all`, `backing/` is a sparse artifact directory. Deleted source files are
+absent. Whiteouts and directory redirects live only for the session; untouched
+source descendants of a renamed directory are not exported. Consequently the
+retained directory cannot replay the final merged snapshot. Copy any complete
+result you need to an explicit host path while the command is still running.
+With `none`, `--keep` retains an empty writable artifact directory.
 
 Usage errors return 2; a runner failure returns 125; otherwise the command's exit code
 is returned. If the command terminates by signal, git-on re-raises that signal after
@@ -221,9 +258,13 @@ output. Latency and RSS are measured, not promised as a machine-independent SLA.
 - **FUSE device or mount errors:** check that `/dev/fuse` is available and `fusermount3`
   is installed. Containers need host-granted mount capabilities; installing the binary
   alone cannot provide them.
-- **A tool cannot write:** check the `.gitignore` committed in the selected tree,
+- **A tool cannot write:** check the selected policy. `none` forbids all writes;
+  `all` permits supported writes in its temporary layer. With the default
+  `ignored`, check the `.gitignore` committed in the selected tree,
   including ignored-parent and negation rules. A matching tracked file is still
   immutable. Adding a pattern in the live checkout does not change that tree.
+  `untracked` allows new paths without ignore rules, while still protecting
+  selected-tree entries and their parent directories.
 - **A script or recent edit is missing:** git-on reads the selected revision. Staged,
   unstaged, and untracked changes do not appear until committed and selected.
 - **Generated results disappear:** the writable layer is deleted by default. Use

@@ -26,6 +26,12 @@ def publish():
     sha = os.environ["GITHUB_SHA"]
     if os.environ.get("GITHUB_EVENT_NAME") != "push" or os.environ.get("GITHUB_REF") != "refs/heads/master":
         raise RuntimeError("publishing is restricted to a master push")
+    decision = os.environ.get("RELEASE_REQUIRED")
+    if decision == "false":
+        print("No binary release required; skipping publication")
+        return
+    if decision != "true":
+        raise RuntimeError("validated release decision is required before publishing")
     manifest = json.loads(Path("dist/release.json").read_text())
     if manifest["commit"] != sha:
         raise RuntimeError("artifact source SHA differs from the tested master SHA")

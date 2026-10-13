@@ -3,9 +3,9 @@
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::OpenOptions,
-    os::unix::{io::AsRawFd, process::ExitStatusExt},
+    os::unix::{ffi::OsStringExt, io::AsRawFd, process::ExitStatusExt},
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -47,12 +47,24 @@ fn fixture() -> (tempfile::TempDir, Oid, Oid, Oid) {
 }
 fn load(root: &Path, rev: &str, verify: bool) -> anyhow::Result<Snapshot> {
     let source = format!("file://{}", root.join("server").display());
-    let run = root.join("run");
-    std::fs::create_dir_all(&run)?;
+    load_operands(root, OsStr::new(&source), OsStr::new(rev), verify)
+}
+fn load_operands(
+    root: &Path,
+    source: &OsStr,
+    rev: &OsStr,
+    verify: bool,
+) -> anyhow::Result<Snapshot> {
+    // Production always owns a fresh private run. Keep it under the fixture so
+    // repeated native fetches share the cache, never a previous FETCH_HEAD.
+    let run = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(root)?
+        .keep();
     Snapshot::load_source_with_pin_record(
         root,
-        Some(OsStr::new(&source)),
-        OsStr::new(rev),
+        Some(source),
+        rev,
         verify,
         &run,
         "test",
@@ -100,15 +112,17 @@ fn remote_metadata_and_payloads_are_demanded_and_pinned() {
     );
 }
 #[test]
-fn remote_subtrees_match_local_content() {
-    let (temp, _, _, _) = fixture();
+fn remote_colon_refspec_selects_full_tree_in_a_private_repository() {
+    let (temp, _, tree, _) = fixture();
     let snap = load(temp.path(), "main:deep", false).unwrap();
-    let entry = snap.entry(Path::new("value")).unwrap().unwrap();
+    assert_eq!(snap.tree_oid, tree);
+    let entry = snap.entry(Path::new("deep/value")).unwrap().unwrap();
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
-    assert!(snap.entry(Path::new("untouched")).unwrap().is_none());
+    let server = Repository::open_bare(temp.path().join("server")).unwrap();
+    assert!(server.find_reference("refs/heads/deep").is_err());
 }
 #[test]
-fn review_same_oid_branch_and_tag_are_still_ambiguous() {
+fn branch_and_tag_with_the_same_name_follow_native_fetch_precedence() {
     let (temp, commit, tree, _) = fixture();
     let server = Repository::open_bare(temp.path().join("server")).unwrap();
     server
@@ -119,39 +133,67 @@ fn review_same_oid_branch_and_tag_are_still_ambiguous() {
             "same-OID ambiguity fixture",
         )
         .unwrap();
-    let error = load(temp.path(), "main", false).unwrap_err();
-    assert!(
-        error.to_string().contains("ambiguous remote revision"),
-        "{error:#}"
-    );
-    // Explicit namespaces remain usable even when both references agree today.
-    for revision in ["refs/heads/main", "refs/tags/main"] {
+    // Native fetch prefers the branch; git-on must not invent an ambiguity.
+    for revision in ["main", "refs/heads/main", "refs/tags/main"] {
         assert_eq!(load(temp.path(), revision, false).unwrap().tree_oid, tree);
     }
 }
 #[test]
-fn review_subtree_components_are_not_silently_normalized() {
+fn native_fetch_ref_names_force_prefix_and_destination_forms_are_accepted() {
     let (temp, _, tree, _) = fixture();
     for revision in [
-        "main:deep/.",
-        "main:deep/./",
-        "main:deep//",
-        "main:./deep",
-        "main:deep/..",
+        "heads/main",
+        "+main",
+        "",
+        "main:",
+        "main:refs/heads/selected",
     ] {
+        assert_eq!(load(temp.path(), revision, false).unwrap().tree_oid, tree);
+    }
+}
+#[test]
+fn invalid_remote_refspecs_keep_native_git_diagnostics() {
+    let (temp, _, _, _) = fixture();
+    for revision in ["main:deep/.", "main:deep//", "main:deep/.."] {
         let error = load(temp.path(), revision, false).unwrap_err();
         assert!(
-            error.to_string().contains("REV:path"),
+            error.to_string().contains("invalid refspec"),
             "{revision}: {error:#}"
         );
     }
-    // Native Git accepts an empty path and one trailing slash for a directory.
-    assert_eq!(load(temp.path(), "main:", false).unwrap().tree_oid, tree);
-    for revision in ["main:deep", "main:deep/"] {
-        let snap = load(temp.path(), revision, false).unwrap();
-        let entry = snap.entry(Path::new("value")).unwrap().unwrap();
-        assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
-    }
+}
+#[test]
+fn direct_non_utf8_repository_paths_are_native_git_operands() {
+    let (temp, _, tree, _) = fixture();
+    let source = temp
+        .path()
+        .join(OsString::from_vec(b"source-\xff".to_vec()));
+    std::os::unix::fs::symlink(temp.path().join("server"), &source).unwrap();
+    let snap = load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
+    assert_eq!(snap.tree_oid, tree);
+    let entry = snap.entry(Path::new("deep/value")).unwrap().unwrap();
+    assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
+}
+#[test]
+fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
+    let (temp, _, tree, _) = fixture();
+    let server = Repository::open_bare(temp.path().join("server")).unwrap();
+    let sig = Signature::now("Test", "test@example.invalid").unwrap();
+    server
+        .commit(
+            Some("refs/heads/second"),
+            &sig,
+            &sig,
+            "different selected object",
+            &server.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    let error = load(temp.path(), "refs/heads/*:refs/remotes/private/*", false).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("selected multiple objects"),
+        "{error:#}"
+    );
 }
 #[test]
 fn review_waiting_for_cache_lock_is_cancellable() {

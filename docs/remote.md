@@ -1,21 +1,42 @@
 # Remote execution and native verification
 
-`git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]` selects a local revision,
-or a source and revision when REPOSITORY is supplied.
-Put `--keep`, `-k`, and `--verify` after REV and before the first `--`;
-the command tail stays literal. URLs work
+`git on REV [OPTIONS] -- COMMAND [ARGS...]` resolves one local revision through
+native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` passes its
+two positional operands unchanged to native `git fetch`, then selects the fetched
+object. git-on parses its own options and command separator; Git parses the
+repository and revision/refspec. No runner URL, ref-name or object-ID syntax
+check is applied to those operands.
+Runner options may appear anywhere before the first `--`, interspersed with
+the two operands; the command tail stays literal. URLs work
 outside a checkout. A configured remote name requires its local repository.
-HTTPS, OpenSSH and scp-style SSH URLs use native Git transport; `file://` also
-supports local upload-pack fixtures. URL rewriting is applied once.
+Configured remote names, ordinary local paths, `file://`, HTTPS, OpenSSH and
+scp-style SSH URLs use native Git repository resolution and transport. Effective
+URL rewriting is applied once. Authentication and server capabilities still
+determine whether execution can proceed.
 
-Remote revisions accept HEAD, an advertised full ref, an unambiguous branch/tag
-name or a full SHA-1 OID. Ancestry, reflog and abbreviated-ID syntax require local
-objects and are unsupported remotely. Peeled tag advertisement rows ending in
-`^{}` are helpers, not selectable refs. Resolve the ref once, then request only
-that OID. Match HEAD and full refs literally; expand only short names to branch
-and tag candidates. Unrelated non-UTF-8 ref names do not prevent ASCII selection.
-Ref movement cannot change the selected tree. SHA-256 repositories,
-submodules and Git LFS remain unsupported.
+Native fetches honor inherited Git configuration, including configured hooks.
+For example, a destination ref update can invoke `reference-transaction` through
+the caller's `core.hooksPath`. Native Git writes those destination refs in the
+private repository; hooks remain ordinary user programs with access to host
+paths outside the snapshot. Reading the snapshot performs no checkout and runs
+no checkout filters or worktree hooks.
+
+Fetch syntax such as `heads/main`, `tags/release`, `+main` and
+`main:refs/heads/demo` is interpreted by Git. A destination ref is written only
+in the private temporary repository, never the caller's repository. In two-operand
+mode, `main:directory` is a fetch refspec, not a snapshot-subdirectory selector.
+Use the command's arguments or working-directory logic to choose a directory
+inside that fetched snapshot. One-operand local `HEAD:directory` remains native
+Git tree selection.
+
+Git decides which object-ID abbreviations and revision expressions are valid:
+local revision resolution and fetching do not necessarily accept the same forms.
+A full commit ID pins the source even if an upstream branch later moves. git-on
+uses the single distinct object selected by the fetch's `FETCH_HEAD`, and
+subsequent reads request exact OIDs rather than resolving the ref again. A fetch
+that selects multiple distinct objects cannot define one snapshot and fails
+before mounting.
+SHA-256 object storage, submodules and Git LFS remain unsupported.
 
 ## Object demand and cache lifetime
 
@@ -30,6 +51,20 @@ name alone proves nothing about demand.
 
 The server must advertise filtering before any object transfer. Rejection of a
 requested unadvertised OID names the OID and includes Git's server diagnostic.
+
+Two-operand local-path and `file://` sources use upload-pack and require the same
+capabilities. Ordinary local repositories do not enable them by default. When
+you control the source repository, configure it before fetching through git-on:
+
+```sh
+git -C ../another-repo config uploadpack.allowFilter true
+git -C ../another-repo config uploadpack.allowAnySHA1InWant true
+git on ../another-repo main -- ls
+```
+
+These settings belong to the source repository. One-operand local revision
+resolution reads its Git objects directly and needs no upload-pack configuration.
+
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
 the runner fail even if the command catches EIO and exits successfully.
@@ -47,7 +82,10 @@ retry the read using the same pinned snapshot and owned SSH connection.
 
 Metadata lookup may fetch the requested blob to determine its size: ordinary
 upload-pack offers no header-only request. Listing does not fetch child sizes or
-payloads. Applicable `.gitignore` blobs are fetched on demand for write policy.
+payloads. Applicable `.gitignore` blobs are fetched on demand in default
+`ignored` mode. `none`, `untracked` and `all` do not need ignore-rule blobs for
+write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
+local and remote snapshots.
 
 Persistent objects live in `$XDG_CACHE_HOME/git-on/objects-v1`, falling back to
 `$HOME/.cache/git-on/objects-v1`. Retain at most 256 MiB and 4096 objects, plus a
@@ -56,6 +94,11 @@ insertion and LRU eviction share an exclusive flock. Acquiring the lock reclaims
 interrupted staging writes. Check restored object hashes. Each active run copies
 demanded cached objects into a private temporary bare repository, so concurrent
 eviction cannot invalidate active reads. Oversized objects stay in run storage.
+
+A warm run still performs the initial native fetch to interpret the unchanged
+repository/refspec and select its commit or tag. Cached tree and blob objects
+are restored only when demanded, avoiding their repeated transfer. Cached data
+never substitutes for resolving the current operand through Git.
 
 These limits bound persistent retention. Active temporary objects and normal
 ignored writes have no runner quota; ordinary system disk limits apply.
@@ -135,9 +178,11 @@ transport subprocesses and follows the normal unmount/cleanup path.
 
 ## Native signature verification
 
-Local execution without `--verify` retains its bundled-libgit2 revision resolver
-and does not require or invoke native Git. Remote execution and all `--verify`
-runs use native Git as described here.
+All runs use native Git to interpret positional operands. Local execution resolves
+the unchanged revision in the caller's repository, then the object loader reads
+that pinned object through bundled libgit2. Remote execution fetches the unchanged
+repository/refspec pair and pins its selected object. `--verify` adds native Git's
+signature check to either mode.
 
 `--verify` resolves one commit or annotated tag OID, then calls native
 `git verify-commit OID` or `git verify-tag OID`. Native Git's exit status decides
@@ -148,8 +193,9 @@ interface exists.
 
 Verify an annotated tag as that exact tag, then peel its recorded targets to a
 tree. The target commit need not carry a second signature. A lightweight tag
-resolves to its commit, which must verify. Support at most 64 nested annotated
-tags. Raw tree/blob IDs fail clearly, with no history search for another object.
+resolves to its commit, which must verify. Annotated tag chains are peeled to
+their selected tree without imposing an arbitrary runner depth limit. Raw
+tree/blob IDs fail clearly, with no history search for another object.
 Any failed native verification forbids mounting and execution. Acceptance is
 exactly native Git's result under the caller's effective configuration; git-on
 adds no signer allowlist or trust threshold. Git's default OpenPGP verification
@@ -160,9 +206,12 @@ mounting or execution. The calling workflow chooses and validates the configured
 policy it uses as execution approval. Disable replacements in native Git and read
 exact ODB objects in the loader.
 
-For verified `REV:path`, verify REV first and select a relative directory inside
-its bound tree. Colon-based searches such as `:/message` are unsupported in this
-mode. Preserve existing local revision/path resolution without verification.
+Native Git resolves the complete local operand before verification. A local
+`REV:path` therefore selects a raw tree or blob; those objects have no signature
+and `--verify` refuses them. To verify the containing commit, select `REV` with
+`--verify` and change directory inside the command instead. Git's revision-search
+syntax remains Git's responsibility; git-on does not replace it with a ref-name
+whitelist. Remote refspec destinations do not select subtrees.
 Never re-resolve a ref after verification. Success certifies neither passed
 tests nor sandbox safety.
 

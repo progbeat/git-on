@@ -5,14 +5,17 @@ implementation generic: application-specific Python/uv/Numba examples are not
 filesystem exceptions. Preserve the complete FUSE-operation coverage matrix and
 its guard whenever callbacks or tests change.
 
-## Every pull request is a release
+## Release changes to the binary
 
-Follow docs/releases.md. Fetch current master, choose patch/minor/major from the
-actual compatibility impact, update Cargo.toml and Cargo.lock together, and write
-the new version's user-facing .github/release-notes.md. Fixes also need a bump.
+Follow docs/releases.md. Fetch current master. Changes to CLI source, runtime
+dependencies or binary build settings need exactly one patch/minor/major bump
+from the actual compatibility impact, matching Cargo.toml and Cargo.lock, and
+user-facing .github/release-notes.md. Behavioral fixes also need a bump.
+Documentation, GIFs, tests, standalone examples and install.sh alone keep the
+current master version and skip binary publication. Required checks still run.
 Do not create a manual tag, release, merge, or visibility change unless requested.
 Updating the PR is not permission to merge it. If master advances, update the
-branch and recompute the version before requesting review.
+branch and recompute any required version before requesting review.
 
 Run formatting, strict clippy, Rust tests, the FUSE coverage guard, release-policy
 tests and integration tests. Real FUSE checks must run on a host with /dev/fuse;

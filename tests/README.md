@@ -3,6 +3,7 @@
 ```console
 cargo build --locked
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
 ```
 
 Requirements: Linux, Git, Python 3.11+, `uv` (CI pins 0.8.22), a usable `/dev/fuse`,
@@ -102,6 +103,23 @@ backing-store errors. The real-FUSE job separately tests kernel translation and
 fallbacks (including locks, polling, seeking, and copying).
 
 ## Filesystem mutation matrix
+
+`tests/write_policy.py` exercises all four policies through real mounts. It
+checks ignored and unignored creation, tracked contents and parent-directory
+protection, file/directory renames and deletion, symlinks/hardlinks, metadata,
+open-handle coherence, sparse `--keep` exports, command errors and SIGINT cleanup.
+Its dirty-index/working-copy fixture verifies that `untracked` means absent from
+the selected commit. Source checks include ignored host files to catch leaks.
+
+| Path / operation | `none` | `ignored` | `untracked` | `all` |
+| --- | --- | --- | --- | --- |
+| New ignored file | Denied | Allowed | Allowed | Allowed |
+| New unignored file | Denied | Denied | Allowed | Allowed |
+| Change or remove tracked file | Denied | Denied | Denied | Allowed in temporary layer |
+| Rename or replace tracked directory | Denied | Denied | Denied | Allowed in temporary layer |
+| New child in tracked directory | Denied | Allowed when ignored | Allowed | Allowed |
+
+The existing matrix below applies to default `ignored`:
 
 The real-FUSE suite covers these categories separately, with exact byte and
 namespace checks after failures rather than accepting an arbitrary exception as

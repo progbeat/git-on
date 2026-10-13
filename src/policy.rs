@@ -1,4 +1,4 @@
-//! Demand-loaded creation rules compiled only from pinned .gitignore blobs.
+//! Write modes and demand-loaded ignore rules from pinned .gitignore blobs.
 use crate::snapshot::{EntryKind, Snapshot};
 use anyhow::Result;
 use std::{
@@ -7,6 +7,29 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+/// Controls which paths may acquire private, temporary changes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WritePolicy {
+    None,
+    #[default]
+    Ignored,
+    Untracked,
+    All,
+}
+
+impl std::str::FromStr for WritePolicy {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "ignored" => Ok(Self::Ignored),
+            "untracked" => Ok(Self::Untracked),
+            "all" => Ok(Self::All),
+            _ => Err("write policy must be none, ignored, untracked, or all"),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Rule {
@@ -120,12 +143,17 @@ impl RulesCache {
 #[derive(Debug)]
 pub struct Policy {
     snapshot: Snapshot,
+    mode: WritePolicy,
     rules: Mutex<RulesCache>,
 }
 impl Policy {
     pub fn new(snapshot: &Snapshot) -> Result<Self> {
+        Self::with_mode(snapshot, WritePolicy::Ignored)
+    }
+    pub fn with_mode(snapshot: &Snapshot, mode: WritePolicy) -> Result<Self> {
         Ok(Self {
             snapshot: snapshot.clone(),
+            mode,
             rules: Mutex::new(RulesCache::default()),
         })
     }
@@ -163,7 +191,8 @@ impl Policy {
         cache.insert(directory, rules.clone(), cost);
         Ok(rules)
     }
-    /// True only for a new ignored relative path. Object/rule errors fail closed.
+    /// True when the configured policy permits this relative path. Object/rule
+    /// errors fail closed; ignore rules are loaded only in ignored mode.
     pub fn allows(&self, path: &Path, is_dir: bool) -> bool {
         self.check(path, is_dir).unwrap_or(false)
     }
@@ -178,10 +207,18 @@ impl Policy {
         {
             return Ok(false);
         }
+        match self.mode {
+            WritePolicy::None => return Ok(false),
+            WritePolicy::All => return Ok(true),
+            WritePolicy::Ignored | WritePolicy::Untracked => {}
+        }
         // Protect tracked paths without indexing their siblings or descendants.
         // A non-directory tracked ancestor is an error, never write permission.
         if self.snapshot.entry(path)?.is_some() {
             return Ok(false);
+        }
+        if self.mode == WritePolicy::Untracked {
+            return Ok(true);
         }
         let mut current = PathBuf::new();
         let mut applicable = vec![(PathBuf::new(), self.rules_at(Path::new(""))?)];
@@ -232,6 +269,36 @@ mod tests {
         let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "policy").unwrap();
         let policy = Policy::new(&snap).unwrap();
         (tmp, snap, policy)
+    }
+    #[test]
+    fn modes_preserve_pinned_paths_and_only_ignored_demands_rules() {
+        let (_temp, snapshot, _) = fixture("*.tmp\n", "");
+        let before = snapshot.metrics();
+        for (mode, new_plain, new_ignored, tracked) in [
+            (WritePolicy::None, false, false, false),
+            (WritePolicy::Untracked, true, true, false),
+            (WritePolicy::All, true, true, true),
+        ] {
+            let policy = Policy::with_mode(&snapshot, mode).unwrap();
+            assert_eq!(policy.allows(Path::new("plain"), false), new_plain);
+            assert_eq!(
+                policy.allows(Path::new("generated.tmp"), false),
+                new_ignored
+            );
+            assert_eq!(
+                policy.allows(Path::new("nested/existing.log"), false),
+                tracked
+            );
+            assert_eq!(policy.allows(Path::new("nested"), true), tracked);
+            for path in ["", "/absolute", "../escape", "nested/../escape"] {
+                assert!(!policy.allows(Path::new(path), false), "{mode:?} {path}");
+            }
+        }
+        assert_eq!(snapshot.metrics().blob_loads, before.blob_loads);
+        let policy = Policy::new(&snapshot).unwrap();
+        assert!(!policy.allows(Path::new("plain"), false));
+        assert!(policy.allows(Path::new("generated.tmp"), false));
+        assert!(snapshot.metrics().blob_loads > before.blob_loads);
     }
     #[test]
     fn documented_ignore_cache_budget_matches_runtime() {

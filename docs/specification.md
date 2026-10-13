@@ -19,17 +19,19 @@ separate from that contract; a requirement is not a claim of a passing test.
   Caller-provided variables with such names remain ordinarily inherited.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
-  accept one nonempty operand for the local revision or two for repository and
-  revision, then exact `--keep`/`-k`/`--verify` options after REV. Options may
-  repeat and combine idempotently. A token beginning with byte `-` that is not
-  one of those options is an unknown option. Do not split or normalize the
-  revision: `HEAD:path/to/subtree` is one unchanged operand.
+  accept one operand for the local revision or two for repository and
+  revision. Recognized `--keep`/`-k`/`--verify` and
+  `--write-policy=none|ignored|untracked|all` options may appear anywhere before
+  the separator, interspersed with those operands. Boolean options may
+  repeat and combine idempotently. Parse only git-on's recognized options;
+  every other token is a Git operand, including an empty or option-looking
+  token. Preserve its original bytes without splitting or normalization.
 - Everything after the first separator is literal command argv, including a
   command name beginning with `-`, unknown options, `--keep`, `-k`, and further
   `--` tokens. Empty later arguments and non-UTF-8 bytes are preserved. No shell
   or string re-tokenization is introduced.
-- A missing separator, missing/empty revision, more than two positional operands,
-  unknown runner option, or missing/empty command name returns usage status 2
+- A missing separator, missing revision operand, more than two positional operands,
+  malformed git-on option, or missing/empty command name returns usage status 2
   with a clear diagnostic before Git resolution or runtime-state creation.
   First-token `--help`/`-h`, `--version` and `--cleanup` retain their separate
   existing handling and do not require a child-command separator. These
@@ -37,22 +39,85 @@ separate from that contract; a requirement is not a claim of a passing test.
 - Migration from 0.1.x requires inserting the separator before every command:
   `git on REV command args` becomes `git on REV -- command args`.
   To retain generated files, use `git on REV --keep -- command args`.
-  Select a revision whose name starts with `-` using its full object ID.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
+
+## Native Git argument compatibility
+
+This compatibility is part of the original command contract. Corrections that
+restore native Git argument semantics are bug fixes, not a new git-on grammar.
+Native Git is the resolution authority for both local and remote operands.
+Consequently, direct local `git-on` execution also requires Git on `PATH`, even
+where the former Git-free resolver accepted a revision. Retiring that resolver
+is part of this bug fix; it does not require a major version increment.
+
+- With one operand, pass that exact `OsStr` as the revision argument to native
+  `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
+  including abbreviations, ancestry, reflogs and `HEAD:path`. Native Git is
+  required for local resolution as well as remote operations.
+- With two operands, pass the exact repository and revision/refspec arguments
+  to native `git fetch` in a private temporary Git repository. Git resolves
+  configured remotes, URLs, local paths, ref names, refspecs and their precedence.
+  A colon in this second operand is fetch syntax; git-on must not reinterpret
+  it as a remote subtree selector or strip a `+` prefix.
+- Do not implement an additional repository/revision grammar, reject operands
+  by character set or encoding, trim them, expand names, duplicate Git's
+  ambiguity checks or introduce host-specific resolution. Delegate acceptance
+  and diagnostics to the native Git operation, with argument boundaries that
+  prevent an operand from becoming an internal Git option. git-on's own option
+  and command-boundary checks remain its responsibility.
+- Resolve once before executing the command. The native fetch result must
+  identify one distinct selected object; a result with no object or multiple
+  different objects cannot identify the single snapshot. The selected object
+  must yield a Git tree. These are checks of Git's result, not operand syntax.
+  Signature verification examines the exact selected commit or annotated tag;
+  a tree returned by `HEAD:path` has no signature to verify.
+- Caller refs, index and working files must stay untouched. Fetch destinations
+  are confined to the private repository. Existing object-demand, filter,
+  cancellation, SSH ownership, cache and filesystem contracts still apply;
+  there is no full-checkout fallback to make an input succeed.
+- Native operations use the caller's Git configuration and object-location
+  environment. Resolve local revisions and read the objects from the same
+  Git-selected object database, including object directories and alternates.
+  Relative object locations follow native Git's repository setup context,
+  including worktree subdirectories, bare repositories and explicit `GIT_DIR`.
+  Native fetch can invoke configured Git hooks for its private ref updates;
+  git-on does not introduce a checkout or run checkout filters on snapshot
+  content. Hooks and other configured helpers are caller programs with host
+  access, like the explicitly executed command; their side effects are not
+  confined by the snapshot's write policy.
+- Regression tests must compare acceptance, selected objects and diagnostics
+  against native Git in isolated fixture repositories. Include native ref
+  spellings and prefixes, colliding branch/tag names, literal fetch refspecs,
+  local paths, non-UTF-8 operands and invalid inputs. A short hash accepted by
+  local revision resolution must not be assumed accepted by remote fetch.
 
 ## Filesystem policy
 
 Remote demand, persistent cache lifetime, native verification, authentication
 limits and acceptance requirements are normative in [the remote guide](remote.md).
-The same FUSE and ignored-write contract below applies to local and remote runs.
+The same FUSE and write-policy contract below applies to local and remote runs.
 
-- Entries present in the selected tree are immutable. An ignore match does not
+- `--write-policy=ignored` is the default and preserves the existing contract.
+  Entries present in the selected tree are immutable. An ignore match does not
   permit changing, replacing, removing, renaming, or shadowing tracked entries.
-- New paths are writable only when ignored by applicable `.gitignore` files in
+- In `ignored`, new paths are writable only when ignored by applicable `.gitignore` files in
   the selected tree, using Git's nested, negated, anchored, and ignored-parent
   semantics. Host-global rules, `.git/info/exclude`, working-tree edits, and new
   runtime `.gitignore` files do not alter this policy.
+- `--write-policy=none` makes the entire mount read-only, including ignored paths,
+  contents, namespace operations, links, and metadata changes.
+- `--write-policy=untracked` allows creating and mutating paths absent from the
+  selected Git tree without consulting ignore rules. The index and working copy
+  do not define tracking. Selected-tree entries remain immutable, including
+  their parent directories: rename, deletion and replacement cannot bypass
+  tracked-file protection. New paths inside a tracked directory are permitted.
+- `--write-policy=all` permits ordinary file creation, modification, deletion,
+  rename, links and supported metadata changes within the mount, independent of
+  ignore rules. Source payloads are copied only when required for mutation;
+  directory renames keep demand-loaded source origins. Git objects, the index,
+  and the working copy stay unchanged. Unsupported filesystem operations retain
+  their existing error contracts.
 - The same rule governs all programs and languages. No Python, uv, Numba, cache,
   or environment-directory exception exists.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
@@ -68,6 +133,11 @@ The same FUSE and ignored-write contract below applies to local and remote runs.
   not retain a mount, duplicate untouched source files, or reuse those writes in
   another invocation. Host paths explicitly written by the command are outside
   this cleanup scope.
+  In `all`, retained artifacts include copied-up modified files and generated
+  files. Deleted source paths are absent; whiteouts and source-directory redirects
+  are session-only namespace state. Untouched descendants of a renamed source
+  directory are omitted from retained artifacts. `backing/` is neither a complete
+  checkout nor a durable format for replaying deletions and renames.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
   locking, releasing the exact Git pin and identifying the owned SSH socket;

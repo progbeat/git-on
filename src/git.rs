@@ -25,7 +25,17 @@ impl Git {
             .current_dir(cwd)
             .args(["config", "--null", "--list", "--includes"])
             .stdin(Stdio::null());
-        let output = run(command, true).context("read effective Git configuration")?;
+        let output = run(command, true).map_err(|error| {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }) {
+                error.context("native Git was not found on PATH; revision resolution requires native Git; install Git with your distribution tools or select an existing Git on PATH")
+            } else {
+                error.context("read effective Git configuration")
+            }
+        })?;
         if !output.status.success() {
             bail!(
                 "read effective Git configuration: {}",
@@ -80,9 +90,12 @@ impl Git {
                     .env_remove("GIT_CONFIG_COUNT");
                 let mut count = 0;
                 for (key, value) in &self.config {
-                    // Remote::open pins the already rewritten transport URL.
-                    if key.as_bytes().starts_with(b"url.")
-                        && key.as_bytes().ends_with(b".insteadof")
+                    // Object/ref storage belongs to the private repository,
+                    // rather than the caller's format. Replaying format zero
+                    // over a newly created promisor pack would make native Git
+                    // reject its intentionally missing tree objects.
+                    if key == "core.repositoryformatversion"
+                        || key.as_bytes().starts_with(b"extensions.")
                     {
                         continue;
                     }
@@ -93,21 +106,21 @@ impl Git {
                     count += 1;
                 }
                 command.env("GIT_CONFIG_COUNT", count.to_string());
+                for key in [
+                    "GIT_DIR",
+                    "GIT_WORK_TREE",
+                    "GIT_COMMON_DIR",
+                    "GIT_OBJECT_DIRECTORY",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    "GIT_INDEX_FILE",
+                ] {
+                    command.env_remove(key);
+                }
             }
             command
                 .arg("--git-dir")
                 .arg(dir)
                 .args(["-c", "core.bare=true"]);
-            for key in [
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_COMMON_DIR",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_INDEX_FILE",
-            ] {
-                command.env_remove(key);
-            }
         }
         command
     }
@@ -136,6 +149,11 @@ impl Git {
         )?;
         Oid::from_str(std::str::from_utf8(&out)?.trim())
             .context("resolve exact SHA-1 revision (SHA-256 repositories unsupported)")
+    }
+    pub fn repository_dir(&self) -> Result<&Path> {
+        self.original_dir
+            .as_deref()
+            .context("native Git did not identify the selected repository directory")
     }
     pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
         let operation = match kind { git2::ObjectType::Commit => "verify-commit", git2::ObjectType::Tag => "verify-tag", _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature") };
@@ -185,13 +203,6 @@ impl Git {
                 .rev()
                 .find_map(|(key, value)| (key == "ssh.variant").then(|| value.clone()).flatten())
         })
-    }
-    pub fn pin_remote_url(&mut self, name: &OsStr, url: &OsStr) {
-        let mut key = OsString::from("remote.");
-        key.push(name);
-        key.push(".url");
-        self.config.retain(|(existing, _)| existing != &key);
-        self.config.push((key, Some(url.to_os_string())));
     }
 }
 trait SplitByte {
