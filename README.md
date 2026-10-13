@@ -9,7 +9,7 @@ Run commands against a Git revision without checking it out. Git objects and you
 working copy stay unchanged; choose read-only, ignored-only, or temporary writes
 to any snapshot path.
 
-![Build and run the original SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/9eb6cb9419c950f0d046a42c5c8da726e4b3760e/demo.webp)
+![Build and run the original SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/bbdaa83733d8f922b1385688a2f36583a5fdcbc5/demo.webp)
 
 [Installation](#installation) · [Quick start](#quick-start) ·
 [Documentation](#documentation)

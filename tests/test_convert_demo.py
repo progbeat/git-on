@@ -111,6 +111,37 @@ class ConversionArtifactTests(unittest.TestCase):
         self.assertEqual(result["webp_sha256"], hashlib.sha256(self.destination.read_bytes()).hexdigest())
         self.assertEqual(self.source.read_bytes(), self.source_bytes)
 
+    def test_encoder_failure_removes_partial_output_and_allows_retry(self):
+        def failed_encoder(image, output, *args, **kwargs):
+            output.write(b"partial encoder output")
+            output.flush()
+            raise OSError("fixture encoder failure")
+
+        with patch.object(Image.Image, "save", failed_encoder):
+            error, _ = self.attempt_conversion()
+        self.assertIsInstance(error, OSError)
+        self.assertIn("fixture encoder failure", str(error))
+        self.assertFalse(self.destination.exists(), "Failed encoder left a partial final output")
+        self.assertEqual(list(self.root.iterdir()), [self.source])
+        self.assertEqual(self.source.read_bytes(), self.source_bytes)
+        result = MOD.convert(self.source, self.destination)
+        self.assertTrue(result["lossless_rgb_and_timeline"])
+
+    def test_encoder_failure_preserves_another_writers_output(self):
+        def failed_encoder(image, output, *args, **kwargs):
+            output.write(b"partial encoder output")
+            output.flush()
+            self.destination.unlink(missing_ok=True)
+            self.destination.write_bytes(b"another writer's output\n")
+            raise OSError("fixture encoder failure")
+
+        with patch.object(Image.Image, "save", failed_encoder):
+            error, _ = self.attempt_conversion()
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(self.destination.read_bytes(), b"another writer's output\n")
+        self.assertEqual(self.source.read_bytes(), self.source_bytes)
+        self.assertEqual(set(self.root.iterdir()), {self.source, self.destination})
+
 
 if __name__ == "__main__":
     unittest.main()

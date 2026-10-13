@@ -6,6 +6,7 @@ make/gcc/ncurses headers,
 Git 2.45.1+, and a usable FUSE device. Read upstream source before recording.
 """
 import argparse
+from contextlib import ExitStack
 import datetime
 import hashlib
 import json
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -27,10 +29,68 @@ def output(*argv):
     return subprocess.check_output(argv, text=True).strip()
 
 
+class RecordingDestination:
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def refuse(self):
+        return RuntimeError(f"Refusing to overwrite recording artifacts: destination changed or is not empty: {self.path}")
+
+    def __enter__(self):
+        if self.path.exists() or self.path.is_symlink():
+            if self.path.is_symlink() or not self.path.is_dir() or any(self.path.iterdir()):
+                raise self.refuse()
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                self.check()
+            except BaseException:
+                os.close(self.fd)
+                self.fd = None
+                raise
+        return self
+
+    def __exit__(self, *error):
+        if self.fd is not None:
+            os.close(self.fd)
+
+    def check(self, staging_name=None, require_empty=True):
+        try:
+            current, pinned = self.path.lstat(), os.fstat(self.fd)
+        except FileNotFoundError:
+            raise self.refuse() from None
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise self.refuse()
+        if require_empty and any(name != staging_name for name in os.listdir(self.fd)):
+            raise self.refuse()
+
+    def reserve(self):
+        if self.fd is None:
+            try:
+                self.path.mkdir(parents=True)
+            except FileExistsError:
+                raise self.refuse() from None
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.check()
+
+    def publish(self, staging_fd, staging_name):
+        self.check(staging_name)
+        for name in os.listdir(staging_fd):
+            if not stat.S_ISREG(os.stat(name, dir_fd=staging_fd, follow_symlinks=False).st_mode):
+                raise RuntimeError(f"Unsupported recording artifact: {name}")
+            try:
+                os.link(name, name, src_dir_fd=staging_fd, dst_dir_fd=self.fd, follow_symlinks=False)
+            except FileExistsError:
+                raise self.refuse() from None
+        self.check(require_empty=False)
+
+
 def record(binary, destination):
-    if destination.exists() or destination.is_symlink():
-        if not destination.is_dir() or any(destination.iterdir()):
-            raise RuntimeError(f"Refusing to overwrite recording artifacts: use a new or empty directory: {destination}")
+    with RecordingDestination(destination) as target:
+        _record(binary, target)
+
+
+def _record(binary, target):
     for tool in ("vhs", "ttyd", "ffmpeg", "git", "make", "gcc", "fusermount3"):
         if shutil.which(tool) is None:
             raise RuntimeError(f"Missing recording dependency: {tool}")
@@ -38,7 +98,7 @@ def record(binary, destination):
     os.close(fd)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError(f"Build git-on first: {binary}")
-    destination.mkdir(parents=True, exist_ok=True)
+    target.reserve()
     info = {
         "recorded_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "host": platform.node(),
@@ -52,8 +112,13 @@ def record(binary, destination):
         "vhs": output("vhs", "--version"),
         "tape_sha256": hashlib.sha256((ROOT / "assets/demo.tape").read_bytes()).hexdigest(),
     }
-    with tempfile.TemporaryDirectory(prefix="git-on-demo-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="git-on-demo-") as temporary, \
+            tempfile.TemporaryDirectory(prefix=".git-on-recording-", dir=f"/proc/self/fd/{target.fd}") as recording, \
+            ExitStack() as cleanup:
         private = Path(temporary)
+        staging = Path(recording)
+        staging_fd = os.open(staging.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target.fd)
+        cleanup.callback(os.close, staging_fd)
         tools = private / "bin"
         tools.mkdir()
         (tools / "git-on").symlink_to(binary)
@@ -66,14 +131,15 @@ def record(binary, destination):
                    TMPDIR=str(runtime), GIT_ON_DEMO_STATUS=str(status),
                    PROMPT_COMMAND='printf "%s\\n" "$?" >> "$GIT_ON_DEMO_STATUS"',
                    LC_ALL="C.UTF-8")
-        log = destination / "vhs.log"
         observed = set()
         generated = False
-        with log.open("w") as stream:
-            # All relative Output/Screenshot paths in the tape belong to the
-            # requested recording directory, never the source checkout.
+        log_fd = os.open("vhs.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=staging_fd)
+        with os.fdopen(log_fd, "w") as stream:
+            # The pinned staging cwd stays private even if the requested output
+            # pathname is replaced. Publication never replaces existing files.
             process = subprocess.Popen(["vhs", str(ROOT / "assets/demo.tape")],
-                                       cwd=destination, env=env, stdout=stream, stderr=subprocess.STDOUT)
+                                       cwd=f"/proc/self/fd/{staging_fd}", pass_fds=(staging_fd,),
+                                       env=env, stdout=stream, stderr=subprocess.STDOUT)
             try:
                 deadline = time.monotonic() + 240
                 while process.poll() is None:
@@ -96,7 +162,7 @@ def record(binary, destination):
                             generated |= os.access(run / "mount/sl", os.X_OK)
                     time.sleep(0.02)
                 if process.returncode:
-                    raise RuntimeError(f"VHS failed with status {process.returncode}; inspect {log}")
+                    raise RuntimeError(f"VHS failed with status {process.returncode}; recording artifacts were not published")
                 if not generated or len(observed) != 1:
                     raise RuntimeError("No single real mounted SL build/execution was observed")
                 statuses = status.read_text().splitlines() if status.exists() else []
@@ -114,13 +180,15 @@ def record(binary, destination):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
-    size = (destination / "demo.gif").stat().st_size
-    info["gif_bytes"] = size
-    info["gif_sha256"] = hashlib.sha256((destination / "demo.gif").read_bytes()).hexdigest()
-    (destination / "demo.json").write_text(json.dumps(info, indent=2) + "\n")
+        size = (staging / "demo.gif").stat().st_size
+        info["gif_bytes"] = size
+        info["gif_sha256"] = hashlib.sha256((staging / "demo.gif").read_bytes()).hexdigest()
+        with (staging / "demo.json").open("x") as metadata:
+            metadata.write(json.dumps(info, indent=2) + "\n")
+        if size > 5 * 1024 * 1024:
+            raise RuntimeError("GIF exceeds the 5 MiB repository-asset budget: do not commit it or open a PR")
+        target.publish(staging_fd, staging.name)
     print(f"Recorded actual SL/FUSE execution on {info['host']}: {size:,} bytes")
-    if size > 5 * 1024 * 1024:
-        raise RuntimeError("GIF exceeds the 5 MiB repository-asset budget: do not commit it or open a PR")
 
 
 if __name__ == "__main__":

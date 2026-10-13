@@ -555,13 +555,29 @@ fn protocol_directory_pagination_sync_statfs_and_bad_handles() {
 
 #[test]
 fn protocol_access_and_setattr_credentials_and_boundaries() {
-    let mut p = Peer::new();
     // Exercise an ordinary owner even when the test process itself is root.
-    let owner_uid = p.uid.max(1);
-    let owner_gid = p.gid;
+    access_and_setattr_credentials_and_boundaries(unsafe { libc::geteuid() }.max(1), unsafe {
+        libc::getegid()
+    });
+}
+
+#[test]
+fn protocol_access_and_setattr_distinct_uid_and_gid() {
+    // Synthetic wire credentials are independent of the host process IDs.
+    // The second pair makes stranger_gid equal owner_uid: mixing the UID/GID
+    // payloads would incorrectly turn the UID rejection into a permitted no-op.
+    for (owner_uid, owner_gid) in [(1000, 1001), (1, 0)] {
+        access_and_setattr_credentials_and_boundaries(owner_uid, owner_gid);
+    }
+}
+
+fn access_and_setattr_credentials_and_boundaries(owner_uid: u32, owner_gid: u32) {
+    let mut p = Peer::new();
+    assert_ne!(owner_uid, 0);
     let stranger_uid = if owner_uid == 1 { 2 } else { 1 };
     let stranger_gid = if owner_gid == 0 { 1 } else { 0 };
     p.uid = owner_uid;
+    p.gid = owner_gid;
     let (ino, fh) = p.create("mode.tmp");
     let access = |mask| u32s(&[mask, 0]);
     p.ok(34, ino, access((libc::R_OK | libc::W_OK) as u32));
@@ -591,6 +607,35 @@ fn protocol_access_and_setattr_credentials_and_boundaries() {
     setattr[..4].copy_from_slice(&(2u32).to_ne_bytes());
     setattr[76..80].copy_from_slice(&stranger_uid.to_ne_bytes());
     p.err(4, ino, setattr, libc::EPERM);
+    let mut setattr = vec![0; 88];
+    setattr[..4].copy_from_slice(&4u32.to_ne_bytes());
+    setattr[80..84].copy_from_slice(&stranger_gid.to_ne_bytes());
+    p.err(4, ino, setattr, libc::EPERM);
+    for caller_uid in [owner_uid, 0] {
+        p.uid = caller_uid;
+        for (valid, offset, owner_id, stranger_id) in [
+            (2u32, 76, owner_uid, stranger_uid),
+            (4u32, 80, owner_gid, stranger_gid),
+        ] {
+            let mut setattr = vec![0; 88];
+            setattr[..4].copy_from_slice(&valid.to_ne_bytes());
+            setattr[offset..offset + 4].copy_from_slice(&owner_id.to_ne_bytes());
+            p.ok(4, ino, setattr.clone());
+            let before = p.ok(3, ino, vec![0; 16]);
+            assert_eq!(
+                u32::from_ne_bytes(before[84..88].try_into().unwrap()),
+                owner_uid
+            );
+            assert_eq!(
+                u32::from_ne_bytes(before[88..92].try_into().unwrap()),
+                owner_gid
+            );
+            setattr[offset..offset + 4].copy_from_slice(&stranger_id.to_ne_bytes());
+            p.err(4, ino, setattr, libc::EPERM);
+            assert_eq!(p.ok(3, ino, vec![0; 16]), before);
+        }
+    }
+    p.uid = owner_uid;
     let mut setattr = vec![0; 88];
     setattr[..4].copy_from_slice(&(8u32 | 64).to_ne_bytes());
     setattr[8..16].copy_from_slice(&fh.to_ne_bytes());

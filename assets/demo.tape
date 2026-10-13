@@ -29,8 +29,9 @@ Set TypingSpeed 45ms
 Set WaitTimeout 60s
 Env PS1 `\[\e[38;2;195;151;239m\]$ \[\e[0m\]`
 
-# Every character and Backspace uses 45ms +/- 8ms independent noise.
-# Fixed generation seed 923; spaces, URL and hash use the same timing rule.
+# Ordinary characters and Backspace use 45ms +/- 8ms independent noise.
+# Fixed generation seed 923; spaces and URL keep the same timing rule.
+# The full hash appears instantly as one visible chunk after master is erased.
 Sleep 450ms
 Screenshot initial.png
 Type@52ms "g"
@@ -95,46 +96,14 @@ Set TypingSpeed 39ms
 Backspace
 Set TypingSpeed 40ms
 Backspace
-Type@39ms "9"
-Type@46ms "2"
-Type@42ms "3"
-Type@40ms "e"
-Type@39ms "7"
-Type@51ms "d"
-Type@52ms "7"
-Type@46ms "e"
-Type@46ms "b"
-Type@51ms "c"
-Type@52ms "5"
-Type@45ms "c"
-Type@44ms "1"
-Type@38ms "f"
-Type@45ms "0"
-Type@47ms "0"
-Type@38ms "9"
-Type@51ms "7"
-Type@48ms "5"
-Type@39ms "5"
-Type@41ms "b"
-Type@39ms "d"
-Type@48ms "e"
-Type@39ms "b"
-Type@40ms "7"
-Type@48ms "8"
-Type@51ms "9"
-Type@51ms "a"
-Type@49ms "c"
-Type@39ms "2"
-Type@53ms "5"
-Type@42ms "6"
-Type@53ms "5"
-Type@42ms "8"
-Type@42ms "c"
-Type@43ms "c"
-Type@37ms "c"
-Type@38ms "e"
-Type@47ms "0"
-Type@41ms "3"
+# Deliver the complete hash as one zero-delay input chunk while recording is paused.
+# Resume only after the real terminal has echoed the whole ID and rendered it.
+# This emulates the visible effect of a paste without using the OS clipboard.
+Hide
+Type@0ms "923e7d7ebc5c1f009755bdeb789ac25658ccce03"
+Wait+Line /58ccce03$/
+Sleep 80ms
+Show
 Screenshot pinned.png
 Type@39ms " "
 Type@48ms "-"

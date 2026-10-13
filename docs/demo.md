@@ -43,9 +43,12 @@ The upstream [license notice](../assets/SL-LICENSE) accompanies the animation.
 Bash terminal in the selected Neon style: near-black background, restrained
 turquoise text, a purple prompt, Source Code Pro at 24 px, and a compact rounded
 window. Its 54-column terminal wraps the complete command instead of shrinking
-the text. Every character, including spaces, URLs and the hash, uses the same
+the text. Ordinary typed characters, including spaces and the URL, use the same
 45 ms baseline with independent noise between -8 and +8 ms. The committed tape
-fixes that sequence with seed 923; it has no typing-speed ramps or paste bursts.
+fixes that sequence with seed 923, without typing-speed ramps. After erasing
+`master`, the complete pinned hash appears immediately, as if pasted. VHS pauses
+frame capture while sending that hash with zero delay, then resumes after the
+real terminal has echoed and rendered it; it does not access the OS clipboard.
 It pauses at the revision edit and leaves 1.2 seconds to read the completed
 command before running it. It waits for the real final prompt, then clears the
 screen so the loop rejoins the initial prompt. It contains one animation, the

@@ -3,7 +3,9 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 
 from PIL import Image, features
 
@@ -39,25 +41,28 @@ def convert(source, destination):
             durations.append(image.info['duration'])
     settings = dict(lossless=True, quality=100, method=6,
                     minimize_size=True, allow_mixed=False)
-    try:
-        with destination.open('xb') as output:
+    with tempfile.TemporaryDirectory(prefix='.git-on-webp-', dir=destination.parent) as temporary:
+        staged = Path(temporary) / 'animation.webp'
+        with staged.open('xb') as output:
             frames[0].save(output, 'WEBP', save_all=True,
                            append_images=frames[1:], duration=durations,
                            loop=loop, **settings)
-    except FileExistsError:
-        raise ValueError(f'Refusing to overwrite {destination}') from None
-    before, after = timeline(source), timeline(destination)
-    if before != after:
-        destination.unlink()
-        raise ValueError('Decoded pixels, timing, dimensions or loop changed')
-    return dict(source_gif_bytes=source.stat().st_size,
-                webp_bytes=destination.stat().st_size,
-                webp_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
-                dimensions=list(after[0]), loop=after[1],
-                duration_ms=sum(item[1] for item in after[2]),
-                lossless_rgb_and_timeline=True, first_last_identical=after[3],
-                encoder=f'Pillow {Image.__version__}; libwebp {features.version("webp")}',
-                settings=settings)
+        before, after = timeline(source), timeline(staged)
+        if before != after:
+            raise ValueError('Decoded pixels, timing, dimensions or loop changed')
+        result = dict(source_gif_bytes=source.stat().st_size,
+                      webp_bytes=staged.stat().st_size,
+                      webp_sha256=hashlib.sha256(staged.read_bytes()).hexdigest(),
+                      dimensions=list(after[0]), loop=after[1],
+                      duration_ms=sum(item[1] for item in after[2]),
+                      lossless_rgb_and_timeline=True, first_last_identical=after[3],
+                      encoder=f'Pillow {Image.__version__}; libwebp {features.version("webp")}',
+                      settings=settings)
+        try:
+            os.link(staged, destination, follow_symlinks=False)
+        except FileExistsError:
+            raise ValueError(f'Refusing to overwrite {destination}') from None
+    return result
 
 
 if __name__ == '__main__':

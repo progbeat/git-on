@@ -1,5 +1,5 @@
 {
-  "recorded_at_utc": "2026-10-13T03:18:03.543442+00:00",
+  "recorded_at_utc": "2026-10-13T04:49:25.035313+00:00",
   "host": "vmi3099253",
   "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.39",
   "upstream": "https://github.com/mtoyoda/sl.git",
@@ -9,12 +9,12 @@
   "git_on_binary_sha256": "7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f",
   "git": "git version 2.55.0",
   "vhs": "vhs version v0.12.1 (24fa225)",
-  "tape_sha256": "ef0d8dcf862c33ff80fff8ea11faddd8f9056be97db79464b14991785bc9a91d",
+  "tape_sha256": "5dcdfd54ce9c820aa85252280816fd40b7a7f8174e049b722e88e4172d3264df",
   "upstream_tree": "56a5fd07310088f1e6372d81455c8489c66ea00b",
   "generated_sl_removed_with_snapshot": true,
   "recorded_command_exit_status": 0,
-  "gif_bytes": 2122802,
-  "gif_sha256": "b65264964b59731b96e6d061b64ce1c279d2a882a7275fca827e10048c8fa3a2",
+  "gif_bytes": 2497833,
+  "gif_sha256": "61466c6df25301fb49f2f56f1debd15141e59333bc9c60720342a3ebd22d312e",
   "git_on_build_profile": "release",
   "git_on_source_sha256": "ff2c340f57110af2f66ed7b82acb7394e80d92d83b41398287f14c76e19f6458",
   "git_on_source_hash_format": "SHA-256 of UTF-8 JSON source_files map; sorted keys; compact separators comma and colon; no trailing newline",
@@ -33,13 +33,13 @@
     "tests/support/source_probe.rs": "ae053783f532ff6fc09b5e6511d05d37c58182b7f4067b40e2e1b0ea01be962f"
   },
   "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
-  "raw_gif_bytes": 2420901,
-  "raw_gif_sha256": "bc1bb924a5e977f7b076886c394d096da990fceea3433105f27a52dda538f20c",
+  "raw_gif_bytes": 2835681,
+  "raw_gif_sha256": "889ffce2117307c309980aac9da560f4a70cefb2fabb597bc380bd169382b2bc",
   "gif_dimensions": [
     896,
     728
   ],
-  "gif_duration_seconds": 18.88,
+  "gif_duration_seconds": 15.68,
   "style": "Neon",
   "typing": {
     "baseline_ms": 45,
@@ -48,8 +48,28 @@
       8
     ],
     "seed": 923,
-    "typed_characters": 111,
-    "backspaces": 6
+    "typed_characters": 71,
+    "backspaces": 6,
+    "instantly_inserted_hash_characters": 40,
+    "hash_input": "zero-delay terminal input while VHS frame capture is paused; no OS clipboard",
+    "hash_input_delay_ms": 0,
+    "hash_render_settle_ms": 80,
+    "hash_appearance_verification": {
+      "inspected_frame_range": [
+        55,
+        81
+      ],
+      "hash_characters": 40,
+      "foreground_core_pixels": 1465,
+      "all_40_hash_glyph_cells_checked": true,
+      "partial_hash_frames": 0,
+      "last_absent_frame": 56,
+      "last_absent_start_ms": 4200,
+      "first_complete_frame": 57,
+      "first_complete_start_ms": 4240,
+      "consecutive_absent_then_complete": true,
+      "captured_full_command_reading_hold_ms": 1280
+    }
   },
   "optimization": {
     "tool": "gifsicle 1.96",
@@ -68,8 +88,8 @@
       640,
       375
     ],
-    "complete_command_frame": 119,
-    "complete_command_time_seconds": 8.4,
+    "complete_command_frame": 79,
+    "complete_command_time_seconds": 6.0,
     "phases": [
       "initial prompt",
       "typing",
@@ -82,18 +102,18 @@
     ]
   },
   "display_format": "animated_webp",
-  "animation_bytes": 1642408,
-  "animation_sha256": "8b6adcd23b76e6cdf2071c4ed95228f2bec1ef303e44cb06efe0eff491f5b725",
+  "animation_bytes": 1892042,
+  "animation_sha256": "cba8622e8c01515b93818fd451982e3eacd5d13bdea71a0581ebbf5e762d547e",
   "webp_conversion": {
-    "source_gif_bytes": 2122802,
-    "webp_bytes": 1642408,
-    "webp_sha256": "8b6adcd23b76e6cdf2071c4ed95228f2bec1ef303e44cb06efe0eff491f5b725",
+    "source_gif_bytes": 2497833,
+    "webp_bytes": 1892042,
+    "webp_sha256": "cba8622e8c01515b93818fd451982e3eacd5d13bdea71a0581ebbf5e762d547e",
     "dimensions": [
       896,
       728
     ],
     "loop": 0,
-    "duration_ms": 18880,
+    "duration_ms": 15680,
     "lossless_rgb_and_timeline": true,
     "first_last_identical": true,
     "encoder": "Pillow 11.3.0; libwebp 1.5.0",
@@ -112,9 +132,9 @@
   },
   "animation_storage": {
     "branch": "demo-media",
-    "commit": "9eb6cb9419c950f0d046a42c5c8da726e4b3760e",
+    "commit": "bbdaa83733d8f922b1385688a2f36583a5fdcbc5",
     "file": "demo.webp",
-    "url": "https://raw.githubusercontent.com/progbeat/git-on/9eb6cb9419c950f0d046a42c5c8da726e4b3760e/demo.webp",
+    "url": "https://raw.githubusercontent.com/progbeat/git-on/bbdaa83733d8f922b1385688a2f36583a5fdcbc5/demo.webp",
     "parentless_commit": true
   }
 }

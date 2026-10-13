@@ -25,7 +25,7 @@ class RecordingDestinationTests(unittest.TestCase):
         self.destination = self.root / "recording"
         self.destination.mkdir()
 
-    def attempt_recording(self):
+    def attempt_recording(self, dependency_probe=None):
         real_open = os.open
 
         def fixture_open(path, *args, **kwargs):
@@ -33,7 +33,8 @@ class RecordingDestinationTests(unittest.TestCase):
             # without requiring a FUSE device or starting a real recorder.
             return real_open(os.devnull if path == "/dev/fuse" else path, *args, **kwargs)
 
-        with patch.object(MOD.shutil, "which", return_value="fixture-tool") as dependencies, \
+        with patch.object(MOD.shutil, "which", return_value="fixture-tool",
+                          side_effect=dependency_probe) as dependencies, \
                 patch.object(MOD.os, "open", side_effect=fixture_open) as opened, \
                 patch.object(MOD, "output", return_value="fixture version"), \
                 patch.object(MOD.platform, "node", return_value="fixture-host"), \
@@ -103,6 +104,32 @@ class RecordingDestinationTests(unittest.TestCase):
         self.assertEqual(list(self.destination.iterdir()), [directory])
         self.assert_rejected_before_probes(attempt)
 
+    def test_destination_replaced_after_preflight_cannot_clobber_outside_log(self):
+        outside = self.root / "outside-recording"
+        outside.mkdir()
+        outside_log = outside / "vhs.log"
+        outside_log.write_bytes(b"outside recording diagnostics\n")
+        replaced = False
+
+        def replace_after_preflight(tool):
+            nonlocal replaced
+            if not replaced:
+                self.destination.rmdir()
+                self.destination.symlink_to(outside)
+                replaced = True
+            return "fixture-tool"
+
+        error, dependencies, _, recorder = self.attempt_recording(replace_after_preflight)
+        self.assertTrue(dependencies.called)
+        self.assertTrue(replaced)
+        self.assertEqual(outside_log.read_bytes(), b"outside recording diagnostics\n")
+        self.assertEqual(list(outside.iterdir()), [outside_log])
+        self.assertTrue(self.destination.is_symlink())
+        self.assertEqual(self.destination.readlink(), outside)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("Refusing to overwrite", str(error))
+        recorder.assert_not_called()
+
     def test_new_or_empty_destination_reaches_normal_dependency_checks(self):
         for existing in [True, False]:
             with self.subTest(existing=existing):
@@ -113,6 +140,71 @@ class RecordingDestinationTests(unittest.TestCase):
                         MOD.record(self.binary, self.destination)
                 dependencies.assert_called_once_with("vhs")
                 self.assertEqual(self.destination.exists(), existing)
+
+    def test_successful_publication_preserves_all_generated_artifact_bytes(self):
+        for existing in [True, False]:
+            with self.subTest(existing=existing):
+                for path in self.destination.iterdir():
+                    path.unlink()
+                if not existing:
+                    self.destination.rmdir()
+                artifacts = {"demo.gif": b"animation fixture", "demo.json": b"metadata fixture",
+                             "vhs.log": b"recording diagnostics"}
+                with MOD.RecordingDestination(self.destination) as target:
+                    target.reserve()
+                    with tempfile.TemporaryDirectory(dir=f"/proc/self/fd/{target.fd}") as temporary:
+                        staging = Path(temporary)
+                        for name, payload in artifacts.items():
+                            (staging / name).write_bytes(payload)
+                        fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            target.publish(fd, staging.name)
+                        finally:
+                            os.close(fd)
+                self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, artifacts)
+
+    def test_publication_cannot_replace_a_competing_artifact(self):
+        real_link = os.link
+        with MOD.RecordingDestination(self.destination) as target:
+            target.reserve()
+            with tempfile.TemporaryDirectory(dir=f"/proc/self/fd/{target.fd}") as temporary:
+                staging = Path(temporary)
+                (staging / "vhs.log").write_bytes(b"new recording diagnostics")
+                fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    def competing_link(*args, **kwargs):
+                        (self.destination / "vhs.log").write_bytes(b"another writer's diagnostics")
+                        return real_link(*args, **kwargs)
+
+                    with patch.object(MOD.os, "link", side_effect=competing_link):
+                        with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                            target.publish(fd, staging.name)
+                    self.assertEqual((self.destination / "vhs.log").read_bytes(), b"another writer's diagnostics")
+                finally:
+                    os.close(fd)
+
+    def test_late_destination_substitution_cannot_redirect_publication(self):
+        outside = self.root / "outside-recording"
+        outside.mkdir()
+        outside_log = outside / "vhs.log"
+        outside_log.write_bytes(b"outside diagnostics")
+        original = self.root / "original-recording"
+        with MOD.RecordingDestination(self.destination) as target:
+            target.reserve()
+            with tempfile.TemporaryDirectory(dir=f"/proc/self/fd/{target.fd}") as temporary:
+                staging = Path(temporary)
+                (staging / "vhs.log").write_bytes(b"new diagnostics")
+                fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+                self.destination.rename(original)
+                self.destination.symlink_to(outside)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                        target.publish(fd, staging.name)
+                    self.assertEqual(outside_log.read_bytes(), b"outside diagnostics")
+                finally:
+                    os.close(fd)
+        self.assertEqual(list(original.iterdir()), [])
+        self.assertEqual(list(outside.iterdir()), [outside_log])
 
 
 if __name__ == "__main__":
