@@ -46,13 +46,22 @@ window. Its 54-column terminal wraps the complete command instead of shrinking
 the text. Ordinary typed characters, including spaces and the URL, use the same
 45 ms baseline with independent noise between -8 and +8 ms. The committed tape
 fixes that sequence with seed 923, without typing-speed ramps. After erasing
-`master`, the complete pinned hash appears immediately, as if pasted. VHS pauses
+`master`, it pauses for 500 ms before the complete pinned hash appears at once,
+as if pasted, then pauses for 250 ms before continuing the command. VHS pauses
 frame capture while sending that hash with zero delay, then resumes after the
 real terminal has echoed and rendered it; it does not access the OS clipboard.
-It pauses at the revision edit and leaves 1.2 seconds to read the completed
+It pauses for 500 ms before the revision edit and leaves 1.2 seconds to read the completed
 command before running it. It waits for the real final prompt, then clears the
 screen so the loop rejoins the initial prompt. It contains one animation, the
 steam locomotive. VHS renders the real terminal and original program.
+
+The published capture was made with [`assets/demo.capture.tape`](../assets/demo.capture.tape).
+Its three static input holds were then adjusted to the selected 500/500/250 ms
+pauses by changing only GIF/WebP frame-duration fields: frames 49, 57 and 58
+have duration changes of -150, +300 and +150 ms. All 197 decoded frames and all
+other durations stay identical, including the real compiler output and train
+motion. The main tape above uses the selected pauses for future recordings;
+provenance distinguishes its hash from the original capture tape's hash.
 
 ```sh
 cargo build --release --locked

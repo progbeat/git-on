@@ -1,22 +1,22 @@
 {
-  "recorded_at_utc": "2026-10-13T04:49:25.035313+00:00",
+  "recorded_at_utc": "2026-10-13T05:44:34.313603+00:00",
   "host": "vmi3099253",
   "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.39",
   "upstream": "https://github.com/mtoyoda/sl.git",
   "upstream_commit": "923e7d7ebc5c1f009755bdeb789ac25658ccce03",
   "executed_revision": "923e7d7ebc5c1f009755bdeb789ac25658ccce03",
   "git_on_version": "git-on 1.2.0",
-  "git_on_binary_sha256": "7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f",
+  "git_on_binary_sha256": "e32a7c351318e6f6453ac74fa132d558c19181cd64a17ed8a5e01787e39921dd",
   "git": "git version 2.55.0",
   "vhs": "vhs version v0.12.1 (24fa225)",
-  "tape_sha256": "5dcdfd54ce9c820aa85252280816fd40b7a7f8174e049b722e88e4172d3264df",
+  "tape_sha256": "7cc4bef7a4b14d047ac846c7311ea032d5324273b07919ba6d97da2a818bdcb5",
   "upstream_tree": "56a5fd07310088f1e6372d81455c8489c66ea00b",
   "generated_sl_removed_with_snapshot": true,
   "recorded_command_exit_status": 0,
-  "gif_bytes": 2497833,
-  "gif_sha256": "61466c6df25301fb49f2f56f1debd15141e59333bc9c60720342a3ebd22d312e",
+  "gif_bytes": 2182608,
+  "gif_sha256": "cd0118cef81e51fbba5ed4dbc16d42d198fa6e1e8fc2455a4715f870b477cc76",
   "git_on_build_profile": "release",
-  "git_on_source_sha256": "ff2c340f57110af2f66ed7b82acb7394e80d92d83b41398287f14c76e19f6458",
+  "git_on_source_sha256": "e23b379217c387d7f13b05edce02446cf778ab07570011e497bb4c1400dc5204",
   "git_on_source_hash_format": "SHA-256 of UTF-8 JSON source_files map; sorted keys; compact separators comma and colon; no trailing newline",
   "git_on_source_files": {
     "src/cli.rs": "dd7d97b43574a8c637d04c708279a6ac0000840642082af503b0dc8bd5d15f64",
@@ -25,7 +25,7 @@
     "src/lib.rs": "73b08e9acf2c8c705177f15c5fa0d9b4b7143524080bdca1475a9ac31d5faf43",
     "src/main.rs": "b71e84984c6bc13ba087096ff5388776889f420fdc07945786b8a8e4be885263",
     "src/policy.rs": "94b928a54cfc3d8d6fdfe865148b7598e33c1630eccc92b5c6451643135e2706",
-    "src/remote.rs": "8de127e0b8c999d7d4be5ddfdee4484f83a864d5e15b0aa41d667b9ec4622f65",
+    "src/remote.rs": "46d08e31c52bd244854a178fb9a428e1d257044ffca87886e0f5519c7444d576",
     "src/snapshot.rs": "b1ea25811530884f479e5f8a5d0e359d1ea42280e751df3077d7fb2fdc3924b7",
     "src/wildmatch.rs": "72bae078592f99ba885d41c8be23ef8f4ae3f19c79050b9c055498e6a4faf968",
     "Cargo.toml": "f327ba9f399c4342c70c177c6fe52fffd687894711984f66f86d144921b300e6",
@@ -33,13 +33,13 @@
     "tests/support/source_probe.rs": "ae053783f532ff6fc09b5e6511d05d37c58182b7f4067b40e2e1b0ea01be962f"
   },
   "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
-  "raw_gif_bytes": 2835681,
-  "raw_gif_sha256": "889ffce2117307c309980aac9da560f4a70cefb2fabb597bc380bd169382b2bc",
+  "raw_gif_bytes": 2486743,
+  "raw_gif_sha256": "f6465804ff069310f71778509185a6ae9d33932e50d57f05de153a3e5ebdc96a",
   "gif_dimensions": [
     896,
     728
   ],
-  "gif_duration_seconds": 15.68,
+  "gif_duration_seconds": 15.7,
   "style": "Neon",
   "typing": {
     "baseline_ms": 45,
@@ -54,22 +54,29 @@
     "hash_input": "zero-delay terminal input while VHS frame capture is paused; no OS clipboard",
     "hash_input_delay_ms": 0,
     "hash_render_settle_ms": 80,
+    "pre_paste_pause_ms": 500,
+    "post_paste_pause_ms": 250,
     "hash_appearance_verification": {
       "inspected_frame_range": [
-        55,
-        81
+        57,
+        84
       ],
       "hash_characters": 40,
-      "foreground_core_pixels": 1465,
+      "foreground_core_pixels": 1471,
       "all_40_hash_glyph_cells_checked": true,
       "partial_hash_frames": 0,
-      "last_absent_frame": 56,
-      "last_absent_start_ms": 4200,
-      "first_complete_frame": 57,
-      "first_complete_start_ms": 4240,
+      "last_absent_frame": 57,
+      "last_absent_start_ms": 4050,
+      "first_complete_frame": 58,
+      "first_complete_start_ms": 4590,
       "consecutive_absent_then_complete": true,
-      "captured_full_command_reading_hold_ms": 1280
-    }
+      "pre_paste_pause_ms": 500,
+      "post_paste_pause_ms": 250,
+      "captured_full_command_reading_hold_ms": 1240,
+      "displayed_absent_revision_hold_ms": 540,
+      "displayed_complete_hash_alone_hold_ms": 310
+    },
+    "pre_revision_edit_pause_ms": 500
   },
   "optimization": {
     "tool": "gifsicle 1.96",
@@ -88,8 +95,8 @@
       640,
       375
     ],
-    "complete_command_frame": 79,
-    "complete_command_time_seconds": 6.0,
+    "complete_command_frame": 82,
+    "complete_command_time_seconds": 6.4,
     "phases": [
       "initial prompt",
       "typing",
@@ -102,18 +109,18 @@
     ]
   },
   "display_format": "animated_webp",
-  "animation_bytes": 1892042,
-  "animation_sha256": "cba8622e8c01515b93818fd451982e3eacd5d13bdea71a0581ebbf5e762d547e",
+  "animation_bytes": 1666560,
+  "animation_sha256": "b04899c19e2a2809d98114983076aecdf96574496ace01ba406ff0a5c86d09cb",
   "webp_conversion": {
-    "source_gif_bytes": 2497833,
-    "webp_bytes": 1892042,
-    "webp_sha256": "cba8622e8c01515b93818fd451982e3eacd5d13bdea71a0581ebbf5e762d547e",
+    "source_gif_bytes": 2182608,
+    "webp_bytes": 1666560,
+    "webp_sha256": "b04899c19e2a2809d98114983076aecdf96574496ace01ba406ff0a5c86d09cb",
     "dimensions": [
       896,
       728
     ],
     "loop": 0,
-    "duration_ms": 15680,
+    "duration_ms": 15700,
     "lossless_rgb_and_timeline": true,
     "first_last_identical": true,
     "encoder": "Pillow 11.3.0; libwebp 1.5.0",
@@ -130,11 +137,65 @@
       375
     ]
   },
+  "recorded_tape": "assets/demo.capture.tape",
+  "reproduction_tape": "assets/demo.tape",
+  "reproduction_tape_sha256": "159ab99ba8f88478fc1ef257fb7261a43f9b7fe91a96926fbc51af2efca87de4",
+  "recorded_input_pauses_ms": {
+    "before_master_deletion": 650,
+    "before_hash_paste": 200,
+    "after_hash_paste": 100
+  },
+  "recorded_hash_appearance_verification": {
+    "inspected_frame_range": [
+      57,
+      84
+    ],
+    "hash_characters": 40,
+    "foreground_core_pixels": 1471,
+    "all_40_hash_glyph_cells_checked": true,
+    "partial_hash_frames": 0,
+    "last_absent_frame": 57,
+    "last_absent_start_ms": 4200,
+    "first_complete_frame": 58,
+    "first_complete_start_ms": 4440,
+    "consecutive_absent_then_complete": true,
+    "pre_paste_pause_ms": 200,
+    "post_paste_pause_ms": 100,
+    "captured_absent_revision_hold_ms": 240,
+    "captured_complete_hash_alone_hold_ms": 160,
+    "captured_full_command_reading_hold_ms": 1240
+  },
+  "timing_postprocessing": {
+    "only_static_input_holds_changed": true,
+    "original_capture_tape_sha256": "7cc4bef7a4b14d047ac846c7311ea032d5324273b07919ba6d97da2a818bdcb5",
+    "original_optimized_gif_sha256": "3289cc6302028910676433117534bd6e70764c73537f2180e5fa616afb7eeda2",
+    "original_lossless_webp_sha256": "3bdba87fbdc90d4fb583f1e031ac3d497393d6755fbb5be6d05aa00a75e8c957",
+    "changed_duration_fields": [
+      {
+        "frame": 49,
+        "before_ms": 680,
+        "after_ms": 530
+      },
+      {
+        "frame": 57,
+        "before_ms": 240,
+        "after_ms": 540
+      },
+      {
+        "frame": 58,
+        "before_ms": 160,
+        "after_ms": 310
+      }
+    ],
+    "all_197_decoded_rgb_frames_unchanged": true,
+    "all_other_frame_durations_unchanged": true,
+    "pixel_reencoded": false
+  },
   "animation_storage": {
     "branch": "demo-media",
-    "commit": "bbdaa83733d8f922b1385688a2f36583a5fdcbc5",
+    "commit": "943434c1f102a0efc626cafd40ae6245002fa392",
     "file": "demo.webp",
-    "url": "https://raw.githubusercontent.com/progbeat/git-on/bbdaa83733d8f922b1385688a2f36583a5fdcbc5/demo.webp",
+    "url": "https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp",
     "parentless_commit": true
   }
 }

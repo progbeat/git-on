@@ -83,7 +83,7 @@ Type@48ms "e"
 Type@48ms "r"
 Screenshot branch.png
 # Deliberate revision-edit hold, outside the typing cadence.
-Sleep 650ms
+Sleep 500ms
 Set TypingSpeed 51ms
 Backspace
 Set TypingSpeed 53ms
@@ -96,6 +96,8 @@ Set TypingSpeed 39ms
 Backspace
 Set TypingSpeed 40ms
 Backspace
+# Brief visible pause before the paste gesture.
+Sleep 500ms
 # Deliver the complete hash as one zero-delay input chunk while recording is paused.
 # Resume only after the real terminal has echoed the whole ID and rendered it.
 # This emulates the visible effect of a paste without using the OS clipboard.
@@ -104,6 +106,7 @@ Type@0ms "923e7d7ebc5c1f009755bdeb789ac25658ccce03"
 Wait+Line /58ccce03$/
 Sleep 80ms
 Show
+Sleep 250ms
 Screenshot pinned.png
 Type@39ms " "
 Type@48ms "-"

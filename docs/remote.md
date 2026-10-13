@@ -51,6 +51,20 @@ name alone proves nothing about demand.
 
 The server must advertise filtering before any object transfer. Rejection of a
 requested unadvertised OID names the OID and includes Git's server diagnostic.
+
+Two-operand local-path and `file://` sources use upload-pack and require the same
+capabilities. Ordinary local repositories do not enable them by default. When
+you control the source repository, configure it before fetching through git-on:
+
+```sh
+git -C ../another-repo config uploadpack.allowFilter true
+git -C ../another-repo config uploadpack.allowAnySHA1InWant true
+git on ../another-repo main -- ls
+```
+
+These settings belong to the source repository. One-operand local revision
+resolution reads its Git objects directly and needs no upload-pack configuration.
+
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
 the runner fail even if the command catches EIO and exits successfully.

@@ -9,7 +9,7 @@ Run commands against a Git revision without checking it out. Git objects and you
 working copy stay unchanged; choose read-only, ignored-only, or temporary writes
 to any snapshot path.
 
-![Build and run the original SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/bbdaa83733d8f922b1385688a2f36583a5fdcbc5/demo.webp)
+![Build and run the original SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp)
 
 [Installation](#installation) · [Quick start](#quick-start) ·
 [Documentation](#documentation)
@@ -144,7 +144,6 @@ inside its local repository:
 ```sh
 git on https://github.com/OWNER/REPO.git main -- python script.py
 git on origin main -k -- python script.py
-git on ../another-repo main -- ls
 git on ssh://git@HOST/REPO.git signed-release --verify -- ./check.sh
 git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on HEAD --verify -- ./check.sh
 ```
@@ -154,6 +153,17 @@ Git 2.45.1+, a server advertising object filters and allowing exact object
 requests, and existing HTTPS credentials or OpenSSH authentication. An unlocked
 SSH agent needs no passphrase prompt. One selected encrypted identity
 authenticates before mounting and lazy fetches reuse that SSH connection.
+
+For a local-path source, first enable those capabilities in the source repository:
+
+```sh
+git -C ../another-repo config uploadpack.allowFilter true
+git -C ../another-repo config uploadpack.allowAnySHA1InWant true
+git on ../another-repo main -- ls
+```
+
+The one-operand local mode (`git on HEAD -- ls`) reads its repository directly
+and needs no upload-pack setup; see the [remote guide](docs/remote.md#object-demand-and-cache-lifetime).
 
 `--verify` asks native Git to verify the exact commit or annotated tag before
 execution. Git controls formats and trust through your effective configuration,
