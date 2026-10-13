@@ -1007,3 +1007,24 @@ There is no runtime fix or authentic red-before defect to claim for this
 finding. The original native oracle rejected the proposed acceptance behavior
 before invoking the runner, so that failed experiment is not runtime regression
 evidence.
+
+## WebP converter output preservation (Copilot follow-up)
+
+At authentic head `b00fb876`, the converter's `exists()` check missed a dangling
+output symlink. With a real 8×6 two-frame GIF and Pillow 11.3.0/libwebp 1.5.0,
+`test_dangling_output_symlink_does_not_create_its_target` failed because the
+encoder created the link's previously absent target. A second controlled
+interleaving created another writer's output during source decoding;
+`test_output_created_during_source_decode_is_not_overwritten` failed because the
+encoder replaced those bytes. The preserved original helper is
+`target/git-operands-red/convert-demo-before.py`.
+
+The converter now rejects existing entries, including dangling symlinks, and
+passes an exclusively created `xb` file handle to the actual WebP encoder.
+All six permanent `tests/test_convert_demo.py` tests pass: occupied regular,
+symlink and directory outputs remain intact, competing output creation is
+rejected, and the tiny real conversion preserves RGB pixels, dimensions,
+70/130 ms frame timing and loop count. CI runs the suite in an isolated Python
+environment with pinned Pillow 11.3.0; missing codec support fails the tests.
+Evidence is retained in
+`target/git-operands-{red,green}/copilot-converter-output.txt`.

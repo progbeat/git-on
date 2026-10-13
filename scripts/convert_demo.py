@@ -28,7 +28,7 @@ def timeline(path):
 
 
 def convert(source, destination):
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         raise ValueError(f'Refusing to overwrite {destination}')
     frames, durations = [], []
     with Image.open(source) as image:
@@ -39,9 +39,13 @@ def convert(source, destination):
             durations.append(image.info['duration'])
     settings = dict(lossless=True, quality=100, method=6,
                     minimize_size=True, allow_mixed=False)
-    frames[0].save(destination, 'WEBP', save_all=True,
-                   append_images=frames[1:], duration=durations,
-                   loop=loop, **settings)
+    try:
+        with destination.open('xb') as output:
+            frames[0].save(output, 'WEBP', save_all=True,
+                           append_images=frames[1:], duration=durations,
+                           loop=loop, **settings)
+    except FileExistsError:
+        raise ValueError(f'Refusing to overwrite {destination}') from None
     before, after = timeline(source), timeline(destination)
     if before != after:
         destination.unlink()

@@ -214,6 +214,13 @@ jobs:
           python3 tests/test_publish_release.py
           python3 tests/test_installer.py
           python3 tests/test_record_demo.py
+      - name: Test lossless conversion and output preservation
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-venv
+          python3 -m venv /tmp/git-on-conversion-tests
+          /tmp/git-on-conversion-tests/bin/python -m pip install --disable-pip-version-check Pillow==11.3.0
+          /tmp/git-on-conversion-tests/bin/python tests/test_convert_demo.py
       - name: Validate against current master or the pre-push master SHA
         id: policy
         env:
