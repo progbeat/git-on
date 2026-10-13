@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Protect existing recording artifacts without running VHS or mounting FUSE."""
+from contextlib import contextmanager
+import errno
 import importlib.util
 import os
 from pathlib import Path
@@ -24,6 +26,25 @@ class RecordingDestinationTests(unittest.TestCase):
         self.binary.chmod(0o755)
         self.destination = self.root / "recording"
         self.destination.mkdir()
+
+    @contextmanager
+    def staged_publication(self, artifacts):
+        with MOD.RecordingDestination(self.destination) as target:
+            target.reserve()
+            with tempfile.TemporaryDirectory(dir=f"/proc/self/fd/{target.fd}") as temporary:
+                staging = Path(temporary)
+                for name, payload in artifacts.items():
+                    (staging / name).write_bytes(payload)
+                fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    yield target, staging, fd
+                finally:
+                    os.close(fd)
+
+    def publication_order(self, staging_fd, names):
+        real_listdir = os.listdir
+        return patch.object(MOD.os, "listdir", side_effect=lambda fd:
+                            names if fd == staging_fd else real_listdir(fd))
 
     def attempt_recording(self, dependency_probe=None):
         real_open = os.open
@@ -182,6 +203,83 @@ class RecordingDestinationTests(unittest.TestCase):
                     self.assertEqual((self.destination / "vhs.log").read_bytes(), b"another writer's diagnostics")
                 finally:
                     os.close(fd)
+
+    def test_second_artifact_collision_rolls_back_the_first_owned_link(self):
+        artifacts = {"demo.gif": b"new animation", "demo.json": b"new metadata"}
+        competitor = self.destination / "demo.json"
+        real_link = os.link
+        with self.staged_publication(artifacts) as (target, staging, fd):
+            def collide_with_second_link(source, destination, **kwargs):
+                if source == "demo.json":
+                    self.assertTrue((self.destination / "demo.gif").samefile(staging / "demo.gif"))
+                    competitor.write_bytes(b"another recording's metadata")
+                return real_link(source, destination, **kwargs)
+
+            with self.publication_order(fd, list(artifacts)), \
+                    patch.object(MOD.os, "link", side_effect=collide_with_second_link):
+                with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                    target.publish(fd, staging.name)
+            self.assertFalse((self.destination / "demo.gif").exists())
+            self.assertEqual(competitor.read_bytes(), b"another recording's metadata")
+            self.assertEqual({name: (staging / name).read_bytes() for name in artifacts}, artifacts)
+        self.assertEqual(list(self.destination.iterdir()), [competitor])
+
+    def test_second_artifact_io_error_rolls_back_the_first_owned_link(self):
+        artifacts = {"demo.gif": b"new animation", "demo.json": b"new metadata"}
+        real_link = os.link
+        with self.staged_publication(artifacts) as (target, staging, fd):
+            def fail_second_link(source, destination, **kwargs):
+                if source == "demo.json":
+                    self.assertTrue((self.destination / "demo.gif").samefile(staging / "demo.gif"))
+                    raise OSError(errno.ENOSPC, "Fixture publication ran out of space")
+                return real_link(source, destination, **kwargs)
+
+            with self.publication_order(fd, list(artifacts)), \
+                    patch.object(MOD.os, "link", side_effect=fail_second_link):
+                with self.assertRaisesRegex(OSError, "Fixture publication ran out of space"):
+                    target.publish(fd, staging.name)
+            self.assertFalse((self.destination / "demo.gif").exists())
+            self.assertFalse((self.destination / "demo.json").exists())
+            self.assertEqual({name: (staging / name).read_bytes() for name in artifacts}, artifacts)
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_unsupported_later_artifact_is_rejected_before_any_publication(self):
+        with self.staged_publication({"demo.gif": b"new animation"}) as (target, staging, fd):
+            unsupported = staging / "frames"
+            unsupported.mkdir()
+            with self.publication_order(fd, ["demo.gif", "frames"]), \
+                    patch.object(MOD.os, "link", wraps=os.link) as linked:
+                with self.assertRaisesRegex(RuntimeError, "Unsupported recording artifact: frames"):
+                    target.publish(fd, staging.name)
+            linked.assert_not_called()
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_rollback_preserves_a_competitor_replacing_the_first_link(self):
+        artifacts = {"demo.gif": b"new animation", "demo.json": b"new metadata",
+                     "vhs.log": b"new diagnostics"}
+        first = self.destination / "demo.gif"
+        third = self.destination / "vhs.log"
+        real_link = os.link
+        with self.staged_publication(artifacts) as (target, staging, fd):
+            def replace_first_before_third_fails(source, destination, **kwargs):
+                if source == "vhs.log":
+                    self.assertTrue(first.samefile(staging / "demo.gif"))
+                    replacement = self.root / "replacement.gif"
+                    replacement.write_bytes(b"another recording's animation")
+                    os.replace(replacement, first)
+                    third.write_bytes(b"another recording's diagnostics")
+                return real_link(source, destination, **kwargs)
+
+            with self.publication_order(fd, list(artifacts)), \
+                    patch.object(MOD.os, "link", side_effect=replace_first_before_third_fails):
+                with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                    target.publish(fd, staging.name)
+            self.assertEqual(first.read_bytes(), b"another recording's animation")
+            self.assertFalse(first.samefile(staging / "demo.gif"))
+            self.assertFalse((self.destination / "demo.json").exists())
+            self.assertEqual(third.read_bytes(), b"another recording's diagnostics")
+            self.assertEqual({name: (staging / name).read_bytes() for name in artifacts}, artifacts)
+        self.assertCountEqual(self.destination.iterdir(), [first, third])
 
     def test_late_destination_substitution_cannot_redirect_publication(self):
         outside = self.root / "outside-recording"

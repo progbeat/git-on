@@ -651,7 +651,14 @@ fn remove_disconnected_socket(socket: &Path, owner: &SocketOwner) -> Result<bool
     // SIGKILL of a master can leave a pathname after the listener closes.
     // Recheck ownership immediately before removing only that stale node.
     if owned_socket(socket, owner) {
-        fs::remove_file(socket).context("remove disconnected owned SSH control socket")?;
+        match fs::remove_file(socket) {
+            Ok(()) => {}
+            // OpenSSH may remove its own node after the ownership check.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("remove disconnected owned SSH control socket")
+            }
+        }
     }
     Ok(true)
 }

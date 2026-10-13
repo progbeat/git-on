@@ -75,14 +75,32 @@ class RecordingDestination:
 
     def publish(self, staging_fd, staging_name):
         self.check(staging_name)
+        artifacts = []
         for name in os.listdir(staging_fd):
-            if not stat.S_ISREG(os.stat(name, dir_fd=staging_fd, follow_symlinks=False).st_mode):
+            source = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
+            if not stat.S_ISREG(source.st_mode):
                 raise RuntimeError(f"Unsupported recording artifact: {name}")
-            try:
-                os.link(name, name, src_dir_fd=staging_fd, dst_dir_fd=self.fd, follow_symlinks=False)
-            except FileExistsError:
-                raise self.refuse() from None
-        self.check(require_empty=False)
+            artifacts.append((name, source.st_dev, source.st_ino))
+        published = []
+        try:
+            for artifact in artifacts:
+                name, _, _ = artifact
+                try:
+                    os.link(name, name, src_dir_fd=staging_fd, dst_dir_fd=self.fd, follow_symlinks=False)
+                except FileExistsError:
+                    raise self.refuse() from None
+                published.append(artifact)
+            self.check(require_empty=False)
+        except BaseException:
+            # Roll back our links without removing another writer's replacement.
+            for name, device, inode in reversed(published):
+                try:
+                    current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) == (device, inode):
+                        os.unlink(name, dir_fd=self.fd)
+                except FileNotFoundError:
+                    pass
+            raise
 
 
 def record(binary, destination):

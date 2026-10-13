@@ -1081,3 +1081,84 @@ The proposed-change failure is recorded in
 `target/git-operands-red/copilot-setattr-proposed-change/regression.log`.
 Protocol, distinct-credential, strict-clippy, coverage and release-policy green
 results are retained in `target/git-operands-green/copilot-setattr-*.txt`.
+
+## Native Git dependency and release classification
+
+Copilot's `39c11087` review correctly identified that the former direct local
+Git-free path is removed. The native resolver requirement is intentional:
+the requested compatibility contract makes Git itself the only authority for
+repository and revision interpretation. Preserving a second resolver would
+violate that requirement. The requested release classification explicitly
+treats this restoration as a bug fix, including the local dependency change;
+the additional write policies determine the single minor bump to 1.2.0.
+
+The specification, release rules and migration notes now state this consequence
+explicitly. `test_local_unverified_run_requires_native_git_for_revision_resolution`
+already checks the required executable and diagnostic. This clarification does
+not claim a new runtime defect or red-before/green-after behavior change.
+
+## Multi-artifact recording publication rollback (Copilot follow-up)
+
+At authentic head `39c11087`, four permanent recording tests failed. A collision
+on the second artifact and a simulated disk-space error both left the first
+published hard link behind. When another writer replaced the first link before
+a later collision, the helper preserved that replacement but left a second
+owned artifact behind. A later unsupported directory was rejected only after
+an earlier regular file had already been published.
+
+Publication now validates every staged entry before creating any destination
+link. It records successfully created links and, on failure, rolls them back
+through the held destination FD only when the current no-follow entry still
+has the staged source's device and inode. Missing entries and another writer's
+replacement are preserved; the competing name that caused a collision is never
+owned by this publication. Staged source files remain unchanged.
+
+All 14 `tests/test_record_demo.py` tests pass after the correction, including
+four new controlled real-file regressions and the existing ten destination
+checks. The unsupported-entry case requires zero link calls; the two-artifact
+cases exercise a real first link before a second collision or injected ENOSPC;
+the three-artifact replacement case preserves both competing files while
+removing the remaining owned link. These fixtures do not run VHS or mount FUSE
+and do not claim exhaustive concurrent interleaving coverage. Runtime source,
+release binary and the published animation are unaffected by this helper fix.
+
+The authentic helper has SHA-256
+`8b67221857e2a63a7688cb29c401bd83d82bd6993f2f8f63aa2f3f5241c60ef2` and
+is preserved at `target/git-operands-red/record_demo-39-before.py`. Red/green
+results are in
+`target/git-operands-{red,green}/copilot-recording-publication-rollback.txt`.
+
+## Owned SSH socket disappearance during signal cleanup
+
+The real-FUSE job for `39c11087` failed the SIGQUIT subcase of
+`test_real_mount_all_handled_signals_close_owned_ssh_and_remove_state`: the
+runner returned the expected signal status but retained its temporary directory.
+The authentic release executable with SHA-256
+`7c5efe724cf608acbf0900566568e51d7d8056d8d704f9a71ed40c0d1936d68f`
+also reproduced that assertion locally on the fourth focused replay, for SIGINT.
+
+An isolated copy of the same runtime, instrumented only to print its existing
+cleanup error before reraising the signal, reproduced the failure on its fifth
+replay. It reported `remove disconnected owned SSH control socket: No such file
+or directory` and no remaining mount. OpenSSH had removed its own socket between
+the runner's final ownership check and unlink. The original signal-specific
+core-dump hypothesis therefore did not explain this failure.
+
+`remove_disconnected_socket` now treats `NotFound` from that final unlink as an
+already completed removal. Other errors continue to retain recovery state.
+The permanent
+`SshRegressionTests.test_owned_socket_removed_during_unlink_does_not_block_recovery`
+uses a real closed Unix socket and valid private recovery state. A test-only
+`LD_PRELOAD` fixture removes the socket during the runner's unlink call, after
+its ownership check. This controlled interleaving failed against the authentic
+executable with status 125 and ENOENT, then passed after the correction. A
+separate injected EACCES case requires status 125 and preserves the socket and
+recovery state; ordinary recovery succeeds after that injection is removed.
+
+All 21 SSH regressions pass with the corrected metrics executable. Twelve
+bounded real-FUSE replays additionally passed all four handled signals, for
+48 signal completions; this is not exhaustive interleaving coverage. Formatting
+and the FUSE inventory guard pass. The authentic executable is retained at
+`target/cleanup-forensics-authentic-before`; diagnostic and controlled red/green
+evidence is in `target/cleanup-forensics-replay.log` and
+`target/cleanup-forensics-{controlled-red,controlled-green,ssh-green,signals-green}.log`.

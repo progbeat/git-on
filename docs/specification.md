@@ -46,6 +46,10 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 This compatibility is part of the original command contract. Corrections that
 restore native Git argument semantics are bug fixes, not a new git-on grammar.
+Native Git is the resolution authority for both local and remote operands.
+Consequently, direct local `git-on` execution also requires Git on `PATH`, even
+where the former Git-free resolver accepted a revision. Retiring that resolver
+is part of this bug fix; it does not require a major version increment.
 
 - With one operand, pass that exact `OsStr` as the revision argument to native
   `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
