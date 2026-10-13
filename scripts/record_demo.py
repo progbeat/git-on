@@ -5,6 +5,8 @@ Requires VHS 0.12.1, ttyd, ffmpeg, Chromium, Source Code Pro,
 make/gcc/ncurses headers,
 Git 2.45.1+, and a usable FUSE device. Read upstream source before recording.
 Successful recordings appear together under OUTPUT/capture/.
+Failed recordings retain their staging directory and logs for inspection;
+use a fresh output directory when retrying.
 """
 import argparse
 from contextlib import ExitStack
@@ -18,6 +20,7 @@ import platform
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -107,9 +110,14 @@ class RecordingDestination:
         self.published = True
         self.check(require_empty=False)
 
-    def discard_staging(self, name):
+    def report_retained_staging(self, staging_fd, name):
         if not self.published:
-            shutil.rmtree(f"/proc/self/fd/{self.fd}/{name}")
+            try:
+                retained = os.readlink(f"/proc/self/fd/{staging_fd}")
+            except OSError:
+                retained = str(self.path / name)
+            print(f"Recording artifacts retained at {retained}; inspect vhs.log if present; "
+                  "use a fresh --output directory for retry.", file=sys.stderr)
 
 
 def record(binary, destination):
@@ -142,9 +150,11 @@ def _record(binary, target):
     with tempfile.TemporaryDirectory(prefix="git-on-demo-") as temporary, ExitStack() as cleanup:
         private = Path(temporary)
         staging = Path(tempfile.mkdtemp(prefix=".git-on-recording-", dir=f"/proc/self/fd/{target.fd}"))
-        cleanup.callback(target.discard_staging, staging.name)
         staging_fd = os.open(staging.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target.fd)
         cleanup.callback(os.close, staging_fd)
+        # Failure artifacts stay intact. The directory FD reports its actual
+        # location even if another writer renames it or reuses its old name.
+        cleanup.callback(target.report_retained_staging, staging_fd, staging.name)
         tools = private / "bin"
         tools.mkdir()
         (tools / "git-on").symlink_to(binary)

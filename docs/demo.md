@@ -73,6 +73,9 @@ Choose a new or empty output directory: the helper refuses any existing
 contents before recording. It publishes all generated files together as its
 `capture/` subdirectory with an atomic no-replace directory rename, preserving
 competing output rather than deleting individual files during rollback.
+If recording or publication fails, it preserves the incomplete staging directory
+and reports its actual path and `vhs.log` for inspection. Choose a fresh output
+directory for the next attempt; failed output is never deleted automatically.
 During execution it checks the live FUSE recovery
 state against the reviewed tree, observes the generated executable inside the
 mount, and records the shell's real exit status through a private prompt hook.
@@ -93,7 +96,10 @@ is unsuitable for repository storage, keep it local, do not commit it, and do
 not create the associated PR. Publish the verified WebP in the separate
 `demo-media` branch. The tape, provenance and upstream license stay in `assets/`
 on the main development branch. WebP conversion needs Pillow 11.3.0 in an
-isolated Python environment; the command above uses uv. It verifies identical decoded RGB,
+isolated Python environment; the command above uses uv. Conversion also requires
+Linux `/proc` and an output filesystem supporting `O_TMPFILE` and hard links.
+It encodes into an unnamed file, validates it, then publishes that inode without
+replacing any existing output. It verifies identical decoded RGB,
 accumulated frame durations, dimensions and loop settings before accepting output.
 
 The selected GIF is losslessly optimized with `gifsicle --careful -O3`.

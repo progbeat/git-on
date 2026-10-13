@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real lossless WebP conversion and output-preservation regressions."""
 import hashlib
+import errno
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -141,6 +142,57 @@ class ConversionArtifactTests(unittest.TestCase):
         self.assertEqual(self.destination.read_bytes(), b"another writer's output\n")
         self.assertEqual(self.source.read_bytes(), self.source_bytes)
         self.assertEqual(set(self.root.iterdir()), {self.source, self.destination})
+
+    def test_failed_validation_preserves_a_replacement_staging_directory(self):
+        real_save = Image.Image.save
+        real_timeline = MOD.timeline
+        foreign = None
+
+        def substitute_staging(image, output, *args, **kwargs):
+            nonlocal foreign
+            real_save(image, output, *args, **kwargs)
+            output.flush()
+            if isinstance(output.name, int):
+                # Anonymous encoding has no staging pathname to substitute.
+                # A foreign directory must still survive the same failure.
+                directory = self.root / 'foreign-staging-directory'
+                directory.mkdir()
+            else:
+                directory = Path(output.name).parent
+                directory.rename(self.root / 'actual-owned-staging')
+                directory.mkdir()
+            foreign = directory / 'foreign-recording.txt'
+            foreign.write_bytes(b'another writer owns these bytes\n')
+
+        def failed_validation(path):
+            if path == self.source:
+                return real_timeline(path)
+            raise OSError('fixture validation failure after real encoding')
+
+        with patch.object(Image.Image, 'save', substitute_staging), \
+                patch.object(MOD, 'timeline', side_effect=failed_validation):
+            error, _ = self.attempt_conversion()
+        self.assertIsInstance(error, OSError)
+        self.assertIn('fixture validation failure', str(error))
+        self.assertIsNotNone(foreign)
+        self.assertTrue(foreign.exists(), 'Converter cleanup deleted a competing replacement')
+        self.assertEqual(foreign.read_bytes(), b'another writer owns these bytes\n')
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.source.read_bytes(), self.source_bytes)
+
+    def test_unsupported_anonymous_output_fails_without_named_artifacts(self):
+        real_open = MOD.os.open
+
+        def unsupported_tmpfile(path, flags, *args, **kwargs):
+            if flags & getattr(MOD.os, 'O_TMPFILE', 0) == getattr(MOD.os, 'O_TMPFILE', 0):
+                raise OSError(errno.EOPNOTSUPP, 'fixture filesystem lacks O_TMPFILE')
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(MOD.os, 'open', side_effect=unsupported_tmpfile):
+            error, _ = self.attempt_conversion()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn('O_TMPFILE', str(error))
+        self.assertEqual(list(self.root.iterdir()), [self.source])
 
 
 if __name__ == "__main__":

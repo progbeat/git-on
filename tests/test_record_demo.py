@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Protect existing recording artifacts without running VHS or mounting FUSE."""
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import errno
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -40,15 +41,13 @@ class RecordingDestinationTests(unittest.TestCase):
                 yield target, staging, fd
             finally:
                 os.close(fd)
-                if not getattr(target, "published", False):
-                    shutil.rmtree(staging)
 
     def publication_order(self, staging_fd, names):
         real_listdir = os.listdir
         return patch.object(MOD.os, "listdir", side_effect=lambda fd:
                             names if fd == staging_fd else real_listdir(fd))
 
-    def attempt_recording(self, dependency_probe=None):
+    def attempt_recording(self, dependency_probe=None, recorder_failure=None):
         real_open = os.open
 
         def fixture_open(path, *args, **kwargs):
@@ -62,7 +61,7 @@ class RecordingDestinationTests(unittest.TestCase):
                 patch.object(MOD, "output", return_value="fixture version"), \
                 patch.object(MOD.platform, "node", return_value="fixture-host"), \
                 patch.object(MOD.platform, "platform", return_value="fixture-platform"), \
-                patch.object(MOD.subprocess, "Popen", side_effect=RuntimeError(
+                patch.object(MOD.subprocess, "Popen", side_effect=recorder_failure or RuntimeError(
                     "Fixture VHS recording started")) as recorder:
             error = None
             try:
@@ -224,7 +223,8 @@ class RecordingDestinationTests(unittest.TestCase):
             self.assertFalse((self.destination / "demo.gif").exists())
             self.assertEqual(competitor.read_bytes(), b"another recording's metadata")
             self.assertEqual({name: (staging / name).read_bytes() for name in artifacts}, artifacts)
-        self.assertEqual(list(self.destination.iterdir()), [capture])
+        self.assertCountEqual(self.destination.iterdir(), [capture, self.destination / staging.name])
+        self.assertEqual((self.destination / staging.name / "demo.gif").read_bytes(), artifacts["demo.gif"])
 
     def test_publication_io_error_exposes_no_partial_artifacts(self):
         artifacts = {"demo.gif": b"new animation", "demo.json": b"new metadata"}
@@ -237,7 +237,7 @@ class RecordingDestinationTests(unittest.TestCase):
             self.assertFalse((self.destination / "demo.gif").exists())
             self.assertFalse((self.destination / "demo.json").exists())
             self.assertEqual({name: (staging / name).read_bytes() for name in artifacts}, artifacts)
-        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(list(self.destination.iterdir()), [self.destination / staging.name])
 
     def test_unsupported_later_artifact_is_rejected_before_any_publication(self):
         with self.staged_publication({"demo.gif": b"new animation"}) as (target, staging, fd):
@@ -248,7 +248,7 @@ class RecordingDestinationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Unsupported recording artifact: frames"):
                     target.publish(fd, staging.name)
             renamed.assert_not_called()
-        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(list(self.destination.iterdir()), [self.destination / staging.name])
 
     def test_postpublication_directory_substitution_preserves_entire_capture(self):
         artifacts = {"demo.gif": b"new animation", "demo.json": b"new metadata",
@@ -275,8 +275,8 @@ class RecordingDestinationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
                     target.publish(fd, staging.name)
             self.assertTrue(target.published)
-            # Cleanup is explicitly disarmed once the group becomes visible.
-            target.discard_staging(staging.name)
+            # Published and failed artifacts have no destructive cleanup.
+            target.report_retained_staging(fd, staging.name)
             capture = original / "capture"
             self.assertEqual((capture / "demo.gif").read_bytes(), b"another recording's animation")
             self.assertEqual((capture / "additional.txt").read_bytes(), b"another recording's extra artifact")
@@ -295,21 +295,14 @@ class RecordingDestinationTests(unittest.TestCase):
         outside_log = outside / "vhs.log"
         outside_log.write_bytes(b"outside diagnostics")
         original = self.root / "original-recording"
-        with MOD.RecordingDestination(self.destination) as target:
-            target.reserve()
-            with tempfile.TemporaryDirectory(dir=f"/proc/self/fd/{target.fd}") as temporary:
-                staging = Path(temporary)
-                (staging / "vhs.log").write_bytes(b"new diagnostics")
-                fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
-                self.destination.rename(original)
-                self.destination.symlink_to(outside)
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
-                        target.publish(fd, staging.name)
-                    self.assertEqual(outside_log.read_bytes(), b"outside diagnostics")
-                finally:
-                    os.close(fd)
-        self.assertEqual(list(original.iterdir()), [])
+        with self.staged_publication({"vhs.log": b"new diagnostics"}) as (target, staging, fd):
+            self.destination.rename(original)
+            self.destination.symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+                target.publish(fd, staging.name)
+            self.assertEqual(outside_log.read_bytes(), b"outside diagnostics")
+        self.assertEqual(list(original.iterdir()), [original / staging.name])
+        self.assertEqual((original / staging.name / "vhs.log").read_bytes(), b"new diagnostics")
         self.assertEqual(list(outside.iterdir()), [outside_log])
 
     def test_rollback_cannot_delete_a_competitor_arriving_after_ownership_check(self):
@@ -362,8 +355,9 @@ class RecordingDestinationTests(unittest.TestCase):
     def test_late_capture_file_or_symlink_is_not_replaced(self):
         for kind in ("regular", "dangling symlink"):
             with self.subTest(kind=kind):
+                self.destination = self.root / ("recording-" + kind)
+                self.destination.mkdir()
                 capture = self.destination / "capture"
-                capture.unlink(missing_ok=True)
                 real_rename = MOD.rename_noreplace
                 with self.staged_publication({"demo.gif": b"new animation"}) as (target, staging, fd):
                     def competing_entry(*args, **kwargs):
@@ -403,6 +397,64 @@ class RecordingDestinationTests(unittest.TestCase):
             renamed.assert_called_once()
             linked.assert_not_called()
             unlinked.assert_not_called()
+
+    def test_failed_recording_preserves_replacement_staging_directory_and_owned_log(self):
+        owned = self.root / "held-owned-stage"
+        foreign = None
+
+        def replace_staging_before_failure(*args, **kwargs):
+            nonlocal foreign
+            stage = Path(os.readlink(kwargs["cwd"]))
+            kwargs["stdout"].write("owned VHS diagnostics\n")
+            kwargs["stdout"].flush()
+            (stage / "demo.gif").write_bytes(b"owned incomplete animation")
+            stage.rename(owned)
+            stage.mkdir()
+            foreign = stage / "foreign.txt"
+            foreign.write_bytes(b"another writer's files must survive")
+            raise RuntimeError("Fixture recorder failed after staging replacement")
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            error, _, _, recorder = self.attempt_recording(recorder_failure=replace_staging_before_failure)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("Fixture recorder failed", str(error))
+        recorder.assert_called_once()
+        self.assertTrue(foreign.is_file(), "failed-recording cleanup deleted another writer's directory")
+        self.assertEqual(foreign.read_bytes(), b"another writer's files must survive")
+        self.assertEqual((owned / "vhs.log").read_text(), "owned VHS diagnostics\n")
+        self.assertEqual((owned / "demo.gif").read_bytes(), b"owned incomplete animation")
+        self.assertIn(str(owned), diagnostics.getvalue())
+        self.assertIn("vhs.log", diagnostics.getvalue())
+        self.assertIn("fresh --output directory", diagnostics.getvalue())
+
+    def test_failed_vhs_retains_diagnostics_and_same_output_retry_is_rejected(self):
+        class FailedVhs:
+            returncode = 17
+
+            def poll(self):
+                return self.returncode
+
+        def fail_vhs(*args, **kwargs):
+            kwargs["stdout"].write("VHS renderer failed with fixture diagnostics\n")
+            kwargs["stdout"].flush()
+            return FailedVhs()
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            error, _, _, recorder = self.attempt_recording(recorder_failure=fail_vhs)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("VHS failed with status 17", str(error))
+        recorder.assert_called_once()
+        retained, = self.destination.iterdir()
+        self.assertTrue(retained.name.startswith(".git-on-recording-"))
+        self.assertEqual((retained / "vhs.log").read_text(),
+                         "VHS renderer failed with fixture diagnostics\n")
+        self.assertIn(str(retained), diagnostics.getvalue())
+        self.assertIn("fresh --output directory", diagnostics.getvalue())
+        self.assert_rejected_before_probes(self.attempt_recording())
+        self.assertEqual((retained / "vhs.log").read_text(),
+                         "VHS renderer failed with fixture diagnostics\n")
 
 
 if __name__ == "__main__":

@@ -1238,3 +1238,75 @@ Red/green logs are in
 results are in `target/git-operands-green/copilot-dev-runtime-publisher.txt`.
 The native offline oracle is recorded in
 `target/policy-cargo-offline-oracle/proof.json`.
+
+## Preserve failed recording staging (Copilot follow-up)
+
+At authentic head `9bccb75b`, the recorder recursively removed its staging
+pathname after a failed recording. A competing writer could rename the original
+held directory and create a different directory at that name. The permanent
+`test_failed_recording_preserves_replacement_staging_directory_and_owned_log`
+reproduces the failure with actual directories and files: its recorder fixture
+writes owned diagnostics and a partial animation, moves that staging directory,
+creates a replacement containing a foreign file, then fails. The authentic
+helper deletes the replacement directory and the foreign file.
+
+Failed staging is now deliberately retained for inspection. The helper performs
+no recursive or name-based deletion of recording artifacts on failure. Before
+closing the held staging FD it reports that directory's actual location and
+points to `vhs.log` when present, including after the directory has been renamed.
+A retry requires a fresh output directory; existing artifacts are rejected
+before dependency probes. Successful recordings still appear together through
+the single atomic move to `OUTPUT/capture/`.
+
+All 19 recording tests pass. The new controlled replacement case preserves both
+the original owned diagnostics/animation and the competing directory. A second
+failure case retains the actual log from a renderer returning status 17 and
+checks that retrying the same output cannot overwrite it. Publication-failure
+tests now retain their staged files rather than expecting an empty output
+directory. Runtime source, release version, executable and published media are
+unaffected.
+
+The authentic helper is retained at
+`target/git-operands-red/record_demo-9bcc-before.py` with SHA-256
+`6261db70db8a893016c942d1356077b214fc2b39d4aad9e37489afa56731e411`.
+The focused red result is in
+`target/git-operands-red/copilot-recording-failed-staging-red.txt`; the complete
+green suite is in
+`target/git-operands-green/copilot-recording-retained-failure-green.txt`.
+
+## Anonymous WebP output avoids replacement-directory cleanup
+
+The converter at authentic head `9bccb75b` had the same staging-name cleanup
+defect. After a genuine Pillow encoding of an 8×6 two-frame GIF, a controlled
+fixture moved the owned staging directory and recreated its original name with
+a foreign recording. Validation then failed. `TemporaryDirectory` recursively
+deleted that replacement and its foreign file, while the renamed owned
+animation survived. The permanent
+`test_failed_validation_preserves_a_replacement_staging_directory` failed against
+the authentic helper because those competing bytes disappeared.
+
+The converter now opens an anonymous `O_TMPFILE` inode through a held destination
+directory FD. Pillow writes to its file handle; validation decodes a `BytesIO`
+copy, leaving the publication descriptor owned by the helper. A successful
+conversion publishes that inode with an exclusive `linkat` operation through
+`/proc/self/fd`. Closing descriptors handles failures without named staging
+directories or recursive deletion. The helper requires Linux, `/proc/self/fd`
+and `O_TMPFILE` support on the destination filesystem, and reports an explicit
+error when anonymous output is unsupported. It has no named-file fallback.
+
+All ten conversion tests pass with real Pillow 11.3.0/libwebp 1.5.0, including
+the existing eight output-preservation/codec cases, foreign-directory survival
+after failed validation, and unsupported-filesystem failure without artifacts.
+An actual CLI conversion also preserved all decoded RGB pixels, dimensions,
+70/130 ms frame durations and loop count; publication returned the expected
+size and SHA-256. Runtime source, version, executable and the large published
+animation are unchanged.
+
+The authentic converter is retained at
+`target/git-operands-red/convert_demo-9bcc-before.py` with SHA-256
+`919af473a91c5d2fdce80e98b117690c433a71598a3c4488f6c23be34a7cd14f`.
+Red/green results are in
+`target/git-operands-red/copilot-converter-staging-substitution.txt` and
+`target/git-operands-green/copilot-converter-anonymous-output.txt`.
+The original real-codec reproduction is recorded in
+`target/converter-staging-substitution-red/proof.json`.
