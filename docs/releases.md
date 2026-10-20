@@ -122,16 +122,17 @@ where master advances after the PR's version check finishes.
 
 ## Installing a published binary
 
-The installer needs Python 3.8+ and supports **Linux x86_64 with glibc 2.35+**
+The POSIX `sh` installer supports **Linux x86_64 with glibc 2.35+**
 (Ubuntu 22.04 baseline), plus the shared zlib (`libz.so.1`) and GCC
 (`libgcc_s.so.1`) runtimes confirmed by the packaging job. Its executable probe
 catches missing runtime libraries before replacing an existing installation.
-It installs a prebuilt binary; Rust, a C compiler, jq,
-and sudo are not needed. The same command installs or updates to GitHub's latest
+It needs `curl`, GNU coreutils (`sha256sum`, `timeout`, `stat`, `mktemp`, `mv`
+and the ordinary file utilities), `awk`, `tar`, `gzip` and `getconf`.
+Python, jq, Rust, a C compiler and sudo are not needed. The same command installs or updates to GitHub's latest
 stable release each time it runs:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
 Stable binaries are published in [GitHub Releases](https://github.com/progbeat/git-on/releases).
@@ -158,6 +159,33 @@ refused. These bits describe permissions, not proof that another user has
 effective access. Diagnostics show the directory's path, mode and owner.
 For a user-owned personal directory with unnecessary group writing, consider
 removing just that permission; otherwise select a separate `--bin-dir`.
+The directory must be a canonical absolute path, without `.`/`..` components,
+repeated slashes or a trailing slash. Relative and empty `PATH` entries retain
+their meaning from the directory in which the installer was invoked.
+
+### Release format and compatibility
+
+Releases keep exactly three assets: `git-on-vVERSION-x86_64-unknown-linux-gnu.tar.gz`,
+`SHA256SUMS` and `release.json`. Saved older installers reject extra assets and
+extra checksum entries, so adding a raw executable to the same release would
+break those clients. This transition changes the installer only; no published
+release is edited and no new distribution format is introduced. The tar contains
+the executable, README and MIT LICENSE, not bundled shared libraries. The original
+v0.1.0 archive predates LICENSE; it remains installable. Publication keeps the
+license notice in new archives.
+
+The shell installer downloads the same archive as older clients, but reads only
+the exact `git-on` member to a staging file, without extracting the directory
+tree. It does not parse JSON or need a general-purpose archive validator.
+`release.json` remains available for build provenance and older installers.
+
+For public latest installation, the GitHub `/releases/latest` redirect resolves
+one stable version exactly once. Both downloads then use that tag's predictable
+asset URLs; a changing latest release cannot mix the binary and checksums.
+Public `--version` requests the exact stable-format tag, without consulting GitHub
+JSON flags. A semver tag manually marked prerelease is therefore not separately
+rejected in that path; `--github-cli` checks both draft and prerelease flags using
+gh's built-in `--jq` (no external jq program).
 
 ### Inspect first or use an authenticated private release
 
@@ -165,7 +193,7 @@ Piping a script to a shell executes code from the repository. To inspect it firs
 download it, review it, then run the saved copy:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh -o install.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on -o install.sh
 less install.sh
 sh install.sh
 ```
@@ -188,13 +216,15 @@ limited. The normal mode does not read GitHub token environment variables.
 
 ### Verification and update safety
 
-The installer resolves one release, checks its exact asset names, verifies the
-archive and build metadata against `SHA256SUMS`, and rejects unexpected archive
-members and links. New archives include the project's MIT `LICENSE`; the original
-v0.1.0 layout remains accepted. It bounds compressed and expanded input sizes, reads only the
-expected executable, and checks its reported version before an atomic replacement.
-A failed download, checksum, archive check, version probe, or replacement leaves
-the previous executable in place. Rerunning the same version is safe. Temporary
+The installer verifies the selected archive's SHA-256 before reading its exact
+binary member, rejecting missing/duplicate members and empty output. Other archive
+paths are never extracted. Downloads have size limits; archive reading and the
+executable probe have timeouts. It stages in the destination filesystem, checks
+the binary's reported version, then atomically renames it over the old executable.
+Download, checksum, extraction, probe or rename failure before that commit leaves
+the previous executable in place. A signal after the atomic rename can leave the
+new, verified executable installed; the diagnostic does not promise rollback.
+Rerunning the same version is safe. Temporary
 files are cleaned on ordinary failures and handled interruption signals; an
 uncatchable SIGKILL or power loss can leave temporary files.
 
@@ -203,8 +233,8 @@ archive, and checksum file share the GitHub repository's trust boundary. To pin
 the installer code as well as the binary version, inspect a copy from the matching
 release tag or an explicitly selected commit instead of the moving master URL.
 
-The bootstrap uses an HTTPS URL with curl's default redirect and TLS settings.
-The installer's release downloader separately rejects non-HTTPS redirects.
+The bootstrap requires HTTPS and TLS 1.2+. The installer's release downloads
+also restrict redirects to HTTPS.
 The script encloses its payload in a function and guards the final call, so an
 incomplete download cannot start installation or drop supplied arguments. See the installer regressions in
 the [test guide](../tests/README.md#installer-acceptance).

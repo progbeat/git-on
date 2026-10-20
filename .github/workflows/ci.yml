@@ -42,6 +42,8 @@ jobs:
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests
+      - name: Install the real binary without Python or jq
+        run: python3 tests/installer_no_python.py --binary target/debug/git-on
       - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
         run: |
           cargo build --locked --features test-metrics --example source-probe --bin git-on

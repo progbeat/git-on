@@ -1,605 +1,413 @@
 #!/usr/bin/env python3
-"""Offline installer regressions and real packaged-binary installer acceptance.
+"""Black-box shell installer tests; transport fixtures are shell programs.
 
-No GitHub request is made. Fixture transport is supplied through a fake gh on
-PATH, not through a production insecure URL or checksum-bypass option.
+The installer runs with an explicit tool PATH containing neither Python nor jq.
+--dist additionally installs the real packaged executable (latest and pinned).
 """
 import argparse
 import hashlib
-import gzip
-import importlib.util
 import io
 import json
 import os
 from pathlib import Path
-import pwd
-import grp
 import shutil
 import signal
-import time
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
-from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.sh'
-SOURCE = SCRIPT.read_text().split("<<'GIT_ON_INSTALLER_PYTHON'\n", 1)[1].rsplit('\nGIT_ON_INSTALLER_PYTHON', 1)[0]
-MOD = importlib.util.module_from_spec(importlib.util.spec_from_loader('installer', loader=None))
-exec(compile(SOURCE, str(SCRIPT), 'exec'), MOD.__dict__)
+TARGET = 'x86_64-unknown-linux-gnu'
+TOOLS = 'awk cat chmod cp getconf gzip id mkdir mktemp mv rm sha256sum stat tar timeout uname sleep'.split()
+CURL_FIXTURE = r'''#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$INSTALLER_FIXTURES/requests"
+out= url=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -o) out=$2; shift 2;;
+        -w|--proto|--proto-redir|--connect-timeout|--max-time|--max-filesize) shift 2;;
+        --tlsv1.2|-fsSL) shift;;
+        https://*) url=$1; shift;;
+        *) exit 90;;
+    esac
+done
+base=https://github.com/progbeat/git-on/releases
+case $url in
+    "$base/latest")
+        if [ -f "$INSTALLER_FIXTURES/latest-url" ]; then cat "$INSTALLER_FIXTURES/latest-url";
+        else printf '%s/tag/%s' "$base" "$(cat "$INSTALLER_FIXTURES/latest")"; fi
+        if [ -f "$INSTALLER_FIXTURES/move-latest" ]; then cp "$INSTALLER_FIXTURES/move-latest" "$INSTALLER_FIXTURES/latest"; fi;;
+    "$base/download/"*)
+        path=${url#"$base/download/"}
+        if [ -f "$INSTALLER_FIXTURES/fail-download" ]; then printf partial > "$out"; exit 22; fi
+        cp "$INSTALLER_FIXTURES/$path" "$out";;
+    *) exit 91;;
+esac
+'''
+GH_FIXTURE = r'''#!/bin/sh
+set -eu
+printf 'gh %s\n' "$*" >> "$INSTALLER_FIXTURES/requests"
+case $1 in
+    api)
+        endpoint=$4
+        case $endpoint in */latest) tag=$(cat "$INSTALLER_FIXTURES/latest");; *) tag=${endpoint##*/};; esac
+        if [ -f "$INSTALLER_FIXTURES/gh-tag" ]; then cat "$INSTALLER_FIXTURES/gh-tag"; else printf '%s\n' "$tag"; fi;;
+    release)
+        tag=$3
+        shift 3
+        name= dest=
+        while [ "$#" -gt 0 ]; do
+            case $1 in --repo) shift 2;; --pattern) name=$2; shift 2;; --dir) dest=$2; shift 2;; *) exit 92;; esac
+        done
+        if [ -f "$INSTALLER_FIXTURES/fail-download" ]; then printf partial > "$dest/$name"; exit 1; fi
+        cp "$INSTALLER_FIXTURES/$tag/$name" "$dest/$name";;
+    *) exit 93;;
+esac
+'''
+
+
+def tools_directory(path):
+    path.mkdir()
+    for tool in TOOLS:
+        source = shutil.which(tool)
+        if source is None:
+            raise RuntimeError('Required test tool is missing: ' + tool)
+        (path / tool).symlink_to(source)
+    for name, source in [('curl', CURL_FIXTURE), ('gh', GH_FIXTURE)]:
+        (path / name).write_text(source)
+        (path / name).chmod(0o755)
 
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(prefix='git-on-installer-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.releases = self.root / 'releases'
         self.releases.mkdir()
         self.bin = self.root / 'home with spaces/.local/bin'
         self.bin.mkdir(parents=True)
-        # Keep fixture acceptance independent of the caller's group-write umask.
         self.bin.chmod(0o755)
         self.old = self.bin / 'git-on'
         self.old.write_bytes(b'old executable\n')
         self.fakebin = self.root / 'tools'
-        self.fakebin.mkdir()
-        # Exercise the actual shell entrypoint, parser, embedded Python and gh arguments.
-        helper = self.fakebin / 'gh'
-        helper.write_text('''#!/usr/bin/env python3
-import json, os, pathlib, shutil, sys
-args = sys.argv[1:]
-root = pathlib.Path(os.environ['INSTALLER_FIXTURES'])
-with (root / 'requests.jsonl').open('a') as output:
-    output.write(json.dumps(args) + '\\n')
-if args[:3] == ['api', '--hostname', 'github.com']:
-    endpoint = args[3]
-    tag = (root / 'latest').read_text() if endpoint.endswith('/latest') else endpoint.rsplit('/', 1)[1]
-    sys.stdout.buffer.write((root / tag / 'api.json').read_bytes())
-elif args[:2] == ['release', 'download']:
-    assert args[3:5] == ['--repo', 'https://github.com/progbeat/git-on']
-    name = args[args.index('--pattern') + 1]
-    target = pathlib.Path(args[args.index('--dir') + 1]) / name
-    if (root / 'fail-download').exists():
-        target.write_bytes(b'partial')
-        sys.exit(1)
-    shutil.copyfile(root / args[2] / name, target)
-else:
-    sys.exit(2)
-''')
-        helper.chmod(0o755)
-        self.env = dict(os.environ, HOME=str(self.root / 'home with spaces'),
-                        PATH=str(self.fakebin) + os.pathsep + os.environ['PATH'],
-                        INSTALLER_FIXTURES=str(self.releases))
+        tools_directory(self.fakebin)
+        self.env = dict(HOME=str(self.root / 'home with spaces'), PATH=str(self.fakebin),
+                        LC_ALL='C', INSTALLER_FIXTURES=str(self.releases))
         self.release('0.1.0')
 
-    def release(self, version, members=None, distribution=None):
-        tag = 'v' + version
-        directory = self.releases / tag
+    def release(self, version, members=None, distribution=None, binary=None):
+        directory = self.releases / ('v' + version)
         directory.mkdir(exist_ok=True)
-        archive = 'git-on-' + tag + '-' + MOD.TARGET + '.tar.gz'
-        root = archive[:-7]
+        name = 'git-on-v' + version + '-' + TARGET
+        archive = name + '.tar.gz'
         if distribution:
-            for name in (archive, 'release.json', 'SHA256SUMS'):
-                shutil.copyfile(distribution / name, directory / name)
+            for filename in (archive, 'release.json', 'SHA256SUMS'):
+                shutil.copyfile(distribution / filename, directory / filename)
         else:
+            if binary is None:
+                binary = ('#!/bin/sh\nprintf "git-on ' + version + '\\n"\n').encode()
             if members is None:
-                members = [(root, 'dir', b''),
-                           (root + '/git-on', 'file', ('#!/bin/sh\nprintf "git-on ' + version + '\\n"\n').encode()),
-                           (root + '/README.md', 'file', b'fixture documentation')]
-            with tarfile.open(directory / archive, 'w:gz') as package:
-                for name, kind, content in members:
-                    member = tarfile.TarInfo(name)
-                    member.mode = 0o755 if name.endswith('/git-on') else 0o644
+                members = [(name, 'dir', b''), (name + '/git-on', 'file', binary),
+                           (name + '/README.md', 'file', b'documentation')]
+                if version != '0.1.0':
+                    members.append((name + '/LICENSE', 'file', (ROOT / 'LICENSE').read_bytes()))
+            with tarfile.open(directory / archive, 'w:gz', format=tarfile.USTAR_FORMAT) as package:
+                for filename, kind, content in members:
+                    entry = tarfile.TarInfo(filename)
+                    entry.mode = 0o755 if filename.endswith('/git-on') else 0o644
                     if kind == 'dir':
-                        member.type = tarfile.DIRTYPE
+                        entry.type = tarfile.DIRTYPE
                     elif kind in ('symlink', 'hardlink'):
-                        member.type = tarfile.SYMTYPE if kind == 'symlink' else tarfile.LNKTYPE
-                        member.linkname = str(content)
+                        entry.type = tarfile.SYMTYPE if kind == 'symlink' else tarfile.LNKTYPE
+                        entry.linkname = content
                     else:
-                        member.size = len(content)
-                    package.addfile(member, io.BytesIO(content) if kind == 'file' else None)
-            (directory / 'release.json').write_text(json.dumps({'version': version, 'commit': 'a' * 40,
-                'target': MOD.TARGET, 'baseline': 'Ubuntu 22.04 / glibc 2.35', 'rust': '1.90.0'}))
+                        entry.size = len(content)
+                    package.addfile(entry, io.BytesIO(content) if kind == 'file' else None)
+            (directory / 'release.json').write_text(json.dumps({'version': version, 'commit': 'a'*40,
+                'target': TARGET, 'baseline': 'Ubuntu 22.04 / glibc 2.35', 'rust': '1.90.0'}))
             self.checksums(directory, archive)
-        self.api(directory, tag, archive)
-        (self.releases / 'latest').write_text(tag)
+        (self.releases / 'latest').write_text('v' + version)
         return directory, archive
 
     def checksums(self, directory, archive):
-        (directory / 'SHA256SUMS').write_text(''.join(hashlib.sha256((directory / name).read_bytes()).hexdigest() + '  ' + name + '\n'
-                                                  for name in (archive, 'release.json')))
+        (directory / 'SHA256SUMS').write_text(''.join(
+            hashlib.sha256((directory / filename).read_bytes()).hexdigest() + '  ' + filename + '\n'
+            for filename in (archive, 'release.json')))
 
-    def api(self, directory, tag, archive):
-        assets = [{'name': name, 'state': 'uploaded', 'size': (directory / name).stat().st_size,
-                   'browser_download_url': 'https://github.com/progbeat/git-on/releases/download/' + tag + '/' + name}
-                  for name in (archive, 'SHA256SUMS', 'release.json')]
-        data = {'tag_name': tag, 'draft': False, 'prerelease': False, 'assets': assets}
-        (directory / 'api.json').write_text(json.dumps(data))
-        return data
-
-    def run_script(self, *args, success=True, pipe=False):
-        command = ['sh', '-s', '--'] if pipe else ['sh', str(SCRIPT)]
-        result = subprocess.run(command + ['--github-cli', *args],
-                                input=SCRIPT.read_text() if pipe else None,
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=self.env, timeout=30)
+    def run_script(self, *args, success=True, pipe=False, github_cli=False):
+        command = ['/bin/sh', '-s', '--'] if pipe else ['/bin/sh', str(SCRIPT)]
+        if github_cli:
+            command.append('--github-cli')
+        result = subprocess.run(command + list(args), input=SCRIPT.read_text() if pipe else None,
+                                env=self.env, capture_output=True, text=True, timeout=30)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertEqual(self.old.read_bytes(), b'old executable\n')
-        self.assertEqual(list(self.bin.glob('.git-on-install-*')), [])
+        self.assertEqual(list(self.bin.glob('.git-on-install.*')), [])
         return result
 
-    def test_truncated_pipe_payload_never_starts_installation(self):
-        script = SCRIPT.read_text()
-        suffix = script.index('if __name__ == "__main__":')
-        # Each line boundary after main() may still be a syntactically valid
-        # Python file. The shell must wait for the whole enclosing function.
-        boundaries = [index + 1 for index in range(suffix, len(script))
-                      if script[index] == '\n' and index + 1 < script.rfind('GIT_ON_INSTALLER_PYTHON') + len('GIT_ON_INSTALLER_PYTHON')]
-        for boundary in boundaries:
-            with self.subTest(boundary=boundary):
-                self.old.write_bytes(b'old executable\n')
-                (self.releases / 'requests.jsonl').unlink(missing_ok=True)
-                result = subprocess.run(['sh', '-s', '--', '--github-cli'], input=script[:boundary],
-                                        env=self.env, capture_output=True, text=True, timeout=30)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertEqual(self.old.read_bytes(), b'old executable\n')
-                self.assertFalse((self.releases / 'requests.jsonl').exists())
+    def requests(self):
+        path = self.releases / 'requests'
+        return path.read_text().splitlines() if path.exists() else []
 
-    def test_final_invocation_truncation_cannot_drop_arguments(self):
-        script = SCRIPT.read_text()
-        marker = self.root / 'python-argv'
-        python = self.fakebin / 'python3'
-        python.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INSTALLER_PROBE\"\n")
-        python.chmod(0o755)
-        env = dict(self.env, INSTALLER_PROBE=str(marker))
-        start = script.rfind('git_on_install "$@"')
-        # All prefixes shorter than the complete guarded invocation are inert.
-        end = script.rstrip().rfind('}') if script.rstrip().endswith('}') else len(script.rstrip())
-        for boundary in range(start, end + 1):
-            with self.subTest(boundary=boundary):
-                marker.unlink(missing_ok=True)
-                subprocess.run(['sh', '-s', '--', '--github-cli', '--version', '0.1.0', '--bin-dir', '/intended/path'],
-                               input=script[:boundary], env=env, capture_output=True, text=True, timeout=10)
-                self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else '')
-        result = subprocess.run(['sh', '-s', '--', '--github-cli', '--version', '0.1.0', '--bin-dir', '/intended/path'],
-                                input=script.rstrip(), env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(marker.read_text().splitlines(), ['-', '--github-cli', '--version', '0.1.0', '--bin-dir', '/intended/path'])
-
-    def test_latest_install_repeat_and_update_through_pipe(self):
-        result = self.run_script(pipe=True)
-        self.assertIn('v0.1.0', result.stdout)
-        first = self.old.read_bytes()
+    def test_latest_repeat_upgrade_without_python_or_jq(self):
+        for tool in ('python', 'python3', 'jq'):
+            self.assertIsNone(shutil.which(tool, path=self.env['PATH']))
+        self.run_script(pipe=True)
         self.assertEqual(stat.S_IMODE(self.old.stat().st_mode), 0o755)
+        first = self.old.read_bytes()
         self.run_script()
         self.assertEqual(self.old.read_bytes(), first)
         self.release('0.2.0')
         self.run_script()
         self.assertIn(b'git-on 0.2.0', self.old.read_bytes())
-        requests = [json.loads(line) for line in (self.releases / 'requests.jsonl').read_text().splitlines()]
-        self.assertEqual(sum(args[0] == 'api' for args in requests), 3)
-        self.assertTrue(all(args[-1].endswith('/latest') for args in requests if args[0] == 'api'))
+        self.assertEqual(sum('/releases/latest' in r for r in self.requests()), 3)
 
-    def test_specific_version_and_custom_destination(self):
+    def test_latest_is_resolved_once_before_any_asset_request(self):
         self.release('0.2.0')
-        destination = self.root / 'custom bin'
-        self.run_script('--version', 'v0.1.0', '--bin-dir', str(destination))
-        self.assertIn(b'git-on 0.1.0', (destination / 'git-on').read_bytes())
-        self.assertEqual(self.old.read_bytes(), b'old executable\n')
-        requests = [json.loads(line) for line in (self.releases / 'requests.jsonl').read_text().splitlines()]
-        self.assertEqual(requests[0][-1], 'repos/progbeat/git-on/releases/tags/v0.1.0')
+        (self.releases / 'latest').write_text('v0.1.0')
+        (self.releases / 'move-latest').write_text('v0.2.0')
+        self.run_script()
+        self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
+        downloads = [r for r in self.requests() if '/download/' in r]
+        self.assertEqual(len(downloads), 2)
+        self.assertTrue(all('/download/v0.1.0/' in r for r in downloads))
+        self.assertTrue(all("--proto =https --proto-redir =https --tlsv1.2" in r for r in self.requests()))
 
-    def test_partial_download_preserves_old_binary(self):
+    def test_pinned_version_custom_directory_and_legacy_layout(self):
+        self.release('0.2.0')
+        for version in ('0.1.0', 'v0.1.0'):
+            destination = self.root / ('custom bin ' + version)
+            self.run_script('--version', version, '--bin-dir', str(destination))
+            self.assertIn(b'git-on 0.1.0', (destination / 'git-on').read_bytes())
+        self.assertFalse(any('/releases/latest' in r for r in self.requests()))
+
+    def test_gh_latest_and_pinned_need_no_external_jq(self):
+        self.run_script(github_cli=True)
+        self.run_script('--version', 'v0.1.0', github_cli=True)
+        self.assertTrue(all(r.startswith('gh ') for r in self.requests()))
+        self.assertTrue(any('select(.draft == false and .prerelease == false)' in r for r in self.requests()))
+
+    def test_invalid_versions_and_arguments_fail_before_download(self):
+        for version in ('', 'v', '../x', '1.2', '01.2.3', '1.2.3-rc.1', 'latest', '1.2.3\n4.5.6'):
+            with self.subTest(version=version):
+                self.run_script('--version', version, success=False)
+        for args in (['--version'], ['--bin-dir'], ['--unknown'], ['--bin-dir', 'relative'], ['--bin-dir', '/tmp/../bin']):
+            self.run_script(*args, success=False)
+        self.assertFalse(self.requests())
+
+    def test_unexpected_latest_url_and_gh_tag_are_rejected(self):
+        for url in ('http://github.com/progbeat/git-on/releases/tag/v0.1.0',
+                    'https://example.invalid/releases/tag/v0.1.0',
+                    'https://github.com/progbeat/git-on/releases/tag/v0.1.0-rc.1'):
+            (self.releases / 'latest-url').write_text(url)
+            self.run_script(success=False)
+        for tag in ('', 'v0.1.0-rc.1', 'v0.2.0'):
+            (self.releases / 'gh-tag').write_text(tag)
+            self.run_script('--version', '0.1.0', github_cli=True, success=False)
+
+    def test_download_hash_and_manifest_failures_preserve_old_binary(self):
         (self.releases / 'fail-download').touch()
-        self.assertIn('GitHub CLI request failed', self.run_script(success=False).stderr)
+        for gh in (False, True):
+            self.run_script(github_cli=gh, success=False)
+        (self.releases / 'fail-download').unlink()
+        directory, archive = self.release('0.1.0')
+        original = (directory / archive).read_bytes()
+        (directory / archive).write_bytes(original + b'changed')
+        self.assertIn('Checksum', self.run_script(success=False).stderr)
+        (directory / archive).write_bytes(original)
+        sums = (directory / 'SHA256SUMS').read_text()
+        for content in ('', 'garbage\n', sums + sums, sums.replace(archive, '../' + archive)):
+            (directory / 'SHA256SUMS').write_text(content)
+            self.assertIn('SHA256SUMS', self.run_script(success=False).stderr)
 
-    def test_checksum_failure_preserves_old_binary(self):
-        directory = self.releases / 'v0.1.0'
-        path = next(directory.glob('*.tar.gz'))
-        data = bytearray(path.read_bytes())
-        data[-1] ^= 1
-        path.write_bytes(data)
-        self.assertIn('Checksum verification failed', self.run_script(success=False).stderr)
-
-    def test_wrong_binary_version_preserves_old_binary(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        self.release('0.1.0', [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.9.0\n'),
-                               (root + '/README.md', 'file', b'readme')])
+    def test_binary_probe_failure_and_timeout_preserve_old_binary(self):
+        for binary in (b'#!/bin/sh\necho git-on 99.0.0\n', b'broken executable', b'#!/bin/sh\nexit 127\n'):
+            self.release('0.1.0', binary=binary)
+            self.assertIn('version check', self.run_script(success=False).stderr)
+        self.release('0.1.0', binary=b'#!/bin/sh\nexec sleep 60\n')
         self.assertIn('version check', self.run_script(success=False).stderr)
 
-    def test_missing_runtime_library_probe_preserves_old_binary(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        self.release('0.1.0', [(root, 'dir', b''), (root + '/git-on', 'file',
-                              b'#!/bin/sh\necho "libz.so.1: cannot open shared object file" >&2\nexit 127\n'),
-                               (root + '/README.md', 'file', b'readme')])
-        result = self.run_script(success=False)
-        self.assertIn('libz.so.1', result.stderr)
-        self.assertIn('libgcc_s.so.1', result.stderr)
+    def test_version_probe_kills_a_process_ignoring_term(self):
+        self.release('0.1.0', binary=b'#!/bin/sh\ntrap "" TERM\nwhile :; do sleep 1; done\n')
+        timeout = self.fakebin / 'timeout'
+        timeout.unlink()
+        timeout.write_text('#!/bin/sh\nfor arg; do shift; [ "$arg" != 15 ] || arg=1; set -- "$@" "$arg"; done\nexec ' +
+                           shutil.which('timeout') + ' "$@"\n')
+        timeout.chmod(0o755)
+        process = subprocess.Popen(['/bin/sh', str(SCRIPT)], env=self.env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=6)
+            self.assertNotEqual(process.returncode, 0, stdout)
+            self.assertEqual(self.old.read_bytes(), b'old executable\n')
+            self.assertFalse(list(self.bin.glob('.git-on-install.*')))
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
 
-    def test_unsafe_archive_members_preserve_old_binary(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        normal = [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
-                  (root + '/README.md', 'file', b'readme')]
-        cases = [normal + [('../escape', 'file', b'no')],
-                 normal[:1] + [(root + '/git-on', 'symlink', '/tmp/escape')] + normal[2:],
-                 normal[:1] + [(root + '/git-on', 'hardlink', '/tmp/escape')] + normal[2:],
-                 normal + [normal[1]],
-                 normal[:2] + [('/absolute', 'file', b'no')]]
-        for members in cases:
-            with self.subTest(members=members):
-                self.release('0.1.0', members)
-                self.run_script(success=False)
-                self.assertFalse((self.root / 'escape').exists())
+    def test_archive_links_and_duplicate_binary_are_rejected(self):
+        root = 'git-on-v0.1.0-' + TARGET
+        binary = (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n')
+        for members in ([binary, binary], [(root + '/git-on', 'symlink', '/bin/sh')],
+                        [(root + '/git-on', 'hardlink', root + '/other')], [],
+                        [(root + '/git-on', 'dir', b'')]):
+            self.release('0.1.0', members=members)
+            self.run_script(success=False)
 
-    def test_license_member_and_original_release_layout(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        original = [(root, 'dir', b''),
-                    (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
-                    (root + '/README.md', 'file', b'readme')]
-        for extra in ([], [(root + '/LICENSE', 'file', (ROOT / 'LICENSE').read_bytes())]):
-            with self.subTest(licensed=bool(extra)):
-                directory, archive = self.release('0.1.0', original + extra)
-                MOD.verify(directory, 'v0.1.0', archive)
-                expanded, (offset, size) = MOD.unpack_binary(directory, archive)
-                with expanded.open('rb') as source:
-                    source.seek(offset)
-                    self.assertEqual(source.read(size), original[1][2])
+    def test_duplicate_members_cannot_bypass_guard_with_early_exit(self):
+        root = 'git-on-v0.1.0-' + TARGET
+        # Concatenation still prints one valid version if the first script exits.
+        # A version probe alone therefore cannot detect duplicate members.
+        binary = (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\nexit 0\n')
+        self.release('0.1.0', members=[binary, binary])
+        self.run_script(success=False)
 
-    def test_license_member_cannot_bypass_archive_checks(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        original = [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\n'),
-                    (root + '/README.md', 'file', b'readme')]
-        license_member = (root + '/LICENSE', 'file', b'license')
-        cases = [[license_member, license_member],
-                 [(root + '/LICENSE', 'symlink', '/tmp/license')],
-                 [(root + '/LICENSE', 'hardlink', root + '/README.md')],
-                 [(root + '/LICENSE', 'file', bytes(MOD.MAX_METADATA + 1))]]
-        for extra in cases:
-            with self.subTest(extra=extra[0][:2], duplicate=len(extra) > 1):
-                directory, archive = self.release('0.1.0', original + extra)
-                with self.assertRaises(RuntimeError):
-                    MOD.unpack_binary(directory, archive)
-                self.assertEqual(self.old.read_bytes(), b'old executable\n')
+    def test_only_fixed_binary_bytes_are_extracted(self):
+        root = 'git-on-v0.1.0-' + TARGET
+        outside = self.root / 'escape'
+        self.release('0.1.0', members=[(root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
+            (str(outside), 'file', b'no'), ('../../escape', 'file', b'no'),
+            (root + '/link', 'symlink', str(outside))])
+        self.run_script()
+        self.assertFalse(outside.exists())
+        self.assertFalse((self.bin / 'escape').exists())
+        self.assertEqual(sorted(p.name for p in self.bin.iterdir()), ['git-on'])
 
-    def test_reject_symlink_destination_and_parent(self):
+    def test_destination_symlinks_directories_and_permissions(self):
         outside = self.root / 'outside'
         outside.write_bytes(b'keep')
         self.old.unlink()
         self.old.symlink_to(outside)
-        result = subprocess.run(['sh', str(SCRIPT), '--github-cli'], env=self.env, capture_output=True, text=True)
+        result = subprocess.run(['/bin/sh', str(SCRIPT)], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('symlink', result.stderr)
-        self.assertEqual(outside.read_bytes(), b'keep')
         self.assertTrue(self.old.is_symlink())
-        link = self.root / 'linked'
-        link.symlink_to(self.bin, target_is_directory=True)
-        result = subprocess.run(['sh', str(SCRIPT), '--bin-dir', str(link)], env=self.env, capture_output=True, text=True)
-        self.assertIn('symlink', result.stderr)
-
-    def test_invalid_versions_fail_before_download(self):
-        for value in ('../x', '1.2', '01.2.3', '1.2.3-rc.1', 'latest', 'v1.2.3;touch /tmp/x'):
-            with self.subTest(value=value):
-                self.assertIn('stable version', self.run_script('--version', value, success=False).stderr)
-        self.assertFalse((self.releases / 'requests.jsonl').exists())
-
-    def test_reject_unsafe_release_selection(self):
-        directory = self.releases / 'v0.1.0'
-        original = json.loads((directory / 'api.json').read_text())
-        cases = []
-        for field, value in [('draft', True), ('prerelease', True), ('tag_name', 'v0.1.0-rc.1')]:
-            data = json.loads(json.dumps(original))
-            data[field] = value
-            cases.append(data)
-        data = json.loads(json.dumps(original))
-        data['assets'][0]['browser_download_url'] = 'https://example.com/evil'
-        cases.append(data)
-        data = json.loads(json.dumps(original))
-        data['assets'].append(data['assets'][0])
-        cases.append(data)
-        data = json.loads(json.dumps(original))
-        data['assets'][0]['name'] = '../evil'
-        cases.append(data)
-        for data in cases:
-            with self.subTest(data=data):
-                (directory / 'api.json').write_text(json.dumps(data))
-                self.run_script(success=False)
-
-    def test_checksum_manifest_and_release_metadata_validation(self):
-        directory, archive = self.release('0.1.0')
-        original = (directory / 'SHA256SUMS').read_text()
-        for text in (original + original.splitlines()[0] + '\n', original.replace('release.json', '../release.json'),
-                     original.splitlines()[0] + '\n', original + 'invalid\n'):
-            (directory / 'SHA256SUMS').write_text(text)
-            self.api(directory, 'v0.1.0', archive)
-            self.assertIn('SHA256SUMS', self.run_script(success=False).stderr)
-        (directory / 'release.json').write_text(json.dumps({'version': '0.2.0'}))
-        self.checksums(directory, archive)
-        self.api(directory, 'v0.1.0', archive)
-        self.assertIn('metadata does not match', self.run_script(success=False).stderr)
-
-    def test_platform_and_libc_preflight(self):
-        for system, architecture, libc in [('Darwin', 'x86_64', 'glibc 2.35'),
-            ('Linux', 'aarch64', 'glibc 2.35'), ('Linux', 'x86_64', 'glibc 2.34'),
-            ('Linux', 'x86_64', ''), ('Linux', 'x86_64', 'musl 1.2')]:
-            with self.subTest(system=system, architecture=architecture, libc=libc), \
-                    patch.object(MOD.platform, 'system', return_value=system), \
-                    patch.object(MOD.platform, 'machine', return_value=architecture), \
-                    patch.object(MOD.os, 'confstr', return_value=libc), self.assertRaises(RuntimeError):
-                MOD.supported_host()
-        with patch.object(MOD.os, 'geteuid', return_value=0), self.assertRaisesRegex(RuntimeError, 'without sudo'):
-            MOD.supported_host()
-
-    def test_https_transport_limits_and_truncation(self):
-        class Response(io.BytesIO):
-            headers = {'Content-Length': '10'}
-        response = Response(b'short')
-        opener = unittest.mock.Mock()
-        opener.open.return_value = response
-        with patch.object(MOD.urllib.request, 'build_opener', return_value=opener), self.assertRaisesRegex(RuntimeError, 'truncated'):
-            MOD.download('https://example.com/file', self.root / 'download', 100)
-        opener.open.return_value = Response(b'short')
-        with patch.object(MOD.urllib.request, 'build_opener', return_value=opener), self.assertRaisesRegex(RuntimeError, 'oversized'):
-            MOD.download('https://example.com/file', self.root / 'download', 5)
-        request = MOD.urllib.request.Request('https://example.com')
-        with self.assertRaisesRegex(RuntimeError, 'non-HTTPS'):
-            MOD.HTTPSOnly().redirect_request(request, None, 302, '', {}, 'http://example.com/file')
+        self.assertEqual(outside.read_bytes(), b'keep')
+        self.old.unlink()
+        self.old.mkdir()
+        result = subprocess.run(['/bin/sh', str(SCRIPT)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.old.rmdir()
+        self.old.write_bytes(b'old executable\n')
+        alias = self.root / 'alias'
+        alias.symlink_to(self.bin)
+        self.run_script('--bin-dir', str(alias), success=False)
+        for mode in (0o775, 0o777, 0o555):
+            self.bin.chmod(mode)
+            try:
+                self.assertIn('--bin-dir', self.run_script(success=False).stderr)
+            finally:
+                self.bin.chmod(0o755)
 
     def test_replace_failure_preserves_old_binary(self):
-        directory, archive = self.release('0.1.0')
-        with patch.object(MOD.os, 'replace', side_effect=OSError('replacement failed')), self.assertRaises(OSError):
-            MOD.install(directory, archive, 'v0.1.0', self.bin)
-        self.assertEqual(self.old.read_bytes(), b'old executable\n')
-        self.assertFalse(list(self.bin.glob('.git-on-install-*')))
+        (self.fakebin / 'mv').unlink()
+        (self.fakebin / 'mv').write_text('#!/bin/sh\nexit 1\n')
+        (self.fakebin / 'mv').chmod(0o755)
+        self.run_script(success=False)
 
-    def test_hidden_extended_headers_and_unexpected_types_are_rejected(self):
-        directory, archive = self.release('0.1.0')
-        ordinary_tar = gzip.decompress((directory / archive).read_bytes())
-        for kind, size in ((tarfile.XHDTYPE, 2 * 1024 * 1024),
-                           (tarfile.GNUTYPE_LONGNAME, 2 * 1024 * 1024),
-                           (tarfile.GNUTYPE_SPARSE, 0), (tarfile.CONTTYPE, 0)):
-            with self.subTest(kind=kind):
-                header = tarfile.TarInfo('ignored extended metadata')
-                header.type, header.size = kind, size
-                payload = header.tobuf(format=tarfile.GNU_FORMAT) + bytes(size)
-                (directory / archive).write_bytes(gzip.compress(payload + ordinary_tar))
-                self.checksums(directory, archive)
-                self.api(directory, 'v0.1.0', archive)
-                self.assertIn('unsafe paths', self.run_script(success=False).stderr)
-        root = archive[:-7]
-        for kind in (tarfile.GNUTYPE_SPARSE, tarfile.CONTTYPE):
-            binary_header = tarfile.TarInfo(root + '/git-on')
-            binary_header.type = kind
-            binary_header.size = 32
-            # Replace the real binary header while retaining its data and names.
-            raw = bytearray(ordinary_tar)
-            raw[512:1024] = binary_header.tobuf(format=tarfile.GNU_FORMAT)
-            (directory / archive).write_bytes(gzip.compress(raw))
-            self.checksums(directory, archive)
-            self.api(directory, 'v0.1.0', archive)
-            self.assertIn('unexpected member type', self.run_script(success=False).stderr)
+    def test_directory_swap_before_cd_cannot_redirect_installation(self):
+        outside = self.root / 'outside-bin'
+        outside.mkdir(mode=0o755)
+        (outside / 'git-on').write_bytes(b'outside executable\n')
+        saved = self.root / 'saved-bin'
+        mkdir = self.fakebin / 'mkdir'
+        mkdir.unlink()
+        mkdir.write_text('#!/bin/sh\n' + shutil.which('mv') + ' -- "$RACE_BIN" "$RACE_SAVED"\n' +
+                         shutil.which('ln') + ' -s -- "$RACE_OUTSIDE" "$RACE_BIN"\nexec ' +
+                         shutil.which('mkdir') + ' "$@"\n')
+        mkdir.chmod(0o755)
+        result = subprocess.run(['/bin/sh', str(SCRIPT)], capture_output=True, text=True,
+            env=dict(self.env, RACE_BIN=str(self.bin), RACE_SAVED=str(saved), RACE_OUTSIDE=str(outside)), timeout=30)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((saved / 'git-on').read_bytes(), b'old executable\n')
+        self.assertEqual((outside / 'git-on').read_bytes(), b'outside executable\n')
 
-    def test_expanded_archive_and_readme_limits(self):
-        directory, archive = self.release('0.1.0')
-        with patch.object(MOD, 'MAX_ARCHIVE', 100), patch.object(MOD, 'MAX_METADATA', 100):
-            (directory / archive).write_bytes(gzip.compress(bytes(2 * 1024 * 1024)))
-            with self.assertRaisesRegex(RuntimeError, 'Expanded archive'):
-                MOD.unpack_binary(directory, archive)
-        root = archive[:-7]
-        self.release('0.1.0', [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\necho git-on 0.1.0\n'),
-                               (root + '/README.md', 'file', bytes(MOD.MAX_METADATA + 1))])
-        self.assertIn('size limit', self.run_script(success=False).stderr)
+    def test_platform_and_dependency_failures_before_download(self):
+        for name, source in [('uname', '#!/bin/sh\necho unsupported\n'),
+                             ('getconf', '#!/bin/sh\necho glibc 2.34\n'),
+                             ('id', '#!/bin/sh\necho 0\n')]:
+            tool = self.fakebin / name
+            original = tool.readlink()
+            tool.unlink()
+            tool.write_text(source)
+            tool.chmod(0o755)
+            self.run_script(success=False)
+            tool.unlink()
+            tool.symlink_to(original)
+        (self.fakebin / 'sha256sum').unlink()
+        self.assertIn('sha256sum', self.run_script(success=False).stderr)
+        self.assertFalse(self.requests())
 
-    def test_anonymous_latest_and_pinned_install_use_one_release(self):
-        directory, archive = self.release('0.1.0')
-        def fake_download(url, destination, limit):
-            if url.startswith('https://api.github.com/'):
-                shutil.copyfile(directory / 'api.json', destination)
-            else:
-                self.assertTrue(url.startswith('https://github.com/progbeat/git-on/releases/download/v0.1.0/'))
-                shutil.copyfile(directory / url.rsplit('/', 1)[1], destination)
-        for arguments, endpoint in (([], 'latest'), (['--version', '0.1.0'], 'tags/v0.1.0')):
-            with patch.object(MOD, 'download', side_effect=fake_download) as download, \
-                    patch.object(MOD, 'gh', side_effect=AssertionError('Unexpected authentication')), \
-                    patch('sys.stdout', new_callable=io.StringIO):
-                MOD.main(['--bin-dir', str(self.bin), *arguments])
-            self.assertEqual(download.call_count, 4)
-            self.assertEqual(download.call_args_list[0].args[0], 'https://api.github.com/repos/progbeat/git-on/releases/' + endpoint)
-            self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
-
-    def test_bad_metadata_shapes_fail_cleanly(self):
-        directory = self.releases / 'v0.1.0'
-        original = json.loads((directory / 'api.json').read_text())
-        bad_names = []
-        for name in ([], {}):
-            data = json.loads(json.dumps(original))
-            data['assets'][0]['name'] = name
-            bad_names.append(data)
-        for data in ([], None, dict(original, assets=[None, None, None]), *bad_names):
-            (directory / 'api.json').write_text(json.dumps(data))
-            result = self.run_script(success=False)
-            self.assertNotIn('Traceback', result.stderr)
-        directory, archive = self.release('0.1.0')
-        for data in ([], None, {'version': '0.1.0', 'target': MOD.TARGET,
-                              'baseline': 'Ubuntu 22.04 / glibc 2.35', 'commit': None}):
-            (directory / 'release.json').write_text(json.dumps(data))
-            self.checksums(directory, archive)
-            self.api(directory, 'v0.1.0', archive)
-            result = self.run_script(success=False)
-            self.assertNotIn('Traceback', result.stderr)
-
-    def test_python_version_relative_directory_and_shared_directory(self):
-        with patch.object(MOD.sys, 'version_info', (3, 7)), self.assertRaisesRegex(RuntimeError, 'Python 3.8'):
-            MOD.supported_host()
-        self.assertIn('absolute path', self.run_script('--bin-dir', 'relative', success=False).stderr)
-        self.bin.chmod(0o777)
-        error = self.run_script(success=False).stderr
-        self.assertIn('group-write is enabled', error)
-        self.assertIn('other-write is enabled', error)
-
-    def test_owned_group_writable_directory_has_precise_conditional_advice(self):
-        self.bin.chmod(0o775)
-        info = self.bin.stat()
-        result = self.run_script(success=False)
-        for detail in (str(self.bin), '0775', pwd.getpwuid(info.st_uid).pw_name,
-                       grp.getgrgid(info.st_gid).gr_name, 'group-write', 'chmod g-w',
-                       'if group-write is not needed', '--bin-dir'):
-            self.assertIn(detail, result.stderr)
-        self.assertNotIn('other users have access', result.stderr)
-        self.assertNotIn('chmod -R', result.stderr)
-        self.assertNotIn('sudo chmod', result.stderr)
-        self.assertEqual(stat.S_IMODE(self.bin.stat().st_mode), 0o775)
-
-    def test_other_writable_directory_is_distinguished_from_group_write(self):
-        self.bin.chmod(0o757)
-        result = self.run_script(success=False)
-        self.assertIn('0757', result.stderr)
-        self.assertIn('other-write', result.stderr)
-        self.assertNotIn('group-write is enabled', result.stderr)
-        self.assertNotIn('chmod g-w', result.stderr)
-        self.assertIn('--bin-dir', result.stderr)
-        self.assertEqual(stat.S_IMODE(self.bin.stat().st_mode), 0o757)
-
-    def test_foreign_owner_never_gets_permission_change_advice(self):
-        info = self.bin.stat()
-        foreign = SimpleNamespace(st_uid=info.st_uid + 100000, st_gid=info.st_gid,
-                                  st_mode=stat.S_IFDIR | 0o775)
-        with patch.object(MOD.os, 'fstat', return_value=foreign):
-            with self.assertRaises(RuntimeError) as outcome:
-                MOD.open_bin_dir(self.bin)
-        message = str(outcome.exception)
-        for detail in (str(self.bin), '0775', str(foreign.st_uid), 'different owner',
-                       'group-write', '--bin-dir'):
-            self.assertIn(detail, message)
-        self.assertNotIn('chmod', message)
-
-    def test_success_has_shell_quoted_path_advice_only_when_missing(self):
-        result = self.run_script()
-        self.assertIn('export PATH=', result.stdout)
-        self.assertIn('"$PATH"', result.stdout)
-        self.assertNotIn('Run this same installer again', result.stdout)
-        self.env['PATH'] = str(self.bin) + os.pathsep + self.env['PATH']
-        result = self.run_script()
-        self.assertNotIn('export PATH=', result.stdout)
-        self.assertNotIn('to your PATH', result.stdout)
-        self.env['PATH'] = str(self.bin) + '/' + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
-        self.assertNotIn('export PATH=', self.run_script().stdout)
-
-    def test_success_identifies_an_earlier_executable_without_running_it(self):
-        earlier = self.fakebin / 'git-on'
-        marker = self.root / 'shadow-was-executed'
-        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
-        earlier.write_bytes(content)
-        earlier.chmod(0o755)
-        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
-        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
-        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
-        result = self.run_script()
-        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
-        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
-        self.assertNotIn('export PATH=', result.stdout)
-        self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
-        self.assertEqual(earlier.read_bytes(), content)
-        self.assertFalse(marker.exists())
-
-    def test_no_shadow_warning_when_installed_binary_is_first_on_path(self):
-        later = self.fakebin / 'git-on'
-        marker = self.root / 'shadow-was-executed'
-        later.write_bytes(b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\n')
-        later.chmod(0o755)
-        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
-        self.env['PATH'] = str(self.bin) + os.pathsep + str(self.fakebin) + os.pathsep + os.environ['PATH']
-        result = self.run_script()
-        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(self.old))
-        self.assertNotIn('PATH selects', result.stdout)
-        self.assertNotIn('export PATH=', result.stdout)
-        self.assertFalse(marker.exists())
-
-    def test_path_alias_of_installed_binary_is_not_a_shadow(self):
-        alias = self.fakebin / 'git-on'
-        alias.symlink_to(self.old)
-        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(self.bin) + os.pathsep + os.environ['PATH']
-        result = self.run_script()
-        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(alias))
-        self.assertTrue(os.path.samefile(alias, self.old))
-        self.assertNotIn('PATH selects', result.stdout)
-        self.assertNotIn('export PATH=', result.stdout)
-
-    def test_symlinked_path_directory_selects_installed_binary_without_guidance(self):
-        alias = self.root / 'bin directory alias'
-        alias.symlink_to(self.bin, target_is_directory=True)
+    def test_path_aliases_and_shadow_diagnostics_do_not_execute_old_binary(self):
+        alias = self.root / 'bin alias'
+        alias.symlink_to(self.bin)
         self.env['PATH'] = str(alias) + os.pathsep + self.env['PATH']
-        result = self.run_script()
-        selected = shutil.which('git-on', path=self.env['PATH'])
-        self.assertEqual(selected, str(alias / 'git-on'))
-        self.assertTrue(os.path.samefile(selected, self.old))
-        self.assertNotIn('export PATH=', result.stdout)
-        self.assertNotIn('PATH selects', result.stdout)
-        self.assertTrue(alias.is_symlink())
-
-    def test_symlinked_path_directory_does_not_hide_an_earlier_executable(self):
-        alias = self.root / 'bin directory alias'
-        alias.symlink_to(self.bin, target_is_directory=True)
+        self.assertNotIn('PATH selects', self.run_script().stdout)
+        marker = self.root / 'executed-shadow'
         earlier = self.fakebin / 'git-on'
-        marker = self.root / 'shadow-was-executed'
-        content = b'#!/bin/sh\n: > "$INSTALLER_SHADOW_EXECUTED"\nprintf "old git-on\\n"\n'
-        earlier.write_bytes(content)
+        earlier.write_text('#!/bin/sh\n: > "' + str(marker) + '"\n')
         earlier.chmod(0o755)
-        self.env['INSTALLER_SHADOW_EXECUTED'] = str(marker)
-        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(alias) + os.pathsep + os.environ['PATH']
-        result = self.run_script()
-        self.assertEqual(shutil.which('git-on', path=self.env['PATH']), str(earlier))
-        self.assertIn('PATH selects ' + MOD.shlex.quote(str(earlier)) + ' before this installation', result.stdout)
-        self.assertIn(MOD.shlex.quote(str(self.old)) + ' --version', result.stdout)
-        self.assertNotIn('export PATH=', result.stdout)
+        self.env['PATH'] = str(self.fakebin) + os.pathsep + str(alias)
+        self.assertIn('PATH selects', self.run_script().stdout)
         self.assertFalse(marker.exists())
-        self.assertEqual(earlier.read_bytes(), content)
-        self.assertTrue(alias.is_symlink())
 
-    def test_owner_write_missing_names_directory_mode_and_safe_alternative(self):
-        self.bin.chmod(0o555)
-        self.addCleanup(lambda: self.bin.chmod(0o755))
-        error = self.run_script(success=False).stderr
-        for detail in (str(self.bin), '0555', 'owner-write', '--bin-dir'):
-            self.assertIn(detail, error)
-        self.assertNotIn('chmod', error)
+    def test_relative_and_empty_path_entries_survive_directory_pinning(self):
+        for path in ('tools', ':tools', 'tools:'):
+            result = subprocess.run(['/bin/sh', str(SCRIPT)], cwd=self.root,
+                env=dict(self.env, PATH=path), capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_version_timeout_cleans_staging_and_preserves_old_binary(self):
-        directory, archive = self.release('0.1.0')
-        with patch.object(MOD.subprocess, 'run', side_effect=subprocess.TimeoutExpired('git-on', 15)), \
-                self.assertRaises(subprocess.TimeoutExpired):
-            MOD.install(directory, archive, 'v0.1.0', self.bin)
-        self.assertEqual(self.old.read_bytes(), b'old executable\n')
-        self.assertFalse(list(self.bin.glob('.git-on-install-*')))
+    def test_truncated_pipe_does_not_start_or_drop_arguments(self):
+        source = SCRIPT.read_text()
+        start = source.rfind('{ git_on_install')
+        boundaries = [i+1 for i,c in enumerate(source) if c=='\n' and i+1<=start]
+        boundaries += list(range(start, len(source.rstrip())))
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                subprocess.run(['/bin/sh', '-s', '--', '--version', '0.1.0'], input=source[:boundary],
+                               env=self.env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(self.old.read_bytes(), b'old executable\n')
+                self.assertFalse(self.requests())
 
     def test_interruption_cleans_staging_and_preserves_old_binary(self):
-        root = 'git-on-v0.1.0-' + MOD.TARGET
-        self.release('0.1.0', [(root, 'dir', b''), (root + '/git-on', 'file', b'#!/bin/sh\nexec sleep 60\n'),
-                               (root + '/README.md', 'file', b'readme')])
-        process = subprocess.Popen(['sh', str(SCRIPT), '--github-cli'], env=self.env,
+        self.release('0.1.0', binary=b'#!/bin/sh\nexec sleep 60\n')
+        process = subprocess.Popen(['/bin/sh', str(SCRIPT)], env=self.env, start_new_session=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 10
-            while not list(self.bin.glob('.git-on-install-*')) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(list(self.bin.glob('.git-on-install-*')))
-            process.send_signal(signal.SIGTERM)
+            while not list(self.bin.glob('.git-on-install.*/git-on')) and time.monotonic()<deadline:
+                time.sleep(.02)
+            self.assertTrue(list(self.bin.glob('.git-on-install.*/git-on')))
+            os.killpg(process.pid, signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=10)
             self.assertNotEqual(process.returncode, 0, stdout)
-            self.assertIn('interrupted', stderr)
             self.assertEqual(self.old.read_bytes(), b'old executable\n')
-            self.assertFalse(list(self.bin.glob('.git-on-install-*')))
+            self.assertFalse(list(self.bin.glob('.git-on-install.*')))
         finally:
             if process.poll() is None:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
+
+    def test_signal_after_atomic_commit_reports_no_false_rollback(self):
+        mv = self.fakebin / 'mv'
+        mv.unlink()
+        mv.write_text('#!/bin/sh\n' + shutil.which('mv') + ' "$@" || exit\nkill -TERM "$PPID"\n')
+        mv.chmod(0o755)
+        result = subprocess.run(['/bin/sh', str(SCRIPT)], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'git-on 0.1.0', self.old.read_bytes())
+        self.assertNotIn('unchanged', result.stderr)
+        self.assertFalse(list(self.bin.glob('.git-on-install.*')))
 
 
 def packaged_acceptance(distribution, destination):
@@ -608,18 +416,19 @@ def packaged_acceptance(distribution, destination):
     try:
         version = json.loads((distribution / 'release.json').read_text())['version']
         case.release(version, distribution=distribution)
-        archive = distribution / ('git-on-v' + version + '-' + MOD.TARGET + '.tar.gz')
-        with tarfile.open(archive, 'r:gz') as package:
-            license_file = package.extractfile(archive.name[:-7] + '/LICENSE')
-            if license_file is None or license_file.read() != (ROOT / 'LICENSE').read_bytes():
-                raise RuntimeError('Packaged license differs from the source license')
-        case.run_script('--bin-dir', str(destination))
-        case.run_script('--bin-dir', str(destination))
-        binary = destination / 'git-on'
-        result = subprocess.run([str(binary), '--version'], capture_output=True, text=True, check=True)
-        if result.stdout.strip() != 'git-on ' + version:
-            raise RuntimeError('Installed packaged version differs')
-        print('Verified the actual distribution through install.sh, including repeat installation: ' + str(binary))
+        archive = 'git-on-v' + version + '-' + TARGET + '.tar.gz'
+        # Freeze the legacy publication contract: extra assets/checksum entries
+        # break saved Python installers. No release repacking is necessary.
+        assert {p.name for p in distribution.iterdir() if p.is_file()} == {archive, 'release.json', 'SHA256SUMS'}
+        assert {line.split()[1] for line in (distribution/'SHA256SUMS').read_text().splitlines()} == {archive, 'release.json'}
+        with tarfile.open(distribution / archive, 'r:gz') as package:
+            license_file = package.extractfile(archive[:-7] + '/LICENSE')
+            assert license_file.read() == (ROOT / 'LICENSE').read_bytes()
+        for args in ([], ['--version', version], ['--version', 'v'+version]):
+            case.run_script('--bin-dir', str(destination), *args)
+        result = subprocess.run([str(destination/'git-on'), '--version'], capture_output=True, text=True, check=True)
+        assert result.stdout.strip() == 'git-on ' + version
+        print('Installed real packaged binary using shell, latest/pinned/repeat paths; Python/jq absent from installer PATH')
     finally:
         case.doCleanups()
 

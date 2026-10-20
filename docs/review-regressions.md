@@ -1359,3 +1359,39 @@ The authentic helper is retained at
 Red/green evidence is in
 `target/git-operands-{red,green}/copilot-recording-stage-identity.txt`.
 Runtime source, version, executable and animation are unchanged.
+
+## POSIX installer review (2026-10-20)
+
+The shell rewrite preserves the published three-asset release format. Independent
+review found five defects in working candidates before publication. Each gained
+a permanent black-box regression in `tests/test_installer.py` and was observed
+failing before its fix:
+
+- `test_duplicate_members_cannot_bypass_guard_with_early_exit`: a duplicate tar
+  binary ending in `exit 0` installed successfully in candidate SHA-256
+  `7c0207b3bbebb16289b839a1908e6d941783d0d76867080f0346aa436ba13652`.
+  `set -e` is suppressed inside a conditional subshell; explicit failure exits now
+  guard every archive-reading step.
+- `test_directory_swap_before_cd_cannot_redirect_installation`: a controlled
+  `mkdir` wrapper replaced the checked directory with a symlink. Without the
+  post-`cd` physical-path check, installation returned success and replaced the
+  foreign binary. The physical-path check now fails before staging.
+- `test_relative_and_empty_path_entries_survive_directory_pinning`: candidate
+  SHA-256 `cd232c99dbcb296a40a0afc85308d813760da1f1177ed85bb3b9c81cbb6fd39b`
+  returned 127 (`stat: not found`) for `PATH=tools`. Entries are now made absolute
+  relative to the invocation directory before `cd`.
+- `test_signal_after_atomic_commit_reports_no_false_rollback`: a signal from a
+  wrapper after successful `mv` produced a false “unchanged” diagnostic despite
+  the new executable being installed. Interrupt diagnostics now avoid claiming
+  rollback after the atomic commit; pre-commit preservation is tested separately.
+- `test_version_probe_kills_a_process_ignoring_term`: a shortened test timeout
+  could not stop a fixture ignoring SIGTERM and exceeded the six-second harness
+  deadline. `--kill-after=2` now bounds both archive commands and the executable
+  probe. The shortened deadline is test-only; production keeps a 15-second probe.
+
+Focused regressions and the complete shell-installer suite pass after these
+fixes. The Docker acceptance additionally installs the actual executable through
+latest/pinned/upgrade paths with no Python/jq anywhere in its root filesystem,
+network disabled, and verifies download/checksum failure preservation. These are
+installation checks, not evidence of a real FUSE mount; exact-head CI separately
+supplies real-mount acceptance.
