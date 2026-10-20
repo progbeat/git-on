@@ -206,10 +206,25 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 `python3 tests/test_installer.py` runs offline latest/pinned release selection,
 repeat installation, updates, checksum/download failure preservation, unsafe
 archives/destinations, platform checks, and atomic replacement regressions.
-A fake GitHub CLI fixture exercises the actual `sh install.sh` entrypoint without
-network access; unit-level transport fixtures cover the anonymous HTTPS path.
+Shell curl/gh transport fixtures exercise the actual `sh install.sh` entrypoint
+with an explicit tools-only PATH containing no Python or jq. Tests cover
+one-time latest resolution, pinned original/current archive layouts, checksum and
+download failures, duplicates/links, destination races, signals, relative PATH,
+replacement failure and incomplete piped scripts.
+Focused regressions also cover fresh destinations under `umask 0002`, probe
+children holding stdout, shell metacharacters in diagnostic paths, and duplicate
+checksum entries in the legacy compatibility guard.
+
+`python3 tests/installer_smoke.py --binary target/debug/git-on` constructs a
+minimal Docker root filesystem from local utilities/shared libraries. Python and
+jq are absent from that filesystem. With the network disabled and root filesystem
+read-only, it installs the actual binary through latest/pinned paths, upgrades,
+and verifies download/checksum failure preservation. No registry image or package
+download is needed; Python runs only in the external developer test harness.
 
 The Ubuntu 22.04 `package` job passes the actual release assets to
 `python3 tests/test_installer.py --dist dist --install-dir "$PWD/installed"`, then
-runs the complete real-FUSE integration suite against `installed/git-on`.
+runs the complete real-FUSE integration suite against `installed/git-on`. The
+acceptance test also guards the legacy three-asset/two-checksum-entry contract
+and verifies the distributed LICENSE.
 Installer fixtures are not a substitute for that packaged-binary mount test.

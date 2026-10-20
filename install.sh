@@ -1,433 +1,192 @@
 #!/bin/sh
-# Install or update git-on. The entire payload is parsed before main() can run.
+# Define the whole payload before invoking it, including when piped to sh.
 git_on_install() {
 set -eu
-if ! command -v python3 >/dev/null 2>&1; then
-    printf '%s\n' 'git-on installer: Python 3.8+ is required; install it with your distribution tools.' >&2
-    exit 1
+LC_ALL=C
+export LC_ALL
+fail() { printf 'git-on installer: %s\n' "$*" >&2; exit 1; }
+version_ok() {
+    printf '%s\n' "$1" | awk '
+        NR!=1 {bad=1}
+        !/^[0-9]+\.[0-9]+\.[0-9]+$/ {bad=1}
+        /^[0-9]+\.[0-9]+\.[0-9]+$/ {
+            n=split($0,a,"."); for(i=1;i<=n;i++) if(length(a[i])>1 && substr(a[i],1,1)=="0") exit 1
+            ok=1
+        }
+        END { if(!ok || bad) exit 1 }'
+}
+version=
+version_requested=0
+bin_dir=${HOME:-}/.local/bin
+use_gh=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --version|--bin-dir)
+            [ "$#" -ge 2 ] || fail "$1 needs a value"
+            case $1 in --version) version=${2#v}; version_requested=1;; --bin-dir) bin_dir=$2;; esac
+            shift 2;;
+        --github-cli) use_gh=1; shift;;
+        -h|--help)
+            printf '%s\n' 'Usage: sh install.sh [--version VERSION] [--bin-dir /absolute/path] [--github-cli]' \
+                'Install/update git-on for Linux x86_64, glibc 2.35+, without sudo.'
+            exit 0;;
+        *) fail "Unknown argument: $1";;
+    esac
+done
+# Preserve relative/empty PATH entries when pinning the destination with cd.
+initial_pwd=$(pwd -P)
+remaining_path=${PATH:-}
+absolute_path=
+separator=
+while :; do
+    entry=${remaining_path%%:*}
+    case $entry in /*) ;; *) entry=$initial_pwd/${entry:-.};; esac
+    absolute_path=$absolute_path$separator$entry
+    separator=:
+    case $remaining_path in *:*) remaining_path=${remaining_path#*:};; *) break;; esac
+done
+PATH=$absolute_path
+export PATH
+for tool in awk cat chmod getconf gzip id mkdir mktemp mv rm sha256sum stat tar timeout uname; do
+    command -v "$tool" >/dev/null 2>&1 || fail "Required tool is missing: $tool (GNU coreutils, tar and gzip are needed)"
+done
+if [ "$version_requested" -eq 1 ]; then
+    version_ok "$version" || fail '--version must be a stable version such as 1.2.0 or v1.2.0'
 fi
-exec python3 - "$@" <<'GIT_ON_INSTALLER_PYTHON'
-import argparse
-import hashlib
-import gzip
-import json
-import os
-import pwd
-import grp
-from pathlib import Path
-import platform
-import re
-import shutil
-import secrets
-import shlex
-import signal
-import stat
-import subprocess
-import sys
-import tarfile
-import tempfile
-import urllib.error
-import urllib.request
-
-REPO = "progbeat/git-on"
-TARGET = "x86_64-unknown-linux-gnu"
-VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-MAX_ARCHIVE = 128 * 1024 * 1024
-MAX_METADATA = 1024 * 1024
-
-
-def fail(message):
-    raise RuntimeError(message)
-
-
-def supported_host():
-    if sys.version_info < (3, 8):
-        fail("Python 3.8 or newer is required.")
-    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
-        fail("Prebuilt releases support Linux x86_64 only; build from source on other Linux architectures.")
-    try:
-        libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
-    except (ValueError, OSError):
-        libc = ""
-    match = re.fullmatch(r"glibc ([0-9]+)\.([0-9]+)", libc)
-    if not match or tuple(map(int, match.groups())) < (2, 35):
-        fail("This binary needs glibc 2.35 or newer (Ubuntu 22.04 baseline); musl/Alpine is not supported.")
-    if os.geteuid() == 0:
-        fail("Run this installer as your normal user, without sudo.")
-
-
-class HTTPSOnly(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, message, headers, url):
-        if not url.startswith("https://"):
-            fail("Refusing a non-HTTPS download redirect.")
-        return super().redirect_request(request, fp, code, message, headers, url)
-
-
-def download(url, destination, limit):
-    # No tokens are read, passed in URLs, or forwarded to redirected asset hosts.
-    request = urllib.request.Request(url, headers={"User-Agent": "git-on-installer", "Accept": "application/vnd.github+json"})
-    opener = urllib.request.build_opener(HTTPSOnly())
-    with opener.open(request, timeout=30) as response, destination.open("wb") as output:
-        length = response.headers.get("Content-Length")
-        if length is not None and (not length.isdigit() or int(length) > limit):
-            fail("Download has an invalid or oversized Content-Length.")
-        total = 0
-        while True:
-            chunk = response.read(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                fail("Download exceeds the size limit.")
-            output.write(chunk)
-        if length is not None and total != int(length):
-            fail("Download was truncated.")
-
-
-def gh(*args):
-    # Use only the caller's existing GitHub CLI authentication. Never print its output on error.
-    result = subprocess.run(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
-    if result.returncode:
-        fail("GitHub CLI request failed. Check gh auth status and repository/release access.")
-    return result.stdout
-
-
-def get_release(version, use_gh, directory):
-    endpoint = "latest" if version is None else "tags/v" + version
-    path = "repos/" + REPO + "/releases/" + endpoint
-    if use_gh:
-        if not shutil.which("gh"):
-            fail("--github-cli requires an already authenticated GitHub CLI (gh).")
-        data = gh("api", "--hostname", "github.com", path)
-        if len(data) > MAX_METADATA:
-            fail("Release metadata exceeds the size limit.")
-    else:
-        metadata = directory / "github-release.json"
-        download("https://api.github.com/" + path, metadata, MAX_METADATA)
-        data = metadata.read_bytes()
-    release = json.loads(data)
-    if not isinstance(release, dict):
-        fail("Release metadata must be an object.")
-    tag = release.get("tag_name", "")
-    if not isinstance(tag, str) or not re.fullmatch("v" + VERSION, tag):
-        fail("Release has an invalid stable version tag.")
-    if release.get("draft") is not False or release.get("prerelease") is not False:
-        fail("Refusing a draft or prerelease.")
-    if version is not None and tag != "v" + version:
-        fail("Release does not match the requested version.")
-    archive = "git-on-" + tag + "-" + TARGET + ".tar.gz"
-    expected = {archive, "SHA256SUMS", "release.json"}
-    assets = release.get("assets", [])
-    if not isinstance(assets, list) or len(assets) != len(expected):
-        fail("Release has missing, duplicate, or unexpected assets.")
-    names = set()
-    for asset in assets:
-        if not isinstance(asset, dict):
-            fail("Release asset metadata must be an object.")
-        name = asset.get("name")
-        if not isinstance(name, str) or name not in expected or name in names or asset.get("state") != "uploaded":
-            fail("Release has missing, duplicate, or unexpected assets.")
-        names.add(name)
-        url = "https://github.com/" + REPO + "/releases/download/" + tag + "/" + name
-        if asset.get("browser_download_url") != url:
-            fail("Release asset URL does not match its expected repository and version.")
-        size = asset.get("size")
-        limit = MAX_ARCHIVE if name == archive else MAX_METADATA
-        if type(size) is not int or size <= 0 or size > limit:
-            fail("Release asset has an invalid size.")
-    return tag, archive, assets
-
-
-def get_assets(tag, archive, assets, use_gh, directory):
-    for asset in assets:
-        name = asset["name"]
-        if use_gh:
-            gh("release", "download", tag, "--repo", "https://github.com/" + REPO,
-               "--pattern", name, "--dir", str(directory))
-        else:
-            download(asset["browser_download_url"], directory / name,
-                     MAX_ARCHIVE if name == archive else MAX_METADATA)
-        path = directory / name
-        if not path.is_file() or path.is_symlink() or path.stat().st_size != asset["size"]:
-            fail("Downloaded asset has an unexpected size or type: " + name)
-
-
-def verify(directory, tag, archive):
-    expected = {archive, "release.json"}
-    sums = {}
-    for line in (directory / "SHA256SUMS").read_text(encoding="ascii").splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64}) [ *]([^/\\]+)", line)
-        if not match or match[2] not in expected or match[2] in sums:
-            fail("SHA256SUMS has missing, duplicate, or unexpected entries.")
-        sums[match[2]] = match[1]
-    if set(sums) != expected:
-        fail("SHA256SUMS is incomplete.")
-    for name, expected_hash in sums.items():
-        digest = hashlib.sha256()
-        with (directory / name).open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != expected_hash:
-            fail("Checksum verification failed for " + name + "; existing installation is unchanged.")
-    manifest = json.loads((directory / "release.json").read_bytes())
-    if not isinstance(manifest, dict):
-        fail("Verified release metadata must be an object.")
-    if (manifest.get("version") != tag[1:] or manifest.get("target") != TARGET
-            or manifest.get("baseline") != "Ubuntu 22.04 / glibc 2.35"
-            or not isinstance(manifest.get("commit"), str)
-            or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("commit", ""))):
-        fail("Verified release metadata does not match this version, target, or supported baseline.")
-
-
-def same_file(left, right):
-    try:
-        return os.path.samefile(left, right)
-    except OSError:
-        return False
-
-
-def safe_destination(directory):
-    if not directory.is_absolute() or ".." in directory.parts:
-        fail("--bin-dir must be an absolute path without .. components.")
-    # Reject symlink components rather than silently installing somewhere else.
-    for component in reversed((directory, *directory.parents)):
-        if component.is_symlink():
-            fail("Refusing a symlink in the installation directory: " + str(component))
-        if component.exists() and not component.is_dir():
-            fail("Installation directory contains a non-directory: " + str(component))
-    destination = directory / "git-on"
-    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
-        fail("Refusing to replace a symlink or non-regular git-on destination.")
-    return destination
-
-
-def unpack_binary(directory, archive):
-    root = archive[:-7]
-    expanded = directory / "package.tar"
-    # Bound expansion before parsing headers: tarfile otherwise consumes hidden
-    # PAX/GNU extension payloads before exposing members for validation.
-    with gzip.open(directory / archive, "rb") as source, expanded.open("wb") as output:
-        total = 0
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            total += len(chunk)
-            if total > MAX_ARCHIVE + MAX_METADATA + 1024 * 1024:
-                fail("Expanded archive exceeds the size limit.")
-            output.write(chunk)
-    expected = {root, root + "/git-on", root + "/README.md"}
-    # v0.1.0 predates LICENSE in archives; retain pinned/repeat installation support.
-    allowed = expected | {root + "/LICENSE"}
-    members = set()
-    binary_range = None
-    with expanded.open("rb") as source:
-        while True:
-            header = source.read(512)
-            if header == bytes(512):
-                # A valid tar ends with at least two zero blocks, then padding.
-                trailer = source.read()
-                if len(trailer) < 512 or any(trailer):
-                    fail("Archive has an invalid trailer.")
-                break
-            if len(header) != 512:
-                fail("Archive header was truncated.")
-            member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
-            if member.name not in allowed or member.name in members:
-                fail("Archive has duplicate, missing, or unsafe paths.")
-            members.add(member.name)
-            if member.name == root:
-                if not member.isdir() or member.size != 0:
-                    fail("Archive root is not an ordinary directory.")
-            elif member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
-                fail("Archive contains a symlink, hard link, or unexpected member type.")
-            limit = MAX_ARCHIVE if member.name == root + "/git-on" else MAX_METADATA
-            if member.size < 0 or member.size > limit:
-                fail("Archive member exceeds the size limit.")
-            if member.name == root + "/git-on":
-                if member.size == 0:
-                    fail("Archive binary is empty.")
-                binary_range = (source.tell(), member.size)
-            # No extension records, extraction paths, or sparse files are trusted.
-            source.seek((member.size + 511) // 512 * 512, os.SEEK_CUR)
-        if not expected <= members:
-            fail("Archive has missing members.")
-    return expanded, binary_range
-
-
-def describe_directory(directory, info):
-    try:
-        owner = pwd.getpwuid(info.st_uid).pw_name
-    except KeyError:
-        owner = "unknown"
-    try:
-        group = grp.getgrgid(info.st_gid).gr_name
-    except KeyError:
-        group = "unknown"
-    return (str(directory) + " has mode " + format(stat.S_IMODE(info.st_mode), "04o")
-            + " (" + stat.filemode(info.st_mode) + "), owner " + owner
-            + " (uid " + str(info.st_uid) + "), group " + group
-            + " (gid " + str(info.st_gid) + ")")
-
-
-def open_bin_dir(directory):
-    # Pin every path component with O_NOFOLLOW. A renamed/replaced ancestor
-    # cannot redirect the final write between a path check and os.replace.
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    component = Path("/")
-    try:
-        for part in directory.parts[1:]:
-            component = component / part
-            try:
-                os.mkdir(part, 0o755, dir_fd=fd)
-            except FileExistsError:
-                pass
-            except OSError as error:
-                fail("Cannot create installation directory " + str(component) + ": " + str(error)
-                     + "; parent " + describe_directory(component.parent, os.fstat(fd))
-                     + ". Choose an accessible directory you own using --bin-dir.")
-            try:
-                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except OSError as error:
-                try:
-                    details = describe_directory(component, os.stat(part, dir_fd=fd, follow_symlinks=False))
-                except OSError:
-                    details = str(component)
-                fail("Cannot open installation directory " + details + ": " + str(error)
-                     + ". Choose an accessible directory you own using --bin-dir.")
-            os.close(fd)
-            fd = next_fd
-        info = os.fstat(fd)
-        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
-            reasons = []
-            if info.st_uid != os.geteuid():
-                reasons.append("different owner (current uid " + str(os.geteuid()) + ")")
-            if info.st_mode & 0o020:
-                reasons.append("group-write is enabled")
-            if info.st_mode & 0o002:
-                reasons.append("other-write is enabled")
-            advice = "Choose a directory you own without group/other write permission using --bin-dir."
-            # A group-write bit is a policy failure, not proof that another user
-            # actually has access. Offer a manual change only for the owned dir.
-            if info.st_uid == os.geteuid() and info.st_mode & 0o020 and not info.st_mode & 0o002:
-                advice = ("For your personal directory, if group-write is not needed, run: chmod g-w -- "
-                          + shlex.quote(str(directory)) + "; otherwise choose a separate --bin-dir.")
-            fail("Installation directory " + describe_directory(directory, info) + ": " + "; ".join(reasons)
-                 + ". It must be owned by you, accessible for installation, with group-write and other-write bits disabled. "
-                 + advice)
-        result, fd = fd, None
-        return result
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
-def check_target(fd):
-    try:
-        info = os.stat("git-on", dir_fd=fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(info.st_mode):
-        fail("Refusing to replace a symlink or non-regular git-on destination.")
-
-
-def install(directory, archive, tag, bin_dir):
-    destination = safe_destination(bin_dir)
-    expanded, (offset, size) = unpack_binary(directory, archive)
-    dir_fd = open_bin_dir(bin_dir)
-    staged = ".git-on-install-" + secrets.token_hex(16)
-    try:
-        check_target(dir_fd)
-        try:
-            fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
-        except OSError as error:
-            info = os.fstat(dir_fd)
-            missing = ["owner-" + name for bit, name in ((0o200, "write"), (0o100, "search"))
-                       if not info.st_mode & bit]
-            reason = ("; " + " and ".join(missing) + " permission is missing") if missing else ""
-            fail("Cannot stage git-on in installation directory " + describe_directory(bin_dir, info)
-                 + ": " + str(error) + reason + ". Choose an accessible directory you own using --bin-dir; existing installation is unchanged.")
-        with os.fdopen(fd, "wb") as output, expanded.open("rb") as source:
-            source.seek(offset)
-            remaining = size
-            while remaining:
-                chunk = source.read(min(remaining, 1024 * 1024))
-                if not chunk:
-                    fail("Archive binary was truncated.")
-                output.write(chunk)
-                remaining -= len(chunk)
-            output.flush()
-            os.fchmod(output.fileno(), 0o755)
-            os.fsync(output.fileno())
-        # /proc/self/fd pins the same verified directory for the version probe.
-        result = subprocess.run(["/proc/self/fd/" + str(dir_fd) + "/" + staged, "--version"],
-                                pass_fds=(dir_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-        if result.returncode or result.stdout.decode("utf-8").strip() != "git-on " + tag[1:]:
-            fail("Downloaded executable failed its version check. It needs glibc 2.35+, libz.so.1 and libgcc_s.so.1; check your distribution runtime libraries. Existing installation is unchanged.")
-        check_target(dir_fd)
-        os.replace(staged, "git-on", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-    finally:
-        try:
-            os.unlink(staged, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
-        os.close(dir_fd)
-    return destination
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(prog="install.sh", description="Install or update git-on to the latest stable GitHub Release, without sudo.")
-    parser.add_argument("--version", help="install a specific stable version, e.g. 0.1.0 or v0.1.0")
-    parser.add_argument("--bin-dir", default=str(Path.home() / ".local/bin"), help="absolute installation directory (default: ~/.local/bin)")
-    parser.add_argument("--github-cli", action="store_true", help="use existing gh authentication for private releases or API rate limits")
-    args = parser.parse_args(argv)
-    version = args.version
-    if version is not None:
-        version = version[1:] if version.startswith("v") else version
-        if not re.fullmatch(VERSION, version):
-            fail("--version must be a stable version such as 0.1.0 or v0.1.0.")
-    supported_host()
-    bin_dir = Path(args.bin_dir)
-    safe_destination(bin_dir)
-    with tempfile.TemporaryDirectory(prefix="git-on-download-") as temporary:
-        directory = Path(temporary)
-        tag, archive, assets = get_release(version, args.github_cli, directory)
-        print("Installing git-on " + tag + " ...", flush=True)
-        get_assets(tag, archive, assets, args.github_cli, directory)
-        verify(directory, tag, archive)
-        destination = install(directory, archive, tag, bin_dir)
-    print("Installed git-on " + tag + " to " + str(destination))
-    selected = shutil.which("git-on")
-    if selected is None or not same_file(selected, destination):
-        if selected is not None:
-            print("PATH selects " + shlex.quote(os.path.abspath(selected))
-                  + " before this installation; run " + shlex.quote(str(destination))
-                  + " --version to use the installed binary.")
-        if not any(same_file(entry or os.curdir, bin_dir)
-                   for entry in os.environ.get("PATH", "").split(os.pathsep)):
-            print("For this shell: export PATH=" + shlex.quote(str(bin_dir)) + ':"$PATH"; git on --version')
-    if not shutil.which("fusermount3"):
-        print("Before running git on: install your distribution's fuse3 package (fusermount3 is missing).")
-    try:
-        usable_fuse = stat.S_ISCHR(os.stat("/dev/fuse").st_mode) and os.access("/dev/fuse", os.R_OK | os.W_OK)
-    except OSError:
-        usable_fuse = False
-    if not usable_fuse:
-        print("Before running git on: provide a usable /dev/fuse; containers also need permission to mount FUSE.")
-
-
-def interrupted(signum, frame):
-    fail("Installation interrupted; temporary files are being removed.")
-
-
-if __name__ == "__main__":
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, interrupted)
-    try:
-        main()
-    except urllib.error.HTTPError as error:
-        print("git-on installer: GitHub download failed (HTTP " + str(error.code) + "). Check that a release exists and is public; use --github-cli for private access or rate limits.", file=sys.stderr)
-        sys.exit(1)
-    except (OSError, ValueError, RuntimeError, tarfile.TarError, subprocess.SubprocessError) as error:
-        print("git-on installer: " + str(error), file=sys.stderr)
-        sys.exit(1)
-GIT_ON_INSTALLER_PYTHON
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || fail 'Prebuilt releases support Linux x86_64 only'
+uid=$(id -u)
+[ "$uid" != 0 ] || fail 'Run this installer as your normal user, without sudo'
+libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || :)
+printf '%s\n' "$libc" | awk '$1=="glibc" {split($2,v,"."); if(v[1]>2 || (v[1]==2 && v[2]>=35)) ok=1} END {exit !ok}' ||
+    fail 'This binary needs glibc 2.35+; musl/Alpine is not supported'
+case $bin_dir in /*) ;; *) fail '--bin-dir must be an absolute path';; esac
+case /${bin_dir#/}/ in */../*|*/./*) fail '--bin-dir must not contain . or .. components';; esac
+case $bin_dir in /|*//*|*/) fail '--bin-dir must be a canonical absolute path without repeated/trailing slashes';; esac
+# Reject symlink components before entering the directory. Once inside, use
+# relative paths so renaming an ancestor cannot redirect staging or replacement.
+rest=${bin_dir#/}
+prefix=
+while [ -n "$rest" ]; do
+    part=${rest%%/*}
+    case $rest in */*) rest=${rest#*/};; *) rest=;; esac
+    [ -n "$part" ] || continue
+    prefix=$prefix/$part
+    [ ! -L "$prefix" ] || fail "Refusing a symlink in installation directory: $prefix"
+    if [ -e "$prefix" ] && [ ! -d "$prefix" ]; then fail "Not a directory: $prefix"; fi
+done
+umask 077
+mkdir -p -- "$bin_dir" || fail "Cannot create $bin_dir; choose an accessible --bin-dir"
+cd -P -- "$bin_dir" || fail "Cannot enter $bin_dir"
+[ "$(pwd -P)" = "$bin_dir" ] || fail 'Installation directory changed or became a symlink; existing installation is unchanged'
+owner=$(stat -c %u .)
+mode=$(stat -c %a .)
+[ "$owner" = "$uid" ] && [ "$((0$mode & 022))" -eq 0 ] ||
+    fail "Installation directory $bin_dir has mode $mode, uid $owner; use a directory you own without group/other write permission (--bin-dir)"
+[ -w . ] && [ -x . ] || fail "Cannot stage in $bin_dir (mode $mode); owner-write and search permission are needed; choose --bin-dir"
+check_target() {
+    [ ! -L git-on ] && { [ ! -e git-on ] || [ -f git-on ]; } ||
+        fail 'Refusing to replace a symlink or non-regular git-on destination'
+}
+check_target
+stage=$(mktemp -d .git-on-install.XXXXXXXXXX) || fail 'Cannot create staging directory; existing installation is unchanged'
+probe_pid=
+cleanup() {
+    if [ -n "$probe_pid" ]; then
+        # The interrupted wait still owns this unreaped timeout child. Stop
+        # its leader and private process group before removing probe output.
+        kill -KILL "$probe_pid" 2>/dev/null || :
+        kill -KILL "-$probe_pid" 2>/dev/null || :
+        wait "$probe_pid" 2>/dev/null || :
+    fi
+    rm -rf -- "$stage"
+}
+trap cleanup 0
+trap 'fail "Installation interrupted; removing temporary files"' HUP INT TERM
+base=https://github.com/progbeat/git-on/releases
+if [ "$use_gh" -eq 1 ]; then
+    command -v gh >/dev/null 2>&1 || fail '--github-cli requires an already authenticated GitHub CLI (gh)'
+    endpoint=latest
+    [ -z "$version" ] || endpoint=tags/v$version
+    # --jq is built into gh; no external jq executable is needed.
+    tag=$(gh api --hostname github.com "repos/progbeat/git-on/releases/$endpoint" \
+        --jq 'select(.draft == false and .prerelease == false) | .tag_name') || fail 'GitHub CLI release lookup failed'
+else
+    command -v curl >/dev/null 2>&1 || fail 'curl is required for public downloads'
+    if [ -n "$version" ]; then
+        tag=v$version
+    else
+        resolved=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+            --connect-timeout 15 --max-time 180 --max-filesize 1048576 -o /dev/null -w '%{url_effective}' "$base/latest") ||
+            fail 'Cannot resolve the latest release; check network access or use --github-cli'
+        case $resolved in "$base/tag/"*) tag=${resolved#"$base/tag/"};; *) fail 'Unexpected latest release URL';; esac
+    fi
+fi
+case $tag in v*) version_ok "${tag#v}" || fail 'Release must have a stable version tag';; *) fail 'Release must have a stable version tag';; esac
+[ -z "$version" ] || [ "$tag" = "v$version" ] || fail 'Release does not match --version'
+name=git-on-$tag-x86_64-unknown-linux-gnu
+archive=$name.tar.gz
+# Latest is never used below: both downloads are pinned to the same tag.
+download() {
+    if [ "$use_gh" -eq 1 ]; then
+        gh release download "$tag" --repo https://github.com/progbeat/git-on --pattern "$1" --dir "$stage" ||
+            fail 'GitHub CLI download failed; existing installation is unchanged'
+    else
+        curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 180 \
+            --max-filesize "$2" "$base/download/$tag/$1" -o "$stage/$1" ||
+            fail 'Download failed; existing installation is unchanged'
+    fi
+    [ -f "$stage/$1" ] && [ ! -L "$stage/$1" ] || fail 'Downloaded asset is missing or is not a regular file'
+    [ "$(stat -c %s "$stage/$1")" -le "$2" ] || fail 'Downloaded asset exceeds its size limit'
+}
+printf 'Installing git-on %s ...\n' "$tag"
+download SHA256SUMS 1048576
+download "$archive" 134217728
+# Select only the fixed archive name; never pass downloaded filenames/options to
+# sha256sum. release.json remains published for legacy installers/build provenance.
+hash=$(awk -v name="$archive" '
+    NF!=2 || length($1)!=64 || $1~/[^0-9a-f]/ {bad=1}
+    $2==name {hash=$1; count++}
+    END {if(bad || count!=1) exit 1; print hash}' "$stage/SHA256SUMS") || fail 'Invalid or incomplete SHA256SUMS'
+actual=$(sha256sum "$stage/$archive")
+[ "${actual%% *}" = "$hash" ] || fail 'Checksum verification failed; existing installation is unchanged'
+# Extract bytes, never archive paths. GNU tar does not emit symlink/hardlink
+# targets with -O. Reject duplicate binary members before tar can concatenate them.
+# Bound both decompression work and output size; there is no custom tar parser.
+(
+    ulimit -f 262144 || exit 1
+    timeout --foreground --kill-after=2 60 tar -tzf "$stage/$archive" -- "$name/git-on" > "$stage/members" || exit 1
+    awk -v name="$name/git-on" 'NR!=1 || $0!=name {bad=1} END {exit (NR!=1 || bad)}' "$stage/members" || exit 1
+    timeout --foreground --kill-after=2 60 tar -xzOf "$stage/$archive" -- "$name/git-on" > "$stage/git-on" || exit 1
+) || fail 'Cannot read the release binary from the verified archive'
+[ -s "$stage/git-on" ] || fail 'Archive binary is empty'
+chmod 755 "$stage/git-on"
+# Keep the monitored wrapper alive until it has terminated its own private
+# timeout group, including children left behind by a successful probe.
+timeout --signal=KILL 15 /bin/sh -c '
+    probe_status=0
+    "$1" --version > "$2/version" 2>/dev/null || probe_status=$?
+    printf "%s\n" "$probe_status" > "$2/status" || :
+    kill -KILL 0
+' sh "$stage/git-on" "$stage" 2>/dev/null &
+probe_pid=$!
+wait "$probe_pid" 2>/dev/null || :
+probe_pid=
+[ -f "$stage/status" ] && [ "$(cat "$stage/status")" = 0 ] ||
+    fail 'Downloaded executable failed its version check; glibc 2.35+, libz.so.1 and libgcc_s.so.1 are needed; existing installation is unchanged'
+reported=$(cat "$stage/version")
+[ "$reported" = "git-on ${tag#v}" ] || fail 'Downloaded executable failed its version check; existing installation is unchanged'
+check_target
+mv -fT -- "$stage/git-on" git-on || fail 'Cannot replace git-on; existing installation is unchanged'
+printf 'Installed git-on %s to %s/git-on\n' "$tag" "$bin_dir"
+selected=$(command -v git-on || :)
+if [ -n "$selected" ] && [ "$selected" -ef ./git-on ]; then
+    :
+else
+    [ -z "$selected" ] || printf 'PATH selects %s before this installation.\n' "$selected"
+    printf 'Installed executable: %s/git-on\nAdd the installation directory to PATH if needed.\n' "$bin_dir"
+fi
+if ! command -v fusermount3 >/dev/null 2>&1 || [ ! -c /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+    printf '%s\n' 'Before running git on: provide fuse3 (fusermount3), a usable /dev/fuse and permission to mount FUSE.'
+fi
 }
 { git_on_install "$@"; }
