@@ -211,6 +211,9 @@ with an explicit tools-only PATH containing no Python or jq. Tests cover
 one-time latest resolution, pinned original/current archive layouts, checksum and
 download failures, duplicates/links, destination races, signals, relative PATH,
 replacement failure and incomplete piped scripts.
+Focused regressions also cover fresh destinations under `umask 0002`, probe
+children holding stdout, shell metacharacters in diagnostic paths, and duplicate
+checksum entries in the legacy compatibility guard.
 
 `python3 tests/installer_smoke.py --binary target/debug/git-on` constructs a
 minimal Docker root filesystem from local utilities/shared libraries. Python and

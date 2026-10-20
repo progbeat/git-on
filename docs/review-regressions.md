@@ -1395,3 +1395,42 @@ latest/pinned/upgrade paths with no Python/jq anywhere in its root filesystem,
 network disabled, and verifies download/checksum failure preservation. These are
 installation checks, not evidence of a real FUSE mount; exact-head CI separately
 supplies real-mount acceptance.
+
+### Shell installer follow-up review
+
+Four additional review regressions reproduce failures at PR head
+`04caed336791fb274e4dc3f73ec28e75f489e950`. Running the four named tests against
+that installer/acceptance code produced three assertion failures and a six-second
+probe deadline error before the fixes:
+
+- `test_fresh_destinations_under_group_writable_umask`: both fresh default and
+  custom destinations must work under `umask 0002`. Previously `mkdir` created
+  mode 0775 and the permission guard rejected it. The private umask now applies
+  before directory creation; an existing 0775 directory is still refused and
+  retains its permissions and old executable.
+- `test_probe_deadline_includes_child_processes`: a probe spawning `sleep 60`
+  left inherited stdout open after a shortened one-second timeout. The probe now
+  runs in timeout's process group; interrupted waits explicitly stop the owned,
+  unreaped timeout leader and its group. The regression checks the child stopped,
+  the old installation survived, and staging was removed.
+- `test_destination_diagnostic_treats_shell_metacharacters_as_data`: paths with
+  dollar signs, backticks and quotes were presented as an unsafe runnable shell
+  command. The diagnostic now labels the literal executable path as data.
+- `test_packaged_acceptance_rejects_duplicate_checksum_entries`: a manifest
+  containing the archive once and `release.json` twice incorrectly passed the
+  set-based acceptance guard. Comparing the sorted names with multiplicity now
+  rejects it before installation, matching saved legacy installers.
+
+Independent follow-up additionally reproduced two lifecycle failures in the first
+correction: a child ignoring TERM survived when its parent exited on TERM, and a
+successful version probe could leave a background child running. Permanent tests
+`test_probe_timeout_stops_term_resistant_child_after_parent_exits` and
+`test_successful_probe_stops_background_children` both failed before the final
+probe-group cleanup. The monitored wrapper now writes the probe status, then
+terminates its own private timeout group even on success. At the 15-second
+deadline timeout sends KILL to that group; interruption cleanup only signals the
+owned, unreaped timeout child/group. No numeric group is signalled after reaping.
+
+The targeted regressions pass after their fixes. Only fixtures shorten the
+production 15-second probe deadline. Release assets, binary inputs and the
+package version are unchanged.

@@ -47,7 +47,7 @@ while :; do
 done
 PATH=$absolute_path
 export PATH
-for tool in awk chmod getconf gzip id mkdir mktemp mv rm sha256sum stat tar timeout uname; do
+for tool in awk cat chmod getconf gzip id mkdir mktemp mv rm sha256sum stat tar timeout uname; do
     command -v "$tool" >/dev/null 2>&1 || fail "Required tool is missing: $tool (GNU coreutils, tar and gzip are needed)"
 done
 if [ "$version_requested" -eq 1 ]; then
@@ -74,6 +74,7 @@ while [ -n "$rest" ]; do
     [ ! -L "$prefix" ] || fail "Refusing a symlink in installation directory: $prefix"
     if [ -e "$prefix" ] && [ ! -d "$prefix" ]; then fail "Not a directory: $prefix"; fi
 done
+umask 077
 mkdir -p -- "$bin_dir" || fail "Cannot create $bin_dir; choose an accessible --bin-dir"
 cd -P -- "$bin_dir" || fail "Cannot enter $bin_dir"
 [ "$(pwd -P)" = "$bin_dir" ] || fail 'Installation directory changed or became a symlink; existing installation is unchanged'
@@ -87,9 +88,18 @@ check_target() {
         fail 'Refusing to replace a symlink or non-regular git-on destination'
 }
 check_target
-umask 077
 stage=$(mktemp -d .git-on-install.XXXXXXXXXX) || fail 'Cannot create staging directory; existing installation is unchanged'
-cleanup() { rm -rf -- "$stage"; }
+probe_pid=
+cleanup() {
+    if [ -n "$probe_pid" ]; then
+        # The interrupted wait still owns this unreaped timeout child. Stop
+        # its leader and private process group before removing probe output.
+        kill -KILL "$probe_pid" 2>/dev/null || :
+        kill -KILL "-$probe_pid" 2>/dev/null || :
+        wait "$probe_pid" 2>/dev/null || :
+    fi
+    rm -rf -- "$stage"
+}
 trap cleanup 0
 trap 'fail "Installation interrupted; removing temporary files"' HUP INT TERM
 base=https://github.com/progbeat/git-on/releases
@@ -150,8 +160,20 @@ actual=$(sha256sum "$stage/$archive")
 ) || fail 'Cannot read the release binary from the verified archive'
 [ -s "$stage/git-on" ] || fail 'Archive binary is empty'
 chmod 755 "$stage/git-on"
-reported=$(timeout --foreground --kill-after=2 15 "$stage/git-on" --version 2>/dev/null) ||
+# Keep the monitored wrapper alive until it has terminated its own private
+# timeout group, including children left behind by a successful probe.
+timeout --signal=KILL 15 /bin/sh -c '
+    probe_status=0
+    "$1" --version > "$2/version" 2>/dev/null || probe_status=$?
+    printf "%s\n" "$probe_status" > "$2/status" || :
+    kill -KILL 0
+' sh "$stage/git-on" "$stage" 2>/dev/null &
+probe_pid=$!
+wait "$probe_pid" 2>/dev/null || :
+probe_pid=
+[ -f "$stage/status" ] && [ "$(cat "$stage/status")" = 0 ] ||
     fail 'Downloaded executable failed its version check; glibc 2.35+, libz.so.1 and libgcc_s.so.1 are needed; existing installation is unchanged'
+reported=$(cat "$stage/version")
 [ "$reported" = "git-on ${tag#v}" ] || fail 'Downloaded executable failed its version check; existing installation is unchanged'
 check_target
 mv -fT -- "$stage/git-on" git-on || fail 'Cannot replace git-on; existing installation is unchanged'
@@ -161,7 +183,7 @@ if [ -n "$selected" ] && [ "$selected" -ef ./git-on ]; then
     :
 else
     [ -z "$selected" ] || printf 'PATH selects %s before this installation.\n' "$selected"
-    printf 'To use this installation: "%s/git-on" --version\nAdd "%s" to PATH if needed.\n' "$bin_dir" "$bin_dir"
+    printf 'Installed executable: %s/git-on\nAdd the installation directory to PATH if needed.\n' "$bin_dir"
 fi
 if ! command -v fusermount3 >/dev/null 2>&1 || [ ! -c /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
     printf '%s\n' 'Before running git on: provide fuse3 (fusermount3), a usable /dev/fuse and permission to mount FUSE.'

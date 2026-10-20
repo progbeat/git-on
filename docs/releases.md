@@ -162,6 +162,8 @@ removing just that permission; otherwise select a separate `--bin-dir`.
 The directory must be a canonical absolute path, without `.`/`..` components,
 repeated slashes or a trailing slash. Relative and empty `PATH` entries retain
 their meaning from the directory in which the installer was invoked.
+Missing directories are created with private permissions even under a shared
+umask; existing directory permissions are never changed to pass the guard.
 
 ### Release format and compatibility
 
@@ -219,7 +221,8 @@ limited. The normal mode does not read GitHub token environment variables.
 The installer verifies the selected archive's SHA-256 before reading its exact
 binary member, rejecting missing/duplicate members and empty output. Other archive
 paths are never extracted. Downloads have size limits; archive reading and the
-executable probe have timeouts. It stages in the destination filesystem, checks
+executable probe have timeouts. The probe timeout also covers child processes in
+its process group. It stages in the destination filesystem, checks
 the binary's reported version, then atomically renames it over the old executable.
 Download, checksum, extraction, probe or rename failure before that commit leaves
 the previous executable in place. A signal after the atomic rename can leave the

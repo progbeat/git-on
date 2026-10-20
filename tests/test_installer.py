@@ -191,6 +191,27 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(b'git-on 0.1.0', (destination / 'git-on').read_bytes())
         self.assertFalse(any('/releases/latest' in r for r in self.requests()))
 
+    def test_fresh_destinations_under_group_writable_umask(self):
+        for custom in (False, True):
+            home = self.root / ('fresh-home-' + str(custom))
+            destination = self.root / 'fresh-custom-bin' if custom else home / '.local/bin'
+            args = ['--bin-dir', str(destination)] if custom else []
+            result = subprocess.run(['/bin/sh', str(SCRIPT), *args],
+                env=dict(self.env, HOME=str(home)), umask=0o002,
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode) & 0o022, 0)
+            self.assertIn(b'git-on 0.1.0', (destination / 'git-on').read_bytes())
+        self.bin.chmod(0o775)
+        try:
+            result = subprocess.run(['/bin/sh', str(SCRIPT)], env=self.env,
+                umask=0o002, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(stat.S_IMODE(self.bin.stat().st_mode), 0o775)
+            self.assertEqual(self.old.read_bytes(), b'old executable\n')
+        finally:
+            self.bin.chmod(0o755)
+
     def test_gh_latest_and_pinned_need_no_external_jq(self):
         self.run_script(github_cli=True)
         self.run_script('--version', 'v0.1.0', github_cli=True)
@@ -255,6 +276,66 @@ class InstallerTests(unittest.TestCase):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
+
+    def test_probe_deadline_includes_child_processes(self):
+        self.assert_probe_children_stop(b'#!/bin/sh\nsleep 60 &\nprintf "%s\\n" "$!" > "$PROBE_CHILD_PID"\nwait\n')
+
+    def test_probe_timeout_stops_term_resistant_child_after_parent_exits(self):
+        self.assert_probe_children_stop(b'#!/bin/sh\n/bin/sh -c \'trap "" TERM; printf "%s\\n" "$$" > "$PROBE_CHILD_PID"; exec sleep 60\' &\nwait\n')
+
+    def test_successful_probe_stops_background_children(self):
+        self.assert_probe_children_stop(b'#!/bin/sh\nsleep 60 &\nprintf "%s\\n" "$!" > "$PROBE_CHILD_PID"\nprintf "git-on 0.1.0\\n"\n', success=True)
+
+    def assert_probe_children_stop(self, binary, success=False):
+        marker = self.root / 'probe-child-pid'
+        group = self.root / 'probe-group-pid'
+        self.env['PROBE_CHILD_PID'] = str(marker)
+        self.env['PROBE_GROUP_PID'] = str(group)
+        self.release('0.1.0', binary=binary)
+        timeout = self.fakebin / 'timeout'
+        timeout.unlink()
+        timeout.write_text('#!/bin/sh\nprobe=0\nfor arg; do shift; if [ "$arg" = 15 ]; then arg=1; probe=1; fi; set -- "$@" "$arg"; done\n' +
+                           '[ "$probe" != 1 ] || printf "%s\\n" "$$" > "$PROBE_GROUP_PID"\nexec ' +
+                           shutil.which('timeout') + ' "$@"\n')
+        timeout.chmod(0o755)
+        process = subprocess.Popen(['/bin/sh', str(SCRIPT)], env=self.env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=6)
+            if success:
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            else:
+                self.assertNotEqual(process.returncode, 0, stdout)
+            self.assertTrue(marker.exists(), stderr)
+            child = Path('/proc') / marker.read_text().strip() / 'stat'
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    child_state = child.read_text().split()[2]
+                except FileNotFoundError:
+                    break
+                if child_state == 'Z':
+                    break
+                self.assertLess(time.monotonic(), deadline, 'probe child is still running')
+                time.sleep(.02)
+            if success:
+                self.assertEqual(self.old.read_bytes(), binary)
+            else:
+                self.assertEqual(self.old.read_bytes(), b'old executable\n')
+            self.assertFalse(list(self.bin.glob('.git-on-install.*')))
+        finally:
+            if group.exists():
+                try:
+                    os.killpg(int(group.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            # The fixture owns this session, including a foreground-timeout
+            # child on the old implementation; do not leave the red case asleep.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=3)
 
     def test_archive_links_and_duplicate_binary_are_rejected(self):
         root = 'git-on-v0.1.0-' + TARGET
@@ -361,6 +442,23 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('PATH selects', self.run_script().stdout)
         self.assertFalse(marker.exists())
 
+    def test_destination_diagnostic_treats_shell_metacharacters_as_data(self):
+        destination = self.root / 'bin $HOME `id` "quoted"'
+        result = self.run_script('--bin-dir', str(destination))
+        self.assertIn('Installed executable: ' + str(destination / 'git-on'), result.stdout)
+        self.assertNotIn(' --version', result.stdout)
+        self.assertIn(b'git-on 0.1.0', (destination / 'git-on').read_bytes())
+
+    def test_packaged_acceptance_rejects_duplicate_checksum_entries(self):
+        directory, archive = self.release('1.2.0')
+        sums = directory / 'SHA256SUMS'
+        original = sums.read_text()
+        sums.write_text(original + original.splitlines()[1] + '\n')
+        destination = self.root / 'invalid-package-install'
+        with self.assertRaises(AssertionError):
+            packaged_acceptance(directory, destination)
+        self.assertFalse(destination.exists())
+
     def test_relative_and_empty_path_entries_survive_directory_pinning(self):
         for path in ('tools', ':tools', 'tools:'):
             result = subprocess.run(['/bin/sh', str(SCRIPT)], cwd=self.root,
@@ -420,7 +518,8 @@ def packaged_acceptance(distribution, destination):
         # Freeze the legacy publication contract: extra assets/checksum entries
         # break saved Python installers. No release repacking is necessary.
         assert {p.name for p in distribution.iterdir() if p.is_file()} == {archive, 'release.json', 'SHA256SUMS'}
-        assert {line.split()[1] for line in (distribution/'SHA256SUMS').read_text().splitlines()} == {archive, 'release.json'}
+        checksum_names = [line.split()[1] for line in (distribution/'SHA256SUMS').read_text().splitlines()]
+        assert sorted(checksum_names) == sorted([archive, 'release.json'])
         with tarfile.open(distribution / archive, 'r:gz') as package:
             license_file = package.extractfile(archive[:-7] + '/LICENSE')
             assert license_file.read() == (ROOT / 'LICENSE').read_bytes()
