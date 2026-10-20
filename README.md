@@ -28,9 +28,8 @@ Prebuilt releases support **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseli
 plus the shared zlib and GCC runtimes (`libz.so.1`, `libgcc_s.so.1`). Running git-on
 requires a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
 `fuse3` package. All runs require native Git on `PATH`; remote execution requires
-Git 2.45.1+ to control automatic promisor fetches. Installation uses POSIX `sh`,
-`curl`, GNU coreutils (including `sha256sum` and `timeout`), `tar` and `gzip`.
-Python and jq are not required.
+Git 2.45.1+ to control automatic promisor fetches. The installer needs `curl` and
+Python 3.8+.
 
 ### Install or update
 
@@ -40,8 +39,8 @@ Install the latest stable release, or update using the same command:
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
-Run as your normal user. The installer pins one release, checks SHA-256 and the
-binary's version, then atomically replaces `~/.local/bin/git-on`. It does not modify shell
+Run as your normal user. The installer verifies SHA-256 checksums and release
+metadata, then atomically replaces `~/.local/bin/git-on`. It does not modify shell
 profiles. Add the destination to your current shell's `PATH` if needed:
 
 ```sh
