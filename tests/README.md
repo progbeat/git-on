@@ -212,7 +212,7 @@ one-time latest resolution, pinned original/current archive layouts, checksum an
 download failures, duplicates/links, destination races, signals, relative PATH,
 replacement failure and incomplete piped scripts.
 
-`python3 tests/installer_no_python.py --binary target/debug/git-on` constructs a
+`python3 tests/installer_smoke.py --binary target/debug/git-on` constructs a
 minimal Docker root filesystem from local utilities/shared libraries. Python and
 jq are absent from that filesystem. With the network disabled and root filesystem
 read-only, it installs the actual binary through latest/pinned paths, upgrades,
