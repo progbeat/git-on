@@ -36,7 +36,7 @@ Python 3.8+.
 Install the latest stable release, or update using the same command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/progbeat/git-on/master/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
 Run as your normal user. The installer verifies SHA-256 checksums and release
