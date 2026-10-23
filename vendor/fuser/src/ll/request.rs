@@ -947,7 +947,7 @@ mod op {
     #[derive(Debug)]
     pub struct Init<'a> {
         header: &'a fuse_in_header,
-        arg: &'a fuse_init_in,
+        arg: fuse_init_in,
     }
     impl_request!(Init<'a>);
     impl<'a> Init<'a> {
@@ -970,12 +970,12 @@ mod op {
 
             let init = fuse_init_out {
                 major: FUSE_KERNEL_VERSION,
-                minor: FUSE_KERNEL_MINOR_VERSION,
+                minor: self.arg.minor.min(FUSE_KERNEL_MINOR_VERSION),
                 max_readahead: config.max_readahead,
                 #[cfg(not(feature = "abi-7-36"))]
                 flags: flags as u32,
                 #[cfg(feature = "abi-7-36")]
-                flags: (flags | FUSE_INIT_EXT) as u32,
+                flags: (flags | (self.arg.flags as u64 & FUSE_INIT_EXT)) as u32,
                 max_background: config.max_background,
                 congestion_threshold: config.congestion_threshold(),
                 max_write: config.max_write,
@@ -1723,10 +1723,26 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-            fuse_opcode::FUSE_INIT => Operation::Init(Init {
-                header,
-                arg: data.fetch()?,
-            }),
+            fuse_opcode::FUSE_INIT => {
+                // Before ABI 7.36 INIT is only the 16-byte legacy prefix.
+                // Decode it first; require the extension only when advertised.
+                let prefix = *data.fetch::<[u32; 4]>()?;
+                #[cfg(feature = "abi-7-36")]
+                let flags2 = if prefix[3] & (FUSE_INIT_EXT as u32) != 0 {
+                    data.fetch::<[u32; 12]>()?[0]
+                } else { 0 };
+                Operation::Init(Init {
+                    header,
+                    arg: fuse_init_in {
+                        major: prefix[0], minor: prefix[1],
+                        max_readahead: prefix[2], flags: prefix[3],
+                        #[cfg(feature = "abi-7-36")]
+                        flags2,
+                        #[cfg(feature = "abi-7-36")]
+                        unused: [0; 11],
+                    },
+                })
+            },
             fuse_opcode::FUSE_OPENDIR => Operation::OpenDir(OpenDir {
                 header,
                 arg: data.fetch()?,
@@ -2253,6 +2269,28 @@ mod tests {
             }
             _ => panic!("Unexpected request operation"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "abi-7-36")]
+    fn init_extended_and_truncated_extension() {
+        let mut bytes = AlignedData([0_u8; 104]);
+        bytes.0[..56].copy_from_slice(&INIT_REQUEST[..]);
+        bytes.0[..4].copy_from_slice(&104_u32.to_ne_bytes());
+        bytes.0[44..48].copy_from_slice(&40_u32.to_ne_bytes());
+        bytes.0[52..56].copy_from_slice(&(crate::consts::FUSE_INIT_EXT as u32).to_ne_bytes());
+        bytes.0[56..60].copy_from_slice(&32_u32.to_ne_bytes());
+        let req = AnyRequest::try_from(&bytes[..]).unwrap();
+        match req.operation().unwrap() {
+            Operation::Init(init) => {
+                assert_eq!(init.version(), Version(7, 40));
+                assert_eq!(init.capabilities(), crate::consts::FUSE_INIT_EXT | (32_u64 << 32));
+            }
+            _ => panic!("expected extended INIT"),
+        }
+        bytes.0[..4].copy_from_slice(&56_u32.to_ne_bytes());
+        let req = AnyRequest::try_from(&bytes[..56]).unwrap();
+        assert!(req.operation().is_err(), "advertised but absent extension must fail");
     }
 
     #[test]

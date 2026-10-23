@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FUSER_VERSION = "0.16.0"
-VENDORED_SHA256 = "fa632e1a6272c0fd100f2950cbd6bdab7fcca188f50aac00fa8a5a7c9f4b3f19"
+VENDORED_SHA256 = "47e66c97e27b6ad4e53a174c0972d75fb7cd531d6a77223be9434495bead487a"
 FUSER_CHECKSUM = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
 TRAIT_SHA256 = "6d47b0047ba5917f4534ab34186152e1ef909ab04323bdc8d4bc7e9a87479fdf"
 

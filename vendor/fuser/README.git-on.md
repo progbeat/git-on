@@ -6,6 +6,11 @@ The upstream MIT license is retained. The Filesystem trait is unchanged.
 
 Local changes:
 
+- `ll/request.rs`: parse legacy 16-byte INIT and advertised 64-byte extended INIT
+  separately, clamp the reply minor version and reflect the client extension bit.
+  This fixes upstream ABI7.40 short-INIT incompatibility without changing the
+  Filesystem trait. Parser unit and actual protocol-dispatch regressions cover it.
+
 - `reply.rs`: add the two ReplyCreate passthrough methods corresponding to
   ReplyOpen. This fills the upstream 0.16 create-reply gap, using the existing
   `Response::new_create` backing ID field. No new ioctl implementation.

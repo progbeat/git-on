@@ -19,7 +19,7 @@ from integration import BINARY, FUSE_AVAILABLE, OPTIONS, PARSER, RepositoryTest,
 class WritePolicyTests(RepositoryTest):
     def policy(self, policy, code):
         return self.invoke_argv([
-            "HEAD", "--write-policy=" + policy, *(["--keep"] if keep else []),
+            "HEAD", "--write-policy=" + policy,
             "--", sys.executable, "-c", code,
         ])
 

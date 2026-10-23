@@ -65,6 +65,9 @@ impl Peer {
         Self::with_policy(WritePolicy::Ignored)
     }
     fn with_policy(policy: WritePolicy) -> Self {
+        Self::with_init(policy, false)
+    }
+    fn with_init(policy: WritePolicy, extended: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -129,17 +132,20 @@ impl Peer {
             gid: unsafe { libc::getegid() },
             _temp: temp,
         };
-        let init = p.ok(
-            26,
+        let minor = if extended { 40 } else { 31 };
+        let mut body = vec![
+            7,
+            minor,
             0,
-            u32s(&[
-                7,
-                31,
-                0,
-                (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
-            ]),
-        );
-        assert_eq!(&init[..8], &u32s(&[7, 31]));
+            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
+        ];
+        if extended {
+            body[3] |= 1 << 30; // FUSE_INIT_EXT
+            body.push(1 << 5); // FUSE_PASSTHROUGH high flag
+            body.extend([0; 11]);
+        }
+        let init = p.ok(26, 0, u32s(&body));
+        assert_eq!(&init[..8], &u32s(&[7, minor]));
         // No POSIX locks, readdirplus or writeback-cache capabilities enabled.
         let flags = u32::from_ne_bytes(init[12..16].try_into().unwrap());
         assert_eq!(
@@ -234,6 +240,14 @@ impl Drop for Peer {
                 task.join().unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
+    for extended in [false, true] {
+        let mut peer = Peer::with_init(WritePolicy::Ignored, extended);
+        peer.ok(3, 1, vec![0; 16]); // successful real dispatch after INIT
     }
 }
 

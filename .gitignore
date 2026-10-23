@@ -4,3 +4,6 @@ __pycache__/
 
 /release-body.md
 /dist/
+
+/vendor/fuser/target/
+/vendor/fuser/Cargo.lock

@@ -85,3 +85,20 @@ paths. macOS hosted CI does not pretend to supply a usable macFUSE driver.
 Actual macFUSE and capable-kernel lifecycle evidence are prerequisites for
 marking the milestone PR ready; no published release is needed to test its
 packaged artifacts. See [releases](releases.md).
+
+### Hosted macOS CI feasibility
+
+Standard GitHub-hosted `macos-14` is an Apple Silicon VM, and the native/macOS
+suite in `ci.yml` executes Rust, CLI, materialized filesystem and installer
+checks, rather than stopping at compilation. The hosted image does not provide
+the approved macFUSE kernel backend required by this port. Installing/loading it
+or altering the VM's security policy has not been authorized or attempted.
+
+macFUSE 5 also offers an explicit `backend=fskit` on newer macOS. Its upstream
+[backend documentation](https://github.com/macfuse/macfuse/wiki/FUSE-Backends)
+currently lists unimplemented kernel-handled mount options. This is not yet a
+verified substitute for owner-only/default-permission/nosuid/nodev behavior;
+the port does not silently select it or remove required options to get a green
+test. A suitably provisioned Apple Silicon/macFUSE host is still needed for the
+non-skipping `tests/macos_mounts.py` suite. This remains a real CI/acceptance gap,
+not a claim that hosted native tests passed real Mac mounts.

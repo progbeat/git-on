@@ -1450,3 +1450,32 @@ Green: the corrected diagnostic includes the attempted snapshot path and the
 existing host directory entries. The same test passes on arm64 macOS 26.3.1(a).
 Local transcripts are `/tmp/git-on-collision-red.log` and
 `/tmp/git-on-collision-green.log`. This is materialization evidence, not macFUSE.
+
+## 1.3 Copilot: optional passthrough must preserve older INIT negotiation
+
+At `af8791f`, enabling ABI 7.40 inherited upstream 0.16's unconditional 64-byte
+INIT decode. The pre-existing 16-byte INIT unit fixture failed with
+`InsufficientData` using:
+`cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-40 ll::request::tests::init -- --exact`.
+The red transcript is `/tmp/git-on-init-red.log`.
+
+The reviewed patch decodes the four-word prefix, requires the extension only
+when FUSE_INIT_EXT is advertised, preserves high capability bits, clamps the
+reply minor and reflects the client's extension flag. The original short test
+and new extended/truncated-extension parser test pass; all five parser tests
+pass in `/tmp/git-on-init-green.log`. The permanent actual-dispatch regression
+`protocol_short_and_extended_init_preserve_ordinary_fuse` additionally covers
+both session handshakes on Linux. Parser/protocol tests are not real mounts.
+
+## 1.3 Copilot: disposable write-policy harness
+
+At `af8791f`, `WritePolicyTests.policy` retained an undefined `keep` expansion.
+`python3 tests/test_write_policy_harness.py` reproduced NameError before any
+command launch (red: `/tmp/git-on-keep-harness-red.log`). Removing that expansion
+preserves exact argv and passes the permanent launcher regression (green:
+`/tmp/git-on-keep-harness-green.log`). Real policy tests remain separately required.
+
+Copilot also identified the Ubuntu 22.04/Python3.10 tomllib assumption and
+cross-job rehash weakness. Assembly now reads Cargo's JSON metadata and the
+four permanent `test_dist_integrity.py` cases reject changed native archives,
+missing/malformed checksums and source/manifest mismatches before regeneration.
