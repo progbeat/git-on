@@ -115,6 +115,7 @@ print(os.environ['GIT_ON_TREE_OID'])
             self.skipTest('case-sensitive host; collision is faithfully representable')
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn(b'foo', result.stderr)
+        self.assertIn(b'Foo', result.stderr)
         self.assertEqual(result.stdout, b'')
         self.clean()
 

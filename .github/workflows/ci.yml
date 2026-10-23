@@ -42,6 +42,8 @@ jobs:
       - run: cargo build --locked
       - name: CLI tests without a mount
         run: python3 tests/integration.py --binary target/debug/git-on CliTests
+      - name: Explicit-all materialization without a FUSE helper
+        run: python3 tests/materialized.py target/debug/git-on
       - name: Installer smoke test
         run: python3 tests/installer_smoke.py --binary target/debug/git-on
       - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
@@ -134,6 +136,9 @@ jobs:
           python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on "${BEFORE_ARGUMENT[@]}"
           python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on "${SSH_BEFORE_ARGUMENT[@]}"
           python3 tests/native_job_control.py --binary target/release/git-on "${JOB_BEFORE_ARGUMENT[@]}"
+
+      - name: Real-FUSE generated-file passthrough fallback
+        run: python3 tests/passthrough.py --binary target/release/git-on --expect=fallback
 
       - name: Seeded bounded filesystem differential stress
         run: >-

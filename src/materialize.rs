@@ -89,7 +89,18 @@ fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
             }
             Ok(())
         })();
-        result.with_context(|| format!("cannot faithfully materialize {} (unsupported name, host collision, symlink/permission limitation, or object error)", relative.display()))?;
+        if let Err(error) = result {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                let existing = fs::read_dir(path.parent().context("missing materialized parent")?)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
+            }
+            return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
+        }
         expected.push(name);
     }
     let mut actual = fs::read_dir(root.join(relative))?

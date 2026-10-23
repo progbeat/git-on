@@ -793,7 +793,7 @@ mod tests {
             }
         }
     }
-    fn recovery(keep: bool) -> Recovery {
+    fn recovery() -> Recovery {
         Recovery {
             format: "git-on-temp-v1".into(),
             id: "unit-test".into(),
@@ -803,20 +803,16 @@ mod tests {
         }
     }
     #[test]
-    fn recovery_refuses_active_and_kept_data() {
+    fn recovery_refuses_active_runs_and_removes_disposable_state() {
         let _serial = PROCESS_TEST_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("temp");
         private_dir(&dir).unwrap();
         let held = lock(&dir, true).unwrap();
-        save(&dir, &recovery(false)).unwrap();
+        save(&dir, &recovery()).unwrap();
         assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
-        save(&dir, &recovery(true)).unwrap();
-        assert!(cleanup(&dir).unwrap_err().to_string().contains("kept"));
-        assert!(dir.exists());
-        save(&dir, &recovery(false)).unwrap();
         cleanup(&dir).unwrap();
         assert!(!dir.exists());
     }
@@ -825,7 +821,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(root.path().join("repo")).unwrap();
         let oid = repo.treebuilder(None).unwrap().write().unwrap();
-        let mut state = recovery(false);
+        let mut state = recovery();
         state.git_dir = Some(repo.path().into());
         state.tree_oid = Some(oid.to_string());
         state.pin_ref = Some("refs/git-on/unit-test".into());

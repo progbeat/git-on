@@ -1434,3 +1434,19 @@ owned, unreaped timeout child/group. No numeric group is signalled after reaping
 The targeted regressions pass after their fixes. Only fixtures shorten the
 production 15-second probe deadline. Release assets, binary inputs and the
 package version are unchanged.
+
+## 1.3 materialized host-collision diagnostics
+
+Self-review found that the materializer safely refused `Foo`/`foo` on the
+case-insensitive development volume but reported only `foo`, omitting the
+already-created conflicting path. The strengthened permanent
+`MaterializedTests.test_case_collision_fails_before_child` requires both names,
+no child stdout, unchanged source and complete temporary cleanup.
+
+Red: at `ad4e33efd927b4c35f03d55a67e816f8958c259d`, rebuild and run
+`python3 tests/materialized.py target/debug/git-on MaterializedTests.test_case_collision_fails_before_child`.
+It failed because `b'Foo'` was absent from stderr (exit 1); the child never ran.
+Green: the corrected diagnostic includes the attempted snapshot path and the
+existing host directory entries. The same test passes on arm64 macOS 26.3.1(a).
+Local transcripts are `/tmp/git-on-collision-red.log` and
+`/tmp/git-on-collision-green.log`. This is materialization evidence, not macFUSE.
