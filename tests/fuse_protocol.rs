@@ -152,7 +152,13 @@ impl Peer {
             body.extend([0; 11]);
         }
         let init = p.ok(26, 0, u32s(&body));
-        assert_eq!(&init[..8], &u32s(&[7, minor]));
+        assert_eq!(&init[..4], &u32s(&[7]));
+        let daemon_minor = u32::from_ne_bytes(init[4..8].try_into().unwrap());
+        // FUSE negotiates MIN(kernel, daemon), not equality of advertisements.
+        // Upstream fuser0.18 advertises7.40 while accepting a legacy7.31 peer.
+        // The complete operation suite below still uses the peer's7.31 layout.
+        // https://man7.org/linux/man-pages/man4/fuse.4.html (FUSE_INIT)
+        assert_eq!(minor.min(daemon_minor), minor);
         // No POSIX locks, readdirplus or writeback-cache capabilities enabled.
         let flags = u32::from_ne_bytes(init[12..16].try_into().unwrap());
         assert_eq!(

@@ -1583,3 +1583,15 @@ now identify the same transport. These metadata/fixture checks are not real
 Mac mount acceptance. Stable macFUSE 5.4.0 and official 5.5.0 prerelease are
 distinguished, and the per-file sync limitation retains the user's intended
 disposable-tree scope rather than adding crash-durable temporary databases.
+
+## Registry fuser0.18 migration: advertised versus negotiated minor version
+
+At912114e, CI run39982153538 failed the existing protocol peer's literal
+INIT-reply equality check: upstream advertised7.40 to the7.31 peer. The FUSE
+contract negotiates the minimum of the two advertisements, so a higher server
+minor is compatible. The permanent peer now checks the negotiated minimum and
+continues the entire operation suite using its legacy7.31 layouts; the64-byte
+extended7.40 case remains. No protocol implementation or fork is reintroduced.
+Linux real mounts, enabled passthrough/lifecycle, performance and both packaged
+installers already passed that CI; the corrected protocol peer requires new-head
+Linux verification. This distinction does not claim Apple FSKit mount acceptance.
