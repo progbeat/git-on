@@ -1479,3 +1479,10 @@ Copilot also identified the Ubuntu 22.04/Python3.10 tomllib assumption and
 cross-job rehash weakness. Assembly now reads Cargo's JSON metadata and the
 four permanent `test_dist_integrity.py` cases reject changed native archives,
 missing/malformed checksums and source/manifest mismatches before regeneration.
+
+The packaging invariants also have permanent workflow-contract regressions.
+`GIT_ON_CI_BEFORE_REF=fc01cbc python3 tests/test_ci_contract.py` fails the missing
+pre-generation integrity gate and hard-coded 1.3.0 binary probe. The same suite
+passes against the corrected workflow (`/tmp/git-on-ci-contract-{red,green}.log`).
+The current probe obtains the package version from Cargo's JSON metadata and
+therefore retains the Ubuntu 22.04/Python3.10 build baseline.

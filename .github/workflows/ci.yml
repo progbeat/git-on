@@ -224,6 +224,7 @@ jobs:
           python3 tests/test_installer.py
           python3 tests/test_dist_integrity.py
           python3 tests/test_write_policy_harness.py
+          python3 tests/test_ci_contract.py
           python3 tests/test_record_demo.py
       - name: Test lossless conversion and output preservation
         run: |
