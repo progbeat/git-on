@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,9 +35,10 @@ class DispatcherTests(unittest.TestCase):
 from pathlib import Path
 args=sys.argv[1:]
 with open(os.environ['CURL_LOG'],'a') as f:f.write(repr(args)+'\\n')
-path=Path(args[args.index('-o')+1])
 capture='import json,os,sys;json.dump(sys.argv[1:],open(os.environ["ARGV_LOG"],"w"))'
-path.write_text('printf "%s\\\\n" "${GIT_ON_INSTALL_DIR:-$HOME/.local/bin}" > "$MARKER"\\n'+shlex.quote(sys.executable)+' -c '+shlex.quote(capture)+' "$@"\\nexit '+os.environ.get('CHILD_STATUS','0')+'\\n')
+payload=('printf "%s\\\\n" "${GIT_ON_INSTALL_DIR:-$HOME/.local/bin}" > "$MARKER"\\n'+shlex.quote(sys.executable)+' -c '+shlex.quote(capture)+' "$@"\\nexit '+os.environ.get('CHILD_STATUS','0')+'\\n')
+if '-o' in args:Path(args[args.index('-o')+1]).write_text(payload)
+else:sys.stdout.write(payload)
 sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
 ''')
         curl.chmod(0o755)
@@ -93,6 +96,33 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         result = self.run_installer('--version','1.3.0', CHILD_STATUS='23')
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertTrue(self.marker.exists())
+
+    def test_signalling_bootstrap_pid_stops_installer_before_replacement(self):
+        existing = self.root/'existing'
+        existing.write_text('old')
+        ready, release = self.root/'ready', self.root/'release'
+        payload = self.root/'payload'
+        payload.write_text('printf ready > "$READY"\nwhile [ ! -f "$RELEASE" ]; do sleep .02; done\nprintf new > "$EXISTING"\n')
+        # An inert curl supplies a controlled installer; no network or host install.
+        (self.bin/'curl').write_text('#!/bin/sh\ncat "$PAYLOAD"\n')
+        process = subprocess.Popen(['sh',str(ROOT/'install.sh')], env=dict(self.env,
+            PAYLOAD=str(payload),READY=str(ready),RELEASE=str(release),EXISTING=str(existing)),
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        try:
+            deadline=time.monotonic()+3
+            while not ready.exists() and process.poll() is None and time.monotonic()<deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(),process.poll())
+            process.send_signal(signal.SIGTERM)  # actual bootstrap PID, not its group
+            process.wait(timeout=3)
+            release.touch()
+            time.sleep(.15)
+            self.assertEqual(existing.read_text(),'old')
+        finally:
+            release.touch()
+            try: os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.communicate(timeout=3)
 
     def test_incomplete_bootstrap_cannot_start(self):
         source = (ROOT/'install.sh').read_text().rsplit('git_on_install "$@"',1)[0]

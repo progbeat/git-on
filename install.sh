@@ -1,7 +1,6 @@
 #!/bin/sh
-git_on_install() (
+git_on_install() {
     set -eu
-    umask 077
     version=latest
     # Rotate unconsumed arguments to preserve their order and exact bytes.
     remaining=$#
@@ -25,14 +24,8 @@ git_on_install() (
         latest) release=latest/download;;
         *) release=download/v${version#v};;
     esac
-    temporary=$(mktemp -d "${TMPDIR:-/tmp}/git-on-installer.XXXXXXXX")
-    trap 'rm -rf "$temporary"' 0
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-        "https://github.com/progbeat/git-on/releases/$release/git-on-installer.sh" \
-        -o "$temporary/installer.sh"
-    sh "$temporary/installer.sh" "$@"
-)
+    installer=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+        "https://github.com/progbeat/git-on/releases/$release/git-on-installer.sh")
+    exec sh -c "$installer" -- "$@"
+}
 { git_on_install "$@"; }

@@ -99,8 +99,8 @@ ranges: a missing tag/installer asset fails through HTTP, without executing the
 partial download. No legacy installer path exists. The Cloudflare redirect and
 published releases are unchanged.
 
-The dispatcher downloads the complete release installer into a private temporary
-file, checks curl's status, then runs it. It parses only version selection and
+The dispatcher captures the complete release installer in a shell variable, checks
+curl's status, then execs it. There is no bootstrap temporary file or cleanup trap. It parses only version selection and
 `--bin-dir`, translated to `GIT_ON_INSTALL_DIR` because cargo-dist has no such CLI
 option. All remaining arguments are passed unchanged to the generated installer,
 which owns `--help`, `--quiet`, `--verbose` and unknown-option handling. No shell

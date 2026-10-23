@@ -1670,3 +1670,36 @@ fix (`/tmp/git-on-first-open-red.log`) and passes afterward
 (`/tmp/git-on-first-open-green.log`). Explicit regular-file timestamps now reach
 the backing file before registration too; unspecified times remain untouched.
 The real enabled/fallback suite also covers this mknod/first-open transition.
+
+## Actual cargo-dist streaming and bootstrap cancellation
+
+The owner chose a minimal checked in-memory download after an actual generated
+installer experiment. CI95's corrected cargo-dist0.33 script (head93aae21) is
+53,869 bytes, SHA256
+`716a59b3adf24e2f454f65d2e8764ee35a8631d51a85ae3e29521146a33b67c8`.
+Its line1591 is the ungrouped final invocation
+`download_binary_and_run_installer "$@" || exit 1`.
+
+A real curl/loopback HTTP test served these exact bytes and the actual verified
+Mac archive into isolated HOME/XDG/TMPDIR/install directories. An incomplete body
+returned curl18/shell2 without installation. A stream ending16 bytes early,
+after the bare final function token, returned curl18/shell0 and installed the
+actual binary despite --help. HTTP404 and empty connection returned curl22/52
+but shell0 without installing. Complete help did not install; complete installation
+succeeded. This establishes the specific streaming edge, not a blanket objection
+to curl|sh. The report is
+`/var/folders/h8/1w0z_0kn7h32ls4byh382nwc0000gn/T/git-on-actual-stream-ngf6z325/report.json`.
+
+`tests/dist_installer.py` now permanently serves the actual generated script over
+loopback with a prematurely closed Content-Length response. The dispatcher must
+return18/22 for truncation/404 and preserve the sentinel, while complete help and
+installation retain upstream semantics. This passed locally with stock Mac shasum;
+log `/tmp/git-on-checked-real-installer.log`. Package CI repeats it on both hosts.
+
+Copilot also reproduced SIGTERM of the bootstrap PID leaving its subshell installer
+alive to replace existing bytes. The permanent actual-PID regression failed in
+`/tmp/git-on-bootstrap-pid-red.log`. A brace function plus exec now makes that PID
+the generated installer; no new supervisor or traps are added. All10 installer
+regressions pass in `/tmp/git-on-memory-dispatcher-green.log`. The missing-value
+case after a forwarded option is covered too (RED/GREEN logs
+`/tmp/git-on-forwarded-option-{red,green}.log`).

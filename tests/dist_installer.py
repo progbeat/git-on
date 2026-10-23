@@ -3,6 +3,7 @@
 No release is created and no network is used: a curl fixture supplies CI artifacts.
 """
 import argparse
+import http.server
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--dist',type=Path,required=True)
@@ -22,13 +24,15 @@ with tempfile.TemporaryDirectory() as scratch:
     root=Path(scratch)
     programs=root/'programs'; programs.mkdir()
     curl=programs/'curl'
-    curl.write_text(f'#!{sys.executable}\n'+'''import os,sys,shutil
+    curl.write_text(f'#!{sys.executable}\n'+'''import os,sys,shutil,subprocess
 from pathlib import Path
 args=sys.argv[1:]
 if '--version' in args:print('curl 8.0.0');sys.exit(0)
 if '--help' in args:print('--proto --tlsv1.2');sys.exit(0)
 url=next((a for a in args if a.startswith('https://')),None)
 if not url:sys.exit(1)
+if url.endswith('/git-on-installer.sh'):
+ sys.exit(subprocess.run(['/usr/bin/curl','-fsS',os.environ['SCRIPT_ENDPOINT']]).returncode)
 flag='--output' if '--output' in args else '-o'
 shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.index(flag)+1])
 ''')
@@ -51,6 +55,32 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
         result=subprocess.run(['sh',str(dist/'git-on-installer.sh'),option],env=env,capture_output=True,timeout=90)
         assert result.returncode!=0 and b'unknown option' in result.stderr,(option,result.stdout,result.stderr)
         assert (install/'git-on').read_bytes()==before
+    # Real HTTP truncation of the ACTUAL corrected script. A bare final main
+    # token would execute if streamed directly; checked capture must not run it.
+    script=(dist/'git-on-installer.sh').read_bytes()
+    footer=b'download_binary_and_run_installer "$@" || exit 1'
+    assert script.rstrip().endswith(footer)
+    cut=script.rfind(footer)+len(b'download_binary_and_run_installer')
+    class ScriptServer(http.server.BaseHTTPRequestHandler):
+        def log_message(self,*args): pass
+        def do_GET(self):
+            if self.path=='/missing':self.send_response(404);self.end_headers();return
+            self.send_response(200);self.send_header('Content-Length',str(len(script)));self.end_headers()
+            self.wfile.write(script[:cut] if self.path=='/incomplete' else script)
+            self.wfile.flush();self.close_connection=True
+    server=http.server.HTTPServer(('127.0.0.1',0),ScriptServer)
+    worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
+    try:
+        (install/'git-on').write_bytes(b'existing installation sentinel')
+        bootstrap=Path(__file__).resolve().parents[1]/'install.sh'
+        for route,status,arguments in [('incomplete',18,['--help']),('missing',22,[]),('complete',0,['--help'])]:
+            result=subprocess.run(['sh',str(bootstrap),*arguments],env=dict(env,SCRIPT_ENDPOINT=f'http://127.0.0.1:{server.server_port}/{route}'),capture_output=True,timeout=90)
+            assert result.returncode==status,(route,result.returncode,result.stderr)
+            assert (install/'git-on').read_bytes()==b'existing installation sentinel',route
+        subprocess.run(['sh',str(bootstrap),'--quiet'],env=dict(env,SCRIPT_ENDPOINT=f'http://127.0.0.1:{server.server_port}/complete'),check=True,timeout=90)
+        assert (install/'git-on').read_bytes()==before
+    finally:
+        server.shutdown();server.server_close();worker.join()
     sentinel=root/'inherited-stage'; sentinel.mkdir()
     (sentinel/'preserve').write_text('unrelated data')
     env.update(_install_temp=str(sentinel),_lib_install_temp=str(sentinel))
