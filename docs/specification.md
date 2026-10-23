@@ -145,10 +145,21 @@ The same FUSE and write-policy contract below applies to local and remote runs.
 FUSE is preferred whenever available and capable of the requested behavior.
 Missing Linux kernel passthrough is only an optimization limitation and retains
 ordinary FUSE I/O, including on macOS. Before launching the child, discovery
-identifies absent/inaccessible `/dev/fuse` or `fusermount3` on Linux, or absent
-macFUSE libfuse2/helper on macOS. Only explicit `--write-policy=all` permits an
+identifies absent/inaccessible `/dev/fuse` or `fusermount3` on Linux, or an absent
+official MFMount framework/macFUSE application on macOS. Native macOS
+mounts explicitly select FSKit and require owner-provisioned helpers and an
+activated user-space file system extension; a libfuse2 installation alone is
+insufficient. Only explicit `--write-policy=all` permits an
 ordinary private-directory backend in that case. Other mount failures remain
 errors. Never rerun a command after a mount or runtime failure.
+
+FSKit is the preferred macOS path without a kernel extension. Its missing
+per-file fsync callback is an explicit platform limitation, not an equivalent
+durability/error-propagation contract. Persistent databases belong outside the
+disposable execution tree; crash-durable temporary databases are not required.
+Required write policies, permissions, isolation and lifecycle behavior remain
+unchanged. See [the platform constraints](platforms.md) for separate startup,
+FSKit and read-only-mount version requirements and actual verification status.
 
 The materialized backend reads the same pinned tree eagerly, preserves bytes,
 symlinks and executable modes, and never applies checkout filters or fabricates

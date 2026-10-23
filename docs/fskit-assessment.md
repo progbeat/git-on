@@ -52,29 +52,34 @@ those Apple interfaces alone.
 ## Specific release/OS constraints
 
 Read-only checks confirmed this Mac is 26.3.1(a), build 25D771280a. GitHub's latest
-official macFUSE release is 5.4.0 (2026-09-07), not the planned 5.5.0.
+stable macFUSE release is 5.4.0 (2026-09-07). The official
+[5.5.0 prerelease](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.5.0)
+(2026-10-17) is available, but is not a stable release.
 
 In [macFUSE #1208](https://github.com/macfuse/macfuse/issues/1208), the maintainer
-confirms unreliable read-only mount enforcement on older macOS. Planned 5.5
-forwards the newer read-only API on 26.4+, whose reliability was reported fixed
-in 26.5 beta 2. The adapter retains ro and rejects a missing actual read-only
+confirms unreliable read-only mount enforcement on older macOS. The 5.5
+prerelease adds the newer read-only API on 26.4+, whose reliability was reported
+fixed in 26.5 beta 2. The adapter retains ro and rejects a missing actual read-only
 flag for policy none. Userspace guards do not silently substitute for that flag.
 
 In [macFUSE #1214](https://github.com/macfuse/macfuse/issues/1214), the maintainer
 confirms FSKit lacks a per-file fsync callback. macFUSE 5.4 whole-volume sync
-already sends fsync/fsyncdir for live handles; planned 5.5 adds flush before
+already sends fsync/fsyncdir for live handles; the 5.5 prerelease adds flush before
 release, while close cannot propagate its error on the discussed OS. Git-on
 normally performs backing-file sync and propagates errors in these callbacks.
 Whole-volume sync is not proven equivalent to each caller's fsync contract.
-An actual callback/error/ordering probe is required. Synchronizing every write
-is a possible conservative adaptation to investigate, but changes latency and
-still needs kernel-cache ordering proof; it is not implemented or claimed here.
-These are concrete remaining contract gates, not a blanket rejection of FSKit.
+This is a documented FSKit limitation for the intended disposable build and
+test tree. Persistent databases belong outside that tree. Crash-durable
+temporary database support is not an added acceptance gate, and full per-file
+sync/error equivalence is not claimed. Ordinary I/O correctness, write policies,
+permissions and checked lifecycle remain required.
 `tests/fsync_contract.py --binary target/debug/git-on` supplies that focused
 probe for a `--features test-metrics` build: require a real callback for ordinary
 fsync, then inject EIO in that callback and require the caller to receive it.
-No callback, a false success or ignored error fails the probe. Its Linux real
-FUSE execution is part of CI; it has not been executed through FSKit here.
+No callback, a false success or ignored error fails this strict probe. Its Linux
+real-FUSE execution is part of CI; it has not been executed through FSKit here.
+An expected FSKit failure must be reported as the known limitation, never a
+passing per-file sync test or proof that temporary databases are crash-durable.
 
 ## Test and installation boundary
 
@@ -111,6 +116,7 @@ user activation of that extension. Git/SSH execution and host access must remain
 in an ordinary CLI/helper or be mediated with supported resource/IPC permissions;
 embedding Rust does not grant an extension unrestricted host access. These are
 additional packaging and sandbox decisions beyond a single command-line binary.
-The shared Apple FSKit per-file sync limitation also needs resolution; replacing
-macFUSE alone does not establish that contract. No direct-FSKit rewrite, signing
-credential creation or extension installation is authorized or implemented here.
+The shared Apple FSKit per-file sync limitation also remains; replacing
+macFUSE alone does not establish per-file sync equivalence. No direct-FSKit
+rewrite, signing credential creation or extension installation is authorized or
+implemented here.

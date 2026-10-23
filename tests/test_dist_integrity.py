@@ -3,9 +3,12 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import runpy
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('verify_local',ROOT/'scripts/verify_local_dist.py')
@@ -47,6 +50,34 @@ class NativeIntegrityTests(unittest.TestCase):
         name='git-on-'+mod.TARGETS[0]+'.tar.gz'
         (self.root/(mod.TARGETS[0]+'-dist-manifest.json')).write_text(json.dumps({'artifacts':{name:{'checksums':{'sha256':'0'*64}}}}))
         with self.assertRaisesRegex(ValueError,'manifest mismatch'):mod.verify(self.root,SHA)
+
+
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_actual_assembly_distinguishes_macos_startup_and_mount_requirements(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            source=root/'target/distrib';source.mkdir(parents=True)
+            for name in ('git-on-aarch64-apple-darwin.tar.gz','git-on-x86_64-unknown-linux-gnu.tar.gz','git-on-installer.sh','source.tar.gz'):
+                (source/name).write_bytes(b'fixture; never executed')
+            previous=Path.cwd()
+            try:
+                os.chdir(root)
+                with mock.patch('subprocess.check_output',side_effect=[json.dumps({'packages':[{'version':'1.3.0'}]}),SHA]):
+                    runpy.run_path(str(ROOT/'scripts/assemble_dist.py'),run_name='__main__')
+            finally:
+                os.chdir(previous)
+            metadata=json.loads((root/'dist/release.json').read_text())
+            mac=metadata['targets']['aarch64-apple-darwin']
+            self.assertEqual(mac['baseline'],'macOS 13+ (startup and explicit-all materialization)')
+            self.assertEqual(mac['mounts']['minimum_macos'],'15.4')
+            self.assertEqual(mac['mounts']['backend'],'macFUSE FSKit via MFMount')
+            self.assertEqual(mac['mounts']['read_only_minimum_macos'],'26.4')
+            self.assertEqual(mac['mounts']['read_only_minimum_macfuse'],'5.5.0')
+            self.assertIn('helpers',mac['mounts']['runtime'])
+            self.assertIn('extension',mac['mounts']['runtime'])
+            self.assertNotIn('libfuse2',json.dumps(mac))
+            inventory=(root/'dist/SHA256SUMS').read_text()
+            self.assertIn(hashlib.sha256((root/'dist/release.json').read_bytes()).hexdigest()+'  release.json\n',inventory)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

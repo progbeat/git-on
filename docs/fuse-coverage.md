@@ -191,10 +191,12 @@ real-mount oracle in `tests/stress.py` also checks this after every operation.
 ## 1.3 macOS and passthrough evidence limits
 
 The vendored 0.16.0 patch preserves the complete Filesystem trait above. Linux
-uses ABI 7.40; macOS uses ABI 7.31 with macFUSE 4 compatibility and the official
-libfuse2 mount entry point. The three macOS-only callbacks retain their upstream
-ENOSYS contracts. The protocol harness is Linux-only and is never macFUSE mount
-evidence. Actual macFUSE mount acceptance remains a release-readiness gate.
+uses ABI 7.40; macOS uses ABI 7.31 with the official MFMount message transport
+and explicitly selects macFUSE's FSKit backend. The three macOS-only callbacks
+retain their upstream ENOSYS contracts. The Linux protocol harness and the
+native Mac rename-dispatch peer are not real mount evidence. Actual FSKit
+mounts, permission/isolation checks and lifecycle acceptance remain gates;
+the per-file sync limitation is documented in [the FSKit assessment](fskit-assessment.md).
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
 FOPEN_PASSTHROUGH for command-created regular files only, after policy and access

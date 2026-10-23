@@ -15,7 +15,8 @@ The binary deployment target remains macOS 13+ for startup/materialization.
 The MFMount/FSKit backend requires macOS 15.4+ and the official runtime framework
 at `/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount`.
 It explicitly selects FSKit and never selects a kernel backend. The latest
-verified official release is macFUSE 5.4.0. Required-behavior gaps below must be
+verified stable release is macFUSE 5.4.0; official 5.5.0 is a prerelease, adding
+FSKit read-only mounting on macOS 26.4+. Required-behavior gaps below must be
 resolved/verified before claiming supported native mounts. The fixed framework
 path is loaded at runtime, not through an arbitrary library search path.
 No driver or SDK is required merely to build or use the explicit-all fallback.
@@ -113,21 +114,29 @@ does not prohibit the separate user-space FSKit route.
 The adapter retains the requested mount options and verifies actual nosuid/nodev
 flags and the read-only flag for policy none before command launch. It records
 getmntinfo filesystem ID, mount owner and source for checked cleanup rather than
-assuming FSKit preserves fsname. POSIX permissions, cross-user isolation, sync
+assuming FSKit preserves fsname. POSIX permissions, cross-user isolation, I/O
 and remaining lifecycle cases still need actual tests. No missing protection is
 silently removed to get a passing mount.
 
 ### Concrete owner prerequisite
 
-The proposed test dependency is the official
-[macFUSE 5.4.0](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.4.0)
-DMG's `Install macFUSE.pkg`, then activation of its user-space FSKit file system
+The stable dependency candidate is official
+[macFUSE 5.4.0](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.4.0).
+Full policy-none acceptance additionally needs the read-only API on macOS 26.4+
+and the [5.5.0 prerelease](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.5.0),
+or a later stable release incorporating that support. An owner-approved test
+would install the selected official DMG's `Install macFUSE.pkg`, then activate
+its user-space FSKit file system
 extension in System Settings. Confirm helpers are already provisioned before
 calling MFMount, which may try to refresh them. This proposal does not authorize
 installation, extension activation, system security changes or restart.
 Use FSKit explicitly; do not approve or load a kernel extension for this test.
-On this Mac's verified 26.3.1(a), read-only mount flags and per-file fsync are
-concrete compatibility gates; installation is not a promise that all tests pass.
+On this Mac's verified 26.3.1(a), the newer read-only API is absent. Required
+read-only mount flags remain an acceptance gate; installation alone cannot fix
+that OS prerequisite or prove the tests pass. FSKit's per-file fsync limitation
+is documented rather than presented as equivalent to Linux. Persistent databases
+belong outside the disposable tree; crash-durable temporary database support is
+not an extra release gate. See [the assessment](fskit-assessment.md).
 
 ### Existing Linux host evidence
 

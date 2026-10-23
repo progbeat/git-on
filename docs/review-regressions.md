@@ -1567,3 +1567,19 @@ and recovery format reported by its own child. At `f3e0b24`, all enabled and
 ordinary-FUSE lifecycle cases passed with checked cleanup. CI printed the
 capability-revocation and private-copy-deletion receipt; the linked evidence is
 in docs/platforms.md. No mount skip is counted as this result.
+
+## 1.3 Copilot follow-up: release metadata identifies FSKit prerequisites
+
+At `56667a5`, the actual assembly script still emitted a macOS 13+ / libfuse2
+mount baseline despite the MFMount/FSKit adapter. The permanent
+`ReleaseMetadataTests.test_actual_assembly_distinguishes_macos_startup_and_mount_requirements`
+executes that script with inert archive fixtures and checks its generated
+release.json and checksum inventory. It failed on the obsolete baseline
+(`/tmp/git-on-macos-metadata-red.log`), then passed after recording separate
+startup/materialization, FSKit, runtime framework/helper/extension and read-only
+requirements (`/tmp/git-on-macos-metadata-green.log`, all six integrity tests).
+The acceptance matrix, backend discovery specification and release/build docs
+now identify the same transport. These metadata/fixture checks are not real
+Mac mount acceptance. Stable macFUSE 5.4.0 and official 5.5.0 prerelease are
+distinguished, and the per-file sync limitation retains the user's intended
+disposable-tree scope rather than adding crash-durable temporary databases.

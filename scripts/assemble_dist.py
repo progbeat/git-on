@@ -15,6 +15,24 @@ for name in ('git-on-aarch64-apple-darwin.tar.gz','git-on-x86_64-unknown-linux-g
     shutil.copy2(source/name,output/name)
     digest=hashlib.sha256((output/name).read_bytes()).hexdigest()
     (output/(name+'.sha256')).write_text(digest+' *'+name+'\n')
-manifest={'version':version,'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'cargo_dist':'0.33.0','targets':{'x86_64-unknown-linux-gnu':{'baseline':'Ubuntu 22.04 / glibc 2.35'},'aarch64-apple-darwin':{'baseline':'macOS 13+; macFUSE libfuse2 for mounts'}}}
+manifest={
+    'version':version,
+    'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+    'cargo_dist':'0.33.0',
+    'targets':{
+        'x86_64-unknown-linux-gnu':{'baseline':'Ubuntu 22.04 / glibc 2.35'},
+        'aarch64-apple-darwin':{
+            'baseline':'macOS 13+ (startup and explicit-all materialization)',
+            'mounts':{
+                'backend':'macFUSE FSKit via MFMount',
+                'minimum_macos':'15.4',
+                'runtime':'official macFUSE application, helpers, MFMount.framework and activated user-space FSKit extension',
+                'read_only_minimum_macos':'26.4',
+                'read_only_minimum_macfuse':'5.5.0',
+                'sync_limitation':'FSKit has no per-file fsync callback; keep persistent databases outside the disposable tree',
+            },
+        },
+    },
+}
 (output/'release.json').write_text(json.dumps(manifest,sort_keys=True)+'\n')
 (output/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(output.iterdir())))
