@@ -17,7 +17,7 @@ from integration import BINARY, FUSE_AVAILABLE, OPTIONS, PARSER, RepositoryTest,
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE device and fusermount3 required")
 class WritePolicyTests(RepositoryTest):
-    def policy(self, policy, code, *, keep=False):
+    def policy(self, policy, code):
         return self.invoke_argv([
             "HEAD", "--write-policy=" + policy, *(["--keep"] if keep else []),
             "--", sys.executable, "-c", code,
@@ -256,28 +256,6 @@ reader.close()
         self.assert_source_unchanged()
         self.assert_no_runtime_files()
 
-    def test_keep_retains_sparse_artifacts_on_success_and_command_error(self):
-        for outcome in (0, 37):
-            for policy in ("none", "ignored", "untracked", "all"):
-                with self.subTest(policy=policy, outcome=outcome):
-                    code = "from pathlib import Path; "
-                    if policy != "none":
-                        code += "Path('out/result').write_text('saved'); "
-                    if policy == "all":
-                        code += "Path('tracked.txt').write_text('modified'); Path('plain/source.py').unlink(); "
-                    code += f"raise SystemExit({outcome})"
-                    result, run = self.policy(policy, code, keep=True)
-                    self.assertEqual(result.returncode, outcome, result.stderr)
-                    self.assertIsNotNone(run)
-                    self.assertFalse((run / "mount").exists())
-                    self.assertFalse((run / "backing/nested/module.py").exists())
-                    if policy != "none":
-                        self.assertEqual((run / "backing/out/result").read_text(), "saved")
-                    if policy == "all":
-                        self.assertEqual((run / "backing/tracked.txt").read_text(), "modified")
-                        self.assertFalse((run / "backing/plain/source.py").exists())
-                    self.assertNotEqual(self.cleanup_run(run).returncode, 0)
-                    self.assert_source_unchanged()
 
     def test_interrupt_cleans_each_policy_and_preserves_the_source(self):
         for policy in ("none", "ignored", "untracked", "all"):

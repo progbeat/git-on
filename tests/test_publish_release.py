@@ -34,11 +34,13 @@ class PublicationTests(unittest.TestCase):
         self.assets = {}
         self.starter = set()
         self.calls = []
+        self.immutable_enabled = True
 
     def fake(self, *args, raw=False, data=None):
         self.calls.append((args, data))
         if args[0] == 'api':
             path = next(x for x in args[1:] if x.startswith('repos/'))
+            if path.endswith('/immutable-releases'): return {'enabled': self.immutable_enabled}
             if '/git/matching-refs/' in path:
                 return self.refs
             if path.endswith('/git/refs'):
@@ -60,6 +62,7 @@ class PublicationTests(unittest.TestCase):
             if path.endswith('/releases/1'):
                 if data is not None:
                     self.releases[0].update(data)
+                    if data.get("draft") is False: self.releases[0]["immutable"] = True
                 return self.releases[0]
         if args[:2] == ('release', 'upload'):
             path = Path(args[3])
@@ -75,6 +78,13 @@ class PublicationTests(unittest.TestCase):
     def run_publish(self):
         with patch.object(MOD, 'gh', self.fake):
             MOD.publish()
+
+    def test_disabled_immutability_fails_before_tag_or_release_creation(self):
+        self.immutable_enabled = False
+        with self.assertRaisesRegex(RuntimeError, 'immutability must already'):
+            self.run_publish()
+        self.assertEqual(self.refs, [])
+        self.assertEqual(self.releases, [])
 
     def test_create_and_retry_published_without_mutation(self):
         self.run_publish()

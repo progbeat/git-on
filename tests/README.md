@@ -107,7 +107,7 @@ fallbacks (including locks, polling, seeking, and copying).
 `tests/write_policy.py` exercises all four policies through real mounts. It
 checks ignored and unignored creation, tracked contents and parent-directory
 protection, file/directory renames and deletion, symlinks/hardlinks, metadata,
-open-handle coherence, sparse `--keep` exports, command errors and SIGINT cleanup.
+open-handle coherence, disposable overlay cleanup, command errors and SIGINT cleanup.
 Its dirty-index/working-copy fixture verifies that `untracked` means absent from
 the selected commit. Source checks include ignored host files to catch leaks.
 
@@ -172,15 +172,15 @@ raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
 binary standard streams and inherited stdin; exit/signal return codes; direct
 terminal detection, PTY foreground ownership and stop/continue handling; missing
 executables; forwarded signals; default temporary-layer removal; `TMPDIR`
-selection; mandatory command separators; `--keep`/`-k` and compatibility argument
+selection; mandatory command separators; removed `--keep`/`-k` rejection and literal child argument
 parsing; exact argument forwarding after the first separator; rejected old direct
 command syntax, extra operands and unknown options without runtime state; retention
 after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
-active or deliberately retained state; retained busy mounts and explicit
+active state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
 runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
-retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.
+inspect caches inside the command or explicitly copy them to an external path.
 
 Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
 during startup transport and after the mounted child starts. SIGKILL observations
@@ -228,3 +228,17 @@ runs the complete real-FUSE integration suite against `installed/git-on`. The
 acceptance test also guards the legacy three-asset/two-checksum-entry contract
 and verifies the distributed LICENSE.
 Installer fixtures are not a substitute for that packaged-binary mount test.
+
+## 1.3 verification
+
+`python3 tests/materialized.py target/debug/git-on` performs actual no-FUSE
+execution, never a mocked or claimed real mount. It isolates PATH from the FUSE
+helper and checks explicit policy selection, bytes/links/modes, argv, source
+isolation, fresh runs, unsupported entries, signals and cleanup; macOS also
+exercises its case-insensitive filesystem collision guard.
+
+`python3 tests/test_installer.py` checks the thin dispatcher and fail-closed
+checksum correction. Packaging runs `tests/dist_installer.py --dist dist
+--install-dir /absolute/path` against the actual generated installer and archive.
+The old installer/asset-layout contract is intentionally retired at 1.3.0.
+See [platform validation](../docs/platforms.md) for real Mac/passthrough gates.

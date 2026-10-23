@@ -1,5 +1,9 @@
 use anyhow::{bail, Context, Result};
-use git_on::{filesystem::Overlay, snapshot::Snapshot};
+use git_on::{
+    filesystem::Overlay,
+    platform::{ensure_unmounted, mount_is_ours},
+    snapshot::Snapshot,
+};
 use serde::{Deserialize, Serialize};
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
@@ -11,7 +15,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::{
-        ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
@@ -28,7 +31,6 @@ mod cli;
 struct Recovery {
     format: String,
     id: String,
-    keep: bool,
     git_dir: Option<PathBuf>,
     tree_oid: Option<String>,
     pin_ref: Option<String>,
@@ -65,60 +67,6 @@ fn kill_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
     }
-}
-fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
-    let p = dir.join("mount");
-    let source = format!("git-on:{id}");
-    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-    let mut found = false;
-    for line in mounts.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() > 6 && decode_mount(fields[4]) == p.as_os_str().as_bytes() {
-            let sep = fields
-                .iter()
-                .position(|x| *x == "-")
-                .context("invalid mountinfo")?;
-            if fields.get(sep + 2) == Some(&source.as_str()) {
-                if found {
-                    bail!("stacked mounts at the temporary mountpoint");
-                }
-                found = true;
-                continue;
-            }
-            bail!("mountpoint is occupied by a different filesystem");
-        }
-    }
-    Ok(found)
-}
-fn ensure_unmounted(dir: &Path) -> Result<()> {
-    for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
-        if let Some(point) = line.split_whitespace().nth(4) {
-            let bytes = decode_mount(point);
-            let path = Path::new(std::ffi::OsStr::from_bytes(&bytes));
-            if path.starts_with(dir) {
-                bail!("a mount remains below {}; refusing deletion", dir.display());
-            }
-        }
-    }
-    Ok(())
-}
-fn decode_mount(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|v| (b'0'..=b'7').contains(v))
-        {
-            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + b[i + 3] - b'0');
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    out
 }
 fn release_pin(m: &Recovery) -> Result<()> {
     if let (Some(repo), Some(pin), Some(oid)) = (&m.git_dir, &m.pin_ref, &m.tree_oid) {
@@ -197,8 +145,15 @@ impl Drop for Terminal {
 fn clean_unmount(mountpoint: &Path) -> Result<()> {
     let start = Instant::now();
     loop {
-        let mut child = Command::new("fusermount3")
-            .args(["-u", "--"])
+        #[cfg(target_os = "linux")]
+        let mut unmount = {
+            let mut c = Command::new("fusermount3");
+            c.args(["-u", "--"]);
+            c
+        };
+        #[cfg(target_os = "macos")]
+        let mut unmount = Command::new("/sbin/umount");
+        let mut child = unmount
             .arg(mountpoint)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -279,7 +234,7 @@ fn child_exited(pid: u32) -> Result<bool> {
         }
         return Err(e.into());
     }
-    Ok(unsafe { info.si_pid() } != 0)
+    Ok(git_on::platform::siginfo_pid(&info) != 0)
 }
 fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
     let (Some(parent_pgid), Some(fd)) = (terminal.parent, terminal.descriptor()) else {
@@ -304,8 +259,8 @@ fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
     if current == parent_pgid {
         foreground(fd, pid as libc::pid_t)?;
     }
-    if unsafe { info.si_pid() } != 0 {
-        let stop = unsafe { info.si_status() };
+    if git_on::platform::siginfo_pid(&info) != 0 {
+        let stop = git_on::platform::siginfo_status(&info);
         if current == parent_pgid && (stop == libc::SIGTTIN || stop == libc::SIGTTOU) {
             kill_group(pid, libc::SIGCONT);
             return Ok(());
@@ -332,9 +287,6 @@ fn cleanup(dir: &Path) -> Result<()> {
     let state: Recovery = serde_json::from_reader(File::open(dir.join(".state"))?)?;
     if state.format != "git-on-temp-v1" {
         bail!("unrecognized temporary directory");
-    }
-    if state.keep {
-        bail!("kept temporary files must be removed explicitly by their owner");
     }
     if mount_is_ours(&dir, &state.id)? {
         clean_unmount(&dir.join("mount"))?;
@@ -404,7 +356,6 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
 fn execute(
     tree: OsString,
     args: Vec<OsString>,
-    keep: bool,
     source: Option<OsString>,
     verify: bool,
     write_policy: git_on::policy::WritePolicy,
@@ -427,14 +378,12 @@ fn execute(
     let mut state = Recovery {
         format: "git-on-temp-v1".into(),
         id: id.clone(),
-        keep,
         git_dir: None,
         tree_oid: None,
         pin_ref: None,
     };
     let _lock = held_lock;
     let mut observed = None;
-    let mut kept_export = None;
     let mut result = (|| -> Result<ExitStatus> {
         #[cfg(feature = "test-metrics")]
         if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
@@ -461,38 +410,46 @@ fn execute(
         observed = Some(snapshot.clone());
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
-        let mut overlay = Overlay::with_write_policy(snapshot, dir.join("backing"), write_policy)?;
-        if keep {
-            kept_export = Some(overlay.enable_keep_export(dir.join("kept")));
-        }
-        if let Some(signal) = signals
-            .pending()
-            .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
-        {
-            return Ok(ExitStatus::from_raw(signal));
-        }
-        let mut mount_options = vec![
-            fuser::MountOption::FSName(format!("git-on:{id}")),
-            fuser::MountOption::Subtype("git-on".into()),
-            fuser::MountOption::NoSuid,
-            fuser::MountOption::NoDev,
-            fuser::MountOption::DefaultPermissions,
-        ];
-        if write_policy == git_on::policy::WritePolicy::None {
-            mount_options.push(fuser::MountOption::RO);
-        }
-        let session = fuser::spawn_mount2(overlay, dir.join("mount"), &mount_options)
+        let unavailable = git_on::platform::fuse_unavailable()?;
+        let mut session = if let Some(reason) = unavailable {
+            if write_policy != git_on::policy::WritePolicy::All {
+                bail!("FUSE unavailable: {reason}; policy {write_policy:?} requires FUSE. Only explicit --write-policy=all supports materialization");
+            }
+            eprintln!("git-on: materialized backend (explicit all): {reason}; eagerly reading the complete snapshot");
+            git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
+            None
+        } else {
+            let overlay = Overlay::with_write_policy(snapshot, dir.join("backing"), write_policy)?;
+            if let Some(signal) = signals
+                .pending()
+                .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
+            {
+                return Ok(ExitStatus::from_raw(signal));
+            }
+            let mut mount_options = vec![
+                fuser::MountOption::FSName(format!("git-on:{id}")),
+                fuser::MountOption::Subtype("git-on".into()),
+                fuser::MountOption::NoSuid,
+                fuser::MountOption::NoDev,
+                fuser::MountOption::DefaultPermissions,
+            ];
+            if write_policy == git_on::policy::WritePolicy::None {
+                mount_options.push(fuser::MountOption::RO);
+            }
+            let session = fuser::spawn_mount2(overlay, dir.join("mount"), &mount_options)
         .with_context(|| {
             format!("cannot mount snapshot at {}; check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support", dir.join("mount").display())
         })?;
-        let mut session = Mounted {
-            session: Some(session),
-            mountpoint: dir.join("mount"),
-            id: id.clone(),
+            let session = Mounted {
+                session: Some(session),
+                mountpoint: dir.join("mount"),
+                id: id.clone(),
+            };
+            if !mount_is_ours(&dir, &id)? {
+                bail!("FUSE mount did not become ready");
+            }
+            Some(session)
         };
-        if !mount_is_ours(&dir, &id)? {
-            bail!("FUSE mount did not become ready");
-        }
         if let Some(signal) = signals
             .pending()
             .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
@@ -556,7 +513,7 @@ fn execute(
             let _ = child.wait();
         }
         drop(terminal);
-        let unmount = session.finish();
+        let unmount = session.as_mut().map_or(Ok(()), Mounted::finish);
         match (outcome, unmount) {
             (Ok(status), Ok(())) => Ok(status),
             (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
@@ -613,34 +570,7 @@ fn execute(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("remove SSH recovery identity"),
         }
-        if keep {
-            if let Some(export) = kept_export.as_ref() {
-                match export
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("keep export lock poisoned"))?
-                    .as_ref()
-                {
-                    Some(Ok(())) => {
-                        fs::remove_dir_all(dir.join("backing"))?;
-                        fs::rename(dir.join("kept"), dir.join("backing"))?;
-                    }
-                    Some(Err(e)) => bail!(
-                        "cannot export kept files: {e}; raw backing retained at {}",
-                        dir.display()
-                    ),
-                    None => bail!(
-                        "keep export did not complete; raw backing retained at {}",
-                        dir.display()
-                    ),
-                }
-            }
-            if dir.join("mount").exists() {
-                fs::remove_dir(dir.join("mount"))?;
-            }
-            eprintln!("git-on: kept temporary files at {}", dir.display());
-        } else {
-            fs::remove_dir_all(&dir)?;
-        }
+        fs::remove_dir_all(&dir)?;
         Ok(())
     })();
     if let Err(e) = cleanup_result {
@@ -673,7 +603,6 @@ fn main() {
             Ok(cli::Invocation::Run(run)) => execute(
                 run.tree,
                 run.command.to_vec(),
-                run.keep,
                 run.repository,
                 run.verify,
                 run.write_policy,
@@ -709,9 +638,10 @@ fn main() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -867,7 +797,6 @@ mod tests {
         Recovery {
             format: "git-on-temp-v1".into(),
             id: "unit-test".into(),
-            keep,
             git_dir: None,
             tree_oid: None,
             pin_ref: None,
@@ -948,6 +877,9 @@ mod tests {
     }
     #[test]
     fn mount_escapes_are_decoded() {
-        assert_eq!(decode_mount("/tmp/a\\040b\\134c"), b"/tmp/a b\\c");
+        assert_eq!(
+            git_on::platform::decode_mount("/tmp/a\\040b\\134c"),
+            b"/tmp/a b\\c"
+        );
     }
 }

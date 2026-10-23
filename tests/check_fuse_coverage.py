@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FUSER_VERSION = "0.16.0"
+VENDORED_SHA256 = "fa632e1a6272c0fd100f2950cbd6bdab7fcca188f50aac00fa8a5a7c9f4b3f19"
 FUSER_CHECKSUM = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
 TRAIT_SHA256 = "6d47b0047ba5917f4534ab34186152e1ef909ab04323bdc8d4bc7e9a87479fdf"
 
@@ -154,8 +155,13 @@ def check(root=ROOT):
     packages = [p for p in lock["package"] if p["name"] == "fuser"]
     require(len(packages) == 1, "expected exactly one locked fuser dependency")
     locked = packages[0]
-    require((locked["version"], locked.get("checksum")) == (FUSER_VERSION, FUSER_CHECKSUM),
+    require(locked["version"] == FUSER_VERSION and "source" not in locked,
             "fuser dependency changed; review callback contract, matrix and fingerprint")
+    vendored = root / "vendor/fuser"
+    digest = hashlib.sha256()
+    for path in sorted([vendored / "Cargo.toml", vendored / "build.rs", *vendored.glob("src/**/*.rs")]):
+        digest.update(str(path.relative_to(vendored)).encode() + b"\0" + path.read_bytes())
+    require(digest.hexdigest() == VENDORED_SHA256, "vendored fuser changed; review the compatibility patch and inventory")
     metadata = host_metadata(root)
     packages = [p for p in metadata["packages"] if p["name"] == "fuser"]
     require(len(packages) == 1 and packages[0]["version"] == FUSER_VERSION,

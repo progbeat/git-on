@@ -1,10 +1,11 @@
 [package]
 name = "git-on"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
 license = "MIT"
+repository = "https://github.com/progbeat/git-on"
 
 [features]
 default = []
@@ -36,3 +37,14 @@ tempfile = "3"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-40"] }
+
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }

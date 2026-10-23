@@ -21,9 +21,9 @@ git on --version
 
 Every executed command requires `--`. Before the first separator, supply exactly
 one local revision, or a repository followed by a revision. Recognized
-`--keep`/`-k`/`--verify` and `--write-policy=none|ignored|untracked|all` options may
+`--verify` and `--write-policy=none|ignored|untracked|all` options may
 appear anywhere before that separator, interspersed with the operands.
-Both keep spellings have the same effect; repeating them is harmless. With one
+`--keep` and `-k` before the separator return usage 2 with migration guidance. With one
 operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`. With two,
 native `git fetch` receives the unchanged repository and revision/refspec;
 `main:destination` is a fetch refspec, not a remote directory selector.
@@ -32,14 +32,13 @@ argv: git-on does not parse the command's options or any subsequent `--`.
 
 ```sh
 git on HEAD -- ls
-git on HEAD:examples/uv-project -k -- uv run --locked main.py
-git on HEAD:examples/uv-project --keep -- uv run --locked main.py
+git on HEAD:examples/uv-project -- uv run --locked main.py
 ```
 
 | Invocation | Interpretation |
 | --- | --- |
-| `git on HEAD --keep -- cmd -k --keep -- arg` | Keep files; pass `-k --keep -- arg` to `cmd` |
-| `git on HEAD -k -- cmd --keep` | Keep files; pass `--keep` to `cmd` |
+| `git on HEAD -- cmd -k --keep -- arg` | Pass `-k --keep -- arg` unchanged to `cmd` |
+| `git on HEAD -k -- cmd` | Usage error: removed runner option |
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
 | `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
@@ -61,7 +60,7 @@ help. The same spellings after the separator are ordinary command argv.
 
 **Migrating from 0.1.x:** insert `--` before the command in every execution call:
 `git on REV command args` becomes `git on REV -- command args`.
-To retain generated files, use `git on REV --keep -- command args`.
+Write required logs and artifacts to explicit paths outside the execution tree.
 For a rare executable named `--keep`, use `git on REV -- --keep -- args`: the
 second `--` belongs to that executable.
 
@@ -116,7 +115,7 @@ The following ignore-rule restrictions apply to `ignored`:
   git-on does not terminate the application merely because an operation was denied; the
   application handles that error normally.
 - The writable layer is temporary and private to one run. Normal completion removes it
-  unless `--keep` was requested; a new run starts empty. Abrupt termination can leave
+  and a new run starts empty. Abrupt termination can leave
   backing files until checked cleanup runs, as described below.
 
 The policy is language-independent. There are no special write exceptions for Python,
@@ -159,29 +158,10 @@ itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesys
 capacity and operating-system resource limits still apply. Temporary directories are
 private to the current user.
 
-By default, git-on unmounts and removes the writable layer after the command finishes.
-To retain generated files and, in `all`, modified source files:
-
-```sh
-git on HEAD --keep -- python script.py
-```
-
-The equivalent short form is `git on HEAD -k -- python script.py`. After unmounting,
-git-on reports the retained
-temporary-directory path on stderr. Its `backing/` subdirectory contains the writable
-layer with its original paths, not a checkout of the selected tree; untouched tracked
-source files are not copied into it. The mount is removed. A small retention marker
-remains so recovery cleanup cannot mistake intentionally kept files for disposable stale
-state. A later invocation still starts with an empty writable layer. Remove the retained
-directory yourself when finished with it. Alternatively, write or copy chosen results to
-an explicit host path from the command.
-
-In `all`, `backing/` is a sparse artifact directory. Deleted source files are
-absent. Whiteouts and directory redirects live only for the session; untouched
-source descendants of a renamed directory are not exported. Consequently the
-retained directory cannot replay the final merged snapshot. Copy any complete
-result you need to an explicit host path while the command is still running.
-With `none`, `--keep` retains an empty writable artifact directory.
+git-on unmounts and removes temporary writes after the command finishes.
+`--keep` and `-k` were removed in 1.3.0. Use explicit external paths for required
+results, such as `git on HEAD -- command > /absolute/path/command.log` or copy
+chosen artifacts outside the execution tree while the command is running.
 
 Usage errors return 2; a runner failure returns 125; otherwise the command's exit code
 is returned. If the command terminates by signal, git-on re-raises that signal after
@@ -199,8 +179,7 @@ detached process outside the managed group can still retain inherited descriptor
 git-on is a foreground runner, not a service daemonizer or host process sandbox.
 
 Git trees are pinned under `refs/git-on/<id>` while in use. Normal completion unmounts,
-releases the pin, and removes temporary state. With `--keep`, only the writable backing
-directory is retained. A busy mount or abrupt termination can leave a temporary
+releases the pin, and removes temporary state. A busy mount or abrupt termination can leave a temporary
 directory, mount, and pin; minimal private recovery metadata allows checked cleanup
 without keeping execution logs or a run manifest:
 
@@ -208,7 +187,7 @@ without keeping execution logs or a run manifest:
 git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run or a deliberately kept backing directory, will only
+Cleanup refuses an active locked run, will only
 unmount a matching git-on filesystem, and checks the pin's exact target before deleting
 it. A busy stale mount requires stopping processes using it first. Cleanup does not kill
 processes by stale PID. A surviving pin intentionally prevents garbage collection until
@@ -268,8 +247,27 @@ output. Latency and RSS are measured, not promised as a machine-independent SLA.
 - **A script or recent edit is missing:** git-on reads the selected revision. Staged,
   unstaged, and untracked changes do not appear until committed and selected.
 - **Generated results disappear:** the writable layer is deleted by default. Use
-  `--keep`/`-k` using the syntax above, redirect output in the invoking shell, or have the
+  redirect output in the invoking shell, or have the
   command save chosen files to an explicit host path.
 
 For errors after an interrupted run, see [recovery
 cleanup](#foreground-lifecycle-and-cleanup).
+
+## When FUSE is unavailable
+
+Only explicitly selecting `--write-policy=all` permits eager materialization.
+The default `ignored`, `none`, and `untracked` require FUSE and fail clearly.
+The runner reports the concrete discovery limitation and selected backend before
+launch. A mount failure after successful discovery is an error, and commands are
+never retried. A missing passthrough privilege or kernel feature retains ordinary
+FUSE and does not select this fallback.
+
+Materialization reads the complete pinned tree before launching, including remote
+objects. Budget startup time, traffic and temporary disk accordingly. Submodules,
+LFS pointers and unrepresentable names/collisions fail before launch even if the
+child would not read them. Case-insensitive/normalizing host filesystems cannot
+represent every Git tree. Data, symlinks and executable bits must be preserved;
+no checkout filters, line-ending conversion or synthetic `.git` is introduced.
+Host-native metadata, locks and xattrs differ from FUSE's restricted operation
+set. Required logs and artifacts still use external paths, and all temporary
+execution state is checked and removed.

@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Real Linux FUSE bypass and coherence check; needs a test-metrics build.
+--expect=enabled requires actual registered passthrough plus zero generated-file
+read/write callbacks. --expect=fallback requires ordinary userspace callbacks.
+No sudo, capability changes, detached execution or forced unmount is performed.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--binary',type=Path,required=True)
+p.add_argument('--expect',choices=['enabled','fallback'],required=True)
+args=p.parse_args()
+assert os.uname().sysname=='Linux','real Linux FUSE required'
+assert Path('/dev/fuse').exists() and shutil.which('fusermount3'),'usable FUSE required'
+with tempfile.TemporaryDirectory() as scratch:
+    root=Path(scratch); repo=root/'repo'; repo.mkdir(); tmp=root/'tmp'; tmp.mkdir()
+    env=dict(os.environ,TMPDIR=str(tmp),GIT_AUTHOR_NAME='Fixture',GIT_COMMITTER_NAME='Fixture',GIT_AUTHOR_EMAIL='f@example.invalid',GIT_COMMITTER_EMAIL='f@example.invalid')
+    def git(*argv): subprocess.run(['git',*argv],cwd=repo,env=env,check=True,capture_output=True)
+    git('init','-q')
+    (repo/'.gitignore').write_text('out/\n')
+    (repo/'program.c').write_text('#include <stdio.h>\nint main(void) { puts("compiled"); return 0; }\n')
+    git('add','.'); git('commit','-qm','fixture')
+    code=r'''
+import mmap,os,subprocess,time
+from pathlib import Path
+Path('out').mkdir()
+p=Path('out/generated')
+with p.open('w+b') as f:
+ f.write(b'a'*131072); f.flush()
+ s=p.stat(); assert s.st_size==131072
+ f.seek(0); assert f.read()==b'a'*131072
+ with mmap.mmap(f.fileno(),0) as m:
+  m[65536:65540]=b'mmap'; m.flush()
+ assert p.stat().st_size==131072
+assert p.read_bytes()[65536:65540]==b'mmap'
+with p.open('r+b') as f:f.truncate(7)
+assert p.stat().st_size==7 and p.read_bytes()==b'a'*7
+os.chmod(p,0o751); assert p.stat().st_mode & 0o777==0o751
+os.rename(p,'out/renamed'); p=Path('out/renamed')
+with p.open('r+b') as f:
+ f.truncate(8*1024*1024)
+ with mmap.mmap(f.fileno(),0) as m:
+  m[-4:]=b'last'; m.flush(); p.unlink()
+  if hasattr(m,'madvise'):m.madvise(mmap.MADV_DONTNEED)
+  assert m[-4:]==b'last'  # page fault after backing pathname unlink, daemon alive
+subprocess.run(['cc','program.c','-o','out/program'],check=True)
+assert subprocess.check_output(['./out/program'])==b'compiled\n'
+print('metadata, reopen, truncate, modes, rename/unlink, mmap and compiled executable verified')
+'''
+    read_fd,write_fd=os.pipe()
+    try:
+        result=subprocess.run([str(args.binary.resolve()),'HEAD','--',os.sys.executable,'-c',code],cwd=repo,env=dict(env,GIT_ON_TEST_METRICS_FD=str(write_fd)),pass_fds=[write_fd],capture_output=True,timeout=90)
+    finally: os.close(write_fd)
+    with os.fdopen(read_fd) as f: metrics=json.load(f)
+    assert result.returncode==0,(result.stdout,result.stderr)
+    if args.expect=='enabled':
+        assert metrics['passthrough_handles']>0,metrics
+        assert metrics['generated_read_callbacks']==0,metrics
+        assert metrics['generated_write_callbacks']==0,metrics
+    else:
+        assert metrics['passthrough_handles']==0,metrics
+        assert metrics['generated_write_callbacks']>0,metrics
+    assert list(tmp.iterdir())==[],list(tmp.iterdir())
+    assert subprocess.check_output(['git','status','--porcelain'],cwd=repo)==b''
+    print(result.stdout.decode(),json.dumps(metrics,sort_keys=True))

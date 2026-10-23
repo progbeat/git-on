@@ -20,17 +20,17 @@ to any snapshot path.
   unpacking or scanning the whole repository at startup.
 - **Disposable writes.** Each run gets a fresh writable layer. The default allows
   ignored paths; `--write-policy=all` also allows changing source files.
-  Clean it up automatically, or retain artifacts with `--keep`.
+  Cleanup is automatic; save required artifacts to explicit external paths.
 
 ## Installation
 
-Prebuilt releases support **Linux x86_64 with glibc 2.35+** (Ubuntu 22.04 baseline),
-plus the shared zlib and GCC runtimes (`libz.so.1`, `libgcc_s.so.1`). Running git-on
-requires a usable `/dev/fuse` and `fusermount3`, usually from your distribution's
-`fuse3` package. All runs require native Git on `PATH`; remote execution requires
-Git 2.45.1+ to control automatic promisor fetches. Installation uses POSIX `sh`,
-`curl`, GNU coreutils (including `sha256sum` and `timeout`), `tar` and `gzip`.
-Python and jq are not required.
+The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and native Apple Silicon
+macOS (macOS 13+). Linux FUSE requires `/dev/fuse` and `fusermount3`; macOS
+mounts use the official macFUSE libfuse2 backend. Real macFUSE acceptance is a
+release-readiness prerequisite; see [platform validation](docs/platforms.md).
+When FUSE is unavailable, only explicit `--write-policy=all` can use a fresh,
+eagerly materialized directory. Other policies fail without being weakened.
+Native Git is required on PATH; remote execution requires Git 2.45.1+.
 
 ### Install or update
 
@@ -40,9 +40,10 @@ Install the latest stable release, or update using the same command:
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
-Run as your normal user. The installer pins one release, checks SHA-256 and the
-binary's version, then atomically replaces `~/.local/bin/git-on`. It does not modify shell
-profiles. Add the destination to your current shell's `PATH` if needed:
+Run as your normal user. The thin bootstrap downloads a complete release
+installer over HTTPS, then the generated installer verifies the selected archive's
+SHA-256 before installing `~/.local/bin/git-on`. The installer accepts only 1.3.0
+and later, and never modifies shell profiles. Add the destination to PATH:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -50,9 +51,8 @@ git on --version
 ```
 
 See the [installation guide](docs/releases.md#installing-a-published-binary) to
-inspect the script first, pin a version, or choose another directory. Anonymous
-downloads require a public repository; [private releases](docs/releases.md#inspect-first-or-use-an-authenticated-private-release)
-use your existing GitHub CLI authentication.
+inspect the script first, pin a version, or choose another directory. Anonymous downloads require a public repository; `--github-cli` is explicitly removed.
+See the installation guide for authenticated manual download instructions.
 For a source installation, see [building from source](docs/releases.md#building-from-source).
 
 ## Quick start
@@ -113,29 +113,18 @@ git on HEAD --write-policy=all -- sh -c 'cc source.c -o program && ./program'
 Every mode preserves the original Git objects and working copy. This policy
 governs the mounted tree; commands can still access host paths outside it.
 
-### Keep results
+### Save results
 
-Use `--keep` (or `-k`) and a command separator to retain generated files:
+Execution snapshots are disposable. `--keep` and `-k` were removed in 1.3.0;
+write logs and artifacts to explicit external paths:
 
 ```sh
-git on HEAD:examples/uv-project -k -- uv run --locked main.py
-git on HEAD:examples/uv-project --keep -- uv run --locked main.py
+git on HEAD -- ls > committed-files.txt
+git on HEAD --write-policy=all -- sh -c 'make && cp program /absolute/path/artifacts/program'
 ```
 
-Runner options may appear anywhere before the first `--`; the examples place
-them after the revision.
-Every command requires `--`: put the revision and runner options before it,
-then the command and its literal arguments after it. The command's own `--`,
-`--keep` and `-k` are passed unchanged; see the
-[syntax reference](docs/usage.md#command-syntax).
-
-After unmounting, git-on prints the retained temporary directory on stderr.
-Generated and modified files are under `backing/`; remove the directory when you
-are done. This is a sparse artifact directory: untouched source files and
-deleted paths are absent, and directory renames do not export untouched source
-descendants. It is not a replayable snapshot; see the [keep contract](docs/usage.md#standard-streams-and-temporary-writes).
-Each subsequent run starts fresh. Use ordinary shell redirection to save output,
-for example `git on HEAD -- ls > committed-files.txt`.
+Runner options go before the first `--`. Everything after it belongs to the
+child, including `--keep`, `-k`, empty arguments and additional separators.
 
 ## Support and limitations
 
@@ -144,7 +133,7 @@ inside its local repository:
 
 ```sh
 git on https://github.com/OWNER/REPO.git main -- python script.py
-git on origin main -k -- python script.py
+git on origin main -- python script.py
 git on ssh://git@HOST/REPO.git signed-release --verify -- ./check.sh
 git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on HEAD --verify -- ./check.sh
 ```
@@ -181,8 +170,10 @@ git-on is **not a security sandbox**. Commands retain your user identity,
 environment, network access, and access to host files outside the mount. Run only
 code you trust.
 
-macOS and Windows are unsupported. Other Linux architectures have no prebuilt
-release or CI support guarantee. Containers need `/dev/fuse` and permission to mount.
+Windows and Intel macOS have no support guarantee. Other Linux architectures have
+no prebuilt release. Containers need `/dev/fuse` and mount permission for FUSE.
+Apple Silicon/macFUSE validation requirements and known limits are documented
+in [platforms](docs/platforms.md).
 
 Git executable bits and symlinks are preserved. Submodules and Git LFS content
 fail when accessed; unrelated files remain usable. Git SHA-256 repositories are

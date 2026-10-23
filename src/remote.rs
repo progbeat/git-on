@@ -684,17 +684,15 @@ fn connect_control_endpoint(socket: &Path) -> Result<(UnixStream, Option<std::io
     for (destination, byte) in address.sun_path.iter_mut().zip(path) {
         *destination = *byte as libc::c_char;
     }
-    let descriptor = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error()).context("inspect owned SSH control endpoint");
     }
     let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+    stream.set_nonblocking(true)?;
+    if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("protect SSH endpoint descriptor");
+    }
     let result = unsafe {
         libc::connect(
             stream.as_raw_fd(),

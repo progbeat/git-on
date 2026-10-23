@@ -9,7 +9,6 @@ pub struct RunArgs<'a> {
     pub tree: OsString,
     pub repository: Option<OsString>,
     pub command: &'a [OsString],
-    pub keep: bool,
     pub verify: bool,
     pub write_policy: WritePolicy,
 }
@@ -39,16 +38,9 @@ fn command(mode: Mode) -> Command {
         .disable_version_flag(true)
         .args_override_self(true)
         .override_usage(RUN_USAGE)
-        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand is resolved by native git rev-parse; two operands are passed unchanged to native git fetch. Git owns repository and revision syntax.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nLinux /dev/fuse and fusermount3 are required. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
+        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand is resolved by native git rev-parse; two operands are passed unchanged to native git fetch. Git owns repository and revision syntax.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nPrefer Linux FUSE or macFUSE. Without FUSE, only explicit --write-policy=all supports eager materialization. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
     if mode != Mode::Cleanup {
         command = command
-            .arg(
-                Arg::new("keep")
-                    .long("keep")
-                    .short('k')
-                    .action(ArgAction::SetTrue)
-                    .help("Retain generated files for debugging after unmount"),
-            )
             .arg(
                 Arg::new("verify")
                     .long("verify")
@@ -146,6 +138,10 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, clap::Error> {
     let mut options = Vec::new();
     let mut operands = Vec::new();
     for arg in prefix {
+        if arg == "--keep" || arg == "-k" || arg.as_bytes().starts_with(b"--keep=") {
+            return Err(command.error(ErrorKind::UnknownArgument,
+                "--keep and -k were removed in 1.3.0; write logs and artifacts to an explicit external path"));
+        }
         if command.get_arguments().any(|definition| {
             definition.get_long().is_some_and(|long| {
                 let Some(value) = arg.as_bytes().strip_prefix(b"--") else {
@@ -199,7 +195,6 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, clap::Error> {
         tree,
         repository,
         command: command_tail,
-        keep: matches.get_flag("keep"),
         verify: matches.get_flag("verify"),
         write_policy: matches
             .get_one::<String>("write-policy")
@@ -218,25 +213,26 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    fn assert_run(args: &[&str], tree: &str, command: &[&str], keep: bool) {
+    fn assert_run(args: &[&str], tree: &str, command: &[&str]) {
         let args = arguments(args);
         let parsed = parse_run_args(&args).unwrap();
         assert_eq!(parsed.tree, tree);
         assert_eq!(parsed.command, command);
-        assert_eq!(parsed.keep, keep);
     }
 
     #[test]
-    fn keep_accepts_both_spellings_on_either_side_of_revision() {
-        for flag in ["--keep", "-k"] {
-            assert_run(&[flag, "HEAD", "--", "cmd"], "HEAD", &["cmd"], true);
-            assert_run(&["HEAD", flag, "--", "cmd"], "HEAD", &["cmd"], true);
+    fn removed_keep_options_are_rejected_only_before_separator() {
+        for flag in ["--keep", "-k", "--keep=1"] {
+            for args in [[flag, "HEAD", "--", "cmd"], ["HEAD", flag, "--", "cmd"]] {
+                let error = parse_run_args(&arguments(&args)).unwrap_err();
+                assert_eq!(error.exit_code(), 2);
+                assert!(error.to_string().contains("were removed"));
+            }
         }
         assert_run(
-            &["-k", "--keep", "HEAD", "--keep", "-k", "--", "cmd"],
+            &["HEAD", "--", "cmd", "--keep", "-k"],
             "HEAD",
-            &["cmd"],
-            true,
+            &["cmd", "--keep", "-k"],
         );
     }
 
@@ -254,24 +250,19 @@ mod tests {
     #[test]
     fn first_separator_forwards_the_entire_command_tail() {
         let command = ["--keep", "-k", "--unknown", "--", "", "a b"];
-        for options in [vec![], vec!["-k"], vec!["--keep", "-k"]] {
-            let mut args = vec!["HEAD"];
-            args.extend(&options);
-            args.push("--");
-            args.extend(command);
-            assert_run(&args, "HEAD", &command, !options.is_empty());
-        }
-        assert_run(&["HEAD", "--", "--", "arg"], "HEAD", &["--", "arg"], false);
+        let mut args = vec!["HEAD", "--"];
+        args.extend(command);
+        assert_run(&args, "HEAD", &command);
+        assert_run(&["HEAD", "--", "--", "arg"], "HEAD", &["--", "arg"]);
         for name in ["--help", "-h", "--version", "--cleanup"] {
-            assert_run(&["HEAD", "--", name], "HEAD", &[name], false);
+            assert_run(&["HEAD", "--", name], "HEAD", &[name]);
         }
     }
 
     #[test]
     fn subtree_revision_is_one_unchanged_operand() {
         let tree = "HEAD:examples/uv-project";
-        assert_run(&[tree, "--", "cmd"], tree, &["cmd"], false);
-        assert_run(&[tree, "-k", "--", "cmd"], tree, &["cmd"], true);
+        assert_run(&[tree, "--", "cmd"], tree, &["cmd"]);
     }
     #[test]
     fn write_policy_accepts_exact_values_and_keeps_command_tail_literal() {
@@ -327,7 +318,6 @@ mod tests {
             let args = arguments(&[
                 "--verify",
                 source,
-                "-k",
                 "main:deep",
                 "--verify",
                 "--",
@@ -339,7 +329,7 @@ mod tests {
             let parsed = parse_run_args(&args).unwrap();
             assert_eq!(parsed.repository.unwrap(), source);
             assert_eq!(parsed.tree, "main:deep");
-            assert!(parsed.keep && parsed.verify);
+            assert!(parsed.verify);
             assert_eq!(parsed.command, arguments(&["cmd", "--verify", "-k", "--"]));
         }
     }
@@ -388,18 +378,10 @@ mod tests {
     fn non_utf8_revision_command_and_arguments_are_preserved() {
         let tree = OsString::from_vec(b"tree-\xff:subtree".to_vec());
         let raw = OsString::from_vec(b"-\xfe".to_vec());
-        let args = vec![
-            tree.clone(),
-            "-k".into(),
-            "--".into(),
-            raw.clone(),
-            raw,
-            "".into(),
-        ];
+        let args = vec![tree.clone(), "--".into(), raw.clone(), raw, "".into()];
         let parsed = parse_run_args(&args).unwrap();
         assert_eq!(parsed.tree, tree);
-        assert_eq!(parsed.command, &args[3..]);
-        assert!(parsed.keep);
+        assert_eq!(parsed.command, &args[2..]);
         let args = vec![
             "HEAD".into(),
             OsString::from_vec(b"-\xff".to_vec()),
@@ -416,10 +398,12 @@ mod tests {
     #[test]
     fn interspersed_flags_do_not_relax_total_operand_limit() {
         for args in [
-            vec!["repo", "-k", "HEAD", "extra", "--", "cmd"],
-            vec!["repo", "HEAD", "-k", "extra", "--", "cmd"],
-            vec!["repo", "-k", "HEAD", "--verify", "extra", "--", "cmd"],
-            vec!["a", "-k", "b", "--verify", "c", "-k", "d", "--", "cmd"],
+            vec!["repo", "--verify", "HEAD", "extra", "--", "cmd"],
+            vec!["repo", "HEAD", "--verify", "extra", "--", "cmd"],
+            vec!["repo", "--verify", "HEAD", "--verify", "extra", "--", "cmd"],
+            vec![
+                "a", "--verify", "b", "--verify", "c", "--verify", "d", "--", "cmd",
+            ],
         ] {
             let error = parse_run_args(&arguments(&args)).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::TooManyValues, "{args:?}");
@@ -462,7 +446,6 @@ mod tests {
             OsString::from("--"),
             "--help".into(),
             "--version".into(),
-            "-k".into(),
             "".into(),
             OsString::from_vec(b"path-\xff".to_vec()),
         ] {

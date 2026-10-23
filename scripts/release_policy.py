@@ -155,10 +155,10 @@ def distribution_build(workflow):
     # run defaults also affect compilation (for example RUSTFLAGS or shell).
     # Comparing their complete YAML blocks is deliberately conservative and
     # requires no external YAML parser in the policy job.
-    match = re.search(r"^  package:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*\n|\Z)", workflow,
-                      re.M | re.S)
+    matches = re.findall(r"^  (package(?:-build|-assemble)?):\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*\n|\Z)", workflow,
+                         re.M | re.S)
     inherited = re.findall(r"^(?:env|defaults):[^\n]*(?:\n(?:[ \t].*|[ \t]*|\#.*))*", workflow, re.M)
-    return (match.group(1) if match else "", tuple(inherited))
+    return (tuple(matches), tuple(inherited))
 
 
 def release_reasons(base, current_manifest, current_lock):
@@ -176,14 +176,14 @@ def release_reasons(base, current_manifest, current_lock):
     # agrees with CI after those files are added.
     changed = subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z", base, "--"], text=True).split("\0")
     changed += subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], text=True).split("\0")
-    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml"}
+    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml", "dist-workspace.toml", "scripts/fetch_dist.sh"}
     for manifest in (old_manifest, current_manifest):
         if isinstance(manifest["package"].get("build"), str):
             build_paths.add(manifest["package"]["build"])
         for kind in ("bin", "lib"):
             targets = manifest.get(kind, []) if kind == "bin" else [manifest.get(kind, {})]
             build_paths.update(target["path"] for target in targets if "path" in target)
-    reasons = [path for path in changed if path.startswith(("src/", ".cargo/")) or path in build_paths]
+    reasons = [path for path in changed if path.startswith(("src/", ".cargo/", "vendor/")) or path in build_paths]
     if binary_manifest(current_manifest) != binary_manifest(old_manifest):
         reasons.append("Cargo.toml binary settings")
     if old_lock_text is None or binary_lock(current_manifest, current_lock) != binary_lock(old_manifest, tomllib.loads(old_lock_text)):

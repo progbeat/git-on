@@ -62,46 +62,10 @@ missing/placeholder notes. All PRs reject stale branches and package/lockfile
 version mismatches. Nonrelease PRs must retain the current master version.
 All required checks, including `package`, run on every PR regardless of this
 decision; no path filter hides a required check.
-`package` builds on Ubuntu 22.04 using Rust 1.90.0, packages Linux x86_64 and tests
-the **extracted archive executable** against a real FUSE mount. The GNU binary's
-supported baseline is glibc 2.35, not arbitrary Linux. The build vendors libgit2;
-FUSE mounting still requires a usable `/dev/fuse` and `fusermount3` on the host.
-Release builds use optimization level 3, fat link-time optimization and one
-codegen unit to reduce the executable size. This increases release build/link
-work; debug builds and runtime dependencies are unchanged.
-
-After a master push, the same workflow waits for `rust`, `real-fuse`,
-`lazy-performance`, `release-policy` and `package`. If the validated policy says
-no binary release is needed, `release` is skipped and existing versions are not
-republished. Otherwise, only then its `release` job
-creates `vVERSION` at that exact tested commit, uploads the archive, SHA256SUMS
-and source/build metadata to a draft GitHub Release, then publishes it. It never
-checks out moving master to choose release contents. Release notes come from
-that commit. The token has read access in test/build jobs and contents-write only
-in the publishing job; no personal token, crates.io account or app is required.
-
-Master validation compares against the push event's `before` SHA, so a rebased
-PR may contain a version bump followed by additional commits. Force pushes and
-branch-creation events are rejected by this release validation.
-
-Tag creation is an atomic GitHub ref creation. A tag at another SHA is an error,
-never force-moved. Re-running the same commit resumes a draft with matching notes
-and assets. An incomplete `starter` upload can be removed and retried only while the
-verified release is still a draft; published assets are never repaired by deletion.
-Matching published releases are verified and left unchanged. Different
-commits can finish out of order without canceling each other's publication.
-GitHub may require additional workflow permissions when publishing an older
-commit after a newer commit changed workflow files. In that case publication
-fails visibly; this pipeline does not request a broader token or promise every
-historical release can be published with `contents: write` alone.
-The tag-created event is not used to trigger another workflow, because GitHub's
-GITHUB_TOKEN normally does not trigger such workflows.
-
-If publication fails, rerun the failed workflow for that exact master commit.
-A failure before upload completion leaves a draft, not a partially published
-release. Checksums detect corruption; they are not a separate cryptographic
-identity/signature. Reproducible archive metadata does not claim independently
-reproducible compilation across changing toolchains/runners.
+The shared native cargo-dist packaging and immutable draft-publication sequence
+are specified below. The existing release decision and exact-master-commit
+requirements still apply. All native build, artifact integrity, installed binary,
+Linux real-FUSE and performance gates must succeed before publication.
 
 ## Required repository settings
 
@@ -122,152 +86,94 @@ where master advances after the PR's version check finishes.
 
 ## Installing a published binary
 
-The POSIX `sh` installer supports **Linux x86_64 with glibc 2.35+**
-(Ubuntu 22.04 baseline), plus the shared zlib (`libz.so.1`) and GCC
-(`libgcc_s.so.1`) runtimes confirmed by the packaging job. Its executable probe
-catches missing runtime libraries before replacing an existing installation.
-It needs `curl`, GNU coreutils (`sha256sum`, `timeout`, `stat`, `mktemp`, `mv`
-and the ordinary file utilities), `awk`, `tar`, `gzip` and `getconf`.
-Python, jq, Rust, a C compiler and sudo are not needed. The same command installs or updates to GitHub's latest
-stable release each time it runs:
+The entry point remains unchanged:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
+curl -fsSL https://sh.progbeat.dev/git-on | sh
+curl -fsSL https://sh.progbeat.dev/git-on | sh -s -- --version 1.3.0 --bin-dir /absolute/path
 ```
 
-Stable binaries are published in [GitHub Releases](https://github.com/progbeat/git-on/releases).
-Anonymous downloads require a public repository. For private releases or API
-rate limits, use your existing GitHub CLI authentication as described below.
-A failed release download leaves the current executable in place.
+`install.sh` is a minimal dispatcher. It supports stable 1.3.0+ versions, optional
+`v`, the default latest stable release, and a canonical absolute `--bin-dir`.
+Earlier versions and a latest release older than 1.3.0 fail clearly. No legacy
+installer path exists. The Cloudflare redirect is unchanged; URL query parameters
+are not options. Published old releases are untouched.
 
-To pin a version or choose another user-owned installation directory, first
-download the script as shown in the next section, then pass the desired option:
+The dispatcher trusts HTTPS GitHub. It resolves one tag, downloads the entire
+matching `git-on-installer.sh` privately, checks download success and only then
+executes it. It performs no API/digest/immutable-release check or jq branch.
+The generated installer chooses the platform, downloads/extracts the archive,
+verifies its embedded SHA-256 and installs the binary. The default directory is
+`$HOME/.local/bin`. `GIT_ON_INSTALL_DIR` maps `--bin-dir`; profile edits and the
+optional updater are disabled. Running again updates or reinstalls safely.
 
-```sh
-sh install.sh --version 0.1.0
-sh install.sh --bin-dir "$HOME/bin"
-```
+### Release format and trust boundary
 
-Both `0.1.0` and `v0.1.0` are accepted; prerelease versions are not. Omitting
-`--version` selects the latest stable release, even when git-on is already
-installed. An explicit older version intentionally downgrades. Nothing runs in
-the background, and the installer never edits shell profiles or installs system
-packages. The default destination is `$HOME/.local/bin/git-on`. Add that directory
-to `PATH` if prompted. Existing symlink/non-regular destinations, symlink directory
-components and directories with group-write or other-write mode bits are
-refused. These bits describe permissions, not proof that another user has
-effective access. Diagnostics show the directory's path, mode and owner.
-For a user-owned personal directory with unnecessary group writing, consider
-removing just that permission; otherwise select a separate `--bin-dir`.
-The directory must be a canonical absolute path, without `.`/`..` components,
-repeated slashes or a trailing slash. Relative and empty `PATH` entries retain
-their meaning from the directory in which the installer was invoked.
-Missing directories are created with private permissions even under a shared
-umask; existing directory permissions are never changed to pass the guard.
+Pinned cargo-dist 0.33.0 builds:
 
-### Release format and compatibility
+- `git-on-x86_64-unknown-linux-gnu.tar.gz` (Ubuntu 22.04 / glibc 2.35+).
+- `git-on-aarch64-apple-darwin.tar.gz` (native Apple Silicon, macOS 13+).
+- `git-on-installer.sh`, per-asset `.sha256` checksums, `source.tar.gz`,
+  `release.json` provenance and a complete `SHA256SUMS` inventory.
 
-Releases keep exactly three assets: `git-on-vVERSION-x86_64-unknown-linux-gnu.tar.gz`,
-`SHA256SUMS` and `release.json`. Saved older installers reject extra assets and
-extra checksum entries, so adding a raw executable to the same release would
-break those clients. This transition changes the installer only; no published
-release is edited and no new distribution format is introduced. The tar contains
-the executable, README and MIT LICENSE, not bundled shared libraries. The original
-v0.1.0 archive predates LICENSE; it remains installable. Publication keeps the
-license notice in new archives.
+The installed binary is always `git-on`; archive root directories match their
+archive names without `.tar.gz`. README and MIT LICENSE accompany the executable.
+Intel macOS is not implied by the arm64 artifact. See [platforms](platforms.md)
+for runtime prerequisites and the real macFUSE validation gate.
 
-The shell installer downloads the same archive as older clients, but reads only
-the exact `git-on` member to a staging file, without extracting the directory
-tree. It does not parse JSON or need a general-purpose archive validator.
-`release.json` remains available for build provenance and older installers.
+Stock cargo-dist can skip hashing when `sha256sum` is absent.
+`scripts/harden_dist_installer.py` is the explicit reviewed generation-time
+correction: require valid embedded SHA-256 for both archives, use `sha256sum` or
+macOS `shasum -a 256`, and fail on missing/malformed/mismatched hashes, failed hash
+tools or absence of both tools. Hash verification precedes extraction/install,
+so those failures leave the previous executable unchanged. The correction also
+cleans the private download directory on ordinary failures and handled signals.
+Template drift fails generation. CI tests the actual corrected output and both
+packaged native binaries, including corruption and repeat installation.
 
-For public latest installation, the GitHub `/releases/latest` redirect resolves
-one stable version exactly once. Both downloads then use that tag's predictable
-asset URLs; a changing latest release cannot mix the binary and checksums.
-Public `--version` requests the exact stable-format tag, without consulting GitHub
-JSON flags. A semver tag manually marked prerelease is therefore not separately
-rejected in that path; `--github-cli` checks both draft and prerelease flags using
-gh's built-in `--jq` (no external jq program).
+Archive hashes detect mismatch/corruption within the GitHub release trust
+boundary. They neither authenticate the bootstrap independently nor protect
+against a compromised release source. The thin bootstrap needs POSIX sh, curl,
+awk and ordinary temporary-file tools; Rust, Python and jq are not dependencies.
 
 ### Inspect first or use an authenticated private release
 
-Piping a script to a shell executes code from the repository. To inspect it first,
-download it, review it, then run the saved copy:
+Download and inspect `install.sh` before running if desired. `--github-cli` is
+explicitly removed: cargo-dist's public HTTPS downloader does not preserve the
+old gh-authenticated semantics. For private releases, use an existing authenticated
+gh account to download and inspect the release installer and archives manually,
+then use its documented `GIT_ON_GITHUB_TOKEN` support if required. The dispatcher
+never creates credentials or reads a token. No external authentication is configured.
 
-```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on -o install.sh
-less install.sh
-sh install.sh
-```
+### Shared packaging and publication
 
-For a private repository, use an **already authenticated** GitHub CLI account with
-repository access:
+`dist-workspace.toml` pins cargo-dist 0.33.0; `scripts/fetch_dist.sh` pins the tool
+archive hashes. The custom `ci.yml` integrates its native local/global build
+phases with the existing release-policy gate rather than a separate tag workflow.
+The local matrix builds both native archives, verifies their checksums and probes
+the extracted executable. Global generation receives both verified archives;
+the correction embeds their SHA-256, then assembly records the exact asset set.
+`verify_dist.py` checks integrity again across assembly, install and publication
+jobs. Both hosts install/update the actual archive through the actual corrected
+installer; Linux additionally runs non-skipped FUSE acceptance. macOS native and
+materialized tests are not presented as macFUSE mount evidence.
 
-```sh
-gh api --hostname github.com 'repos/progbeat/git-on/contents/install.sh?ref=master' \
-  -H 'Accept: application/vnd.github.raw+json' > install.sh
-# Review the saved script before running it.
-sh install.sh --github-cli
-```
-
-An authenticated source checkout can also run `sh install.sh --github-cli`.
-`--github-cli` uses existing gh authentication for metadata and release assets;
-it creates no credentials and puts no token into a URL, script, or log. It also
-works for authenticated public downloads when the anonymous GitHub API is rate
-limited. The normal mode does not read GitHub token environment variables.
-
-### Verification and update safety
-
-The installer verifies the selected archive's SHA-256 before reading its exact
-binary member, rejecting missing/duplicate members and empty output. Other archive
-paths are never extracted. Downloads have size limits; archive reading and the
-executable probe have timeouts. The probe timeout also covers child processes in
-its process group. It stages in the destination filesystem, checks
-the binary's reported version, then atomically renames it over the old executable.
-Download, checksum, extraction, probe or rename failure before that commit leaves
-the previous executable in place. A signal after the atomic rename can leave the
-new, verified executable installed; the diagnostic does not promise rollback.
-Rerunning the same version is safe. Temporary
-files are cleaned on ordinary failures and handled interruption signals; an
-uncatchable SIGKILL or power loss can leave temporary files.
-
-Checksums detect corruption; they are not independent signatures. The script,
-archive, and checksum file share the GitHub repository's trust boundary. To pin
-the installer code as well as the binary version, inspect a copy from the matching
-release tag or an explicitly selected commit instead of the moving master URL.
-
-The bootstrap requires HTTPS and TLS 1.2+. The installer's release downloads
-also restrict redirects to HTTPS.
-The script encloses its payload in a function and guards the final call, so an
-incomplete download cannot start installation or drop supplied arguments. See the installer regressions in
-the [test guide](../tests/README.md#installer-acceptance).
-
-Install the distribution's `fuse3` package separately when needed. A working
-`fusermount3`, usable `/dev/fuse`, and permission to mount FUSE are required to run
-git-on. Missing FUSE setup produces an installation warning; it does not prevent
-installing a verified binary. Containers must expose the device and allow mounts.
-Do not run the installer as root to bypass unavailable FUSE setup.
+Only a validated master push can execute publication. The publisher requires
+release immutability already enabled (read-only setting check), creates/resumes a
+draft, uploads every archive/installer/metadata/checksum asset, downloads and
+verifies the complete exact set while still draft, then publishes. It verifies
+GitHub reports `immutable: true` afterward. No assets are appended after
+publication; existing mismatching releases are never repaired. Repository settings
+must be managed separately; this PR is not permission to publish or change them.
 
 ### Building from source
 
-From a checkout of the revision you want to install, with Rust 1.89+ and a C
-compiler:
+Use Rust 1.89+, native Git, and a C compiler:
 
 ```sh
 cargo install --path . --locked
 ```
 
-Ensure Cargo's binary directory, normally `~/.cargo/bin`, is on `PATH`.
-The Linux/FUSE runtime requirements still apply.
-
-## Design references
-
-- [GitHub strict required checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
-- [GitHub token-trigger behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
-- [Cargo compatibility guidance](https://doc.rust-lang.org/cargo/reference/semver.html)
-- [release-plz release PR flow](https://release-plz.dev/docs/usage/release-pr)
-- [cargo-dist configuration](https://axodotdev.github.io/cargo-dist/book/reference/config.html)
-
-release-plz's separate release-PR workflow and cargo-dist's broader distribution
-machinery are useful for other policies. This project's single supported target
-and release-on-binary-change policy use a smaller explicit pipeline.
+The macOS binary resolves the official macFUSE libfuse2 library at runtime, so
+building needs no installed driver or SDK. It never installs/loads extensions or
+changes security settings. Linux keeps the pure Rust fuser backend.

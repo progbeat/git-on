@@ -253,6 +253,12 @@ pub struct SnapshotMetrics {
     pub active_blob_readers: usize,
     pub spool_writes: u64,
     pub spool_bytes: u64,
+    #[cfg(feature = "test-metrics")]
+    pub passthrough_handles: u64,
+    #[cfg(feature = "test-metrics")]
+    pub generated_read_callbacks: u64,
+    #[cfg(feature = "test-metrics")]
+    pub generated_write_callbacks: u64,
 }
 
 enum BlobData {
@@ -768,6 +774,24 @@ impl Snapshot {
         consume: impl FnOnce(&[u8]) -> Result<T>,
     ) -> Result<T> {
         self.state()?.with_blob(oid, consume)
+    }
+    #[cfg(feature = "test-metrics")]
+    pub(crate) fn record_generated_io(&self, write: bool) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if write {
+            state.metrics.generated_write_callbacks += 1;
+        } else {
+            state.metrics.generated_read_callbacks += 1;
+        }
+    }
+    #[cfg(all(feature = "test-metrics", target_os = "linux"))]
+    pub(crate) fn record_passthrough(&self) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metrics
+            .passthrough_handles += 1;
     }
     pub fn metrics(&self) -> SnapshotMetrics {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());

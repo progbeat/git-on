@@ -18,7 +18,7 @@ lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
   alongside the targeted operation tests below. Missing FUSE must fail rather
   than turn a real-mount claim into a skipped test.
 - Rust helper/unit tests additionally check policy, object loading, retention,
-  inode reclamation, append/mmap behavior and kept-layer export. They do not
+  inode reclamation, append/mmap behavior and disposable-layer cleanup. They do not
   replace either layer above.
 - A test mapped to a callback is not a measured percentage of statements,
   branches or all possible inputs. Kernel caching, `DefaultPermissions`,
@@ -110,8 +110,8 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 <!-- CALLBACK MATRIX START -->
 | Callback | Classification | Protocol tests | Mounted behavior tests | Assertions and limitations |
 | --- | --- | --- | --- | --- |
-| init | inherited | P-life | I-snapshot | ABI negotiation succeeds; optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
-| destroy | inherited | P-life | I-snapshot | DESTROY terminates dispatch lifecycle; a subsequent ordinary request returns EIO. Default hook has no application-side work; export/cleanup use Drop and separate lifecycle tests. |
+| init | implemented | P-life | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
+| destroy | inherited | P-life | I-snapshot | DESTROY terminates dispatch lifecycle; a subsequent ordinary request returns EIO. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
 | lookup | implemented | P-life, P-namespace | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
@@ -186,3 +186,24 @@ versions, races or host failures. In particular:
 parent link accounting through mkdir, rmdir, cross-parent rename, replacement
 and same-parent rename while preserving tracked-parent metadata. The randomized
 real-mount oracle in `tests/stress.py` also checks this after every operation.
+
+## 1.3 macOS and passthrough evidence limits
+
+The vendored 0.16.0 patch preserves the complete Filesystem trait above. Linux
+uses ABI 7.40; macOS uses ABI 7.31 with macFUSE 4 compatibility and the official
+libfuse2 mount entry point. The three macOS-only callbacks retain their upstream
+ENOSYS contracts. The protocol harness is Linux-only and is never macFUSE mount
+evidence. Actual macFUSE mount acceptance remains a release-readiness gate.
+
+Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
+FOPEN_PASSTHROUGH for command-created regular files only, after policy and access
+checks. Create/open handles share one BackingId per inode, retained through
+release. Git-backed and copied-up tracked inodes never qualify. getattr refreshes
+size, blocks and data timestamps from the backing descriptor without replacing
+logical overlay mode, uid, gid or link count. Lack of the kernel capability,
+CAP_SYS_ADMIN or a successful registration retains userspace I/O on this same
+FUSE mount. No new privileged child, detached process or early teardown exists.
+
+`tests/passthrough.py` must establish real negotiation and bypass, metadata,
+reopen/truncate, executable and mmap behavior on a capable kernel. Protocol
+responses and ordinary mount tests alone do not demonstrate kernel bypass.

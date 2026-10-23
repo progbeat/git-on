@@ -389,10 +389,10 @@ fn relay_native_job_control(pid: u32, fd: i32, parent_group: libc::pid_t) -> Res
         // sending SIGCONT. Pass ownership on during the normal polling loop.
         set_foreground(fd, group)?;
     }
-    if unsafe { info.si_pid() } == 0 {
+    if crate::platform::siginfo_pid(&info) == 0 {
         return Ok(());
     }
-    let stop = unsafe { info.si_status() };
+    let stop = crate::platform::siginfo_status(&info);
     if foreground == parent_group && matches!(stop, libc::SIGTTIN | libc::SIGTTOU) {
         // A pending background-I/O stop raced the shell's `fg` transition.
         unsafe { libc::kill(-group, libc::SIGCONT) };
@@ -435,7 +435,7 @@ fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
         {
             break;
         }
-        if (result == 0 && unsafe { info.si_pid() } != 0) || Instant::now() >= deadline {
+        if (result == 0 && crate::platform::siginfo_pid(&info) != 0) || Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -560,7 +560,7 @@ pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
     error.is::<RequestInterrupted>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};

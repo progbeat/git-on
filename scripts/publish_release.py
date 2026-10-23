@@ -35,6 +35,10 @@ def publish():
     manifest = json.loads(Path("dist/release.json").read_text())
     if manifest["commit"] != sha:
         raise RuntimeError("artifact source SHA differs from the tested master SHA")
+    # Repository setting is read-only here: publication must fail closed rather
+    # than publish a mutable release or modify security configuration.
+    if api(f"repos/{repo}/immutable-releases").get("enabled") is not True:
+        raise RuntimeError("release immutability must already be enabled before publication")
     tag = "v" + manifest["version"]
     # Never use 'latest master' as the target: overlapping merges may finish out of order.
     refs = api(f"repos/{repo}/git/matching-refs/tags/{tag}")
@@ -87,11 +91,23 @@ def publish():
             gh("release", "upload", tag, str(path), "--repo", repo, raw=True)
         else:
             raise RuntimeError("published release is missing an asset; refusing mutation")
+    # Verify the complete uploaded set while still draft, including new assets.
+    current_assets = api(f"repos/{repo}/releases/{release['id']}/assets?per_page=100")
+    if len(current_assets) != len(expected) or {a['name'] for a in current_assets} != expected:
+        raise RuntimeError("uploaded release asset set is incomplete or duplicated")
+    for path in files:
+        with tempfile.TemporaryDirectory() as directory:
+            gh("release", "download", tag, "--repo", repo, "--pattern", path.name,
+               "--dir", directory, raw=True)
+            if hashlib.sha256(Path(directory, path.name).read_bytes()).digest() != hashlib.sha256(path.read_bytes()).digest():
+                raise RuntimeError("uploaded release asset differs: " + path.name)
     if release["draft"]:
         # 'legacy' chooses latest using version/date semantics, not job completion order.
         gh("api", f"repos/{repo}/releases/{release['id']}", "--method", "PATCH", "--input", "-",
            data={"draft": False, "make_latest": "legacy"})
-    print(f"Verified release {tag} at {sha}")
+    if api(f"repos/{repo}/releases/{release['id']}").get("immutable") is not True:
+        raise RuntimeError("published release did not report immutability; inspect publication before retrying")
+    print(f"Verified immutable release {tag} at {sha}")
 
 
 if __name__ == "__main__":
