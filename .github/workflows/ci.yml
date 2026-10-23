@@ -297,8 +297,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
       - run: cargo test --locked --all-targets --features test-metrics
-      - name: Native MFMount message transport unit checks without installing a driver
-        run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib mnt::macfuse::tests
+      - name: Native internal stream framing without installing an extension
+        run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib mnt::native::tests
       - run: cargo build --locked
       - run: python3 tests/integration.py --binary target/debug/git-on CliTests
       - run: python3 tests/materialized.py target/debug/git-on

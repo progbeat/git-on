@@ -450,7 +450,7 @@ fn execute(
                     #[cfg(target_os = "linux")]
                     let prerequisite = "check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support";
                     #[cfg(target_os = "macos")]
-                    let prerequisite = "check the owner-provided official macFUSE package/helpers and enabled FSKit extension; no kernel backend is selected";
+                    let prerequisite = "check the owner-installed GitOn.app and activated native Apple FSKit extension; macFUSE is not used";
                     format!("cannot mount snapshot at {}; {prerequisite}", dir.join("mount").display())
                 })?;
             #[cfg(target_os = "macos")]

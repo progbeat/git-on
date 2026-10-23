@@ -2,15 +2,14 @@ fn main() {
     // Register rustc cfg for switching between mount implementations.
     // When fuser MSRV is updated to v1.77 or above, we should switch from 'cargo:' to 'cargo::' syntax.
     println!(
-        "cargo:rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\", \"macfuse\"))"
+        "cargo:rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\", \"fskit\"))"
     );
 
     #[cfg(target_os = "macos")]
     {
-        // The official macFUSE MFMount transport is loaded at runtime.
+        // Our native Apple FSKit extension connects through a private local channel.
         // Building and --write-policy=all materialization need no installed driver/SDK.
-        println!("cargo:rustc-cfg=fuser_mount_impl=\"macfuse\"");
-        println!("cargo:rustc-cfg=feature=\"macfuse-4-compat\"");
+        println!("cargo:rustc-cfg=fuser_mount_impl=\"fskit\"");
     }
     #[cfg(all(
         not(feature = "libfuse"),
@@ -32,7 +31,6 @@ fn main() {
                 .is_ok()
             {
                 println!("cargo:rustc-cfg=fuser_mount_impl=\"libfuse2\"");
-                println!("cargo:rustc-cfg=feature=\"macfuse-4-compat\"");
             } else {
                 pkg_config::Config::new()
                     .atleast_version("2.6.0")

@@ -11,7 +11,7 @@ mod fuse3;
 #[cfg(fuser_mount_impl = "libfuse3")]
 mod fuse3_sys;
 #[cfg(target_os = "macos")]
-pub(crate) mod macfuse;
+pub(crate) mod native;
 
 #[cfg(fuser_mount_impl = "pure-rust")]
 mod fuse_pure;
@@ -59,7 +59,7 @@ pub use fuse2::Mount;
 #[cfg(fuser_mount_impl = "libfuse3")]
 pub use fuse3::Mount;
 #[cfg(target_os = "macos")]
-pub use macfuse::Mount;
+pub use native::Mount;
 use std::ffi::CStr;
 
 #[inline]

@@ -52,17 +52,12 @@ pub fn fuse_unavailable() -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
         if !Path::new(
-            "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount",
+            "/Applications/GitOn.app/Contents/PlugIns/GitOnFS.appex/Contents/MacOS/GitOnFS",
         )
         .is_file()
         {
             return Ok(Some(
-                "official macFUSE FSKit MFMount transport is absent".into(),
-            ));
-        }
-        if !Path::new("/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app").is_dir() {
-            return Ok(Some(
-                "the official macFUSE application/helpers are absent".into(),
+                "the native GitOn Apple FSKit extension bundle is absent".into(),
             ));
         }
     }
@@ -84,7 +79,7 @@ pub fn mount_is_ours(dir: &Path, id: &str, identity: Option<&MountIdentity>) -> 
         }
         anyhow::ensure!(
             matches.len() == 1
-                && matches[0].kind == "macfuse"
+                && matches[0].kind == "giton"
                 && matches[0].identity.owner == unsafe { libc::geteuid() }
                 && identity == Some(&matches[0].identity),
             "mountpoint is occupied by a different, stacked or unverified filesystem"
@@ -117,9 +112,9 @@ pub fn capture_mount_identity(dir: &Path) -> Result<MountIdentity> {
         .collect();
     anyhow::ensure!(
         matches.len() == 1
-            && matches[0].kind == "macfuse"
+            && matches[0].kind == "giton"
             && matches[0].identity.owner == unsafe { libc::geteuid() },
-        "expected one macFUSE mount owned by the current user"
+        "expected one GitOn FSKit mount owned by the current user"
     );
     Ok(matches[0].identity.clone())
 }
@@ -130,15 +125,15 @@ pub fn verify_mount_protections(dir: &Path, read_only: bool) -> Result<()> {
     let record = records
         .iter()
         .find(|record| record.path == dir.join("mount"))
-        .context("macFUSE mount disappeared")?;
+        .context("GitOn FSKit mount disappeared")?;
     let required = (libc::MNT_NOSUID | libc::MNT_NODEV) as u32;
     anyhow::ensure!(
         record.flags & required == required,
-        "macFUSE FSKit did not preserve required nosuid/nodev mount flags"
+        "native Apple FSKit did not preserve required nosuid/nodev mount flags"
     );
     anyhow::ensure!(
         !read_only || record.flags & libc::MNT_RDONLY as u32 != 0,
-        "macFUSE FSKit did not provide a read-only mount for policy none on this macOS version"
+        "native Apple FSKit did not provide a read-only mount for policy none on this macOS version"
     );
     Ok(())
 }

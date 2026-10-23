@@ -31,3 +31,6 @@ Linux remains on upstream's pure Rust backend with ABI 7.40. macOS keeps ABI
 trait and the full vendored source tree; regenerating/updating this dependency
 requires explicit review. macFUSE mounting itself still needs real host
 verification, with no permission to install/load extensions or alter security.
+
+Unused upstream example targets and their root-only example harness are omitted.
+Git-on's own real-mount/passthrough and parser regression tests are retained.

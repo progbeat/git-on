@@ -16,7 +16,7 @@ pub struct Channel(Transport);
 enum Transport {
     Device(Arc<File>),
     #[cfg(target_os = "macos")]
-    Mac(Arc<crate::mnt::macfuse::MacChannel>),
+    Native(Arc<crate::mnt::native::NativeChannel>),
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -39,8 +39,8 @@ impl Channel {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn from_mac(channel: Arc<crate::mnt::macfuse::MacChannel>) -> Self {
-        Self(Transport::Mac(channel))
+    pub(crate) fn from_native(channel: Arc<crate::mnt::native::NativeChannel>) -> Self {
+        Self(Transport::Native(channel))
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
@@ -48,7 +48,7 @@ impl Channel {
         let file = match &self.0 {
             Transport::Device(file) => file,
             #[cfg(target_os = "macos")]
-            Transport::Mac(channel) => return channel.receive(buffer),
+            Transport::Native(channel) => return channel.receive(buffer),
         };
         let rc = unsafe {
             libc::read(
@@ -82,7 +82,7 @@ impl ReplySender for ChannelSender {
         let file = match &self.0 {
             Transport::Device(file) => file,
             #[cfg(target_os = "macos")]
-            Transport::Mac(channel) => return channel.send(bufs),
+            Transport::Native(channel) => return channel.send(bufs),
         };
         let rc = unsafe {
             libc::writev(
@@ -104,7 +104,7 @@ impl ReplySender for ChannelSender {
         match &self.0 {
             Transport::Device(file) => BackingId::create(file, fd),
             #[cfg(target_os = "macos")]
-            Transport::Mac(_) => Err(io::Error::new(
+            Transport::Native(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Linux passthrough is unavailable on FSKit",
             )),

@@ -105,7 +105,7 @@ impl<FS: Filesystem> Session<FS> {
         #[cfg(not(target_os = "macos"))]
         let ch = Channel::new(file);
         #[cfg(target_os = "macos")]
-        let ch = Channel::from_mac(file);
+        let ch = Channel::from_native(file);
         let allowed = if options.contains(&MountOption::AllowRoot) {
             SessionACL::RootAndOwner
         } else if options.contains(&MountOption::AllowOther) {
