@@ -2,6 +2,7 @@
 """Dispatcher and fail-closed checksum regressions; no network or installation."""
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -28,19 +29,18 @@ class DispatcherTests(unittest.TestCase):
         self.marker = self.root / 'executed'
         self.log = self.root / 'curl.log'
         curl = self.bin / 'curl'
-        curl.write_text(f'#!{sys.executable}\n' + '''import os,sys
+        curl.write_text(f'#!{sys.executable}\n' + '''import os,shlex,sys
 from pathlib import Path
 args=sys.argv[1:]
 with open(os.environ['CURL_LOG'],'a') as f:f.write(repr(args)+'\\n')
-if '-w' in args:
- print('https://github.com/progbeat/git-on/releases/tag/'+os.environ.get('LATEST','v1.3.0'),end='')
-else:
- path=Path(args[args.index('-o')+1])
- path.write_text('printf "%s\\\\n" "$GIT_ON_INSTALL_DIR" > "$MARKER"\\nexit '+os.environ.get('CHILD_STATUS','0')+'\\n')
+path=Path(args[args.index('-o')+1])
+capture='import json,os,sys;json.dump(sys.argv[1:],open(os.environ["ARGV_LOG"],"w"))'
+path.write_text('printf "%s\\\\n" "${GIT_ON_INSTALL_DIR:-$HOME/.local/bin}" > "$MARKER"\\n'+shlex.quote(sys.executable)+' -c '+shlex.quote(capture)+' "$@"\\nexit '+os.environ.get('CHILD_STATUS','0')+'\\n')
 sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
 ''')
         curl.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.bin)+':/usr/bin:/bin', TMPDIR=str(self.downloads), CURL_LOG=str(self.log), MARKER=str(self.marker), HOME=str(self.root))
+        self.argv_log = self.root / 'argv.json'
+        self.env = dict(os.environ, PATH=str(self.bin)+':/usr/bin:/bin', TMPDIR=str(self.downloads), CURL_LOG=str(self.log), MARKER=str(self.marker), HOME=str(self.root), ARGV_LOG=str(self.argv_log))
 
     def run_installer(self, *args, **env):
         result = subprocess.run(['sh', str(ROOT/'install.sh'), *args], env=dict(self.env, **env), capture_output=True, timeout=10)
@@ -55,17 +55,15 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
                 self.assertEqual(self.marker.read_text().strip(), str(self.root/('custom' if '--bin-dir' in args else '.local/bin')))
         self.assertIn('/v2.0.0/git-on-installer.sh', self.log.read_text())
 
-    def test_old_versions_and_unreleased_latest_are_rejected(self):
-        for version in ['0.1.0','1.2.999','v1.2.0']:
-            result = self.run_installer('--version',version)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(b'1.3.0 and later', result.stderr)
-            self.assertFalse(self.log.exists())
-        result = self.run_installer(LATEST='v1.2.0')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.marker.exists())
+    def test_missing_release_installer_fails_on_http_not_a_local_version_check(self):
+        for version in ['0.1.0', 'v1.2.0', 'unpublished-tag']:
+            result = self.run_installer('--version', version, DOWNLOAD_STATUS='22')
+            self.assertEqual(result.returncode, 22)
+            self.assertIn('/download/v'+version.removeprefix('v')+'/git-on-installer.sh', self.log.read_text())
+            self.assertFalse(self.marker.exists())
+        self.assertNotIn(b'supported', result.stderr)
 
-    def test_normal_install_is_quiet_and_unknown_flags_have_one_generic_error(self):
+    def test_normal_install_is_quiet_and_all_other_args_are_delegated(self):
         normal = self.run_installer()
         self.assertEqual(normal.returncode, 0, normal.stderr)
         self.assertNotIn(b'--github-cli', normal.stdout + normal.stderr)
@@ -73,13 +71,16 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.log.unlink()
         for flag in ['--not-an-option', '--github-cli']:
             result = self.run_installer(flag)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, f'git-on: unknown option: {flag}\n'.encode())
-            self.assertEqual(result.stdout, b'')
-            self.assertFalse(self.log.exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(self.argv_log.read_text()), [flag])
+        forwarded = ['--quiet', '', 'space value', '*', '--verbose', '--', 'two\nlines']
+        result = self.run_installer('--quiet', '--version', '2.0.0', *forwarded[1:], '--bin-dir', str(self.root/'chosen'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.argv_log.read_text()), forwarded)
+        self.assertEqual(self.marker.read_text().strip(), str(self.root/'chosen'))
 
-    def test_invalid_options(self):
-        for args in [['--version',''], ['--version='], ['--version','x;touch bad'], ['--version','1.3.0-rc.1'], ['--version','01.3.0'], ['--bin-dir','relative'], ['--version'], ['--bogus']]:
+    def test_owned_options_require_values(self):
+        for args in [['--version'], ['--bin-dir']]:
             result = self.run_installer(*args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertFalse(self.marker.exists())

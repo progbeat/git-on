@@ -1642,3 +1642,20 @@ using checked shell error propagation. Platform/archive selection, integrity,
 extraction and executable installation remain in cargo-dist. Complete download,
 version/bin-dir semantics, signal cleanup and the grouped final invocation remain
 covered by all nine permanent installer tests.
+
+## Minimal dispatcher: delegate the generated installer's own contract
+
+The owner removed local semantic-version/minimum/range checks and duplicate
+argument validation. The default is `version=latest`; a missing tag/asset fails
+on curl's status before execution. Only version selection and bin-dir translation
+are consumed. The actual pinned generated parser supports help/quiet/verbose;
+all remaining arguments retain their exact order and bytes, including empty,
+spaced, newline and wildcard values. The permanent dispatcher fixture records
+that argv; the packaged-installer suite tests the real generated parser's flags
+and generic unknown errors. No obsolete flag branch remains.
+
+The forced PATH/updater environment flags were removed. Only install-updater=false
+was in TOML; generated PATH management had its own default. Tests keep isolated
+HOME and explicit test-only environment controls; no owner shell profile is
+modified by validation. Current bootstrapping has no semantic/API/hash/destination
+validation; complete private download and its short cleanup traps remain.

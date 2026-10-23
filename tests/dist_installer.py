@@ -43,6 +43,14 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
         subprocess.run(['sh',str(dist/'git-on-installer.sh')],env=env,check=True,timeout=90)
         subprocess.run([str(install/'git-on'),'--version'],check=True,timeout=10)
     before=(install/'git-on').read_bytes()
+    # Exercise the generated parser, rather than duplicating it in the dispatcher.
+    for option in ['--quiet', '--verbose', '--help']:
+        result=subprocess.run(['sh',str(dist/'git-on-installer.sh'),option],env=env,capture_output=True,timeout=90)
+        assert result.returncode==0,(option,result.stdout,result.stderr)
+    for option in ['--not-an-option', '--github-cli']:
+        result=subprocess.run(['sh',str(dist/'git-on-installer.sh'),option],env=env,capture_output=True,timeout=90)
+        assert result.returncode!=0 and b'unknown option' in result.stderr,(option,result.stdout,result.stderr)
+        assert (install/'git-on').read_bytes()==before
     sentinel=root/'inherited-stage'; sentinel.mkdir()
     (sentinel/'preserve').write_text('unrelated data')
     env.update(_install_temp=str(sentinel),_lib_install_temp=str(sentinel))

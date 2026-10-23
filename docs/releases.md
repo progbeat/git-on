@@ -93,19 +93,26 @@ curl -fsSL https://sh.progbeat.dev/git-on | sh
 curl -fsSL https://sh.progbeat.dev/git-on | sh -s -- --version 1.3.0 --bin-dir /absolute/path
 ```
 
-`install.sh` is a minimal dispatcher. It supports stable 1.3.0+ versions, optional
-`v`, the default latest stable release, and a canonical absolute `--bin-dir`.
-Earlier versions and a latest release older than 1.3.0 fail clearly. No legacy
-installer path exists. The Cloudflare redirect is unchanged; URL query parameters
-are not options. Published old releases are untouched.
+`install.sh` selects the latest generated release installer or the tag requested
+with `--version` (optional v prefix). It does not validate semantic versions or
+ranges: a missing tag/installer asset fails through HTTP, without executing the
+partial download. No legacy installer path exists. The Cloudflare redirect and
+published releases are unchanged.
 
-The dispatcher trusts HTTPS GitHub. It resolves one tag, downloads the entire
-matching `git-on-installer.sh` privately, checks download success and only then
-executes it. It performs no API/digest/immutable-release check or jq branch.
-The generated installer chooses the platform, downloads/extracts the archive,
-verifies its embedded SHA-256 and installs the binary. The default directory is
-`$HOME/.local/bin`. `GIT_ON_INSTALL_DIR` maps `--bin-dir`; profile edits and the
-optional updater are disabled. Running again updates or reinstalls safely.
+The dispatcher downloads the complete release installer into a private temporary
+file, checks curl's status, then runs it. It parses only version selection and
+`--bin-dir`, translated to `GIT_ON_INSTALL_DIR` because cargo-dist has no such CLI
+option. All remaining arguments are passed unchanged to the generated installer,
+which owns `--help`, `--quiet`, `--verbose` and unknown-option handling. No shell
+evaluation, version/API/digest lookup, duplicate destination validation or jq
+branch is present.
+
+The generated installer chooses the platform, verifies its embedded archive
+SHA256 and installs the binary. `dist-workspace.toml` sets the default destination
+and disables updater packaging. The bootstrap does not override PATH-management
+or updater policy; cargo-dist's generated defaults and user environment apply.
+Running again updates or reinstalls. Earlier releases without a generated
+installer asset fail rather than selecting an old archive format.
 
 ### Release format and trust boundary
 

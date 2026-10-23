@@ -204,7 +204,8 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 ## Installer acceptance
 
 `python3 tests/test_installer.py` exercises the thin dispatcher's latest/pinned
-selection, 1.3.0 minimum, optional v, bin-dir, generic unknown-option errors,
+selection, missing-tag/asset HTTP failures, optional v, bin-dir translation and
+exact downstream argv forwarding,
 partial downloads, incomplete piped invocation and status propagation. It also
 checks the generation-time SHA256 correction with GNU and stock Mac tools,
 including absent/malformed/mismatched metadata and failed/missing hash tools.
@@ -232,6 +233,6 @@ exercises its case-insensitive filesystem collision guard.
 `python3 tests/test_installer.py` checks the thin dispatcher and fail-closed
 checksum correction. Packaging runs `tests/dist_installer.py --dist dist
 --install-dir /absolute/path` against the actual generated installer and archive.
-The old installer/asset-layout contract is intentionally retired at 1.3.0.
+No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
