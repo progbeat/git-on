@@ -34,6 +34,13 @@ status=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().
 for name in ['CapEff','CapPrm','CapAmb']:assert int(status[name].strip(),16)==0,(name,status[name])
 os.umask(0o027)
 Path('out').mkdir()
+preopen=Path('out/preopen')
+os.mknod(preopen,0o100600)
+stamp=946684800000000000
+os.utime(preopen,ns=(stamp,stamp))
+with preopen.open('rb') as first:
+ s=os.fstat(first.fileno()); assert (s.st_atime_ns,s.st_mtime_ns)==(stamp,stamp)
+preopen.unlink()
 p=Path('out/generated')
 with p.open('w+b') as f:
  old=946684800000000000

@@ -1659,3 +1659,14 @@ was in TOML; generated PATH management had its own default. Tests keep isolated
 HOME and explicit test-only environment controls; no owner shell profile is
 modified by validation. Current bootstrapping has no semantic/API/hash/destination
 validation; complete private download and its short cleanup traps remain.
+
+## First passthrough open preserves prior timestamp updates
+
+Copilot reproduced mknod → utime → first read-only open → fstat losing the
+requested timestamps: before the first registration, external_io was false and
+only logical times changed. The permanent
+`passthrough_first_open_keeps_times_set_before_registration` failed before the
+fix (`/tmp/git-on-first-open-red.log`) and passes afterward
+(`/tmp/git-on-first-open-green.log`). Explicit regular-file timestamps now reach
+the backing file before registration too; unspecified times remain untouched.
+The real enabled/fallback suite also covers this mknod/first-open transition.

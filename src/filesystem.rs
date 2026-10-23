@@ -1108,7 +1108,7 @@ impl Overlay {
             n.attr.crtime = t;
         }
         n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-        if n.external_io && (atime.is_some() || mtime.is_some()) {
+        if n.attr.kind == FileType::RegularFile && (atime.is_some() || mtime.is_some()) {
             // Unspecified timestamps stay untouched even when a bypass write
             // has made the cached attributes stale since the last callback.
             let mut times = std::fs::FileTimes::new();
@@ -1673,6 +1673,30 @@ mod tests {
         assert_eq!(overlay.node(ino).unwrap().attr.size, 3);
         assert_eq!(overlay.read_data(ino, handle, 0, 100).unwrap(), [0; 3]);
         assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
+    }
+
+    #[test]
+    fn passthrough_first_open_keeps_times_set_before_registration() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "before-open.tmp");
+        let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(5678);
+        assert!(!overlay.node(ino).unwrap().external_io);
+        overlay
+            .set_attributes(
+                ino,
+                0,
+                SetAttributes {
+                    atime: Some(TimeOrNow::SpecificTime(accessed)),
+                    mtime: Some(TimeOrNow::SpecificTime(modified)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let handle = overlay.open_file(ino, libc::O_RDONLY).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        let attr = overlay.attributes(ino, Some(handle)).unwrap();
+        assert_eq!((attr.atime, attr.mtime), (accessed, modified));
     }
 
     #[test]
