@@ -80,7 +80,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.assertEqual(self.marker.read_text().strip(), str(self.root/'chosen'))
 
     def test_owned_options_require_values(self):
-        for args in [['--version'], ['--bin-dir']]:
+        for args in [['--version'], ['--bin-dir'], ['--quiet', '--version'], ['--verbose', '--bin-dir']]:
             result = self.run_installer(*args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertFalse(self.marker.exists())

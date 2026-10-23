@@ -9,14 +9,15 @@ git_on_install() (
         argument=$1; shift
         remaining=$((remaining - 1))
         case $argument in
-            --version)
-                version=${1?--version requires a value}; shift
-                remaining=$((remaining - 1));;
+            --version|--bin-dir)
+                [ "$remaining" -gt 0 ] || { printf '%s requires a value\n' "$argument" >&2; exit 2; }
+                case $argument in
+                    --version) version=$1;;
+                    --bin-dir) export GIT_ON_INSTALL_DIR="$1";;
+                esac
+                shift; remaining=$((remaining - 1));;
             --version=*) version=${argument#--version=};;
-            --bin-dir)
-                export GIT_ON_INSTALL_DIR=${1?--bin-dir requires a value}; shift
-                remaining=$((remaining - 1));;
-            --bin-dir=*) export GIT_ON_INSTALL_DIR=${argument#--bin-dir=};;
+            --bin-dir=*) export GIT_ON_INSTALL_DIR="${argument#--bin-dir=}";;
             *) set -- "$@" "$argument";;
         esac
     done
