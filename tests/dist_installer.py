@@ -51,7 +51,7 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
     for option in ['--quiet', '--verbose', '--help']:
         result=subprocess.run(['sh',str(dist/'git-on-installer.sh'),option],env=env,capture_output=True,timeout=90)
         assert result.returncode==0,(option,result.stdout,result.stderr)
-    for option in ['--not-an-option', '--github-cli']:
+    for option in ['--not-an-option', '--github-cli', '--bin-dir']:
         result=subprocess.run(['sh',str(dist/'git-on-installer.sh'),option],env=env,capture_output=True,timeout=90)
         assert result.returncode!=0 and b'unknown option' in result.stderr,(option,result.stdout,result.stderr)
         assert (install/'git-on').read_bytes()==before

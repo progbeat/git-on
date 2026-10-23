@@ -44,18 +44,19 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         curl.chmod(0o755)
         self.argv_log = self.root / 'argv.json'
         self.env = dict(os.environ, PATH=str(self.bin)+':/usr/bin:/bin', TMPDIR=str(self.downloads), CURL_LOG=str(self.log), MARKER=str(self.marker), HOME=str(self.root), ARGV_LOG=str(self.argv_log))
+        self.env.pop('GIT_ON_INSTALL_DIR', None)
 
     def run_installer(self, *args, **env):
         result = subprocess.run(['sh', str(ROOT/'install.sh'), *args], env=dict(self.env, **env), capture_output=True, timeout=10)
         self.assertEqual(list(self.downloads.iterdir()), [])
         return result
 
-    def test_latest_explicit_optional_v_bin_dir_and_repeat_update(self):
-        for args in [[], ['--version','latest'], ['--version=latest'], ['--version','1.3.0'], ['--version','v1.3.0'], ['--version=2.0.0','--bin-dir',str(self.root/'custom')]]:
+    def test_latest_explicit_optional_v_install_environment_and_repeat_update(self):
+        for args in [[], ['--version','latest'], ['--version=latest'], ['--version','1.3.0'], ['--version','v1.3.0'], ['--version=2.0.0']]:
             for _ in range(2):
-                result = self.run_installer(*args)
+                result = self.run_installer(*args, **({'GIT_ON_INSTALL_DIR':str(self.root/'custom')} if '--version=2.0.0' in args else {}))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.marker.read_text().strip(), str(self.root/('custom' if '--bin-dir' in args else '.local/bin')))
+                self.assertEqual(self.marker.read_text().strip(), str(self.root/('custom' if '--version=2.0.0' in args else '.local/bin')))
         self.assertIn('/v2.0.0/git-on-installer.sh', self.log.read_text())
 
     def test_missing_release_installer_fails_on_http_not_a_local_version_check(self):
@@ -72,18 +73,18 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.assertNotIn(b'--github-cli', normal.stdout + normal.stderr)
         self.assertNotIn(b'removed', normal.stdout + normal.stderr)
         self.log.unlink()
-        for flag in ['--not-an-option', '--github-cli']:
+        for flag in ['--not-an-option', '--github-cli', '--bin-dir']:
             result = self.run_installer(flag)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(self.argv_log.read_text()), [flag])
         forwarded = ['--quiet', '', 'space value', '*', '--verbose', '--', 'two\nlines']
-        result = self.run_installer('--quiet', '--version', '2.0.0', *forwarded[1:], '--bin-dir', str(self.root/'chosen'))
+        result = self.run_installer('--quiet', '--version', '2.0.0', *forwarded[1:], GIT_ON_INSTALL_DIR=str(self.root/'chosen'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.argv_log.read_text()), forwarded)
         self.assertEqual(self.marker.read_text().strip(), str(self.root/'chosen'))
 
     def test_owned_options_require_values(self):
-        for args in [['--version'], ['--bin-dir'], ['--quiet', '--version'], ['--verbose', '--bin-dir']]:
+        for args in [['--version'], ['--quiet', '--version']]:
             result = self.run_installer(*args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertFalse(self.marker.exists())
@@ -136,7 +137,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         # must remain inert until its complete argument-preserving group arrives.
         for end in range(start+1, len(source.rstrip())):
             with self.subTest(end=end-start):
-                subprocess.run(['sh','-s','--','--version','1.3.0','--bin-dir',str(self.root/'chosen')], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
+                subprocess.run(['sh','-s','--','--version','1.3.0','--quiet'], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
                 self.assertFalse(self.log.exists(), source[start:end])
                 self.assertFalse(self.marker.exists())
 

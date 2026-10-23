@@ -55,7 +55,7 @@ regressions were also run before replacing their implementations.
 | Reproduced failure | Permanent regression | Result after fix |
 | --- | --- | --- |
 | Installer refused owned mode 0775 without path/mode/owner or conditional advice | `test_owned_group_writable_directory_has_precise_conditional_advice`, `test_other_writable_directory_is_distinguished_from_group_write`, `test_foreign_owner_never_gets_permission_change_advice` | Precise reasons, safe single-directory advice only where appropriate, permissions unchanged |
-| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible `--bin-dir` alternative |
+| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible install-directory alternative |
 | Old Git 2.43.0 and missing Git diagnostics omitted detected version or next steps | `RemoteDiagnosticsTests` in `tests/remote.py` | Requirement stays 2.45.1+, with detected version/PATH guidance |
 | GitHub SSH publickey failure offered no public HTTPS alternative | `RemoteDiagnosticsTests` | Conditional HTTPS hint; no automatic retry or weakened authentication |
 | Version preflight before configuration capture blocked on a real Git 2.55 global-config FIFO | `SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state` | Restored configuration-first ordering; original lifecycle assertion passes |
@@ -1640,15 +1640,15 @@ The focused test failed before that removal and passes afterward; logs are
 The dispatcher shrank from62 to49 lines by combining version validation and
 using checked shell error propagation. Platform/archive selection, integrity,
 extraction and executable installation remain in cargo-dist. Complete download,
-version/bin-dir semantics, signal cleanup and the grouped final invocation remain
+release-selection semantics and the grouped final invocation remain
 covered by all nine permanent installer tests.
 
 ## Minimal dispatcher: delegate the generated installer's own contract
 
 The owner removed local semantic-version/minimum/range checks and duplicate
 argument validation. The default is `version=latest`; a missing tag/asset fails
-on curl's status before execution. Only version selection and bin-dir translation
-are consumed. The actual pinned generated parser supports help/quiet/verbose;
+on curl's status before execution. Only version selection is consumed; the standard install-directory environment
+is passed through unchanged. The actual pinned generated parser supports help/quiet/verbose;
 all remaining arguments retain their exact order and bytes, including empty,
 spaced, newline and wildcard values. The permanent dispatcher fixture records
 that argv; the packaged-installer suite tests the real generated parser's flags

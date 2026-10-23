@@ -8,17 +8,13 @@ git_on_install() {
         argument=$1; shift
         remaining=$((remaining - 1))
         case $argument in
-            --version|--bin-dir)
+            --version)
                 [ "$remaining" -gt 0 ] || { printf '%s requires a value\n' "$argument" >&2; exit 2; }
-                case $argument in
-                    --version) case $1 in latest) release=latest/download;; *) release=download/v${1#v};; esac;;
-                    --bin-dir) export GIT_ON_INSTALL_DIR="$1";;
-                esac
+                case $1 in latest) release=latest/download;; *) release=download/v${1#v};; esac
                 shift; remaining=$((remaining - 1));;
             --version=*)
                 argument=${argument#--version=}
                 case $argument in latest) release=latest/download;; *) release=download/v${argument#v};; esac;;
-            --bin-dir=*) export GIT_ON_INSTALL_DIR="${argument#--bin-dir=}";;
             *) set -- "$@" "$argument";;
         esac
     done
