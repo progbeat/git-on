@@ -143,3 +143,13 @@ This same runner can supply the kernel prerequisite without changing Brick or
 creating infrastructure. Backing registration still requires a separately
 approved capability setup that keeps the command unprivileged; no capabilities
 have been granted.
+
+On that runner at `897088d`, the ordinary-FUSE lifecycle experiment observed
+normal unmount failing with EBUSY while a worker held cwd/mmap. A test-only lazy
+detach removed the namespace mount but kept the worker's existing data usable;
+daemon SIGKILL left the mount disconnected and descriptor reads returned
+ENOTCONN. A previously cached mmap tail survived a MADV_DONTNEED page-table
+discard in all three cases. Each case completed checked cleanup. These cached
+page observations do not prove future uncached data access: the permanent
+harness additionally probes a previously unread sparse page and records any
+SIGBUS/errno separately. Enabled-passthrough observations are still required.

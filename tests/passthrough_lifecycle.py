@@ -58,7 +58,9 @@ for name in ['CapEff','CapPrm','CapAmb']:assert int(status[name].strip(),16)==0
 Path('out').mkdir()
 p=Path('out/generated')
 f=p.open('w+b',buffering=0)
-f.write(b'a'*(8*1024*1024-4)+b'last')
+f.truncate(8*1024*1024)
+f.seek(8*1024*1024-4)
+f.write(b'last')
 m=mmap.mmap(f.fileno(),0)
 m.flush()
 ino=p.stat().st_ino
@@ -77,6 +79,10 @@ try:
  f.seek(-4,os.SEEK_END)
  result['descriptor_read']=f.read().decode()
 except OSError as error:result['descriptor_errno']=error.errno
+# Save the cached-tail/descriptor observation even if the untouched sparse
+# page subsequently faults with SIGBUS after the daemon has exited.
+(control/'worker-result').write_text(json.dumps(result))
+result['unread_sparse_page']=m[4*1024*1024:4*1024*1024+4].hex()
 (control/'worker-result').write_text(json.dumps(result))
 os._exit(0)  # Avoid a disconnected FUSE flush obscuring the recorded observation.
 '''
@@ -141,10 +147,10 @@ def scenario(binary, expected, mode):
         record['worker_status_after_fault'] = worker.returncode
         if (control / 'worker-result').exists():
             record.update(json.loads((control / 'worker-result').read_text()))
-        else:
+        if worker.returncode != 0:
             assert worker.returncode in [-signal.SIGBUS, -signal.SIGSEGV], record
         if mode == 'normal-unmount':
-            assert worker.returncode == 0 and record['mmap_after_discard'] == 'last', record
+            assert worker.returncode == 0 and record['mmap_after_discard'] == 'last' and record['unread_sparse_page'] == '00000000', record
         (control / 'stop-driver').touch()
         if mode == 'daemon-exit':
             # The deliberately killed runner cannot reap its command. Let the
