@@ -81,6 +81,8 @@ jobs:
           fd = os.open('/dev/fuse', os.O_RDWR)
           os.close(fd)
           PY
+      - name: Record Linux passthrough prerequisites without privilege changes
+        run: python3 scripts/passthrough_prerequisites.py
       - name: Select stable Rust
         run: |
           rustup toolchain install stable --profile minimal
