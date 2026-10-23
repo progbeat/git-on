@@ -178,6 +178,21 @@ fn direct_non_utf8_repository_paths_are_native_git_operands() {
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
 }
 #[test]
+fn remote_materialization_preserves_the_selected_tree_without_a_checkout() {
+    let (temp, _, tree, _) = fixture();
+    let source = temp.path().join("server");
+    let snap = load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
+    let destination = temp.path().join("materialized");
+    std::fs::create_dir(&destination).unwrap();
+    git_on::materialize::materialize(&snap, &destination).unwrap();
+    assert_eq!(snap.tree_oid, tree);
+    assert_eq!(
+        std::fs::read(destination.join("deep/value")).unwrap(),
+        b"selected\n"
+    );
+    assert!(!destination.join(".git").exists());
+}
+#[test]
 fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
     let (temp, _, tree, _) = fixture();
     let server = Repository::open_bare(temp.path().join("server")).unwrap();

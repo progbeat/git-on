@@ -6,12 +6,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tomllib
 
 source=Path('target/distrib')
 output=Path('dist')
 output.mkdir(exist_ok=False)
-version=tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+version=json.loads(subprocess.check_output(['cargo','metadata','--no-deps','--format-version=1'],text=True))['packages'][0]['version']
 for name in ('git-on-aarch64-apple-darwin.tar.gz','git-on-x86_64-unknown-linux-gnu.tar.gz','git-on-installer.sh','source.tar.gz'):
     shutil.copy2(source/name,output/name)
     digest=hashlib.sha256((output/name).read_bytes()).hexdigest()

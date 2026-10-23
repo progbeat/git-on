@@ -2112,7 +2112,11 @@ class UvTests(RepositoryTest):
                 self.assert_success(result)
                 self.assertIn(b"cache-reused", result.stdout)
                 self.assertIsNone(run)
-                self.assert_no_runtime_files()
+                # uv creates its own lock files in inherited TMPDIR. Those are
+                # ordinary child host side effects, not git-on execution state.
+                self.assertTrue(all(p.name.startswith("uv-") and p.suffix == ".lock"
+                                    for p in self.system_tmp.iterdir()))
+                self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
 
 if __name__ == "__main__":
