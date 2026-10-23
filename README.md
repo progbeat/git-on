@@ -12,80 +12,51 @@ and index stay unchanged; temporary changes disappear when the command finishes.
 
 ## Installation
 
+Install on Linux or Apple Silicon macOS:
+
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
-If `git-on` is not on PATH:
-
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-You need Git. Linux mounts also need FUSE (`/dev/fuse` and `fusermount3`).
-On Apple Silicon macOS, use `--write-policy=all`: mounts and protected write
-policies are not supported yet. See [platform requirements](docs/platforms.md).
+You need Git. On Linux, install [FUSE](docs/platforms.md) to use the default write
+policy. See the [installation guide](docs/releases.md#installing-a-published-binary)
+for setup and custom install locations.
 
 ## Usage
 
-From a repository with a commit:
+Run a command at a revision in your repository:
 
 ```sh
 git on HEAD -- ls
 git on HEAD~1 -- python script.py
+```
+
+On macOS, add `--write-policy=all`, as in the next example. Other write policies
+currently require Linux with FUSE.
+
+Build an earlier revision, allowing temporary writes:
+
+```sh
+git on HEAD~1 --write-policy=all -- cargo build
+```
+
+Commands start at the snapshot's root. Everything after `--` belongs to your
+command. For more options, run:
+
+```sh
 git on -h
 ```
 
-The command starts at the selected tree's root. Put git-on options before `--`;
-every argument after it belongs to your command.
-
-To allow temporary edits to any snapshot file:
-
-```sh
-git on HEAD --write-policy=all -- sh -c 'echo temporary > result.txt; cat result.txt'
-```
-
-On macOS, this copies the whole tree before execution. Linux prefers FUSE and
-uses that copy only when a supported mount backend is unavailable.
-
-Choose a write policy with `--write-policy`:
-
-| Policy | Allowed changes |
-| --- | --- |
-| `ignored` (default) | New paths ignored by rules committed in the selected tree |
-| `untracked` | New paths, while protecting the selected tree |
-| `none` | No changes |
-| `all` | Temporary changes to any snapshot path |
-
-Tracked files remain protected under `ignored`, even if an ignore rule matches.
-Write required results outside the temporary tree:
-
-```sh
-git on HEAD -- ls > committed-files.txt
-```
-
-You can also run a remote revision or require signature verification:
-
-```sh
-git on https://github.com/OWNER/REPO.git main -- python script.py
-git on signed-tag --verify -- ./check.sh
-```
-
-Remote execution needs a compatible Git server and existing authentication.
-`--verify` uses Git's configured signature policy. See the [remote guide](docs/remote.md).
+**git-on is not a security sandbox.** Run only code you trust.
 
 ## Documentation
 
-Commands retain access to your host files, network and credentials. **git-on is
-not a security sandbox; run only code you trust.**
-
-The snapshot has no `.git` checkout. Submodules and Git LFS content are unsupported.
-Save logs and artifacts explicitly: snapshots are disposable.
-
-- [Usage and troubleshooting](docs/usage.md)
+- [Usage, write policies and troubleshooting](docs/usage.md)
+- [Remote repositories and signature verification](docs/remote.md)
 - [Runnable examples](examples/README.md)
 - [Platform requirements](docs/platforms.md)
-- [Installation details](docs/releases.md#installing-a-published-binary)
-- [Contributing](AGENTS.md) and [tests](tests/README.md)
+- [Contributing](AGENTS.md)
 
-Licensed under the [MIT License](LICENSE). Dependencies retain their own notices.
+## License
+
+[MIT](LICENSE)
