@@ -174,12 +174,10 @@ Use Rust 1.89+, native Git, and a C compiler:
 cargo install --path . --locked
 ```
 
-The macOS binary resolves the official MFMount framework at runtime and selects
-macFUSE's FSKit message transport. Building needs no installed driver or SDK;
-startup/materialization has a macOS 13+ baseline, while FSKit requires 15.4+.
-Read-only policy additionally needs the newer 26.4+ API and macFUSE 5.5+; 5.5.0
-is currently a prerelease. See [platform prerequisites](platforms.md) for actual
-acceptance status. Owners must provision the official application/helpers and
-activate the user-space extension before mounting: MFMount can refresh helpers,
-so quiet mode is not permission to install them. No kernel extension or security
-reduction is needed for FSKit. Linux keeps the pure Rust fuser backend.
+The macOS native backend uses our direct Apple FSKit extension in GitOn.app.
+Build the unsigned containing bundle with scripts/build_macos_bundle.py on a
+26.4+ SDK. No macFUSE dependency, kernel extension or security reduction is used.
+Owner-approved signing, installation and user-space extension activation are
+separate from building. CLI startup/materialization keeps macOS13+, while native
+mounting requires26.4+. Linux uses published fuser0.18.0. See
+[platform prerequisites](platforms.md) for exact acceptance limits.

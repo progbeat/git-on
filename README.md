@@ -26,7 +26,7 @@ to any snapshot path.
 
 The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and native Apple Silicon
 macOS (macOS 13+). Linux FUSE requires `/dev/fuse` and `fusermount3`; macOS
-mounts use the official macFUSE MFMount/FSKit backend (macOS 15.4+). Real macFUSE acceptance is a
+mounts use our native Apple FSKit extension in GitOn.app (macOS 26.4+). Real native FSKit acceptance is a
 release-readiness prerequisite; see [platform validation](docs/platforms.md).
 When FUSE is unavailable, only explicit `--write-policy=all` can use a fresh,
 eagerly materialized directory. Other policies fail without being weakened.
@@ -172,7 +172,7 @@ code you trust.
 
 Windows and Intel macOS have no support guarantee. Other Linux architectures have
 no prebuilt release. Containers need `/dev/fuse` and mount permission for FUSE.
-Apple Silicon/macFUSE validation requirements and known limits are documented
+Apple Silicon/FSKit validation requirements and known limits are documented
 in [platforms](docs/platforms.md).
 
 Git executable bits and symlinks are preserved. Submodules and Git LFS content

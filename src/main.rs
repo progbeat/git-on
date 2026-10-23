@@ -185,7 +185,7 @@ fn clean_unmount(mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 struct Mounted {
-    session: Option<fuser::BackgroundSession>,
+    session: Option<git_on::backend::Session>,
     mountpoint: PathBuf,
     id: String,
     identity: Option<git_on::platform::MountIdentity>,
@@ -212,9 +212,8 @@ impl Mounted {
                 std::mem::forget(session);
                 return Err(error);
             }
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join())).is_err() {
-                bail!("FUSE session failed during unmount");
-            }
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()))
+                .map_err(|_| anyhow::anyhow!("filesystem thread panicked"))??;
         }
         Ok(())
     }
@@ -435,17 +434,7 @@ fn execute(
             {
                 return Ok(ExitStatus::from_raw(signal));
             }
-            let mut mount_options = vec![
-                fuser::MountOption::FSName(format!("git-on:{id}")),
-                fuser::MountOption::Subtype("git-on".into()),
-                fuser::MountOption::NoSuid,
-                fuser::MountOption::NoDev,
-                fuser::MountOption::DefaultPermissions,
-            ];
-            if write_policy == git_on::policy::WritePolicy::None {
-                mount_options.push(fuser::MountOption::RO);
-            }
-            let session = fuser::spawn_mount2(overlay, dir.join("mount"), &mount_options)
+            let session = git_on::backend::mount(overlay, &dir.join("mount"), &id, write_policy)
                 .with_context(|| {
                     #[cfg(target_os = "linux")]
                     let prerequisite = "check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support";

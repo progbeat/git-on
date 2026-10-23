@@ -1,13 +1,10 @@
 //! An inode-based union of a pinned Git snapshot and a private, disposable
 //! writable layer. During a mount, user-controlled names never become host
 //! filesystem paths. All execution state is disposable.
+use crate::backend::{FileAttr, FileType, SetAttributes, Statistics, TimeOrNow};
 use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
-use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
-};
 use git2::Oid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -17,8 +14,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const TTL: Duration = Duration::from_secs(0);
-type FsResult<T> = std::result::Result<T, i32>;
+pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
@@ -38,18 +34,13 @@ struct Node {
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
-    #[cfg(target_os = "linux")]
-    passthrough_backing: std::sync::Weak<fuser::BackingId>,
-    #[cfg(target_os = "linux")]
-    passthrough_used: bool,
+    external_io: bool,
 }
 #[derive(Clone)]
 struct Handle {
     ino: u64,
     flags: i32,
     reader: Option<BlobReader>,
-    #[cfg(target_os = "linux")]
-    backing: Option<std::sync::Arc<fuser::BackingId>>,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -72,8 +63,6 @@ pub struct Overlay {
     next_ino: u64,
     next_handle: u64,
     snapshot_time: SystemTime,
-    #[cfg(target_os = "linux")]
-    passthrough: bool,
 }
 
 impl Overlay {
@@ -115,10 +104,7 @@ impl Overlay {
                 snapshot_path: Some(PathBuf::new()),
                 bytes: Vec::new(),
                 file: None,
-                #[cfg(target_os = "linux")]
-                passthrough_backing: std::sync::Weak::new(),
-                #[cfg(target_os = "linux")]
-                passthrough_used: false,
+                external_io: false,
             },
         );
         paths.insert(PathBuf::new(), 1);
@@ -139,8 +125,6 @@ impl Overlay {
             next_ino: 2,
             next_handle: 1,
             snapshot_time,
-            #[cfg(target_os = "linux")]
-            passthrough: false,
         })
     }
     fn lower_path(&self, path: &Path) -> Option<PathBuf> {
@@ -203,17 +187,14 @@ impl Overlay {
                 snapshot_path: Some(source),
                 bytes: Vec::new(),
                 file: None,
-                #[cfg(target_os = "linux")]
-                passthrough_backing: std::sync::Weak::new(),
-                #[cfg(target_os = "linux")]
-                passthrough_used: false,
+                external_io: false,
             },
         );
         self.paths.insert(path.to_path_buf(), ino);
         self.inode_paths.insert(ino, path.to_path_buf());
         Ok(ino)
     }
-    fn forget_inode(&mut self, ino: u64, count: u64) {
+    pub(crate) fn forget_inode(&mut self, ino: u64, count: u64) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.lookups = node.lookups.saturating_sub(count);
         }
@@ -238,7 +219,7 @@ impl Overlay {
             // Unlinked mutable nodes have no pathname left to remove.
         }
     }
-    fn open_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
+    pub(crate) fn open_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
         if self.node(ino)?.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
@@ -574,10 +555,7 @@ impl Overlay {
                 snapshot_path: None,
                 bytes,
                 file: None,
-                #[cfg(target_os = "linux")]
-                passthrough_backing: std::sync::Weak::new(),
-                #[cfg(target_os = "linux")]
-                passthrough_used: false,
+                external_io: false,
             },
         );
         self.paths.insert(p.clone(), ino);
@@ -597,8 +575,6 @@ impl Overlay {
                 ino,
                 flags,
                 reader: None,
-                #[cfg(target_os = "linux")]
-                backing: None,
             },
         );
         fh
@@ -610,34 +586,9 @@ impl Overlay {
             .cloned()
             .ok_or(libc::EBADF)
     }
-    #[cfg(target_os = "linux")]
-    fn backing_id(
-        &mut self,
-        ino: u64,
-        register: impl FnOnce(&File) -> std::io::Result<fuser::BackingId>,
-    ) -> Option<std::sync::Arc<fuser::BackingId>> {
-        let node = self.nodes.get_mut(&ino)?;
-        if !self.passthrough
-            || node.snapshot_path.is_some()
-            || node.attr.kind != FileType::RegularFile
-        {
-            return None;
-        }
-        let id = if let Some(id) = node.passthrough_backing.upgrade() {
-            id
-        } else {
-            let id = std::sync::Arc::new(register(node.file.as_ref()?).ok()?);
-            node.passthrough_backing = std::sync::Arc::downgrade(&id);
-            id
-        };
-        node.passthrough_used = true;
-        Some(id)
-    }
-
     fn refresh_backing_attr(&mut self, ino: u64) -> FsResult<()> {
-        #[cfg(target_os = "linux")]
         {
-            if self.node(ino)?.passthrough_used {
+            if self.node(ino)?.external_io {
                 let metadata = self.disk_file(ino)?.metadata().map_err(errno)?;
                 let node = self.node_mut(ino)?;
                 node.attr.size = metadata.len();
@@ -652,11 +603,9 @@ impl Overlay {
                     .ok_or(libc::EOVERFLOW)?;
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = ino;
         Ok(())
     }
-    fn open_file(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
+    pub(crate) fn open_file(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
         self.refresh_backing_attr(ino)?;
         let node = self.node(ino)?;
         if node.attr.kind != FileType::RegularFile {
@@ -717,7 +666,13 @@ impl Overlay {
         Self::record_data_change(&mut n.attr, &metadata);
         Ok(())
     }
-    fn read_data(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> FsResult<Vec<u8>> {
+    pub(crate) fn read_data(
+        &mut self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+    ) -> FsResult<Vec<u8>> {
         let h = self.handle(ino, fh)?;
         if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(libc::EBADF);
@@ -772,7 +727,7 @@ impl Overlay {
                 .map_err(snapshot_errno)
         }
     }
-    fn write_data(
+    pub(crate) fn write_data(
         &mut self,
         ino: u64,
         fh: u64,
@@ -892,7 +847,7 @@ impl Overlay {
         // Keep inode objects and open descriptors for outstanding kernel inode
         // references and open-unlinked handles; all are reclaimed at unmount.
     }
-    fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
+    pub(crate) fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
         let p = self.child(parent, name)?;
         let ino = self.ensure(&p)?;
         self.writable(ino)?;
@@ -910,7 +865,7 @@ impl Overlay {
         self.remove_path(&p);
         Ok(())
     }
-    fn rename_path(
+    pub(crate) fn rename_path(
         &mut self,
         parent: u64,
         name: &OsStr,
@@ -1075,556 +1030,245 @@ impl Overlay {
     }
 }
 
-impl Filesystem for Overlay {
-    fn init(&mut self, _req: &Request<'_>, config: &mut fuser::KernelConfig) -> FsResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            // Missing capability or privilege leaves ordinary userspace FUSE I/O.
-            self.passthrough = crate::platform::has_sys_admin()
-                && config
-                    .add_capabilities(fuser::consts::FUSE_PASSTHROUGH)
-                    .is_ok();
-            if self.passthrough {
-                self.passthrough = config.set_max_stack_depth(2).is_ok();
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = config;
-        Ok(())
+impl Overlay {
+    pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
+        let p = self.child(parent, name)?;
+        let ino = self.ensure(&p)?;
+        self.refresh_backing_attr(ino)?;
+        let node = self.node_mut(ino)?;
+        node.lookups = node.lookups.saturating_add(1);
+        Ok(node.attr)
     }
-    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        let result = (|| {
-            let p = self.child(parent, name)?;
-            let ino = self.ensure(&p)?;
-            self.refresh_backing_attr(ino)?;
-            let node = self.node_mut(ino)?;
-            node.lookups = node.lookups.saturating_add(1);
-            Ok(node.attr)
-        })();
-        match result {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        self.forget_inode(ino, nlookup);
-    }
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+    pub(crate) fn attributes(&mut self, ino: u64, fh: Option<u64>) -> FsResult<FileAttr> {
         if let Some(fh) = fh {
-            if let Err(e) = self.handle(ino, fh) {
-                reply.error(e);
-                return;
-            }
-        }
-        if let Err(e) = self.refresh_backing_attr(ino) {
-            reply.error(e);
-            return;
-        }
-        match self.node(ino) {
-            Ok(n) => reply.attr(&TTL, &n.attr),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn setattr(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
-        ctime: Option<SystemTime>,
-        fh: Option<u64>,
-        crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        let result = (|| {
-            self.writable(ino)?;
-            if let Some(fh) = fh {
-                let h = self.handle(ino, fh)?;
-                if size.is_some() && h.flags & libc::O_ACCMODE == libc::O_RDONLY {
-                    return Err(libc::EBADF);
-                }
-            }
-            let n = self.node(ino)?;
-            if req.uid() != 0 && req.uid() != n.attr.uid {
-                return Err(libc::EPERM);
-            }
-            if uid.is_some_and(|u| u != n.attr.uid) || gid.is_some_and(|g| g != n.attr.gid) {
-                return Err(libc::EPERM);
-            }
-            if flags.is_some_and(|f| f != 0) {
-                return Err(libc::EOPNOTSUPP);
-            }
-            if let Some(size) = size {
-                self.truncate(ino, size)?;
-            } else {
-                self.copy_up(ino, true)?;
-            }
-            let n = self.node_mut(ino)?;
-            if let Some(mode) = mode {
-                n.attr.perm = (mode & 0o777) as u16;
-            }
-            let time = |v: TimeOrNow| match v {
-                TimeOrNow::SpecificTime(t) => t,
-                TimeOrNow::Now => SystemTime::now(),
-            };
-            if let Some(t) = atime {
-                n.attr.atime = time(t);
-            }
-            if let Some(t) = mtime {
-                n.attr.mtime = time(t);
-            }
-            if let Some(t) = crtime {
-                n.attr.crtime = t;
-            }
-            n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-            #[cfg(target_os = "linux")]
-            if n.passthrough_used {
-                if let Some(file) = &n.file {
-                    file.set_times(
-                        std::fs::FileTimes::new()
-                            .set_accessed(n.attr.atime)
-                            .set_modified(n.attr.mtime),
-                    )
-                    .map_err(errno)?;
-                }
-            }
-            self.refresh_backing_attr(ino)?;
-            Ok(self.node(ino)?.attr)
-        })();
-        match result {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        let result = (|| {
-            let n = self.node(ino)?;
-            if n.attr.kind != FileType::Symlink {
-                return Err(libc::EINVAL);
-            }
-            if let Some(oid) = n.oid {
-                self._snapshot.read_link(oid).map_err(snapshot_errno)
-            } else {
-                Ok(n.bytes.clone())
-            }
-        })();
-        match result {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(e),
-        }
-    }
-    #[allow(clippy::useless_conversion)] // libc mode_t is u16 on macOS, u32 on Linux.
-    fn mknod(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        if mode & u32::from(libc::S_IFMT) != 0
-            && mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
-        {
-            reply.error(libc::EPERM);
-            return;
-        }
-        match self.make(
-            parent,
-            name,
-            FileType::RegularFile,
-            mode & !umask,
-            req.uid(),
-            req.gid(),
-            Vec::new(),
-        ) {
-            Ok(ino) => {
-                self.nodes.get_mut(&ino).unwrap().lookups += 1;
-                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn mkdir(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        umask: u32,
-        reply: ReplyEntry,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.make(
-            parent,
-            name,
-            FileType::Directory,
-            mode & !umask,
-            req.uid(),
-            req.gid(),
-            Vec::new(),
-        ) {
-            Ok(ino) => {
-                self.nodes.get_mut(&ino).unwrap().lookups += 1;
-                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.remove(parent, name, false) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.remove(parent, name, true) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn symlink(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
-        link_name: &OsStr,
-        target: &Path,
-        reply: ReplyEntry,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        if target.as_os_str().as_bytes().contains(&0) {
-            reply.error(libc::EINVAL);
-            return;
-        }
-        match self.make(
-            parent,
-            link_name,
-            FileType::Symlink,
-            0o777,
-            req.uid(),
-            req.gid(),
-            target.as_os_str().as_bytes().to_vec(),
-        ) {
-            Ok(ino) => {
-                self.nodes.get_mut(&ino).unwrap().lookups += 1;
-                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn rename(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        newparent: u64,
-        newname: &OsStr,
-        flags: u32,
-        reply: ReplyEmpty,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.rename_path(parent, name, newparent, newname, flags) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn link(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
-        newparent: u64,
-        newname: &OsStr,
-        reply: ReplyEntry,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.hardlink(ino, newparent, newname) {
-            Ok(()) => {
-                self.nodes.get_mut(&ino).unwrap().lookups += 1;
-                reply.entry(&TTL, &self.nodes[&ino].attr, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        // No keep-cache or writeback-cache flags: normal page-cache semantics
-        // preserve executable mappings and shared mmap write-through handles.
-        match self.open_file(ino, flags) {
-            Ok(fh) => {
-                #[cfg(target_os = "linux")]
-                if let Some(id) = self.backing_id(ino, |file| reply.open_backing(file)) {
-                    self.handles.get_mut(&fh).unwrap().backing = Some(id.clone());
-                    #[cfg(feature = "test-metrics")]
-                    self._snapshot.record_passthrough();
-                    reply.opened_passthrough(fh, 0, &id);
-                    return;
-                }
-                reply.opened(fh, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn create(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        umask: u32,
-        flags: i32,
-        reply: ReplyCreate,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        let result = (|| {
-            let ino = self.make(
-                parent,
-                name,
-                FileType::RegularFile,
-                mode & !umask,
-                req.uid(),
-                req.gid(),
-                Vec::new(),
-            )?;
-            let fh = self.open_file(ino, flags)?;
-            Ok((ino, fh))
-        })();
-        match result {
-            Ok((ino, fh)) => {
-                self.nodes.get_mut(&ino).unwrap().lookups += 1;
-                #[cfg(target_os = "linux")]
-                if let Some(id) = self.backing_id(ino, |file| reply.open_backing(file)) {
-                    self.handles.get_mut(&fh).unwrap().backing = Some(id.clone());
-                    #[cfg(feature = "test-metrics")]
-                    self._snapshot.record_passthrough();
-                    reply.created_passthrough(&TTL, &self.nodes[&ino].attr, 0, fh, 0, &id);
-                    return;
-                }
-                reply.created(&TTL, &self.nodes[&ino].attr, 0, fh, 0)
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn read(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.read_data(ino, fh, offset, size) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        data: &[u8],
-        write_flags: u32,
-        flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        match self.write_data(ino, fh, offset, data, write_flags, flags) {
-            Ok(n) => reply.written(n),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _lock_owner: u64,
-        reply: ReplyEmpty,
-    ) {
-        match self.handle(ino, fh) {
-            Ok(_) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        match self.handle(ino, fh) {
-            Ok(_) => {
-                self.close_handle(ino, fh);
-                reply.ok();
-            }
-            Err(e) => reply.error(e),
-        }
-    }
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        #[cfg(feature = "test-metrics")]
-        self._snapshot.record_file_sync();
-        let result = (|| {
             self.handle(ino, fh)?;
-            #[cfg(feature = "test-metrics")]
-            if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
-                return Err(libc::EIO);
+        }
+        self.refresh_backing_attr(ino)?;
+        Ok(self.node(ino)?.attr)
+    }
+    pub(crate) fn set_attributes(
+        &mut self,
+        ino: u64,
+        caller_uid: u32,
+        update: SetAttributes,
+    ) -> FsResult<FileAttr> {
+        let SetAttributes {
+            mode,
+            owner: uid,
+            group: gid,
+            size,
+            atime,
+            mtime,
+            ctime,
+            fh,
+            crtime,
+            flags,
+        } = update;
+
+        self.writable(ino)?;
+        if let Some(fh) = fh {
+            let h = self.handle(ino, fh)?;
+            if size.is_some() && h.flags & libc::O_ACCMODE == libc::O_RDONLY {
+                return Err(libc::EBADF);
             }
-            if let Some(file) = &self.node(ino)?.file {
-                if datasync {
-                    file.sync_data()
-                } else {
-                    file.sync_all()
-                }
+        }
+        let n = self.node(ino)?;
+        if caller_uid != 0 && caller_uid != n.attr.uid {
+            return Err(libc::EPERM);
+        }
+        if uid.is_some_and(|u| u != n.attr.uid) || gid.is_some_and(|g| g != n.attr.gid) {
+            return Err(libc::EPERM);
+        }
+        if flags.is_some_and(|f| f != 0) {
+            return Err(libc::EOPNOTSUPP);
+        }
+        if let Some(size) = size {
+            self.truncate(ino, size)?;
+        } else {
+            self.copy_up(ino, true)?;
+        }
+        let n = self.node_mut(ino)?;
+        if let Some(mode) = mode {
+            n.attr.perm = (mode & 0o777) as u16;
+        }
+        let time = |v: TimeOrNow| match v {
+            TimeOrNow::SpecificTime(t) => t,
+            TimeOrNow::Now => SystemTime::now(),
+        };
+        if let Some(t) = atime {
+            n.attr.atime = time(t);
+        }
+        if let Some(t) = mtime {
+            n.attr.mtime = time(t);
+        }
+        if let Some(t) = crtime {
+            n.attr.crtime = t;
+        }
+        n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
+        if n.external_io {
+            if let Some(file) = &n.file {
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_accessed(n.attr.atime)
+                        .set_modified(n.attr.mtime),
+                )
                 .map_err(errno)?;
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        }
+        self.refresh_backing_attr(ino)?;
+        Ok(self.node(ino)?.attr)
+    }
+    pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<Vec<u8>> {
+        let n = self.node(ino)?;
+        if n.attr.kind != FileType::Symlink {
+            return Err(libc::EINVAL);
+        }
+        if let Some(oid) = n.oid {
+            self._snapshot.read_link(oid).map_err(snapshot_errno)
+        } else {
+            Ok(n.bytes.clone())
         }
     }
-    fn opendir(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
-        let result = self.open_directory(ino, flags);
-        match result {
-            Ok(fh) => reply.opened(fh, 0),
-            Err(e) => reply.error(e),
-        }
-    }
-    fn readdir(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_node(
         &mut self,
-        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        kind: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        data: Vec<u8>,
+    ) -> FsResult<FileAttr> {
+        if data.contains(&0) && kind == FileType::Symlink {
+            return Err(libc::EINVAL);
+        }
+        let ino = self.make(parent, name, kind, mode, uid, gid, data)?;
+        self.node_mut(ino)?.lookups += 1;
+        Ok(self.node(ino)?.attr)
+    }
+    pub(crate) fn link_node(&mut self, ino: u64, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
+        self.hardlink(ino, parent, name)?;
+        self.node_mut(ino)?.lookups += 1;
+        Ok(self.node(ino)?.attr)
+    }
+    pub(crate) fn entries(
+        &self,
         ino: u64,
         fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        if offset < 0 {
-            reply.error(libc::EINVAL);
-            return;
+        offset: u64,
+    ) -> FsResult<&[(u64, FileType, OsString)]> {
+        self.handle(ino, fh)?;
+        if offset > i64::MAX as u64 {
+            return Err(libc::EINVAL);
         }
-        if let Err(e) = self.handle(ino, fh) {
-            reply.error(e);
-            return;
-        }
-        match self.directories.get(&fh) {
-            Some(entries) => {
-                for (i, (child, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-                    if reply.add(*child, (i + 1) as i64, *kind, name) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
-            None => reply.error(libc::EBADF),
-        }
+        let entries = self.directories.get(&fh).ok_or(libc::EBADF)?;
+        Ok(entries
+            .get(usize::try_from(offset).map_err(|_| libc::EINVAL)?..)
+            .unwrap_or(&[]))
     }
-    fn releasedir(&mut self, req: &Request<'_>, ino: u64, fh: u64, flags: i32, reply: ReplyEmpty) {
-        self.release(req, ino, fh, flags, None, false, reply)
-    }
-    fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        let result = self
-            .handle(ino, fh)
-            .and_then(|_| File::open(&self.backing).map_err(errno))
-            .and_then(|f| f.sync_all().map_err(errno));
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+    pub(crate) fn sync_file(&mut self, ino: u64, fh: u64, datasync: bool) -> FsResult<()> {
+        #[cfg(feature = "test-metrics")]
+        self._snapshot.record_file_sync();
+
+        self.handle(ino, fh)?;
+        #[cfg(feature = "test-metrics")]
+        if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
+            return Err(libc::EIO);
         }
-    }
-    #[allow(clippy::useless_conversion)] // libc filesystem counters differ across supported hosts.
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        let path = match std::ffi::CString::new(self.backing.as_os_str().as_bytes()) {
-            Ok(p) => p,
-            Err(_) => {
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-            reply.error(errno(std::io::Error::last_os_error()));
-            return;
-        }
-        let s = unsafe { stats.assume_init() };
-        reply.statfs(
-            u64::from(s.f_blocks),
-            u64::from(s.f_bfree),
-            u64::from(s.f_bavail),
-            u64::from(s.f_files),
-            u64::from(s.f_ffree),
-            s.f_bsize as u32,
-            255,
-            s.f_frsize as u32,
-        );
-    }
-    fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        let result = (|| {
-            let n = self.node(ino)?;
-            if mask & libc::W_OK != 0
-                && (self.write_policy == WritePolicy::None
-                    || (matches!(
-                        self.write_policy,
-                        WritePolicy::Ignored | WritePolicy::Untracked
-                    ) && n.immutable
-                        && n.attr.kind != FileType::Directory))
-            {
-                return Err(libc::EROFS);
-            }
-            let bits = if req.uid() == n.attr.uid {
-                n.attr.perm >> 6
-            } else if req.gid() == n.attr.gid {
-                n.attr.perm >> 3
+        if let Some(file) = &self.node(ino)?.file {
+            if datasync {
+                file.sync_data()
             } else {
-                n.attr.perm
-            };
-            if req.uid() == 0 {
-                if mask & libc::X_OK != 0
-                    && n.attr.kind != FileType::Directory
-                    && n.attr.perm & 0o111 == 0
-                {
-                    return Err(libc::EACCES);
-                }
-            } else if bits as i32 & mask != mask {
+                file.sync_all()
+            }
+            .map_err(errno)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn sync_directory(&self, ino: u64, fh: u64) -> FsResult<()> {
+        self.handle(ino, fh)?;
+        File::open(&self.backing)
+            .map_err(errno)?
+            .sync_all()
+            .map_err(errno)
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn validate_handle(&self, ino: u64, fh: u64) -> FsResult<()> {
+        self.handle(ino, fh).map(|_| ())
+    }
+    pub(crate) fn release_handle(&mut self, ino: u64, fh: u64) -> FsResult<()> {
+        self.handle(ino, fh)?;
+        self.close_handle(ino, fh);
+        Ok(())
+    }
+    pub(crate) fn check_access(&self, ino: u64, uid: u32, gid: u32, mask: i32) -> FsResult<()> {
+        let n = self.node(ino)?;
+        if mask & libc::W_OK != 0
+            && (self.write_policy == WritePolicy::None
+                || (matches!(
+                    self.write_policy,
+                    WritePolicy::Ignored | WritePolicy::Untracked
+                ) && n.immutable
+                    && n.attr.kind != FileType::Directory))
+        {
+            return Err(libc::EROFS);
+        }
+        let bits = if uid == n.attr.uid {
+            n.attr.perm >> 6
+        } else if gid == n.attr.gid {
+            n.attr.perm >> 3
+        } else {
+            n.attr.perm
+        };
+        if uid == 0 {
+            if mask & libc::X_OK != 0
+                && n.attr.kind != FileType::Directory
+                && n.attr.perm & 0o111 == 0
+            {
                 return Err(libc::EACCES);
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        } else if bits as i32 & mask != mask {
+            return Err(libc::EACCES);
         }
+        Ok(())
+    }
+    pub(crate) fn statistics(&self) -> FsResult<Statistics> {
+        let path = std::ffi::CString::new(self.backing.as_os_str().as_bytes())
+            .map_err(|_| libc::EINVAL)?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(errno(std::io::Error::last_os_error()));
+        }
+        let s = unsafe { stats.assume_init() };
+        #[allow(clippy::useless_conversion)]
+        Ok(Statistics {
+            blocks: u64::from(s.f_blocks),
+            free: u64::from(s.f_bfree),
+            available: u64::from(s.f_bavail),
+            files: u64::from(s.f_files),
+            free_files: u64::from(s.f_ffree),
+            block_size: s.f_bsize as u32,
+            fragment_size: s.f_frsize as u32,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn eligible_backing(&self, ino: u64) -> Option<&File> {
+        let node = self.nodes.get(&ino)?;
+        if node.snapshot_path.is_some() || node.attr.kind != FileType::RegularFile {
+            return None;
+        }
+        node.file.as_ref()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn enable_external_io(&mut self, ino: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.external_io = true;
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "test-metrics"))]
+    pub(crate) fn record_passthrough(&self) {
+        self._snapshot.record_passthrough();
     }
 }
 
@@ -2006,7 +1650,7 @@ mod tests {
         overlay.nodes.get_mut(&ino).unwrap().attr.perm = 0o751;
         // Simulate the actual kernel's bypass of write_data, not passthrough
         // negotiation. The real-kernel test proves bypass separately.
-        overlay.nodes.get_mut(&ino).unwrap().passthrough_used = true;
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
         let file = overlay.disk_file(ino).unwrap();
         file.write_at(b"extended", 4096).unwrap();
         overlay.refresh_backing_attr(ino).unwrap();

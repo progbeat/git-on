@@ -47,7 +47,7 @@ The checker resolves the dependency source with `cargo metadata --locked
 Filtering prevents an already-built Linux checkout from needing unused wasm or
 Windows dependency downloads. It verifies the locked version/checksum and reviewed trait-source
 fingerprint, enumerates every method including platform exclusions, compares
-the actual `Overlay` overrides and default handler classifications, and checks
+the actual Linux adapter overrides and default handler classifications, and checks
 that named tests still exist. A dependency or trait change requires an explicit
 review and fingerprint update, not merely adding the new method's name here.
 
@@ -190,13 +190,14 @@ real-mount oracle in `tests/stress.py` also checks this after every operation.
 
 ## 1.3 macOS and passthrough evidence limits
 
-The vendored 0.16.0 patch preserves the complete Filesystem trait above. Linux
-uses ABI 7.40; macOS uses ABI 7.31 with the official MFMount message transport
-and explicitly selects macFUSE's FSKit backend. The three macOS-only callbacks
-retain their upstream ENOSYS contracts. The Linux protocol harness and the
-native Mac rename-dispatch peer are not real mount evidence. Actual FSKit
-mounts, permission/isolation checks and lifecycle acceptance remain gates;
-the per-file sync limitation is documented in [the FSKit assessment](fskit-assessment.md).
+The published registry fuser 0.18.0 owns Linux protocol handling and backing
+registration. Its locked checksum and unchanged reviewed Filesystem trait are
+checked above; no local fork or FUSE protocol implementation is shipped.
+`src/backend/linux.rs` converts typed callbacks into the shared Overlay engine.
+The native Apple FSKit extension calls those same engine operations without a
+fuser runtime dependency. Native callback/real-mount evidence is separate from
+this Linux FUSE inventory. FSKit's per-file sync limitation is documented in
+[the platform assessment](fskit-assessment.md).
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
 FOPEN_PASSTHROUGH for command-created regular files only, after policy and access

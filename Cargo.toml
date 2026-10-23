@@ -20,7 +20,6 @@ required-features = ["test-metrics"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
-fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 gix-glob = "0.29"
 gix-quote = "0.6.1"
@@ -44,7 +43,8 @@ inherits = "release"
 lto = "thin"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-40"] }
+fuser = { version = "=0.18.0", default-features = false }
 
-[patch.crates-io]
-fuser = { path = "vendor/fuser" }
+# Compile the Linux callback adapter in native unit tests, without mounting.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+fuser = { version = "=0.18.0", default-features = false, features = ["macos-no-mount"] }

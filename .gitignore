@@ -7,3 +7,5 @@ __pycache__/
 
 /vendor/fuser/target/
 /vendor/fuser/Cargo.lock
+
+/THIRD_PARTY_NOTICES

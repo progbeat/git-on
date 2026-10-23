@@ -21,3 +21,6 @@ checksum = "sha256"
 ci = []
 # Where to host releases
 hosting = "github"
+
+# Generated from the exact target's locked runtime/build sources before packing.
+include = ["THIRD_PARTY_NOTICES"]

@@ -5,6 +5,7 @@
 #![cfg(target_os = "linux")]
 use fuser::{Session, SessionACL};
 use git2::Repository;
+use git_on::backend::linux::Fuse;
 use git_on::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -118,9 +119,15 @@ impl Peer {
             0
         );
         let task = std::thread::spawn(move || {
-            Session::from_fd(overlay, server, SessionACL::All)
-                .run()
-                .unwrap();
+            Session::from_fd(
+                Fuse::new(overlay),
+                server,
+                SessionACL::All,
+                fuser::Config::default(),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
         });
         let mut p = Self {
             fd,

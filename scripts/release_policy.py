@@ -176,7 +176,7 @@ def release_reasons(base, current_manifest, current_lock):
     # agrees with CI after those files are added.
     changed = subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z", base, "--"], text=True).split("\0")
     changed += subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], text=True).split("\0")
-    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml", "dist-workspace.toml", "scripts/fetch_dist.sh"}
+    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml", "dist-workspace.toml", "scripts/fetch_dist.sh", "scripts/build_macos_bundle.py", "scripts/third_party_notices.py"}
     for manifest in (old_manifest, current_manifest):
         if isinstance(manifest["package"].get("build"), str):
             build_paths.add(manifest["package"]["build"])
@@ -186,7 +186,7 @@ def release_reasons(base, current_manifest, current_lock):
     # Vendored runtime and build inputs affect the executable. Upstream docs,
     # standalone examples and tests retain the same nonrelease treatment as ours.
     vendor_inputs = re.compile(r"^vendor/[^/]+/(?:src/|\.cargo/|(?:Cargo\.toml|build\.rs|rust-toolchain(?:\.toml)?)$)")
-    reasons = [path for path in changed if path.startswith(("src/", ".cargo/"))
+    reasons = [path for path in changed if path.startswith(("src/", ".cargo/")) or (path.startswith("macos/") and not path.endswith(".md"))
                or vendor_inputs.match(path) or path in build_paths]
     if binary_manifest(current_manifest) != binary_manifest(old_manifest):
         reasons.append("Cargo.toml binary settings")

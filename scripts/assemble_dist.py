@@ -24,11 +24,10 @@ manifest={
         'aarch64-apple-darwin':{
             'baseline':'macOS 13+ (startup and explicit-all materialization)',
             'mounts':{
-                'backend':'macFUSE FSKit via MFMount',
-                'minimum_macos':'15.4',
-                'runtime':'official macFUSE application, helpers, MFMount.framework and activated user-space FSKit extension',
+                'backend':'direct Apple FSKit (GitOnFS)',
+                'minimum_macos':'26.4',
+                'runtime':'GitOn.app containing our signed and owner-activated native file system extension',
                 'read_only_minimum_macos':'26.4',
-                'read_only_minimum_macfuse':'5.5.0',
                 'sync_limitation':'FSKit has no per-file fsync callback; keep persistent databases outside the disposable tree',
             },
         },
