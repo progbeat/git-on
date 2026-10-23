@@ -595,12 +595,15 @@ impl Overlay {
                 node.attr.blocks = metadata.blocks();
                 node.attr.atime = metadata.accessed().map_err(errno)?;
                 node.attr.mtime = metadata.modified().map_err(errno)?;
-                node.attr.ctime = SystemTime::UNIX_EPOCH
+                let backing_ctime = SystemTime::UNIX_EPOCH
                     .checked_add(Duration::new(
                         metadata.ctime().max(0) as u64,
                         metadata.ctime_nsec() as u32,
                     ))
                     .ok_or(libc::EOVERFLOW)?;
+                // The numeric backing path does not change for overlay links
+                // and renames. Preserve their later logical namespace changes.
+                node.attr.ctime = node.attr.ctime.max(backing_ctime);
             }
         }
         Ok(())
@@ -1105,10 +1108,16 @@ impl Overlay {
             n.attr.crtime = t;
         }
         n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-        if n.external_io {
-            let times = std::fs::FileTimes::new()
-                .set_accessed(n.attr.atime)
-                .set_modified(n.attr.mtime);
+        if n.external_io && (atime.is_some() || mtime.is_some()) {
+            // Unspecified timestamps stay untouched even when a bypass write
+            // has made the cached attributes stale since the last callback.
+            let mut times = std::fs::FileTimes::new();
+            if atime.is_some() {
+                times = times.set_accessed(n.attr.atime);
+            }
+            if mtime.is_some() {
+                times = times.set_modified(n.attr.mtime);
+            }
             self.disk_file(ino)?.set_times(times).map_err(errno)?;
         }
         self.refresh_backing_attr(ino)?;
@@ -1664,6 +1673,82 @@ mod tests {
         assert_eq!(overlay.node(ino).unwrap().attr.size, 3);
         assert_eq!(overlay.read_data(ino, handle, 0, 100).unwrap(), [0; 3]);
         assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
+    }
+
+    #[test]
+    fn passthrough_link_preserves_namespace_ctime_after_stat() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "generated.tmp");
+        let _handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        std::thread::sleep(Duration::from_millis(5));
+        let linked = overlay.link_node(ino, 1, OsStr::new("alias.tmp")).unwrap();
+        assert_eq!(overlay.attributes(ino, None).unwrap().ctime, linked.ctime);
+    }
+
+    #[test]
+    fn passthrough_rename_preserves_namespace_ctime_after_stat() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "generated.tmp");
+        let _handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        std::thread::sleep(Duration::from_millis(5));
+        overlay
+            .rename_path(
+                1,
+                OsStr::new("generated.tmp"),
+                1,
+                OsStr::new("renamed.tmp"),
+                0,
+            )
+            .unwrap();
+        let changed = overlay.node(ino).unwrap().attr.ctime;
+        assert_eq!(overlay.attributes(ino, None).unwrap().ctime, changed);
+    }
+
+    #[test]
+    fn passthrough_mode_and_partial_utime_preserve_unspecified_disk_times() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "generated.tmp");
+        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        // The kernel writes without going through Overlay or refreshing its
+        // cache. chmod must not copy cached pre-write timestamps back to disk.
+        let backing = overlay.disk_file(ino).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        backing.write_at(b"kernel write", 0).unwrap();
+        let modified = backing.metadata().unwrap().modified().unwrap();
+        let attr = overlay
+            .set_attributes(
+                ino,
+                0,
+                SetAttributes {
+                    mode: Some(0o751),
+                    fh: Some(handle),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.mtime, modified);
+        assert_eq!(attr.perm, 0o751);
+        // A second bypass write makes the cache stale again before an atime-only update.
+        std::thread::sleep(Duration::from_millis(5));
+        backing.write_at(b"newer", 0).unwrap();
+        let modified = backing.metadata().unwrap().modified().unwrap();
+        let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+        let attr = overlay
+            .set_attributes(
+                ino,
+                0,
+                SetAttributes {
+                    atime: Some(TimeOrNow::SpecificTime(accessed)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.atime, accessed);
+        assert_eq!(attr.mtime, modified);
+        assert_eq!(backing.metadata().unwrap().modified().unwrap(), modified);
     }
 
     #[test]

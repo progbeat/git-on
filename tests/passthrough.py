@@ -39,6 +39,7 @@ with p.open('w+b') as f:
  old=946684800000000000
  os.utime(p,ns=(old,old))
  f.write(b'a'*131072); f.flush()
+ os.fchmod(f.fileno(),0o640)  # no stat between bypass write and mode-only setattr
  s=p.stat(); assert s.st_size==131072 and s.st_mtime_ns>old and s.st_ctime_ns>=s.st_mtime_ns
  assert s.st_blocks>0 and s.st_mode & 0o777==0o640 and s.st_uid==os.getuid() and s.st_gid==os.getgid()
  # A simultaneous second handle must share coherent data and registration.
@@ -61,7 +62,13 @@ with p.open('rb') as reopened:
 with p.open('r+b') as f:f.truncate(7)
 s=p.stat(); assert s.st_size==7 and s.st_mtime_ns>old and 0<s.st_blocks<=256 and p.read_bytes()==b'a'*7
 os.chmod(p,0o751); assert p.stat().st_mode & 0o777==0o751
+before=p.stat().st_ctime_ns; time.sleep(.01)
+os.link(p,'out/alias')
+assert p.stat().st_ctime_ns>before and p.stat().st_nlink==2
+Path('out/alias').unlink()
+before=p.stat().st_ctime_ns; time.sleep(.01)
 os.rename(p,'out/renamed'); p=Path('out/renamed')
+assert p.stat().st_ctime_ns>before
 with p.open('r+b') as f:
  f.truncate(8*1024*1024)
  with mmap.mmap(f.fileno(),0) as m:

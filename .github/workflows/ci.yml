@@ -256,6 +256,7 @@ jobs:
           python3 tests/test_dist_integrity.py
           python3 tests/test_third_party_notices.py
           python3 tests/test_write_policy_harness.py
+          python3 tests/test_passthrough_lifecycle_harness.py
           python3 tests/test_ci_contract.py
           python3 tests/test_record_demo.py
       - name: Test lossless conversion and output preservation

@@ -1605,3 +1605,37 @@ code and mount-only tests were removed from the final PR; historical commits
 remain available. The native idle-timeout, cold-enumeration and prerequisite
 review findings apply to that removed implementation. Mac CLI/materialization,
 archive metadata and installer tests remain; no actual Mac mount is claimed.
+
+## 1.3 Copilot: passthrough metadata merges and readiness publication
+
+Atce5366c, focused `passthrough_link_preserves_namespace_ctime_after_stat` and
+`passthrough_rename_preserves_namespace_ctime_after_stat` both failed: backing
+ctime predates overlay-only namespace changes. Refresh now retains the later
+logical ctime while still reading physical data metadata. The permanent
+`passthrough_mode_and_partial_utime_preserve_unspecified_disk_times` also failed:
+mode-only or atime-only updates restored stale cached mtime after bypass writes.
+Only explicitly requested timestamps now reach FileTimes; omitted times remain
+untouched. All three reproduce RED in
+`/tmp/git-on-review-round8-metadata-red.log` and pass GREEN in
+`/tmp/git-on-review-round8-metadata-green.log`. The real enabled/fallback suite
+additionally checks write→fchmod→stat without intervening refresh and
+link/rename→stat ctime progression.
+
+`tests/test_passthrough_lifecycle_harness.py` pauses a live producer after JSON
+creation and separately tests an incomplete file from a dead producer. Both
+failed with JSONDecodeError before the fix. Polling now retries incomplete JSON
+within its existing deadline and retains the dead-process error. Both pass;
+RED/GREEN logs are `/tmp/git-on-review-round8-readiness-{red,green}.log`. These
+focused cases run in CI; actual lifecycle mounts remain a separate required job.
+
+## Installer diagnostic and minimal-dispatcher cleanup
+
+The verbose github-cli removal diagnostic was emitted only for the explicit
+unsupported flag, not ordinary installation. A permanent stdout/stderr test
+checks both paths; it failed on release-history text and now passes with a short
+actionable error. Logs are `/tmp/git-on-review-installer-ux-{red,green}.log`.
+The dispatcher shrank from62 to50 lines by combining version validation and
+using checked shell error propagation. Platform/archive selection, integrity,
+extraction and executable installation remain in cargo-dist. Complete download,
+version/bin-dir semantics, signal cleanup and the grouped final invocation remain
+covered by all nine permanent installer tests.

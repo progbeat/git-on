@@ -22,7 +22,10 @@ def wait_file(path, process, seconds=20):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if path.is_file():
-            return json.loads(path.read_text())
+            try:
+                return json.loads(path.read_text())
+            except json.JSONDecodeError:
+                pass  # A live producer may still be writing the readiness file.
         if process.poll() is not None:
             raise AssertionError(f'{path.name} missing; process exited {process.returncode}')
         time.sleep(.02)
