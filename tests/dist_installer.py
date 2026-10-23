@@ -13,6 +13,7 @@ import tempfile
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--dist',type=Path,required=True)
 p.add_argument('--install-dir',type=Path,required=True)
+p.add_argument('--without-gnu-hash',action='store_true',help='verify complete macOS installer with only stock shasum')
 args=p.parse_args()
 dist=args.dist.resolve()
 install=args.install_dir.resolve()
@@ -32,6 +33,11 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
 ''')
     curl.chmod(0o755)
     env=dict(os.environ,PATH=str(programs)+os.pathsep+os.environ['PATH'],GIT_ON_INSTALL_DIR=str(install),GIT_ON_NO_MODIFY_PATH='1',GIT_ON_DISABLE_UPDATE='1',HOME=str(root/'home'),TMPDIR=str(root),FIXTURE_DIST=str(dist))
+    if args.without_gnu_hash:
+        assert sys.platform=='darwin', 'stock macOS hash-tool scenario requires macOS'
+        env['PATH']=str(programs)+':/usr/bin:/bin:/usr/sbin'
+        assert shutil.which('sha256sum',path=env['PATH']) is None, 'GNU hash tool was not excluded'
+        assert shutil.which('shasum',path=env['PATH']) is not None, 'stock macOS shasum required'
     for _ in range(2):
         subprocess.run(['sh',str(dist/'git-on-installer.sh')],env=env,check=True,timeout=90)
         subprocess.run([str(install/'git-on'),'--version'],check=True,timeout=10)

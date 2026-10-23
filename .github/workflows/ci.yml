@@ -378,6 +378,9 @@ jobs:
           sudo apt-get install --yes fuse3
           python3 tests/integration.py --binary "$RUNNER_TEMP/installed/git-on" --require-fuse
       - if: runner.os == 'macOS'
+        name: Full generated installer with stock macOS shasum only
+        run: python3 tests/dist_installer.py --dist dist --install-dir "$RUNNER_TEMP/installed" --without-gnu-hash
+      - if: runner.os == 'macOS'
         run: python3 tests/materialized.py "$RUNNER_TEMP/installed/git-on"
 
   package:

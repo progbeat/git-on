@@ -1497,3 +1497,9 @@ that failure (`/tmp/git-on-dist-blank-red.log`). The guard now trims surrounding
 whitespace before strict whole-record validation; embedded extra records,
 malformed hashes and wrong artifact names still fail. All five integrity
 regressions pass (`/tmp/git-on-dist-blank-green.log`).
+
+The complete generated Apple Silicon installer is also exercised with GNU
+`sha256sum` excluded from PATH, leaving stock `/usr/bin/shasum`. Actual install,
+repeat update and corrupted-archive preservation pass locally in
+`/tmp/git-on-generated-shasum.log`; the same scenario is now a macOS packaging
+CI step (`tests/dist_installer.py --without-gnu-hash`).
