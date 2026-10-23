@@ -142,24 +142,16 @@ The same FUSE and write-policy contract below applies to local and remote runs.
 
 ## Backend selection and materialization
 
-FUSE is preferred whenever available and capable of the requested behavior.
-Missing Linux kernel passthrough is only an optimization limitation and retains
-ordinary FUSE I/O, including on macOS. Before launching the child, discovery
-identifies absent/inaccessible `/dev/fuse` or `fusermount3` on Linux, or an absent
-GitOn.app native Apple FSKit extension bundle on macOS. Native mounting
-requires owner-approved bundle installation, signing and extension activation.
-Linux uses the published fuser library; macOS has no macFUSE dependency.
-Only explicit `--write-policy=all` permits an
-ordinary private-directory backend in that case. Other mount failures remain
-errors. Never rerun a command after a mount or runtime failure.
-
-FSKit is the preferred macOS path without a kernel extension. Its missing
-per-file fsync callback is an explicit platform limitation, not an equivalent
-durability/error-propagation contract. Persistent databases belong outside the
-disposable execution tree; crash-durable temporary databases are not required.
-Required write policies, permissions, isolation and lifecycle behavior remain
-unchanged. See [the platform constraints](platforms.md) for separate startup,
-FSKit and read-only-mount version requirements and actual verification status.
+Linux FUSE is preferred whenever available and capable of the requested behavior.
+Missing kernel passthrough is only an optimization limitation and retains
+ordinary FUSE I/O. Before launching the child, discovery identifies absent or
+inaccessible `/dev/fuse` or `fusermount3`. macOS mounts are outside 1.3.0 and are
+tracked by [issue #12](https://github.com/progbeat/git-on/issues/12); the Mac CLI
+reports this concrete capability limitation without probing or activating an
+extension. Only explicit `--write-policy=all` permits an ordinary private-directory
+backend in these cases. Other mount failures remain errors. Never rerun a command
+after a mount or runtime failure. Protected policies never become all implicitly.
+See [platform requirements](platforms.md).
 
 The materialized backend reads the same pinned tree eagerly, preserves bytes,
 symlinks and executable modes, and never applies checkout filters or fabricates

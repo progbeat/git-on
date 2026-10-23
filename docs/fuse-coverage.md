@@ -1,9 +1,8 @@
 # FUSE callback acceptance matrix
 
-This is the reviewed operation inventory for **fuser 0.16.0, Linux ABI 7.40 and
-the macFUSE protocol layout**.
+This is the reviewed operation inventory for **registry fuser 0.18.0 and Linux ABI 7.40**.
 It is a test contract, not an assertion that any particular CI run passed.
-The dependency has 44 trait methods: 26 implemented by `Overlay`, 2 inherited
+The dependency has 44 trait methods: 26 implemented by the Linux adapter and shared `Overlay`, 2 inherited
 lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
 
 ## Evidence layers and limits
@@ -188,16 +187,14 @@ parent link accounting through mkdir, rmdir, cross-parent rename, replacement
 and same-parent rename while preserving tracked-parent metadata. The randomized
 real-mount oracle in `tests/stress.py` also checks this after every operation.
 
-## 1.3 macOS and passthrough evidence limits
+## 1.3 passthrough evidence limits
 
 The published registry fuser 0.18.0 owns Linux protocol handling and backing
 registration. Its locked checksum and unchanged reviewed Filesystem trait are
 checked above; no local fork or FUSE protocol implementation is shipped.
 `src/backend/linux.rs` converts typed callbacks into the shared Overlay engine.
-The native Apple FSKit extension calls those same engine operations without a
-fuser runtime dependency. Native callback/real-mount evidence is separate from
-this Linux FUSE inventory. FSKit's per-file sync limitation is documented in
-[the platform assessment](fskit-assessment.md).
+macOS mounts are deferred to issue #12. Mac CLI/materialization tests do not
+establish FUSE mount behavior.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
 FOPEN_PASSTHROUGH for command-created regular files only, after policy and access

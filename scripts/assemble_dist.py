@@ -23,13 +23,7 @@ manifest={
         'x86_64-unknown-linux-gnu':{'baseline':'Ubuntu 22.04 / glibc 2.35'},
         'aarch64-apple-darwin':{
             'baseline':'macOS 13+ (startup and explicit-all materialization)',
-            'mounts':{
-                'backend':'direct Apple FSKit (GitOnFS)',
-                'minimum_macos':'26.4',
-                'runtime':'GitOn.app containing our signed and owner-activated native file system extension',
-                'read_only_minimum_macos':'26.4',
-                'sync_limitation':'FSKit has no per-file fsync callback; keep persistent databases outside the disposable tree',
-            },
+            'mounts':{'supported':False,'reason':'macOS mount support is deferred to issue #12'},
         },
     },
 }

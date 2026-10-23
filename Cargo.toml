@@ -44,7 +44,3 @@ lto = "thin"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "=0.18.0", default-features = false }
-
-# Compile the Linux callback adapter in native unit tests, without mounting.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-fuser = { version = "=0.18.0", default-features = false, features = ["macos-no-mount"] }

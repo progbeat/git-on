@@ -1,50 +1,26 @@
 # Platform requirements and verification
 
-Git-on builds Linux x86_64 and native Apple Silicon binaries. Linux uses registry
-fuser0.18.0 with no fork. macOS uses our direct Apple FSKit extension in GitOn.app,
-without macFUSE/MFMount or a kernel extension. Git snapshot, overlay and policy
-logic are shared; platform adapters translate operations and manage mounts.
+Git-on 1.3.0 builds Linux x86_64 and Apple Silicon CLI binaries. Linux mounts use
+registry fuser0.18.0, without a fork or vendored source. A usable `/dev/fuse` and
+`fusermount3` are required; optional passthrough does not change that requirement.
 
 ## Apple Silicon
 
-CLI startup and explicit-all materialization retain macOS13+. The native FSKit
-bundle targets26.4+, using Apple's public read-only mount API. Build it with
-an SDK containing that API:
+macOS13+ supports CLI startup and explicitly selected `--write-policy=all`
+materialization. Default `ignored`, `untracked` and `none` policies fail clearly:
+1.3.0 provides no supporting Mac mount backend. macOS mounts are deferred to
+[issue #12](https://github.com/progbeat/git-on/issues/12), which remains open outside
+this milestone. No FSKit/macFUSE adapter, app bundle, activation or security change
+is part of this release. The same console installer installs the CLI binary.
 
-```sh
-python3 scripts/build_macos_bundle.py
-```
+The Mac CI job runs strict clippy, Rust tests, eleven CLI cases, materialized
+execution and installer tests. Native packaging also executes the extracted
+binary and the generated installer with stock `shasum`; build-only success is
+not substituted for these behavior tests. Actual Mac mounts are not claimed.
 
-This produces unsigned target/native/GitOn.app and GitOnFS.entitlements. Building
-never installs, signs, registers, activates or changes security settings. Actual
-mounts require usable signing, bundle registration and activation of GitOn's
-user-space file-system extension. The final installer must provision the CLI
-and its companion in one command; manual app installation is not the finished
-installation contract. Per-user placement/activation integration is still under
-verification. /Applications is only the preliminary local test path. A new signing
-credential or security bypass is not an implicit prerequisite or authorized action.
-The owner must approve any test installation/activation separately.
-
-Run actual acceptance against the extracted/installed CLI:
-
-```sh
-python3 tests/macos_mounts.py --binary /absolute/path/git-on
-```
-
-Missing prerequisites must fail, not count as skipped passes. Verify all write
-policies, bytes/links/executable modes, generated I/O, metadata, compiled execution,
-mmap, source isolation, cross-user access, statuses/signals and terminal job control,
-busy recovery and cleanup. The runtime checks actual nosuid/nodev/read-only flags
-before launching the command. Checked cleanup records filesystem ID, owner and
-source through getmntinfo; it does not trust a path alone. No forced/lazy product
-unmount or detached execution exists.
-
-The owner's Mac was verified as27.0.1 (26A434), SDK26.5. Native compilation and
-57 shared Rust unit tests passed, followed by seven real materialized-execution
-and eleven CLI cases. Actual direct FSKit mounting remains unverified pending
-approved bundle signing/installation/activation. Those results are not mount passes.
-See [the native assessment](fskit-assessment.md), including the per-file fsync
-limitation: persistent databases belong outside the disposable tree.
+On the owner's Mac27.0.1 (26A434), SDK26.5, seven materialized-execution and eleven
+CLI cases passed at the preceding shared-core checkpoint. The reduced final head
+must repeat its supported checks before readiness.
 
 ## Linux passthrough
 
@@ -82,6 +58,6 @@ policy cases plus fallback, preserving existing mounts/checkout. Brick's older
 kernel does not establish enabled passthrough. A missing /dev/fuse in the saved
 Linux container is a failed prerequisite, never a passed real-mount test.
 
-CI exercises Linux real mounts/performance/MSRV and native Mac behavior/bundle
-compilation, both archives and corrected generated installers. Actual native
-FSKit mount acceptance and exact final-head CI/Copilot review remain release gates.
+CI exercises Linux real mounts/performance/MSRV and Mac CLI/materialized behavior,
+both native archives and corrected generated installers. Exact final-head CI and
+Copilot review remain readiness gates; COMMENTED/no findings is not APPROVED.

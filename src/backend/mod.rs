@@ -1,10 +1,8 @@
 //! Shared filesystem values. Policy and namespace logic live in Overlay;
 //! platform adapters translate their own API without implementing those rules.
 use std::time::SystemTime;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
-pub mod native;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum FileType {
@@ -66,16 +64,12 @@ pub struct Statistics {
 pub enum Session {
     #[cfg(target_os = "linux")]
     Linux(fuser::BackgroundSession),
-    #[cfg(target_os = "macos")]
-    Native(native::Session),
 }
 impl Session {
     pub fn join(self) -> std::io::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Linux(session) => session.join(),
-            #[cfg(target_os = "macos")]
-            Self::Native(session) => session.join(),
         }
     }
 }
@@ -102,7 +96,10 @@ pub fn mount(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = id;
-        native::Session::mount(overlay, path, policy).map(Session::Native)
+        let _ = (overlay, path, id, policy);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "macOS mounts are not supported in git-on 1.3.0",
+        ))
     }
 }

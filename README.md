@@ -24,12 +24,13 @@ to any snapshot path.
 
 ## Installation
 
-The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and native Apple Silicon
-macOS (macOS 13+). Linux FUSE requires `/dev/fuse` and `fusermount3`; macOS
-mounts use our native Apple FSKit extension in GitOn.app (macOS 26.4+). Real native FSKit acceptance is a
-release-readiness prerequisite; see [platform validation](docs/platforms.md).
-When FUSE is unavailable, only explicit `--write-policy=all` can use a fresh,
-eagerly materialized directory. Other policies fail without being weakened.
+The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and Apple Silicon
+macOS (macOS 13+) CLI binaries. Linux mounts require `/dev/fuse` and
+`fusermount3`. macOS mount support is deferred to [issue #12](https://github.com/progbeat/git-on/issues/12).
+On macOS, only explicitly selected `--write-policy=all` runs through a fresh,
+eagerly materialized directory. On Linux this fallback is available only when
+FUSE is concretely unavailable. Protected policies fail without being weakened.
+See [platform requirements and verification](docs/platforms.md).
 Native Git is required on PATH; remote execution requires Git 2.45.1+.
 
 ### Install or update
@@ -172,7 +173,7 @@ code you trust.
 
 Windows and Intel macOS have no support guarantee. Other Linux architectures have
 no prebuilt release. Containers need `/dev/fuse` and mount permission for FUSE.
-Apple Silicon/FSKit validation requirements and known limits are documented
+Apple Silicon CLI/materialization requirements and known limits are documented
 in [platforms](docs/platforms.md).
 
 Git executable bits and symlinks are preserved. Submodules and Git LFS content

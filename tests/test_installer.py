@@ -83,8 +83,18 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
     def test_incomplete_bootstrap_cannot_start(self):
         source = (ROOT/'install.sh').read_text().rsplit('git_on_install "$@"',1)[0]
         result = subprocess.run(['sh','-s','--','--version','1.3.0'], input=source.encode(), env=self.env, capture_output=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.log.exists())
+
+    def test_truncation_inside_final_invocation_cannot_discard_arguments(self):
+        source = (ROOT/'install.sh').read_text()
+        start = source.rindex('git_on_install "$@"')
+        # Every nonempty prefix of the call, including the bare command token,
+        # must remain inert until its complete argument-preserving group arrives.
+        for end in range(start+1, len(source.rstrip())):
+            with self.subTest(end=end-start):
+                subprocess.run(['sh','-s','--','--version','1.3.0','--bin-dir',str(self.root/'chosen')], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
+                self.assertFalse(self.log.exists(), source[start:end])
+                self.assertFalse(self.marker.exists())
 
 
 class ChecksumTests(unittest.TestCase):

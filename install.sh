@@ -59,4 +59,4 @@ git_on_install() (
         sh "$temporary/installer.sh"
 )
 # A truncated bootstrap must not invoke its payload.
-git_on_install "$@"
+{ git_on_install "$@"; }

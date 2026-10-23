@@ -1544,18 +1544,6 @@ including both permanent cleanup regressions
 (`/tmp/git-on-materialized-perms-green.log`). This is non-FUSE evidence;
 Linux CI separately runs the same cases and real-FUSE lifecycle tests.
 
-## 1.3 macOS source audit: exclusive rename flags
-
-Auditing the FSKit transport found that upstream macFUSE FUSE_RENAME carries
-exclusive/swap flags in high bits, but the vendored dispatcher unconditionally
-passed zero to the filesystem callback. The permanent actual-dispatch test
-`macos_exclusive_rename_flags_survive_actual_dispatch` failed with observed 0
-versus expected portable no-replace flag 1
-(`/tmp/git-on-macos-rename-red.log`). The parser now preserves and translates
-these flags; unsupported exchange still fails in Overlay rather than silently
-becoming replacement. The same dispatch test passes afterward
-(`/tmp/git-on-macos-rename-green.log`). This private protocol peer is not a mount.
-
 ## 1.3 enabled-passthrough harness secure execution
 
 The first authorized capable-daemon CI at `a5dec76` proved actual bypass (eight
@@ -1568,22 +1556,6 @@ ordinary-FUSE lifecycle cases passed with checked cleanup. CI printed the
 capability-revocation and private-copy-deletion receipt; the linked evidence is
 in docs/platforms.md. No mount skip is counted as this result.
 
-## 1.3 Copilot follow-up: release metadata identifies FSKit prerequisites
-
-At `56667a5`, the actual assembly script still emitted a macOS 13+ / libfuse2
-mount baseline despite the MFMount/FSKit adapter. The permanent
-`ReleaseMetadataTests.test_actual_assembly_distinguishes_macos_startup_and_mount_requirements`
-executes that script with inert archive fixtures and checks its generated
-release.json and checksum inventory. It failed on the obsolete baseline
-(`/tmp/git-on-macos-metadata-red.log`), then passed after recording separate
-startup/materialization, FSKit, runtime framework/helper/extension and read-only
-requirements (`/tmp/git-on-macos-metadata-green.log`, all six integrity tests).
-The acceptance matrix, backend discovery specification and release/build docs
-now identify the same transport. These metadata/fixture checks are not real
-Mac mount acceptance. Stable macFUSE 5.4.0 and official 5.5.0 prerelease are
-distinguished, and the per-file sync limitation retains the user's intended
-disposable-tree scope rather than adding crash-durable temporary databases.
-
 ## Registry fuser0.18 migration: advertised versus negotiated minor version
 
 At912114e, CI run39982153538 failed the existing protocol peer's literal
@@ -1595,3 +1567,40 @@ extended7.40 case remains. No protocol implementation or fork is reintroduced.
 Linux real mounts, enabled passthrough/lifecycle, performance and both packaged
 installers already passed that CI; the corrected protocol peer requires new-head
 Linux verification. This distinction does not claim Apple FSKit mount acceptance.
+
+## 1.3 Copilot: truncated dispatcher invocation
+
+At60e9322, `DispatcherTests.test_truncation_inside_final_invocation_cannot_discard_arguments`
+reproduced execution when the piped bootstrap ended after the bare final function
+token: caller version/destination arguments were lost. The permanent test checks
+every incomplete prefix of the final invocation. RED is recorded in
+`/tmp/git-on-review-bootstrap-red.log`. Grouping the complete invocation prevents
+execution until the full group is parsed; all eight installer tests pass in
+`/tmp/git-on-review-bootstrap-green.log`.
+
+## 1.3 Copilot: path timestamps after passthrough close
+
+At60e9322, `passthrough_path_utime_after_last_close_updates_backing_and_reopen`
+failed because the last close removed the cached descriptor and setattr updated
+only logical timestamps, immediately overwritten by unchanged disk metadata.
+The focused regression verifies close → path utime → backing stat → reopen stat.
+RED is recorded in `/tmp/git-on-review-utime-red.log`; obtaining `disk_file` before
+setting timestamps passes in `/tmp/git-on-review-utime-green.log`. This core test
+simulates external I/O metadata; real enabled passthrough remains a separate CI gate.
+
+## Registry fuser0.18 protocol peer shutdown
+
+At60e9322, all19 protocol cases failed during harness teardown: socket EOF is an
+invalid request for the registry session, whereas actual FUSE unmount reports
+ENODEV. The lifecycle case also sent GETATTR after terminal DESTROY. The peer now
+requires the real DESTROY reply and successful event-loop join before closing its
+socket, and sends no further requests. It does not suppress session errors or
+relax callback assertions. Linux exact-head CI must verify the full suite.
+
+## Deferred macOS mounts
+
+The owner moved issue #12 outside1.3.0. All unfinished native FSKit/app/transport
+code and mount-only tests were removed from the final PR; historical commits
+remain available. The native idle-timeout, cold-enumeration and prerequisite
+review findings apply to that removed implementation. Mac CLI/materialization,
+archive metadata and installer tests remain; no actual Mac mount is claimed.

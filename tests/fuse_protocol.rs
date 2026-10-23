@@ -242,16 +242,21 @@ impl Peer {
     fn release(&mut self, ino: u64, fh: u64) {
         self.ok(18, ino, [u64s(&[fh]), u32s(&[0, 0]), u64s(&[0])].concat());
     }
+    fn destroy(&mut self) {
+        // Upstream ends its event loop on DESTROY. Socket EOF is an invalid
+        // request, unlike a real device's ENODEV after unmount. Require both
+        // the protocol acknowledgement and successful session completion.
+        self.ok(38, 0, vec![]);
+        self.task.take().unwrap().join().unwrap();
+    }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        if self.task.is_some() && !std::thread::panicking() {
+            self.destroy();
+        }
         unsafe {
             libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
-        }
-        if let Some(task) = self.task.take() {
-            if !std::thread::panicking() {
-                task.join().unwrap();
-            }
         }
     }
 }
@@ -278,8 +283,7 @@ fn protocol_lifecycle_lookup_forget_and_batch_forget() {
     p.send(42, 0, [u32s(&[2, 0]), u64s(&[a, 1, b, 1])].concat());
     p.err(3, a, vec![0; 16], libc::ENOENT);
     p.err(3, b, vec![0; 16], libc::ENOENT);
-    p.ok(38, 0, vec![]);
-    p.err(3, 1, vec![0; 16], libc::EIO);
+    p.destroy(); // DESTROY is terminal; no requests follow its acknowledgement.
 }
 
 #[test]

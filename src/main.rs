@@ -34,8 +34,6 @@ struct Recovery {
     git_dir: Option<PathBuf>,
     tree_oid: Option<String>,
     pin_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mount_identity: Option<git_on::platform::MountIdentity>,
 }
 fn private_dir(path: &Path) -> Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -188,23 +186,19 @@ struct Mounted {
     session: Option<git_on::backend::Session>,
     mountpoint: PathBuf,
     id: String,
-    identity: Option<git_on::platform::MountIdentity>,
 }
 impl Mounted {
     fn finish(&mut self) -> Result<()> {
         if let Some(session) = self.session.take() {
-            let result = mount_is_ours(
-                self.mountpoint.parent().unwrap(),
-                &self.id,
-                self.identity.as_ref(),
-            )
-            .and_then(|mounted| {
-                if mounted {
-                    clean_unmount(&self.mountpoint)
-                } else {
-                    Ok(())
-                }
-            });
+            let result =
+                mount_is_ours(self.mountpoint.parent().unwrap(), &self.id).and_then(|mounted| {
+                    if mounted {
+                        clean_unmount(&self.mountpoint)
+                    } else {
+                        Ok(())
+                    }
+                });
+            #[cfg(target_os = "linux")]
             if let Err(error) = result {
                 // Do not invoke fuser's lazy-unmount fallback on a busy mount.
                 // Process exit closes the FUSE connection; the persistent pin
@@ -212,6 +206,8 @@ impl Mounted {
                 std::mem::forget(session);
                 return Err(error);
             }
+            #[cfg(target_os = "macos")]
+            result?;
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()))
                 .map_err(|_| anyhow::anyhow!("filesystem thread panicked"))??;
         }
@@ -294,7 +290,7 @@ fn cleanup(dir: &Path) -> Result<()> {
     if state.format != "git-on-temp-v1" {
         bail!("unrecognized temporary directory");
     }
-    if mount_is_ours(&dir, &state.id, state.mount_identity.as_ref())? {
+    if mount_is_ours(&dir, &state.id)? {
         clean_unmount(&dir.join("mount"))?;
     }
     ensure_unmounted(&dir)?;
@@ -388,7 +384,6 @@ fn execute(
         git_dir: None,
         tree_oid: None,
         pin_ref: None,
-        mount_identity: None,
     };
     let _lock = held_lock;
     let mut observed = None;
@@ -439,28 +434,17 @@ fn execute(
                     #[cfg(target_os = "linux")]
                     let prerequisite = "check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support";
                     #[cfg(target_os = "macos")]
-                    let prerequisite = "check the owner-installed GitOn.app and activated native Apple FSKit extension; macFUSE is not used";
+                    let prerequisite = "macOS mounts are outside git-on 1.3.0; explicitly select --write-policy=all for materialization";
                     format!("cannot mount snapshot at {}; {prerequisite}", dir.join("mount").display())
                 })?;
-            #[cfg(target_os = "macos")]
-            {
-                state.mount_identity = Some(git_on::platform::capture_mount_identity(&dir)?);
-                save(&dir, &state)?;
-            }
             let session = Mounted {
                 session: Some(session),
                 mountpoint: dir.join("mount"),
                 id: id.clone(),
-                identity: state.mount_identity.clone(),
             };
-            if !mount_is_ours(&dir, &id, state.mount_identity.as_ref())? {
+            if !mount_is_ours(&dir, &id)? {
                 bail!("FUSE mount did not become ready");
             }
-            #[cfg(target_os = "macos")]
-            git_on::platform::verify_mount_protections(
-                &dir,
-                write_policy == git_on::policy::WritePolicy::None,
-            )?;
             Some(session)
         };
         if let Some(signal) = signals
@@ -552,9 +536,7 @@ fn execute(
         }
         // A busy mount or failed owned transport shutdown keeps the pin and
         // recovery identity available for explicit stale cleanup.
-        if transport_cleanup_failure.is_some()
-            || mount_is_ours(&dir, &id, state.mount_identity.as_ref()).unwrap_or(true)
-        {
+        if transport_cleanup_failure.is_some() || mount_is_ours(&dir, &id).unwrap_or(true) {
             std::mem::forget(snapshot);
         }
     }
@@ -567,7 +549,7 @@ fn execute(
                 )
             });
         }
-        if mount_is_ours(&dir, &id, state.mount_identity.as_ref())? {
+        if mount_is_ours(&dir, &id)? {
             bail!(
                 "temporary mount remains at {}; use --cleanup after stopping its users",
                 dir.display()
@@ -816,7 +798,6 @@ mod tests {
             git_dir: None,
             tree_oid: None,
             pin_ref: None,
-            mount_identity: None,
         }
     }
     #[test]

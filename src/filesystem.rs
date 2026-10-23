@@ -1106,14 +1106,10 @@ impl Overlay {
         }
         n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
         if n.external_io {
-            if let Some(file) = &n.file {
-                file.set_times(
-                    std::fs::FileTimes::new()
-                        .set_accessed(n.attr.atime)
-                        .set_modified(n.attr.mtime),
-                )
-                .map_err(errno)?;
-            }
+            let times = std::fs::FileTimes::new()
+                .set_accessed(n.attr.atime)
+                .set_modified(n.attr.mtime);
+            self.disk_file(ino)?.set_times(times).map_err(errno)?;
         }
         self.refresh_backing_attr(ino)?;
         Ok(self.node(ino)?.attr)
@@ -1668,6 +1664,37 @@ mod tests {
         assert_eq!(overlay.node(ino).unwrap().attr.size, 3);
         assert_eq!(overlay.read_data(ino, handle, 0, 100).unwrap(), [0; 3]);
         assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
+    }
+
+    #[test]
+    fn passthrough_path_utime_after_last_close_updates_backing_and_reopen() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "timestamps.tmp");
+        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        overlay.close_handle(ino, handle);
+        assert!(overlay.node(ino).unwrap().file.is_none());
+        let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(5678);
+        let attr = overlay
+            .set_attributes(
+                ino,
+                0,
+                SetAttributes {
+                    atime: Some(TimeOrNow::SpecificTime(atime)),
+                    mtime: Some(TimeOrNow::SpecificTime(mtime)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.atime, atime);
+        assert_eq!(attr.mtime, mtime);
+        let metadata = overlay.disk_file(ino).unwrap().metadata().unwrap();
+        assert_eq!(metadata.accessed().unwrap(), atime);
+        assert_eq!(metadata.modified().unwrap(), mtime);
+        let handle = overlay.open_file(ino, libc::O_RDONLY).unwrap();
+        let attr = overlay.attributes(ino, Some(handle)).unwrap();
+        assert_eq!((attr.atime, attr.mtime), (atime, mtime));
     }
 
     #[test]

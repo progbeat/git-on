@@ -300,10 +300,7 @@ jobs:
       - run: python3 tests/integration.py --binary target/debug/git-on CliTests
       - run: python3 tests/materialized.py target/debug/git-on
       - run: python3 tests/test_installer.py
-      - name: Compile the unsigned direct Apple FSKit bundle
-        run: python3 scripts/build_macos_bundle.py
-      # Registration/activation and real mounts need a separately approved host.
-      # Bundle compilation and materialization are not native mount evidence.
+      # macOS 1.3.0 supports CLI/materialization; mounts are deferred to #12.
 
   package-build:
     needs: [release-policy]

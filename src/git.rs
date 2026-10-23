@@ -5,12 +5,12 @@ use std::{
     cell::RefCell,
     ffi::{OsStr, OsString},
     fs::File,
-    marker::PhantomData,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    rc::Rc,
 };
+#[cfg(target_os = "linux")]
+use std::{marker::PhantomData, rc::Rc};
 
 #[derive(Debug)]
 pub struct Git {
@@ -491,10 +491,12 @@ thread_local! {
 
 /// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
 /// proc descriptor open prevents a reused task ID from changing this identity.
+#[cfg(target_os = "linux")]
 pub(crate) struct RequestGuard {
     previous: Option<File>,
     _same_thread: PhantomData<Rc<()>>,
 }
+#[cfg(target_os = "linux")]
 impl RequestGuard {
     pub(crate) fn enter(pid: u32) -> Self {
         let status = File::open(format!("/proc/{pid}/status")).ok();
@@ -504,6 +506,7 @@ impl RequestGuard {
         }
     }
 }
+#[cfg(target_os = "linux")]
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         REQUEST_STATUS.with(|slot| slot.replace(self.previous.take()));

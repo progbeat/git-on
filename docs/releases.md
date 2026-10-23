@@ -117,9 +117,9 @@ Pinned cargo-dist 0.33.0 builds:
   `release.json` provenance and a complete `SHA256SUMS` inventory.
 
 The installed binary is always `git-on`; archive root directories match their
-archive names without `.tar.gz`. README and MIT LICENSE accompany the executable.
+archive names without `.tar.gz`. README, MIT LICENSE and target-specific THIRD_PARTY_NOTICES accompany the executable.
 Intel macOS is not implied by the arm64 artifact. See [platforms](platforms.md)
-for runtime prerequisites and the real macFUSE validation gate.
+for runtime prerequisites and the Mac materialization-only scope.
 
 Stock cargo-dist can skip hashing when `sha256sum` is absent.
 `scripts/harden_dist_installer.py` is the explicit reviewed generation-time
@@ -155,8 +155,8 @@ the extracted executable. Global generation receives both verified archives;
 the correction embeds their SHA-256, then assembly records the exact asset set.
 `verify_dist.py` checks integrity again across assembly, install and publication
 jobs. Both hosts install/update the actual archive through the actual corrected
-installer; Linux additionally runs non-skipped FUSE acceptance. macOS native and
-materialized tests are not presented as macFUSE mount evidence.
+installer; Linux additionally runs non-skipped FUSE acceptance. macOS CLI and
+materialized tests validate its supported 1.3.0 subset; Mac mounts are deferred.
 
 Only a validated master push can execute publication. The publisher requires
 release immutability already enabled (read-only setting check), creates/resumes a
@@ -174,10 +174,6 @@ Use Rust 1.89+, native Git, and a C compiler:
 cargo install --path . --locked
 ```
 
-The macOS native backend uses our direct Apple FSKit extension in GitOn.app.
-Build the unsigned containing bundle with scripts/build_macos_bundle.py on a
-26.4+ SDK. No macFUSE dependency, kernel extension or security reduction is used.
-Owner-approved signing, installation and user-space extension activation are
-separate from building. CLI startup/materialization keeps macOS13+, while native
-mounting requires26.4+. Linux uses published fuser0.18.0. See
-[platform prerequisites](platforms.md) for exact acceptance limits.
+macOS builds require no FUSE framework or extension: 1.3.0 supports startup
+and explicit-all materialization only. Native Mac mount support is deferred to
+issue #12. Linux builds use registry fuser0.18 with no vendored fork.

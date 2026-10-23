@@ -69,12 +69,9 @@ class ReleaseMetadataTests(unittest.TestCase):
             metadata=json.loads((root/'dist/release.json').read_text())
             mac=metadata['targets']['aarch64-apple-darwin']
             self.assertEqual(mac['baseline'],'macOS 13+ (startup and explicit-all materialization)')
-            self.assertEqual(mac['mounts']['minimum_macos'],'26.4')
-            self.assertEqual(mac['mounts']['backend'],'direct Apple FSKit (GitOnFS)')
-            self.assertEqual(mac['mounts']['read_only_minimum_macos'],'26.4')
-            self.assertIn('GitOn.app',mac['mounts']['runtime'])
-            self.assertIn('extension',mac['mounts']['runtime'])
-            self.assertNotIn('libfuse2',json.dumps(mac))
+            self.assertIs(mac['mounts']['supported'], False)
+            self.assertIn('#12',mac['mounts']['reason'])
+            self.assertNotIn('GitOn.app',json.dumps(mac))
             inventory=(root/'dist/SHA256SUMS').read_text()
             self.assertIn(hashlib.sha256((root/'dist/release.json').read_bytes()).hexdigest()+'  release.json\n',inventory)
 
