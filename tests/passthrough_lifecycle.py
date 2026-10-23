@@ -116,8 +116,17 @@ def scenario(binary, expected, mode):
         driver = wait_file(control / 'driver-ready', runner)
         mount = Path(driver['mount'])
         run_directory = mount.parent
-        assert run_directory.parent == temporary and mount.name == 'mount'
-        assert str(mount) in mounts_below(root), 'real FUSE mount required'
+        # glibc's secure execution for file capabilities strips TMPDIR before
+        # Rust starts. Accept the system temporary parent only for this explicit
+        # enabled scenario; validate the exact private run reported by our child.
+        allowed_parents = [temporary]
+        if expected == 'enabled': allowed_parents.append(Path(tempfile.gettempdir()).resolve())
+        assert run_directory.parent in allowed_parents and mount.name == 'mount', mount
+        assert run_directory.name.startswith('git-on-')
+        assert run_directory.stat().st_uid == os.getuid() and run_directory.stat().st_mode & 0o777 == 0o700
+        state = json.loads((run_directory / '.state').read_text())
+        assert state['format'] == 'git-on-temp-v1'
+        assert str(mount) in mounts_below(run_directory), 'real FUSE mount required'
         worker = subprocess.Popen([sys.executable, '-c', WORKER], cwd=mount,
                                   env=environment, stdout=logs, stderr=logs)
         ready = wait_file(control / 'worker-ready', worker)
@@ -136,11 +145,11 @@ def scenario(binary, expected, mode):
             record['unmount_stderr'] = unmount.stderr.decode(errors='replace').strip()
             if mode == 'normal-unmount':
                 assert unmount.returncode != 0, 'normal unmount unexpectedly succeeded with held cwd/mmap'
-                assert str(mount) in mounts_below(root)
+                assert str(mount) in mounts_below(run_directory)
             else:
                 assert unmount.returncode == 0, record
-                assert str(mount) not in mounts_below(root)
-        record['namespace_mount_present'] = str(mount) in mounts_below(root)
+                assert str(mount) not in mounts_below(run_directory)
+        record['namespace_mount_present'] = str(mount) in mounts_below(run_directory)
         record['temporary_state_still_present'] = run_directory.exists()
         (control / 'fault-now').touch()
         worker.wait(timeout=15)
@@ -181,7 +190,7 @@ def scenario(binary, expected, mode):
             recovery = subprocess.run([str(binary), '--cleanup', str(run_directory)],
                                       cwd=repo, env=environment, capture_output=True, timeout=20)
             assert recovery.returncode == 0, recovery.stderr
-        assert not mounts_below(root) and not list(temporary.iterdir())
+        assert not mounts_below(run_directory) and not run_directory.exists() and not list(temporary.iterdir())
         assert git('status', '--porcelain') == b''
         assert git('for-each-ref', '--format=%(refname)', 'refs/git-on/') == b''
         record['checked_cleanup'] = True
@@ -201,7 +210,7 @@ def scenario(binary, expected, mode):
             shutil.rmtree(root)
         else:
             # Never let generic recursive deletion descend into a live mount.
-            print('Lifecycle experiment failed; preserving owned state and logs at ' + str(root), file=sys.stderr)
+            print(f'Lifecycle experiment failed; preserving logs at {root}, run {run_directory}', file=sys.stderr)
 
 
 if __name__ == '__main__':

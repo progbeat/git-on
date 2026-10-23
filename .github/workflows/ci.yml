@@ -162,6 +162,8 @@ jobs:
             fi
             test -z "$(getcap "$TEST_BINARY")" || return 1
             rm -rf "$TEST_DIRECTORY"
+            test ! -e "$TEST_DIRECTORY" || return 1
+            echo 'Test capability removed and private binary copy deleted'
           }
           trap cleanup_passthrough_test EXIT
           sudo setcap cap_sys_admin=ep "$TEST_BINARY"
