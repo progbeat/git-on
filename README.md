@@ -14,8 +14,7 @@ and index stay unchanged; temporary changes disappear when the command finishes.
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
-Run as your normal user. The same command installs or updates `~/.local/bin/git-on`.
-If that directory is not on PATH:
+If `git-on` is not on PATH:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -24,9 +23,6 @@ export PATH="$HOME/.local/bin:$PATH"
 You need Git. Linux mounts also need FUSE (`/dev/fuse` and `fusermount3`).
 On Apple Silicon macOS, use `--write-policy=all`: mounts and protected write
 policies are not supported yet. See [platform requirements](docs/platforms.md).
-
-For a custom destination, a pinned version or building from source, see the
-[installation guide](docs/releases.md#installing-a-published-binary).
 
 ## Run
 
