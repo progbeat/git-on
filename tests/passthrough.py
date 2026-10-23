@@ -20,7 +20,7 @@ assert os.uname().sysname=='Linux','real Linux FUSE required'
 assert Path('/dev/fuse').exists() and shutil.which('fusermount3'),'usable FUSE required'
 with tempfile.TemporaryDirectory() as scratch:
     root=Path(scratch); repo=root/'repo'; repo.mkdir(); tmp=root/'tmp'; tmp.mkdir()
-    env=dict(os.environ,TMPDIR=str(tmp),GIT_AUTHOR_NAME='Fixture',GIT_COMMITTER_NAME='Fixture',GIT_AUTHOR_EMAIL='f@example.invalid',GIT_COMMITTER_EMAIL='f@example.invalid')
+    env=dict(os.environ,TMPDIR=str(tmp),GIT_ON_EXPECT_UID=str(os.getuid()),GIT_AUTHOR_NAME='Fixture',GIT_COMMITTER_NAME='Fixture',GIT_AUTHOR_EMAIL='f@example.invalid',GIT_COMMITTER_EMAIL='f@example.invalid')
     def git(*argv): subprocess.run(['git',*argv],cwd=repo,env=env,check=True,capture_output=True)
     git('init','-q')
     (repo/'.gitignore').write_text('out/\n')
@@ -29,6 +29,9 @@ with tempfile.TemporaryDirectory() as scratch:
     code=r'''
 import mmap,os,subprocess,time
 from pathlib import Path
+assert os.getuid()==os.geteuid()==int(os.environ['GIT_ON_EXPECT_UID'])!=0
+status=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+for name in ['CapEff','CapPrm','CapAmb']:assert int(status[name].strip(),16)==0,(name,status[name])
 Path('out').mkdir()
 p=Path('out/generated')
 with p.open('w+b') as f:
@@ -51,7 +54,7 @@ with p.open('r+b') as f:
   assert m[-4:]==b'last'  # page fault after backing pathname unlink, daemon alive
 subprocess.run(['cc','program.c','-o','out/program'],check=True)
 assert subprocess.check_output(['./out/program'])==b'compiled\n'
-print('metadata, reopen, truncate, modes, rename/unlink, mmap and compiled executable verified')
+print('ordinary child UID/zero capabilities, metadata, reopen, truncate, modes, rename/unlink, mmap and compiled executable verified')
 '''
     read_fd,write_fd=os.pipe()
     try:
