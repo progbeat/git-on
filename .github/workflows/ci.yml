@@ -220,6 +220,7 @@ jobs:
           python3 tests/test_release_policy.py
           python3 tests/test_publish_release.py
           python3 tests/test_installer.py
+          python3 tests/test_dist_integrity.py
           python3 tests/test_record_demo.py
       - name: Test lossless conversion and output preservation
         run: |
@@ -294,6 +295,12 @@ jobs:
           rustup default 1.90.0
           dist build --artifacts=local --target=${{ matrix.target }} --allow-dirty --output-format=json > local-dist-manifest.json
           cp local-dist-manifest.json target/distrib/${{ matrix.target }}-dist-manifest.json
+          python3 - <<'PYPROVENANCE'
+          import json, subprocess
+          from pathlib import Path
+          target='${{ matrix.target }}'
+          Path('target/distrib/provenance-'+target+'.json').write_text(json.dumps({'target':target,'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'rust':'1.90.0'})+'\n')
+          PYPROVENANCE
       - name: Verify native archive and binary
         run: |
           python3 - <<'PY'
@@ -330,6 +337,7 @@ jobs:
       - run: sh scripts/fetch_dist.sh "$RUNNER_TEMP/dist-tool"
       - name: Generate and harden the shared release installer
         run: |
+          python3 scripts/verify_local_dist.py
           "$RUNNER_TEMP/dist-tool/dist" build --artifacts=global --allow-dirty --output-format=json > global-dist-manifest.json
           python3 scripts/harden_dist_installer.py target/distrib
           python3 scripts/assemble_dist.py
