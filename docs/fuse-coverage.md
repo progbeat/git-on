@@ -111,7 +111,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | Callback | Classification | Protocol tests | Mounted behavior tests | Assertions and limitations |
 | --- | --- | --- | --- | --- |
 | init | implemented | P-life | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
-| destroy | inherited | P-life | I-snapshot | DESTROY terminates dispatch lifecycle; a subsequent ordinary request returns EIO. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
+| destroy | inherited | P-life | I-snapshot | DESTROY is acknowledged and the session thread joins successfully; no requests follow termination. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
 | lookup | implemented | P-life, P-namespace | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
