@@ -1595,7 +1595,8 @@ invalid request for the registry session, whereas actual FUSE unmount reports
 ENODEV. The lifecycle case also sent GETATTR after terminal DESTROY. The peer now
 requires the real DESTROY reply and successful event-loop join before closing its
 socket, and sends no further requests. It does not suppress session errors or
-relax callback assertions. Linux exact-head CI must verify the full suite.
+relax callback assertions. Independent Linux replay verified RED0/19 at60e9322 and GREEN19/19 at7b9938f.
+The subsequent b07e786 head changes only the real-kernel timestamp assertions.
 
 ## Deferred macOS mounts
 

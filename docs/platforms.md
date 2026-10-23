@@ -18,9 +18,10 @@ execution and installer tests. Native packaging also executes the extracted
 binary and the generated installer with stock `shasum`; build-only success is
 not substituted for these behavior tests. Actual Mac mounts are not claimed.
 
-On the owner's Mac27.0.1 (26A434), SDK26.5, seven materialized-execution and eleven
-CLI cases passed at the preceding shared-core checkpoint. The reduced final head
-must repeat its supported checks before readiness.
+On the owner's Mac27.0.1 (26A434), SDK26.5, the reduced implementation passed
+58 core, 12 binary and 10 remote-source Rust tests, strict metrics clippy,
+seven materialized-execution and eleven CLI cases. Local tests use disposable
+fixtures; no extension is installed or activated.
 
 ## Linux passthrough
 
@@ -45,13 +46,16 @@ handles, reopen/truncate, rename/unlink, executable and mmap behavior. Lifecycle
 experiments record physical-name unlink, busy normal unmount, test-only lazy detach
 and daemon exit, including unread page faults; they do not authorize early teardown.
 
-[CI at the preceding checkpoint](https://github.com/progbeat/git-on/actions/runs/39977099308)
+[CI at b07e786](https://github.com/progbeat/git-on/actions/runs/39986005244)
 verified ordinary mounts and enabled passthrough on6.17.0-1022-azure, UID1001,
-with eight registrations and zero generated callbacks. Normal unmount was busy;
-after daemon exit enabled mmap read an unread sparse page while descriptor read
-failed ENOTCONN; fallback faulted SIGBUS. All cases completed checked cleanup.
-The owner-approved capability was confined to a private disposable CI test copy,
-then revoked and the copy deleted. New registry/core changes need new-head CI.
+with nine registrations and zero generated read/write callbacks. The fallback
+reported zero registrations and ten read/46 write callbacks. Both paths verified
+path timestamps after the last handle closes, metadata/reopen/truncate, mmap and
+compiled execution. Normal unmount was busy; after daemon exit enabled mmap read
+an unread sparse page while descriptor read failed ENOTCONN; fallback faulted
+SIGBUS. All six lifecycle cases completed checked cleanup. The owner-approved
+capability was confined to a private disposable CI test copy, then revoked and
+the copy deleted; the child asserted zero effective/permitted/ambient capabilities.
 
 Independent Brick ordinary-FUSE validation at71eab9f passed55 mount and eight
 policy cases plus fallback, preserving existing mounts/checkout. Brick's older

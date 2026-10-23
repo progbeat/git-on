@@ -203,31 +203,23 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 
 ## Installer acceptance
 
-`python3 tests/test_installer.py` runs offline latest/pinned release selection,
-repeat installation, updates, checksum/download failure preservation, unsafe
-archives/destinations, platform checks, and atomic replacement regressions.
-Shell curl/gh transport fixtures exercise the actual `sh install.sh` entrypoint
-with an explicit tools-only PATH containing no Python or jq. Tests cover
-one-time latest resolution, pinned original/current archive layouts, checksum and
-download failures, duplicates/links, destination races, signals, relative PATH,
-replacement failure and incomplete piped scripts.
-Focused regressions also cover fresh destinations under `umask 0002`, probe
-children holding stdout, shell metacharacters in diagnostic paths, and duplicate
-checksum entries in the legacy compatibility guard.
+`python3 tests/test_installer.py` exercises the thin dispatcher's latest/pinned
+selection, 1.3.0 minimum, optional v, bin-dir, removed github-cli diagnostic,
+partial downloads, incomplete piped invocation and status propagation. It also
+checks the generation-time SHA256 correction with GNU and stock Mac tools,
+including absent/malformed/mismatched metadata and failed/missing hash tools.
+These offline fixtures execute no downloaded release binary.
 
-`python3 tests/installer_smoke.py --binary target/debug/git-on` constructs a
-minimal Docker root filesystem from local utilities/shared libraries. Python and
-jq are absent from that filesystem. With the network disabled and root filesystem
-read-only, it installs the actual binary through latest/pinned paths, upgrades,
-and verifies download/checksum failure preservation. No registry image or package
-download is needed; Python runs only in the external developer test harness.
-
-The Ubuntu 22.04 `package` job passes the actual release assets to
-`python3 tests/test_installer.py --dist dist --install-dir "$PWD/installed"`, then
-runs the complete real-FUSE integration suite against `installed/git-on`. The
-acceptance test also guards the legacy three-asset/two-checksum-entry contract
-and verifies the distributed LICENSE.
-Installer fixtures are not a substitute for that packaged-binary mount test.
+Native packaging jobs build real archives, execute the extracted binary and
+compare embedded THIRD_PARTY_NOTICES to the target-specific generated file.
+Assembly checks the original incoming hashes and source/target provenance before
+regeneration. `tests/dist_installer.py --dist dist --install-dir /absolute/path`
+then executes the actual corrected generated installer and packaged host binary:
+install/update, corrupt/truncated archive preservation and destination-staging
+failure/signal cleanup. The Mac job repeats with `--without-gnu-hash`, excluding
+GNU sha256sum and requiring stock shasum. The installed Linux binary runs the
+real-FUSE integration suite; the installed Mac CLI runs materialized behavior.
+Installer fixture success does not substitute for those packaged-binary checks.
 
 ## 1.3 verification
 
@@ -241,4 +233,5 @@ exercises its case-insensitive filesystem collision guard.
 checksum correction. Packaging runs `tests/dist_installer.py --dist dist
 --install-dir /absolute/path` against the actual generated installer and archive.
 The old installer/asset-layout contract is intentionally retired at 1.3.0.
-See [platform validation](../docs/platforms.md) for real Mac/passthrough gates.
+See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
+the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
