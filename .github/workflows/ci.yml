@@ -144,6 +144,9 @@ jobs:
       - name: Real-FUSE generated-file passthrough fallback
         run: python3 tests/passthrough.py --binary target/release/git-on --expect=fallback
 
+      - name: Observe generated-file mmap and mount lifetime on ordinary FUSE
+        run: python3 tests/passthrough_lifecycle.py --binary target/release/git-on --expect=fallback
+
       - name: Seeded bounded filesystem differential stress
         run: >-
           python3 tests/stress.py --binary target/release/git-on --require-fuse

@@ -58,8 +58,10 @@ metadata; data size, allocation and timestamps refresh from backing files.
 ```sh
 cargo build --locked --features test-metrics
 python3 tests/passthrough.py --binary target/debug/git-on --expect=fallback
+python3 tests/passthrough_lifecycle.py --binary target/debug/git-on --expect=fallback
 # On a separately provisioned capable host/daemon identity, without elevating child:
 python3 tests/passthrough.py --binary target/debug/git-on --expect=enabled
+python3 tests/passthrough_lifecycle.py --binary target/debug/git-on --expect=enabled
 ```
 
 Enabled verification requires successful kernel backing registration and zero
@@ -74,6 +76,11 @@ a lazy unmount detaches a namespace but does not prove release of all kernel
 references. Daemon-exit/subsequent-page-fault guarantees and measured benefit
 must be recorded on the tested kernel. Those destructive lifecycle experiments
 remain an explicit verification gate, not a claim inferred from passthrough.
+The lifecycle harness reports actual subsequent page-fault/descriptor outcomes
+after physical backing-name unlink, busy normal unmount, test-only lazy detach
+and daemon SIGKILL, then checks explicit recovery and source isolation. Only
+its own unique disposable mount is touched. Detach/daemon-exit observations are
+not treated as safety guarantees; abnormal outcomes are reported explicitly.
 The execution contract still waits for the command, stops its remaining group,
 normally unmounts and checks cleanup. There is no early-unmount/detached mode.
 
