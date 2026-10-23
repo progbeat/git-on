@@ -293,6 +293,7 @@ fn cleanup(dir: &Path) -> Result<()> {
     }
     ensure_unmounted(&dir)?;
     git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+    git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
     release_pin(&state)?;
     fs::remove_dir_all(dir)?;
     Ok(())
@@ -561,6 +562,7 @@ fn execute(
         ensure_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
         git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+        git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
         release_pin(&state)?;
         if dir.join("remote-repository").exists() {
             fs::remove_dir_all(dir.join("remote-repository"))?;

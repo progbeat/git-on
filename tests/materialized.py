@@ -3,6 +3,7 @@
 These do not count as real FUSE/macFUSE verification.
 """
 import os
+import json
 from pathlib import Path
 import signal
 import shutil
@@ -90,6 +91,48 @@ print(os.environ['GIT_ON_TREE_OID'])
         self.clean()
         result = self.invoke('import os,signal; os.kill(os.getpid(),signal.SIGTERM)', '--write-policy=all')
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)
+        self.clean()
+
+    def outside_directory(self):
+        outside=self.root/'outside';outside.mkdir()
+        (outside/'preserve').write_text('external data')
+        outside.chmod(0o555)
+        self.addCleanup(outside.chmod,0o755)
+        return outside
+
+    def assert_outside_untouched(self,outside):
+        self.assertEqual(outside.stat().st_mode & 0o777,0o555)
+        self.assertEqual((outside/'preserve').read_text(),'external data')
+
+    def test_normal_cleanup_restores_locked_directories_without_following_links(self):
+        outside=self.outside_directory()
+        result=self.invoke("""
+import os,sys
+from pathlib import Path
+Path('d/nested').mkdir(parents=True)
+Path('d/nested/output').write_text('disposable')
+os.symlink(sys.argv[-1],'external')
+os.chmod('d/nested',0)
+os.chmod('d',0o555)
+os.chmod('.',0)
+""".replace('sys.argv[-1]',repr(str(outside))),'--write-policy=all')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assert_outside_untouched(outside)
+        self.clean()
+
+    def test_explicit_recovery_restores_locked_directories_without_following_links(self):
+        outside=self.outside_directory()
+        run=self.tmp/'git-on-recovery';run.mkdir(mode=0o700)
+        (run/'.lock').touch(mode=0o600)
+        (run/'.state').write_text(json.dumps(dict(format='git-on-temp-v1',id='materialized-test',git_dir=None,tree_oid=None,pin_ref=None)))
+        mount=run/'mount';mount.mkdir()
+        nested=mount/'d';nested.mkdir()
+        (nested/'output').write_text('disposable')
+        os.symlink(outside,mount/'external')
+        nested.chmod(0o555);mount.chmod(0)
+        result=subprocess.run([str(BINARY),'--cleanup',str(run)],cwd=self.repo,env=self.env,capture_output=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assert_outside_untouched(outside)
         self.clean()
 
     def test_submodule_and_lfs_prevent_launch(self):

@@ -1526,3 +1526,20 @@ runtime sources, manifests and build inputs preserves AGENTS.md's nonrelease
 exceptions. All 41 release-policy tests pass after the correction, including
 runtime source and isolated manifest/build-input cases that still require a
 release (`/tmp/git-on-vendor-policy-green.log`).
+
+## 1.3 Copilot follow-up: locked materialized directories
+
+At `897088d`, the permanent normal-execution and explicit-recovery regressions
+in `tests/materialized.py` both failed with exit 125 / Permission denied when
+the disposable view contained populated mode-0555 and mode-000 directories.
+The view root itself was also mode 000. The red transcript is
+`/tmp/git-on-materialized-perms-red.log`.
+
+After mount-ownership/unmount checks, both cleanup paths now restore owner
+directory access through pinned directory descriptors, O_NOFOLLOW and no-follow
+stat/chmod operations. Only directories owned by the current identity qualify.
+An external read-only directory reached by a symlink keeps its original mode
+and bytes. All seven actual Mac materialized cases pass after rebuilding,
+including both permanent cleanup regressions
+(`/tmp/git-on-materialized-perms-green.log`). This is non-FUSE evidence;
+Linux CI separately runs the same cases and real-FUSE lifecycle tests.
