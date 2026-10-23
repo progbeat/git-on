@@ -90,17 +90,18 @@ The entry point remains unchanged:
 
 ```sh
 curl -fsSL https://sh.progbeat.dev/git-on | sh
-curl -fsSL https://sh.progbeat.dev/git-on | GIT_ON_INSTALL_DIR=/absolute/path sh -s -- --version 1.3.0
+curl -fsSL https://sh.progbeat.dev/git-on | GIT_ON_VERSION=1.3.0 GIT_ON_INSTALL_DIR=/absolute/path sh
 ```
 
 `install.sh` selects the latest generated release installer or the tag requested
-with `--version` (optional v prefix). It does not validate semantic versions or
+with `GIT_ON_VERSION` (optional v prefix). It does not validate semantic versions or
 ranges: a missing tag/installer asset is reported by curl. No legacy installer path exists. The Cloudflare redirect and
 published releases are unchanged.
 
 The dispatcher streams the selected script through `curl ... | sh -s -- "$@"`.
-It parses only version selection. Set the generated installer's standard
-`GIT_ON_INSTALL_DIR` environment variable to choose a destination. All remaining
+It parses no arguments. `GIT_ON_VERSION` selects a release; unset, empty or latest
+uses the latest release. Set the generated installer's standard `GIT_ON_INSTALL_DIR`
+environment variable to choose a destination. All remaining
 arguments pass unchanged to the generated installer, which owns help, verbosity
 and unknown-option handling. There is no RAM/file staging, sh -c, cleanup trap,
 semantic/API validation or duplicate environment policy in the bootstrap.

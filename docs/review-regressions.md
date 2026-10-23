@@ -1717,3 +1717,13 @@ real-tool regression failed on both stock shasum paths before the fix in
 input, so their output contains no filename escaping. All11 dispatcher/hash cases
 pass in `/tmp/git-on-hash-path-green.log`. CI's native Linux and Mac tools repeat
 the same permanent cases; missing tools and mismatched archives still fail closed.
+
+## Environment-only bootstrap configuration
+
+The final bootstrap parses no arguments. `GIT_ON_VERSION` selects the release;
+unset, empty and latest values use latest/download. All argv is passed intact
+to the generated installer, including flags the bootstrap used to consume.
+`GIT_ON_INSTALL_DIR` remains the standard downstream environment control.
+The permanent matrix verifies defaults, pinned versions, optional v, repeated
+installs, custom destination environment and byte-exact downstream argv.
+Prior missing-selector parser tests were removed with that parser, not bypassed.

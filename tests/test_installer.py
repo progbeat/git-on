@@ -45,23 +45,27 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.argv_log = self.root / 'argv.json'
         self.env = dict(os.environ, PATH=str(self.bin)+':/usr/bin:/bin', TMPDIR=str(self.downloads), CURL_LOG=str(self.log), MARKER=str(self.marker), HOME=str(self.root), ARGV_LOG=str(self.argv_log))
         self.env.pop('GIT_ON_INSTALL_DIR', None)
+        self.env.pop('GIT_ON_VERSION', None)
 
     def run_installer(self, *args, **env):
         result = subprocess.run(['sh', str(ROOT/'install.sh'), *args], env=dict(self.env, **env), capture_output=True, timeout=10)
         self.assertEqual(list(self.downloads.iterdir()), [])
         return result
 
-    def test_latest_explicit_optional_v_install_environment_and_repeat_update(self):
-        for args in [[], ['--version','latest'], ['--version=latest'], ['--version','1.3.0'], ['--version','v1.3.0'], ['--version=2.0.0']]:
+    def test_latest_pinned_version_and_install_directory_environments(self):
+        for version in [None, '', 'latest', '1.3.0', 'v1.3.0', '2.0.0']:
+            environment = {} if version is None else {'GIT_ON_VERSION':version}
+            if version=='2.0.0':environment['GIT_ON_INSTALL_DIR']=str(self.root/'custom')
             for _ in range(2):
-                result = self.run_installer(*args, **({'GIT_ON_INSTALL_DIR':str(self.root/'custom')} if '--version=2.0.0' in args else {}))
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.marker.read_text().strip(), str(self.root/('custom' if '--version=2.0.0' in args else '.local/bin')))
-        self.assertIn('/v2.0.0/git-on-installer.sh', self.log.read_text())
+                result=self.run_installer(**environment)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(self.marker.read_text().strip(),str(self.root/('custom' if version=='2.0.0' else '.local/bin')))
+        self.assertIn('/v2.0.0/git-on-installer.sh',self.log.read_text())
+        self.assertIn('/latest/download/git-on-installer.sh',self.log.read_text())
 
     def test_missing_release_installer_fails_on_http_not_a_local_version_check(self):
         for version in ['0.1.0', 'v1.2.0', 'unpublished-tag']:
-            result = self.run_installer('--version', version, DOWNLOAD_STATUS='22')
+            result = self.run_installer(GIT_ON_VERSION=version, DOWNLOAD_STATUS='22')
             self.assertEqual(result.returncode, 0)  # POSIX pipeline reports the empty shell, not curl.
             self.assertIn('/download/v'+version.removeprefix('v')+'/git-on-installer.sh', self.log.read_text())
             self.assertFalse(self.marker.exists())
@@ -73,28 +77,21 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.assertNotIn(b'--github-cli', normal.stdout + normal.stderr)
         self.assertNotIn(b'removed', normal.stdout + normal.stderr)
         self.log.unlink()
-        for flag in ['--not-an-option', '--github-cli', '--bin-dir']:
+        for flag in ['--not-an-option', '--github-cli', '--bin-dir', '--version']:
             result = self.run_installer(flag)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(self.argv_log.read_text()), [flag])
         forwarded = ['--quiet', '', 'space value', '*', '--verbose', '--', 'two\nlines']
-        result = self.run_installer('--quiet', '--version', '2.0.0', *forwarded[1:], GIT_ON_INSTALL_DIR=str(self.root/'chosen'))
+        result = self.run_installer(*forwarded, GIT_ON_VERSION='2.0.0', GIT_ON_INSTALL_DIR=str(self.root/'chosen'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.argv_log.read_text()), forwarded)
         self.assertEqual(self.marker.read_text().strip(), str(self.root/'chosen'))
 
-    def test_owned_options_require_values(self):
-        for args in [['--version'], ['--quiet', '--version']]:
-            result = self.run_installer(*args)
-            self.assertNotEqual(result.returncode, 0, args)
-            self.assertFalse(self.marker.exists())
-            self.assertFalse(self.log.exists())
-
     def test_empty_http_failure_has_no_payload_and_installer_status_propagates(self):
-        result = self.run_installer('--version','1.3.0', DOWNLOAD_STATUS='22')
+        result = self.run_installer(GIT_ON_VERSION='1.3.0', DOWNLOAD_STATUS='22')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists())
-        result = self.run_installer('--version','1.3.0', CHILD_STATUS='23')
+        result = self.run_installer(GIT_ON_VERSION='1.3.0', CHILD_STATUS='23')
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertTrue(self.marker.exists())
 
@@ -127,7 +124,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
 
     def test_incomplete_bootstrap_cannot_start(self):
         source = (ROOT/'install.sh').read_text().rsplit('git_on_install "$@"',1)[0]
-        result = subprocess.run(['sh','-s','--','--version','1.3.0'], input=source.encode(), env=self.env, capture_output=True, timeout=10)
+        result = subprocess.run(['sh','-s','--','--help'], input=source.encode(), env=self.env, capture_output=True, timeout=10)
         self.assertFalse(self.log.exists())
 
     def test_truncation_inside_final_invocation_cannot_discard_arguments(self):
@@ -137,7 +134,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         # must remain inert until its complete argument-preserving group arrives.
         for end in range(start+1, len(source.rstrip())):
             with self.subTest(end=end-start):
-                subprocess.run(['sh','-s','--','--version','1.3.0','--quiet'], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
+                subprocess.run(['sh','-s','--','--help'], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
                 self.assertFalse(self.log.exists(), source[start:end])
                 self.assertFalse(self.marker.exists())
 
