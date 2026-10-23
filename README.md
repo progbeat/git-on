@@ -8,7 +8,9 @@ and index stay unchanged; temporary changes disappear when the command finishes.
 
 ![Build and run SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp)
 
-## Install
+[Installation](#installation) · [Usage](#usage) · [Documentation](#documentation)
+
+## Installation
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
@@ -24,7 +26,7 @@ You need Git. Linux mounts also need FUSE (`/dev/fuse` and `fusermount3`).
 On Apple Silicon macOS, use `--write-policy=all`: mounts and protected write
 policies are not supported yet. See [platform requirements](docs/platforms.md).
 
-## Run
+## Usage
 
 From a repository with a commit:
 
@@ -40,7 +42,7 @@ every argument after it belongs to your command.
 To allow temporary edits to any snapshot file:
 
 ```sh
-git on HEAD --write-policy=all -- sh -c 'make && ./program'
+git on HEAD --write-policy=all -- sh -c 'echo temporary > result.txt; cat result.txt'
 ```
 
 On macOS, this copies the whole tree before execution. Linux prefers FUSE and
@@ -72,7 +74,7 @@ git on signed-tag --verify -- ./check.sh
 Remote execution needs a compatible Git server and existing authentication.
 `--verify` uses Git's configured signature policy. See the [remote guide](docs/remote.md).
 
-## Limits and documentation
+## Documentation
 
 Commands retain access to your host files, network and credentials. **git-on is
 not a security sandbox; run only code you trust.**
