@@ -93,6 +93,10 @@ suite in `ci.yml` executes Rust, CLI, materialized filesystem and installer
 checks, rather than stopping at compilation. The hosted image does not provide
 the approved macFUSE kernel backend required by this port. Installing/loading it
 or altering the VM's security policy has not been authorized or attempted.
+Upstream's [installation guide](https://github.com/macfuse/macfuse/wiki/Getting-Started)
+explicitly states that recent macOS cannot load third-party kernel extensions
+inside a VM. Installing the package on this hosted VM would not verify the VFS
+backend.
 
 macFUSE 5 also offers an explicit `backend=fskit` on newer macOS. Its upstream
 [backend documentation](https://github.com/macfuse/macfuse/wiki/FUSE-Backends)
@@ -102,3 +106,33 @@ the port does not silently select it or remove required options to get a green
 test. A suitably provisioned Apple Silicon/macFUSE host is still needed for the
 non-skipping `tests/macos_mounts.py` suite. This remains a real CI/acceptance gap,
 not a claim that hosted native tests passed real Mac mounts.
+
+### Concrete owner prerequisite
+
+For this port, the proposed test dependency is the official
+[macFUSE 5.3.3](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.3.3)
+DMG's `Install macFUSE.pkg`, using the default VFS/kernel backend on a physical
+Apple Silicon Mac. An already approved installation is sufficient. On a first
+installation, upstream requires Recovery's Reduced Security and permission for
+user-managed kernel extensions, followed by extension approval and restart.
+Installing the package alone does not authorize these separate owner actions.
+Neither disabling SIP nor disabling Gatekeeper is needed. No such installation,
+approval, security change or restart has been performed by this PR.
+
+### Existing Linux host evidence
+
+Independent Brick validation at `71eab9f0ea93855cb6f63496955e251ac97accf0`
+ran 55 real-FUSE tests and eight write-policy tests successfully on kernel
+6.8.0-147-generic, as an ordinary user. The fallback passthrough scenario passed
+with zero registrations, eight generated read callbacks and 45 write callbacks,
+including mmap after unlink and compiled execution. Its existing two mounts and
+clean checkout were preserved. This does not verify enabled kernel passthrough.
+
+The existing `ubuntu-latest` real-fuse job at `23f5fca` reported kernel
+6.17.0-1022-azure, `CONFIG_FUSE_PASSTHROUGH=y`, usable `/dev/fuse`, UID 1001,
+zero effective/permitted/ambient capabilities and `NoNewPrivs=0`.
+See [the read-only prerequisite probe](https://github.com/progbeat/git-on/actions/runs/39958126361/job/120428991862).
+This same runner can supply the kernel prerequisite without changing Brick or
+creating infrastructure. Backing registration still requires a separately
+approved capability setup that keeps the command unprivileged; no capabilities
+have been granted.

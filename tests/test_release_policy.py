@@ -214,6 +214,19 @@ class ChangeClassificationTests(unittest.TestCase):
         self.write('vendor/fuser/src/reply.rs', 'runtime patch\n')
         self.run_policy(True, success=False)
 
+    def test_vendored_docs_tests_and_standalone_examples_need_no_release(self):
+        for name in ['README.git-on.md', 'LICENSE.md', 'tests/integration_tests.rs',
+                     'examples/hello.rs']:
+            self.write('vendor/fuser/' + name, 'non-binary change\n')
+        self.run_policy(False)
+
+    def test_vendored_manifests_and_build_inputs_require_a_release(self):
+        for name in ['Cargo.toml', 'build.rs', '.cargo/config.toml']:
+            with self.subTest(name=name):
+                self.write('vendor/fuser/' + name, 'binary build change\n')
+                self.run_policy(True, success=False)
+                (self.root / 'vendor/fuser' / name).unlink()
+
     def test_native_distribution_matrix_changes_require_a_release(self):
         self.write('.github/workflows/ci.yml', 'jobs:\n  package-build:\n    runs-on: macos-14\n')
         self.run_policy(True, success=False)

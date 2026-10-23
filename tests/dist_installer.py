@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,9 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
         subprocess.run(['sh',str(dist/'git-on-installer.sh')],env=env,check=True,timeout=90)
         subprocess.run([str(install/'git-on'),'--version'],check=True,timeout=10)
     before=(install/'git-on').read_bytes()
+    sentinel=root/'inherited-stage'; sentinel.mkdir()
+    (sentinel/'preserve').write_text('unrelated data')
+    env.update(_install_temp=str(sentinel),_lib_install_temp=str(sentinel))
     # Actual archive mismatch and truncation must leave the installed executable.
     for archive in dist.glob('git-on-*.tar.gz'):
         original=archive.read_bytes()
@@ -52,5 +56,35 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
                 assert result.returncode!=0,(archive,result.stdout,result.stderr)
                 assert b'checksum mismatch' in result.stderr,result.stderr
                 assert (install/'git-on').read_bytes()==before
+                assert (sentinel/'preserve').read_text()=='unrelated data'
         finally: archive.write_bytes(original)
     assert not list(root.glob('tmp.*')), 'installer leaked temporary state'
+    # Interrupt/fail after the real executable has reached destination staging.
+    # Inherited staging names must never authorize deletion of unrelated paths.
+    mv=programs/'mv'
+    mv.write_text(f'#!{sys.executable}\n'+'''import os,signal,subprocess,sys
+from pathlib import Path
+status=subprocess.run(['/bin/mv',*sys.argv[1:]]).returncode
+if status:sys.exit(status)
+destination=Path(sys.argv[-1])
+if destination.parent==Path(os.environ['GIT_ON_INSTALL_DIR']) and destination.name.startswith('tmp.'):
+ Path(os.environ['STAGING_MARKER']).write_text(str(destination))
+ mode=os.environ['STAGING_INTERRUPT']
+ if mode=='failure':sys.exit(73)
+ os.kill(os.getppid(),getattr(signal,mode))
+''')
+    mv.chmod(0o755)
+    for mode in ['SIGINT','failure','SIGTERM','SIGHUP']:
+        marker=root/('staging-'+mode)
+        interrupted=dict(env,STAGING_INTERRUPT=mode,STAGING_MARKER=str(marker),
+                         _install_temp=str(sentinel),_lib_install_temp=str(sentinel))
+        result=subprocess.run(['sh',str(dist/'git-on-installer.sh')],env=interrupted,capture_output=True,timeout=90)
+        assert marker.exists(), ('destination staging not exercised',mode,result.stderr)
+        assert result.returncode!=0, (mode,result.stdout,result.stderr)
+        if mode!='failure':
+            assert result.returncode==128+getattr(signal,mode),(mode,result.returncode,result.stderr)
+        assert (install/'git-on').read_bytes()==before, 'interrupted staging replaced installed executable'
+        assert not list(root.glob('tmp.*')), ('download staging leaked',mode)
+        assert not list(install.glob('tmp.*')), ('destination staging leaked',mode)
+        assert (sentinel/'preserve').read_text()=='unrelated data'
+    print('generated installer install/update/hash and staging failure/signal checks passed')

@@ -1503,3 +1503,26 @@ The complete generated Apple Silicon installer is also exercised with GNU
 repeat update and corrupted-archive preservation pass locally in
 `/tmp/git-on-generated-shasum.log`; the same scenario is now a macOS packaging
 CI step (`tests/dist_installer.py --without-gnu-hash`).
+
+## 1.3 Copilot follow-up: destination staging and vendored release policy
+
+At `23f5fca`, `tests/dist_installer.py` interrupted the actual generated installer
+after its first real move into destination staging. SIGINT returned 130 but left
+both destination `tmp.*` directories, including the staged executable
+(`/tmp/git-on-staging-sigint-red.log`). An injected staging failure independently
+reproduced the leak (`/tmp/git-on-staging-red.log`). The hardening correction now
+initializes both staging globals before registering cleanup, and removes them
+along with the download directory. Inherited staging values cannot authorize
+deleting unrelated paths. The permanent generated-installer regression passes
+for staging failure, SIGINT, SIGTERM and SIGHUP, preserving installed bytes and
+an unrelated sentinel; it also passes with stock macOS shasum alone
+(`/tmp/git-on-staging-green.log`, `/tmp/git-on-staging-shasum-green.log`). The same
+actual-installer test runs on both packaging CI platforms.
+
+The permanent vendored-docs/tests/examples policy regression failed at
+`23f5fca`, demanding a binary version bump for nonruntime edits
+(`/tmp/git-on-vendor-policy-red.log`). Restricting the vendored classification to
+runtime sources, manifests and build inputs preserves AGENTS.md's nonrelease
+exceptions. All 41 release-policy tests pass after the correction, including
+runtime source and isolated manifest/build-input cases that still require a
+release (`/tmp/git-on-vendor-policy-green.log`).

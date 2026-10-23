@@ -183,7 +183,11 @@ def release_reasons(base, current_manifest, current_lock):
         for kind in ("bin", "lib"):
             targets = manifest.get(kind, []) if kind == "bin" else [manifest.get(kind, {})]
             build_paths.update(target["path"] for target in targets if "path" in target)
-    reasons = [path for path in changed if path.startswith(("src/", ".cargo/", "vendor/")) or path in build_paths]
+    # Vendored runtime and build inputs affect the executable. Upstream docs,
+    # standalone examples and tests retain the same nonrelease treatment as ours.
+    vendor_inputs = re.compile(r"^vendor/[^/]+/(?:src/|\.cargo/|(?:Cargo\.toml|build\.rs|rust-toolchain(?:\.toml)?)$)")
+    reasons = [path for path in changed if path.startswith(("src/", ".cargo/"))
+               or vendor_inputs.match(path) or path in build_paths]
     if binary_manifest(current_manifest) != binary_manifest(old_manifest):
         reasons.append("Cargo.toml binary settings")
     if old_lock_text is None or binary_lock(current_manifest, current_lock) != binary_lock(old_manifest, tomllib.loads(old_lock_text)):

@@ -60,13 +60,16 @@ def harden(directory):
         raise ValueError('cargo-dist verification call template changed')
     source = source.replace(old, '        verify_checksum "$_file" "${_checksum_style:-}" "${_checksum_value:-}"')
     # Upstream only cleans download directories on success. Ordinary failures
-    # and interruption must also clean up, with no change to installation code.
+    # and interruption must also clean up destination staging. Reset these
+    # globals before registering the trap: inherited values are not ours.
     old = '        _dir="$(ensure mktemp -d)" || return 1'
     if source.count(old) != 1:
         raise ValueError('cargo-dist temporary directory template changed')
     source = source.replace(old, old + '''
         GIT_ON_CLEANUP_DIR=$_dir
-        trap 'rm -rf "$GIT_ON_CLEANUP_DIR"' 0
+        _install_temp=
+        _lib_install_temp=
+        trap 'rm -rf "$GIT_ON_CLEANUP_DIR" "$_install_temp" "$_lib_install_temp"' 0
         trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM''')
