@@ -32,18 +32,29 @@ from pathlib import Path
 assert os.getuid()==os.geteuid()==int(os.environ['GIT_ON_EXPECT_UID'])!=0
 status=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
 for name in ['CapEff','CapPrm','CapAmb']:assert int(status[name].strip(),16)==0,(name,status[name])
+os.umask(0o027)
 Path('out').mkdir()
 p=Path('out/generated')
 with p.open('w+b') as f:
+ old=946684800000000000
+ os.utime(p,ns=(old,old))
  f.write(b'a'*131072); f.flush()
- s=p.stat(); assert s.st_size==131072
+ s=p.stat(); assert s.st_size==131072 and s.st_mtime_ns>old and s.st_ctime_ns>=s.st_mtime_ns
+ assert s.st_blocks>0 and s.st_mode & 0o777==0o640 and s.st_uid==os.getuid() and s.st_gid==os.getgid()
+ # A simultaneous second handle must share coherent data and registration.
+ with p.open('r+b',buffering=0) as second:
+  second.seek(131072); second.write(b'extended')
+  assert os.fstat(f.fileno()).st_size==131080
+  f.seek(131072); assert f.read()==b'extended'
+  second.truncate(131072)
  f.seek(0); assert f.read()==b'a'*131072
  with mmap.mmap(f.fileno(),0) as m:
   m[65536:65540]=b'mmap'; m.flush()
  assert p.stat().st_size==131072
 assert p.read_bytes()[65536:65540]==b'mmap'
+os.utime(p,ns=(old,old))
 with p.open('r+b') as f:f.truncate(7)
-assert p.stat().st_size==7 and p.read_bytes()==b'a'*7
+s=p.stat(); assert s.st_size==7 and s.st_mtime_ns>old and 0<s.st_blocks<=256 and p.read_bytes()==b'a'*7
 os.chmod(p,0o751); assert p.stat().st_mode & 0o777==0o751
 os.rename(p,'out/renamed'); p=Path('out/renamed')
 with p.open('r+b') as f:
