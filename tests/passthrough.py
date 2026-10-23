@@ -53,6 +53,11 @@ with p.open('w+b') as f:
  assert p.stat().st_size==131072
 assert p.read_bytes()[65536:65540]==b'mmap'
 os.utime(p,ns=(old,old))
+assert (p.stat().st_atime_ns,p.stat().st_mtime_ns)==(old,old)
+# No descriptor is held here: path-based utime must reach the physical file
+# after the daemon dropped its last cached open/passthrough handle.
+with p.open('rb') as reopened:
+ s=os.fstat(reopened.fileno()); assert (s.st_atime_ns,s.st_mtime_ns)==(old,old)
 with p.open('r+b') as f:f.truncate(7)
 s=p.stat(); assert s.st_size==7 and s.st_mtime_ns>old and 0<s.st_blocks<=256 and p.read_bytes()==b'a'*7
 os.chmod(p,0o751); assert p.stat().st_mode & 0o777==0o751
