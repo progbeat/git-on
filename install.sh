@@ -15,7 +15,6 @@ git_on_install() (
                 case $option in --version) version=$1; version_selected=1;; --bin-dir) bin_dir=$1;; esac;;
             --version=*) version=${1#*=}; version_selected=1;;
             --bin-dir=*) bin_dir=${1#*=};;
-            --github-cli) fail '--github-cli is not supported; see docs/releases.md for authenticated downloads or use HTTPS';;
             -h|--help) printf '%s\n' 'Usage: sh install.sh [--version VERSION] [--bin-dir /absolute/path]'; exit 0;;
             *) fail "unknown option: $1";;
         esac

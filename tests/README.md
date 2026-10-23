@@ -204,7 +204,7 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 ## Installer acceptance
 
 `python3 tests/test_installer.py` exercises the thin dispatcher's latest/pinned
-selection, 1.3.0 minimum, optional v, bin-dir, removed github-cli diagnostic,
+selection, 1.3.0 minimum, optional v, bin-dir, generic unknown-option errors,
 partial downloads, incomplete piped invocation and status propagation. It also
 checks the generation-time SHA256 correction with GNU and stock Mac tools,
 including absent/malformed/mismatched metadata and failed/missing hash tools.

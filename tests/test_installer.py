@@ -65,22 +65,21 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.marker.exists())
 
-    def test_normal_install_has_no_deprecation_chatter_and_explicit_flag_is_actionable(self):
+    def test_normal_install_is_quiet_and_unknown_flags_have_one_generic_error(self):
         normal = self.run_installer()
         self.assertEqual(normal.returncode, 0, normal.stderr)
         self.assertNotIn(b'--github-cli', normal.stdout + normal.stderr)
         self.assertNotIn(b'removed', normal.stdout + normal.stderr)
         self.log.unlink()
-        result = self.run_installer('--github-cli')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b'--github-cli', result.stderr)
-        self.assertIn(b'HTTPS', result.stderr)
-        self.assertNotIn(b'1.3.0', result.stderr)
-        self.assertNotIn(b'removed', result.stderr)
-        self.assertFalse(self.log.exists())
+        for flag in ['--not-an-option', '--github-cli']:
+            result = self.run_installer(flag)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, f'git-on: unknown option: {flag}\n'.encode())
+            self.assertEqual(result.stdout, b'')
+            self.assertFalse(self.log.exists())
 
-    def test_invalid_options_and_github_cli_migration(self):
-        for args in [['--version',''], ['--version='], ['--github-cli'], ['--version','x;touch bad'], ['--version','1.3.0-rc.1'], ['--version','01.3.0'], ['--bin-dir','relative'], ['--version'], ['--bogus']]:
+    def test_invalid_options(self):
+        for args in [['--version',''], ['--version='], ['--version','x;touch bad'], ['--version','1.3.0-rc.1'], ['--version','01.3.0'], ['--bin-dir','relative'], ['--version'], ['--bogus']]:
             result = self.run_installer(*args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertFalse(self.marker.exists())

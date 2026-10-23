@@ -138,10 +138,9 @@ awk and ordinary temporary-file tools; Rust, Python and jq are not dependencies.
 
 ### Inspect first or use an authenticated private release
 
-Download and inspect `install.sh` before running if desired. `--github-cli` is
-explicitly removed: cargo-dist's public HTTPS downloader does not preserve the
-old gh-authenticated semantics. For private releases, use an existing authenticated
-gh account to download and inspect the release installer and archives manually,
+Download and inspect `install.sh` before running if desired. For private releases,
+use an existing authenticated gh account to download and inspect the release
+installer and archives manually,
 then use its documented `GIT_ON_GITHUB_TOKEN` support if required. The dispatcher
 never creates credentials or reads a token. No external authentication is configured.
 

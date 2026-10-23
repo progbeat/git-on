@@ -1630,11 +1630,14 @@ focused cases run in CI; actual lifecycle mounts remain a separate required job.
 
 ## Installer diagnostic and minimal-dispatcher cleanup
 
-The verbose github-cli removal diagnostic was emitted only for the explicit
-unsupported flag, not ordinary installation. A permanent stdout/stderr test
-checks both paths; it failed on release-history text and now passes with a short
-actionable error. Logs are `/tmp/git-on-review-installer-ux-{red,green}.log`.
-The dispatcher shrank from62 to50 lines by combining version validation and
+An unsupported-option diagnostic previously contained unnecessary release history.
+Normal installs were already quiet. The permanent stdout/stderr regression checks
+normal installation and generic unknown-option errors. The owner subsequently
+removed all special handling for obsolete options; they use the same generic
+error as every other unknown flag, without compatibility branches or help text.
+The focused test failed before that removal and passes afterward; logs are
+`/tmp/git-on-review-generic-option-{red,green}.log`.
+The dispatcher shrank from62 to49 lines by combining version validation and
 using checked shell error propagation. Platform/archive selection, integrity,
 extraction and executable installation remain in cargo-dist. Complete download,
 version/bin-dir semantics, signal cleanup and the grouped final invocation remain
