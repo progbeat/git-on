@@ -31,34 +31,3 @@ unsafe extern "C" {
     )))]
     pub fn fuse_unmount_compat22(mountpoint: *const c_char);
 }
-
-// The macFUSE ABI is the same compat25 interface used by upstream's libfuse2
-// backend. Resolve only the documented system installation, never a search path.
-#[cfg(target_os = "macos")]
-pub unsafe fn fuse_mount_compat25(mountpoint: *const c_char, args: *const fuse_args) -> c_int {
-    use std::sync::OnceLock;
-    static ENTRY: OnceLock<Option<usize>> = OnceLock::new();
-    let entry = ENTRY.get_or_init(|| {
-        let library = unsafe { libc::dlopen(c"/usr/local/lib/libfuse.2.dylib".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if library.is_null() { return None; }
-        let entry = unsafe { libc::dlsym(library, c"fuse_mount_compat25".as_ptr()) };
-        if entry.is_null() {
-            unsafe { libc::dlclose(library) };
-            None
-        } else {
-            // Keep the library loaded until process exit: its mount helpers may
-            // retain internal state beyond this call.
-            Some(entry as usize)
-        }
-    });
-    match entry {
-        Some(entry) => {
-            let mount: unsafe extern "C" fn(*const c_char, *const fuse_args) -> c_int = unsafe { std::mem::transmute(*entry) };
-            unsafe { mount(mountpoint, args) }
-        }
-        None => {
-            unsafe { *libc::__error() = libc::ENODEV };
-            -1
-        }
-    }
-}

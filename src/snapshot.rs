@@ -259,6 +259,8 @@ pub struct SnapshotMetrics {
     pub generated_read_callbacks: u64,
     #[cfg(feature = "test-metrics")]
     pub generated_write_callbacks: u64,
+    #[cfg(feature = "test-metrics")]
+    pub file_sync_callbacks: u64,
 }
 
 enum BlobData {
@@ -810,6 +812,15 @@ impl Snapshot {
             }
         }
         metrics
+    }
+    #[cfg(feature = "test-metrics")]
+    pub(crate) fn record_file_sync(&self) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metrics
+            .file_sync_callbacks += 1;
     }
 }
 #[cfg(test)]

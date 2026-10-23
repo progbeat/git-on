@@ -271,7 +271,7 @@ impl<'a> Request<'a> {
                     x.src().name.as_ref(),
                     x.dest().dir.into(),
                     x.dest().name.as_ref(),
-                    0,
+                    x.flags(),
                     self.reply(),
                 );
             }

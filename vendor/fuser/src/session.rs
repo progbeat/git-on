@@ -9,7 +9,9 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
 use nix::unistd::geteuid;
 use std::fmt;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
+#[cfg(not(target_os = "macos"))]
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -67,6 +69,7 @@ pub struct Session<FS: Filesystem> {
     pub(crate) destroyed: bool,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl<FS: Filesystem> AsFd for Session<FS> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.ch.as_fd()
@@ -99,7 +102,10 @@ impl<FS: Filesystem> Session<FS> {
             Mount::new(mountpoint, options)?
         };
 
+        #[cfg(not(target_os = "macos"))]
         let ch = Channel::new(file);
+        #[cfg(target_os = "macos")]
+        let ch = Channel::from_mac(file);
         let allowed = if options.contains(&MountOption::AllowRoot) {
             SessionACL::RootAndOwner
         } else if options.contains(&MountOption::AllowOther) {
@@ -260,6 +266,10 @@ impl BackgroundSession {
             let mut se = se;
             se.run()
         });
+        #[cfg(target_os = "macos")]
+        if let Some(mount) = &mount {
+            mount.wait_mounted()?;
+        }
         Ok(BackgroundSession {
             guard,
             sender,

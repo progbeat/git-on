@@ -14,14 +14,20 @@ Local changes:
 - `reply.rs`: add the two ReplyCreate passthrough methods corresponding to
   ReplyOpen. This fills the upstream 0.16 create-reply gap, using the existing
   `Response::new_create` backing ID field. No new ioctl implementation.
-- `build.rs`, `mnt/mod.rs`, `mnt/fuse2_sys.rs`: macOS uses the existing libfuse2
-  backend, loading the official `/usr/local/lib/libfuse.2.dylib` compat25 entry
-  point with `dlopen`. Retain the library for process lifetime. This permits a
-  native binary to start without macFUSE, for diagnostics and explicit-all
-  materialization, and avoids installing a driver/SDK merely to build.
+- `build.rs`, `channel.rs`, `session.rs`, `mnt/macfuse.rs`: macOS uses the official
+  MFMount framework's message transport and explicitly selects FSKit. The old
+  libfuse compat25 function returns -1 on macOS in modern macFUSE and cannot
+  supply a device descriptor for FSKit. Load the fixed official framework path
+  at runtime, retain it for process lifetime, copy complete message buffers
+  before releasing them and wait for concurrent mount/INIT before launch.
+  No driver/SDK is needed merely to build or use explicit-all materialization.
+  MFMount may refresh its own helpers; they must be owner-provisioned first.
+- `ll/request.rs`, `request.rs`: preserve macFUSE FUSE_RENAME flags, translating
+  exclusive/swap high bits to the portable callback flag values. An actual Mac
+  protocol-dispatch regression reproduces the previous silently lost flag.
 
 Linux remains on upstream's pure Rust backend with ABI 7.40. macOS keeps ABI
-7.31 and macFUSE 4 compatibility. The inventory guard fingerprints the unchanged
+7.31 and the macFUSE protocol layout. The inventory guard fingerprints the unchanged
 trait and the full vendored source tree; regenerating/updating this dependency
 requires explicit review. macFUSE mounting itself still needs real host
 verification, with no permission to install/load extensions or alter security.

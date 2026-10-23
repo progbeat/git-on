@@ -598,6 +598,28 @@ mod op {
     }
     impl_request!(Rename<'_>);
     impl<'a> Rename<'a> {
+        pub fn flags(&self) -> u32 {
+            #[cfg(feature = "macfuse-4-compat")]
+            {
+                // macFUSE encodes exclusive/swap in high bits of FUSE_RENAME.
+                // Filesystem::rename uses the portable Linux flag values.
+                const EXCLUSIVE: u32 = 1 << 26;
+                const SWAP: u32 = 1 << 25;
+                let flags = self.arg.flags;
+                if flags & !(EXCLUSIVE | SWAP) != 0 {
+                    // Do not reinterpret an unknown native low bit as a known
+                    // portable flag. Keep it visibly unsupported.
+                    return flags | (1 << 31);
+                }
+                (flags & !(EXCLUSIVE | SWAP))
+                    | if flags & EXCLUSIVE != 0 { 1 } else { 0 }
+                    | if flags & SWAP != 0 { 2 } else { 0 }
+            }
+            #[cfg(not(feature = "macfuse-4-compat"))]
+            {
+                0
+            }
+        }
         pub fn src(&self) -> FilenameInDir<'a> {
             FilenameInDir::<'a> {
                 dir: self.nodeid(),
@@ -1730,19 +1752,23 @@ mod op {
                 #[cfg(feature = "abi-7-36")]
                 let flags2 = if prefix[3] & (FUSE_INIT_EXT as u32) != 0 {
                     data.fetch::<[u32; 12]>()?[0]
-                } else { 0 };
+                } else {
+                    0
+                };
                 Operation::Init(Init {
                     header,
                     arg: fuse_init_in {
-                        major: prefix[0], minor: prefix[1],
-                        max_readahead: prefix[2], flags: prefix[3],
+                        major: prefix[0],
+                        minor: prefix[1],
+                        max_readahead: prefix[2],
+                        flags: prefix[3],
                         #[cfg(feature = "abi-7-36")]
                         flags2,
                         #[cfg(feature = "abi-7-36")]
                         unused: [0; 11],
                     },
                 })
-            },
+            }
             fuse_opcode::FUSE_OPENDIR => Operation::OpenDir(OpenDir {
                 header,
                 arg: data.fetch()?,
@@ -2284,13 +2310,19 @@ mod tests {
         match req.operation().unwrap() {
             Operation::Init(init) => {
                 assert_eq!(init.version(), Version(7, 40));
-                assert_eq!(init.capabilities(), crate::consts::FUSE_INIT_EXT | (32_u64 << 32));
+                assert_eq!(
+                    init.capabilities(),
+                    crate::consts::FUSE_INIT_EXT | (32_u64 << 32)
+                );
             }
             _ => panic!("expected extended INIT"),
         }
         bytes.0[..4].copy_from_slice(&56_u32.to_ne_bytes());
         let req = AnyRequest::try_from(&bytes[..56]).unwrap();
-        assert!(req.operation().is_err(), "advertised but absent extension must fail");
+        assert!(
+            req.operation().is_err(),
+            "advertised but absent extension must fail"
+        );
     }
 
     #[test]

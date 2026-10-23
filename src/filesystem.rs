@@ -1484,8 +1484,14 @@ impl Filesystem for Overlay {
         }
     }
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        #[cfg(feature = "test-metrics")]
+        self._snapshot.record_file_sync();
         let result = (|| {
             self.handle(ino, fh)?;
+            #[cfg(feature = "test-metrics")]
+            if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
+                return Err(libc::EIO);
+            }
             if let Some(file) = &self.node(ino)?.file {
                 if datasync {
                     file.sync_data()

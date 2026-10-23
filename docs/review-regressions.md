@@ -1543,3 +1543,27 @@ and bytes. All seven actual Mac materialized cases pass after rebuilding,
 including both permanent cleanup regressions
 (`/tmp/git-on-materialized-perms-green.log`). This is non-FUSE evidence;
 Linux CI separately runs the same cases and real-FUSE lifecycle tests.
+
+## 1.3 macOS source audit: exclusive rename flags
+
+Auditing the FSKit transport found that upstream macFUSE FUSE_RENAME carries
+exclusive/swap flags in high bits, but the vendored dispatcher unconditionally
+passed zero to the filesystem callback. The permanent actual-dispatch test
+`macos_exclusive_rename_flags_survive_actual_dispatch` failed with observed 0
+versus expected portable no-replace flag 1
+(`/tmp/git-on-macos-rename-red.log`). The parser now preserves and translates
+these flags; unsupported exchange still fails in Overlay rather than silently
+becoming replacement. The same dispatch test passes afterward
+(`/tmp/git-on-macos-rename-green.log`). This private protocol peer is not a mount.
+
+## 1.3 enabled-passthrough harness secure execution
+
+The first authorized capable-daemon CI at `a5dec76` proved actual bypass (eight
+registrations and zero generated I/O callbacks) but the lifecycle harness failed
+before its experiment: file-capability secure execution strips TMPDIR, so the
+daemon used the system temporary parent. The permanent harness now accepts that
+parent only in explicit enabled mode and validates the exact private owned run
+and recovery format reported by its own child. At `f3e0b24`, all enabled and
+ordinary-FUSE lifecycle cases passed with checked cleanup. CI printed the
+capability-revocation and private-copy-deletion receipt; the linked evidence is
+in docs/platforms.md. No mount skip is counted as this result.

@@ -7,6 +7,13 @@ use std::fs;
 use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
 use std::path::Path;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MountIdentity {
+    filesystem_id: [i32; 2],
+    owner: u32,
+    source: String,
+}
+
 pub fn fuse_unavailable() -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
@@ -44,32 +51,96 @@ pub fn fuse_unavailable() -> Result<Option<String>> {
     }
     #[cfg(target_os = "macos")]
     {
-        if !Path::new("/usr/local/lib/libfuse.2.dylib").is_file() {
+        if !Path::new(
+            "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount",
+        )
+        .is_file()
+        {
             return Ok(Some(
-                "macFUSE libfuse2 is absent (/usr/local/lib/libfuse.2.dylib)".into(),
+                "official macFUSE FSKit MFMount transport is absent".into(),
             ));
         }
-        if !Path::new("/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse").is_file()
-        {
-            return Ok(Some("the macFUSE mount helper is absent".into()));
+        if !Path::new("/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app").is_dir() {
+            return Ok(Some(
+                "the official macFUSE application/helpers are absent".into(),
+            ));
         }
     }
     Ok(None)
 }
 
-pub fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
+pub fn mount_is_ours(dir: &Path, id: &str, identity: Option<&MountIdentity>) -> Result<bool> {
     let point = dir.join("mount");
-    let expected = format!("git-on:{id}");
-    let mut found = false;
-    for (path, source) in mounts()? {
-        if path == point {
-            if source != expected || found {
-                bail!("mountpoint is occupied by a different or stacked filesystem");
-            }
-            found = true;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = id;
+        let records = mac_mounts()?;
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|record| record.path == point)
+            .collect();
+        if matches.is_empty() {
+            return Ok(false);
         }
+        anyhow::ensure!(
+            matches.len() == 1
+                && matches[0].kind == "macfuse"
+                && matches[0].identity.owner == unsafe { libc::geteuid() }
+                && identity == Some(&matches[0].identity),
+            "mountpoint is occupied by a different, stacked or unverified filesystem"
+        );
+        Ok(true)
     }
-    Ok(found)
+    #[cfg(target_os = "linux")]
+    {
+        let _ = identity;
+        let expected = format!("git-on:{id}");
+        let mut found = false;
+        for (path, source) in mounts()? {
+            if path == point {
+                if source != expected || found {
+                    bail!("mountpoint is occupied by a different or stacked filesystem");
+                }
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_mount_identity(dir: &Path) -> Result<MountIdentity> {
+    let records = mac_mounts()?;
+    let matches: Vec<_> = records
+        .iter()
+        .filter(|record| record.path == dir.join("mount"))
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1
+            && matches[0].kind == "macfuse"
+            && matches[0].identity.owner == unsafe { libc::geteuid() },
+        "expected one macFUSE mount owned by the current user"
+    );
+    Ok(matches[0].identity.clone())
+}
+
+#[cfg(target_os = "macos")]
+pub fn verify_mount_protections(dir: &Path, read_only: bool) -> Result<()> {
+    let records = mac_mounts()?;
+    let record = records
+        .iter()
+        .find(|record| record.path == dir.join("mount"))
+        .context("macFUSE mount disappeared")?;
+    let required = (libc::MNT_NOSUID | libc::MNT_NODEV) as u32;
+    anyhow::ensure!(
+        record.flags & required == required,
+        "macFUSE FSKit did not preserve required nosuid/nodev mount flags"
+    );
+    anyhow::ensure!(
+        !read_only || record.flags & libc::MNT_RDONLY as u32 != 0,
+        "macFUSE FSKit did not provide a read-only mount for policy none on this macOS version"
+    );
+    Ok(())
 }
 
 pub fn ensure_unmounted(dir: &Path) -> Result<()> {
@@ -102,6 +173,22 @@ fn mounts() -> Result<Vec<(std::path::PathBuf, String)>> {
 
 #[cfg(target_os = "macos")]
 fn mounts() -> Result<Vec<(std::path::PathBuf, String)>> {
+    Ok(mac_mounts()?
+        .into_iter()
+        .map(|record| (record.path, record.identity.source))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+struct MacMount {
+    path: std::path::PathBuf,
+    kind: String,
+    identity: MountIdentity,
+    flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_mounts() -> Result<Vec<MacMount>> {
     use std::{
         ffi::{CStr, OsStr},
         os::unix::ffi::OsStrExt,
@@ -123,10 +210,19 @@ fn mounts() -> Result<Vec<(std::path::PathBuf, String)>> {
             .map(|entry| {
                 let path = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
                 let source = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) };
-                (
-                    Path::new(OsStr::from_bytes(path.to_bytes())).to_path_buf(),
-                    source.to_string_lossy().into_owned(),
-                )
+                let kind = unsafe { CStr::from_ptr(entry.f_fstypename.as_ptr()) };
+                MacMount {
+                    path: Path::new(OsStr::from_bytes(path.to_bytes())).to_path_buf(),
+                    kind: kind.to_string_lossy().into_owned(),
+                    identity: MountIdentity {
+                        filesystem_id: unsafe {
+                            std::mem::transmute::<libc::fsid_t, [i32; 2]>(entry.f_fsid)
+                        },
+                        owner: entry.f_owner,
+                        source: source.to_string_lossy().into_owned(),
+                    },
+                    flags: entry.f_flags,
+                }
             })
             .collect(),
     )

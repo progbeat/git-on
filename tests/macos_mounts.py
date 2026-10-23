@@ -18,7 +18,7 @@ parser.add_argument('--binary',type=Path,required=True)
 args=parser.parse_args()
 BINARY=args.binary.resolve()
 if sys.platform!='darwin' or os.uname().machine!='arm64': parser.error('native Apple Silicon Mac required')
-for prerequisite in ['/usr/local/lib/libfuse.2.dylib','/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse']:
+for prerequisite in ['/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount']:
     if not Path(prerequisite).is_file(): parser.error('missing macFUSE prerequisite: '+prerequisite)
 
 
@@ -83,6 +83,50 @@ except OSError as e:assert e.errno in [1,13,30];created=False
                 self.assertEqual(child.returncode,-sig,(out,err));self.clean()
             finally:
                 if child.poll() is None:child.kill();child.communicate(timeout=10)
+
+    def test_actual_posix_permissions_are_enforced(self):
+        code=r'''
+import os,subprocess
+from pathlib import Path
+assert os.geteuid()!=0
+Path('out').mkdir()
+p=Path('out/locked');p.write_bytes(b'private');p.chmod(0)
+for flags in [os.O_RDONLY,os.O_WRONLY,os.O_RDWR|os.O_TRUNC]:
+ try:fd=os.open(p,flags)
+ except PermissionError:pass
+ else:os.close(fd);raise AssertionError('mode-000 file access allowed')
+p.chmod(0o600)
+d=Path('out/readonly');d.mkdir();d.chmod(0o555)
+try:(d/'new').write_text('must fail')
+except PermissionError:pass
+else:raise AssertionError('write into mode-0555 directory allowed')
+d.chmod(0o755)
+p=Path('out/program');p.write_text('#!/bin/sh\nexit 0\n');p.chmod(0o644)
+try:subprocess.run(['./out/program'],check=True)
+except PermissionError:pass
+else:raise AssertionError('non-executable mode ignored')
+'''
+        result=subprocess.run(self.command('ignored',code),cwd=self.repo,env=self.env,capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stderr);self.clean()
+
+    def test_native_exclusive_rename_preserves_both_files(self):
+        code=r'''
+import ctypes,errno
+from pathlib import Path
+Path('out').mkdir()
+Path('out/source').write_bytes(b'source')
+Path('out/destination').write_bytes(b'destination')
+libc=ctypes.CDLL(None,use_errno=True)
+rename=libc.renamex_np
+rename.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_uint]
+rename.restype=ctypes.c_int
+assert rename(b'out/source',b'out/destination',4)==-1
+assert ctypes.get_errno()==errno.EEXIST
+assert Path('out/source').read_bytes()==b'source'
+assert Path('out/destination').read_bytes()==b'destination'
+'''
+        result=subprocess.run(self.command('ignored',code),cwd=self.repo,env=self.env,capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stderr);self.clean()
 
 
 unittest.main(argv=[sys.argv[0]],verbosity=2)

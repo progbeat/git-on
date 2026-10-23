@@ -1,12 +1,6 @@
-use std::{
-    fs::File,
-    io,
-    os::{
-        fd::{AsFd, BorrowedFd},
-        unix::prelude::AsRawFd,
-    },
-    sync::Arc,
-};
+#[cfg(any(not(target_os = "macos"), feature = "abi-7-40"))]
+use std::os::fd::BorrowedFd;
+use std::{fs::File, io, os::unix::prelude::AsRawFd, sync::Arc};
 
 use libc::{c_int, c_void, size_t};
 
@@ -16,11 +10,23 @@ use crate::reply::ReplySender;
 
 /// A raw communication channel to the FUSE kernel driver
 #[derive(Debug)]
-pub struct Channel(Arc<File>);
+pub struct Channel(Transport);
 
+#[derive(Clone, Debug)]
+enum Transport {
+    Device(Arc<File>),
+    #[cfg(target_os = "macos")]
+    Mac(Arc<crate::mnt::macfuse::MacChannel>),
+}
+
+#[cfg(not(target_os = "macos"))]
+use std::os::fd::AsFd;
+#[cfg(not(target_os = "macos"))]
 impl AsFd for Channel {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        match &self.0 {
+            Transport::Device(file) => file.as_fd(),
+        }
     }
 }
 
@@ -29,14 +35,24 @@ impl Channel {
     /// given path. The kernel driver will delegate filesystem operations of
     /// the given path to the channel.
     pub(crate) fn new(device: Arc<File>) -> Self {
-        Self(device)
+        Self(Transport::Device(device))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_mac(channel: Arc<crate::mnt::macfuse::MacChannel>) -> Self {
+        Self(Transport::Mac(channel))
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
     pub fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        let file = match &self.0 {
+            Transport::Device(file) => file,
+            #[cfg(target_os = "macos")]
+            Transport::Mac(channel) => return channel.receive(buffer),
+        };
         let rc = unsafe {
             libc::read(
-                self.0.as_raw_fd(),
+                file.as_raw_fd(),
                 buffer.as_ptr() as *mut c_void,
                 buffer.len() as size_t,
             )
@@ -59,13 +75,18 @@ impl Channel {
 }
 
 #[derive(Clone, Debug)]
-pub struct ChannelSender(Arc<File>);
+pub struct ChannelSender(Transport);
 
 impl ReplySender for ChannelSender {
     fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        let file = match &self.0 {
+            Transport::Device(file) => file,
+            #[cfg(target_os = "macos")]
+            Transport::Mac(channel) => return channel.send(bufs),
+        };
         let rc = unsafe {
             libc::writev(
-                self.0.as_raw_fd(),
+                file.as_raw_fd(),
                 bufs.as_ptr() as *const libc::iovec,
                 bufs.len() as c_int,
             )
@@ -80,6 +101,13 @@ impl ReplySender for ChannelSender {
 
     #[cfg(feature = "abi-7-40")]
     fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-        BackingId::create(&self.0, fd)
+        match &self.0 {
+            Transport::Device(file) => BackingId::create(file, fd),
+            #[cfg(target_os = "macos")]
+            Transport::Mac(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Linux passthrough is unavailable on FSKit",
+            )),
+        }
     }
 }

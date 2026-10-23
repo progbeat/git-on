@@ -2,17 +2,20 @@ fn main() {
     // Register rustc cfg for switching between mount implementations.
     // When fuser MSRV is updated to v1.77 or above, we should switch from 'cargo:' to 'cargo::' syntax.
     println!(
-        "cargo:rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\"))"
+        "cargo:rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\", \"macfuse\"))"
     );
 
     #[cfg(target_os = "macos")]
     {
-        // The official macFUSE libfuse2 mount entry point is loaded at runtime.
+        // The official macFUSE MFMount transport is loaded at runtime.
         // Building and --write-policy=all materialization need no installed driver/SDK.
-        println!("cargo:rustc-cfg=fuser_mount_impl=\"libfuse2\"");
+        println!("cargo:rustc-cfg=fuser_mount_impl=\"macfuse\"");
         println!("cargo:rustc-cfg=feature=\"macfuse-4-compat\"");
     }
-    #[cfg(all(not(feature = "libfuse"), not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(all(
+        not(feature = "libfuse"),
+        not(any(target_os = "linux", target_os = "macos"))
+    ))]
     unimplemented!("Building without libfuse is only supported on Linux");
 
     #[cfg(all(not(feature = "libfuse"), not(target_os = "macos")))]

@@ -6,11 +6,18 @@ commit, OS/kernel, backend version, privileges and commands for each gate.
 
 ## Apple Silicon macOS
 
-The deployment target is macOS 13+. The backend is macFUSE's libfuse2 compat25
-mount API with FUSE ABI 7.31/macFUSE 4 compatibility. Use official macFUSE 4.10.2
-or a compatible later release providing `/usr/local/lib/libfuse.2.dylib` and
-`/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse`.
-The binary loads this library at runtime, not an arbitrary library search path.
+FSKit is the selected route under investigation; see the concrete
+[FSKit assessment](fskit-assessment.md). No core operation is proven to require
+a kernel extension. The earlier compat25 raw-device prototype cannot mount
+modern macFUSE; its macOS entry point returns -1 in the vendor's source.
+
+The binary deployment target remains macOS 13+ for startup/materialization.
+The MFMount/FSKit backend requires macOS 15.4+ and the official runtime framework
+at `/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount`.
+It explicitly selects FSKit and never selects a kernel backend. The latest
+verified official release is macFUSE 5.4.0. Required-behavior gaps below must be
+resolved/verified before claiming supported native mounts. The fixed framework
+path is loaded at runtime, not through an arbitrary library search path.
 No driver or SDK is required merely to build or use the explicit-all fallback.
 Intel macOS and FUSE-T are not part of this support target.
 
@@ -21,10 +28,10 @@ No forced/lazy teardown, extension loading or security-setting adjustment exists
 
 On the development Mac (arm64 macOS 26.3.1(a)), macFUSE/FUSE-T was absent in
 standard paths. Actual mount checks therefore remain BLOCKED, not skipped passes.
-The exact prerequisite is an owner-approved installation and usable official
-macFUSE libfuse2/kernel backend on an Apple Silicon Mac, with mount permission.
-If its installation requires system extension approval/reboot/security changes,
-those require the owner's separate decision. This PR does not authorize them.
+The test prerequisite is an owner-provided official macFUSE package/helpers
+and enabled FSKit file system extension. Package installation and activation
+remain unapproved. No Recovery/kernel-extension security reduction is needed
+for this route; no installation or activation has been performed here.
 
 After those prerequisites are independently provided, build/install the packaged
 binary and perform real mounts for all four policies: read committed bytes and
@@ -95,36 +102,32 @@ packaged artifacts. See [releases](releases.md).
 
 ### Hosted macOS CI feasibility
 
-Standard GitHub-hosted `macos-14` is an Apple Silicon VM, and the native/macOS
-suite in `ci.yml` executes Rust, CLI, materialized filesystem and installer
-checks, rather than stopping at compilation. The hosted image does not provide
-the approved macFUSE kernel backend required by this port. Installing/loading it
-or altering the VM's security policy has not been authorized or attempted.
+The standard `macos-14` Apple Silicon VM executes Rust, CLI, materialized
+filesystem and generated-installer tests. It predates FSKit's minimum OS.
+A hosted macOS 15/26 runner is a candidate for actual FSKit testing after the
+owner authorizes package/helper installation and extension activation.
 Upstream's [installation guide](https://github.com/macfuse/macfuse/wiki/Getting-Started)
-explicitly states that recent macOS cannot load third-party kernel extensions
-inside a VM. Installing the package on this hosted VM would not verify the VFS
-backend.
+says recent macOS VMs cannot load third-party kernel extensions. That limitation
+does not prohibit the separate user-space FSKit route.
 
-macFUSE 5 also offers an explicit `backend=fskit` on newer macOS. Its upstream
-[backend documentation](https://github.com/macfuse/macfuse/wiki/FUSE-Backends)
-currently lists unimplemented kernel-handled mount options. This is not yet a
-verified substitute for owner-only/default-permission/nosuid/nodev behavior;
-the port does not silently select it or remove required options to get a green
-test. A suitably provisioned Apple Silicon/macFUSE host is still needed for the
-non-skipping `tests/macos_mounts.py` suite. This remains a real CI/acceptance gap,
-not a claim that hosted native tests passed real Mac mounts.
+The adapter retains the requested mount options and verifies actual nosuid/nodev
+flags and the read-only flag for policy none before command launch. It records
+getmntinfo filesystem ID, mount owner and source for checked cleanup rather than
+assuming FSKit preserves fsname. POSIX permissions, cross-user isolation, sync
+and remaining lifecycle cases still need actual tests. No missing protection is
+silently removed to get a passing mount.
 
 ### Concrete owner prerequisite
 
-For this port, the proposed test dependency is the official
-[macFUSE 5.3.3](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.3.3)
-DMG's `Install macFUSE.pkg`, using the default VFS/kernel backend on a physical
-Apple Silicon Mac. An already approved installation is sufficient. On a first
-installation, upstream requires Recovery's Reduced Security and permission for
-user-managed kernel extensions, followed by extension approval and restart.
-Installing the package alone does not authorize these separate owner actions.
-Neither disabling SIP nor disabling Gatekeeper is needed. No such installation,
-approval, security change or restart has been performed by this PR.
+The proposed test dependency is the official
+[macFUSE 5.4.0](https://github.com/macfuse/macfuse/releases/tag/macfuse-5.4.0)
+DMG's `Install macFUSE.pkg`, then activation of its user-space FSKit file system
+extension in System Settings. Confirm helpers are already provisioned before
+calling MFMount, which may try to refresh them. This proposal does not authorize
+installation, extension activation, system security changes or restart.
+Use FSKit explicitly; do not approve or load a kernel extension for this test.
+On this Mac's verified 26.3.1(a), read-only mount flags and per-file fsync are
+concrete compatibility gates; installation is not a promise that all tests pass.
 
 ### Existing Linux host evidence
 
@@ -157,3 +160,17 @@ discard in all three cases. Each case completed checked cleanup. These cached
 page observations do not prove future uncached data access: the permanent
 harness additionally probes a previously unread sparse page and records any
 SIGBUS/errno separately. Enabled-passthrough observations are still required.
+
+Enabled kernel passthrough and lifecycle checks passed at
+`f3e0b245be15af2e73acd2632631bb69e35be887` in
+[CI run 39962516128](https://github.com/progbeat/git-on/actions/runs/39962516128).
+The coherence/executable test reported eight registrations, zero generated read
+callbacks and zero write callbacks, with ordinary child UID and zero capabilities.
+On kernel 6.17.0-1022-azure, normal unmount was busy; test-only lazy detach kept
+held mmap/descriptor data accessible. After daemon SIGKILL, passthrough mmap
+access to both the cached tail and an unread sparse page succeeded while
+ordinary descriptor reads failed with ENOTCONN. The ordinary-FUSE comparison
+faulted with SIGBUS after daemon exit. All six scenarios completed checked
+recovery; CI confirmed removal of the capability and temporary binary copy.
+These are observed dependencies on this kernel, not guarantees for detached
+execution; no such product mode is implemented.

@@ -4,29 +4,35 @@
 
 #[cfg(fuser_mount_impl = "libfuse2")]
 mod fuse2;
-#[cfg(any(feature = "libfuse", target_os = "macos", test))]
+#[cfg(any(all(feature = "libfuse", not(target_os = "macos")), test))]
 mod fuse2_sys;
 #[cfg(fuser_mount_impl = "libfuse3")]
 mod fuse3;
 #[cfg(fuser_mount_impl = "libfuse3")]
 mod fuse3_sys;
+#[cfg(target_os = "macos")]
+pub(crate) mod macfuse;
 
 #[cfg(fuser_mount_impl = "pure-rust")]
 mod fuse_pure;
 pub mod mount_options;
 
-#[cfg(any(test, feature = "libfuse", target_os = "macos"))]
+#[cfg(any(test, all(feature = "libfuse", not(target_os = "macos"))))]
 use fuse2_sys::fuse_args;
 #[cfg(any(test, all(not(feature = "libfuse"), not(target_os = "macos"))))]
 use std::fs::File;
 use std::io;
 
-#[cfg(any(feature = "libfuse", target_os = "macos", test))]
+#[cfg(any(
+    all(feature = "libfuse", not(target_os = "macos")),
+    test,
+    target_os = "macos"
+))]
 use mount_options::MountOption;
 
 /// Helper function to provide options as a fuse_args struct
 /// (which contains an argc count and an argv pointer)
-#[cfg(any(feature = "libfuse", target_os = "macos", test))]
+#[cfg(any(all(feature = "libfuse", not(target_os = "macos")), test))]
 fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) -> T {
     use mount_options::option_to_string;
     use std::ffi::CString;
@@ -52,6 +58,8 @@ pub use fuse_pure::Mount;
 pub use fuse2::Mount;
 #[cfg(fuser_mount_impl = "libfuse3")]
 pub use fuse3::Mount;
+#[cfg(target_os = "macos")]
+pub use macfuse::Mount;
 use std::ffi::CStr;
 
 #[inline]
@@ -152,6 +160,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn mount_unmount() {
         // We use ManuallyDrop here to leak the directory on test failure.  We don't
         // want to try and clean up the directory if it's a mountpoint otherwise we'll

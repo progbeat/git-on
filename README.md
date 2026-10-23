@@ -26,7 +26,7 @@ to any snapshot path.
 
 The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and native Apple Silicon
 macOS (macOS 13+). Linux FUSE requires `/dev/fuse` and `fusermount3`; macOS
-mounts use the official macFUSE libfuse2 backend. Real macFUSE acceptance is a
+mounts use the official macFUSE MFMount/FSKit backend (macOS 15.4+). Real macFUSE acceptance is a
 release-readiness prerequisite; see [platform validation](docs/platforms.md).
 When FUSE is unavailable, only explicit `--write-policy=all` can use a fresh,
 eagerly materialized directory. Other policies fail without being weakened.

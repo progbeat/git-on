@@ -1,8 +1,9 @@
 # FUSE callback acceptance matrix
 
-This is the reviewed operation inventory for **fuser 0.16.0, Linux, ABI 7.31**.
+This is the reviewed operation inventory for **fuser 0.16.0, Linux ABI 7.40 and
+the macFUSE protocol layout**.
 It is a test contract, not an assertion that any particular CI run passed.
-The dependency has 44 trait methods: 25 implemented by `Overlay`, 3 inherited
+The dependency has 44 trait methods: 26 implemented by `Overlay`, 2 inherited
 lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
 
 ## Evidence layers and limits
