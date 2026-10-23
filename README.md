@@ -2,7 +2,6 @@
 
 [![CI (master)](https://github.com/progbeat/git-on/actions/workflows/ci.yml/badge.svg?branch=master&event=push)](https://github.com/progbeat/git-on/actions/workflows/ci.yml?query=branch%3Amaster+event%3Apush)
 [![Release](https://img.shields.io/github/v/release/progbeat/git-on)](https://github.com/progbeat/git-on/releases)
-[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-blue?logo=rust&logoColor=white)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Run commands against a Git revision without checking it out. Git objects and your
@@ -24,14 +23,19 @@ to any snapshot path.
 
 ## Installation
 
-The 1.3.0 pipeline builds Linux x86_64 (glibc 2.35+) and Apple Silicon
-macOS (macOS 13+) CLI binaries. Linux mounts require `/dev/fuse` and
-`fusermount3`. macOS mount support is deferred to [issue #12](https://github.com/progbeat/git-on/issues/12).
-On macOS, only explicitly selected `--write-policy=all` runs through a fresh,
-eagerly materialized directory. On Linux this fallback is available only when
-FUSE is concretely unavailable. Protected policies fail without being weakened.
-See [platform requirements and verification](docs/platforms.md).
-Native Git is required on PATH; remote execution requires Git 2.45.1+.
+You need Git on PATH. On Linux, install your distribution's FUSE support
+(`/dev/fuse` and `fusermount3`) to use all write policies.
+
+On Apple Silicon macOS, mounts are not supported yet. Use
+`--write-policy=all` to run in a disposable copy of the selected tree:
+
+```sh
+git on HEAD --write-policy=all -- ls
+```
+
+This reads the whole tree before running the command. Other write policies fail
+rather than granting broader access. See [platform requirements](docs/platforms.md)
+for compatibility details.
 
 ### Install or update
 
@@ -41,10 +45,8 @@ Install the latest stable release, or update using the same command:
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.progbeat.dev/git-on | sh
 ```
 
-Run as your normal user. The thin bootstrap downloads a complete release
-installer over HTTPS, then the generated installer verifies the selected archive's
-SHA-256 before installing `~/.local/bin/git-on`. The installer accepts only 1.3.0
-and later, and never modifies shell profiles. Add the destination to PATH:
+Run as your normal user. The installer places `git-on` in `~/.local/bin` without
+editing shell profiles. Add that directory to PATH:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -52,8 +54,7 @@ git on --version
 ```
 
 See the [installation guide](docs/releases.md#installing-a-published-binary) to
-inspect the script first, pin a version, or choose another directory. Anonymous downloads require a public repository; `--github-cli` is explicitly removed.
-See the installation guide for authenticated manual download instructions.
+inspect the script, choose a version or destination, or use authenticated downloads.
 For a source installation, see [building from source](docs/releases.md#building-from-source).
 
 ## Quick start
@@ -116,8 +117,8 @@ governs the mounted tree; commands can still access host paths outside it.
 
 ### Save results
 
-Execution snapshots are disposable. `--keep` and `-k` were removed in 1.3.0;
-write logs and artifacts to explicit external paths:
+Execution snapshots are disposable. Write logs and artifacts to explicit
+external paths:
 
 ```sh
 git on HEAD -- ls > committed-files.txt
@@ -140,8 +141,8 @@ git -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers on HEAD --verify -- .
 ```
 
 Remote runs fetch selected and subsequently demanded objects. They require native
-Git 2.45.1+, a server advertising object filters and allowing exact object
-requests, and existing HTTPS credentials or OpenSSH authentication. An unlocked
+Git compatible with the [remote requirements](docs/remote.md), a server
+advertising object filters and allowing exact object requests, and existing HTTPS credentials or OpenSSH authentication. An unlocked
 SSH agent needs no passphrase prompt. One selected encrypted identity
 authenticates before mounting and lazy fetches reuse that SSH connection.
 
@@ -195,14 +196,6 @@ the mount. Fetch destination refs are written only in git-on's private repositor
 
 Start with the [specification](docs/specification.md) and [contributor instructions](AGENTS.md).
 The [test guide](tests/README.md) covers local checks and required Linux/FUSE tests.
-CI checks Rust, real mounts, callback coverage, seeded stress, performance, and
-release packaging. Use the PR's checks to verify its exact revision; the badge
-above reports `master`.
-
-CLI source, runtime dependency and binary build changes include a version bump
-and release notes. Documentation, GIFs, tests, standalone examples and installer
-changes alone keep the binary version; required CI still runs. Published history lives in
-[GitHub Releases](https://github.com/progbeat/git-on/releases).
 For a [bug report](https://github.com/progbeat/git-on/issues), include the version,
 Linux distribution, Git tree ID, minimal command and ignore rules, expected result,
 and actual error. Remove secrets and private source from the report.
