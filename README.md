@@ -24,15 +24,15 @@ for setup and custom install locations.
 
 ## Usage
 
+On macOS, use `--write-policy=all` (see the build example). Other write policies
+currently require Linux with FUSE.
+
 Run a command at a revision in your repository:
 
 ```sh
 git on HEAD -- ls
 git on HEAD~1 -- python script.py
 ```
-
-On macOS, add `--write-policy=all`, as in the next example. Other write policies
-currently require Linux with FUSE.
 
 Build an earlier revision, allowing temporary writes:
 
