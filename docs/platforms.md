@@ -139,10 +139,14 @@ The existing `ubuntu-latest` real-fuse job at `23f5fca` reported kernel
 6.17.0-1022-azure, `CONFIG_FUSE_PASSTHROUGH=y`, usable `/dev/fuse`, UID 1001,
 zero effective/permitted/ambient capabilities and `NoNewPrivs=0`.
 See [the read-only prerequisite probe](https://github.com/progbeat/git-on/actions/runs/39958126361/job/120428991862).
-This same runner can supply the kernel prerequisite without changing Brick or
-creating infrastructure. Backing registration still requires a separately
-approved capability setup that keeps the command unprivileged; no capabilities
-have been granted.
+This same runner supplies the kernel prerequisite without changing Brick or
+creating infrastructure. The owner approved an isolated CI experiment: copy the
+test binary into a private runner temporary directory, grant only that copy
+`cap_sys_admin=ep`, execute the enabled suites as the ordinary runner user, then
+remove the capability and copy with an EXIT trap. The command/worker tests
+assert ordinary UID and zero effective/permitted/ambient capabilities. The
+checkout and packaged binaries receive no capability. Actual enabled results
+must still be checked; defining this experiment is not a passed mount test.
 
 On that runner at `897088d`, the ordinary-FUSE lifecycle experiment observed
 normal unmount failing with EBUSY while a worker held cwd/mmap. A test-only lazy

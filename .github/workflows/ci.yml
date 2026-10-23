@@ -147,6 +147,29 @@ jobs:
       - name: Observe generated-file mmap and mount lifetime on ordinary FUSE
         run: python3 tests/passthrough_lifecycle.py --binary target/release/git-on --expect=fallback
 
+      - name: Actual kernel passthrough with an isolated test-daemon capability
+        run: |
+          # Owner-approved test only: never grant a capability to the checkout's
+          # binary or run the command as root. Nothing privileged is uploaded.
+          command -v setcap
+          command -v getcap
+          TEST_DIRECTORY=$(mktemp -d "$RUNNER_TEMP/git-on-passthrough.XXXXXXXX")
+          TEST_BINARY="$TEST_DIRECTORY/git-on"
+          cp target/release/git-on "$TEST_BINARY"
+          cleanup_passthrough_test() {
+            if test -n "$(getcap "$TEST_BINARY")"; then
+              sudo setcap -r "$TEST_BINARY" || return 1
+            fi
+            test -z "$(getcap "$TEST_BINARY")" || return 1
+            rm -rf "$TEST_DIRECTORY"
+          }
+          trap cleanup_passthrough_test EXIT
+          sudo setcap cap_sys_admin=ep "$TEST_BINARY"
+          getcap "$TEST_BINARY"
+          # Both suites assert ordinary child UID and zero Eff/Prm/Amb caps.
+          python3 tests/passthrough.py --binary "$TEST_BINARY" --expect=enabled
+          python3 tests/passthrough_lifecycle.py --binary "$TEST_BINARY" --expect=enabled
+
       - name: Seeded bounded filesystem differential stress
         run: >-
           python3 tests/stress.py --binary target/release/git-on --require-fuse
