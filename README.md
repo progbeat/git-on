@@ -5,12 +5,14 @@
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-blue?logo=rust&logoColor=white)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Run a command against a Git revision without checking it out. Your working tree
-and index stay unchanged; temporary changes disappear when the command finishes.
+Run commands from a Git tree pinned by hash, or from revisions accepted by your
+configured Git signature policy.
 
-- Test another branch without stashing your current work.
-- Build an older commit in a clean snapshot.
-- Run a remote project without setting up a checkout.
+Reuse a tree hash for the same source contents across runs. Use `--verify` to
+require a signed commit or annotated tag before execution.
+
+Each run starts from the selected tree, with temporary writes discarded afterward.
+Your working tree and index stay unchanged.
 
 ![Build and run SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp)
 
@@ -43,45 +45,61 @@ for custom install locations and other setup options.
 
 ## Usage
 
-### Run a command
+### Pin a source tree
 
-List the committed files in your current repository on Linux:
+Resolve your chosen revision to its tree hash once. On Linux:
 
 ```sh
-git on HEAD -- ls
+tree=$(git rev-parse 'HEAD^{tree}')
+git on "$tree" -- ls
 ```
 
 On macOS, use `--write-policy=all`; other write policies are not supported yet:
 
 ```sh
-git on HEAD --write-policy=all -- ls
+tree=$(git rev-parse 'HEAD^{tree}')
+git on "$tree" --write-policy=all -- ls
 ```
 
-Commands start at the snapshot's root. Everything after `--` belongs to your
-command.
+Record the value of `$tree` and pass it to later runs to select the same source
+contents. Commands start at the snapshot's root. Everything after `--` belongs
+to your command.
 
-### Choose a revision
+### Run a verified revision
 
-Use a branch, tag or commit in place of `HEAD`. For example, run a script from
-the previous commit:
+[Configure Git's trusted keys and verification policy](docs/remote.md#native-signature-verification)
+for your review or QA process, then require verification before running:
 
 ```sh
-git on HEAD~1 --write-policy=all -- python script.py
+git on main --verify --write-policy=all -- python script.py
 ```
 
-### Build or test another branch
+`--verify` checks the selected commit's signature. With an annotated tag, it
+checks the tag's signature instead. Verification failure stops execution.
+
+### Build and test the pinned tree
 
 Allow temporary writes to any snapshot file with `--write-policy=all`:
 
 ```sh
-git on HEAD~1 --write-policy=all -- cargo build
-git on feature-branch --write-policy=all -- cargo test
+git on "$tree" --write-policy=all -- cargo build
+git on "$tree" --write-policy=all -- cargo test
 ```
 
 By default on Linux, tracked files stay read-only. New files and directories
 must be ignored by the selected revision's committed `.gitignore` rules. Use
 `all` to edit tracked files or write without ignore rules. See
 [write policies](docs/usage.md#filesystem-behavior) for more control.
+
+### Choose another revision
+
+Branches, tags and commits also work. For a one-off run at the previous commit
+or another branch:
+
+```sh
+git on HEAD~1 --write-policy=all -- python script.py
+git on feature-branch --write-policy=all -- cargo test
+```
 
 ### Run a remote project
 
