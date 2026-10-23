@@ -19,9 +19,9 @@ VERIFY = r'''verify_checksum() {
     [ "${#_checksum_value}" = 64 ] || err "malformed SHA-256 metadata"
     case $_checksum_value in *[!0-9a-f]*) err "malformed SHA-256 metadata";; esac
     if check_cmd sha256sum; then
-        _calculated_checksum="$(sha256sum -b "$_file")" || err "SHA-256 verification failed"
+        _calculated_checksum="$(sha256sum -b < "$_file")" || err "SHA-256 verification failed"
     elif check_cmd shasum; then
-        _calculated_checksum="$(shasum -a 256 -b "$_file")" || err "SHA-256 verification failed"
+        _calculated_checksum="$(shasum -a 256 -b < "$_file")" || err "SHA-256 verification failed"
     else
         err "SHA-256 verification requires sha256sum or shasum -a 256"
     fi

@@ -171,6 +171,18 @@ class ChecksumTests(unittest.TestCase):
             result = self.verify(tool=tool)
             self.assertEqual(result.returncode,0,result.stderr)
 
+    def test_hash_tools_accept_backslash_and_newline_staging_paths(self):
+        for name in ['archive\\name.tar.gz', 'archive\nname.tar.gz']:
+            destination = self.root/name
+            self.archive.rename(destination)
+            self.archive = destination
+            for tool in ['sha256sum', 'shasum']:
+                if not shutil.which(tool):
+                    continue  # The native Linux/Mac CI jobs supply their real tool.
+                with self.subTest(name=name, tool=tool):
+                    result = self.verify(tool=tool)
+                    self.assertEqual(result.returncode,0,result.stderr)
+
     def test_missing_malformed_mismatch_unavailable_and_failed_hash_tool(self):
         for options in [dict(value=''),dict(value='bad'),dict(value='z'*64),dict(value='0'*64),dict(style='false'),dict(tool=None),dict(failing=True)]:
             result = self.verify(**options)

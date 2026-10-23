@@ -1707,3 +1707,13 @@ Generated-installer staging/hash/signal checks remain mandatory. All10 dispatche
 and checksum cases pass in `/tmp/git-on-stream-dispatcher-tests.log`.
 The missing-value case after a forwarded option remains fixed with RED/GREEN
 logs `/tmp/git-on-forwarded-option-{red,green}.log`.
+
+## SHA256 output does not depend on staging filenames
+
+Copilot reproduced false checksum mismatches for paths containing backslash or
+newline: hash tools prefix escaped filename output with a backslash. The focused
+real-tool regression failed on both stock shasum paths before the fix in
+`/tmp/git-on-hash-path-red.log`. Both SHA256 branches now hash redirected standard
+input, so their output contains no filename escaping. All11 dispatcher/hash cases
+pass in `/tmp/git-on-hash-path-green.log`. CI's native Linux and Mac tools repeat
+the same permanent cases; missing tools and mismatched archives still fail closed.
