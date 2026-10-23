@@ -26,6 +26,11 @@ class NativeIntegrityTests(unittest.TestCase):
 
     def test_verified_native_set(self): mod.verify(self.root,SHA)
 
+    def test_cargo_dist_checksum_trailing_blank_line(self):
+        path=self.root/('git-on-'+mod.TARGETS[0]+'.tar.gz.sha256')
+        path.write_text(path.read_text()+'\n')  # actual 0.33.0 native output
+        mod.verify(self.root,SHA)
+
     def test_corrupt_archive_cannot_be_blessed_by_global_rehash(self):
         (self.root/('git-on-'+mod.TARGETS[0]+'.tar.gz')).write_bytes(b'tampered')
         with self.assertRaisesRegex(ValueError,'changed across jobs'):mod.verify(self.root,SHA)

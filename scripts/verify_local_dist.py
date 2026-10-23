@@ -14,8 +14,8 @@ def verify(directory, commit):
     for target in TARGETS:
         name='git-on-'+target+'.tar.gz'
         archive=directory/name
-        checksum=(directory/(name+'.sha256')).read_text()
-        match=re.fullmatch(r'([0-9a-f]{64}) [ *]'+re.escape(name)+r'\n?',checksum)
+        checksum=(directory/(name+'.sha256')).read_text().strip()
+        match=re.fullmatch(r'([0-9a-f]{64}) [ *]'+re.escape(name)+r'',checksum)
         if not match or archive.is_symlink() or not archive.is_file(): raise ValueError('invalid native archive/checksum: '+name)
         digest=hashlib.sha256(archive.read_bytes()).hexdigest()
         if digest!=match[1]: raise ValueError('native archive changed across jobs: '+name)

@@ -1486,3 +1486,14 @@ pre-generation integrity gate and hard-coded 1.3.0 binary probe. The same suite
 passes against the corrected workflow (`/tmp/git-on-ci-contract-{red,green}.log`).
 The current probe obtains the package version from Cargo's JSON metadata and
 therefore retains the Ubuntu 22.04/Python3.10 build baseline.
+
+## 1.3 native cargo-dist checksum whitespace
+
+Exact-head CI exposed that cargo-dist 0.33.0 writes a trailing blank line in
+native per-archive checksum files. At `0f49816`, the new incoming-integrity guard
+accepted only one terminal newline and rejected that authentic output.
+`NativeIntegrityTests.test_cargo_dist_checksum_trailing_blank_line` reproduces
+that failure (`/tmp/git-on-dist-blank-red.log`). The guard now trims surrounding
+whitespace before strict whole-record validation; embedded extra records,
+malformed hashes and wrong artifact names still fail. All five integrity
+regressions pass (`/tmp/git-on-dist-blank-green.log`).
