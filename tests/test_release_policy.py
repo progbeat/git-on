@@ -210,6 +210,14 @@ class ChangeClassificationTests(unittest.TestCase):
         self.write('src/main.rs', 'fn main() { println!("changed"); }\n')
         self.run_policy(True, success=False)
 
+    def test_vendored_runtime_source_requires_a_release(self):
+        self.write('vendor/fuser/src/reply.rs', 'runtime patch\n')
+        self.run_policy(True, success=False)
+
+    def test_native_distribution_matrix_changes_require_a_release(self):
+        self.write('.github/workflows/ci.yml', 'jobs:\n  package-build:\n    runs-on: macos-14\n')
+        self.run_policy(True, success=False)
+
     def test_mixed_source_and_docs_has_one_release(self):
         self.write('README.md', 'updated documentation\n')
         self.write('src/main.rs', 'fn main() { println!("changed"); }\n')

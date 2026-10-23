@@ -3,13 +3,15 @@
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs::OpenOptions,
-    os::unix::{ffi::OsStringExt, io::AsRawFd, process::ExitStatusExt},
+    os::unix::{io::AsRawFd, process::ExitStatusExt},
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 fn fixture() -> (tempfile::TempDir, Oid, Oid, Oid) {
     let temp = tempfile::tempdir().unwrap();
@@ -163,6 +165,7 @@ fn invalid_remote_refspecs_keep_native_git_diagnostics() {
     }
 }
 #[test]
+#[cfg(target_os = "linux")] // Linux host filenames can preserve these bytes; APFS rejects them.
 fn direct_non_utf8_repository_paths_are_native_git_operands() {
     let (temp, _, tree, _) = fixture();
     let source = temp

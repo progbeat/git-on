@@ -32,7 +32,8 @@ links/modes; deny tracked mutation for ignored/untracked; deny all writes for
 none; permit disposable tracked changes for all; verify source/index identity,
 command exit/status, SIGINT/TERM and terminal stop/continue, busy-mount recovery
 and complete normal cleanup. Run from a subdirectory and a selected subtree.
-Use `tests/write_policy.py`'s scenarios and the relevant portable scenarios from
+Start with `python3 tests/macos_mounts.py --binary /absolute/path/git-on`; missing
+prerequisites fail rather than skip. Extend with `tests/write_policy.py`'s scenarios and portable scenarios from
 `tests/integration.py`; Linux /proc/protocol/fusermount-specific scenarios need
 macOS counterparts and must never be relabelled as Mac evidence.
 

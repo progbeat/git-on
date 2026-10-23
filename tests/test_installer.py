@@ -66,7 +66,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         self.assertFalse(self.marker.exists())
 
     def test_invalid_options_and_github_cli_migration(self):
-        for args in [['--github-cli'], ['--version','x;touch bad'], ['--version','1.3.0-rc.1'], ['--version','01.3.0'], ['--bin-dir','relative'], ['--version'], ['--bogus']]:
+        for args in [['--version',''], ['--version='], ['--github-cli'], ['--version','x;touch bad'], ['--version','1.3.0-rc.1'], ['--version','01.3.0'], ['--bin-dir','relative'], ['--version'], ['--bogus']]:
             result = self.run_installer(*args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertFalse(self.marker.exists())

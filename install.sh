@@ -5,14 +5,15 @@ git_on_install() (
     umask 077
     fail() { printf 'git-on: %s\n' "$*" >&2; exit 1; }
     version=''
+    version_selected=0
     bin_dir=${HOME:?HOME must be set}/.local/bin
     while [ "$#" -gt 0 ]; do
         case $1 in
             --version|--bin-dir)
                 option=$1; shift
                 [ "$#" -gt 0 ] || fail "$option requires a value"
-                case $option in --version) version=$1;; --bin-dir) bin_dir=$1;; esac;;
-            --version=*) version=${1#*=};;
+                case $option in --version) version=$1; version_selected=1;; --bin-dir) bin_dir=$1;; esac;;
+            --version=*) version=${1#*=}; version_selected=1;;
             --bin-dir=*) bin_dir=${1#*=};;
             --github-cli) fail '--github-cli was removed in 1.3.0; use public HTTPS release downloads, or download and inspect the release installer with your authenticated gh account, then run it with GIT_ON_INSTALL_DIR';;
             -h|--help) printf '%s\n' 'Usage: sh install.sh [--version VERSION] [--bin-dir /absolute/path]' 'Supports git-on 1.3.0 and later. Default: latest stable release.'; exit 0;;
@@ -33,7 +34,7 @@ git_on_install() (
         code=$?
         case $code in 0) ;; 2) fail 'only git-on 1.3.0 and later are supported; no supported release is available at the selected version';; *) fail "invalid stable version: $1";; esac
     }
-    if [ -n "$version" ]; then
+    if [ "$version_selected" = 1 ]; then
         check_version "$version"
     else
         latest=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' https://github.com/progbeat/git-on/releases/latest) || exit "$?"

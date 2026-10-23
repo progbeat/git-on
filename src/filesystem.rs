@@ -1223,6 +1223,7 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
+    #[allow(clippy::useless_conversion)] // libc mode_t is u16 on macOS, u32 on Linux.
     fn mknod(
         &mut self,
         req: &Request<'_>,
@@ -1556,6 +1557,7 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(e),
         }
     }
+    #[allow(clippy::useless_conversion)] // libc filesystem counters differ across supported hosts.
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         let path = match std::ffi::CString::new(self.backing.as_os_str().as_bytes()) {
             Ok(p) => p,
@@ -1987,6 +1989,35 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn passthrough_data_metadata_survives_close_reopen_without_exposing_backing_mode() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "generated.tmp");
+        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().attr.perm = 0o751;
+        // Simulate the actual kernel's bypass of write_data, not passthrough
+        // negotiation. The real-kernel test proves bypass separately.
+        overlay.nodes.get_mut(&ino).unwrap().passthrough_used = true;
+        let file = overlay.disk_file(ino).unwrap();
+        file.write_at(b"extended", 4096).unwrap();
+        overlay.refresh_backing_attr(ino).unwrap();
+        assert_eq!(overlay.node(ino).unwrap().attr.size, 4104);
+        assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
+        overlay.close_handle(ino, handle);
+        overlay.refresh_backing_attr(ino).unwrap();
+        let handle = overlay.open_file(ino, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            overlay.read_data(ino, handle, 4096, 100).unwrap(),
+            b"extended"
+        );
+        overlay.truncate(ino, 3).unwrap();
+        overlay.refresh_backing_attr(ino).unwrap();
+        assert_eq!(overlay.node(ino).unwrap().attr.size, 3);
+        assert_eq!(overlay.read_data(ino, handle, 0, 100).unwrap(), [0; 3]);
+        assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
     }
 
     #[test]
