@@ -1690,16 +1690,20 @@ succeeded. This establishes the specific streaming edge, not a blanket objection
 to curl|sh. The report is
 `/var/folders/h8/1w0z_0kn7h32ls4byh382nwc0000gn/T/git-on-actual-stream-ngf6z325/report.json`.
 
-`tests/dist_installer.py` now permanently serves the actual generated script over
-loopback with a prematurely closed Content-Length response. The dispatcher must
-return18/22 for truncation/404 and preserve the sentinel, while complete help and
-installation retain upstream semantics. This passed locally with stock Mac shasum;
-log `/tmp/git-on-checked-real-installer.log`. Package CI repeats it on both hosts.
+`tests/dist_installer.py` permanently serves the actual generated script over
+loopback with a prematurely closed Content-Length response. Under the owner's
+selected ordinary stream, the footer truncation records curl18/shell0 and actual
+installation; HTTP404 records curl22/shell0 without replacement. Complete help
+and installation retain upstream semantics. This passed locally with stock Mac
+shasum in `/tmp/git-on-stream-real-installer.log`; package CI repeats it on both hosts.
 
-Copilot also reproduced SIGTERM of the bootstrap PID leaving its subshell installer
-alive to replace existing bytes. The permanent actual-PID regression failed in
-`/tmp/git-on-bootstrap-pid-red.log`. A brace function plus exec now makes that PID
-the generated installer; no new supervisor or traps are added. All10 installer
-regressions pass in `/tmp/git-on-memory-dispatcher-green.log`. The missing-value
-case after a forwarded option is covered too (RED/GREEN logs
-`/tmp/git-on-forwarded-option-{red,green}.log`).
+## Final bootstrap contract
+
+The owner chose the ordinary `curl ... | sh -s -- "$@"` pipeline. No RAM capture,
+sh -c, temporary file, trap or supervisor remains. The permanent actual-bootstrap-PID
+signal test records that its child can continue after the wrapper is terminated;
+this is an accepted limitation rather than a fixed cancellation guarantee.
+Generated-installer staging/hash/signal checks remain mandatory. All10 dispatcher
+and checksum cases pass in `/tmp/git-on-stream-dispatcher-tests.log`.
+The missing-value case after a forwarded option remains fixed with RED/GREEN
+logs `/tmp/git-on-forwarded-option-{red,green}.log`.

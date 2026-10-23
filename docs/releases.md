@@ -95,17 +95,22 @@ curl -fsSL https://sh.progbeat.dev/git-on | sh -s -- --version 1.3.0 --bin-dir /
 
 `install.sh` selects the latest generated release installer or the tag requested
 with `--version` (optional v prefix). It does not validate semantic versions or
-ranges: a missing tag/installer asset fails through HTTP, without executing the
-partial download. No legacy installer path exists. The Cloudflare redirect and
+ranges: a missing tag/installer asset is reported by curl. No legacy installer path exists. The Cloudflare redirect and
 published releases are unchanged.
 
-The dispatcher captures the complete release installer in a shell variable, checks
-curl's status, then execs it. There is no bootstrap temporary file or cleanup trap. It parses only version selection and
-`--bin-dir`, translated to `GIT_ON_INSTALL_DIR` because cargo-dist has no such CLI
-option. All remaining arguments are passed unchanged to the generated installer,
-which owns `--help`, `--quiet`, `--verbose` and unknown-option handling. No shell
-evaluation, version/API/digest lookup, duplicate destination validation or jq
-branch is present.
+The dispatcher streams the selected script through `curl ... | sh -s -- "$@"`.
+It parses only version selection and `--bin-dir`, translated to
+`GIT_ON_INSTALL_DIR` because cargo-dist has no such CLI option. All remaining
+arguments pass unchanged to the generated installer, which owns help, verbosity
+and unknown-option handling. There is no RAM/file staging, sh -c, cleanup trap,
+semantic/API validation or duplicate environment policy in the bootstrap.
+
+This uses ordinary POSIX pipeline semantics: the exit status is the shell's,
+so a curl HTTP failure can accompany status0 when no script arrives. An early
+truncated script usually fails parsing, but truncation inside the final main
+invocation can execute it. A signal to the bootstrap PID alone does not guarantee
+cancellation of the child installer. These are accepted streaming limitations,
+not archive-integrity guarantees; interrupt the foreground process group normally.
 
 The generated installer chooses the platform, verifies its embedded archive
 SHA256 and installs the binary. `dist-workspace.toml` sets the default destination

@@ -38,7 +38,7 @@ with open(os.environ['CURL_LOG'],'a') as f:f.write(repr(args)+'\\n')
 capture='import json,os,sys;json.dump(sys.argv[1:],open(os.environ["ARGV_LOG"],"w"))'
 payload=('printf "%s\\\\n" "${GIT_ON_INSTALL_DIR:-$HOME/.local/bin}" > "$MARKER"\\n'+shlex.quote(sys.executable)+' -c '+shlex.quote(capture)+' "$@"\\nexit '+os.environ.get('CHILD_STATUS','0')+'\\n')
 if '-o' in args:Path(args[args.index('-o')+1]).write_text(payload)
-else:sys.stdout.write(payload)
+elif os.environ.get('DOWNLOAD_STATUS','0')=='0':sys.stdout.write(payload)
 sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
 ''')
         curl.chmod(0o755)
@@ -61,7 +61,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
     def test_missing_release_installer_fails_on_http_not_a_local_version_check(self):
         for version in ['0.1.0', 'v1.2.0', 'unpublished-tag']:
             result = self.run_installer('--version', version, DOWNLOAD_STATUS='22')
-            self.assertEqual(result.returncode, 22)
+            self.assertEqual(result.returncode, 0)  # POSIX pipeline reports the empty shell, not curl.
             self.assertIn('/download/v'+version.removeprefix('v')+'/git-on-installer.sh', self.log.read_text())
             self.assertFalse(self.marker.exists())
         self.assertNotIn(b'supported', result.stderr)
@@ -89,15 +89,15 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
             self.assertFalse(self.marker.exists())
             self.assertFalse(self.log.exists())
 
-    def test_failed_partial_download_never_executes_and_exit_propagates(self):
+    def test_empty_http_failure_has_no_payload_and_installer_status_propagates(self):
         result = self.run_installer('--version','1.3.0', DOWNLOAD_STATUS='22')
-        self.assertEqual(result.returncode, 22, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists())
         result = self.run_installer('--version','1.3.0', CHILD_STATUS='23')
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertTrue(self.marker.exists())
 
-    def test_signalling_bootstrap_pid_stops_installer_before_replacement(self):
+    def test_bootstrap_pid_alone_does_not_cancel_a_streamed_child_installer(self):
         existing = self.root/'existing'
         existing.write_text('old')
         ready, release = self.root/'ready', self.root/'release'
@@ -117,7 +117,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
             process.wait(timeout=3)
             release.touch()
             time.sleep(.15)
-            self.assertEqual(existing.read_text(),'old')
+            self.assertEqual(existing.read_text(),'new')  # Standard pipe: signal its group/installer, not wrapper PID alone.
         finally:
             release.touch()
             try: os.killpg(process.pid,signal.SIGKILL)

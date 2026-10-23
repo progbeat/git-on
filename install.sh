@@ -24,8 +24,7 @@ git_on_install() {
         latest) release=latest/download;;
         *) release=download/v${version#v};;
     esac
-    installer=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-        "https://github.com/progbeat/git-on/releases/$release/git-on-installer.sh")
-    exec sh -c "$installer" -- "$@"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+        "https://github.com/progbeat/git-on/releases/$release/git-on-installer.sh" | sh -s -- "$@"
 }
 { git_on_install "$@"; }

@@ -56,7 +56,7 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
         assert result.returncode!=0 and b'unknown option' in result.stderr,(option,result.stdout,result.stderr)
         assert (install/'git-on').read_bytes()==before
     # Real HTTP truncation of the ACTUAL corrected script. A bare final main
-    # token would execute if streamed directly; checked capture must not run it.
+    # token executes on EOF: record the ordinary pipeline behavior explicitly.
     script=(dist/'git-on-installer.sh').read_bytes()
     footer=b'download_binary_and_run_installer "$@" || exit 1'
     assert script.rstrip().endswith(footer)
@@ -71,12 +71,14 @@ shutil.copyfile(Path(os.environ['FIXTURE_DIST'])/url.rsplit('/',1)[1],args[args.
     server=http.server.HTTPServer(('127.0.0.1',0),ScriptServer)
     worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
     try:
-        (install/'git-on').write_bytes(b'existing installation sentinel')
         bootstrap=Path(__file__).resolve().parents[1]/'install.sh'
-        for route,status,arguments in [('incomplete',18,['--help']),('missing',22,[]),('complete',0,['--help'])]:
+        for route,arguments,replaced in [('incomplete',['--help'],True),('missing',[],False),('complete',['--help'],False)]:
+            (install/'git-on').write_bytes(b'existing installation sentinel')
             result=subprocess.run(['sh',str(bootstrap),*arguments],env=dict(env,SCRIPT_ENDPOINT=f'http://127.0.0.1:{server.server_port}/{route}'),capture_output=True,timeout=90)
-            assert result.returncode==status,(route,result.returncode,result.stderr)
-            assert (install/'git-on').read_bytes()==b'existing installation sentinel',route
+            assert result.returncode==0,(route,result.returncode,result.stderr)
+            assert (install/'git-on').read_bytes()==(before if replaced else b'existing installation sentinel'),route
+            if route=='incomplete':assert b'curl: (18)' in result.stderr,result.stderr
+            if route=='missing':assert b'curl: (22)' in result.stderr,result.stderr
         subprocess.run(['sh',str(bootstrap),'--quiet'],env=dict(env,SCRIPT_ENDPOINT=f'http://127.0.0.1:{server.server_port}/complete'),check=True,timeout=90)
         assert (install/'git-on').read_bytes()==before
     finally:
