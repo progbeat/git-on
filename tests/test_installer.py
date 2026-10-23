@@ -51,7 +51,7 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
         return result
 
     def test_latest_explicit_optional_v_bin_dir_and_repeat_update(self):
-        for args in [[], ['--version','1.3.0'], ['--version','v1.3.0'], ['--version=2.0.0','--bin-dir',str(self.root/'custom')]]:
+        for args in [[], ['--version','latest'], ['--version=latest'], ['--version','1.3.0'], ['--version','v1.3.0'], ['--version=2.0.0','--bin-dir',str(self.root/'custom')]]:
             for _ in range(2):
                 result = self.run_installer(*args)
                 self.assertEqual(result.returncode, 0, result.stderr)
