@@ -143,7 +143,7 @@ repositories are not currently supported by the bundled libgit2.
 The command inherits stdin, stdout, and stderr directly. Terminal detection, pipes,
 redirection, binary output, and buffering behave as they do for an ordinary child
 process. git-on does not tee or capture these streams and creates no logs, run manifest,
-or output directory. Use ordinary shell redirection or a separate experiment runner when
+or output directory. Use ordinary shell redirection or another tool when
 you need durable records.
 
 The only environment variable git-on adds or overrides is `GIT_ON_TREE_OID`, the full
@@ -244,7 +244,7 @@ output. Latency and RSS are measured, not promised as a machine-independent SLA.
   immutable. Adding a pattern in the live checkout does not change that tree.
   `untracked` allows new paths without ignore rules, while still protecting
   selected-tree entries and their parent directories.
-- **A script or recent edit is missing:** git-on reads the selected revision. Staged,
+- **A file or recent edit is missing:** git-on reads the selected revision. Staged,
   unstaged, and untracked changes do not appear until committed and selected.
 - **Generated results disappear:** the writable layer is deleted by default. Use
   shell redirection in the invoking shell, or have the
