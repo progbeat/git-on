@@ -7,9 +7,9 @@
 
 Run commands on a specific Git revision.
 
-Pin a hash to reuse the same tree. Add `--verify` to require the signature
-and trust checks configured in Git, so your signing process can control which
-updated revisions may run.
+Use a commit hash to run against a fixed source tree. Add `--verify` to require
+the signature and trust checks configured in Git, so your signing process can
+control which updated revisions may run.
 
 Git-on prepares the snapshot without checking out the selected revision or
 updating your working tree or index. Commands run in that temporary snapshot;
