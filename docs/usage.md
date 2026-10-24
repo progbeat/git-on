@@ -247,7 +247,7 @@ output. Latency and RSS are measured, not promised as a machine-independent SLA.
 - **A script or recent edit is missing:** git-on reads the selected revision. Staged,
   unstaged, and untracked changes do not appear until committed and selected.
 - **Generated results disappear:** the writable layer is deleted by default. Use
-  redirect output in the invoking shell, or have the
+  shell redirection in the invoking shell, or have the
   command save chosen files to an explicit host path.
 
 For errors after an interrupted run, see [recovery
