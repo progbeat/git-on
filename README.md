@@ -39,7 +39,7 @@ Check the installation:
 git on --version
 ```
 
-You need Git. On Linux, install [FUSE](docs/platforms.md) to use the default write
+On Linux, install [FUSE](docs/platforms.md) to use the default write
 policy. See the [installation guide](docs/releases.md#installing-a-published-binary)
 for custom install locations and other setup options.
 
