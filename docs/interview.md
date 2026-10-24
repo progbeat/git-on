@@ -14,4 +14,20 @@ I would add that another problem with languages such as Python is the risk of so
 
 **Question:** Should this protection cover only replacement of source files, or also interference with the running process's memory, for example through a debugger?
 
-**Answer:** git on solves this problem in a model where another unprivileged process cannot attach a debugger to or interfere with our process's memory. As far as I understand, this is the default behavior on Linux systems.
+**Answer:** git on solves this problem in a model where another unprivileged process cannot attach a debugger to or interfere with our process's memory. On Linux systems with Yama, `ptrace_scope=1` can be enabled, if it is not already enabled, to restrict debugger attachment by a neighboring process running as the same user.
+
+**Question:** What additional execution time and RAM usage do you consider acceptable when running a command through Git-on compared with running the same command from an ordinary local copy of the repository? You can answer qualitatively, without specific numbers.
+
+**Answer:** Overhead should be minimized. File reads should be lazy, so that running a script from a large monorepo can happen almost instantly without materializing the whole repository before execution. Large files also need to be taken into account: preferably, they should be read and written to the cache as streams rather than loaded entirely into RAM. If the backend supports passthrough with the required permissions and it speeds up file operations, that mode should be used.
+
+**Question:** If a platform cannot read the repository lazily and running a command requires materializing it in full, should Git-on refuse to run, or allow that mode only when the user explicitly chooses it?
+
+**Answer:** Git-on should not refuse to run if it can execute the command on the specified tree while respecting the write policy. It should operate on a best-effort basis.
+
+**Question:** Should Git-on tell the user that it is using a slower fallback, or should this remain invisible when the command runs successfully?
+
+**Answer:** By default, Git-on should not complain to the user, but it makes sense to show an animated status during a lengthy materialization when running in a terminal. The status should disappear before the command starts.
+
+**Question:** Once Git-on has external users, is it acceptable to introduce breaking interface changes for simplicity, or should keeping existing commands working take priority?
+
+**Answer:** Changes to Git-on should follow standard semantic versioning and deprecation practices so that users know what to expect.
