@@ -36,7 +36,6 @@ class PublicationTests(unittest.TestCase):
         self.starter = set()
         self.calls = []
         self.immutable_enabled = True
-        self.immutable_authorized = True
         self.immutable_after_publish = True
 
     def fake(self, *args, raw=False, data=None):
@@ -44,10 +43,8 @@ class PublicationTests(unittest.TestCase):
         if args[0] == 'api':
             path = next(x for x in args[1:] if x.startswith('repos/'))
             if path.endswith('/immutable-releases'):
-                if not self.immutable_authorized:
-                    raise subprocess.CalledProcessError(1, ['gh', 'api', path],
-                        stderr='HTTP 403: Resource not accessible by integration')
-                return {'enabled': self.immutable_enabled}
+                raise subprocess.CalledProcessError(1, ['gh', 'api', path],
+                    stderr='HTTP 403: Resource not accessible by integration')
             if '/git/matching-refs/' in path:
                 return self.refs
             if path.endswith('/git/refs'):
@@ -87,21 +84,20 @@ class PublicationTests(unittest.TestCase):
         with patch.object(MOD, 'gh', self.fake):
             MOD.publish()
 
-    def test_disabled_immutability_fails_before_tag_or_release_creation(self):
+    def test_disabled_immutability_is_detected_only_after_publication(self):
         self.immutable_enabled = False
-        with self.assertRaisesRegex(RuntimeError, 'immutability must already'):
+        with self.assertRaisesRegex(RuntimeError, 'did not report immutability'):
             self.run_publish()
-        self.assertEqual(self.refs, [])
-        self.assertEqual(self.releases, [])
+        self.assertEqual(self.refs[0]['object']['sha'], SHA)
+        self.assertFalse(self.releases[0]['draft'])
+        self.assertFalse(self.releases[0]['immutable'])
 
-    def test_immutability_authorization_failure_stops_before_any_mutation(self):
-        self.immutable_authorized = False
-        with self.assertRaisesRegex(RuntimeError, 'Administration-read'):
-            self.run_publish()
-        self.assertEqual(self.refs, [])
-        self.assertEqual(self.releases, [])
-        self.assertEqual(self.assets, {})
-        self.assertEqual(len(self.calls), 1)
+    def test_contents_write_authentication_needs_no_administration_query(self):
+        self.run_publish()
+        self.assertFalse(any('repos/owner/repo/immutable-releases' in args
+                             for args, _ in self.calls))
+        self.assertFalse(self.releases[0]['draft'])
+        self.assertTrue(self.releases[0]['immutable'])
 
     def test_mutable_publication_is_detected_after_publication(self):
         self.immutable_after_publish = False

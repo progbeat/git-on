@@ -1740,26 +1740,22 @@ focused test is GREEN on macOS; real enabled/fallback Linux CI additionally
 exercises write -> link without an intervening stat/close. RED/GREEN logs are
 `/tmp/git-on-link-reply-{red,green}.log`.
 
-## Immutable-release authorization remains a publication prerequisite
+## Publication uses the existing contents-write token
 
-The settings endpoint used before publication requires repository
-Administration(read); the workflow's contents-write GITHUB_TOKEN cannot supply
-that permission. The repository's Actions secret-name inventory was empty when
-checked read-only on 2026-10-24. No credential, secret or access setting was created
-or changed. Publication authentication remains unresolved; a green mock test or
-post-publication immutable flag is not proof that the preflight can authenticate.
+The former settings preflight required Administration(read), which the built-in
+Actions token cannot supply. Its explicit diagnostic was covered by
+`/tmp/git-on-release-auth-{red,green}.log`, but did not fix publication. The owner
+subsequently chose to remove that preflight rather than add credentials or access.
+No credential, secret or repository setting was created or changed.
 
-`test_immutability_authorization_failure_stops_before_any_mutation` reproduces an
-HTTP403 from that first read. It was RED with an uncaught CalledProcessError and
-is GREEN with an explicit Administration-read diagnostic, asserting no tag,
-release or asset mutation. All15 inert publisher tests pass. Logs are
-`/tmp/git-on-release-auth-{red,green}.log`. The immutability preflight and final
-release-state verification remain required; the authentication finding is not
-claimed fixed by this diagnostic change.
+`test_contents_write_authentication_needs_no_administration_query` reproduces the
+old failure at 3d01851 with an HTTP403 from the settings endpoint. It is GREEN
+after removing that query, with all15 inert publisher tests passing. Logs are
+`/tmp/git-on-release-contents-{red,green}.log`. The draft upload/verification order,
+retry guards and final actual-release `immutable` check remain in place.
 
-The live repository setting was read with existing desktop authentication and
-returned enabled=true; no setting changed. That does not grant the Actions token
-Administration(read). In an entirely inert postcondition-only experiment,
-removing the settings preflight let a mutable release be published before the
-final check rejected it. `test_mutable_publication_is_detected_after_publication`
-keeps this distinction explicit; the production preflight was not removed.
+Repository immutability is now an owner-managed prerequisite. The permanent
+`test_disabled_immutability_is_detected_only_after_publication` explicitly records
+that a disabled setting permits a mutable publication before the final check
+fails. This check confirms release state after publication; it neither prevents
+that mutable publication nor rolls it back. All publication tests use a fake API.

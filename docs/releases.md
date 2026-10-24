@@ -170,23 +170,19 @@ jobs. Both hosts install/update the actual archive through the actual corrected
 installer; Linux additionally runs non-skipped FUSE acceptance. macOS CLI and
 materialized tests validate its supported 1.3.0 subset; Mac mounts are deferred.
 
-Only a validated master push can execute publication. The publisher requires
-release immutability already enabled (read-only setting check), creates/resumes a
-draft, uploads every archive/installer/metadata/checksum asset, downloads and
+Only a validated master push can execute publication. The publisher creates/resumes
+a draft, uploads every archive/installer/metadata/checksum asset, downloads and
 verifies the complete exact set while still draft, then publishes. It verifies
 GitHub reports `immutable: true` afterward. No assets are appended after
 publication; existing mismatching releases are never repaired. Repository settings
 must be managed separately; this PR is not permission to publish or change them.
 
-The repository-setting preflight requires authenticated repository
-`Administration: read` access. The built-in Actions `GITHUB_TOKEN` cannot supply
-that permission, even with `contents: write`. Missing access is an unmet
-publication prerequisite: the publisher fails before creating a tag or release.
-An owner-approved authentication strategy is required before the release job can
-publish. The publisher does not create credentials or change access. Reading a
-release's `immutable` field after publication confirms that release's state, but
-cannot replace the pre-publication setting check: it could detect a mutable
-publication only after it happened.
+Enable release immutability in the repository before publishing. This is an
+owner-managed prerequisite: the publisher neither reads nor changes the setting.
+It uses the built-in Actions `GITHUB_TOKEN` with `contents: write`, without an
+additional credential or Administration permission. If immutability is disabled,
+the final check fails only after a mutable release has been published; it does not
+prevent or roll back that publication. Inspect the release before retrying.
 
 ### Building from source
 
