@@ -7,9 +7,11 @@ its guard whenever callbacks or tests change.
 
 docs/interview.md records the author's intent; keep the implementation consistent
 with it. Read the project documentation and interview before asking questions.
-If a material ambiguity or conflict in intent or requirements remains, ask the
-author a self-contained question, then record the complete question and answer
-in English without changing their meaning. Verify technical facts independently;
+If the documentation leaves a material ambiguity about the author's intent or
+requirements, ask the author a self-contained question before making the affected
+implementation decision.
+Record the complete question and answer in docs/interview.md in English without
+changing their meaning. Verify technical facts independently;
 do not invent author decisions or treat the current implementation as proof of
 intent. Recorded goals are not evidence that they are already implemented.
 
