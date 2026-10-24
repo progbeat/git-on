@@ -5,14 +5,15 @@
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-blue?logo=rust&logoColor=white)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Run a build, test or script against the Git source you choose.
+Run commands on a specific Git revision.
 
-Pin a hash to run the same source again. Add `--verify` to require the signature
+Pin a hash to reuse the same tree. Add `--verify` to require the signature
 and trust checks configured in Git, so your signing process can control which
 updated revisions may run.
 
-Commands run in a temporary snapshot. Your working tree and index stay unchanged;
-temporary changes disappear when the command finishes.
+Git-on prepares the snapshot without checking out the selected revision or
+updating your working tree or index. Commands run in that temporary snapshot;
+changes made there are discarded when the command finishes.
 
 ![Build and run SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp)
 
@@ -75,7 +76,7 @@ contents, even after branches move or working files change.
 ### Run a verified revision
 
 [Configure Git's trusted keys and verification policy](docs/remote.md#native-signature-verification)
-for your review or QA process, then require verification before running:
+and require verification before running:
 
 ```sh
 git on main --verify --write-policy=all -- python script.py
@@ -110,9 +111,9 @@ git on HEAD~1 --write-policy=all -- python script.py
 git on feature-branch --write-policy=all -- cargo test
 ```
 
-### Run a remote project
+### Use a remote repository
 
-Supply a repository URL and a revision. Replace the URL with your project:
+Supply a repository URL and a revision. Replace the URL with your repository:
 
 ```sh
 git on https://github.com/OWNER/REPO.git main --write-policy=all -- cargo test
