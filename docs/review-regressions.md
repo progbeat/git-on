@@ -1727,3 +1727,39 @@ to the generated installer, including flags the bootstrap used to consume.
 The permanent matrix verifies defaults, pinned versions, optional v, repeated
 installs, custom destination environment and byte-exact downstream argv.
 Prior missing-selector parser tests were removed with that parser, not bypassed.
+
+## LINK replies after passthrough writes
+
+At d6cca75, a generated file extended through its physical backing descriptor
+and hard-linked without stat or close returned cached pre-write attributes.
+`passthrough_link_reply_refreshes_backing_metadata_without_stat` was RED: LINK
+reported size 0 instead of 4104. The same test now checks size, allocation blocks,
+mtime, link count and logical permissions in the returned reply. Hardlink refreshes
+physical metadata after policy/name checks and before namespace mutation. The
+focused test is GREEN on macOS; real enabled/fallback Linux CI additionally
+exercises write -> link without an intervening stat/close. RED/GREEN logs are
+`/tmp/git-on-link-reply-{red,green}.log`.
+
+## Immutable-release authorization remains a publication prerequisite
+
+The settings endpoint used before publication requires repository
+Administration(read); the workflow's contents-write GITHUB_TOKEN cannot supply
+that permission. The repository's Actions secret-name inventory was empty when
+checked read-only on 2026-10-24. No credential, secret or access setting was created
+or changed. Publication authentication remains unresolved; a green mock test or
+post-publication immutable flag is not proof that the preflight can authenticate.
+
+`test_immutability_authorization_failure_stops_before_any_mutation` reproduces an
+HTTP403 from that first read. It was RED with an uncaught CalledProcessError and
+is GREEN with an explicit Administration-read diagnostic, asserting no tag,
+release or asset mutation. All15 inert publisher tests pass. Logs are
+`/tmp/git-on-release-auth-{red,green}.log`. The immutability preflight and final
+release-state verification remain required; the authentication finding is not
+claimed fixed by this diagnostic change.
+
+The live repository setting was read with existing desktop authentication and
+returned enabled=true; no setting changed. That does not grant the Actions token
+Administration(read). In an entirely inert postcondition-only experiment,
+removing the settings preflight let a mutable release be published before the
+final check rejected it. `test_mutable_publication_is_detected_after_publication`
+keeps this distinction explicit; the production preflight was not removed.

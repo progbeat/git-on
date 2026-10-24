@@ -178,6 +178,16 @@ GitHub reports `immutable: true` afterward. No assets are appended after
 publication; existing mismatching releases are never repaired. Repository settings
 must be managed separately; this PR is not permission to publish or change them.
 
+The repository-setting preflight requires authenticated repository
+`Administration: read` access. The built-in Actions `GITHUB_TOKEN` cannot supply
+that permission, even with `contents: write`. Missing access is an unmet
+publication prerequisite: the publisher fails before creating a tag or release.
+An owner-approved authentication strategy is required before the release job can
+publish. The publisher does not create credentials or change access. Reading a
+release's `immutable` field after publication confirms that release's state, but
+cannot replace the pre-publication setting check: it could detect a mutable
+publication only after it happened.
+
 ### Building from source
 
 Use Rust 1.89+, native Git, and a C compiler:

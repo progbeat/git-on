@@ -1019,6 +1019,7 @@ impl Overlay {
         if self.node(ino)?.attr.nlink == 0 {
             return Err(libc::ENOENT);
         }
+        self.refresh_backing_attr(ino)?;
         self.copy_up(ino, true)?;
         let n = self.node_mut(ino)?;
         if n.attr.nlink == 0 {
@@ -1697,6 +1698,29 @@ mod tests {
         overlay.nodes.get_mut(&ino).unwrap().external_io = true;
         let attr = overlay.attributes(ino, Some(handle)).unwrap();
         assert_eq!((attr.atime, attr.mtime), (accessed, modified));
+    }
+
+    #[test]
+    fn passthrough_link_reply_refreshes_backing_metadata_without_stat() {
+        let (_temp, mut overlay) = fixture();
+        let ino = file(&mut overlay, 1, "generated.tmp");
+        let _handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+        let backing = overlay.disk_file(ino).unwrap();
+        backing.write_at(b"extended", 4096).unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(5678);
+        backing
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let expected = backing.metadata().unwrap();
+
+        // No getattr, close or other overlay refresh between bypass I/O and LINK.
+        let linked = overlay.link_node(ino, 1, OsStr::new("alias.tmp")).unwrap();
+        assert_eq!(linked.size, expected.len());
+        assert_eq!(linked.blocks, expected.blocks());
+        assert_eq!(linked.mtime, expected.modified().unwrap());
+        assert_eq!(linked.nlink, 2);
+        assert_eq!(linked.perm, 0o600);
     }
 
     #[test]

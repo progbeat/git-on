@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -35,12 +36,18 @@ class PublicationTests(unittest.TestCase):
         self.starter = set()
         self.calls = []
         self.immutable_enabled = True
+        self.immutable_authorized = True
+        self.immutable_after_publish = True
 
     def fake(self, *args, raw=False, data=None):
         self.calls.append((args, data))
         if args[0] == 'api':
             path = next(x for x in args[1:] if x.startswith('repos/'))
-            if path.endswith('/immutable-releases'): return {'enabled': self.immutable_enabled}
+            if path.endswith('/immutable-releases'):
+                if not self.immutable_authorized:
+                    raise subprocess.CalledProcessError(1, ['gh', 'api', path],
+                        stderr='HTTP 403: Resource not accessible by integration')
+                return {'enabled': self.immutable_enabled}
             if '/git/matching-refs/' in path:
                 return self.refs
             if path.endswith('/git/refs'):
@@ -62,7 +69,8 @@ class PublicationTests(unittest.TestCase):
             if path.endswith('/releases/1'):
                 if data is not None:
                     self.releases[0].update(data)
-                    if data.get("draft") is False: self.releases[0]["immutable"] = True
+                    if data.get("draft") is False:
+                        self.releases[0]["immutable"] = self.immutable_enabled and self.immutable_after_publish
                 return self.releases[0]
         if args[:2] == ('release', 'upload'):
             path = Path(args[3])
@@ -85,6 +93,22 @@ class PublicationTests(unittest.TestCase):
             self.run_publish()
         self.assertEqual(self.refs, [])
         self.assertEqual(self.releases, [])
+
+    def test_immutability_authorization_failure_stops_before_any_mutation(self):
+        self.immutable_authorized = False
+        with self.assertRaisesRegex(RuntimeError, 'Administration-read'):
+            self.run_publish()
+        self.assertEqual(self.refs, [])
+        self.assertEqual(self.releases, [])
+        self.assertEqual(self.assets, {})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_mutable_publication_is_detected_after_publication(self):
+        self.immutable_after_publish = False
+        with self.assertRaisesRegex(RuntimeError, 'did not report immutability'):
+            self.run_publish()
+        self.assertFalse(self.releases[0]['draft'])
+        self.assertFalse(self.releases[0]['immutable'])
 
     def test_create_and_retry_published_without_mutation(self):
         self.run_publish()

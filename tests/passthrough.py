@@ -69,6 +69,18 @@ with p.open('rb') as reopened:
 with p.open('r+b') as f:f.truncate(7)
 s=p.stat(); assert s.st_size==7 and s.st_mtime_ns>old and 0<s.st_blocks<=256 and p.read_bytes()==b'a'*7
 os.chmod(p,0o751); assert p.stat().st_mode & 0o777==0o751
+# Exercise actual write -> LINK without stat or close in between. The core
+# regression separately inspects the LINK reply before any later GETATTR.
+linked_source=Path('out/link-before-stat')
+linked_alias=Path('out/link-before-stat-alias')
+with linked_source.open('w+b',buffering=0) as f:
+ os.utime(f.fileno(),ns=(old,old))
+ f.write(b'linked'*8192)
+ os.link(linked_source,linked_alias)
+ s=linked_alias.stat()
+ assert s.st_size==6*8192 and s.st_blocks>0 and s.st_mtime_ns>old and s.st_nlink==2
+ assert linked_alias.read_bytes()==b'linked'*8192
+linked_alias.unlink(); linked_source.unlink()
 before=p.stat().st_ctime_ns; time.sleep(.01)
 os.link(p,'out/alias')
 assert p.stat().st_ctime_ns>before and p.stat().st_nlink==2

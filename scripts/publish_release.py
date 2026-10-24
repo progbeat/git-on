@@ -37,7 +37,14 @@ def publish():
         raise RuntimeError("artifact source SHA differs from the tested master SHA")
     # Repository setting is read-only here: publication must fail closed rather
     # than publish a mutable release or modify security configuration.
-    if api(f"repos/{repo}/immutable-releases").get("enabled") is not True:
+    try:
+        immutability = api(f"repos/{repo}/immutable-releases")
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "Publication not attempted: cannot check release immutability; "
+            "repository Administration-read authentication is required"
+        ) from error
+    if immutability.get("enabled") is not True:
         raise RuntimeError("release immutability must already be enabled before publication")
     tag = "v" + manifest["version"]
     # Never use 'latest master' as the target: overlapping merges may finish out of order.
