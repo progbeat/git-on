@@ -5,14 +5,14 @@
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-blue?logo=rust&logoColor=white)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Run commands from a Git tree pinned by hash, or from revisions accepted by your
-configured Git signature policy.
+Run a build, test or script against the Git source you choose.
 
-Reuse a tree hash for the same source contents across runs. Use `--verify` to
-require a signed commit or annotated tag before execution.
+Pin a hash to run the same source again. Add `--verify` to require the signature
+and trust checks configured in Git, so your signing process can control which
+updated revisions may run.
 
-Each run starts from the selected tree, with temporary writes discarded afterward.
-Your working tree and index stay unchanged.
+Commands run in a temporary snapshot. Your working tree and index stay unchanged;
+temporary changes disappear when the command finishes.
 
 ![Build and run SL in a temporary Git snapshot](https://raw.githubusercontent.com/progbeat/git-on/943434c1f102a0efc626cafd40ae6245002fa392/demo.webp)
 
@@ -45,25 +45,32 @@ for custom install locations and other setup options.
 
 ## Usage
 
-### Pin a source tree
-
-Resolve your chosen revision to its tree hash once. On Linux:
+Pass a revision before `--`, followed by the command. For example, on Linux:
 
 ```sh
-tree=$(git rev-parse 'HEAD^{tree}')
-git on "$tree" -- ls
+git on HEAD -- ls
 ```
 
 On macOS, use `--write-policy=all`; other write policies are not supported yet:
 
 ```sh
+git on HEAD --write-policy=all -- ls
+```
+
+Commands start at the snapshot's root. Everything after `--` belongs to your
+command.
+
+### Reuse exact source contents
+
+Resolve a revision to its tree hash once, then run against that hash:
+
+```sh
 tree=$(git rev-parse 'HEAD^{tree}')
-git on "$tree" --write-policy=all -- ls
+git on "$tree" --write-policy=all -- python script.py
 ```
 
 Record the value of `$tree` and pass it to later runs to select the same source
-contents. Commands start at the snapshot's root. Everything after `--` belongs
-to your command.
+contents, even after branches move or working files change.
 
 ### Run a verified revision
 
@@ -76,6 +83,9 @@ git on main --verify --write-policy=all -- python script.py
 
 `--verify` checks the selected commit's signature. With an annotated tag, it
 checks the tag's signature instead. Verification failure stops execution.
+
+Use a commit hash in place of `main` to pin the source and require verification
+together.
 
 ### Build and test the pinned tree
 
@@ -91,10 +101,9 @@ must be ignored by the selected revision's committed `.gitignore` rules. Use
 `all` to edit tracked files or write without ignore rules. See
 [write policies](docs/usage.md#filesystem-behavior) for more control.
 
-### Choose another revision
+### Choose a revision
 
-Branches, tags and commits also work. For a one-off run at the previous commit
-or another branch:
+Run the previous commit or a branch:
 
 ```sh
 git on HEAD~1 --write-policy=all -- python script.py
