@@ -5,6 +5,13 @@ implementation generic: application-specific Python/uv/Numba examples are not
 filesystem exceptions. Preserve the complete FUSE-operation coverage matrix and
 its guard whenever callbacks or tests change.
 
+Before asking about author intent or requirements, read the project documentation
+and docs/interview.md. If a material ambiguity remains, ask the author a
+self-contained question, then record the complete question and answer in English
+in docs/interview.md without changing their meaning. Verify technical facts
+independently; do not invent author decisions or treat the current implementation
+as proof of intent.
+
 ## Release changes to the binary
 
 Follow docs/releases.md. Fetch current master. Changes to CLI source, runtime
