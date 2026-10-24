@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run dispatcher/hash regressions; packaged installation uses dist_installer.py."""
+"""Run the thin dispatcher regressions."""
 import subprocess
 import sys
 from pathlib import Path

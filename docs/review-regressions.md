@@ -1,5 +1,10 @@
 # Review regression evidence
 
+This is a historical review record. The owner subsequently selected stock
+cargo-dist release/installer behavior. Earlier custom publisher, hash-hardening
+and assembly sections below are superseded; their replaced code/tests were
+removed. Current release behavior and checks are described in [releases](releases.md).
+
 ## Native Git operand compatibility (1.2.0 bug fixes)
 
 Repository and revision arguments were always intended to use Git's syntax.
@@ -1740,26 +1745,6 @@ focused test is GREEN on macOS; real enabled/fallback Linux CI additionally
 exercises write -> link without an intervening stat/close. RED/GREEN logs are
 `/tmp/git-on-link-reply-{red,green}.log`.
 
-## Publication uses the existing contents-write token
-
-The former settings preflight required Administration(read), which the built-in
-Actions token cannot supply. Its explicit diagnostic was covered by
-`/tmp/git-on-release-auth-{red,green}.log`, but did not fix publication. The owner
-subsequently chose to remove that preflight rather than add credentials or access.
-No credential, secret or repository setting was created or changed.
-
-`test_contents_write_authentication_needs_no_administration_query` reproduces the
-old failure at 3d01851 with an HTTP403 from the settings endpoint. It is GREEN
-after removing that query, with all15 inert publisher tests passing. Logs are
-`/tmp/git-on-release-contents-{red,green}.log`. The draft upload/verification order,
-retry guards and final actual-release `immutable` check remain in place.
-
-Repository immutability is now an owner-managed prerequisite. The permanent
-`test_disabled_immutability_is_detected_only_after_publication` explicitly records
-that a disabled setting permits a mutable publication before the final check
-fails. This check confirms release state after publication; it neither prevents
-that mutable publication nor rolls it back. All publication tests use a fake API.
-
 ## O_PATH references retain unlinked backing metadata
 
 At 1abb698, passthrough create/write/close followed by O_PATH-style inode lookup,
@@ -1776,3 +1761,17 @@ descriptors survive until the existing lookup/handle/directory-reference lifetim
 ends. Failure to obtain the descriptor occurs before namespace mutation. The real
 Linux enabled/fallback suite additionally uses actual O_PATH descriptors and
 checks fstat after both unlink and replacement; it does not emulate these syscalls.
+
+## Standard cargo-dist release migration
+
+The owner accepted the stock installer checksum policy and selected the generated
+GitHub workflow. The former publisher, hash correction, asset assembly and repeated
+integrity tools are removed. Runtime, hard-link, O_PATH and real-FUSE regressions
+remain permanent. The ordinary required package check still exercises real Linux
+and Mac native builds plus stock installer help/install/reinstall.
+
+The automatic version trigger only tags the exact tested SHA and dispatches the
+stock workflow. `test_trigger_pins_the_tested_commit_and_never_moves_existing_tags`
+uses an inert gh fixture for absent/reused/mismatched tags and creation failure;
+no live tag or workflow dispatch is performed. Regeneration is checked with the
+pinned upstream `dist generate --mode=ci --check` command.

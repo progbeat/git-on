@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Dispatcher and fail-closed checksum regressions; no network or installation."""
-import hashlib
-import importlib.util
+"""Thin dispatcher regressions; no network or installation."""
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import sys
@@ -14,9 +11,6 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('hardening', ROOT / 'scripts/harden_dist_installer.py')
-hardening = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(hardening)
 
 
 class DispatcherTests(unittest.TestCase):
@@ -137,55 +131,6 @@ sys.exit(int(os.environ.get('DOWNLOAD_STATUS','0')))
                 subprocess.run(['sh','-s','--','--help'], input=source[:end].encode(), env=self.env, capture_output=True, timeout=10)
                 self.assertFalse(self.log.exists(), source[start:end])
                 self.assertFalse(self.marker.exists())
-
-
-class ChecksumTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.archive = self.root/'input.tar.gz'
-        self.archive.write_bytes(b'complete archive')
-        self.digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
-
-    def verify(self, value=None, style='sha256', tool='shasum', failing=False):
-        programs = self.root/'programs'
-        programs.mkdir(exist_ok=True)
-        for p in programs.iterdir(): p.unlink()
-        if tool:
-            path = programs/tool
-            original = shutil.which(tool)
-            if original and not failing:
-                path.symlink_to(original)
-            else:
-                path.write_text('#!/bin/sh\nexit 7\n' if failing else '#!/bin/sh\nprintf "'+self.digest+'  %s\\n" "$3"\n')
-                path.chmod(0o755)
-        script = 'set -u\nerr() { echo "$*" >&2; exit 1; }\ncheck_cmd() { command -v "$1" >/dev/null 2>&1; }\n'+hardening.VERIFY+'\nverify_checksum "$1" "$2" "$3"\n'
-        return subprocess.run(['/bin/sh','-c',script,'verify',str(self.archive),style,self.digest if value is None else value], env=dict(os.environ, PATH=str(programs)),capture_output=True,timeout=10)
-
-    def test_linux_and_macos_hash_tools(self):
-        for tool in ['sha256sum','shasum']:
-            result = self.verify(tool=tool)
-            self.assertEqual(result.returncode,0,result.stderr)
-
-    def test_hash_tools_accept_backslash_and_newline_staging_paths(self):
-        for name in ['archive\\name.tar.gz', 'archive\nname.tar.gz']:
-            destination = self.root/name
-            self.archive.rename(destination)
-            self.archive = destination
-            for tool in ['sha256sum', 'shasum']:
-                if not shutil.which(tool):
-                    continue  # The native Linux/Mac CI jobs supply their real tool.
-                with self.subTest(name=name, tool=tool):
-                    result = self.verify(tool=tool)
-                    self.assertEqual(result.returncode,0,result.stderr)
-
-    def test_missing_malformed_mismatch_unavailable_and_failed_hash_tool(self):
-        for options in [dict(value=''),dict(value='bad'),dict(value='z'*64),dict(value='0'*64),dict(style='false'),dict(tool=None),dict(failing=True)]:
-            result = self.verify(**options)
-            self.assertNotEqual(result.returncode,0,options)
-        self.archive.write_bytes(b'truncated')
-        self.assertNotEqual(self.verify().returncode,0)
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

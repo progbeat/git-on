@@ -1,0 +1,7 @@
+- name: Collect third-party license texts
+  run: |
+    cargo fetch --locked --target=${{ matrix.targets[0] }}
+    python3 scripts/third_party_notices.py --target=${{ matrix.targets[0] }}
+- name: Preserve the supported macOS deployment target
+  if: runner.os == 'macOS'
+  run: echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"

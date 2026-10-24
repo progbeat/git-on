@@ -18,7 +18,9 @@ unix-archive = ".tar.gz"
 # Checksums to generate for each App
 checksum = "sha256"
 # CI backends to support
-ci = []
+ci = ["github"]
+dispatch-releases = true
+github-build-setup = "../dist-setup.yml"
 # Where to host releases
 hosting = "github"
 

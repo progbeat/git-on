@@ -15,7 +15,7 @@ SPEC.loader.exec_module(MOD)
 
 
 def notes(v, kind):
-    return f"# {v}\nBump: {kind}\n\nFix immutable file protection during concurrent writes.\n"
+    return f"# {v}\n<!-- Bump: {kind} -->\n\nFix immutable file protection during concurrent writes.\n"
 
 
 class ReleasePolicyTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 MOD.version(text)
 
     def test_reject_lock_and_notes_mismatch(self):
-        for lock, note in [("0.1.0", notes("0.1.1", "patch")), ("0.1.1", notes("0.2.0", "minor")), ("0.1.1", "# 0.1.1\nBump: patch\n\nTODO write the release notes here.")]:
+        for lock, note in [("0.1.0", notes("0.1.1", "patch")), ("0.1.1", notes("0.2.0", "minor")), ("0.1.1", "# 0.1.1\n<!-- Bump: patch -->\n\nTODO write the release notes here.")]:
             with self.subTest(lock=lock, note=note), self.assertRaises(ValueError):
                 MOD.validate("0.1.1", "0.1.0", lock, note)
 
@@ -67,7 +67,7 @@ class PushBaselineTests(unittest.TestCase):
             before = git('rev-parse', 'HEAD')
             package('0.1.1')
             (root / '.github').mkdir()
-            (root / '.github/release-notes.md').write_text(notes('0.1.1', 'patch'))
+            (root / 'RELEASES.md').write_text(notes('0.1.1', 'patch'))
             git('add', '.')
             git('commit', '-qm', 'version bump')
             (root / 'fix').write_text('bug fix')
@@ -104,7 +104,7 @@ class PushBaselineTests(unittest.TestCase):
             package('0.1.1')
             (root / 'src/main.rs').write_text('fn main() { println!("changed"); }\n')
             (root / '.github').mkdir()
-            (root / '.github/release-notes.md').write_text(notes('0.1.1', 'patch'))
+            (root / 'RELEASES.md').write_text(notes('0.1.1', 'patch'))
             git('add', '.')
             git('commit', '-qm', 'one release change')
             if shape == 'merge':
@@ -136,10 +136,10 @@ class PushBaselineTests(unittest.TestCase):
     def test_two_parent_merge_push(self):
         self.check_push_shape('merge')
 
-    def test_workflow_uses_push_event_for_both_validation_stages(self):
+    def test_workflow_uses_push_event_for_validation(self):
         workflow = (Path(SPEC.origin).parents[1] / '.github/workflows/ci.yml').read_text()
         self.assertNotIn('HEAD^1', workflow)
-        self.assertEqual(workflow.count('--push-event "$GITHUB_EVENT_PATH"'), 2)
+        self.assertEqual(workflow.count('--push-event "$GITHUB_EVENT_PATH"'), 1)
 
 
 class ChangeClassificationTests(unittest.TestCase):
@@ -160,7 +160,7 @@ class ChangeClassificationTests(unittest.TestCase):
                    '[[package]]\nname = "transitive"\nversion = "1.0.0"\n'
                    '[[package]]\nname = "test-only"\nversion = "1.0.0"\n')
         self.write('src/main.rs', 'fn main() {}\n')
-        self.write('.github/release-notes.md', notes('1.1.0', 'minor'))
+        self.write('RELEASES.md', notes('1.1.0', 'minor'))
         self.write('.github/workflows/ci.yml', 'jobs:\n  rust:\n    steps:\n      - run: cargo test\n'
                    '  package:\n    runs-on: ubuntu-22.04\n    steps:\n'
                    '      - run: cargo +1.90.0 build --release --locked\n'
@@ -189,7 +189,6 @@ class ChangeClassificationTests(unittest.TestCase):
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f'release_required={str(release).lower()}\n', output.read_text())
-            self.assertEqual((self.root / 'release-body.md').exists(), release)
         else:
             self.assertNotEqual(result.returncode, 0)
         return result
@@ -197,13 +196,11 @@ class ChangeClassificationTests(unittest.TestCase):
     def bump(self):
         self.replace('Cargo.toml', 'version = "1.1.0"', 'version = "1.2.0"')
         self.replace('Cargo.lock', 'version = "1.1.0"', 'version = "1.2.0"')
-        self.write('.github/release-notes.md', notes('1.2.0', 'minor'))
+        self.write('RELEASES.md', notes('1.2.0', 'minor'))
 
     def test_docs_tests_examples_installer_and_gif_need_no_release(self):
         for name in ['README.md', 'docs/usage.md', 'tests/check.py', 'examples/main.rs', 'install.sh', 'assets/demo.gif']:
             self.write(name, 'non-binary change\n')
-        # Stale body files from a previous invocation cannot authorize publication.
-        self.write('release-body.md', 'old release body\n')
         self.run_policy(False)
 
     def test_source_requires_bump(self):
@@ -242,8 +239,16 @@ class ChangeClassificationTests(unittest.TestCase):
         self.bump()
         self.run_policy(False, success=False)
 
+    def test_generated_release_build_settings_require_bump(self):
+        self.write('.github/workflows/release.yml',
+                   'jobs:\n  build-local-artifacts:\n    runs-on: macos-14\n'
+                   '    steps:\n      - run: dist build --artifacts=local\n')
+        self.run_policy(False, success=False)
+        self.bump()
+        self.run_policy(True)
+
     def test_nonrelease_changes_must_retain_release_notes_bytes(self):
-        path = self.root / '.github/release-notes.md'
+        path = self.root / 'RELEASES.md'
         original = path.read_bytes()
         self.git('config', 'core.autocrlf', 'false')
         for change in ['content', 'deletion', 'line-endings']:
@@ -257,15 +262,15 @@ class ChangeClassificationTests(unittest.TestCase):
                 self.assertIn('keep the current master release notes', result.stderr)
 
     def test_nonrelease_cannot_add_previously_absent_release_notes(self):
-        self.git('rm', '.github/release-notes.md')
+        self.git('rm', 'RELEASES.md')
         self.git('commit', '-qm', 'baseline without release notes')
         self.base = self.git('rev-parse', 'HEAD')
-        self.write('.github/release-notes.md', notes('1.1.0', 'minor'))
+        self.write('RELEASES.md', notes('1.1.0', 'minor'))
         result = self.run_policy(False, success=False)
         self.assertIn('keep the current master release notes', result.stderr)
 
     def test_nonrelease_can_retain_absent_release_notes(self):
-        self.git('rm', '.github/release-notes.md')
+        self.git('rm', 'RELEASES.md')
         self.git('commit', '-qm', 'baseline without release notes')
         self.base = self.git('rev-parse', 'HEAD')
         self.write('README.md', 'documentation only\n')
@@ -420,7 +425,6 @@ class ChangeClassificationTests(unittest.TestCase):
                                 capture_output=True, text=True, env={**os.environ, 'GITHUB_OUTPUT': str(output)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('release_required=false\n', output.read_text())
-        self.assertFalse((self.root / 'release-body.md').exists())
 
     def test_required_checks_have_no_path_filters_or_release_condition(self):
         workflow = (Path(SPEC.origin).parents[1] / '.github/workflows/ci.yml').read_text()

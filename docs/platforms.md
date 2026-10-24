@@ -15,8 +15,9 @@ is part of this release. The same console installer installs the CLI binary.
 
 The Mac CI job runs strict clippy, Rust tests, eleven CLI cases, materialized
 execution and installer tests. Native packaging also executes the extracted
-binary and the generated installer with stock `shasum`; build-only success is
-not substituted for these behavior tests. Actual Mac mounts are not claimed.
+binary and unmodified generated installer. The standard installer can skip
+checksum verification when its utility is absent; build-only success is not
+substituted for behavior tests. Actual Mac mounts are not claimed.
 
 On the owner's Mac27.0.1 (26A434), SDK26.5, the reduced implementation passed
 58 core, 12 binary and 10 remote-source Rust tests, strict metrics clippy,

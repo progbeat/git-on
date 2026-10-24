@@ -203,24 +203,16 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 
 ## Installer acceptance
 
-`python3 tests/test_installer.py` exercises the thin dispatcher's latest/pinned
-selection, missing-tag/asset HTTP failures, optional v, version/install-directory environments and
-exact downstream argv forwarding,
-partial downloads, incomplete piped invocation and status propagation. It also
-checks the generation-time SHA256 correction with GNU and stock Mac tools,
-including absent/malformed/mismatched metadata and failed/missing hash tools.
-These offline fixtures execute no downloaded release binary.
+`python3 tests/test_installer.py` exercises the thin dispatcher's environment
+selection, exact argv forwarding and ordinary streaming/error/signal behavior.
+All seven cases use isolated local fixtures.
 
-Native packaging jobs build real archives, execute the extracted binary and
-compare embedded THIRD_PARTY_NOTICES to the target-specific generated file.
-Assembly checks the original incoming hashes and source/target provenance before
-regeneration. `tests/dist_installer.py --dist dist --install-dir /absolute/path`
-then executes the actual corrected generated installer and packaged host binary:
-install/update, corrupt/truncated archive preservation and destination-staging
-failure/signal cleanup. The Mac job repeats with `--without-gnu-hash`, excluding
-GNU sha256sum and requiring stock shasum. The installed Linux binary runs the
-real-FUSE integration suite; the installed Mac CLI runs materialized behavior.
-Installer fixture success does not substitute for those packaged-binary checks.
+Native package jobs use stock `dist build`, execute the extracted binary and
+compare bundled license texts. `python3 tests/dist_installer.py target/distrib`
+serves those local artifacts over loopback and exercises the unmodified
+installer's help, installation and reinstallation in a temporary HOME. It accepts
+upstream checksum policy, including a skip when the utility is absent. Packaged
+Linux binaries run real FUSE checks; Mac binaries run CLI/materialized behavior.
 
 ## 1.3 verification
 
@@ -230,9 +222,9 @@ helper and checks explicit policy selection, bytes/links/modes, argv, source
 isolation, fresh runs, unsupported entries, signals and cleanup; macOS also
 exercises its case-insensitive filesystem collision guard.
 
-`python3 tests/test_installer.py` checks the thin dispatcher and fail-closed
-checksum correction. Packaging runs `tests/dist_installer.py --dist dist
---install-dir /absolute/path` against the actual generated installer and archive.
+`python3 tests/test_installer.py` checks the thin dispatcher. Packaging runs
+`tests/dist_installer.py target/distrib` against the stock generated installer
+and native archive.
 No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.

@@ -150,12 +150,12 @@ def binary_lock(manifest, lock):
 
 
 def distribution_build(workflow):
-    # The package job is the authoritative distribution build. Test-only jobs
-    # and the publication job cannot change its executable. Inherited env and
+    # Native package validation and the generated release build can affect the
+    # executable. Test-only and publication jobs do not. Inherited env and
     # run defaults also affect compilation (for example RUSTFLAGS or shell).
     # Comparing their complete YAML blocks is deliberately conservative and
     # requires no external YAML parser in the policy job.
-    matches = re.findall(r"^  (package(?:-build|-assemble)?):\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*\n|\Z)", workflow,
+    matches = re.findall(r"^  (package(?:-build|-assemble)?|build-local-artifacts):\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*\n|\Z)", workflow,
                          re.M | re.S)
     inherited = re.findall(r"^(?:env|defaults):[^\n]*(?:\n(?:[ \t].*|[ \t]*|\#.*))*", workflow, re.M)
     return (tuple(matches), tuple(inherited))
@@ -176,7 +176,7 @@ def release_reasons(base, current_manifest, current_lock):
     # agrees with CI after those files are added.
     changed = subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z", base, "--"], text=True).split("\0")
     changed += subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], text=True).split("\0")
-    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml", "dist-workspace.toml", "scripts/fetch_dist.sh", "scripts/third_party_notices.py"}
+    build_paths = {"build.rs", "rust-toolchain", "rust-toolchain.toml", "dist-workspace.toml", ".github/dist-setup.yml", "scripts/third_party_notices.py"}
     for manifest in (old_manifest, current_manifest):
         if isinstance(manifest["package"].get("build"), str):
             build_paths.add(manifest["package"]["build"])
@@ -192,11 +192,11 @@ def release_reasons(base, current_manifest, current_lock):
         reasons.append("Cargo.toml binary settings")
     if old_lock_text is None or binary_lock(current_manifest, current_lock) != binary_lock(old_manifest, tomllib.loads(old_lock_text)):
         reasons.append("Cargo.lock runtime/build dependencies")
-    workflow_name = ".github/workflows/ci.yml"
-    if workflow_name in changed:
-        current_workflow = Path(workflow_name).read_text() if Path(workflow_name).exists() else ""
-        if distribution_build(current_workflow) != distribution_build(old_text(workflow_name) or ""):
-            reasons.append("distribution build job")
+    for workflow_name in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
+        if workflow_name in changed:
+            current_workflow = Path(workflow_name).read_text() if Path(workflow_name).exists() else ""
+            if distribution_build(current_workflow) != distribution_build(old_text(workflow_name) or ""):
+                reasons.append("distribution build job")
     return old_manifest["package"]["version"], reasons
 
 
@@ -211,9 +211,10 @@ def validate(current, previous, locked, notes):
     if locked != current:
         raise ValueError("Cargo.lock git-on version differs from Cargo.toml")
     lines = notes.splitlines()
-    if len(lines) < 4 or lines[0] != f"# {current}" or not lines[1].startswith("Bump: "):
-        raise ValueError("release notes must begin with '# VERSION' then 'Bump: KIND'")
-    kind = lines[1][6:]
+    kind_match = re.fullmatch(r"<!-- Bump: (\w+) -->", lines[1]) if len(lines) >= 4 else None
+    if not kind_match or lines[0] != f"# {current}":
+        raise ValueError("release notes must begin with '# VERSION' then '<!-- Bump: KIND -->'")
+    kind = kind_match[1]
     if previous is None:
         if (current, kind) != ("0.1.0", "initial"):
             raise ValueError("first Cargo package must establish 0.1.0 / initial")
@@ -253,16 +254,13 @@ def check(base):
     subprocess.run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], check=True, stdout=subprocess.DEVNULL)
     old, reasons = release_reasons(base, manifest, lock)
     required = bool(reasons)
-    body_path = Path("release-body.md")
-    body_path.unlink(missing_ok=True)
     if required:
-        body = validate(package["version"], old, own["version"], Path(".github/release-notes.md").read_text())
-        body_path.write_text(body + "\n")
+        validate(package["version"], old, own["version"], Path("RELEASES.md").read_text())
         print(f"Validated {old or '(initial)'} -> {package['version']}: {', '.join(reasons)}")
     else:
         if package["version"] != old:
             raise ValueError("no binary changes: keep the current master version and skip publication")
-        notes_name = ".github/release-notes.md"
+        notes_name = "RELEASES.md"
         base_notes_path = subprocess.check_output(["git", "ls-tree", "--name-only", base, "--", notes_name])
         base_notes = subprocess.check_output(["git", "show", f"{base}:{notes_name}"]) if base_notes_path else None
         notes_path = Path(notes_name)
