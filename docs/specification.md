@@ -20,7 +20,7 @@ separate from that contract; a requirement is not a claim of a passing test.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
   accept one operand for the local revision or two for repository and
-  revision. Recognized `--keep`/`-k`/`--verify` and
+  revision. Recognized `--verify` and
   `--write-policy=none|ignored|untracked|all` options may appear anywhere before
   the separator, interspersed with those operands. Boolean options may
   repeat and combine idempotently. Parse only git-on's recognized options;
@@ -38,7 +38,8 @@ separate from that contract; a requirement is not a claim of a passing test.
   spellings after the separator are ordinary command argv.
 - Migration from 0.1.x requires inserting the separator before every command:
   `git on REV command args` becomes `git on REV -- command args`.
-  To retain generated files, use `git on REV --keep -- command args`.
+  `--keep` and `-k` before the separator are removed options and return usage 2.
+  Save required logs and artifacts to explicit external paths.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
@@ -75,7 +76,7 @@ is part of this bug fix; it does not require a major version increment.
 - Caller refs, index and working files must stay untouched. Fetch destinations
   are confined to the private repository. Existing object-demand, filter,
   cancellation, SSH ownership, cache and filesystem contracts still apply;
-  there is no full-checkout fallback to make an input succeed.
+  materialization cannot bypass any Git resolution, verification or object error.
 - Native operations use the caller's Git configuration and object-location
   environment. Resolve local revisions and read the objects from the same
   Git-selected object database, including object directories and alternates.
@@ -127,26 +128,40 @@ The same FUSE and write-policy contract below applies to local and remote runs.
   storage under the system temporary location and respects `TMPDIR`; git-on
   creates no private memory filesystem and imposes no disk quota. The underlying
   temporary filesystem's capacity and operating-system limits still apply.
-- Default completion unmounts and deletes the writable layer. `--keep` unmounts
-  but preserves that backing directory and reports the containing temporary
-  directory on stderr; retained named files are under `backing/`. It does
-  not retain a mount, duplicate untouched source files, or reuse those writes in
-  another invocation. Host paths explicitly written by the command are outside
-  this cleanup scope.
-  In `all`, retained artifacts include copied-up modified files and generated
-  files. Deleted source paths are absent; whiteouts and source-directory redirects
-  are session-only namespace state. Untouched descendants of a renamed source
-  directory are omitted from retained artifacts. `backing/` is neither a complete
-  checkout nor a durable format for replaying deletions and renames.
+- Completion unmounts (when mounted) and deletes the private execution tree.
+  `--keep` and `-k` are removed before the separator; child argv remains literal.
+  Host paths explicitly written by the command are outside this cleanup scope.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
   locking, releasing the exact Git pin and identifying the owned SSH socket;
   it is not a run manifest or log.
-  `git on --cleanup <temporary-directory>` must refuse active or deliberately
-  retained directories, avoid unrelated mounts and changed pin targets, and
+  `git on --cleanup <temporary-directory>` must refuse active directories, avoid unrelated mounts and changed pin targets, and
   never terminate processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
+
+## Backend selection and materialization
+
+Linux FUSE is preferred whenever available and capable of the requested behavior.
+Missing kernel passthrough is only an optimization limitation and retains
+ordinary FUSE I/O. Before launching the child, discovery identifies absent or
+inaccessible `/dev/fuse` or `fusermount3`. macOS mounts are outside 1.3.0 and are
+tracked by [issue #12](https://github.com/progbeat/git-on/issues/12); the Mac CLI
+reports this concrete capability limitation without probing or activating an
+extension. Only explicit `--write-policy=all` permits an ordinary private-directory
+backend in these cases. Other mount failures remain errors. Never rerun a command
+after a mount or runtime failure. Protected policies never become all implicitly.
+See [platform requirements](platforms.md).
+
+The materialized backend reads the same pinned tree eagerly, preserves bytes,
+symlinks and executable modes, and never applies checkout filters or fabricates
+`.git`. Unsupported objects/names, case or normalization collisions and host
+symlink/permission limitations fail before launch, rather than overwriting,
+renaming or omitting entries. This can fail on an entry the child would not use.
+It costs full-tree startup time, network transfers and temporary disk space.
+Host filesystem operations, xattrs and locks follow the host's ordinary behavior;
+this backend implements the explicit-all subset, not protected FUSE policies.
+The lazy startup/performance requirements below apply to the FUSE backend.
 
 ## FUSE operation coverage requirement
 

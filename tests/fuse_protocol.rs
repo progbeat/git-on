@@ -5,6 +5,7 @@
 #![cfg(target_os = "linux")]
 use fuser::{Session, SessionACL};
 use git2::Repository;
+use git_on::backend::linux::Fuse;
 use git_on::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -65,6 +66,9 @@ impl Peer {
         Self::with_policy(WritePolicy::Ignored)
     }
     fn with_policy(policy: WritePolicy) -> Self {
+        Self::with_init(policy, false)
+    }
+    fn with_init(policy: WritePolicy, extended: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -115,9 +119,15 @@ impl Peer {
             0
         );
         let task = std::thread::spawn(move || {
-            Session::from_fd(overlay, server, SessionACL::All)
-                .run()
-                .unwrap();
+            Session::from_fd(
+                Fuse::new(overlay),
+                server,
+                SessionACL::All,
+                fuser::Config::default(),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
         });
         let mut p = Self {
             fd,
@@ -129,17 +139,26 @@ impl Peer {
             gid: unsafe { libc::getegid() },
             _temp: temp,
         };
-        let init = p.ok(
-            26,
+        let minor = if extended { 40 } else { 31 };
+        let mut body = vec![
+            7,
+            minor,
             0,
-            u32s(&[
-                7,
-                31,
-                0,
-                (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
-            ]),
-        );
-        assert_eq!(&init[..8], &u32s(&[7, 31]));
+            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
+        ];
+        if extended {
+            body[3] |= 1 << 30; // FUSE_INIT_EXT
+            body.push(1 << 5); // FUSE_PASSTHROUGH high flag
+            body.extend([0; 11]);
+        }
+        let init = p.ok(26, 0, u32s(&body));
+        assert_eq!(&init[..4], &u32s(&[7]));
+        let daemon_minor = u32::from_ne_bytes(init[4..8].try_into().unwrap());
+        // FUSE negotiates MIN(kernel, daemon), not equality of advertisements.
+        // Upstream fuser0.18 advertises7.40 while accepting a legacy7.31 peer.
+        // The complete operation suite below still uses the peer's7.31 layout.
+        // https://man7.org/linux/man-pages/man4/fuse.4.html (FUSE_INIT)
+        assert_eq!(minor.min(daemon_minor), minor);
         // No POSIX locks, readdirplus or writeback-cache capabilities enabled.
         let flags = u32::from_ne_bytes(init[12..16].try_into().unwrap());
         assert_eq!(
@@ -223,17 +242,30 @@ impl Peer {
     fn release(&mut self, ino: u64, fh: u64) {
         self.ok(18, ino, [u64s(&[fh]), u32s(&[0, 0]), u64s(&[0])].concat());
     }
+    fn destroy(&mut self) {
+        // Upstream ends its event loop on DESTROY. Socket EOF is an invalid
+        // request, unlike a real device's ENODEV after unmount. Require both
+        // the protocol acknowledgement and successful session completion.
+        self.ok(38, 0, vec![]);
+        self.task.take().unwrap().join().unwrap();
+    }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        if self.task.is_some() && !std::thread::panicking() {
+            self.destroy();
+        }
         unsafe {
             libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
         }
-        if let Some(task) = self.task.take() {
-            if !std::thread::panicking() {
-                task.join().unwrap();
-            }
-        }
+    }
+}
+
+#[test]
+fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
+    for extended in [false, true] {
+        let mut peer = Peer::with_init(WritePolicy::Ignored, extended);
+        peer.ok(3, 1, vec![0; 16]); // successful real dispatch after INIT
     }
 }
 
@@ -251,8 +283,7 @@ fn protocol_lifecycle_lookup_forget_and_batch_forget() {
     p.send(42, 0, [u32s(&[2, 0]), u64s(&[a, 1, b, 1])].concat());
     p.err(3, a, vec![0; 16], libc::ENOENT);
     p.err(3, b, vec![0; 16], libc::ENOENT);
-    p.ok(38, 0, vec![]);
-    p.err(3, 1, vec![0; 16], libc::EIO);
+    p.destroy(); // DESTROY is terminal; no requests follow its acknowledgement.
 }
 
 #[test]

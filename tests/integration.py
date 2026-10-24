@@ -78,8 +78,8 @@ class RepositoryTest(unittest.TestCase):
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         return env
 
-    def invoke(self, *command, tree="HEAD", keep=False, input=None, timeout=60, extra_env=None):
-        return self.invoke_argv([*(["--keep"] if keep else []), tree, "--", *map(str, command)],
+    def invoke(self, *command, tree="HEAD", input=None, timeout=60, extra_env=None):
+        return self.invoke_argv([tree, "--", *map(str, command)],
                                 input=input, timeout=timeout, extra_env=extra_env)
 
     def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
@@ -120,7 +120,7 @@ class CliTests(RepositoryTest):
                 self.assertIn(b"Usage: git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]", result.stdout)
                 self.assertIn(b"Arguments:", result.stdout)
                 self.assertIn(b"Options:", result.stdout)
-                self.assertIn(b"-k, --keep", result.stdout)
+                self.assertNotIn(b"--keep", result.stdout)
                 self.assertIn(b"--verify", result.stdout)
                 self.assertIn(b"Local REV, or REPOSITORY REV", result.stdout)
                 self.assertIn(b"native Git", result.stdout)
@@ -1971,7 +1971,7 @@ assert p.exists()
         result, _ = self.python("from pathlib import Path\nfor name in ['external-only.tmp','global-only.tmp']:\n try: Path(name).write_text('bad')\n except OSError: pass\n else: raise AssertionError(name)")
         self.assert_success(result)
 
-    def start_sleeping_run(self, keep=False):
+    def start_sleeping_run(self):
         ready = self.root / "child-ready"
         code = r"""
 import json, os, sys, time
@@ -1983,7 +1983,7 @@ pending.write_text(json.dumps({'pid': os.getpid(), 'run': str(Path.cwd().parent)
 pending.replace(ready)
 time.sleep(300)
 """
-        process = subprocess.Popen([str(BINARY), *(["--keep"] if keep else []), "HEAD", "--",
+        process = subprocess.Popen([str(BINARY), "HEAD", "--",
                                     sys.executable, "-c", code, str(ready)], cwd=self.repo,
                                    env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 20
@@ -2050,124 +2050,10 @@ time.sleep(300)
         self.assertEqual(list(self.system_tmp.iterdir()), [sibling])
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
-    def test_keep_preserves_backing_reports_path_and_refuses_cleanup(self):
-        result, run = self.python("from pathlib import Path; Path('out/result').write_text('retained'); print('child-output')", keep=True)
-        self.assert_success(result)
-        self.assertIsNotNone(run)
-        self.assertEqual(result.stdout, b"child-output\n")
-        self.assertEqual(result.stderr, f"git-on: kept temporary files at {run}\n".encode())
-        self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
-        self.assertTrue((run / ".state").is_file())
-        self.assertFalse((run / "mount").exists())
-        self.assertEqual((run / "backing/out/result").read_text(), "retained")
-        self.assertEqual(set(path.name for path in run.iterdir()), {".state", ".lock", "backing"})
-        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
-        state = (run / ".state").read_bytes()
-        cleanup = self.cleanup_run(run)
-        self.assertNotEqual(cleanup.returncode, 0)
-        self.assertIn(b"kept", cleanup.stderr.lower())
-        self.assertEqual((run / ".state").read_bytes(), state)
-        self.assertEqual((run / "backing/out/result").read_text(), "retained")
 
-    def test_keep_spellings_and_positions_retain_real_subtree_writes(self):
-        arguments = ["--keep", "-k", "--unknown", "--", "", b"-raw-\xff"]
-        expected = [os.fsencode(arg) for arg in arguments]
-        code = f"from pathlib import Path; import os,sys; assert list(map(os.fsencode, sys.argv[1:])) == {expected!r}; Path('generated').mkdir(); Path('generated/result').write_text('retained'); print('child-output')"
-        tree = "HEAD:subtree"
-        for prefix in (["--keep", tree, "--"], ["-k", tree, "--"], [tree, "--keep", "--"],
-                       [tree, "-k", "--"], ["-k", "--keep", tree, "-k", "--keep", "--"]):
-            with self.subTest(prefix=prefix):
-                result, run = self.invoke_argv([*prefix, sys.executable, "-c", code, *arguments])
-                self.assert_success(result)
-                self.assertIsNotNone(run)
-                self.assertEqual(result.stdout, b"child-output\n")
-                self.assertEqual(result.stderr, f"git-on: kept temporary files at {run}\n".encode())
-                self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
-                self.assertFalse((run / "mount").exists())
-                self.assertEqual((run / "backing/generated/result").read_text(), "retained")
-                self.assertFalse((run / "backing/source.txt").exists())
-                self.assertEqual(set(path.name for path in run.iterdir()), {".state", ".lock", "backing"})
-                self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
-                state = (run / ".state").read_bytes()
-                cleanup = self.cleanup_run(run)
-                self.assertNotEqual(cleanup.returncode, 0)
-                self.assertIn(b"kept", cleanup.stderr.lower())
-                self.assertEqual((run / ".state").read_bytes(), state)
-                self.assertEqual((run / "backing/generated/result").read_text(), "retained")
-                shutil.rmtree(run)
-                self.assert_no_runtime_files()
 
-    def test_keep_exports_only_live_writable_paths_and_preserves_links(self):
-        result, run = self.python(r"""
-import os
-from pathlib import Path
-Path('out/original/subdir').mkdir(parents=True)
-Path('out/original/subdir/value').write_text('payload')
-os.chmod('out/original/subdir/value', 0o640)
-os.rename('out/original', 'out/renamed')
-Path('out/renamed/deleted').write_text('discard me')
-os.unlink('out/renamed/deleted')
-Path('out/removed-dir').mkdir()
-os.rmdir('out/removed-dir')
-Path('out/empty').mkdir()
-os.chmod('out/empty', 0o750)
-os.link('out/renamed/subdir/value', 'out/hardlink')
-os.symlink('renamed/subdir/value', 'out/symlink')
-os.symlink('../tracked.txt', 'out/lower-link')
-os.symlink('missing-target', 'out/dangling')
-Path('out/replaced').write_text('old')
-Path('out/replacement').write_text('new')
-os.replace('out/replacement', 'out/replaced')
-""", keep=True)
-        self.assert_success(result)
-        self.assertIsNotNone(run)
-        backing = run / "backing"
-        expected = {"out", "out/renamed", "out/renamed/subdir", "out/renamed/subdir/value",
-                    "out/empty", "out/hardlink", "out/symlink", "out/lower-link", "out/dangling",
-                    "out/replaced"}
-        actual = {str(path.relative_to(backing)) for path in backing.rglob('*')}
-        self.assertEqual(actual, expected)
-        target = backing / "out/renamed/subdir/value"
-        self.assertEqual(target.read_text(), "payload")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
-        self.assertEqual(stat.S_IMODE((backing / "out/empty").stat().st_mode), 0o750)
-        self.assertEqual((backing / "out/hardlink").stat().st_ino, target.stat().st_ino)
-        self.assertEqual(target.stat().st_nlink, 2)
-        self.assertEqual(os.readlink(backing / "out/symlink"), "renamed/subdir/value")
-        self.assertEqual((backing / "out/symlink").read_text(), "payload")
-        self.assertEqual(os.readlink(backing / "out/lower-link"), "../tracked.txt")
-        self.assertEqual(os.readlink(backing / "out/dangling"), "missing-target")
-        self.assertEqual((backing / "out/replaced").read_text(), "new")
-        self.assertFalse((backing / "tracked.txt").exists())
-        self.assertFalse((backing / "out/protected.txt").exists())
-        self.assertFalse((run / "mount").exists())
-        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
 
-    def test_keep_preserves_artifacts_on_command_failure_and_signal(self):
-        for outcome in ["raise SystemExit(37)", "os.kill(os.getpid(), signal.SIGTERM)"]:
-            with self.subTest(outcome=outcome):
-                result, run = self.python("from pathlib import Path; import os,signal; Path('out/failure').write_text('saved'); " + outcome, keep=True)
-                expected = (37,) if outcome.startswith("raise") else (-signal.SIGTERM,)
-                self.assertIn(result.returncode, expected, result.stderr)
-                self.assertIsNotNone(run)
-                self.assertEqual((run / "backing/out/failure").read_text(), "saved")
-                self.assertFalse((run / "mount").exists())
-                self.assertIn(os.fsencode(run), result.stderr)
-                self.assertNotEqual(self.cleanup_run(run).returncode, 0)
-        self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
-    def test_keep_after_spawn_failure_retains_only_runtime_metadata_and_backing(self):
-        result, run = self.invoke("git-on-certainly-nonexistent-executable", keep=True)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(b'cannot start command "git-on-certainly-nonexistent-executable"', result.stderr)
-        self.assertIn(b'check the command on PATH', result.stderr)
-        self.assertIsNotNone(run)
-        self.assertIn(os.fsencode(run), result.stderr)
-        self.assertTrue((run / "backing").is_dir())
-        self.assertFalse((run / "mount").exists())
-        self.assertFalse((run / "stdout.log").exists())
-        self.assertFalse((run / "stderr.log").exists())
-        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
 
     def test_only_tree_oid_is_injected_and_tmpdir_is_private_then_removed(self):
         code = r"""
@@ -2222,12 +2108,15 @@ class UvTests(RepositoryTest):
                 git(self.repo, "add", "--force", "--all")
                 git(self.repo, "commit", "--quiet", "-m", f"add {example}")
                 command = ["uv", "run", "--locked", "--script", "main.py"] if example == "pep723" else ["uv", "run", "--locked", "main.py"]
-                flag = "-k" if example == "pep723" else "--keep"
-                result, run = self.invoke_argv([f"HEAD:{example}", flag, "--", *command], timeout=300)
+                result, run = self.invoke_argv([f"HEAD:{example}", "--", *command], timeout=300)
                 self.assert_success(result)
                 self.assertIn(b"cache-reused", result.stdout)
-                self.assertTrue(list((run / "backing").rglob("*.nbc")), "Numba compiled cache must be retained")
-                self.assertTrue(list((run / "backing").rglob("*.pyc")), "Local import bytecode must be retained")
+                self.assertIsNone(run)
+                # uv creates its own lock files in inherited TMPDIR. Those are
+                # ordinary child host side effects, not git-on execution state.
+                self.assertTrue(all(p.name.startswith("uv-") and p.suffix == ".lock"
+                                    for p in self.system_tmp.iterdir()))
+                self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
 
 if __name__ == "__main__":

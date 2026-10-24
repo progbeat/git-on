@@ -107,7 +107,7 @@ fallbacks (including locks, polling, seeking, and copying).
 `tests/write_policy.py` exercises all four policies through real mounts. It
 checks ignored and unignored creation, tracked contents and parent-directory
 protection, file/directory renames and deletion, symlinks/hardlinks, metadata,
-open-handle coherence, sparse `--keep` exports, command errors and SIGINT cleanup.
+open-handle coherence, disposable overlay cleanup, command errors and SIGINT cleanup.
 Its dirty-index/working-copy fixture verifies that `untracked` means absent from
 the selected commit. Source checks include ignored host files to catch leaks.
 
@@ -172,15 +172,15 @@ raw and subtree tree objects; executable modes; literal and non-UTF-8 argv;
 binary standard streams and inherited stdin; exit/signal return codes; direct
 terminal detection, PTY foreground ownership and stop/continue handling; missing
 executables; forwarded signals; default temporary-layer removal; `TMPDIR`
-selection; mandatory command separators; `--keep`/`-k` and compatibility argument
+selection; mandatory command separators; removed `--keep`/`-k` rejection and literal child argument
 parsing; exact argument forwarding after the first separator; rejected old direct
 command syntax, extra operands and unknown options without runtime state; retention
 after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
-active or deliberately retained state; retained busy mounts and explicit
+active state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
 runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
-retain the writable layer with `--keep` and inspect its `backing/__pycache__/` directly.
+inspect caches inside the command or explicitly copy them to an external path.
 
 Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
 during startup transport and after the mounted child starts. SIGKILL observations
@@ -203,28 +203,28 @@ a real FUSE device for this suite; host-only oracle self-tests are separate.
 
 ## Installer acceptance
 
-`python3 tests/test_installer.py` runs offline latest/pinned release selection,
-repeat installation, updates, checksum/download failure preservation, unsafe
-archives/destinations, platform checks, and atomic replacement regressions.
-Shell curl/gh transport fixtures exercise the actual `sh install.sh` entrypoint
-with an explicit tools-only PATH containing no Python or jq. Tests cover
-one-time latest resolution, pinned original/current archive layouts, checksum and
-download failures, duplicates/links, destination races, signals, relative PATH,
-replacement failure and incomplete piped scripts.
-Focused regressions also cover fresh destinations under `umask 0002`, probe
-children holding stdout, shell metacharacters in diagnostic paths, and duplicate
-checksum entries in the legacy compatibility guard.
+`python3 tests/test_installer.py` exercises the thin dispatcher's environment
+selection, exact argv forwarding and ordinary streaming/error/signal behavior.
+All seven cases use isolated local fixtures.
 
-`python3 tests/installer_smoke.py --binary target/debug/git-on` constructs a
-minimal Docker root filesystem from local utilities/shared libraries. Python and
-jq are absent from that filesystem. With the network disabled and root filesystem
-read-only, it installs the actual binary through latest/pinned paths, upgrades,
-and verifies download/checksum failure preservation. No registry image or package
-download is needed; Python runs only in the external developer test harness.
+Native package jobs use stock `dist build`, execute the extracted binary and
+compare bundled license texts. `python3 tests/dist_installer.py target/distrib`
+serves those local artifacts over loopback and exercises the unmodified
+installer's help, installation and reinstallation in a temporary HOME. It accepts
+upstream checksum policy, including a skip when the utility is absent. Packaged
+Linux binaries run real FUSE checks; Mac binaries run CLI/materialized behavior.
 
-The Ubuntu 22.04 `package` job passes the actual release assets to
-`python3 tests/test_installer.py --dist dist --install-dir "$PWD/installed"`, then
-runs the complete real-FUSE integration suite against `installed/git-on`. The
-acceptance test also guards the legacy three-asset/two-checksum-entry contract
-and verifies the distributed LICENSE.
-Installer fixtures are not a substitute for that packaged-binary mount test.
+## 1.3 verification
+
+`python3 tests/materialized.py target/debug/git-on` performs actual no-FUSE
+execution, never a mocked or claimed real mount. It isolates PATH from the FUSE
+helper and checks explicit policy selection, bytes/links/modes, argv, source
+isolation, fresh runs, unsupported entries, signals and cleanup; macOS also
+exercises its case-insensitive filesystem collision guard.
+
+`python3 tests/test_installer.py` checks the thin dispatcher. Packaging runs
+`tests/dist_installer.py target/distrib` against the stock generated installer
+and native archive.
+No old archive-layout compatibility path is implemented.
+See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
+the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.

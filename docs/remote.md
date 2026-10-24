@@ -103,8 +103,9 @@ never substitutes for resolving the current operand through Git.
 These limits bound persistent retention. Active temporary objects and normal
 ignored writes have no runner quota; ordinary system disk limits apply.
 Completion removes the temporary remote repository and owned SSH connection.
-`--keep` preserves generated files under `backing/` using existing retention and
-cleanup rules. Busy mounts preserve recovery state for stale-run cleanup.
+Write required results to explicit external paths. Busy mounts preserve recovery
+state for stale-run cleanup. Explicit-all materialization eagerly fetches every
+selected tree entry; it never bypasses authentication, verification or object errors.
 
 SIGKILL cannot run cleanup handlers. The runner does not request FUSE
 `auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected

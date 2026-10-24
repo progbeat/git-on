@@ -18,9 +18,9 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FUSER_VERSION = "0.16.0"
-FUSER_CHECKSUM = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
-TRAIT_SHA256 = "6d47b0047ba5917f4534ab34186152e1ef909ab04323bdc8d4bc7e9a87479fdf"
+FUSER_VERSION = "0.18.0"
+FUSER_CHECKSUM = "b82b6597d216503555ead6b358f341ef748869bf5c6fbae6a0cb9dd231baecfd"
+TRAIT_SHA256 = "a194e6a4dc19ae08a007a03d2eee6dc7cf9801da7584e3e13fe7bada7bd47c08"
 
 
 def require(condition, message):
@@ -94,7 +94,7 @@ def classifications(trait, overrides):
     require(set(overrides) <= set(trait), "Overlay method missing from pinned Filesystem trait")
     return {name: ("macos-only" if item["macos"] else
                    "implemented" if name in overrides else
-                   "unsupported" if "reply.error(ENOSYS)" in item["body"] else
+                   "unsupported" if re.search(r"reply\.error\((?:[A-Za-z_:]+::)?ENOSYS\)", item["body"]) else
                    "inherited") for name, item in trait.items()}
 
 
@@ -154,22 +154,20 @@ def check(root=ROOT):
     packages = [p for p in lock["package"] if p["name"] == "fuser"]
     require(len(packages) == 1, "expected exactly one locked fuser dependency")
     locked = packages[0]
-    require((locked["version"], locked.get("checksum")) == (FUSER_VERSION, FUSER_CHECKSUM),
+    require(locked["version"] == FUSER_VERSION and locked.get("source", "").startswith("registry+") and locked.get("checksum")==FUSER_CHECKSUM,
             "fuser dependency changed; review callback contract, matrix and fingerprint")
     metadata = host_metadata(root)
     packages = [p for p in metadata["packages"] if p["name"] == "fuser"]
     require(len(packages) == 1 and packages[0]["version"] == FUSER_VERSION,
             "cargo metadata differs from reviewed fuser version")
     package = packages[0]
-    resolved = next(n for n in metadata["resolve"]["nodes"] if n["id"] == package["id"])
-    require("abi-7-31" in resolved["features"], "reviewed FUSE ABI 7.31 is not enabled")
     library = next(t for t in package["targets"] if "lib" in t["kind"])
     source = Path(library["src_path"]).read_text()
     trait_source = block(source, "pub trait Filesystem")
     require(hashlib.sha256(trait_source.encode()).hexdigest() == TRAIT_SHA256,
             "fuser Filesystem trait changed; review all callback/default semantics")
     trait = methods(trait_source)
-    overlay = methods(block((root / "src/filesystem.rs").read_text(), "impl Filesystem for Overlay"))
+    overlay = methods(block((root / "src/backend/linux.rs").read_text(), "impl Filesystem for Fuse"))
     expected = classifications(trait, overlay)
     document = (root / "docs/fuse-coverage.md").read_text()
     aliases = {}

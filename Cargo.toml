@@ -1,10 +1,11 @@
 [package]
 name = "git-on"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
 license = "MIT"
+repository = "https://github.com/progbeat/git-on"
 
 [features]
 default = []
@@ -19,7 +20,6 @@ required-features = ["test-metrics"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
-fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 gix-glob = "0.29"
 gix-quote = "0.6.1"
@@ -36,3 +36,11 @@ tempfile = "3"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.18.0", default-features = false }

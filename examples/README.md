@@ -40,7 +40,7 @@ The same workload can fetch a configured remote and change directory inside the
 snapshot before invoking uv:
 
 ```console
-git on origin main -k -- sh -c 'cd examples/uv-project && uv run --locked main.py'
+git on origin main -- sh -c 'cd examples/uv-project && uv run --locked main.py'
 ```
 
 With two positional operands, Git interprets the second as a fetch refspec;
@@ -55,15 +55,6 @@ lockfiles also pin and hash the llvmlite dependency. Python 3.11–3.13 is requi
 CI validates these with uv 0.8.22. Initial execution needs package-index access.
 
 Inside git-on, the writable snapshot layer is temporary. Cache reuse is within
-one run; a later run starts fresh. To inspect the generated caches afterward,
-retain that layer explicitly:
-
-```console
-git on HEAD:examples/pep723 -k -- uv run --locked --script main.py
-git on HEAD:examples/uv-project --keep -- uv run --locked main.py
-```
-
-After unmounting, git-on prints the retained temporary-directory path on stderr.
-The generated local-import and Numba cache files are under its
-`backing/__pycache__/` directory. No automatic artifact copy or output-directory environment variable
-is involved. Delete the retained directory when you no longer need it.
+one run; a later run starts fresh. Required caches or outputs can be copied to an
+explicit external path while the command runs. `--keep` and `-k` were removed in
+1.3.0; no retained overlay export or output-directory variable is provided.

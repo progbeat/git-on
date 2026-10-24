@@ -1,8 +1,8 @@
 # FUSE callback acceptance matrix
 
-This is the reviewed operation inventory for **fuser 0.16.0, Linux, ABI 7.31**.
+This is the reviewed operation inventory for **registry fuser 0.18.0 and Linux ABI 7.40**.
 It is a test contract, not an assertion that any particular CI run passed.
-The dependency has 44 trait methods: 25 implemented by `Overlay`, 3 inherited
+The dependency has 44 trait methods: 26 implemented by the Linux adapter and shared `Overlay`, 2 inherited
 lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
 
 ## Evidence layers and limits
@@ -18,7 +18,7 @@ lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
   alongside the targeted operation tests below. Missing FUSE must fail rather
   than turn a real-mount claim into a skipped test.
 - Rust helper/unit tests additionally check policy, object loading, retention,
-  inode reclamation, append/mmap behavior and kept-layer export. They do not
+  inode reclamation, append/mmap behavior and disposable-layer cleanup. They do not
   replace either layer above.
 - A test mapped to a callback is not a measured percentage of statements,
   branches or all possible inputs. Kernel caching, `DefaultPermissions`,
@@ -46,7 +46,7 @@ The checker resolves the dependency source with `cargo metadata --locked
 Filtering prevents an already-built Linux checkout from needing unused wasm or
 Windows dependency downloads. It verifies the locked version/checksum and reviewed trait-source
 fingerprint, enumerates every method including platform exclusions, compares
-the actual `Overlay` overrides and default handler classifications, and checks
+the actual Linux adapter overrides and default handler classifications, and checks
 that named tests still exist. A dependency or trait change requires an explicit
 review and fingerprint update, not merely adding the new method's name here.
 
@@ -110,12 +110,12 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 <!-- CALLBACK MATRIX START -->
 | Callback | Classification | Protocol tests | Mounted behavior tests | Assertions and limitations |
 | --- | --- | --- | --- | --- |
-| init | inherited | P-life | I-snapshot | ABI negotiation succeeds; optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
-| destroy | inherited | P-life | I-snapshot | DESTROY terminates dispatch lifecycle; a subsequent ordinary request returns EIO. Default hook has no application-side work; export/cleanup use Drop and separate lifecycle tests. |
+| init | implemented | P-life | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
+| destroy | inherited | P-life | I-snapshot | DESTROY is acknowledged and the session thread joins successfully; no requests follow termination. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
 | lookup | implemented | P-life, P-namespace | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
-| getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. |
+| getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. `passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` and the real enabled/fallback suite cover metadata through O_PATH after unlink or replacement. |
 | setattr | implemented | P-access, P-bounds, P-metadata, P-sparse | I-file, I-directory, I-partial | Owner/nonowner decisions, changed uid/gid, readonly/stale/mismatched handle and immutable rejection, size overflow, explicit/now times; sparse grow/shrink reports actual backing size/blocks; mounted chmod/chown-self/utime and path/fd truncate. Linux does not supply macOS creation/backup times or file flags. |
 | readlink | implemented | P-io | I-exec, I-links | Exact tracked target and EINVAL for regular inode; mutable, renamed and dangling links and immutable write-through boundaries on mounts. |
 | mknod | implemented | P-create, P-failures | I-mknod | Regular file, existing/disallowed name, special-node EPERM, missing backing and no namespace insertion; real umask/uid/gid and FIFO/socket refusal. Device nodes are not supported. |
@@ -124,7 +124,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | rmdir | implemented | P-create, P-namespace | I-directory | Empty removal, nonempty/file/missing rejection; mounted immutable directory denial and recursive-move cleanup. |
 | symlink | implemented | P-create | I-links | Real callback creates a symlink; mounted exact target, write-through, dangling link and namespace/policy denial assertions. Embedded NUL is not representable in a well-formed wire pathname. |
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
-| link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. |
+| link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. `passthrough_link_reply_refreshes_backing_metadata_without_stat` checks size/blocks/mtime in the LINK reply after bypass writes, before GETATTR or close. |
 | open | implemented | P-io | I-file, I-exec | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. |
 | read | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-large, I-partial | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
 | write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
@@ -186,3 +186,25 @@ versions, races or host failures. In particular:
 parent link accounting through mkdir, rmdir, cross-parent rename, replacement
 and same-parent rename while preserving tracked-parent metadata. The randomized
 real-mount oracle in `tests/stress.py` also checks this after every operation.
+
+## 1.3 passthrough evidence limits
+
+The published registry fuser 0.18.0 owns Linux protocol handling and backing
+registration. Its locked checksum and unchanged reviewed Filesystem trait are
+checked above; no local fork or FUSE protocol implementation is shipped.
+`src/backend/linux.rs` converts typed callbacks into the shared Overlay engine.
+macOS mounts are deferred to issue #12. Mac CLI/materialization tests do not
+establish FUSE mount behavior.
+
+Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
+FOPEN_PASSTHROUGH for command-created regular files only, after policy and access
+checks. Create/open handles share one BackingId per inode, retained through
+release. Git-backed and copied-up tracked inodes never qualify. getattr refreshes
+size, blocks and data timestamps from the backing descriptor without replacing
+logical overlay mode, uid, gid or link count. Lack of the kernel capability,
+CAP_SYS_ADMIN or a successful registration retains userspace I/O on this same
+FUSE mount. No new privileged child, detached process or early teardown exists.
+
+`tests/passthrough.py` must establish real negotiation and bypass, metadata,
+reopen/truncate, executable and mmap behavior on a capable kernel. Protocol
+responses and ordinary mount tests alone do not demonstrate kernel bypass.

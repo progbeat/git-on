@@ -1,5 +1,10 @@
 # Review regression evidence
 
+This is a historical review record. The owner subsequently selected stock
+cargo-dist release/installer behavior. Earlier custom publisher, hash-hardening
+and assembly sections below are superseded; their replaced code/tests were
+removed. Current release behavior and checks are described in [releases](releases.md).
+
 ## Native Git operand compatibility (1.2.0 bug fixes)
 
 Repository and revision arguments were always intended to use Git's syntax.
@@ -55,7 +60,7 @@ regressions were also run before replacing their implementations.
 | Reproduced failure | Permanent regression | Result after fix |
 | --- | --- | --- |
 | Installer refused owned mode 0775 without path/mode/owner or conditional advice | `test_owned_group_writable_directory_has_precise_conditional_advice`, `test_other_writable_directory_is_distinguished_from_group_write`, `test_foreign_owner_never_gets_permission_change_advice` | Precise reasons, safe single-directory advice only where appropriate, permissions unchanged |
-| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible `--bin-dir` alternative |
+| Owned mode 0555 failed staging with only a random basename and EACCES | `test_owner_write_missing_names_directory_mode_and_safe_alternative` | Full directory context and an accessible install-directory alternative |
 | Old Git 2.43.0 and missing Git diagnostics omitted detected version or next steps | `RemoteDiagnosticsTests` in `tests/remote.py` | Requirement stays 2.45.1+, with detected version/PATH guidance |
 | GitHub SSH publickey failure offered no public HTTPS alternative | `RemoteDiagnosticsTests` | Conditional HTTPS hint; no automatic retry or weakened authentication |
 | Version preflight before configuration capture blocked on a real Git 2.55 global-config FIFO | `SshRegressionTests.test_native_config_fifo_cancellation_stops_git_and_removes_state` | Restored configuration-first ordering; original lifecycle assertion passes |
@@ -1434,3 +1439,339 @@ owned, unreaped timeout child/group. No numeric group is signalled after reaping
 The targeted regressions pass after their fixes. Only fixtures shorten the
 production 15-second probe deadline. Release assets, binary inputs and the
 package version are unchanged.
+
+## 1.3 materialized host-collision diagnostics
+
+Self-review found that the materializer safely refused `Foo`/`foo` on the
+case-insensitive development volume but reported only `foo`, omitting the
+already-created conflicting path. The strengthened permanent
+`MaterializedTests.test_case_collision_fails_before_child` requires both names,
+no child stdout, unchanged source and complete temporary cleanup.
+
+Red: at `ad4e33efd927b4c35f03d55a67e816f8958c259d`, rebuild and run
+`python3 tests/materialized.py target/debug/git-on MaterializedTests.test_case_collision_fails_before_child`.
+It failed because `b'Foo'` was absent from stderr (exit 1); the child never ran.
+Green: the corrected diagnostic includes the attempted snapshot path and the
+existing host directory entries. The same test passes on arm64 macOS 26.3.1(a).
+Local transcripts are `/tmp/git-on-collision-red.log` and
+`/tmp/git-on-collision-green.log`. This is materialization evidence, not macFUSE.
+
+## 1.3 Copilot: optional passthrough must preserve older INIT negotiation
+
+At `af8791f`, enabling ABI 7.40 inherited upstream 0.16's unconditional 64-byte
+INIT decode. The pre-existing 16-byte INIT unit fixture failed with
+`InsufficientData` using:
+`cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-40 ll::request::tests::init -- --exact`.
+The red transcript is `/tmp/git-on-init-red.log`.
+
+The reviewed patch decodes the four-word prefix, requires the extension only
+when FUSE_INIT_EXT is advertised, preserves high capability bits, clamps the
+reply minor and reflects the client's extension flag. The original short test
+and new extended/truncated-extension parser test pass; all five parser tests
+pass in `/tmp/git-on-init-green.log`. The permanent actual-dispatch regression
+`protocol_short_and_extended_init_preserve_ordinary_fuse` additionally covers
+both session handshakes on Linux. Parser/protocol tests are not real mounts.
+
+## 1.3 Copilot: disposable write-policy harness
+
+At `af8791f`, `WritePolicyTests.policy` retained an undefined `keep` expansion.
+`python3 tests/test_write_policy_harness.py` reproduced NameError before any
+command launch (red: `/tmp/git-on-keep-harness-red.log`). Removing that expansion
+preserves exact argv and passes the permanent launcher regression (green:
+`/tmp/git-on-keep-harness-green.log`). Real policy tests remain separately required.
+
+Copilot also identified the Ubuntu 22.04/Python3.10 tomllib assumption and
+cross-job rehash weakness. Assembly now reads Cargo's JSON metadata and the
+four permanent `test_dist_integrity.py` cases reject changed native archives,
+missing/malformed checksums and source/manifest mismatches before regeneration.
+
+The packaging invariants also have permanent workflow-contract regressions.
+`GIT_ON_CI_BEFORE_REF=fc01cbc python3 tests/test_ci_contract.py` fails the missing
+pre-generation integrity gate and hard-coded 1.3.0 binary probe. The same suite
+passes against the corrected workflow (`/tmp/git-on-ci-contract-{red,green}.log`).
+The current probe obtains the package version from Cargo's JSON metadata and
+therefore retains the Ubuntu 22.04/Python3.10 build baseline.
+
+## 1.3 native cargo-dist checksum whitespace
+
+Exact-head CI exposed that cargo-dist 0.33.0 writes a trailing blank line in
+native per-archive checksum files. At `0f49816`, the new incoming-integrity guard
+accepted only one terminal newline and rejected that authentic output.
+`NativeIntegrityTests.test_cargo_dist_checksum_trailing_blank_line` reproduces
+that failure (`/tmp/git-on-dist-blank-red.log`). The guard now trims surrounding
+whitespace before strict whole-record validation; embedded extra records,
+malformed hashes and wrong artifact names still fail. All five integrity
+regressions pass (`/tmp/git-on-dist-blank-green.log`).
+
+The complete generated Apple Silicon installer is also exercised with GNU
+`sha256sum` excluded from PATH, leaving stock `/usr/bin/shasum`. Actual install,
+repeat update and corrupted-archive preservation pass locally in
+`/tmp/git-on-generated-shasum.log`; the same scenario is now a macOS packaging
+CI step (`tests/dist_installer.py --without-gnu-hash`).
+
+## 1.3 Copilot follow-up: destination staging and vendored release policy
+
+At `23f5fca`, `tests/dist_installer.py` interrupted the actual generated installer
+after its first real move into destination staging. SIGINT returned 130 but left
+both destination `tmp.*` directories, including the staged executable
+(`/tmp/git-on-staging-sigint-red.log`). An injected staging failure independently
+reproduced the leak (`/tmp/git-on-staging-red.log`). The hardening correction now
+initializes both staging globals before registering cleanup, and removes them
+along with the download directory. Inherited staging values cannot authorize
+deleting unrelated paths. The permanent generated-installer regression passes
+for staging failure, SIGINT, SIGTERM and SIGHUP, preserving installed bytes and
+an unrelated sentinel; it also passes with stock macOS shasum alone
+(`/tmp/git-on-staging-green.log`, `/tmp/git-on-staging-shasum-green.log`). The same
+actual-installer test runs on both packaging CI platforms.
+
+The permanent vendored-docs/tests/examples policy regression failed at
+`23f5fca`, demanding a binary version bump for nonruntime edits
+(`/tmp/git-on-vendor-policy-red.log`). Restricting the vendored classification to
+runtime sources, manifests and build inputs preserves AGENTS.md's nonrelease
+exceptions. All 41 release-policy tests pass after the correction, including
+runtime source and isolated manifest/build-input cases that still require a
+release (`/tmp/git-on-vendor-policy-green.log`).
+
+## 1.3 Copilot follow-up: locked materialized directories
+
+At `897088d`, the permanent normal-execution and explicit-recovery regressions
+in `tests/materialized.py` both failed with exit 125 / Permission denied when
+the disposable view contained populated mode-0555 and mode-000 directories.
+The view root itself was also mode 000. The red transcript is
+`/tmp/git-on-materialized-perms-red.log`.
+
+After mount-ownership/unmount checks, both cleanup paths now restore owner
+directory access through pinned directory descriptors, O_NOFOLLOW and no-follow
+stat/chmod operations. Only directories owned by the current identity qualify.
+An external read-only directory reached by a symlink keeps its original mode
+and bytes. All seven actual Mac materialized cases pass after rebuilding,
+including both permanent cleanup regressions
+(`/tmp/git-on-materialized-perms-green.log`). This is non-FUSE evidence;
+Linux CI separately runs the same cases and real-FUSE lifecycle tests.
+
+## 1.3 enabled-passthrough harness secure execution
+
+The first authorized capable-daemon CI at `a5dec76` proved actual bypass (eight
+registrations and zero generated I/O callbacks) but the lifecycle harness failed
+before its experiment: file-capability secure execution strips TMPDIR, so the
+daemon used the system temporary parent. The permanent harness now accepts that
+parent only in explicit enabled mode and validates the exact private owned run
+and recovery format reported by its own child. At `f3e0b24`, all enabled and
+ordinary-FUSE lifecycle cases passed with checked cleanup. CI printed the
+capability-revocation and private-copy-deletion receipt; the linked evidence is
+in docs/platforms.md. No mount skip is counted as this result.
+
+## Registry fuser0.18 migration: advertised versus negotiated minor version
+
+At912114e, CI run39982153538 failed the existing protocol peer's literal
+INIT-reply equality check: upstream advertised7.40 to the7.31 peer. The FUSE
+contract negotiates the minimum of the two advertisements, so a higher server
+minor is compatible. The permanent peer now checks the negotiated minimum and
+continues the entire operation suite using its legacy7.31 layouts; the64-byte
+extended7.40 case remains. No protocol implementation or fork is reintroduced.
+Linux real mounts, enabled passthrough/lifecycle, performance and both packaged
+installers already passed that CI; the corrected protocol peer requires new-head
+Linux verification. This distinction does not claim Apple FSKit mount acceptance.
+
+## 1.3 Copilot: truncated dispatcher invocation
+
+At60e9322, `DispatcherTests.test_truncation_inside_final_invocation_cannot_discard_arguments`
+reproduced execution when the piped bootstrap ended after the bare final function
+token: caller version/destination arguments were lost. The permanent test checks
+every incomplete prefix of the final invocation. RED is recorded in
+`/tmp/git-on-review-bootstrap-red.log`. Grouping the complete invocation prevents
+execution until the full group is parsed; all eight installer tests pass in
+`/tmp/git-on-review-bootstrap-green.log`.
+
+## 1.3 Copilot: path timestamps after passthrough close
+
+At60e9322, `passthrough_path_utime_after_last_close_updates_backing_and_reopen`
+failed because the last close removed the cached descriptor and setattr updated
+only logical timestamps, immediately overwritten by unchanged disk metadata.
+The focused regression verifies close → path utime → backing stat → reopen stat.
+RED is recorded in `/tmp/git-on-review-utime-red.log`; obtaining `disk_file` before
+setting timestamps passes in `/tmp/git-on-review-utime-green.log`. This core test
+simulates external I/O metadata; real enabled passthrough remains a separate CI gate.
+
+## Registry fuser0.18 protocol peer shutdown
+
+At60e9322, all19 protocol cases failed during harness teardown: socket EOF is an
+invalid request for the registry session, whereas actual FUSE unmount reports
+ENODEV. The lifecycle case also sent GETATTR after terminal DESTROY. The peer now
+requires the real DESTROY reply and successful event-loop join before closing its
+socket, and sends no further requests. It does not suppress session errors or
+relax callback assertions. Independent Linux replay verified RED0/19 at60e9322 and GREEN19/19 at7b9938f.
+The subsequent b07e786 head changes only the real-kernel timestamp assertions.
+
+## Deferred macOS mounts
+
+The owner moved issue #12 outside1.3.0. All unfinished native FSKit/app/transport
+code and mount-only tests were removed from the final PR; historical commits
+remain available. The native idle-timeout, cold-enumeration and prerequisite
+review findings apply to that removed implementation. Mac CLI/materialization,
+archive metadata and installer tests remain; no actual Mac mount is claimed.
+
+## 1.3 Copilot: passthrough metadata merges and readiness publication
+
+Atce5366c, focused `passthrough_link_preserves_namespace_ctime_after_stat` and
+`passthrough_rename_preserves_namespace_ctime_after_stat` both failed: backing
+ctime predates overlay-only namespace changes. Refresh now retains the later
+logical ctime while still reading physical data metadata. The permanent
+`passthrough_mode_and_partial_utime_preserve_unspecified_disk_times` also failed:
+mode-only or atime-only updates restored stale cached mtime after bypass writes.
+Only explicitly requested timestamps now reach FileTimes; omitted times remain
+untouched. All three reproduce RED in
+`/tmp/git-on-review-round8-metadata-red.log` and pass GREEN in
+`/tmp/git-on-review-round8-metadata-green.log`. The real enabled/fallback suite
+additionally checks write→fchmod→stat without intervening refresh and
+link/rename→stat ctime progression.
+
+`tests/test_passthrough_lifecycle_harness.py` pauses a live producer after JSON
+creation and separately tests an incomplete file from a dead producer. Both
+failed with JSONDecodeError before the fix. Polling now retries incomplete JSON
+within its existing deadline and retains the dead-process error. Both pass;
+RED/GREEN logs are `/tmp/git-on-review-round8-readiness-{red,green}.log`. These
+focused cases run in CI; actual lifecycle mounts remain a separate required job.
+
+## Installer diagnostic and minimal-dispatcher cleanup
+
+An unsupported-option diagnostic previously contained unnecessary release history.
+Normal installs were already quiet. The permanent stdout/stderr regression checks
+normal installation and generic unknown-option errors. The owner subsequently
+removed all special handling for obsolete options; they use the same generic
+error as every other unknown flag, without compatibility branches or help text.
+The focused test failed before that removal and passes afterward; logs are
+`/tmp/git-on-review-generic-option-{red,green}.log`.
+The dispatcher shrank from62 to49 lines by combining version validation and
+using checked shell error propagation. Platform/archive selection, integrity,
+extraction and executable installation remain in cargo-dist. Complete download,
+release-selection semantics and the grouped final invocation remain
+covered by all nine permanent installer tests.
+
+## Minimal dispatcher: delegate the generated installer's own contract
+
+The owner removed local semantic-version/minimum/range checks and duplicate
+argument validation. The default is `version=latest`; a missing tag/asset fails
+on curl's status before execution. Only version selection is consumed; the standard install-directory environment
+is passed through unchanged. The actual pinned generated parser supports help/quiet/verbose;
+all remaining arguments retain their exact order and bytes, including empty,
+spaced, newline and wildcard values. The permanent dispatcher fixture records
+that argv; the packaged-installer suite tests the real generated parser's flags
+and generic unknown errors. No obsolete flag branch remains.
+
+The forced PATH/updater environment flags were removed. Only install-updater=false
+was in TOML; generated PATH management had its own default. Tests keep isolated
+HOME and explicit test-only environment controls; no owner shell profile is
+modified by validation. Current bootstrapping has no semantic/API/hash/destination
+validation; complete private download and its short cleanup traps remain.
+
+## First passthrough open preserves prior timestamp updates
+
+Copilot reproduced mknod → utime → first read-only open → fstat losing the
+requested timestamps: before the first registration, external_io was false and
+only logical times changed. The permanent
+`passthrough_first_open_keeps_times_set_before_registration` failed before the
+fix (`/tmp/git-on-first-open-red.log`) and passes afterward
+(`/tmp/git-on-first-open-green.log`). Explicit regular-file timestamps now reach
+the backing file before registration too; unspecified times remain untouched.
+The real enabled/fallback suite also covers this mknod/first-open transition.
+
+## Actual cargo-dist streaming and bootstrap cancellation
+
+The owner chose a minimal checked in-memory download after an actual generated
+installer experiment. CI95's corrected cargo-dist0.33 script (head93aae21) is
+53,869 bytes, SHA256
+`716a59b3adf24e2f454f65d2e8764ee35a8631d51a85ae3e29521146a33b67c8`.
+Its line1591 is the ungrouped final invocation
+`download_binary_and_run_installer "$@" || exit 1`.
+
+A real curl/loopback HTTP test served these exact bytes and the actual verified
+Mac archive into isolated HOME/XDG/TMPDIR/install directories. An incomplete body
+returned curl18/shell2 without installation. A stream ending16 bytes early,
+after the bare final function token, returned curl18/shell0 and installed the
+actual binary despite --help. HTTP404 and empty connection returned curl22/52
+but shell0 without installing. Complete help did not install; complete installation
+succeeded. This establishes the specific streaming edge, not a blanket objection
+to curl|sh. The report is
+`/var/folders/h8/1w0z_0kn7h32ls4byh382nwc0000gn/T/git-on-actual-stream-ngf6z325/report.json`.
+
+`tests/dist_installer.py` permanently serves the actual generated script over
+loopback with a prematurely closed Content-Length response. Under the owner's
+selected ordinary stream, the footer truncation records curl18/shell0 and actual
+installation; HTTP404 records curl22/shell0 without replacement. Complete help
+and installation retain upstream semantics. This passed locally with stock Mac
+shasum in `/tmp/git-on-stream-real-installer.log`; package CI repeats it on both hosts.
+
+## Final bootstrap contract
+
+The owner chose the ordinary `curl ... | sh -s -- "$@"` pipeline. No RAM capture,
+sh -c, temporary file, trap or supervisor remains. The permanent actual-bootstrap-PID
+signal test records that its child can continue after the wrapper is terminated;
+this is an accepted limitation rather than a fixed cancellation guarantee.
+Generated-installer staging/hash/signal checks remain mandatory. All10 dispatcher
+and checksum cases pass in `/tmp/git-on-stream-dispatcher-tests.log`.
+The missing-value case after a forwarded option remains fixed with RED/GREEN
+logs `/tmp/git-on-forwarded-option-{red,green}.log`.
+
+## SHA256 output does not depend on staging filenames
+
+Copilot reproduced false checksum mismatches for paths containing backslash or
+newline: hash tools prefix escaped filename output with a backslash. The focused
+real-tool regression failed on both stock shasum paths before the fix in
+`/tmp/git-on-hash-path-red.log`. Both SHA256 branches now hash redirected standard
+input, so their output contains no filename escaping. All11 dispatcher/hash cases
+pass in `/tmp/git-on-hash-path-green.log`. CI's native Linux and Mac tools repeat
+the same permanent cases; missing tools and mismatched archives still fail closed.
+
+## Environment-only bootstrap configuration
+
+The final bootstrap parses no arguments. `GIT_ON_VERSION` selects the release;
+unset, empty and latest values use latest/download. All argv is passed intact
+to the generated installer, including flags the bootstrap used to consume.
+`GIT_ON_INSTALL_DIR` remains the standard downstream environment control.
+The permanent matrix verifies defaults, pinned versions, optional v, repeated
+installs, custom destination environment and byte-exact downstream argv.
+Prior missing-selector parser tests were removed with that parser, not bypassed.
+
+## LINK replies after passthrough writes
+
+At d6cca75, a generated file extended through its physical backing descriptor
+and hard-linked without stat or close returned cached pre-write attributes.
+`passthrough_link_reply_refreshes_backing_metadata_without_stat` was RED: LINK
+reported size 0 instead of 4104. The same test now checks size, allocation blocks,
+mtime, link count and logical permissions in the returned reply. Hardlink refreshes
+physical metadata after policy/name checks and before namespace mutation. The
+focused test is GREEN on macOS; real enabled/fallback Linux CI additionally
+exercises write -> link without an intervening stat/close. RED/GREEN logs are
+`/tmp/git-on-link-reply-{red,green}.log`.
+
+## O_PATH references retain unlinked backing metadata
+
+At 1abb698, passthrough create/write/close followed by O_PATH-style inode lookup,
+unlink and getattr failed with ENOENT: the last ordinary close dropped the daemon
+descriptor, then unlink removed the only backing pathname. The permanent
+`passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` test was
+RED on that sequence and is GREEN after retaining the backing descriptor before
+last-link removal while inode references remain. It also covers replacement by
+rename, reopening/closing the unlinked inode, and final FORGET reclamation.
+Logs are `/tmp/git-on-opath-{red,green}.log`.
+
+Linked files still drop their descriptor after the last ordinary close. Unlinked
+descriptors survive until the existing lookup/handle/directory-reference lifetime
+ends. Failure to obtain the descriptor occurs before namespace mutation. The real
+Linux enabled/fallback suite additionally uses actual O_PATH descriptors and
+checks fstat after both unlink and replacement; it does not emulate these syscalls.
+
+## Standard cargo-dist release migration
+
+The owner accepted the stock installer checksum policy and selected the generated
+GitHub workflow. The former publisher, hash correction, asset assembly and repeated
+integrity tools are removed. Runtime, hard-link, O_PATH and real-FUSE regressions
+remain permanent. The ordinary required package check still exercises real Linux
+and Mac native builds plus stock installer help/install/reinstall.
+
+The automatic version trigger only tags the exact tested SHA and dispatches the
+stock workflow. `test_trigger_pins_the_tested_commit_and_never_moves_existing_tags`
+uses an inert gh fixture for absent/reused/mismatched tags and creation failure;
+no live tag or workflow dispatch is performed. Regeneration is checked with the
+pinned upstream `dist generate --mode=ci --check` command.

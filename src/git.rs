@@ -5,12 +5,12 @@ use std::{
     cell::RefCell,
     ffi::{OsStr, OsString},
     fs::File,
-    marker::PhantomData,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    rc::Rc,
 };
+#[cfg(target_os = "linux")]
+use std::{marker::PhantomData, rc::Rc};
 
 #[derive(Debug)]
 pub struct Git {
@@ -389,10 +389,10 @@ fn relay_native_job_control(pid: u32, fd: i32, parent_group: libc::pid_t) -> Res
         // sending SIGCONT. Pass ownership on during the normal polling loop.
         set_foreground(fd, group)?;
     }
-    if unsafe { info.si_pid() } == 0 {
+    if crate::platform::siginfo_pid(&info) == 0 {
         return Ok(());
     }
-    let stop = unsafe { info.si_status() };
+    let stop = crate::platform::siginfo_status(&info);
     if foreground == parent_group && matches!(stop, libc::SIGTTIN | libc::SIGTTOU) {
         // A pending background-I/O stop raced the shell's `fg` transition.
         unsafe { libc::kill(-group, libc::SIGCONT) };
@@ -435,7 +435,7 @@ fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
         {
             break;
         }
-        if (result == 0 && unsafe { info.si_pid() } != 0) || Instant::now() >= deadline {
+        if (result == 0 && crate::platform::siginfo_pid(&info) != 0) || Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -491,10 +491,12 @@ thread_local! {
 
 /// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
 /// proc descriptor open prevents a reused task ID from changing this identity.
+#[cfg(target_os = "linux")]
 pub(crate) struct RequestGuard {
     previous: Option<File>,
     _same_thread: PhantomData<Rc<()>>,
 }
+#[cfg(target_os = "linux")]
 impl RequestGuard {
     pub(crate) fn enter(pid: u32) -> Self {
         let status = File::open(format!("/proc/{pid}/status")).ok();
@@ -504,6 +506,7 @@ impl RequestGuard {
         }
     }
 }
+#[cfg(target_os = "linux")]
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         REQUEST_STATUS.with(|slot| slot.replace(self.previous.take()));
@@ -560,7 +563,7 @@ pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
     error.is::<RequestInterrupted>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
