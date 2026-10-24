@@ -1759,3 +1759,20 @@ Repository immutability is now an owner-managed prerequisite. The permanent
 that a disabled setting permits a mutable publication before the final check
 fails. This check confirms release state after publication; it neither prevents
 that mutable publication nor rolls it back. All publication tests use a fake API.
+
+## O_PATH references retain unlinked backing metadata
+
+At 1abb698, passthrough create/write/close followed by O_PATH-style inode lookup,
+unlink and getattr failed with ENOENT: the last ordinary close dropped the daemon
+descriptor, then unlink removed the only backing pathname. The permanent
+`passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` test was
+RED on that sequence and is GREEN after retaining the backing descriptor before
+last-link removal while inode references remain. It also covers replacement by
+rename, reopening/closing the unlinked inode, and final FORGET reclamation.
+Logs are `/tmp/git-on-opath-{red,green}.log`.
+
+Linked files still drop their descriptor after the last ordinary close. Unlinked
+descriptors survive until the existing lookup/handle/directory-reference lifetime
+ends. Failure to obtain the descriptor occurs before namespace mutation. The real
+Linux enabled/fallback suite additionally uses actual O_PATH descriptors and
+checks fstat after both unlink and replacement; it does not emulate these syscalls.

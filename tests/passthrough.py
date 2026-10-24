@@ -81,6 +81,23 @@ with linked_source.open('w+b',buffering=0) as f:
  assert s.st_size==6*8192 and s.st_blocks>0 and s.st_mtime_ns>old and s.st_nlink==2
  assert linked_alias.read_bytes()==b'linked'*8192
 linked_alias.unlink(); linked_source.unlink()
+# O_PATH pins the inode without sending FUSE OPEN. Metadata must survive both
+# unlink and replacement after the last ordinary descriptor has closed.
+for replace in [False,True]:
+ target=Path('out/o-path-'+str(replace))
+ target.write_bytes(b'o-path metadata')
+ descriptor=os.open(target,os.O_PATH)
+ try:
+  expected=os.fstat(descriptor)
+  if replace:
+   replacement=Path('out/o-path-replacement'); replacement.write_bytes(b'replacement')
+   os.replace(replacement,target)
+  else:target.unlink()
+  actual=os.fstat(descriptor)
+  assert actual.st_nlink==0 and actual.st_ino==expected.st_ino
+  assert actual.st_blocks>0 and (actual.st_size,actual.st_mtime_ns)==(expected.st_size,expected.st_mtime_ns)
+ finally:os.close(descriptor)
+ if replace:target.unlink()
 before=p.stat().st_ctime_ns; time.sleep(.01)
 os.link(p,'out/alias')
 assert p.stat().st_ctime_ns>before and p.stat().st_nlink==2

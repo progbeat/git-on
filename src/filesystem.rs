@@ -297,7 +297,9 @@ impl Overlay {
         }
         if !self.handles.values().any(|h| h.ino == ino) {
             if let Some(n) = self.nodes.get_mut(&ino) {
-                n.file = None;
+                if n.attr.nlink != 0 {
+                    n.file = None;
+                }
             }
         }
         self.reclaim(ino);
@@ -814,7 +816,21 @@ impl Overlay {
         }
         Ok(true)
     }
-    fn remove_path(&mut self, p: &Path) {
+    fn remove_path(&mut self, p: &Path) -> FsResult<()> {
+        if let Some(&ino) = self.paths.get(p) {
+            let node = self.node(ino)?;
+            if !node.immutable
+                && node.attr.kind == FileType::RegularFile
+                && node.attr.nlink == 1
+                && node.file.is_none()
+                && (node.lookups > 0 || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0)
+            {
+                // O_PATH can pin an inode without an OPEN handle. Keep its
+                // backing accessible after unlink until FORGET reclaims it.
+                let file = self.disk_file(ino)?;
+                self.node_mut(ino)?.file = Some(file);
+            }
+        }
         self.upper_paths.remove(p);
         if self.write_policy == WritePolicy::All {
             self.whiteouts.insert(p.to_path_buf());
@@ -849,6 +865,7 @@ impl Overlay {
         }
         // Keep inode objects and open descriptors for outstanding kernel inode
         // references and open-unlinked handles; all are reclaimed at unmount.
+        Ok(())
     }
     pub(crate) fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
         let p = self.child(parent, name)?;
@@ -865,7 +882,7 @@ impl Overlay {
             return Err(libc::ENOTEMPTY);
         }
         self.allowed(&p, kind)?;
-        self.remove_path(&p);
+        self.remove_path(&p)?;
         Ok(())
     }
     pub(crate) fn rename_path(
@@ -954,7 +971,7 @@ impl Overlay {
         // Every namespace validation precedes copy-up or a visible mutation.
         self.copy_up(ino, true)?;
         if destination.is_some() {
-            self.remove_path(&to);
+            self.remove_path(&to)?;
         }
         if self.write_policy == WritePolicy::All {
             let moved_whiteouts: Vec<_> = self
@@ -1721,6 +1738,59 @@ mod tests {
         assert_eq!(linked.mtime, expected.modified().unwrap());
         assert_eq!(linked.nlink, 2);
         assert_eq!(linked.perm, 0o600);
+    }
+
+    #[test]
+    fn passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten() {
+        for replace in [false, true] {
+            let (_temp, mut overlay) = fixture();
+            let ino = file(&mut overlay, 1, "generated.tmp");
+            // O_PATH pins a kernel inode reference without a FUSE OPEN handle.
+            overlay
+                .lookup_entry(1, OsStr::new("generated.tmp"))
+                .unwrap();
+            let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+            overlay.nodes.get_mut(&ino).unwrap().external_io = true;
+            let backing = overlay.disk_file(ino).unwrap();
+            backing.write_at(b"extended", 4096).unwrap();
+            let expected = backing.metadata().unwrap();
+            drop(backing);
+            overlay.close_handle(ino, handle);
+            assert!(overlay.node(ino).unwrap().file.is_none());
+
+            if replace {
+                file(&mut overlay, 1, "replacement.tmp");
+                overlay
+                    .rename_path(
+                        1,
+                        OsStr::new("replacement.tmp"),
+                        1,
+                        OsStr::new("generated.tmp"),
+                        0,
+                    )
+                    .unwrap();
+            } else {
+                overlay
+                    .remove(1, OsStr::new("generated.tmp"), false)
+                    .unwrap();
+            }
+            assert!(!overlay.backing.join(ino.to_string()).exists());
+            let attr = overlay.attributes(ino, None).unwrap();
+            assert_eq!(attr.size, expected.len());
+            assert!(attr.blocks > 0);
+            assert_eq!(attr.mtime, expected.modified().unwrap());
+            assert_eq!(attr.nlink, 0);
+
+            let reopened = overlay.open_file(ino, libc::O_RDONLY).unwrap();
+            assert_eq!(
+                overlay.read_data(ino, reopened, 4096, 100).unwrap(),
+                b"extended"
+            );
+            overlay.close_handle(ino, reopened);
+            assert_eq!(overlay.attributes(ino, None).unwrap().size, expected.len());
+            overlay.forget_inode(ino, 1);
+            assert!(!overlay.nodes.contains_key(&ino));
+        }
     }
 
     #[test]
