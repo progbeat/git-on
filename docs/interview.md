@@ -59,8 +59,7 @@ and written to the cache as streams rather than loaded entirely into RAM.
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
 
-**Question:** What repository size, in terms of file count, should Git-on be
-designed to handle?
+**Question:** What scale of repositories should Git-on be designed to handle?
 
 **Answer:** The only situation in which a technical failure of git-on is
 acceptable is when the corresponding git clone followed by running the same
