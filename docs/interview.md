@@ -80,3 +80,50 @@ working take priority?
 
 **Answer:** Changes to Git-on should follow standard semantic versioning and
 deprecation practices so that users know what to expect.
+
+## Author clarifications — 2026-10-28
+
+The author raised the following clarifications in conversation and made the
+decisions recorded below; these are not questions previously asked by the
+interviewer.
+
+### Optimizations and algorithmic complexity
+
+*Context:* The author's "point two" referred to the persistent-cache metadata
+path: each restore/store acquires the cache lock and runs a full reconciliation
+scan and sort, and store then scans and sorts again.
+
+**Question / clarification (author):** So, am I understanding correctly that
+point two means that using the cache can increase the algorithmic complexity of
+an operation? Here we are treating the cache size as a parameter, `K`, rather
+than as a constant, because treating it as a constant can hide inefficiencies.
+Using a cache is generally an optimization. But in that case this is an
+extremely clumsy optimization: an operation that is hypothetically O(1) becomes
+O(K).
+
+**Answer / decision (author):** That is very clumsy. This definitely needs to be
+fixed, and the principle needs to be recorded, as I said: "Optimizations must not
+increase algorithmic complexity."
+
+The O(1)-to-O(K) example is hypothetical; it does not assert that acquiring a Git
+object, hashing its contents, or transferring it over a network is O(1). The
+principle is an author requirement, not a claim that the implementation already
+meets it.
+
+### One-million-file repositories in every supported mode
+
+**Question / clarification (author, 11:56 UTC):** I agree overall, but I think
+we should also record a requirement that Git-on must easily handle a repository
+with 10 million files in all modes. I don't know; we could of course set a more
+modest figure of one million files. In general, repositories like that do not
+exist, so we can set it at one million files. Ten million might be far too much.
+
+**Answer / decision (author):** The chosen requirement is one million files,
+rather than ten million: Git-on must easily handle a repository with one million
+files across all supported modes and backends.
+
+Sparse access and full-tree traversal/materialization are different workloads:
+full traversal necessarily processes the entries and payload bytes. The existing
+million-file one-path test covers only the sparse/lazy case; it does not establish
+acceptance across all supported modes. No numerical time or RAM limit was
+specified in this clarification.
