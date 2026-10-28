@@ -59,6 +59,15 @@ and written to the cache as streams rather than loaded entirely into RAM.
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
 
+**Question:** What scale of repositories should Git-on be designed to handle?
+
+**Answer:** The only situation in which a technical failure of git-on is
+acceptable is when the corresponding git clone followed by running the same
+command would also fail. In all other situations, there must be no limits on
+repository size or file count. In particular, a large repository must not cause
+performance degradation if there is no performance degradation when running
+directly from disk.
+
 **Question:** If a platform cannot read the repository lazily and running a
 command requires materializing it in full, should Git-on refuse to run, or allow
 that mode only when the user explicitly chooses it?
