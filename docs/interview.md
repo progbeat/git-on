@@ -122,8 +122,9 @@ exist, so we can set it at one million files. Ten million might be far too much.
 rather than ten million: Git-on must easily handle a repository with one million
 files across all supported modes and backends.
 
-Sparse access and full-tree traversal/materialization are different workloads:
-full traversal necessarily processes the entries and payload bytes. The existing
-million-file one-path test covers only the sparse/lazy case; it does not establish
-acceptance across all supported modes. No numerical time or RAM limit was
-specified in this clarification.
+Sparse access and full-tree traversal/materialization are different workloads.
+A full traversal must visit the entries; full-tree reads and materialization must
+also process the required payload bytes. The existing million-file one-path test
+covers only the sparse/lazy case; it does not establish acceptance across all
+supported modes. No numerical time or RAM limit was specified in this
+clarification.
