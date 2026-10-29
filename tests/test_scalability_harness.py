@@ -13,6 +13,20 @@ from unittest import mock
 from scalability import CHILD, expected_demands, fixture, fixture_shape, scenario_plan, sample_resources, validate_lazy_noop
 
 
+@contextlib.contextmanager
+def minimal_worktree():
+    with tempfile.TemporaryDirectory() as directory:
+        root=Path(directory);(root/'0/0').mkdir(parents=True)
+        (root/'0/0/0').write_bytes(b'0000000\n');(root/'.gitignore').write_bytes(b'out/\n')
+        yield root
+
+
+def child_in(root,mode,*,snapshot=False,write=False):
+    env={k:v for k,v in os.environ.items() if k!='GIT_ON_TREE_OID'}
+    if snapshot:env['GIT_ON_TREE_OID']='fixture'
+    return subprocess.run([sys.executable,'-c',CHILD,mode,'1','[1,1,1]',*(['write'] if write else [])],cwd=root,env=env,capture_output=True)
+
+
 class ScalabilityHarnessTests(unittest.TestCase):
     def test_denied_proc_observation_does_not_skip_available_filesystem_sample(self):
         samples=dict(runner_peak_descriptors=None,runner_peak_resident_kib=None,
@@ -45,6 +59,43 @@ class ScalabilityHarnessTests(unittest.TestCase):
 
     def test_eager_materialization_keeps_its_required_full_tree_work(self):
         validate_lazy_noop(dict(tree_reads=6,blob_loads=2),dict(backend='materialized',workload='noop'))
+
+    def test_walk_rejects_nested_git_and_out_subtrees(self):
+        for mode in ('full','enumerate'):
+            for name in ('.git','out'):
+                for snapshot in (False,True):
+                    with self.subTest(mode=mode,name=name,snapshot=snapshot),minimal_worktree() as root:
+                        unexpected=root/'0'/name;unexpected.mkdir();(unexpected/'extra').write_bytes(b'unexpected')
+                        result=child_in(root,mode,snapshot=snapshot)
+                        self.assertNotEqual(result.returncode,0,'unexpected nested subtree was hidden')
+                        self.assertIn(b'AssertionError',result.stderr)
+
+    def test_walk_rejects_stale_root_out_before_generated_writes(self):
+        for mode in ('full','enumerate'):
+            for kind in ('directory','file','dangling-symlink'):
+                with self.subTest(mode=mode,kind=kind),minimal_worktree() as root:
+                    out=root/'out'
+                    if kind=='directory':out.mkdir()
+                    elif kind=='file':out.write_bytes(b'stale')
+                    else:out.symlink_to('missing')
+                    result=child_in(root,mode,write=mode=='full')
+                    self.assertNotEqual(result.returncode,0,'stale root output was accepted')
+                    self.assertIn(b'previous case leaked generated files',result.stderr)
+
+    def test_walk_never_exempts_snapshot_root_git(self):
+        for mode in ('full','enumerate'):
+            with self.subTest(mode=mode),minimal_worktree() as root:
+                (root/'.git').mkdir()
+                result=child_in(root,mode,snapshot=True)
+                self.assertNotEqual(result.returncode,0,'snapshot exposed root Git metadata')
+                self.assertIn(b'AssertionError',result.stderr)
+
+    def test_full_walk_can_generate_root_out_after_namespace_validation(self):
+        with minimal_worktree() as root:
+            result=child_in(root,'full',snapshot=True,write=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertTrue(json.loads(result.stdout.splitlines()[-1])['generated_write'])
+            self.assertEqual((root/'out/generated').read_bytes(),b'generated')
 
     def test_plan_preserves_interactions_and_selects_larger_scale_without_cartesian_repetition(self):
         for source in ('local','remote'):

@@ -1993,3 +1993,22 @@ and disposes of the exact process if an assertion fails. Product cancellation
 behavior is unchanged. Diagnostic records are
 `/tmp/git-on-signal-review-{diagnostic,loaded}.jsonl`; focused tests pass in
 `/tmp/git-on-signal-review-green.log`.
+
+## Final Copilot review: hidden nested namespace entries
+
+[Copilot review 5702538999](https://github.com/progbeat/git-on/pull/23#pullrequestreview-5702538999)
+found one real incremental defect after the independent review of 74fc52a
+reported no findings. The scale child's directory filter hid `.git` and `out`
+at every depth, so full-read and namespace-only checks accepted unexpected
+subtrees. All four reported combinations reproduced as false passes. The
+permanent `test_walk_rejects_nested_git_and_out_subtrees` expands them to both
+direct-disk and snapshot contexts; all eight cases failed before the fix and
+pass afterward.
+
+Only a direct clone's root `.git` directory is now exempted. The existing real
+clone full/enumerate controls still pass; snapshot root `.git` remains forbidden.
+No `out` directory is filtered. Six cases reject stale root output as a directory,
+regular file or dangling symlink in both traversal modes, including before a
+generated-write command. A positive case still creates and verifies `out/generated`
+after the full namespace walk. Runtime code and stress sizes are unchanged.
+Focused evidence is `/tmp/git-on-namespace-copilot-{red,green}.log`.

@@ -57,7 +57,9 @@ elif mode in ('full','enumerate'):
  for base,dirs,files in os.walk('.'):
   parts=[] if base=='.' else base[2:].split('/')
   level=len(parts); assert level<len(fanouts),(base,level)
-  dirs[:]=[name for name in dirs if name not in ('.git','out')]
+  # Only the direct clone has legitimate root Git metadata. Snapshot metadata
+  # is forbidden above; every other directory must match the pinned namespace.
+  if not parts and 'GIT_ON_TREE_OID' not in os.environ and '.git' in dirs: dirs.remove('.git')
   expected={f'{n:0{widths[level]}d}' for n in range(fanouts[level])}
   expected_files={'.gitignore'} if not parts else set()
   if level==len(fanouts)-1:
