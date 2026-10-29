@@ -98,12 +98,61 @@ then varies demanded N independently. All measured payloads are hits.
 | 256 | 32 | 9,065 | 103 |
 
 Old cache-directory getdents calls were 22/70/22/70; new calls were zero.
-The JSONL also records wall time, flock-held intervals and internal maintenance
-counts separately. Under strace, the new atomic/durability path took longer in
-these small-cache samples (roughly 0.8–2.6 s held, versus 0.2–0.5 s old); ptrace
-amplifies its extra publication syscalls. This is not claimed as a wall-time win.
-The structural result is independent of K, without hiding durability, payload
-hashing or actual eviction costs. Untraced and final CI timings remain separate.
+The JSONL also records actual file read/write syscall counts, wall time,
+flock-held intervals and record-level maintenance counts separately. The initial
+indexed candidate exposed an avoidable constant cost: serde directly on Files
+performed byte/token I/O. Copilot caught it, and the permanent syscall gate
+reproduced 9,638 cache read/write calls for K=64, N=8 before buffering, versus
+171 after. Metadata is now serialized/deserialized in bounded buffers. Atomics,
+hashing and fsync still cost real work; traced timings are retained separately
+and are not a universal throughput claim.
+
+## Distinct-object demand and pack discovery
+
+Independent review of `d0edf505bfbf5b2280d63fa60a68791b24911996` identified another
+parameter: P, the cumulative number of per-demand packs. The long-lived ODB
+refreshed after every demand, and each remote ensure opened another Repository.
+libgit2 pack refresh enumerates/sorts all packs, including on already available
+run objects. A low descriptor count alone did not fix this metadata work.
+
+Remote fetches now import only newly received pack(s) into the private run's
+loose ODB using native `git unpack-objects`, then discard those pack/index
+files. All companion indexes, including optional `.rev`, leave the ODB before
+unpacking so the input cannot be mistaken for an already retained copy.
+`core.bigFileThreshold=8m` makes native Git stream large non-delta blobs during
+import; delta decoding remains Git's necessary work. Existing object filtering,
+explicit OID requests, cancellation and integrity checks remain in force. This
+is not a startup preload or a request for unrelated objects. Operation-local
+Git handles close before return. Snapshot demand reuses its existing Repository
+and no longer unconditionally refreshes the ODB.
+
+The run retains zero per-demand packs between operations, while loose objects
+remain available until run cleanup. Pack discovery sees only the current
+fetch's pack(s), independently of earlier demands. This adds one native unpack
+operation and recompression of received bytes, accounted for separately from
+payload retention; it avoids cumulative pack enumeration/sorting. Over N demands,
+pack maintenance is linear in the actually received packs/objects, plus necessary
+Git decoding and bytes. No cap is imposed on active run storage or repository size.
+
+`tests/pack_scaling.py` loads 32, 128 and 512 distinct blobs twice from a cold
+cache and checks same-run availability. Its loader-only strace separates pack
+metadata from the global cache and native Git children. The source probe's OID
+reporting itself enumerates run objects, so total benchmark wall time includes
+that helper cost and is not presented as isolated product throughput.
+
+| Distinct blobs | d0edf50 pack-directory bytes enumerated | Corrected bytes |
+| ---: | ---: | ---: |
+| 32 | 2,559,376 | 22,784 |
+| 128 | 37,495,312 | 88,064 |
+| 512 | 742,274,064 | 349,184 |
+
+The permanent reduced-RLIMIT test also inspects the live private pack directory:
+it must be empty at increasing object counts. After this fix, its observed cold
+and warm descriptor samples were three, rather than the initial candidate's
+19/four. The separate local packed-reader limit still protects libgit2 accesses
+to callers' packed repositories. These distinct-demand controls supplement both
+million-file fixtures; they are not a claim of testing a million distinct remote
+payload demands in a full traversal.
 
 ## Full repository-scale matrix
 
@@ -118,7 +167,10 @@ existing million-distinct-seven-byte-blob lazy fixture and its exact fetch gates
 Neither fixture is a maximum supported repository size or proof at every size.
 
 For each source/policy/backend cell, both verified and unverified signed commits
-run no-op, sparse stat/read with 100 repetitions, and complete traversal/read.
+run a Python no-op control, sparse stat/read with 100 repetitions, and complete traversal/read.
+Python startup may inspect the root directory; the no-op gate allows one root
+tree and zero payloads, and still rejects recursive traversal. The existing
+native true/cat million-distinct-file gates retain their separate exact counts.
 Remote runs explicitly start cold and repeat warm. Eager materialization also
 runs an inert child and necessarily visits the entire selected tree before
 launch. Each workload checks bytes, path completeness, startup/result, exact

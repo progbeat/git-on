@@ -116,7 +116,11 @@ compressed source file. Neither mapped OS page cache nor necessary packed decode
 is reported as a retained application payload cache.
 
 Each active run copies demanded cached objects into a private temporary bare
-repository. Global eviction cannot invalidate active reads or cause an available
+repository. Newly fetched packs are imported into loose run storage with native
+Git and discarded before the next demand, so pack discovery does not enumerate
+all earlier per-object packs. Large non-delta blobs stream during import; Git
+still performs required delta decoding. The snapshot reuses its Repository and
+available objects do not trigger unconditional ODB refreshes. Global eviction cannot invalidate active reads or cause an available
 run-local object to be fetched again. Oversized objects stay in run storage.
 Retained libgit2 pack descriptors are capped before threads start: at most 32,
 and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack

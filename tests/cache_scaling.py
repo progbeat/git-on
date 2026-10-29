@@ -46,27 +46,29 @@ def main():
                     # Pay migration once before tracing ordinary operations.
                     subprocess.run([str(binary.resolve()),'file://'+str(f.repo),'HEAD'],cwd=f.cwd,env=env,input=b'exit\n',capture_output=True,check=True)
                     trace=f.root/'trace'
-                    argv=['strace','-ttt','-T','-yy','-e','trace=getdents64,newfstatat,statx,flock,close','-o',str(trace),str(binary.resolve()),'file://'+str(f.repo),'HEAD']
+                    argv=['strace','-ttt','-T','-yy','-e','trace=getdents64,newfstatat,statx,flock,close,read,write','-o',str(trace),str(binary.resolve()),'file://'+str(f.repo),'HEAD']
                     started=time.monotonic_ns()
                     output=subprocess.run(argv,cwd=f.cwd,env=env,input=(''.join(f'read f{i:02d}\n' for i in range(operations))+'exit\n').encode(),capture_output=True,check=True)
                     rows=[json.loads(x) for x in output.stdout.splitlines()]
                     assert sum('data' in row for row in rows)==operations
-                    metadata=enumerations=0;held=0.;acquired=None
+                    metadata=enumerations=record_io=0;held=0.;acquired=None
                     for line in trace.read_text().splitlines():
                         if str(root) not in line: continue
                         if re.search(r'\b(getdents64|newfstatat|statx)\(',line): metadata+=1
                         if 'getdents64(' in line: enumerations+=1
+                        if re.search(r'\b(read|write)\(',line):record_io+=1
                         if 'flock(' in line and ' = 0 ' in line: acquired=float(line.split()[0])
                         elif acquired is not None and 'close(' in line and str(root/'lock') in line:
                             held+=float(line.split()[0])-acquired;acquired=None
                     if binary==options.probe:
                         assert enumerations==0,(capacity,operations,enumerations)
                         assert metadata<=12*(operations+2),(capacity,operations,metadata)
+                        assert record_io<=40*(operations+2),(capacity,operations,record_io)
                     elif options.before_resource_probe:
                         assert enumerations>=operations*2,(capacity,operations,enumerations)
                         assert metadata>=capacity*operations,(capacity,operations,metadata)
                     result=dict(revision=subprocess.check_output(['git','rev-parse','HEAD']).decode().strip(),binary=str(binary),occupancy=capacity,operations=operations,
-                        cache_metadata_syscalls=metadata,cache_directory_enumerations=enumerations,observed_lock_seconds=held,elapsed_ns=time.monotonic_ns()-started,
+                        cache_metadata_syscalls=metadata,cache_directory_enumerations=enumerations,cache_read_write_syscalls=record_io,observed_lock_seconds=held,elapsed_ns=time.monotonic_ns()-started,
                         metrics=rows[-1].get('metrics'),cache_state='fully populated; migration excluded; all payload hits',platform=sys.platform)
                     print(json.dumps(result),flush=True)
                     with options.output.open('a') as file: file.write(json.dumps(result)+'\n')

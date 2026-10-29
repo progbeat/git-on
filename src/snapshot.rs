@@ -353,8 +353,7 @@ struct State {
 impl State {
     fn ensure(&mut self, oid: Oid) -> Result<()> {
         if let Some(remote) = &mut self.remote {
-            remote.ensure(oid)?;
-            self.repo.odb()?.refresh()?;
+            remote.ensure_in(&self.repo, oid)?;
         }
         Ok(())
     }
@@ -577,8 +576,7 @@ impl Snapshot {
         };
         let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {
             if let Some(remote) = remote {
-                remote.ensure(oid)?;
-                repo.odb()?.refresh()?;
+                remote.ensure_in(&repo, oid)?;
             }
             Ok(())
         };

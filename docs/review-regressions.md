@@ -1775,3 +1775,60 @@ stock workflow. `test_trigger_pins_the_tested_commit_and_never_moves_existing_ta
 uses an inert gh fixture for absent/reused/mismatched tags and creation failure;
 no live tag or workflow dispatch is performed. Regeneration is checked with the
 pinned upstream `dist generate --mode=ci --check` command.
+
+## 1.4 full-scale harness: Python startup may inspect cwd
+
+At `d0edf505bfbf5b2280d63fa60a68791b24911996`, exact-head CI run
+[40840201554](https://github.com/progbeat/git-on/actions/runs/40840201554) failed
+both ordinary-FUSE scale cells on the first 1,000-file Python no-op control:
+`tree_reads=1`, `header_reads=0`, `blob_loads=0`. The harness incorrectly treated
+Python startup name lookups in cwd as forbidden recursive work. This was a test
+assumption defect; no runtime source change is required.
+
+`tests/test_scalability_harness.py` now permits zero or one root tree for that
+specific Python no-op workload, rejects a second tree or any payload, and keeps
+eager materialization's full-tree work distinct. The native true/cat million
+lazy gates are unchanged. The final PR CI must rerun the complete matrix; this
+old failure is not counted as platform acceptance.
+
+## 1.4 resource review: buffered metadata, missing payloads and shutdown
+
+Copilot's [review of d0edf50](https://github.com/progbeat/git-on/pull/23#discussion_r4410058171)
+identified four concrete defects. These red-before results were observed before
+changing the affected code; the regressions remain permanent:
+
+- `tests/cache_scaling.py` now counts actual cache read/write syscalls as well
+  as metadata enumeration. Running the d0edf50 source probe with K=64, N=8
+  failed the bounded-I/O gate with 9,638 calls. Both JSON reads and writes were
+  unbuffered. The corrected path uses bounded byte buffers and produced 171
+  calls for that case, while preserving atomic/fsync ordering.
+- `deleted_payload_restore_repairs_accounting_before_replacement` failed with
+  count two where one was required after a missing retained payload. The direct
+  store/eviction regression failed with ENOENT at capacity. Restore and direct
+  store now unlink stale metadata before refilling; eviction tolerates an
+  already absent payload. Permanent tests check replacement at and below
+  capacity, exact bytes, accounting and link topology.
+- `streaming_stops_after_command_completion_without_a_signal` failed because
+  copying returned success after `stop_operations()`. Its isolated reader sets
+  the real process flag during the first chunk, without a cancellation signal.
+  The fixed helper returns the stopped error before the second read; the test
+  observes exactly one active chunk. Isolation preserves other tests' global
+  lifecycle state. Existing real-FUSE escaped-reader/native-operation shutdown
+  checks remain separate acceptance evidence.
+
+## 1.4 independent review: cumulative per-demand pack scans
+
+At d0edf50, `tests/pack_scaling.py --probe <d0edf50-source-probe> --sizes 32`
+failed its linear pack-enumeration gate: 2,559,376 directory bytes for 32 distinct
+blob demands and a repeat pass. The expanded old runs measured 37,495,312 bytes
+at 128 and 742,274,064 at 512. Descriptor bounds and the shared-object full-million
+fixture did not expose this work.
+
+The fix imports only each newly received filtered pack into loose run storage
+using native Git, releases its pack/index files, reuses the snapshot Repository,
+and removes unconditional ODB refreshes. Corrected samples were 22,784/88,064/
+349,184 bytes. The permanent interactive reduced-RLIMIT test checks that live
+pack directories are empty between operations, and the scaling test verifies
+that the second pass neither fetches nor re-stores run-available objects. The
+helper's own OID enumeration and necessary Git unpack/decoding costs are
+explicitly separated from this structural pack-maintenance evidence.

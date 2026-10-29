@@ -342,6 +342,7 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
+        self.unpack_received()?;
         let repo = Repository::open_bare(&self.dir)?;
         if !repo.odb()?.exists(oid) {
             bail!("native Git fetch did not supply selected object {oid}");
@@ -350,15 +351,18 @@ impl Remote {
         Ok(oid)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
+        let repo = Repository::open_bare(&self.dir)?;
+        self.ensure_in(&repo, oid)
+    }
+    pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let outcome = (|| {
-            let repo = Repository::open_bare(&self.dir)?;
             if repo.odb()?.exists(oid) {
                 return Ok(());
             }
-            if self.cache.restore(&repo, oid)? {
+            if self.cache.restore(repo, oid)? {
                 return Ok(());
             }
-            self.fetch(&repo, oid)
+            self.fetch(repo, oid)
         })();
         if let Err(error) = &outcome {
             // Cache/ODB failures are just as incomplete as a failed fetch. Keep
@@ -412,11 +416,71 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        repo.odb()?.refresh()?;
+        self.unpack_received()?;
         if !repo.odb()?.exists(oid) {
             bail!("filtered remote fetch did not supply requested object {oid}");
         }
         self.cache.store(repo, oid)?;
+        Ok(())
+    }
+    /// Native filtered fetches always retain promisor packs. Keeping one pack
+    /// per demand makes later Git/libgit2 pack discovery grow with all previous
+    /// demands. Import only the just-received pack(s) into loose run storage,
+    /// then release their files/indexes before the next operation. The private
+    /// repository has one serialized writer and no auto-maintenance.
+    fn unpack_received(&self) -> Result<()> {
+        let pack_directory = self.dir.join("objects/pack");
+        let mut received = Vec::new();
+        for entry in fs::read_dir(&pack_directory)? {
+            crate::object::check_transfer()?;
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else {
+                bail!("invalid received pack filename");
+            };
+            if let Some((hash, _)) = text
+                .strip_prefix("pack-")
+                .and_then(|name| name.split_once('.'))
+            {
+                if hash.len() == 40 && Oid::from_str(hash).is_ok() && entry.file_type()?.is_file() {
+                    received.push((name, entry.path()));
+                }
+            }
+        }
+        if received.is_empty() {
+            return Ok(());
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("received-pack-")
+            .tempdir_in(&self.dir)?;
+        // Move all companion indexes (including Git's optional .rev) out of
+        // the ODB first: otherwise unpack-objects can see the input itself as
+        // already available and skip writing its loose copy.
+        for (name, path) in &received {
+            crate::object::check_transfer()?;
+            fs::rename(path, staging.path().join(name))?;
+        }
+        for (name, _) in received {
+            if Path::new(&name).extension() != Some(OsStr::new("pack")) {
+                continue;
+            }
+            crate::object::check_transfer()?;
+            let mut command = self.command(false)?;
+            command
+                .args(["-c", "core.bigFileThreshold=8m", "unpack-objects", "-q"])
+                .stdin(Stdio::from(File::open(staging.path().join(name))?));
+            // Native Git streams non-delta blobs over this threshold. Delta
+            // objects still require Git's necessary decoding; no new backend
+            // or custom pack parser is introduced.
+            let output = crate::git::run(command, true)
+                .context("import received objects into run-local storage")?;
+            if !output.status.success() {
+                bail!(
+                    "cannot unpack received Git objects: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
         Ok(())
     }
     /// Release the owned master even when the snapshot pin must remain for recovery.

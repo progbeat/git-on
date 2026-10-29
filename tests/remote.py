@@ -1348,6 +1348,10 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                     self.assertEqual(value['data'],f'object-{index}\n')
                     if index in (15,63,127,191):
                         samples.append(dict(objects=index+1,descriptors=len(list(Path(f'/proc/{process.pid}/fd').iterdir()))))
+                        if not expect_failure:
+                            pack_dirs=list(f.root.glob('*/remote-repository/objects/pack'))
+                            self.assertEqual(len(pack_dirs),1)
+                            self.assertEqual(list(pack_dirs[0].iterdir()),[],'per-demand packs accumulated in the run ODB')
             except (AssertionError,BrokenPipeError) as error:
                 failure=str(error)
                 process.wait(timeout=10)

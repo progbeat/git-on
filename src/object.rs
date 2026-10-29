@@ -18,6 +18,9 @@ pub(crate) fn check_transfer() -> Result<()> {
     if let Some(signal) = crate::git::cancelled_signal() {
         bail!("object transfer cancelled by signal {signal}");
     }
+    if crate::git::operations_stopped() {
+        bail!("object transfer stopped after command completion");
+    }
     crate::git::check_request_interruption()
 }
 
@@ -96,6 +99,55 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streaming_stops_after_command_completion_without_a_signal() {
+        if std::env::var_os("GIT_ON_TRANSFER_STOP_CHILD").is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "object::tests::streaming_stops_after_command_completion_without_a_signal",
+                    "--nocapture",
+                ])
+                .env("GIT_ON_TRANSFER_STOP_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        struct StopOnRead {
+            remaining: usize,
+            reads: usize,
+        }
+        impl Read for StopOnRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let size = self.remaining.min(buffer.len());
+                buffer[..size].fill(0);
+                self.remaining -= size;
+                crate::git::stop_operations();
+                Ok(size)
+            }
+        }
+        let size = 256 * 1024;
+        let id = Oid::hash_object(ObjectType::Blob, &vec![0; size]).unwrap();
+        let mut input = StopOnRead {
+            remaining: size,
+            reads: 0,
+        };
+        let error =
+            copy_verified(&mut input, std::io::sink(), ObjectType::Blob, size, id).unwrap_err();
+        assert!(error.to_string().contains("stopped"), "{error:#}");
+        assert_eq!(crate::git::cancelled_signal(), None);
+        assert_eq!(
+            input.reads, 1,
+            "shutdown consumed more than the active chunk"
+        );
+    }
     #[test]
     fn streaming_checks_exact_length_type_hash_and_io_errors() {
         let bytes = vec![0xff; 200_000];

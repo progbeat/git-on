@@ -119,12 +119,19 @@ impl DiskCache {
     fn read_json<T: DeserializeOwned>(&self, path: PathBuf) -> Result<T> {
         self.measure(|m| m.metadata_reads += 1);
         // Index and link records have a fixed maximum size, independent of K.
-        Ok(serde_json::from_reader(File::open(path)?.take(2048))?)
+        let mut data = Vec::with_capacity(256);
+        File::open(path)?.take(2048).read_to_end(&mut data)?;
+        Ok(serde_json::from_slice(&data)?)
     }
     fn atomic_json(&self, path: PathBuf, value: &impl Serialize) -> Result<()> {
         self.measure(|m| m.metadata_writes += 1);
         let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
-        serde_json::to_writer(&mut file, value)?;
+        let data = serde_json::to_vec(value)?;
+        ensure!(
+            data.len() <= 256,
+            "cache index record exceeds its metadata budget"
+        );
+        file.write_all(&data)?;
         file.as_file().sync_all()?;
         file.persist(path)?;
         Ok(())
@@ -185,6 +192,10 @@ impl DiskCache {
         let mut file = match File::open(self.payload(id)) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.node_path(id).try_exists()? {
+                    locked.remove(id)?;
+                    locked.commit()?;
+                }
                 self.measure(|m| m.misses += 1);
                 return Ok(false);
             }
@@ -244,11 +255,16 @@ impl DiskCache {
         // In particular, never decode an oversized packed blob merely to reject
         // it. Opening a header is enough to apply the retention policy.
         let mut locked = self.lock()?;
+        let id = key(object);
+        let exists = self.payload(id).try_exists()?;
+        if !exists && self.node_path(id).try_exists()? {
+            locked.remove(id)?;
+        }
         if weight > self.budget || self.entries == 0 {
+            locked.commit()?;
             return Ok(());
         }
-        let id = key(object);
-        if self.payload(id).try_exists()? {
+        if exists {
             locked.touch(id)?;
             locked.commit()?;
             return Ok(());
@@ -416,7 +432,11 @@ impl Locked<'_> {
     }
     fn remove(&mut self, id: Key) -> Result<()> {
         self.unlink(id)?;
-        fs::remove_file(self.cache.payload(id))?;
+        match fs::remove_file(self.cache.payload(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
     fn evict(&mut self, bytes: u64, count: usize) -> Result<()> {
@@ -439,6 +459,57 @@ impl Locked<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn deleted_payload_restore_repairs_accounting_before_replacement() {
+        for entries in [2, 4] {
+            let temporary = tempfile::tempdir().unwrap();
+            let cache = DiskCache::new(temporary.path().join("cache"), 1024, entries).unwrap();
+            let original = Repository::init_bare(temporary.path().join("original")).unwrap();
+            let active = Repository::init_bare(temporary.path().join("active")).unwrap();
+            let first = original.blob(b"first").unwrap();
+            let second = original.blob(b"second").unwrap();
+            cache.store(&original, first).unwrap();
+            cache.store(&original, second).unwrap();
+            fs::remove_file(cache.payload(key(first))).unwrap();
+            assert!(!cache.restore(&active, first).unwrap());
+            assert_eq!(cache.lock().unwrap().index.count, 1);
+            cache.store(&original, first).unwrap();
+            assert_eq!(cache.lock().unwrap().index.count, 2);
+            assert!(cache.restore(&active, first).unwrap());
+            assert_eq!(active.find_blob(first).unwrap().content(), b"first");
+        }
+    }
+    #[test]
+    fn deleted_payload_direct_store_and_eviction_preserve_valid_links() {
+        for entries in [2, 4] {
+            let temporary = tempfile::tempdir().unwrap();
+            let cache = DiskCache::new(temporary.path().join("cache"), 1024, entries).unwrap();
+            let original = Repository::init_bare(temporary.path().join("original")).unwrap();
+            let first = original.blob(b"first").unwrap();
+            let second = original.blob(b"second").unwrap();
+            let third = original.blob(b"third").unwrap();
+            cache.store(&original, first).unwrap();
+            cache.store(&original, second).unwrap();
+            fs::remove_file(cache.payload(key(first))).unwrap();
+            cache.store(&original, first).unwrap();
+            {
+                let locked = cache.lock().unwrap();
+                assert_eq!(locked.index.count, 2);
+                assert_eq!(locked.index.bytes, 13);
+                let a = cache.node(locked.index.first.unwrap()).unwrap();
+                assert_eq!(a.previous, None);
+                let b = cache.node(a.next.unwrap()).unwrap();
+                assert_eq!(b.next, None);
+                assert_eq!(b.previous, locked.index.first);
+            }
+            // A missing different victim must not make insertion fail either.
+            fs::remove_file(cache.payload(key(second))).unwrap();
+            cache.store(&original, third).unwrap();
+            assert!(cache.payload(key(first)).exists());
+            assert!(cache.payload(key(third)).exists());
+            assert!(cache.lock().unwrap().index.count <= entries);
+        }
+    }
     #[test]
     fn cache_process_worker() {
         let Some(root) = std::env::var_os("GIT_ON_CACHE_PROCESS_ROOT") else {
