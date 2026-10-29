@@ -283,6 +283,7 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     let tty_fd = tty.as_ref().map(AsRawFd::as_raw_fd);
     let parent_group = unsafe { libc::getpgrp() };
     let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == parent_group });
+    let _progress_lease = crate::progress::native_terminal_lease(transfer);
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {

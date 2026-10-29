@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -49,6 +50,27 @@ class CiContractTests(unittest.TestCase):
         self.assertIn('tests/scalability.py',job('real-fuse'))
         self.assertIn('--backend passthrough',job('real-fuse'))
         self.assertIn('tests/cache_scaling.py',job('rust'))
+
+    def test_missing_intermediate_baseline_keeps_current_pack_scaling_gate(self):
+        body=job('rust')
+        block=re.search(r'      - name: Replay pre-1.4.*?        run: \|\n(.*?)(?=      - name: Retain)',body,re.S)[1]
+        script=textwrap.dedent(block)
+        start=script.find('PACK_BEFORE=')
+        if start<0: start=script.index('git worktree add --detach /tmp/git-on-pack-before')
+        script=script[start:]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); tools=root/'tools';tools.mkdir();calls=root/'calls'
+            subprocess.run(['git','init','--quiet',str(root/'repo')],check=True)
+            (tools/'cargo').write_text('#!'+sys.executable+'\nimport sys\nsys.exit(77)\n')
+            (tools/'cargo').chmod(0o755)
+            (tools/'python3').write_text('#!'+sys.executable+'\nimport json,os,sys\nopen(os.environ["CALLS"],"w").write(json.dumps(sys.argv[1:]))\n')
+            (tools/'python3').chmod(0o755)
+            result=subprocess.run(['bash','-euo','pipefail','-c',script],cwd=root/'repo',capture_output=True,text=True,
+                env={**os.environ,'PATH':str(tools)+os.pathsep+os.environ['PATH'],'CALLS':str(calls)})
+            self.assertEqual(result.returncode,0,result.stderr)
+            arguments=json.loads(calls.read_text())
+            self.assertEqual(arguments[:3],['tests/pack_scaling.py','--probe','target/debug/examples/source-probe'])
+            self.assertNotIn('--before-probe',arguments)
 
     def test_trigger_pins_the_tested_commit_and_never_moves_existing_tags(self):
         script=textwrap.dedent(re.search(r'        run: \|\n(.*)',job('release'),re.S)[1])

@@ -195,5 +195,13 @@ subprocesses and is not a simultaneous sum; Mac runner-only /proc measurements
 are unavailable and represented as such. Unsupported/skipped platforms are not
 passes. Linux real-FUSE, Mac materialization and packaged-binary tests retain
 their distinct evidence layers. Final readiness requires the exact-head matrix,
-existing callback guard/integration/stress suites and Copilot review, not only
+existing callback guard/integration/stress suites and the owner's selected
+private native Codex review, not only
 a loader pass or a sparse million-file sample.
+
+The df900c4 matrix caught a teardown failure after successful million-leaf
+children on ordinary FUSE and enabled passthrough. Clean unmount now waits for
+the active helper's result rather than imposing a three-second reclamation
+deadline. The retry budget for completed busy/unmount failures is retained.
+Those failed historical cells are not acceptance passes; the corrected head
+must run the full matrix again.

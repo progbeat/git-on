@@ -60,9 +60,16 @@ jobs:
           BEFORE=/tmp/git-on-resource-target/debug/examples/source-probe
           python3 tests/remote.py --before-resource-probe "$BEFORE" RemoteTests.test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit RemoteTests.test_first_large_loose_range_streams_without_retaining_full_payload
           python3 tests/cache_scaling.py --probe target/debug/examples/source-probe --before-resource-probe "$BEFORE" --output cache-scaling.jsonl
-          git worktree add --detach /tmp/git-on-pack-before d0edf505bfbf5b2280d63fa60a68791b24911996
-          cargo build --locked --features test-metrics --example source-probe --manifest-path /tmp/git-on-pack-before/Cargo.toml --target-dir /tmp/git-on-pack-target
-          python3 tests/pack_scaling.py --probe target/debug/examples/source-probe --before-probe /tmp/git-on-pack-target/debug/examples/source-probe --output pack-scaling.jsonl
+          PACK_BEFORE=d0edf505bfbf5b2280d63fa60a68791b24911996
+          PACK_ARGUMENT=()
+          if git cat-file -e "$PACK_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$PACK_BEFORE" HEAD; then
+            git worktree add --detach /tmp/git-on-pack-before "$PACK_BEFORE"
+            cargo build --locked --features test-metrics --example source-probe --manifest-path /tmp/git-on-pack-before/Cargo.toml --target-dir /tmp/git-on-pack-target
+            PACK_ARGUMENT=(--before-probe /tmp/git-on-pack-target/debug/examples/source-probe)
+          else
+            echo 'Historical PR pack baseline unavailable after squash; current pack-scaling gates remain required.'
+          fi
+          python3 tests/pack_scaling.py --probe target/debug/examples/source-probe "${PACK_ARGUMENT[@]}" --output pack-scaling.jsonl
       - name: Retain cache metadata and lock measurements
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

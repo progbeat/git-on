@@ -40,8 +40,8 @@ elif mode=='sparse':
   with open(path,'rb') as file: assert file.read()==b'payload\n'
 else:
  actual=0
+ if 'GIT_ON_TREE_OID' in os.environ: assert not os.path.exists('.git')
  for base,dirs,files in os.walk('.'):
-  assert not os.path.exists('.git') if 'GIT_ON_TREE_OID' in os.environ else True
   dirs[:]=[x for x in dirs if x not in ('out','.git')]
   for name in files:
    path=os.path.join(base,name)

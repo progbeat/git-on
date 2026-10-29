@@ -1832,3 +1832,52 @@ pack directories are empty between operations, and the scaling test verifies
 that the second pass neither fetches nor re-stores run-available objects. The
 helper's own OID enumeration and necessary Git unpack/decoding costs are
 explicitly separated from this structural pack-maintenance evidence.
+
+## 1.4 terminal ownership and durable CI replay
+
+The second Copilot review of df900c4 identified three additional defects; no
+further Copilot review is requested because the owner selected private native
+Codex review for final acceptance.
+
+- The permanent real interactive-Bash PTY regression
+  `test_materialization_native_git_tty_handoff_with_tostop` enables `stty tostop`
+  and stalls an actual HTTPS object fetch. Before the fix the runner became
+  stopped (`/proc` state `T`, shell status 150) while native Git owned the
+  foreground terminal. The delayed progress worker now clears before terminal
+  handoff, pauses while Git owns it, and draws only in the foreground. The same
+  test is green, together with the existing success/error/SIGTERM PTY test.
+  A session-leader-only PTY does not reproduce this non-orphan job-control bug.
+- The actual workflow replay block failed with `fatal: invalid reference` in a
+  fresh repository without intermediate PR commit d0edf50. Its permanent test
+  now observes that the current pack-scaling gate still executes when this
+  optional historical baseline is unavailable after a squash merge. Existing
+  history continues to run the old/new comparison; master baseline replay is
+  unchanged.
+- The actual full-walk child checked the root `.git` invariant three times in
+  the permanent tiny three-directory fixture. It now checks once, before the
+  walk, on both clone and git-on paths. Every leaf, byte and path-depth check
+  remains. The focused test failed with `3 != 1` before the change and passes
+  afterward.
+
+Local red/green logs are `/tmp/git-on-tostop-shell-red.log`,
+`/tmp/git-on-tostop-green.log`, `/tmp/git-on-ci-replay-{red,green}.log` and
+`/tmp/git-on-walk-{red,green}.log`.
+
+## 1.4 complete traversal: wait for actual unmount result
+
+In [Actions run 40843614561](https://github.com/progbeat/git-on/actions/runs/40843614561),
+both ordinary FUSE and enabled passthrough read all one million leaves, verified
+their bytes and exited the child successfully. The runner nevertheless failed
+with `clean unmount timed out`: it killed an active unmount helper after three
+seconds. A fixed deadline on an in-flight unmount imposes an artificial failure
+as visited inode reclamation grows.
+
+`clean_unmount_waits_for_active_helper_but_bounds_completed_failures` is a
+permanent helper-supervision regression. With a real four-second helper, the
+old code failed at three seconds; the corrected code waits for success. It
+also verifies that immediately completed failure helpers still produce the
+busy-mount error within the existing retry budget. The helper test is not a
+substitute for an actual mount: the exact-head full traversal matrix and the
+escaped-descendant busy-mount integration test remain required. No forced or
+lazy unmount is introduced, and failed unmounts retain recovery state. Local
+logs are `/tmp/git-on-unmount-{red,green}.log`.
