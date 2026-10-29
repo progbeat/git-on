@@ -6,19 +6,21 @@ use std::{
     io::{self, BufRead, Write},
     path::Path,
 };
-fn report(snapshot: &Snapshot) -> Result<()> {
-    let repo = git2::Repository::open(&snapshot.git_dir)?;
-    let odb = repo.odb()?;
-    let mut objects = Vec::new();
-    odb.foreach(|oid| {
-        objects.push(oid.to_string());
-        true
-    })?;
-    objects.sort();
-    println!(
-        "{}",
-        serde_json::json!({"tree": snapshot.tree_oid.to_string(), "objects": objects, "metrics": snapshot.metrics()})
-    );
+fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
+    let mut report =
+        serde_json::json!({"tree": snapshot.tree_oid.to_string(), "metrics": snapshot.metrics()});
+    if include_objects {
+        let repo = git2::Repository::open(&snapshot.git_dir)?;
+        let odb = repo.odb()?;
+        let mut objects = Vec::new();
+        odb.foreach(|oid| {
+            objects.push(oid.to_string());
+            true
+        })?;
+        objects.sort();
+        report["objects"] = serde_json::json!(objects);
+    }
+    println!("{report}");
     io::stdout().flush()?;
     Ok(())
 }
@@ -51,7 +53,8 @@ fn main() -> Result<()> {
             return Err(error);
         }
     };
-    report(&snapshot)?;
+    let include_objects = !args.iter().any(|x| x == "--metrics-only");
+    report(&snapshot, include_objects)?;
     let mut opened = None;
     for operation in io::stdin().lock().lines() {
         let operation = operation?;
@@ -97,7 +100,7 @@ fn main() -> Result<()> {
         } else if operation != "report" {
             anyhow::bail!("unknown probe operation");
         }
-        report(&snapshot)?;
+        report(&snapshot, include_objects || operation == "report")?;
     }
     if let Err(error) = snapshot.stop_remote_transport() {
         // Keep the owned socket identity and pin reachable after a failed

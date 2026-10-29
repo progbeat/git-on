@@ -35,6 +35,7 @@ PARSER.add_argument('--probe', type=Path, default=ROOT / 'target/debug/examples/
 PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
+PARSER.add_argument('--evidence-output',type=Path,help='Machine-readable completed remote-million evidence')
 PARSER.add_argument('--before-resource-probe', type=Path, help='Master source probe for resource red-before evidence')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
@@ -42,7 +43,7 @@ PARSER.add_argument('--before-policy-binary', type=Path, help='Authentic e427743
 OPTIONS, ARGS = PARSER.parse_known_args()
 # Artifact arguments are relative to the invoking harness, not a forked
 # fixture's cwd. Resolve them before any child changes directories.
-for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary','before_resource_probe'):
+for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary','before_resource_probe','evidence_output'):
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
@@ -1285,14 +1286,14 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertFalse((f.root/'cache').exists(),'remote run created a global cache')
 
     def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
-        f=self.f; ids=[]
+        f=self.f; ids=[];object_mib=16 # Above both the 8 MiB decoded cache and native Git streaming threshold.
         for byte in b'abc':
             with tempfile.TemporaryFile() as output:
                 writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
-                for _ in range(96): writer.stdin.write(bytes([byte])*(1024*1024))
+                for _ in range(object_mib): writer.stdin.write(bytes([byte])*(1024*1024))
                 writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); ids.append(output.read().decode().strip())
         tree=f.git('mktree',data=''.join(f'100644 blob {oid}\t{name}\n' for name,oid in zip('abc',ids)).encode())
-        commit=f.git('commit-tree',tree,data=b'over-capacity fixture\n');f.git('update-ref','refs/heads/main',commit)
+        commit=f.git('commit-tree',tree,data=b'large run-local reuse fixture\n');f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
         process=f.probe(url);f.line(process)
         for name in 'abc':
@@ -1310,7 +1311,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
         f.finish(process)
         self.assertFalse((f.root/'cache').exists())
-        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*96*1024*1024,metrics=last['metrics'])),flush=True)
+        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*object_mib*1024*1024,metrics=last['metrics'])),flush=True)
 
     @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
     def test_materialization_native_git_tty_handoff_with_tostop(self):
@@ -1484,6 +1485,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         process=f.probe(url); f.line(process); value,_=f.operation(process,'read '+path); f.finish(process)
         self.assertEqual(value['data'],selected+'\n')
         self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},set(read['objects']))
+        fuse_runs=[]
         if OPTIONS.require_fuse:
             for index,command in enumerate((['true'],['cat',path],['cat',path])):
                 if index<2: shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -1493,6 +1495,11 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(result.stdout,b'' if command[0]=='true' else (selected+'\n').encode())
                 demands={oid for x in f.requests[begin:] for oid in x['wants']}
                 self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']))
+                fuse_runs.append(dict(command=command,returncode=result.returncode,stdout=result.stdout.decode(),objects=sorted(demands)))
+        if OPTIONS.evidence_output:
+            head=subprocess.check_output(['git','-C',str(Path(__file__).resolve().parents[1]),'rev-parse','HEAD'],text=True).strip()
+            OPTIONS.evidence_output.parent.mkdir(parents=True,exist_ok=True)
+            OPTIONS.evidence_output.write_text(json.dumps(dict(head=head,files=1000000,selected=selected,objects=read['objects'],fuse_runs=fuse_runs))+'\n')
         print('remote million evidence:',json.dumps(dict(fixture=fixture,selected=selected,objects=read['objects'],requests=f.requests)),flush=True)
 
     def test_ssh_denied_authentication_stops_before_mount(self):

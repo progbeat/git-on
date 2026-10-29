@@ -1923,3 +1923,41 @@ while within-run repeats must reuse available OIDs after memory-cache eviction.
 Old global-cache complexity measurements and earlier CI successes are historical,
 not acceptance evidence for this new head. The full exact-head matrix must run
 again before independent review and final Copilot.
+
+## CI test-cost consolidation
+
+The author authorized removing repeated executions of practically identical
+checks and using representative stress sizes, while retaining important
+pre-merge validation. [CI cost and coverage](ci-performance.md) records the old
+76m38s wall / 586.7 runner-minute baseline, the distinct invariants and the new
+plans. Historical full-million passes remain historical; the new namespace
+profile is never labeled as a full-million payload read.
+
+The source probe previously enumerated every available OID after each read,
+adding quadratic observer work to increasing distinct-demand tests. Metrics-only
+reporting plus one final explicit OID-set verification reduced the local
+512-object control from 126.6s to 23.1s; exact bytes, same-run fetch counts and
+pack-metadata gates remain. The permanent gate rejects per-read object lists in
+that mode. Historical `--before-*` options still reproduce old failures; current
+regressions run in CI without rebuilding already-known failing binaries.
+
+The scale child now rejects wrong bytes, missing names and stale generated
+output in focused real-filesystem harness cases. The default execution plan and
+workflow guards cover every prior source/policy/signature interaction, selected
+100k full reads and a separate million-name traversal. Native fixture/clone/
+cleanup phases and actual sample allocation are reported explicitly. The
+existing required package aggregate waits for the scale and Mac jobs, so these
+checks cannot first finish after merge.
+
+The two-level CI plan is conservative for runtime, dependency, workflow, shared
+helper and unknown changes. Positive/negative gate tests cover permitted skips,
+failed base jobs, omitted required jobs/steps, absent artifacts, dropped matrix
+cases and incomplete operation/sample reports. The always-running required
+aggregate validates the exact head and actual execution data, not only the
+classifier's promised plan. No branch settings or publication behavior change.
+
+The new metrics-only probe gate was replayed against an independently built
+immutable `2062eb8` helper: the 32-object case fails specifically with
+`per-read ODB enumeration returned`. The current helper passes the same case
+and still verifies all final OIDs. Local evidence is
+`/tmp/git-on-ci-opt-probe-{red2,green2}.log`.

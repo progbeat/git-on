@@ -275,6 +275,11 @@ functional correctness:
 
 A benchmark fixture that reuses Git objects must disclose this: it measures
 logical namespace growth but does not by itself model a million distinct blobs.
+The [pre-merge CI coverage map](ci-performance.md) distinguishes complete
+small/medium reads, a million-path namespace traversal with sampled payloads,
+and the unchanged million-distinct-file lazy requirement above. Stress fixture
+counts are test parameters, not product limits; smaller full reads must never
+be reported as full million-file reads.
 
 ## Review regressions and bounded randomized stress
 

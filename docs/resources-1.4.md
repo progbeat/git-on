@@ -63,8 +63,11 @@ requires corrected behavior:
 
 This is evidence for loose streaming, not a packed/delta streaming claim.
 Packed first reads may still allocate the decoded object and necessary bases.
-The 288 MiB remote fixture separately verifies streaming three 96 MiB blobs,
+The remote fixture now verifies streaming three 16 MiB blobs (48 MiB total),
+above both the 8 MiB memory-cache and native Git import streaming thresholds,
 exact range bytes, same-run availability and a fresh invocation's repeated fetch.
+The earlier 288 MiB control exceeded a global-cache quota that no longer exists;
+local 16/64/128 MiB first-range scaling remains unchanged.
 There is no global retention/restore path to benchmark.
 
 ## Distinct-object demand and pack discovery
@@ -97,8 +100,10 @@ Git decoding and bytes. No cap is imposed on active run storage or repository si
 `tests/pack_scaling.py` loads 32, 128 and 512 distinct blobs twice in one fresh
 private ODB and checks same-run availability. Its loader-only strace separates pack
 metadata from native Git children. The source probe's OID
-reporting itself enumerates run objects, so total benchmark wall time includes
-that helper cost and is not presented as isolated product throughput.
+reporting enumerated run objects after every read in the historical samples
+below. The current metrics-only mode verifies the available OID set once after
+both passes, removing quadratic test-helper work. Wall time is not presented
+as isolated product throughput.
 
 | Distinct blobs | d0edf50 pack-directory bytes enumerated | Corrected bytes |
 | ---: | ---: | ---: |
@@ -114,64 +119,60 @@ to callers' packed repositories. These distinct-demand controls supplement both
 million-file fixtures; they are not a claim of testing a million distinct remote
 payload demands in a full traversal.
 
-## Full repository-scale matrix
+## Pre-merge repository-scale coverage
 
-`tests/scalability.py` builds increasing 1,000, 10,000 and 1,000,000-leaf fixtures
-and reads every leaf through an actual command. The full-tree fixture has
-six one-digit components at one million leaves, ten-way directories, one shared
-eight-byte leaf blob, one `.gitignore` control blob and six distinct tree objects
-plus a signed commit: nine distinct objects and 8,000,005 logical bytes. Leaves
-are 100644 and directories 040000. Reuse is explicit: this controls namespace,
-complete traversal/read and materialization growth. It does not replace the
-existing million-distinct-seven-byte-blob lazy fixture and its exact fetch gates.
-Neither fixture is a maximum supported repository size or proof at every size.
+The historical `2062eb8` acceptance run completed 378 invocations, including
+42 full million-leaf reads across fourteen physical scale jobs and two enabled
+passthrough groups. Its full-tree fixture reused nine Git objects and one shared
+eight-byte payload; the separate million-distinct-file lazy fixture remained
+independent. Those results are historical evidence, not a claim about the new
+default CI workload.
 
-For each source/policy/backend cell, both verified and unverified signed commits
-run a Python no-op control, sparse stat/read with 100 repetitions, and complete traversal/read.
-Python startup may inspect the root directory; the no-op gate allows one root
-tree and zero payloads, and still rejects recursive traversal. The existing
-native true/cat million-distinct-file gates retain their separate exact counts.
-Remote runs repeat as independent invocations with fresh private object stores;
-each must fetch the same demanded OIDs again. Eager materialization also
-runs an inert child and necessarily visits the entire selected tree before
-launch. Each workload checks bytes, path completeness, startup/result, exact
-source refs and cleanup. Native git clone plus the same three commands establishes
-the technical-failure baseline; direct execution time on that disk copy is
-recorded separately as the performance baseline. Clone preparation is excluded
-from command timing. A per-invocation harness timeout is not a product SLA.
+The author subsequently authorized consolidating repeated checks and varying
+stress parameters, while keeping important validation before merge. The revised
+[CI cost and coverage map](ci-performance.md) identifies each distinct invariant,
+measured old costs and the replacement execution plan. Every previous
+source/policy/signature combination still runs on representative 1k/10k trees
+when the relevant behavior, dependencies, shared helpers or workflows change.
+Unknown changes require all heavy suites; base functional checks always run.
+Selected signed 100k full reads cover local/remote ordinary FUSE, Linux/Mac
+explicit-all materialization and actual generated-file passthrough. These full
+children check startup, complete names, varied bytes, stat and repeated reads.
 
-Each ordinary-FUSE source/policy combination is an independent Actions job,
-retaining every size, verification mode and independent remote invocation.
-Policies do not wait for three other full traversals on the same runner. Artifact names
-include the policy so measurements from parallel jobs cannot overwrite each
-other. Mac verification modes also run separately; their combined scenarios are
-unchanged. The workflow guard verifies the complete fourteen-cell scale matrix.
+A separate HTTPS/FUSE control traverses **one million leaf names**, verifies
+all directory/name sets, and samples one payload per leaf directory. It is not
+a full million-payload read or a million-file materialization. The existing
+million genuinely distinct seven-byte-blob lazy fixture, no-op/read fetch gates,
+unused-subtree controls, large ranges, reduced-RLIMIT tests and increasing
+32/128/512 distinct-object demands remain before merge. Neither a stress count
+nor a test timeout is a product support ceiling or SLA.
 
-| Backend | Sources | Policies | Host/evidence |
-| --- | --- | --- | --- |
-| Ordinary FUSE | Local and real HTTPS remote | none, ignored, untracked, all | Required Linux `repository-scale` matrix |
-| Generated-file passthrough | Local and real HTTPS remote | ignored (generated I/O path) | Existing isolated capability test copy in `real-fuse`; ordinary child identity retained |
-| Explicit-all materialization | Local and real HTTPS remote | all | Linux and Apple Silicon macOS `repository-scale` matrix |
-| Native macOS mount | Inapplicable | Inapplicable | Deferred #12, never counted as a pass |
-| Protected materialization | Inapplicable | none, ignored, untracked | Must fail before child, existing materialized tests |
+The wide namespace fixture has up to sixteen eight-byte payloads and two
+alternating subtree variants. At one million paths it has 23 distinct Git
+objects and 8,000,005 logical payload bytes, with 100-way three-component paths.
+At 100k it has 21 objects. Object reuse is explicit; it does not model a million
+distinct payload demands. Full byte-reading pressure is now limited to the
+selected stress sizes, rather than claimed equivalent to the old 42 million
+payload opens. The permanent real-4s-unmount-helper regression and real busy/
+escaped-reader/signal tests retain their independent failure triggers.
 
-JSONL records exact HEAD, fixture OIDs, OS/CPU/limits, object-store/backend, child-start
-and total times, wait4 peak resident memory, sampled Linux runner descriptors/RSS,
-sampled filesystem space change, demanded objects, requests/bytes and successful
-native fetches. Filesystem space change is host-wide; wait4 includes waited
-subprocesses and is not a simultaneous sum; Mac runner-only /proc measurements
-are unavailable and represented as such. Linux runner `/proc` and host filesystem
-observations are independent: denied daemon inspection does not suppress an
-available storage sample, and denied filesystem sampling is flagged separately.
-Unsupported/skipped platforms are not
-passes. Linux real-FUSE, Mac materialization and packaged-binary tests retain
-their distinct evidence layers. Final readiness requires the exact-head matrix,
-existing callback guard/integration/stress suites, a fresh independent review
-and final Copilot review, not only a loader pass or a sparse million-file sample.
+Each source uses an immutable Git fixture and read-only direct baseline. Actual
+invocations get fresh private snapshots/ODBs; generated output must be absent
+at child entry. Native clone plus the **same child command** remains the
+technical-failure control. Direct command time is separate from clone/setup.
+New records explicitly time fixture generation, clone, clone deletion, startup,
+child phases, time after child and final cleanup. Sample-file allocated blocks
+are observed per filesystem, never assumed universally. Filesystem deltas are
+host-wide; wait4 includes waited subprocesses rather than a simultaneous sum.
+Mac runner-only /proc observations are unavailable and labeled as such; denied
+Linux /proc and filesystem observations remain independent.
 
-The df900c4 matrix caught a teardown failure after successful million-leaf
-children on ordinary FUSE and enabled passthrough. Clean unmount now waits for
-the active helper's result rather than imposing a three-second reclamation
-deadline. The retry budget for completed busy/unmount failures is retained.
-Those failed historical cells are not acceptance passes; the corrected head
-must run the full matrix again.
+Native Mac mounts remain deferred to #12. Protected materialization remains
+inapplicable and must fail before child execution. Native Linux/Mac package,
+protocol/callback guard, full functional/transport/signature suites and seeded
+filesystem differential stress remain. The existing required `package` gate
+validates the conservative change plan, all base jobs and actual artifacts for
+every required scale/stress/lazy/resource case. Required skipped or missing
+coverage fails the gate. A manual exhaustive matrix is available before release;
+no important case is intentionally deferred until after merge. Final readiness still requires exact-head CI,
+a fresh independent review and final Copilot review.

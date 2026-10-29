@@ -58,10 +58,12 @@ The native job-control suite runs an actual interactive Bash in a Linux PTY,
 stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,
 checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
 It fails unsigned native verification after authentication and needs no mount.
-The real-FUSE job additionally replays the authentic `e427743` executable and
-source probe for the SSH argument-boundary, ignore-acquisition errno, and native
-job-control regressions before requiring the fixed behavior.
-SSH shutdown regressions additionally replay `87a11d5`: equal-length client
+The real-FUSE job always runs the SSH argument-boundary, ignore-acquisition
+errno and native job-control regressions. Optional `--before-*` arguments replay
+authentic historical executables; their red-before evidence is recorded in
+[review regressions](../docs/review-regressions.md), without rebuilding known
+failing binaries on every push.
+SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
 retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
 changes the pathname only after file validation, demonstrating the old race;
@@ -229,22 +231,45 @@ No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
 
-## 1.4 resource and complete namespace acceptance
+## 1.4 resource and pre-merge scale acceptance
 
-See [resource acceptance](../docs/resources-1.4.md) and the
-[dependency audit](../docs/crate-audit-1.4.md). Resource regressions are part of
-`remote.py`; `--before-resource-probe` replays exact-master failures. On Linux,
-`pack_scaling.py --probe ... --before-probe ...` requires strace and records
-pack metadata work as distinct-object demand grows. Global persistent-cache
-index/locking tests were removed with that feature; no global paths are read or
-written. Remote regressions preserve historical directories and exercise
-missing/unusable HOME/XDG_CACHE_HOME plus same-run reuse.
+See [resource acceptance](../docs/resources-1.4.md), the
+[CI cost/coverage map](../docs/ci-performance.md), and the
+[dependency audit](../docs/crate-audit-1.4.md). Resource regressions remain in
+`remote.py`; optional `--before-resource-probe` replays exact-master failures.
+`pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
+32/128/512 distinct-object pack metadata work, and verifies the full available
+OID set once after both read passes. The current probe's `--metrics-only` mode
+avoids repeatedly enumerating all OIDs. Historical helpers still include that
+cost; benchmark wall time is not isolated product throughput.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
-performs full traversal/read and eager startup across increasing fixtures to one
-million leaf paths. Use `--policies all` for materialization, and `ignored` for
-passthrough's generated-file control. Both signature modes and independent first/repeat remote
-invocations are built in; each invocation starts with a private object store. A 1,000-file smoke run can use `--sizes 1000`; it is not the
-million-file acceptance. The complete CI matrix runs real FUSE and native macOS
-materialization and retains JSONL artifacts. Its shared-object full-tree fixture
-is separate from the unchanged million-distinct-file sparse-access fixture.
+defaults to `--profile matrix`: representative 1k/10k interactions and selected
+signed 100k complete reads. Use `--policies all` for materialization and
+`--policies ignored` for generated-file passthrough. Full children include stat,
+100 repeated reads, exact varied payloads, complete directory/name sets and
+fresh-output/source/cleanup checks. Instrumented snapshots remain independent
+between cases, with exact remote-demand assertions.
+
+`--profile namespace --backend fuse --source remote --policies ignored` visits
+one million leaf names and samples a payload in every leaf directory. It is
+explicitly **not** reading every million-file payload. The separate million
+**distinct**-blob lazy scenario and native true/cat benchmark remain in default
+pre-merge CI. `--profile exhaustive` is an explicit diagnostic option for full
+million-file reads/materialization and repeated invocations; no correctness
+suite is deferred to a nightly or post-merge job.
+
+All affected source/policy/signature interactions remain pre-merge. Four physical matrix
+jobs group build/setup work; a fifth runs the million-path namespace control.
+Enabled passthrough retains actual-kernel capability/ordinary-child checks in
+`real-fuse`, plus both source scale groups. Differential stress keeps
+both seeds in default ignored and its resource bounds; dedicated write-policy
+and protocol suites retain all four policies. Native package/installer
+and Mac checks remain. The required `package` aggregate always checks the change plan, all base jobs
+and every required heavy outcome/artifact. Unknown/shared/workflow/dependency
+changes enable all heavy suites; scoped test-driver changes enable their own
+suite. Recognized non-contract docs run the base. No workflow-level path filter
+can leave required checks pending. `workflow_dispatch` with `full_matrix=true`
+selects the complete exhaustive matrix before release; it never publishes. JSONL includes the complete planned cases, observed counts and
+phase/allocation measurements; final claims must match the actually executed
+head and workload sizes.
