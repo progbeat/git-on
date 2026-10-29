@@ -7,7 +7,6 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File},
-    io::Write,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::{symlink, FileExt},
@@ -237,6 +236,7 @@ impl Drop for Pin {
 /// libgit2's necessary pack/delta decoding is not separately observable here.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SnapshotMetrics {
+    pub disk_cache: crate::remote::DiskCacheMetrics,
     pub tree_reads: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
@@ -251,6 +251,7 @@ pub struct SnapshotMetrics {
     pub header_cache_entries: usize,
     pub active_spool_bytes: u64,
     pub active_blob_readers: usize,
+    pub streamed_blob_loads: u64,
     pub spool_writes: u64,
     pub spool_bytes: u64,
     #[cfg(feature = "test-metrics")]
@@ -297,50 +298,37 @@ impl BlobReader {
 
 /// A byte- and entry-bounded LRU. Values exceeding the budget are never retained.
 struct Cache<V> {
-    values: BTreeMap<Oid, (V, usize, u64)>,
-    recency: BTreeMap<u64, Oid>,
+    values: lru::LruCache<Oid, (V, usize)>,
     bytes: usize,
-    clock: u64,
     byte_limit: usize,
     entry_limit: usize,
 }
 impl<V: Clone> Cache<V> {
     fn new(byte_limit: usize, entry_limit: usize) -> Self {
         Self {
-            values: BTreeMap::new(),
-            recency: BTreeMap::new(),
+            values: lru::LruCache::unbounded(),
             bytes: 0,
-            clock: 0,
             byte_limit,
             entry_limit,
         }
     }
     fn get(&mut self, oid: Oid) -> Option<V> {
-        let (value, _, used) = self.values.get_mut(&oid)?;
-        self.recency.remove(used);
-        self.clock = self.clock.saturating_add(1);
-        *used = self.clock;
-        self.recency.insert(*used, oid);
-        Some(value.clone())
+        self.values.get(&oid).map(|(value, _)| value.clone())
     }
     fn insert(&mut self, oid: Oid, value: V, bytes: usize) {
         if bytes > self.byte_limit || self.entry_limit == 0 {
             return;
         }
-        if let Some((_, old_bytes, used)) = self.values.remove(&oid) {
+        if let Some((_, old_bytes)) = self.values.pop(&oid) {
             self.bytes -= old_bytes;
-            self.recency.remove(&used);
         }
         while self.values.len() >= self.entry_limit
             || self.bytes > self.byte_limit.saturating_sub(bytes)
         {
-            let (_, oldest) = self.recency.pop_first().expect("cache has a victim");
-            let (_, removed_bytes, _) = self.values.remove(&oldest).unwrap();
+            let (_, (_, removed_bytes)) = self.values.pop_lru().expect("cache has a victim");
             self.bytes -= removed_bytes;
         }
-        self.clock = self.clock.saturating_add(1);
-        self.values.insert(oid, (value, bytes, self.clock));
-        self.recency.insert(self.clock, oid);
+        self.values.put(oid, (value, bytes));
         self.bytes += bytes;
     }
 }
@@ -439,23 +427,37 @@ impl State {
         } else {
             self.metrics.blob_loads += 1;
             self.ensure(oid)?;
-            let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
-            let bytes = blob.content();
-            self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
-            Self::validate_blob(bytes)?;
-            if bytes.len() <= self.blobs.byte_limit {
+            let (size, kind) = self.repo.odb()?.read_header(oid)?;
+            if kind != ObjectType::Blob {
+                bail!("snapshot file does not reference a blob");
+            }
+            if size > self.blobs.byte_limit {
+                let mut file = tempfile::tempfile_in(&self.spool_directory)
+                    .context("create private source blob spool")?;
+                let (copied, kind, streamed) =
+                    crate::object::copy_from_odb(&self.repo.odb()?, oid, &mut file)?;
+                anyhow::ensure!(
+                    kind == ObjectType::Blob && copied == size,
+                    "Git blob changed during transfer"
+                );
+                self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
+                self.metrics.spool_writes += 1;
+                self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
+                self.metrics.streamed_blob_loads += u64::from(streamed);
+                BlobData::Spool {
+                    file,
+                    size: size as u64,
+                }
+            } else {
+                let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
+                let bytes = blob.content();
+                self.metrics.blob_bytes =
+                    self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
+                Self::validate_blob(bytes)?;
                 let bytes = Arc::<[u8]>::from(bytes);
                 drop(blob);
                 self.blobs.insert(oid, bytes.clone(), bytes.len());
                 BlobData::Memory(bytes)
-            } else {
-                let mut file = tempfile::tempfile_in(&self.spool_directory)
-                    .context("create private source blob spool")?;
-                file.write_all(bytes).context("write source blob spool")?;
-                let size = bytes.len() as u64;
-                self.metrics.spool_writes += 1;
-                self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size);
-                BlobData::Spool { file, size }
             }
         };
         let reader = Arc::new(data);
@@ -798,6 +800,9 @@ impl Snapshot {
     pub fn metrics(&self) -> SnapshotMetrics {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut metrics = state.metrics.clone();
+        if let Some(remote) = &state.remote {
+            metrics.disk_cache = remote.cache_metrics();
+        }
         metrics.blob_cache_bytes = state.blobs.bytes;
         metrics.blob_cache_entries = state.blobs.values.len();
         metrics.blob_cache_limit = state.blobs.byte_limit;
@@ -1140,7 +1145,7 @@ mod tests {
         let retained = snap.metrics().blob_cache_bytes;
         assert_eq!(snap.read(large, 1000, 5).unwrap(), b"xxxxx");
         assert_eq!(snap.metrics().blob_cache_bytes, retained);
-        assert!(!snap.state().unwrap().blobs.values.contains_key(&large));
+        assert!(!snap.state().unwrap().blobs.values.contains(&large));
     }
     #[test]
     fn cache_entry_limits_bound_empty_blobs_and_directory_metadata() {
@@ -1178,6 +1183,7 @@ mod tests {
         let oid = repo.blob(&vec![b'x'; size]).unwrap();
         let reader = snap.open(oid).unwrap();
         let second = snap.open(oid).unwrap();
+        assert_eq!(snap.metrics().streamed_blob_loads, 1);
         for offset in (0..size as u64).step_by(4096) {
             assert_eq!(
                 reader.read(offset, 4096).unwrap(),

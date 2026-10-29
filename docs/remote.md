@@ -87,13 +87,44 @@ payloads. Applicable `.gitignore` blobs are fetched on demand in default
 write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
 local and remote snapshots.
 
-Persistent objects live in `$XDG_CACHE_HOME/git-on/objects-v1`, falling back to
-`$HOME/.cache/git-on/objects-v1`. Retain at most 256 MiB and 4096 objects, plus a
-zero-length lock. Each record contains its type byte and object bytes. Atomic
-insertion and LRU eviction share an exclusive flock. Acquiring the lock reclaims
-interrupted staging writes. Check restored object hashes. Each active run copies
-demanded cached objects into a private temporary bare repository, so concurrent
-eviction cannot invalidate active reads. Oversized objects stay in run storage.
+Persistent objects live in `$XDG_CACHE_HOME/git-on/objects-v2`, falling back to
+`$HOME/.cache/git-on/objects-v2`. Retain at most 256 MiB of payload records and
+4096 objects, plus bounded O(K) index metadata (at most 256 encoded bytes per
+object and a 256-byte header in the current format) and a zero-length lock.
+Each payload record contains its type byte and object bytes. The versioned
+namespace keeps older binaries' `objects-v1` caches usable; upgrading begins
+with a cold v2 cache. Older cache directories are left untouched and can be
+removed when no longer needed.
+
+Atomic insertion and LRU eviction share an exclusive flock. Ordinary hits,
+misses and stores follow a constant number of on-disk links; actual evictions
+add work proportional to their count. There is no per-access directory scan,
+sort or in-memory mirror of the global index. Mutation first records a durable
+dirty marker; atomically published payloads and link/header records are synced
+before removing it. A killed/interrupted writer leaves that marker. The next
+lock holder rebuilds the index once from retained payloads and removes abandoned
+staging files, under the same flock. See [resource acceptance](resources-1.4.md)
+for complexity, durability costs and measured evidence.
+
+Restores stream and hash the entire record before trusting it, then stream to
+an ODB writer and verify again before atomic publication. Invalid hashes/types
+are discarded. Stores inspect the Git header before decoding, so oversized
+objects never decode merely for cache retention. Transfers check cancellation
+between 64 KiB chunks. Loose objects can stream to large-file spools; libgit2's
+pack backend still requires object/delta decoding, and its loose reader maps the
+compressed source file. Neither mapped OS page cache nor necessary packed decode
+is reported as a retained application payload cache.
+
+Each active run copies demanded cached objects into a private temporary bare
+repository. Global eviction cannot invalidate active reads or cause an available
+run-local object to be fetched again. Oversized objects stay in run storage.
+Retained libgit2 pack descriptors are capped before threads start: at most 32,
+and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack
+window). This leaves descriptors for native Git startup, the mount and active
+files; it does not raise OS limits or reserve a quota for the child. Active
+operations can still encounter ordinary OS limits, reported before launch or
+through the lazy operation and runner failure as applicable. No failure reruns
+a started child or silently changes write policy.
 
 A warm run still performs the initial native fetch to interpret the unchanged
 repository/refspec and select its commit or tag. Cached tree and blob objects

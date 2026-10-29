@@ -216,7 +216,7 @@ fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
 #[test]
 fn review_waiting_for_cache_lock_is_cancellable() {
     let (temp, _, _, _) = fixture();
-    let cache = temp.path().join("cache/git-on/objects-v1");
+    let cache = temp.path().join("cache/git-on/objects-v2");
     std::fs::create_dir_all(&cache).unwrap();
     let held_lock = OpenOptions::new()
         .read(true)
@@ -319,21 +319,23 @@ fn review_cache_restore_failure_is_latched() {
     let (temporary, _, _, _) = fixture();
     let snapshot = load(temporary.path(), "HEAD", false).unwrap();
     let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
-        .join("git-on/objects-v1");
+        .join("git-on/objects-v2");
     // A competing/failed cache writer left an unusable directory entry. The
     // demanded subtree cannot be restored and the affected operation fails.
-    std::fs::write(cache.join("unrecognized-entry"), b"fault").unwrap();
+    let server = Repository::open_bare(temporary.path().join("server")).unwrap();
+    let tree = server.find_tree(snapshot.tree_oid).unwrap();
+    let subtree = tree.get_name("deep").unwrap().id();
+    let fault = cache.join(subtree.to_string());
+    std::fs::create_dir(&fault).unwrap();
     let error = snapshot.entry(Path::new("deep/value")).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("unrecognized remote cache entry"));
+    assert!(format!("{error:#}").contains("directory"));
     // Returning EIO alone permits the child to catch it and exit 0. The runner
     // must retain the failure so that an incomplete execution returns 125.
     let failure = snapshot
         .remote_failure()
         .expect("demanded cache failure was not latched for runner failure");
-    assert!(failure.contains("unrecognized remote cache entry"));
-    std::fs::remove_file(cache.join("unrecognized-entry")).unwrap();
+    assert!(failure.contains("directory"));
+    std::fs::remove_dir(fault).unwrap();
     // Removing the broken record does not authorize reconnecting/refetching
     // after the latched failure or replace the original diagnostic.
     assert!(snapshot.entry(Path::new("deep/value")).is_err());

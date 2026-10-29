@@ -35,13 +35,14 @@ PARSER.add_argument('--probe', type=Path, default=ROOT / 'target/debug/examples/
 PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
+PARSER.add_argument('--before-resource-probe', type=Path, help='Master source probe for resource red-before evidence')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
 PARSER.add_argument('--before-policy-binary', type=Path, help='Authentic e427743 binary for ignore-acquisition errno red-before replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
 # Artifact arguments are relative to the invoking harness, not a forked
 # fixture's cwd. Resolve them before any child changes directories.
-for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary'):
+for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary','before_resource_probe'):
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
@@ -1249,6 +1250,148 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
+    def test_remote_eviction_keeps_large_run_objects_available_and_warm_transfers_stream(self):
+        f=self.f; ids=[]
+        for byte in b'abc':
+            with tempfile.TemporaryFile() as output:
+                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
+                for _ in range(96): writer.stdin.write(bytes([byte])*(1024*1024))
+                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); ids.append(output.read().decode().strip())
+        tree=f.git('mktree',data=''.join(f'100644 blob {oid}\t{name}\n' for name,oid in zip('abc',ids)).encode())
+        commit=f.git('commit-tree',tree,data=b'over-capacity fixture\n');f.git('update-ref','refs/heads/main',commit)
+        url=f.https();self.addCleanup(f.server.shutdown)
+        process=f.probe(url);f.line(process)
+        for name in 'abc':
+            value,last=f.operation(process,f'range 13 16 {name}')
+            self.assertEqual(bytes(value['bytes']),name.encode()*16)
+        self.assertGreater(last['metrics']['disk_cache']['evictions'],0)
+        requests=len(f.requests)
+        value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
+        self.assertEqual(len(f.requests),requests,'global eviction caused a same-run re-fetch')
+        f.finish(process)
+        # The last object remains retained. Its warm restore and source spool
+        # stream loose bytes; the selected commit and an evicted root may transfer.
+        requests=len(f.requests);process=f.probe(url);f.line(process)
+        value,last=f.operation(process,'range 13 16 c');self.assertEqual(bytes(value['bytes']),b'c'*16)
+        self.assertEqual(last['metrics']['streamed_blob_loads'],1)
+        self.assertLessEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree})
+        f.finish(process)
+        retained=[p for p in (f.root/'cache/git-on/objects-v2').iterdir() if len(p.name)==40]
+        self.assertLessEqual(sum(p.stat().st_size for p in retained),256*1024*1024)
+        print('over-capacity evidence:',json.dumps(dict(logical_blob_bytes=3*96*1024*1024,retained_payload_bytes=sum(p.stat().st_size for p in retained),metrics=last['metrics'])),flush=True)
+
+    def test_materialization_progress_is_delayed_tty_only_and_cleared_before_child_or_error(self):
+        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        programs=f.root/'progress-tools'; programs.mkdir(); (programs/'git').symlink_to(shutil.which('git'))
+        env=dict(f.env,PATH=str(programs),TERM='xterm')
+        f.stalled_oids={f.blob}
+        for outcome in ('success','error','cancel'):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(f.root/'cache',ignore_errors=True)
+                f.resume.clear(); f.stalled.clear(); f.denied_oids=set()
+                master,slave=pty.openpty()
+                self.addCleanup(os.close,master)
+                child="import sys; sys.stderr.write('CHILD-START\\n'); print('child output')"
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=slave)
+                os.close(slave); f.children.append(process)
+                self.assertTrue(f.stalled.wait(10),'materialization never reached controlled object stall')
+                transcript=bytearray(); deadline=time.monotonic()+5
+                while b'Preparing snapshot' not in transcript and time.monotonic()<deadline:
+                    if select.select([master],[],[],.1)[0]: transcript.extend(os.read(master,65536))
+                self.assertIn(b'Preparing snapshot',transcript)
+                self.assertNotIn(b'CHILD-START',transcript)
+                if outcome=='error': f.denied_oids={f.blob}
+                if outcome=='cancel': process.send_signal(signal.SIGTERM)
+                f.resume.set()
+                output,_=process.communicate(timeout=20)
+                while select.select([master],[],[],.05)[0]:
+                    try: chunk=os.read(master,65536)
+                    except OSError as error:
+                        if error.errno==errno.EIO: break
+                        raise
+                    if not chunk: break
+                    transcript.extend(chunk)
+                self.assertIn(b'\x1b[2K',transcript)
+                if outcome=='success':
+                    self.assertEqual(process.returncode,0,transcript)
+                    self.assertEqual(output,b'child output\n')
+                    self.assertGreater(transcript.index(b'CHILD-START'),transcript.rfind(b'\x1b[2K'))
+                else:
+                    self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
+                    self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
+                    if outcome=='error': self.assertIn(b'fetch of exact object',transcript)
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
+    def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):
+        import resource
+        f=self.f
+        entries=[]
+        for index in range(192):
+            blob=f.git('hash-object','-w','--stdin',data=f'object-{index}\n'.encode())
+            entries.append(f'100644 blob {blob}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'descriptor fixture\n')
+        f.git('update-ref','refs/heads/main',commit)
+        limit=64
+        def reduced_limit(): resource.setrlimit(resource.RLIMIT_NOFILE,(limit,limit))
+        def exercise(binary,cache,expect_failure=False):
+            process=subprocess.Popen([str(binary),'file://'+str(f.repo),'HEAD'],cwd=f.cwd,
+                env=dict(f.env,XDG_CACHE_HOME=str(cache)),preexec_fn=reduced_limit,
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+            f.children.append(process)
+            samples=[]; failure=None; last=None
+            try:
+                f.line(process)
+                for index in range(192):
+                    value,last=f.operation(process,f'read f{index:03d}')
+                    self.assertEqual(value['data'],f'object-{index}\n')
+                    if index in (15,63,127,191):
+                        samples.append(dict(objects=index+1,descriptors=len(list(Path(f'/proc/{process.pid}/fd').iterdir()))))
+            except (AssertionError,BrokenPipeError) as error:
+                failure=str(error)
+                process.wait(timeout=10)
+            if expect_failure:
+                self.assertIsNotNone(failure,'old binary unexpectedly completed; red result unavailable')
+                self.assertIn('Too many open files',failure)
+            else:
+                if failure: self.fail(failure)
+                f.finish(process)
+                self.assertLessEqual(max(x['descriptors'] for x in samples),48)
+            print('descriptor evidence:',json.dumps(dict(binary=str(binary),cache=str(cache),rlimit_nofile=limit,samples=samples,failure=failure,metrics=last['metrics'] if last else None)),flush=True)
+            return last
+        if OPTIONS.before_resource_probe:
+            exercise(OPTIONS.before_resource_probe,f.root/'before-cache',True)
+        cache=f.root/'resource-cache'
+        cold=exercise(OPTIONS.probe,cache)
+        warm=exercise(OPTIONS.probe,cache)
+        self.assertEqual(cold['metrics']['blob_loads'],192)
+        self.assertEqual(warm['metrics']['disk_cache']['restores'],193)
+        self.assertEqual(warm['metrics']['disk_cache']['stores'],0)
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
+    def test_first_large_loose_range_streams_without_retaining_full_payload(self):
+        f=self.f
+        for mib in (16,64,128):
+            with tempfile.TemporaryFile() as output:
+                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
+                for _ in range(mib): writer.stdin.write(b'x'*(1024*1024))
+                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); blob=output.read().decode().strip()
+            tree=f.git('mktree',data=f'100644 blob {blob}\tlarge\n'.encode())
+            for binary in ([OPTIONS.before_resource_probe] if OPTIONS.before_resource_probe else [])+[OPTIONS.probe]:
+                process=subprocess.Popen([str(binary),'local',tree],cwd=f.repo,env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+                f.children.append(process); f.line(process)
+                value,report=f.operation(process,'range 1234 16 large')
+                self.assertEqual(bytes(value['bytes']),b'x'*16)
+                repeated,again=f.operation(process,'range 4321 16 large')
+                self.assertEqual(repeated,value)
+                self.assertEqual(again['metrics']['spool_writes'],1)
+                status=Path(f'/proc/{process.pid}/status').read_text()
+                peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
+                if binary==OPTIONS.probe: self.assertEqual(report['metrics']['streamed_blob_loads'],1)
+                print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
+                f.finish(process)
+
     def test_million_distinct_file_remote_cold_and_warm_bounded_fetch(self):
         if not OPTIONS.million: self.skipTest('million-file acceptance explicitly selected in CI')
         import benchmark
@@ -1388,7 +1531,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(f.git('rev-parse',pin,at=directory/'remote-repository'),recovery['tree_oid'])
         # Kernel flock ownership ends with the killed process. Cached objects
         # remain reusable; active-run objects and pin remain in private storage.
-        for lockfile in (directory/'.lock',f.root/'cache/git-on/objects-v1/lock'):
+        for lockfile in (directory/'.lock',next((f.root/'cache/git-on').glob('objects-v*'))/'lock'):
             with lockfile.open('rb') as held:
                 fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 fcntl.flock(held,fcntl.LOCK_UN)
@@ -1634,14 +1777,14 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_review_real_mount_caught_cache_fault_forces_runner_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        code="import errno,os; from pathlib import Path; (Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('cache fault not observed')\n"
+        code=f"import errno,os; from pathlib import Path; (next((Path(os.environ['XDG_CACHE_HOME'])/'git-on').glob('objects-v*'))/'{f.subtree}').mkdir()\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('cache fault not observed')\n"
         cases=([(OPTIONS.before_binary,0)] if OPTIONS.before_binary else [])+[(OPTIONS.binary,125)]
         for binary,expected in cases:
             shutil.rmtree(f.root/'cache',ignore_errors=True)
             result=subprocess.run([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,expected,result.stderr)
             if expected==125:
-                self.assertIn(b'not-an-object',result.stderr)
+                self.assertIn(b'remote object loading failed',result.stderr)
                 self.assertIn(b'execution incomplete',result.stderr)
             self.assertEqual(list(f.root.glob('git-on-*')),[])
             print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
@@ -1667,7 +1810,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
                         code="import json,os,sys; from pathlib import Path\n"
                         if fault=='cache':
-                            code+="(Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\n"
+                            code+=f"(next((Path(os.environ['XDG_CACHE_HOME'])/'git-on').glob('objects-v*'))/'{f.ignore}').mkdir()\n"
                         code+="try:\n"
                         code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
                         code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
@@ -1678,7 +1821,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         if fault=='transport':
                             self.assertTrue(any(f.ignore in request['wants'] and request.get('status')==403 for request in f.requests),f.requests)
                             self.assertIn(f.ignore.encode(),result.stderr)
-                        else: self.assertIn(b'not-an-object',result.stderr)
+                        else: self.assertIn(b'remote object loading failed',result.stderr)
                         self.assertEqual(list(f.root.glob('git-on-*')),[])
                         print('ignore acquisition errno regression evidence:',json.dumps(dict(binary=str(binary),before=expected==errno.EROFS,fault=fault,operation=operation,errno=expected)),flush=True)
         # With healthy rules, policy denial retains its distinct EROFS meaning.

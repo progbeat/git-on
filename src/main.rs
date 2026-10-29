@@ -418,7 +418,6 @@ fn execute(
             if write_policy != git_on::policy::WritePolicy::All {
                 bail!("FUSE unavailable: {reason}; policy {write_policy:?} requires FUSE. Only explicit --write-policy=all supports materialization");
             }
-            eprintln!("git-on: materialized backend (explicit all): {reason}; eagerly reading the complete snapshot");
             git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
             None
         } else {
@@ -593,6 +592,8 @@ fn subscribe_signals() -> std::io::Result<Signals> {
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
+        // main has not created signal handlers, worker threads or Git handles.
+        unsafe { git_on::object::configure_pack_descriptors() }?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
                 cleanup(Path::new(&directory))?;

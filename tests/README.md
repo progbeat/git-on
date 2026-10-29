@@ -228,3 +228,20 @@ and native archive.
 No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
+
+## 1.4 resource and complete namespace acceptance
+
+See [resource acceptance](../docs/resources-1.4.md) and the
+[dependency audit](../docs/crate-audit-1.4.md). Resource regressions are part of
+`remote.py`; `--before-resource-probe` replays exact-master failures. On Linux,
+`cache_scaling.py --probe ... --before-resource-probe ...` requires strace and
+records metadata work and lock time independently in K and N.
+
+`scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
+performs full traversal/read and eager startup across increasing fixtures to one
+million leaf paths. Use `--policies all` for materialization, and `ignored` for
+passthrough's generated-file control. Both signature modes and cold/warm remote
+runs are built in. A 1,000-file smoke run can use `--sizes 1000`; it is not the
+million-file acceptance. The complete CI matrix runs real FUSE and native macOS
+materialization and retains JSONL artifacts. Its shared-object full-tree fixture
+is separate from the unchanged million-distinct-file sparse-access fixture.

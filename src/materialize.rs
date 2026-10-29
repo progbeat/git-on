@@ -129,6 +129,7 @@ fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
 }
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
+    let _progress = crate::progress::MaterializationProgress::start();
     snapshot.set_spool_directory(root)?;
     directory(snapshot, Path::new(""), root)
 }

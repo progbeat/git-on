@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, FromRawFd},
         net::UnixStream,
     },
@@ -457,6 +457,9 @@ impl Remote {
     }
     pub fn failure(&self) -> Option<String> {
         self.failed.clone()
+    }
+    pub fn cache_metrics(&self) -> DiskCacheMetrics {
+        self.cache.metrics()
     }
 }
 impl Drop for Remote {
@@ -915,176 +918,7 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     fi
 }"#;
 
-/// Persistent loose objects are copied into each run's private repository.
-/// Eviction cannot invalidate active readers; temporary run storage has no quota.
-pub struct DiskCache {
-    root: PathBuf,
-    budget: u64,
-    entries: usize,
-}
-impl DiskCache {
-    pub fn standard() -> Result<Self> {
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|x| PathBuf::from(x).join(".cache")))
-            .context("remote cache requires XDG_CACHE_HOME or HOME")?
-            .join("git-on/objects-v1");
-        Self::new(root, DISK_CACHE_BYTES, DISK_CACHE_ENTRIES)
-    }
-    pub fn new(root: PathBuf, budget: u64, entries: usize) -> Result<Self> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)?;
-        Ok(Self {
-            root,
-            budget,
-            entries,
-        })
-    }
-    fn lock(&self) -> Result<File> {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.root.join("lock"))?;
-        loop {
-            if let Some(signal) = crate::git::cancelled_signal() {
-                bail!("remote cache lock cancelled by signal {signal}");
-            }
-            if crate::git::operations_stopped() {
-                bail!("remote cache lock stopped after command completion");
-            }
-            crate::git::check_request_interruption()?;
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock
-                && error.kind() != std::io::ErrorKind::Interrupted
-            {
-                return Err(error.into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        self.reconcile()?;
-        Ok(f)
-    }
-    fn reconcile(&self) -> Result<()> {
-        let mut files = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                bail!("unrecognized remote cache entry");
-            };
-            if name == "lock" {
-                continue;
-            }
-            if name.starts_with(".tmp") {
-                // Every writer holds the same flock through atomic publication.
-                // With that lock held, these are interrupted staging files.
-                fs::remove_file(entry.path())?;
-                continue;
-            }
-            if name.len() != 40 || Oid::from_str(name).is_err() || !entry.file_type()?.is_file() {
-                bail!("unrecognized remote cache entry {name:?}");
-            }
-            let metadata = entry.metadata()?;
-            files.push((metadata.modified()?, metadata.len(), entry.path()));
-        }
-        files.sort_by_key(|x| x.0);
-        let mut bytes: u64 = files.iter().map(|x| x.1).sum();
-        let mut count = files.len();
-        for (_, size, path) in files {
-            if bytes <= self.budget && count <= self.entries {
-                break;
-            }
-            fs::remove_file(path)?;
-            bytes = bytes.saturating_sub(size);
-            count -= 1;
-        }
-        Ok(())
-    }
-    fn restore(&self, repo: &Repository, oid: Oid) -> Result<bool> {
-        let _lock = self.lock()?;
-        let file = self.root.join(oid.to_string());
-        let data = match fs::read(&file) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let Some((&kind, data)) = data.split_first() else {
-            fs::remove_file(file)?;
-            return Ok(false);
-        };
-        let Some(kind) = git2::ObjectType::from_raw(i32::from(kind)) else {
-            fs::remove_file(file)?;
-            return Ok(false);
-        };
-        if !matches!(
-            kind,
-            git2::ObjectType::Commit
-                | git2::ObjectType::Tree
-                | git2::ObjectType::Blob
-                | git2::ObjectType::Tag
-        ) || Oid::hash_object(kind, data)? != oid
-        {
-            fs::remove_file(file)?;
-            return Ok(false);
-        }
-        repo.odb()?.write(kind, data)?;
-        File::open(file)?
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
-        Ok(true)
-    }
-    fn store(&self, repo: &Repository, oid: Oid) -> Result<()> {
-        let odb = repo.odb()?;
-        let object = odb.read(oid)?;
-        let weight = object.len() as u64 + 1;
-        let _lock = self.lock()?;
-        let mut files = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.len() == 40 && Oid::from_str(name).is_ok())
-            {
-                let metadata = entry.metadata()?;
-                files.push((metadata.modified()?, metadata.len(), entry.path()));
-            }
-        }
-        files.sort_by_key(|x| x.0);
-        let mut total: u64 = files.iter().map(|x| x.1).sum();
-        let mut count = files.len();
-        let target = self.root.join(oid.to_string());
-        if target.exists() {
-            return Ok(());
-        }
-        let retain = weight <= self.budget && self.entries > 0;
-        for (_, size, path) in files {
-            if total.saturating_add(if retain { weight } else { 0 }) <= self.budget
-                && count + usize::from(retain) <= self.entries
-            {
-                break;
-            }
-            fs::remove_file(path)?;
-            total = total.saturating_sub(size);
-            count -= 1;
-        }
-        if retain {
-            use std::io::Write;
-            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-            temporary.write_all(&[object.kind().raw() as u8])?;
-            temporary.write_all(object.data())?;
-            temporary.persist(target)?;
-        }
-        Ok(())
-    }
-}
+pub use crate::disk_cache::{DiskCache, DiskCacheMetrics};
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,55 +987,5 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         drop(client);
         peer.join().unwrap();
-    }
-    fn total(root: &Path) -> u64 {
-        fs::read_dir(root)
-            .unwrap()
-            .map(|x| x.unwrap().metadata().unwrap().len())
-            .sum()
-    }
-    #[test]
-    fn review_abandoned_staging_files_are_reclaimed_with_cache_lock() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cache");
-        let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-        fs::write(root.join(".tmpAbandonedWrite"), vec![0; 128]).unwrap();
-        let repo = Repository::init_bare(temporary.path().join("repository")).unwrap();
-        let oid = repo.blob(b"demanded").unwrap();
-        cache.store(&repo, oid).unwrap();
-        assert!(!root.join(".tmpAbandonedWrite").exists());
-        assert!(total(&root) <= 64);
-    }
-    #[test]
-    fn concurrent_eviction_keeps_active_run_copies_and_bounds_bytes_entries() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cache");
-        let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-        let original = Repository::init_bare(temporary.path().join("original")).unwrap();
-        let active = Repository::init_bare(temporary.path().join("active")).unwrap();
-        let oid = original.blob(b"active copy").unwrap();
-        cache.store(&original, oid).unwrap();
-        assert!(cache.restore(&active, oid).unwrap());
-        std::thread::scope(|scope| {
-            for worker in 0..4 {
-                let root = root.clone();
-                let path = temporary.path().join(format!("worker-{worker}"));
-                scope.spawn(move || {
-                    let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-                    let repo = Repository::init_bare(path).unwrap();
-                    for n in 0..30 {
-                        let oid = repo.blob(&[worker, n]).unwrap();
-                        cache.store(&repo, oid).unwrap();
-                        let _lock = cache.lock().unwrap();
-                        assert!(total(&root) <= 64);
-                        assert!(fs::read_dir(&root).unwrap().count() <= 3);
-                    }
-                });
-            }
-        });
-        assert_eq!(active.find_blob(oid).unwrap().content(), b"active copy");
-        let oversized = original.blob(&[0; 65]).unwrap();
-        cache.store(&original, oversized).unwrap();
-        assert!(!root.join(oversized.to_string()).exists());
     }
 }

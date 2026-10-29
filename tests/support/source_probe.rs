@@ -23,6 +23,8 @@ fn report(snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
+    // Same process-start resource policy as the production CLI.
+    unsafe { git_on::object::configure_pack_descriptors() }?;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let source = args.first().context("source required")?;
     let revision = args.get(1).context("revision required")?;

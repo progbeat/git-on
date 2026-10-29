@@ -39,8 +39,16 @@ class CiContractTests(unittest.TestCase):
         body=job('release')
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/master'",body)
         self.assertIn("needs.release-policy.outputs.release_required == 'true'",body)
-        self.assertIn('needs: [rust, macos, real-fuse, lazy-performance, release-policy, package]',body)
+        self.assertIn('needs: [rust, macos, real-fuse, lazy-performance, repository-scale, release-policy, package]',body)
         self.assertIn('actions: write',body)
+
+    def test_repository_scale_requires_complete_real_backend_matrix(self):
+        body=job('repository-scale')
+        for expected in ['backend: fuse','backend: materialized','runner: macos-26','source: local','source: remote','policies: none,ignored,untracked,all','tests/scalability.py','--features test-metrics']:
+            self.assertIn(expected,body)
+        self.assertIn('tests/scalability.py',job('real-fuse'))
+        self.assertIn('--backend passthrough',job('real-fuse'))
+        self.assertIn('tests/cache_scaling.py',job('rust'))
 
     def test_trigger_pins_the_tested_commit_and_never_moves_existing_tags(self):
         script=textwrap.dedent(re.search(r'        run: \|\n(.*)',job('release'),re.S)[1])

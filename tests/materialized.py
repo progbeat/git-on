@@ -81,7 +81,7 @@ Path('generated').write_text('fresh')
 print(os.environ['GIT_ON_TREE_OID'])
 """, '--write-policy=all')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(b'materialized backend', result.stderr)
+            self.assertEqual(result.stderr, b'')
             self.assertEqual(result.stdout.strip(), self.oid)
             self.clean()
 
