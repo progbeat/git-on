@@ -179,6 +179,12 @@ the technical-failure baseline; direct execution time on that disk copy is
 recorded separately as the performance baseline. Clone preparation is excluded
 from command timing. A per-invocation harness timeout is not a product SLA.
 
+Each ordinary-FUSE source/policy combination is an independent Actions job,
+retaining every size, verification mode and cold/warm repetition. Policies do
+not wait for three other full traversals on the same runner. Artifact names
+include the policy so measurements from parallel jobs cannot overwrite each
+other. The workflow guard verifies the complete twelve-cell scale matrix.
+
 | Backend | Sources | Policies | Host/evidence |
 | --- | --- | --- | --- |
 | Ordinary FUSE | Local and real HTTPS remote | none, ignored, untracked, all | Required Linux `repository-scale` matrix |

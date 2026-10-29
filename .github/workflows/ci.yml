@@ -279,11 +279,35 @@ jobs:
           - runner: ubuntu-latest
             backend: fuse
             source: local
-            policies: none,ignored,untracked,all
+            policies: none
+          - runner: ubuntu-latest
+            backend: fuse
+            source: local
+            policies: ignored
+          - runner: ubuntu-latest
+            backend: fuse
+            source: local
+            policies: untracked
+          - runner: ubuntu-latest
+            backend: fuse
+            source: local
+            policies: all
           - runner: ubuntu-latest
             backend: fuse
             source: remote
-            policies: none,ignored,untracked,all
+            policies: none
+          - runner: ubuntu-latest
+            backend: fuse
+            source: remote
+            policies: ignored
+          - runner: ubuntu-latest
+            backend: fuse
+            source: remote
+            policies: untracked
+          - runner: ubuntu-latest
+            backend: fuse
+            source: remote
+            policies: all
           - runner: ubuntu-latest
             backend: materialized
             source: local
@@ -323,7 +347,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}
+          name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}
           path: scale-results.jsonl
           if-no-files-found: ignore
 

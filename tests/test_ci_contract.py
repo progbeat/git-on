@@ -45,8 +45,14 @@ class CiContractTests(unittest.TestCase):
 
     def test_repository_scale_requires_complete_real_backend_matrix(self):
         body=job('repository-scale')
-        for expected in ['backend: fuse','backend: materialized','runner: macos-26','source: local','source: remote','policies: none,ignored,untracked,all','tests/scalability.py','--features test-metrics']:
+        for expected in ['tests/scalability.py','--features test-metrics']:
             self.assertIn(expected,body)
+        cells=re.findall(r'- runner: (\S+)\n\s+backend: (\S+)\n\s+source: (\S+)\n\s+policies: (\S+)',body)
+        required={('ubuntu-latest','fuse',source,policy) for source in ('local','remote') for policy in ('none','ignored','untracked','all')}
+        required.update((runner,'materialized',source,'all') for runner in ('ubuntu-latest','macos-26') for source in ('local','remote'))
+        self.assertEqual(set(cells),required)
+        self.assertEqual(len(cells),len(required),'duplicate scale cells')
+        self.assertIn('name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}',body)
         self.assertIn('tests/scalability.py',job('real-fuse'))
         self.assertIn('--backend passthrough',job('real-fuse'))
         self.assertIn('tests/cache_scaling.py',job('rust'))
