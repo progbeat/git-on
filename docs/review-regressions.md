@@ -1961,3 +1961,35 @@ immutable `2062eb8` helper: the 32-object case fails specifically with
 `per-read ODB enumeration returned`. The current helper passes the same case
 and still verifies all final OIDs. Local evidence is
 `/tmp/git-on-ci-opt-probe-{red2,green2}.log`.
+
+## CI evidence review: eager materialization and cancellation observations
+
+The exhaustive manual plan includes no-op and sparse children after eager
+materialization. Its evidence validator incorrectly required those preparations
+to have the same object-load counts as a lazy FUSE mount. The permanent
+`test_exhaustive_materialized_evidence_allows_eager_object_preparation` fails on
+2525918 with `non-lazy no-op`, then passes after restricting lazy counters to
+FUSE/passthrough. Its exhaustive parser fixture includes 378 scenarios; these
+synthetic records are parser coverage, not backend execution. Negative cases
+still reject wrong child read counts on all three backends and excess blob/tree
+loads for lazy no-op/sparse cases. Logs are
+`/tmp/git-on-ci-eager-evidence-{red,green}.log`.
+
+Actual 1,000-file exhaustive materialization passed six local and twelve remote
+invocations: no-op/sparse/full, both verification modes and fresh repeated
+remote runs. Each preparation loaded 17 blobs and three trees; child payload
+read counts were respectively 0, 100 and 1101. No full-million exhaustive matrix
+was run to validate this small evidence correction.
+
+The startup cancellation test also assumed that reaping native Git meant every
+transport in its killed process group was already dead. A review saw a SIGQUIT
+failure followed by a passing rerun. A local diagnostic passed 120 ordinary
+cancellations; with controlled CPU contention, the same immediate `/proc`
+predicate failed for all 80 observations, including 20 SIGQUIT cases, while
+every exact transport's pidfd became readable within 0.503 seconds. The test now
+uses a two-second pidfd death assertion, as the existing stalled-transport test
+already does. It still fails if the owned process survives, avoids PID reuse,
+and disposes of the exact process if an assertion fails. Product cancellation
+behavior is unchanged. Diagnostic records are
+`/tmp/git-on-signal-review-{diagnostic,loaded}.jsonl`; focused tests pass in
+`/tmp/git-on-signal-review-green.log`.

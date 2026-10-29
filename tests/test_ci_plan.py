@@ -27,6 +27,36 @@ def outcomes(plan):
     return result
 
 
+def write_synthetic_scale_reports(root,plan):
+    """Parser fixtures only; these records never claim backend execution."""
+    from scalability import fixture_shape, scenario_plan, expected_demands
+    import math
+    expected=[]
+    for group in plan['scale_matrix']['include']:
+        host='macos' if group['runner'].startswith('macos') else 'linux'
+        for source in group['sources'].split(','):expected.append((host,group['backend'],source,group['profile'],group['policies'].split(',')))
+    expected.extend(('linux','passthrough',source,plan['profile'],['ignored']) for source in ('local','remote'))
+    for index,(host,backend,source,profile,policies) in enumerate(expected):
+        cases=scenario_plan(backend,source,profile,policies,'both')
+        data=[dict(type='environment',platform=host,backend=backend,source=source,profile=profile,revision=HEAD,scenario_plan=cases)]
+        infos={}
+        for count in dict.fromkeys(c['files'] for c in cases):
+            shape=fixture_shape(count)
+            info=dict(count=count,fanouts=shape,depth=len(shape),logical_payload_bytes=count*8+5,git_objects=['c','r','t','b','i'],commit='c',tree='r',sparse_objects=['c','r','t','b'],namespace_objects=['c','r','t','b','i'],namespace_payload_reads=math.prod(shape[:-1])+101)
+            infos[count]=info;data.append(dict(type='fixture',**info))
+            for phase in ('fixture','clone','clone-cleanup'):data.append(dict(type='phase',phase=phase,files=count,outcome='passed'))
+            data.append(dict(type='allocation-sample',files=count,logical_bytes=8,allocated_bytes=0,filesystem_fragment_bytes=512))
+        for count,workload in dict.fromkeys((c['files'],c['workload']) for c in cases):
+            data.append(dict(type='direct-baseline',files=count,workload=workload,backend='disk',target_backend=backend,child_observation=dict(generated_write=backend=='passthrough' and workload=='full')))
+        for case in cases:
+            info=infos[case['files']];wants=expected_demands(info,backend,case['workload']) if source=='remote' else set()
+            child=dict(generated_write=backend=='passthrough' and case['workload']=='full',visited_leaves=case['files'] if case['workload'] in ('full','enumerate') else None,payload_reads=case['files']+101 if case['workload']=='full' else info['namespace_payload_reads'] if case['workload']=='enumerate' else 100 if case['workload']=='sparse' else 0)
+            metrics=dict(remote_fetches=len(wants),tree_reads=3 if backend=='materialized' else 0,blob_loads=17 if backend=='materialized' else int(case['workload']=='sparse'),blob_cache_bytes=0,blob_cache_limit=1,tree_cache_bytes=0,tree_cache_limit=1,passthrough_handles=int(backend=='passthrough'))
+            data.extend([dict(type='runner',backend=backend,source=source,profile=profile,**case,elapsed_ns=3,child_start_ns=1,child_duration_ns=1,after_child_ns=1,child_observation=child,metrics=metrics),dict(type='transport',**case,objects=sorted(wants))])
+        data.append(dict(type='phase',phase='fixture-cleanup',outcome='passed'))
+        (root/f'scale-{index}.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in data))
+
+
 class CiPlanTests(unittest.TestCase):
     def test_docs_keep_fast_base_and_unknown_shared_dependency_workflow_inputs_require_all(self):
         documentation=select(['README.md','docs/ci-performance.md','docs/new-guide.md'],HEAD)
@@ -123,35 +153,9 @@ class CiPlanTests(unittest.TestCase):
 
     def test_synthetic_complete_scale_reports_pass_and_missing_case_fails(self):
         # This tests the evidence parser only, never claims backend execution.
-        from scalability import fixture_shape, scenario_plan, expected_demands
-        import math
         plan=select(['tests/scalability.py'],HEAD)
-        expected=[]
-        for group in plan['scale_matrix']['include']:
-            host='macos' if group['runner'].startswith('macos') else 'linux'
-            for source in group['sources'].split(','):expected.append((host,group['backend'],source,group['profile'],group['policies'].split(',')))
-        expected.extend(('linux','passthrough',source,'matrix',['ignored']) for source in ('local','remote'))
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory)
-            for index,(host,backend,source,profile,policies) in enumerate(expected):
-                cases=scenario_plan(backend,source,profile,policies,'both')
-                data=[dict(type='environment',platform=host,backend=backend,source=source,profile=profile,revision=HEAD,scenario_plan=cases)]
-                infos={}
-                for count in dict.fromkeys(c['files'] for c in cases):
-                    shape=fixture_shape(count)
-                    info=dict(count=count,fanouts=shape,depth=len(shape),logical_payload_bytes=count*8+5,git_objects=['c','r','t','b','i'],commit='c',tree='r',sparse_objects=['c','r','t','b'],namespace_objects=['c','r','t','b','i'],namespace_payload_reads=math.prod(shape[:-1])+101)
-                    infos[count]=info;data.append(dict(type='fixture',**info))
-                    for phase in ('fixture','clone','clone-cleanup'):data.append(dict(type='phase',phase=phase,files=count,outcome='passed'))
-                    data.append(dict(type='allocation-sample',files=count,logical_bytes=8,allocated_bytes=0,filesystem_fragment_bytes=512))
-                for count,workload in dict.fromkeys((c['files'],c['workload']) for c in cases):
-                    data.append(dict(type='direct-baseline',files=count,workload=workload,backend='disk',target_backend=backend,child_observation=dict(generated_write=backend=='passthrough' and workload=='full')))
-                for case in cases:
-                    info=infos[case['files']];wants=expected_demands(info,backend,case['workload']) if source=='remote' else set()
-                    child=dict(generated_write=backend=='passthrough' and case['workload']=='full',visited_leaves=case['files'] if case['workload'] in ('full','enumerate') else None,payload_reads=case['files']+101 if case['workload']=='full' else info['namespace_payload_reads'] if case['workload']=='enumerate' else 100 if case['workload']=='sparse' else 0)
-                    metrics=dict(remote_fetches=len(wants),tree_reads=0,blob_loads=int(case['workload']=='sparse'),blob_cache_bytes=0,blob_cache_limit=1,tree_cache_bytes=0,tree_cache_limit=1,passthrough_handles=int(backend=='passthrough'))
-                    data.extend([dict(type='runner',backend=backend,source=source,profile=profile,**case,elapsed_ns=3,child_start_ns=1,child_duration_ns=1,after_child_ns=1,child_observation=child,metrics=metrics),dict(type='transport',**case,objects=sorted(wants))])
-                data.append(dict(type='phase',phase='fixture-cleanup',outcome='passed'))
-                (root/f'scale-{index}.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in data))
+            root=Path(directory);write_synthetic_scale_reports(root,plan)
             result=validate_scale(plan,root)
             self.assertEqual(result['runner_invocations'],97)
             self.assertEqual(result['full_reads_100000'],8)
@@ -160,6 +164,34 @@ class CiPlanTests(unittest.TestCase):
             data.pop(next(i for i,r in enumerate(data) if r['type']=='runner'))
             path.write_text(''.join(json.dumps(r)+'\n' for r in data))
             with self.assertRaisesRegex(ValueError,'missing/repeated actual scale'):validate_scale(plan,root)
+
+    def test_exhaustive_materialized_evidence_allows_eager_object_preparation(self):
+        plan=select(['tests/scalability.py'],HEAD,full=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);write_synthetic_scale_reports(root,plan)
+            # Materialization loads the fixture's 17 blobs / three trees even
+            # when its child does nothing or repeatedly reads just one file.
+            result=validate_scale(plan,root)
+            self.assertEqual(result['runner_invocations'],378)
+            self.assertEqual(result['full_reads_1000000'],42)
+
+    def test_exhaustive_evidence_still_rejects_wrong_child_reads_and_nonlazy_fuse_access(self):
+        plan=select(['tests/scalability.py'],HEAD,full=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);write_synthetic_scale_reports(root,plan)
+            originals={p:p.read_text() for p in root.glob('scale-*.jsonl')}
+            for backend in ('materialized','fuse','passthrough'):
+                path=next(p for p,text in originals.items() if (env:=json.loads(text.splitlines()[0]))['backend']==backend and env['source']=='local' and env['platform']=='linux')
+                mutations=[(workload,'child_observation','payload_reads',1 if workload=='noop' else 99) for workload in ('noop','sparse')]
+                if backend!='materialized':
+                    mutations += [(workload,'metrics',field,2 if workload=='noop' else 100) for workload in ('noop','sparse') for field in ('blob_loads','tree_reads')]
+                for workload,section,field,value in mutations:
+                    data=[json.loads(line) for line in originals[path].splitlines()]
+                    row=next(r for r in data if r['type']=='runner' and r['workload']==workload)
+                    row[section][field]=value
+                    path.write_text(''.join(json.dumps(r)+'\n' for r in data))
+                    with self.subTest(backend=backend,workload=workload,field=field),self.assertRaises(ValueError):validate_scale(plan,root)
+                    path.write_text(originals[path])
 
     def test_git_diff_includes_both_renamed_paths_and_handles_real_doc_only_diff(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -64,9 +64,11 @@ def validate_scale(plan,root):
                 if child['visited_leaves']!=r['files'] or child['payload_reads']!=info['namespace_payload_reads']:raise ValueError('incomplete namespace/sampled-read control')
                 total[f'namespace_{r["files"]}']+=1
             elif r['workload']=='noop':
-                if child['payload_reads']!=0 or m['blob_loads']!=0 or m['tree_reads']>1:raise ValueError('non-lazy no-op')
+                if child['payload_reads']!=0:raise ValueError('wrong no-op child reads')
+                if env['backend']!='materialized' and (m['blob_loads']!=0 or m['tree_reads']>1):raise ValueError('non-lazy no-op')
             elif r['workload']=='sparse':
-                if child['payload_reads']!=100 or m['blob_loads']!=1 or m['tree_reads']>info['depth']:raise ValueError('non-lazy repeated sparse access')
+                if child['payload_reads']!=100:raise ValueError('wrong repeated sparse child reads')
+                if env['backend']!='materialized' and (m['blob_loads']!=1 or m['tree_reads']>info['depth']):raise ValueError('non-lazy repeated sparse access')
             if env['backend']=='passthrough' and r['workload']=='full' and (m['passthrough_handles']<1 or not child['generated_write']):raise ValueError('actual passthrough path not exercised')
         observed[key]=len(runs);total['runner_invocations']+=len(runs)
     if set(observed)!=set(expected):raise ValueError(f'missing scale groups: {set(expected)-set(observed)}')

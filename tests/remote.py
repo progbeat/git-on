@@ -951,15 +951,21 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 while not pid.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
                 self.assertTrue(pid.exists(),'owned startup transport never began')
                 owned=int(pid.read_text())
+                descriptor=os.pidfd_open(owned)
                 try:
                     process.send_signal(sig); _,errors=process.communicate(timeout=5)
                     self.assertEqual(process.returncode,-sig,errors)
-                    proc=Path(f'/proc/{owned}/stat')
-                    self.assertTrue(not proc.exists() or proc.read_text().split()[2]=='Z')
+                    # Reaping Git can precede its transport processing the same
+                    # group's SIGKILL. Wait for this exact process's bounded
+                    # death, including on loaded runners and unreaped zombies.
+                    self.assertTrue(select.select([descriptor],[],[],2)[0],
+                                    'owned startup transport survived cancellation')
                     self.assertEqual(list(f.root.glob('git-on-*')),[])
                 finally:
+                    if not select.select([descriptor],[],[],0)[0]:
+                        with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+                    os.close(descriptor)
                     if process.poll() is None:
-                        with contextlib.suppress(ProcessLookupError): os.kill(owned,signal.SIGKILL)
                         process.kill(); process.communicate(timeout=5)
     def test_sigkill_during_native_config_startup_requires_external_process_cleanup(self):
         f=self.f; native=str(Path(shutil.which('git')).resolve())
