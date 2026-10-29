@@ -320,10 +320,22 @@ jobs:
             backend: materialized
             source: local
             policies: all
+            verification: unsigned
+          - runner: macos-26
+            backend: materialized
+            source: local
+            policies: all
+            verification: signed
           - runner: macos-26
             backend: materialized
             source: remote
             policies: all
+            verification: unsigned
+          - runner: macos-26
+            backend: materialized
+            source: remote
+            policies: all
+            verification: signed
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -342,12 +354,13 @@ jobs:
         run: >-
           python3 tests/scalability.py --binary target/release/git-on
           --backend ${{ matrix.backend }} --source ${{ matrix.source }}
-          --policies ${{ matrix.policies }} --output scale-results.jsonl
+          --policies ${{ matrix.policies }}
+          --verification ${{ matrix.verification || 'both' }} --output scale-results.jsonl
       - name: Retain full matrix measurements
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}
+          name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}-${{ matrix.verification || 'both' }}
           path: scale-results.jsonl
           if-no-files-found: ignore
 

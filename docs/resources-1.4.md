@@ -183,7 +183,8 @@ Each ordinary-FUSE source/policy combination is an independent Actions job,
 retaining every size, verification mode and cold/warm repetition. Policies do
 not wait for three other full traversals on the same runner. Artifact names
 include the policy so measurements from parallel jobs cannot overwrite each
-other. The workflow guard verifies the complete twelve-cell scale matrix.
+other. Mac verification modes also run separately; their combined scenarios are
+unchanged. The workflow guard verifies the complete fourteen-cell scale matrix.
 
 | Backend | Sources | Policies | Host/evidence |
 | --- | --- | --- | --- |
@@ -198,7 +199,10 @@ and total times, wait4 peak resident memory, sampled Linux runner descriptors/RS
 sampled filesystem space change, demanded objects, requests/bytes and cache
 maintenance. Filesystem space change is host-wide; wait4 includes waited
 subprocesses and is not a simultaneous sum; Mac runner-only /proc measurements
-are unavailable and represented as such. Unsupported/skipped platforms are not
+are unavailable and represented as such. Linux runner `/proc` and host filesystem
+observations are independent: denied daemon inspection does not suppress an
+available storage sample, and denied filesystem sampling is flagged separately.
+Unsupported/skipped platforms are not
 passes. Linux real-FUSE, Mac materialization and packaged-binary tests retain
 their distinct evidence layers. Final readiness requires the exact-head matrix,
 existing callback guard/integration/stress suites and the owner's selected

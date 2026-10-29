@@ -47,12 +47,14 @@ class CiContractTests(unittest.TestCase):
         body=job('repository-scale')
         for expected in ['tests/scalability.py','--features test-metrics']:
             self.assertIn(expected,body)
-        cells=re.findall(r'- runner: (\S+)\n\s+backend: (\S+)\n\s+source: (\S+)\n\s+policies: (\S+)',body)
-        required={('ubuntu-latest','fuse',source,policy) for source in ('local','remote') for policy in ('none','ignored','untracked','all')}
-        required.update((runner,'materialized',source,'all') for runner in ('ubuntu-latest','macos-26') for source in ('local','remote'))
+        cells=re.findall(r'- runner: (\S+)\n\s+backend: (\S+)\n\s+source: (\S+)\n\s+policies: (\S+)(?:\n\s+verification: (\S+))?',body)
+        required={('ubuntu-latest','fuse',source,policy,'') for source in ('local','remote') for policy in ('none','ignored','untracked','all')}
+        required.update(('ubuntu-latest','materialized',source,'all','') for source in ('local','remote'))
+        required.update(('macos-26','materialized',source,'all',verify) for source in ('local','remote') for verify in ('unsigned','signed'))
         self.assertEqual(set(cells),required)
         self.assertEqual(len(cells),len(required),'duplicate scale cells')
-        self.assertIn('name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}',body)
+        self.assertIn("--verification ${{ matrix.verification || 'both' }}",body)
+        self.assertIn("name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}-${{ matrix.verification || 'both' }}",body)
         self.assertIn('tests/scalability.py',job('real-fuse'))
         self.assertIn('--backend passthrough',job('real-fuse'))
         self.assertIn('tests/cache_scaling.py',job('rust'))

@@ -1881,3 +1881,24 @@ substitute for an actual mount: the exact-head full traversal matrix and the
 escaped-descendant busy-mount integration test remain required. No forced or
 lazy unmount is introduced, and failed unmounts retain recovery state. Local
 logs are `/tmp/git-on-unmount-{red,green}.log`.
+
+## 1.4 acceptance review: independent resource observations
+
+The scale sampler put Linux `/proc` and host `statvfs` reads in one try block.
+When a capability-bearing test daemon denied `/proc` access, the otherwise
+available filesystem sample was skipped and its field stayed zero. This is a
+measurement failure, not evidence of zero temporary storage use.
+
+The permanent
+`test_denied_proc_observation_does_not_skip_available_filesystem_sample` calls
+the real sampling helper with a denied descriptor observation and an available
+filesystem observation. Before the fix it failed with `0 != 7168`. Separate
+observation blocks now preserve the denied runner fields while recording the
+filesystem delta; the same test passes. Logs are
+`/tmp/git-on-sampler-{red,green}.log`. Actual enabled-passthrough CI remains
+required, and a denied filesystem observation has its own explicit flag.
+
+Mac verification modes run in separate CI jobs to reduce the elapsed time of
+the required rerun. Their combined sizes, workloads and cold/warm cases are
+unchanged; the matrix guard verifies all fourteen source/policy/verification
+cells. The test harness defaults to both verification modes for existing callers.

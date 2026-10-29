@@ -22,6 +22,7 @@ PARSER.add_argument('--binary',type=Path,required=True)
 PARSER.add_argument('--backend',choices=['fuse','materialized','passthrough'],required=True)
 PARSER.add_argument('--source',choices=['local','remote'],required=True)
 PARSER.add_argument('--policies',default='none,ignored,untracked,all')
+PARSER.add_argument('--verification',choices=['both','unsigned','signed'],default='both')
 PARSER.add_argument('--sizes',default='1000,10000,1000000')
 PARSER.add_argument('--output',type=Path,default=Path('scale-results.jsonl'))
 OPTIONS=None
@@ -82,10 +83,26 @@ def fixture(f,count,key):
         modes={'leaves':'100644','directories':'040000'},shape='ten-way digit paths; shared subtrees and one shared leaf blob',
         git_objects=[signed,*trees,blob,ignore])
 
+def sample_resources(pid,root,available,samples):
+    try:
+        if sys.platform=='linux':
+            samples['runner_peak_descriptors']=max(samples['runner_peak_descriptors'] or 0,len(list(Path(f'/proc/{pid}/fd').iterdir())))
+            for row in Path(f'/proc/{pid}/status').read_text().splitlines():
+                if row.startswith('VmHWM:'): samples['runner_peak_resident_kib']=max(samples['runner_peak_resident_kib'] or 0,int(row.split()[1]))
+    except PermissionError: samples['runner_observation_denied']=True
+    except (FileNotFoundError,ProcessLookupError): pass
+    # /proc access can be denied for a capability-bearing daemon while its
+    # host filesystem remains observable. Neither sample gates the other.
+    try:
+        space=os.statvfs(root)
+        samples['filesystem_allocated_delta_bytes']=max(samples['filesystem_allocated_delta_bytes'],available-space.f_bavail*space.f_frsize)
+    except PermissionError: samples['filesystem_observation_denied']=True
+    except (FileNotFoundError,ProcessLookupError): pass
+
 def execute(f,argv,env,description,metrics=False):
     read_fd,write_fd=os.pipe()
     if metrics: env=dict(env,GIT_ON_TEST_METRICS_FD=str(write_fd))
-    started=time.monotonic_ns(); stop=threading.Event(); samples={'runner_peak_descriptors':None,'runner_peak_resident_kib':None,'filesystem_allocated_delta_bytes':0,'runner_observation_denied':False}
+    started=time.monotonic_ns(); stop=threading.Event(); samples={'runner_peak_descriptors':None,'runner_peak_resident_kib':None,'filesystem_allocated_delta_bytes':0,'runner_observation_denied':False,'filesystem_observation_denied':False}
     available=os.statvfs(f.root).f_bavail*os.statvfs(f.root).f_frsize
     process=subprocess.Popen(argv,cwd=f.repo,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,pass_fds=(write_fd,) if metrics else ())
     os.close(write_fd)
@@ -94,15 +111,7 @@ def execute(f,argv,env,description,metrics=False):
             if time.monotonic_ns()-started>3_600_000_000_000:
                 process.terminate()
                 return
-            try:
-                if sys.platform=='linux':
-                    samples['runner_peak_descriptors']=max(samples['runner_peak_descriptors'] or 0,len(list(Path(f'/proc/{process.pid}/fd').iterdir())))
-                    for row in Path(f'/proc/{process.pid}/status').read_text().splitlines():
-                        if row.startswith('VmHWM:'): samples['runner_peak_resident_kib']=max(samples['runner_peak_resident_kib'] or 0,int(row.split()[1]))
-                space=os.statvfs(f.root)
-                samples['filesystem_allocated_delta_bytes']=max(samples['filesystem_allocated_delta_bytes'],available-space.f_bavail*space.f_frsize)
-            except PermissionError: samples['runner_observation_denied']=True
-            except (FileNotFoundError,ProcessLookupError): pass
+            sample_resources(process.pid,f.root,available,samples)
     monitor=threading.Thread(target=sample);monitor.start()
     first=process.stdout.readline()
     _,status,usage=os.wait4(process.pid,0)
@@ -162,7 +171,7 @@ def main():
             platform=platform.platform(),machine=platform.machine(),cpu=platform.processor(),cpu_count=os.cpu_count(),
             physical_memory_bytes=os.sysconf('SC_PHYS_PAGES')*os.sysconf('SC_PAGE_SIZE'),
             rlimit_nofile=resource.getrlimit(resource.RLIMIT_NOFILE),backend=OPTIONS.backend,
-            source=OPTIONS.source,storage='fixture and run on host temporary filesystem',
+            source=OPTIONS.source,verification=OPTIONS.verification,storage='fixture and run on host temporary filesystem',
             measurement_limits='filesystem space delta is host-wide and sampled; Linux runner /proc samples exclude subprocesses; wait4 peak includes waited descendants; macOS runner-only descriptors/RSS unavailable'))
         for count in map(int,OPTIONS.sizes.split(',')):
             info=fixture(f,count,key);record(dict(type='fixture',**info))
@@ -178,7 +187,7 @@ def main():
                     dict(type='direct-baseline',backend='disk',source='clone',workload=workload,files=count,clone_ns=clone_time))
             f.repo=original;shutil.rmtree(clone)
             for policy in OPTIONS.policies.split(','):
-                for verify in (False,True):
+                for verify in {'both':(False,True),'unsigned':(False,),'signed':(True,)}[OPTIONS.verification]:
                     for workload in ('noop','sparse','full'):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)
                         for warmth in (('cold','warm') if source else ('local',)):

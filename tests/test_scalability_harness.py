@@ -8,10 +8,19 @@ from pathlib import Path
 import sys
 import tempfile
 from unittest import mock
-from scalability import CHILD, validate_lazy_noop
+from scalability import CHILD, sample_resources, validate_lazy_noop
 
 
 class ScalabilityHarnessTests(unittest.TestCase):
+    def test_denied_proc_observation_does_not_skip_available_filesystem_sample(self):
+        samples=dict(runner_peak_descriptors=None,runner_peak_resident_kib=None,
+            filesystem_allocated_delta_bytes=0,runner_observation_denied=False)
+        with mock.patch('sys.platform','linux'), mock.patch.object(Path,'iterdir',side_effect=PermissionError), mock.patch('os.statvfs',return_value=mock.Mock(f_bavail=9,f_frsize=1024)):
+            sample_resources(42,Path('/fixture'),16384,samples)
+        self.assertTrue(samples['runner_observation_denied'])
+        self.assertIsNone(samples['runner_peak_descriptors'])
+        self.assertEqual(samples['filesystem_allocated_delta_bytes'],7168)
+
     def test_python_noop_allows_root_lookups_and_rejects_recursive_or_payload_work(self):
         for backend in ('fuse','passthrough'):
             description=dict(backend=backend,workload='noop')
