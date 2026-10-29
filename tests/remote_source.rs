@@ -2,14 +2,7 @@
 //! real upload-pack protocol and filters; SSH/HTTPS are separately exercised.
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
-use std::{
-    ffi::OsStr,
-    fs::OpenOptions,
-    os::unix::{io::AsRawFd, process::ExitStatusExt},
-    path::Path,
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{ffi::OsStr, path::Path, process::Command};
 #[cfg(target_os = "linux")]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -214,61 +207,6 @@ fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
     );
 }
 #[test]
-fn review_waiting_for_cache_lock_is_cancellable() {
-    let (temp, _, _, _) = fixture();
-    let cache = temp.path().join("cache/git-on/objects-v2");
-    std::fs::create_dir_all(&cache).unwrap();
-    let held_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(cache.join("lock"))
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(held_lock.as_raw_fd(), libc::LOCK_EX) },
-        0
-    );
-    let source = format!("file://{}", temp.path().join("server").display());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_git-on"))
-        .current_dir(temp.path())
-        .env("XDG_CACHE_HOME", temp.path().join("cache"))
-        .env("TMPDIR", temp.path())
-        .args([source.as_str(), "HEAD", "--", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // The held cache lock prevents startup reaching FUSE. This is a competing
-    // stopped writer, not a slow network or mount prerequisite.
-    std::thread::sleep(Duration::from_millis(400));
-    if let Some(status) = child.try_wait().unwrap() {
-        panic!("runner exited before waiting on the cache: {status}");
-    }
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("runner ignored SIGTERM while another writer held the cache lock");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(status.signal(), Some(libc::SIGTERM));
-    assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("git-on-")
-    }));
-}
-#[test]
 fn refused_filter_and_unsigned_objects_fail_before_execution() {
     let (temp, _, tree, _) = fixture();
     let error = load(temp.path(), "HEAD", true).unwrap_err();
@@ -294,50 +232,21 @@ fn refused_filter_and_unsigned_objects_fail_before_execution() {
 }
 
 #[test]
-fn review_cache_restore_failure_is_latched() {
-    // Isolate the process-wide cache environment from concurrent loader tests.
-    if std::env::var_os("GIT_ON_REVIEW_CACHE_CHILD").is_none() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "review_cache_restore_failure_is_latched",
-                "--nocapture",
-            ])
-            .env("GIT_ON_REVIEW_CACHE_CHILD", "1")
-            .env("XDG_CACHE_HOME", directory.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated cache failure regression: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+fn review_run_odb_fetch_failure_is_latched() {
     let (temporary, _, _, _) = fixture();
     let snapshot = load(temporary.path(), "HEAD", false).unwrap();
-    let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
-        .join("git-on/objects-v2");
-    // A competing/failed cache writer left an unusable directory entry. The
-    // demanded subtree cannot be restored and the affected operation fails.
-    let server = Repository::open_bare(temporary.path().join("server")).unwrap();
-    let tree = server.find_tree(snapshot.tree_oid).unwrap();
-    let subtree = tree.get_name("deep").unwrap().id();
-    let fault = cache.join(subtree.to_string());
-    std::fs::create_dir(&fault).unwrap();
-    let error = snapshot.entry(Path::new("deep/value")).unwrap_err();
-    assert!(format!("{error:#}").contains("directory"));
-    // Returning EIO alone permits the child to catch it and exit 0. The runner
-    // must retain the failure so that an incomplete execution returns 125.
+    // Break the private pack destination before a lazy subtree demand. The
+    // native fetch must fail, and an application catching EIO cannot turn the
+    // resulting incomplete remote execution into success.
+    let packs = snapshot.git_dir.join("objects/pack");
+    std::fs::remove_dir(&packs).unwrap();
+    std::fs::write(&packs, b"blocked private pack directory").unwrap();
+    assert!(snapshot.entry(Path::new("deep/value")).is_err());
     let failure = snapshot
         .remote_failure()
-        .expect("demanded cache failure was not latched for runner failure");
-    assert!(failure.contains("directory"));
-    std::fs::remove_dir(fault).unwrap();
-    // Removing the broken record does not authorize reconnecting/refetching
-    // after the latched failure or replace the original diagnostic.
+        .expect("private ODB fetch failure was not latched");
+    std::fs::remove_file(&packs).unwrap();
+    std::fs::create_dir(&packs).unwrap();
     assert!(snapshot.entry(Path::new("deep/value")).is_err());
     assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
 }

@@ -2,56 +2,35 @@
 
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and
-JSONL artifacts are the final acceptance evidence. The early local measurements
-below describe the development candidate; they are not a substitute for final
+JSONL artifacts are the final acceptance evidence; results from earlier heads
+with a global cache do not establish acceptance after its removal. Early local
+measurements below describe the development candidate; they are not a substitute for final
 Linux/FUSE/macOS validation or a numerical SLA.
 
-## Cache complexity and crash policy
+## Object storage and eliminated global-cache work
 
-Let K be retained cache occupancy, N the number of global cache operations, E
-the total actual evictions, B the total transferred payload bytes, and R the
-number of dirty recoveries. File/directory lookup costs of the host filesystem,
-Git's storage decoding and network work are separate parameters.
+The author confirmed that temporary storage for one invocation must remain and
+the global persistent cache must be removed. The interview's preference for
+streaming reads/writes does not require cross-run persistence. The prior global
+cache's O(K log K) scans and the intermediate linked index's constant metadata
+operations both imposed filesystem, serialization, locking and durability costs.
+The final design removes the global cache entirely instead of adding a database
+or service. No claim about O(1) makes those constant costs free.
 
-The old implementation collected metadata for all K payloads and sorted on
-every restore/store, with a second scan/sort in store: O(K log K) maintenance per
-operation, or O(sum K_i log K_i) over N operations. Bounded capacity is not a
-reason to treat K as constant.
+Each remote invocation fetches missing demanded objects into its private ODB.
+Already available objects bypass native fetch and remain available after memory
+cache eviction. A later invocation repeats native resolution and fetches its
+own demands; it does not reuse another run's objects. Global-cache occupancy K,
+evictions and lock/fsync work are absent from this architecture, rather than
+hidden constants. Historical user cache directories are neither opened nor
+deleted. Private run storage has no artificial disk quota; system limits apply.
+Decoded memory caches retain explicit byte and entry budgets.
 
-The new filesystem index has a fixed-size header and one bounded record per
-OID, with previous/next links. Direct OID lookup, a touch and insertion each
-read/write a constant number of records. Normal aggregate metadata work is
-O(N + E), with O(K) persistent metadata and O(1) index RAM. Payload transfer and
-hashing add O(B), plus required Git decoding; a restore deliberately makes two
-streaming passes before publication. Eviction counts each removed object. Run
-ODB hits bypass the global cache entirely.
-
-Initialization and recovery from an interrupted mutation enumerate and sort the
-published payloads once, costing O(K log K) time and O(K) temporary metadata RAM.
-Total work including recovery is O(N + E + sum over R of K_r log K_r + B), plus
-Git/filesystem costs. Clean lock acquisition never schedules a periodic scan.
-There is no promise of amortized constant work under an adversary that kills
-every writer: repeated real interruptions can cause repeated recovery scans.
-No child or run-local disk quota is introduced.
-
-Writers hold flock from recovery through publication/eviction. A durable dirty
-marker precedes mutation. Node/header writes use tempfile atomic rename and
-fsync; affected directories are synced before removing the marker, then its
-removal is synced. Recovery trusts only atomically published payload paths,
-rebuilds links and capacity accounting, and discards abandoned staging files.
-Payload hashes/types are checked before restore and again before ODB finalize.
-Atomic staging can temporarily consume one additional candidate record; it is
-not retained capacity. Index metadata is separately bounded in K. The old v1
-namespace remains untouched, preventing an older binary from encountering v2
-index files after rollback.
-
-The permanent Rust cases vary K=8/64/256 and N=16/128 independently; they assert
-bounded metadata operations with zero ordinary recovery scans. They cover hits,
-misses, byte/entry eviction, recency, corrupt payloads, retained active copies,
-concurrent independent processes and a SIGKILL between link update and commit.
-The latter must recover exactly once and reclaim staging files. A working set
-larger than retention is allowed misses on later runs; it must not re-fetch an
-object still available within an active run.
+Permanent regressions run without HOME/XDG_CACHE_HOME, with a cache path that is
+a regular file, and with marked historical v1/v2 directories. All must succeed
+without modifying those paths. Independent HTTPS invocations must each request
+the demanded objects; repeated access within one invocation must not fetch them
+again. Object integrity, native errors and cancellation remain required.
 
 ## Focused old/new measurements
 
@@ -65,9 +44,11 @@ worktree and target directory, never a relabeled current binary.
 requires corrected behavior:
 
 - At soft/hard RLIMIT_NOFILE=64, old cold loading failed at approximately the
-  54th blob with `start native Git operation: Too many open files`. New cold
-  loading read all 192 distinct blobs, sampling 19 descriptors after 16, 64,
-  128 and 192 objects. A warm run sampled four at each point. No ulimit was raised.
+  54th blob with `start native Git operation: Too many open files`. An early
+  candidate read all 192 blobs with 19 descriptors; the final
+  private-loose-ODB path samples three after 16, 64, 128 and 192 objects on
+  each independent invocation, and reuses an evicted memory entry without
+  fetch. No ulimit was raised.
 - First 16-byte ranges from compressible loose blobs, followed by repeated
   ranges, gave the following Linux VmHWM observations. Each new run performed
   one streamed spool write, retained zero blob-cache payload bytes and reused
@@ -82,30 +63,9 @@ requires corrected behavior:
 
 This is evidence for loose streaming, not a packed/delta streaming claim.
 Packed first reads may still allocate the decoded object and necessary bases.
-The 288 MiB over-capacity remote test separately verifies cold transfers,
-eviction, warm cache-to-ODB/source-spool streaming, exact bytes, and same-run
-availability after global eviction.
-
-`tests/cache_scaling.py` traces only the loader process, excluding native Git
-children. It seeds K records and initializes the index outside measurement,
-then varies demanded N independently. All measured payloads are hits.
-
-| K | N reads | Old cache metadata syscalls | New cache metadata syscalls |
-| ---: | ---: | ---: | ---: |
-| 64 | 8 | 737 | 31 |
-| 64 | 32 | 2,345 | 103 |
-| 256 | 8 | 2,849 | 31 |
-| 256 | 32 | 9,065 | 103 |
-
-Old cache-directory getdents calls were 22/70/22/70; new calls were zero.
-The JSONL also records actual file read/write syscall counts, wall time,
-flock-held intervals and record-level maintenance counts separately. The initial
-indexed candidate exposed an avoidable constant cost: serde directly on Files
-performed byte/token I/O. Copilot caught it, and the permanent syscall gate
-reproduced 9,638 cache read/write calls for K=64, N=8 before buffering, versus
-171 after. Metadata is now serialized/deserialized in bounded buffers. Atomics,
-hashing and fsync still cost real work; traced timings are retained separately
-and are not a universal throughput claim.
+The 288 MiB remote fixture separately verifies streaming three 96 MiB blobs,
+exact range bytes, same-run availability and a fresh invocation's repeated fetch.
+There is no global retention/restore path to benchmark.
 
 ## Distinct-object demand and pack discovery
 
@@ -134,9 +94,9 @@ payload retention; it avoids cumulative pack enumeration/sorting. Over N demands
 pack maintenance is linear in the actually received packs/objects, plus necessary
 Git decoding and bytes. No cap is imposed on active run storage or repository size.
 
-`tests/pack_scaling.py` loads 32, 128 and 512 distinct blobs twice from a cold
-cache and checks same-run availability. Its loader-only strace separates pack
-metadata from the global cache and native Git children. The source probe's OID
+`tests/pack_scaling.py` loads 32, 128 and 512 distinct blobs twice in one fresh
+private ODB and checks same-run availability. Its loader-only strace separates pack
+metadata from native Git children. The source probe's OID
 reporting itself enumerates run objects, so total benchmark wall time includes
 that helper cost and is not presented as isolated product throughput.
 
@@ -147,8 +107,8 @@ that helper cost and is not presented as isolated product throughput.
 | 512 | 742,274,064 | 349,184 |
 
 The permanent reduced-RLIMIT test also inspects the live private pack directory:
-it must be empty at increasing object counts. After this fix, its observed cold
-and warm descriptor samples were three, rather than the initial candidate's
+it must be empty at increasing object counts. Its observed independent-invocation
+descriptor samples were three, rather than the initial cache-bearing candidate's
 19/four. The separate local packed-reader limit still protects libgit2 accesses
 to callers' packed repositories. These distinct-demand controls supplement both
 million-file fixtures; they are not a claim of testing a million distinct remote
@@ -171,7 +131,8 @@ run a Python no-op control, sparse stat/read with 100 repetitions, and complete 
 Python startup may inspect the root directory; the no-op gate allows one root
 tree and zero payloads, and still rejects recursive traversal. The existing
 native true/cat million-distinct-file gates retain their separate exact counts.
-Remote runs explicitly start cold and repeat warm. Eager materialization also
+Remote runs repeat as independent invocations with fresh private object stores;
+each must fetch the same demanded OIDs again. Eager materialization also
 runs an inert child and necessarily visits the entire selected tree before
 launch. Each workload checks bytes, path completeness, startup/result, exact
 source refs and cleanup. Native git clone plus the same three commands establishes
@@ -180,8 +141,8 @@ recorded separately as the performance baseline. Clone preparation is excluded
 from command timing. A per-invocation harness timeout is not a product SLA.
 
 Each ordinary-FUSE source/policy combination is an independent Actions job,
-retaining every size, verification mode and cold/warm repetition. Policies do
-not wait for three other full traversals on the same runner. Artifact names
+retaining every size, verification mode and independent remote invocation.
+Policies do not wait for three other full traversals on the same runner. Artifact names
 include the policy so measurements from parallel jobs cannot overwrite each
 other. Mac verification modes also run separately; their combined scenarios are
 unchanged. The workflow guard verifies the complete fourteen-cell scale matrix.
@@ -194,10 +155,10 @@ unchanged. The workflow guard verifies the complete fourteen-cell scale matrix.
 | Native macOS mount | Inapplicable | Inapplicable | Deferred #12, never counted as a pass |
 | Protected materialization | Inapplicable | none, ignored, untracked | Must fail before child, existing materialized tests |
 
-JSONL records exact HEAD, fixture OIDs, OS/CPU/limits, cache/backend, child-start
+JSONL records exact HEAD, fixture OIDs, OS/CPU/limits, object-store/backend, child-start
 and total times, wait4 peak resident memory, sampled Linux runner descriptors/RSS,
-sampled filesystem space change, demanded objects, requests/bytes and cache
-maintenance. Filesystem space change is host-wide; wait4 includes waited
+sampled filesystem space change, demanded objects, requests/bytes and successful
+native fetches. Filesystem space change is host-wide; wait4 includes waited
 subprocesses and is not a simultaneous sum; Mac runner-only /proc measurements
 are unavailable and represented as such. Linux runner `/proc` and host filesystem
 observations are independent: denied daemon inspection does not suppress an
@@ -205,9 +166,8 @@ available storage sample, and denied filesystem sampling is flagged separately.
 Unsupported/skipped platforms are not
 passes. Linux real-FUSE, Mac materialization and packaged-binary tests retain
 their distinct evidence layers. Final readiness requires the exact-head matrix,
-existing callback guard/integration/stress suites and the owner's selected
-private native Codex review, not only
-a loader pass or a sparse million-file sample.
+existing callback guard/integration/stress suites, a fresh independent review
+and final Copilot review, not only a loader pass or a sparse million-file sample.
 
 The df900c4 matrix caught a teardown failure after successful million-leaf
 children on ordinary FUSE and enabled passthrough. Clean unmount now waits for

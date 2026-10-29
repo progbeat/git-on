@@ -1795,9 +1795,11 @@ old failure is not counted as platform acceptance.
 
 Copilot's [review of d0edf50](https://github.com/progbeat/git-on/pull/23#discussion_r4410058171)
 identified four concrete defects. These red-before results were observed before
-changing the affected code; the regressions remain permanent:
+changing the affected code. The global-cache findings below are historical:
+the owner later removed that entire feature, including its index and tests.
+The streaming/shutdown regression remains permanent:
 
-- `tests/cache_scaling.py` now counts actual cache read/write syscalls as well
+- The former `tests/cache_scaling.py` counted actual cache read/write syscalls as well
   as metadata enumeration. Running the d0edf50 source probe with K=64, N=8
   failed the bounded-I/O gate with 9,638 calls. Both JSON reads and writes were
   unbuffered. The corrected path uses bounded byte buffers and produced 171
@@ -1835,9 +1837,8 @@ explicitly separated from this structural pack-maintenance evidence.
 
 ## 1.4 terminal ownership and durable CI replay
 
-The second Copilot review of df900c4 identified three additional defects; no
-further Copilot review is requested because the owner selected private native
-Codex review for final acceptance.
+The second Copilot review of df900c4 identified three additional defects; the review workflow was later changed to independent clean-context tasks
+followed by final Copilot review.
 
 - The permanent real interactive-Bash PTY regression
   `test_materialization_native_git_tty_handoff_with_tostop` enables `stty tostop`
@@ -1902,3 +1903,23 @@ Mac verification modes run in separate CI jobs to reduce the elapsed time of
 the required rerun. Their combined sizes, workloads and cold/warm cases are
 unchanged; the matrix guard verifies all fourteen source/policy/verification
 cells. The test harness defaults to both verification modes for existing callers.
+
+## 1.4 confirmed removal of the global persistent cache
+
+The owner explicitly retained temporary storage for one invocation and removed
+cross-run persistence. `test_remote_never_requires_or_modifies_global_cache`
+failed against 19f0cbd when HOME/XDG_CACHE_HOME were unset, when the cache path
+was a regular file, and when historical cache directories contained markers.
+`test_separate_remote_runs_fetch_demanded_objects_again` also failed because
+that binary reused globally retained trees/blobs. Both pass after removing the
+global index, cache transfers and directory initialization. Local evidence is
+`/tmp/git-on-no-global-cache-{red,green}.log`.
+
+The run-local ODB, streaming, integrity checks, native error latch, pack import,
+FD limit, progress and cleanup remain. Global-lock/payload-fault tests were
+replaced with private-ODB fault tests; native cancellation and recovery tests
+remain. First/repeat remote scale invocations each fetch their own demands,
+while within-run repeats must reuse available OIDs after memory-cache eviction.
+Old global-cache complexity measurements and earlier CI successes are historical,
+not acceptance evidence for this new head. The full exact-head matrix must run
+again before independent review and final Copilot.

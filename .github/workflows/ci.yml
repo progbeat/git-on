@@ -47,19 +47,18 @@ jobs:
         run: python3 tests/materialized.py target/debug/git-on
       - name: Installer smoke test
         run: python3 tests/installer_smoke.py --binary target/debug/git-on
-      - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
+      - name: Native Git oracle, real HTTPS/OpenSSH, run-storage and transport regressions
         run: |
           cargo build --locked --features test-metrics --example source-probe --bin git-on
           python3 tests/remote.py
           python3 tests/ssh_regressions.py
           python3 tests/native_job_control.py
-      - name: Replay pre-1.4 resource defects and measure independent cache K/N
+      - name: Replay pre-1.4 resource defects and measure distinct-object pack work
         run: |
           git worktree add --detach /tmp/git-on-resource-before 27cd1e5c336541566f9497186425c44e4aa46f73
           cargo build --locked --features test-metrics --example source-probe --manifest-path /tmp/git-on-resource-before/Cargo.toml --target-dir /tmp/git-on-resource-target
           BEFORE=/tmp/git-on-resource-target/debug/examples/source-probe
           python3 tests/remote.py --before-resource-probe "$BEFORE" RemoteTests.test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit RemoteTests.test_first_large_loose_range_streams_without_retaining_full_payload
-          python3 tests/cache_scaling.py --probe target/debug/examples/source-probe --before-resource-probe "$BEFORE" --output cache-scaling.jsonl
           PACK_BEFORE=d0edf505bfbf5b2280d63fa60a68791b24911996
           PACK_ARGUMENT=()
           if git cat-file -e "$PACK_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$PACK_BEFORE" HEAD; then
@@ -70,13 +69,12 @@ jobs:
             echo 'Historical PR pack baseline unavailable after squash; current pack-scaling gates remain required.'
           fi
           python3 tests/pack_scaling.py --probe target/debug/examples/source-probe "${PACK_ARGUMENT[@]}" --output pack-scaling.jsonl
-      - name: Retain cache metadata and lock measurements
+      - name: Retain pack metadata measurements
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cache-scaling
+          name: object-scaling
           path: |
-            cache-scaling.jsonl
             pack-scaling.jsonl
           if-no-files-found: ignore
 
@@ -241,7 +239,7 @@ jobs:
         run: >-
           python3 tests/remote.py --require-fuse --million
           --probe target/release/examples/source-probe --binary target/release/git-on
-          RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+          RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
       - name: Check benchmark harness
         run: python3 tests/benchmark.py self-test
       - name: Prepare the million-file fixture outside timed runs

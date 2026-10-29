@@ -18,8 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-pub const DISK_CACHE_ENTRIES: usize = 4096;
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 
 fn require_native_git(cwd: &Path) -> Result<()> {
@@ -132,7 +130,7 @@ pub struct Remote {
     pub dir: PathBuf,
     source: OsString,
     https_alternative: Option<String>,
-    cache: DiskCache,
+    completed_fetches: u64,
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
@@ -189,7 +187,6 @@ impl Remote {
             true,
         )?;
         drop(repo);
-        let cache = DiskCache::standard()?;
         let socket = ssh_transport.then(|| run.join("ssh-control"));
         let ssh = socket
             .as_ref()
@@ -212,7 +209,7 @@ impl Remote {
             dir,
             source: source.to_os_string(),
             https_alternative: github_https_alternative(&text),
-            cache,
+            completed_fetches: 0,
             socket,
             socket_owner: None,
             ssh,
@@ -301,7 +298,7 @@ impl Remote {
         }
         Ok(command)
     }
-    fn fetch_selected(&self, revision: &OsStr) -> Result<Oid> {
+    fn fetch_selected(&mut self, revision: &OsStr) -> Result<Oid> {
         // A fetch refspec belongs to native Git, including its leading '+',
         // namespace abbreviation and destination. All resulting refs and
         // FETCH_HEAD live in this owned bare repository, never in the caller.
@@ -347,7 +344,7 @@ impl Remote {
         if !repo.odb()?.exists(oid) {
             bail!("native Git fetch did not supply selected object {oid}");
         }
-        self.cache.store(&repo, oid)?;
+        self.completed_fetches += 1;
         Ok(oid)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
@@ -359,13 +356,10 @@ impl Remote {
             if repo.odb()?.exists(oid) {
                 return Ok(());
             }
-            if self.cache.restore(repo, oid)? {
-                return Ok(());
-            }
             self.fetch(repo, oid)
         })();
         if let Err(error) = &outcome {
-            // Cache/ODB failures are just as incomplete as a failed fetch. Keep
+            // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
             if !crate::git::is_request_interruption(error) && self.failed.is_none() {
                 self.failed = Some(format!("{error:#}"));
@@ -374,7 +368,7 @@ impl Remote {
         }
         outcome
     }
-    fn fetch(&self, repo: &Repository, oid: Oid) -> Result<()> {
+    fn fetch(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let mut command = self.command(false)?;
         command
             .args([
@@ -420,7 +414,7 @@ impl Remote {
         if !repo.odb()?.exists(oid) {
             bail!("filtered remote fetch did not supply requested object {oid}");
         }
-        self.cache.store(repo, oid)?;
+        self.completed_fetches += 1;
         Ok(())
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack
@@ -522,8 +516,8 @@ impl Remote {
     pub fn failure(&self) -> Option<String> {
         self.failed.clone()
     }
-    pub fn cache_metrics(&self) -> DiskCacheMetrics {
-        self.cache.metrics()
+    pub(crate) fn completed_fetches(&self) -> u64 {
+        self.completed_fetches
     }
 }
 impl Drop for Remote {
@@ -982,7 +976,6 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     fi
 }"#;
 
-pub use crate::disk_cache::{DiskCache, DiskCacheMetrics};
 #[cfg(test)]
 mod tests {
     use super::*;

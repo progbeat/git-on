@@ -40,13 +40,13 @@ python3 tests/remote.py
 python3 tests/ssh_regressions.py
 python3 tests/native_job_control.py
 python3 tests/remote.py --require-fuse
-python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
 ```
 
 The source probe exercises the production loader without a mount and records
 received OIDs, requested objects, request/response bytes and loader metrics.
 Tests distinguish listing from stat, repeated reads and large ranges; compare
-cold and warm caches; use distinct trees for moving-ref/replacement checks; and
+independent invocations and same-run reuse; use distinct trees for moving-ref/replacement checks; and
 cover native formats/trust, tag chains, inherited Git settings and server faults.
 OpenPGP cases use a disposable public-only keyring to compare unknown-trust
 commit/tag acceptance with native Git's default and rejection with configured
@@ -75,7 +75,7 @@ digit paths; preparation verifies every leaf before measuring remote demand.
 The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
 mounts for remote writes, keep, cancellation, busy/stale recovery, external
 `git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
-FUSE for the remote million cold no-op/read and warm read. A loader success or
+FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
 availability is not required by these deterministic gates.
 
@@ -234,14 +234,17 @@ the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
 See [resource acceptance](../docs/resources-1.4.md) and the
 [dependency audit](../docs/crate-audit-1.4.md). Resource regressions are part of
 `remote.py`; `--before-resource-probe` replays exact-master failures. On Linux,
-`cache_scaling.py --probe ... --before-resource-probe ...` requires strace and
-records metadata work and lock time independently in K and N.
+`pack_scaling.py --probe ... --before-probe ...` requires strace and records
+pack metadata work as distinct-object demand grows. Global persistent-cache
+index/locking tests were removed with that feature; no global paths are read or
+written. Remote regressions preserve historical directories and exercise
+missing/unusable HOME/XDG_CACHE_HOME plus same-run reuse.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
 performs full traversal/read and eager startup across increasing fixtures to one
 million leaf paths. Use `--policies all` for materialization, and `ignored` for
-passthrough's generated-file control. Both signature modes and cold/warm remote
-runs are built in. A 1,000-file smoke run can use `--sizes 1000`; it is not the
+passthrough's generated-file control. Both signature modes and independent first/repeat remote
+invocations are built in; each invocation starts with a private object store. A 1,000-file smoke run can use `--sizes 1000`; it is not the
 million-file acceptance. The complete CI matrix runs real FUSE and native macOS
 materialization and retains JSONL artifacts. Its shared-object full-tree fixture
 is separate from the unchanged million-distinct-file sparse-access fixture.

@@ -57,7 +57,7 @@ class CiContractTests(unittest.TestCase):
         self.assertIn("name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.source }}-${{ matrix.policies }}-${{ matrix.verification || 'both' }}",body)
         self.assertIn('tests/scalability.py',job('real-fuse'))
         self.assertIn('--backend passthrough',job('real-fuse'))
-        self.assertIn('tests/cache_scaling.py',job('rust'))
+        self.assertIn('tests/pack_scaling.py',job('rust'))
 
     def test_missing_intermediate_baseline_keeps_current_pack_scaling_gate(self):
         body=job('rust')

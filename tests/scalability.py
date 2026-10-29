@@ -130,7 +130,7 @@ def execute(f,argv,env,description,metrics=False):
         child_duration_ns=rows[-1]['duration_ns'],runner_and_waited_children_peak_resident_kib=peak,**samples)
     if metrics:
         result['metrics']=json.loads(observed)
-        m=result['metrics'];assert m['disk_cache']['recovery_scans']<=1,m
+        m=result['metrics']
         validate_lazy_noop(m,description)
         if description['backend']=='passthrough' and description['workload']=='full':
             assert m['passthrough_handles']>0,m
@@ -171,7 +171,7 @@ def main():
             platform=platform.platform(),machine=platform.machine(),cpu=platform.processor(),cpu_count=os.cpu_count(),
             physical_memory_bytes=os.sysconf('SC_PHYS_PAGES')*os.sysconf('SC_PAGE_SIZE'),
             rlimit_nofile=resource.getrlimit(resource.RLIMIT_NOFILE),backend=OPTIONS.backend,
-            source=OPTIONS.source,verification=OPTIONS.verification,storage='fixture and run on host temporary filesystem',
+            source=OPTIONS.source,verification=OPTIONS.verification,storage='fixture and private per-invocation ODB on host temporary filesystem',
             measurement_limits='filesystem space delta is host-wide and sampled; Linux runner /proc samples exclude subprocesses; wait4 peak includes waited descendants; macOS runner-only descriptors/RSS unavailable'))
         for count in map(int,OPTIONS.sizes.split(',')):
             info=fixture(f,count,key);record(dict(type='fixture',**info))
@@ -189,15 +189,19 @@ def main():
             for policy in OPTIONS.policies.split(','):
                 for verify in {'both':(False,True),'unsigned':(False,),'signed':(True,)}[OPTIONS.verification]:
                     for workload in ('noop','sparse','full'):
-                        shutil.rmtree(f.root/'cache',ignore_errors=True)
-                        for warmth in (('cold','warm') if source else ('local',)):
+                        first_demands=None
+                        for invocation in (('first','repeat') if source else ('local',)):
                             first_request=len(f.requests)
                             command=[str(OPTIONS.binary),*([source] if source else []),'main',f'--write-policy={policy}',*(['--verify'] if verify else []),'--',sys.executable,'-c',CHILD,workload,str(count),str(info['depth']),*(['write'] if OPTIONS.backend=='passthrough' and workload=='full' else [])]
-                            result=execute(f,command,env,dict(type='runner',backend=OPTIONS.backend,source=OPTIONS.source,policy=policy,verify=verify,cache=warmth,workload=workload,files=count),True)
+                            result=execute(f,command,env,dict(type='runner',backend=OPTIONS.backend,source=OPTIONS.source,policy=policy,verify=verify,invocation=invocation,workload=workload,files=count),True)
                             requests=f.requests[first_request:];wants={oid for request in requests for oid in request.get('wants',[])}
-                            if source and warmth=='warm': assert wants=={info['commit']},wants
+                            assert result['metrics']['remote_fetches']==len(wants),result
+                            if source:
+                                if first_demands is None: first_demands=wants
+                                else: assert wants==first_demands,(first_demands,wants)
+                            assert not (f.root/'cache').exists(),'persistent cache created'
                             assert wants<=set(info['git_objects']),wants
-                            record(dict(type='transport',files=count,workload=workload,policy=policy,verify=verify,cache=warmth,
+                            record(dict(type='transport',files=count,workload=workload,policy=policy,verify=verify,invocation=invocation,
                                 initial_resolution_fetches=sum(info['commit'] in r.get('wants',[]) for r in requests),
                                 exact_object_fetches=sum(bool(r.get('wants')) and info['commit'] not in r['wants'] for r in requests),
                                 response_bytes=sum(r.get('response_bytes',0) for r in requests),http_requests=len(requests),objects=sorted(wants)))

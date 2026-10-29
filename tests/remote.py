@@ -772,7 +772,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         self.assertEqual(result.stdout,b'bare relative alternate\n')
                 finally: f.cwd,f.env=previous_cwd,previous_env
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
-    def test_https_cold_warm_lazy_objects_ref_race_and_local_equivalence(self):
+    def test_https_fresh_runs_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         process=f.probe(url); start=f.line(process)
         self.assertEqual(set(start['objects']), {f.commit, f.tree})
@@ -787,12 +787,10 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(set(read['objects']), {f.commit,f.tree,f.subtree,f.blob})
         self.assertNotIn(f.other, read['objects']); f.finish(process)
         requests=len(f.requests)
-        warm=f.probe(url, f.commit); f.line(warm); f.operation(warm,'read deep/file'); f.finish(warm)
-        # Native Git still resolves the exact user fetch operand. Cached trees
-        # and payloads need no requests beyond advertisement and that fetch.
+        repeated=f.probe(url, f.commit); f.line(repeated); f.operation(repeated,'read deep/file'); f.finish(repeated)
+        # Each invocation resolves its revision and fetches its demanded objects.
         new=f.requests[requests:]
-        self.assertEqual(len([x for x in new if x['path'].endswith('git-upload-pack')]), 2)
-        self.assertEqual({oid for request in new for oid in request['wants']},{f.commit})
+        self.assertEqual({oid for request in new for oid in request['wants']},{f.commit,f.tree,f.subtree,f.blob})
         expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
         self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
@@ -1241,7 +1239,6 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         for cwd,operands in ((f.cwd,[url,signed]),(f.repo,[signed])):
             result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',*operands,'--','cat','deep/file'],cwd=cwd,env=env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
-        shutil.rmtree(f.root/'cache')
         # The command catches EIO and returns 0. The runner must still report 125.
         f.denied_oids.add(f.blob)
         code="import errno\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('transport fault not observed')\n"
@@ -1250,7 +1247,44 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
-    def test_remote_eviction_keeps_large_run_objects_available_and_warm_transfers_stream(self):
+    def test_remote_never_requires_or_modifies_global_cache(self):
+        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        original=dict(f.env)
+        blocked=f.root/'cache-path-is-a-file';blocked.write_bytes(b'unchanged cache path')
+        historical=f.root/'historical-cache'
+        for version in ('objects-v1','objects-v2'):
+            directory=historical/'git-on'/version;directory.mkdir(parents=True)
+            (directory/'keep').write_bytes(b'old user data')
+        for mode in ('unset','blocked','existing'):
+            with self.subTest(mode=mode):
+                f.env=dict(original)
+                if mode=='unset':
+                    f.env.pop('HOME',None);f.env.pop('XDG_CACHE_HOME',None)
+                else:f.env['XDG_CACHE_HOME']=str(blocked if mode=='blocked' else historical)
+                process=f.probe(url);f.line(process)
+                value,report=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n')
+                self.assertEqual(set(report['objects']),{f.commit,f.tree,f.subtree,f.blob})
+                f.finish(process)
+                self.assertEqual(blocked.read_bytes(),b'unchanged cache path')
+                for version in ('objects-v1','objects-v2'):
+                    directory=historical/'git-on'/version
+                    self.assertEqual(list(directory.iterdir()),[directory/'keep'])
+                    self.assertEqual((directory/'keep').read_bytes(),b'old user data')
+        f.env=original
+
+    def test_separate_remote_runs_fetch_demanded_objects_again(self):
+        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        demands=[]
+        for _ in range(2):
+            start=len(f.requests);process=f.probe(url);f.line(process)
+            value,_=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
+            f.finish(process)
+            demands.append({oid for request in f.requests[start:] for oid in request['wants']})
+        self.assertEqual(demands,[{f.commit,f.tree,f.subtree,f.blob}]*2)
+        self.assertFalse((f.root/'cache').exists(),'remote run created a global cache')
+
+    def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
         f=self.f; ids=[]
         for byte in b'abc':
             with tempfile.TemporaryFile() as output:
@@ -1264,21 +1298,19 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         for name in 'abc':
             value,last=f.operation(process,f'range 13 16 {name}')
             self.assertEqual(bytes(value['bytes']),name.encode()*16)
-        self.assertGreater(last['metrics']['disk_cache']['evictions'],0)
+        self.assertEqual(last['metrics']['remote_fetches'],5)
         requests=len(f.requests)
         value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
-        self.assertEqual(len(f.requests),requests,'global eviction caused a same-run re-fetch')
+        self.assertEqual(len(f.requests),requests,'available run object fetched again')
         f.finish(process)
-        # The last object remains retained. Its warm restore and source spool
-        # stream loose bytes; the selected commit and an evicted root may transfer.
+        # A separate invocation streams a newly fetched loose object again.
         requests=len(f.requests);process=f.probe(url);f.line(process)
         value,last=f.operation(process,'range 13 16 c');self.assertEqual(bytes(value['bytes']),b'c'*16)
         self.assertEqual(last['metrics']['streamed_blob_loads'],1)
-        self.assertLessEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree})
+        self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
         f.finish(process)
-        retained=[p for p in (f.root/'cache/git-on/objects-v2').iterdir() if len(p.name)==40]
-        self.assertLessEqual(sum(p.stat().st_size for p in retained),256*1024*1024)
-        print('over-capacity evidence:',json.dumps(dict(logical_blob_bytes=3*96*1024*1024,retained_payload_bytes=sum(p.stat().st_size for p in retained),metrics=last['metrics'])),flush=True)
+        self.assertFalse((f.root/'cache').exists())
+        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*96*1024*1024,metrics=last['metrics'])),flush=True)
 
     @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
     def test_materialization_native_git_tty_handoff_with_tostop(self):
@@ -1390,6 +1422,10 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertIn('Too many open files',failure)
             else:
                 if failure: self.fail(failure)
+                fetches=last['metrics']['remote_fetches']
+                value,again=f.operation(process,'read f000')
+                self.assertEqual(value['data'],'object-0\n')
+                self.assertEqual(again['metrics']['remote_fetches'],fetches)
                 f.finish(process)
                 self.assertLessEqual(max(x['descriptors'] for x in samples),48)
             print('descriptor evidence:',json.dumps(dict(binary=str(binary),cache=str(cache),rlimit_nofile=limit,samples=samples,failure=failure,metrics=last['metrics'] if last else None)),flush=True)
@@ -1397,11 +1433,11 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         if OPTIONS.before_resource_probe:
             exercise(OPTIONS.before_resource_probe,f.root/'before-cache',True)
         cache=f.root/'resource-cache'
-        cold=exercise(OPTIONS.probe,cache)
-        warm=exercise(OPTIONS.probe,cache)
-        self.assertEqual(cold['metrics']['blob_loads'],192)
-        self.assertEqual(warm['metrics']['disk_cache']['restores'],193)
-        self.assertEqual(warm['metrics']['disk_cache']['stores'],0)
+        for _ in range(2):
+            report=exercise(OPTIONS.probe,cache)
+            self.assertEqual(report['metrics']['blob_loads'],192)
+            self.assertEqual(report['metrics']['remote_fetches'],194)
+        self.assertFalse(cache.exists())
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
     def test_first_large_loose_range_streams_without_retaining_full_payload(self):
@@ -1426,7 +1462,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
                 f.finish(process)
 
-    def test_million_distinct_file_remote_cold_and_warm_bounded_fetch(self):
+    def test_million_distinct_file_remote_fresh_runs_bounded_fetch(self):
         if not OPTIONS.million: self.skipTest('million-file acceptance explicitly selected in CI')
         import benchmark
         f=self.f; fixture=benchmark.digit_fixture(f.repo,1_000_000)
@@ -1436,7 +1472,6 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         selected=f'{random.Random(0x5eed).randrange(1_000_000):06d}'; path='/'.join(selected)
         process=f.probe(url); initial=f.line(process)
         self.assertEqual(set(initial['objects']),{commit,tree}); f.finish(process)
-        shutil.rmtree(f.root/'cache')
         process=f.probe(url); f.line(process)
         value,read=f.operation(process,'read '+path); self.assertEqual(value['data'],selected+'\n')
         self.assertEqual(len(read['objects']),8)
@@ -1448,7 +1483,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         start=len(f.requests)
         process=f.probe(url); f.line(process); value,_=f.operation(process,'read '+path); f.finish(process)
         self.assertEqual(value['data'],selected+'\n')
-        self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},{commit})
+        self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},set(read['objects']))
         if OPTIONS.require_fuse:
             for index,command in enumerate((['true'],['cat',path],['cat',path])):
                 if index<2: shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -1457,7 +1492,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'' if command[0]=='true' else (selected+'\n').encode())
                 demands={oid for x in f.requests[begin:] for oid in x['wants']}
-                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']) if index==1 else {commit})
+                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']))
         print('remote million evidence:',json.dumps(dict(fixture=fixture,selected=selected,objects=read['objects'],requests=f.requests)),flush=True)
 
     def test_ssh_denied_authentication_stops_before_mount(self):
@@ -1563,9 +1598,9 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                             for path in (directory/'backing').iterdir()),'raw writable payload was lost')
         self.assertTrue((directory/'ssh-control-owner').is_file())
         self.assertEqual(f.git('rev-parse',pin,at=directory/'remote-repository'),recovery['tree_oid'])
-        # Kernel flock ownership ends with the killed process. Cached objects
-        # remain reusable; active-run objects and pin remain in private storage.
-        for lockfile in (directory/'.lock',next((f.root/'cache/git-on').glob('objects-v*'))/'lock'):
+        # Kernel flock ownership ends with the killed process. Active-run
+        # objects and the recovery pin remain in private storage.
+        for lockfile in (directory/'.lock',):
             with lockfile.open('rb') as held:
                 fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 fcntl.flock(held,fcntl.LOCK_UN)
@@ -1808,20 +1843,15 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 if OPTIONS.before_binary: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
                 self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
 
-    def test_review_real_mount_caught_cache_fault_forces_runner_failure(self):
+    def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        code=f"import errno,os; from pathlib import Path; (next((Path(os.environ['XDG_CACHE_HOME'])/'git-on').glob('objects-v*'))/'{f.subtree}').mkdir()\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('cache fault not observed')\n"
-        cases=([(OPTIONS.before_binary,0)] if OPTIONS.before_binary else [])+[(OPTIONS.binary,125)]
-        for binary,expected in cases:
-            shutil.rmtree(f.root/'cache',ignore_errors=True)
-            result=subprocess.run([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
-            self.assertEqual(result.returncode,expected,result.stderr)
-            if expected==125:
-                self.assertIn(b'remote object loading failed',result.stderr)
-                self.assertIn(b'execution incomplete',result.stderr)
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
-            print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
+        code="import errno; from pathlib import Path; packs=Path.cwd().parent/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private ODB fault not observed')\n"
+        result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,125,result.stderr)
+        self.assertIn(b'remote object loading failed',result.stderr)
+        self.assertIn(b'execution incomplete',result.stderr)
+        self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     def ignore_policy_fixture(self):
         f=self.f
@@ -1837,14 +1867,14 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         f=self.f; url=self.ignore_policy_fixture()
         cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
         for binary,expected in cases:
-            for fault in ('transport','cache'):
+            for fault in ('transport','odb'):
                 for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
                     with self.subTest(binary=str(binary),fault=fault,operation=operation):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)
                         f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
                         code="import json,os,sys; from pathlib import Path\n"
-                        if fault=='cache':
-                            code+=f"(next((Path(os.environ['XDG_CACHE_HOME'])/'git-on').glob('objects-v*'))/'{f.ignore}').mkdir()\n"
+                        if fault=='odb':
+                            code+="packs=Path.cwd().parent/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
                         code+="try:\n"
                         code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
                         code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"

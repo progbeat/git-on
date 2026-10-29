@@ -236,7 +236,8 @@ impl Drop for Pin {
 /// libgit2's necessary pack/delta decoding is not separately observable here.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SnapshotMetrics {
-    pub disk_cache: crate::remote::DiskCacheMetrics,
+    /// Successful explicit native fetches, including initial ref resolution.
+    pub remote_fetches: u64,
     pub tree_reads: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
@@ -799,7 +800,7 @@ impl Snapshot {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut metrics = state.metrics.clone();
         if let Some(remote) = &state.remote {
-            metrics.disk_cache = remote.cache_metrics();
+            metrics.remote_fetches = remote.completed_fetches();
         }
         metrics.blob_cache_bytes = state.blobs.bytes;
         metrics.blob_cache_entries = state.blobs.values.len();

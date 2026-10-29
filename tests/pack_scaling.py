@@ -3,7 +3,7 @@
 
 strace observes only the loader, excluding native Git subprocesses. Source-probe
 reports enumerate available OIDs, so wall time includes that test-helper cost;
-the pack-directory observations are separated from it and from global cache work.
+the pack-directory observations are separated from it and from historical global cache work.
 """
 import argparse
 import json
@@ -41,8 +41,12 @@ def exercise(binary,count,before=False):
         assert values==[f'object-{i}\n' for i in range(count)]*2
         reports=[row for row in rows if 'metrics' in row]
         first=reports[count]['metrics'];second=reports[-1]['metrics']
-        assert second['disk_cache']['misses']==first['disk_cache']['misses'],'available run objects fetched again'
-        assert second['disk_cache']['stores']==first['disk_cache']['stores']
+        if before:
+            assert second['disk_cache']['misses']==first['disk_cache']['misses']
+            assert second['disk_cache']['stores']==first['disk_cache']['stores']
+        else:
+            assert first['remote_fetches']==count+2,first
+            assert second['remote_fetches']==first['remote_fetches'],'available run objects fetched again'
         pack_bytes=pack_metadata=0
         for line in trace.read_text().splitlines():
             if '/remote-repository/objects/pack' not in line: continue
@@ -54,7 +58,7 @@ def exercise(binary,count,before=False):
         # retained pack counts are covered by the interactive permanent test.
         observation=dict(binary=str(binary),distinct_blobs=count,passes=2,pack_directory_bytes_enumerated=pack_bytes,
             pack_metadata_syscalls=pack_metadata,elapsed_ns=time.monotonic_ns()-begin,metrics=second,
-            baseline=before,cache='cold global cache; second pass same run',measurement='loader-only strace, wall time includes helper OID enumeration')
+            baseline=before,object_storage='private run ODB; second pass same run' if not before else 'historical global cache',measurement='loader-only strace, wall time includes helper OID enumeration')
         if not before:
             assert pack_bytes<=2048*(count+2),observation
             assert pack_metadata<=64*(count+2),observation

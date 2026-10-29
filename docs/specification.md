@@ -95,7 +95,7 @@ is part of this bug fix; it does not require a major version increment.
 
 ## Filesystem policy
 
-Remote demand, persistent cache lifetime, native verification, authentication
+Remote demand, run-local object lifetime, native verification, authentication
 limits and acceptance requirements are normative in [the remote guide](remote.md).
 The same FUSE and write-policy contract below applies to local and remote runs.
 
@@ -222,7 +222,7 @@ checkout or a complete in-memory copy of the selected tree.
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.
 6. Repeated operations should reuse useful decoded data instead of repeatedly
-   decoding the same objects. Caching must have an explicit bounded retention
+   decoding the same objects. Decoded memory caching must have an explicit bounded retention
    policy; walking many files must not retain every payload indefinitely.
    Active reads and unavoidable object decoding are accounted for separately.
 7. Do not keep duplicate full source payloads merely to transfer data between
@@ -251,7 +251,9 @@ functional correctness:
   its interpreter startup is required in the measured workload.
 - Measure from git-on invocation until that correct stdout is observed, as well
   as child-start latency, total time, and peak memory where available. Fixture
-  construction is excluded. Repeat trials and identify cold/warm cache state.
+  construction is excluded. Repeat trials and identify OS page-cache conditions
+  where controlled. Remote invocations use independent temporary object stores;
+  distinguish a fresh invocation from repeated access within the same run.
 - Smaller fixtures can diagnose scaling, but do not replace the specified
   million-file case. Keep file contents and object reuse explicit in results.
 - Observe Git object accesses where instrumentation is available. A no-op
@@ -264,7 +266,8 @@ functional correctness:
 - Exercise lookup, `stat`, directory listing, one-file reads, repeated reads,
   and large-file partial reads separately. Record decoding dependencies and
   bytes where observable rather than inferring them from wall time.
-- Visit more content than the cache retention budget and verify eviction; do
+- Visit more content than decoded memory-cache budgets and verify eviction
+  without re-fetching objects already available in the run; do
   not count unavoidable kernel page cache as a second application-owned payload.
 - Run the existing immutable-source, ignore-policy, lifecycle, and real-FUSE
   integration checks after changing the loading architecture. Performance must
