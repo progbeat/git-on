@@ -41,6 +41,8 @@ struct Handle {
     ino: u64,
     flags: i32,
     reader: Option<BlobReader>,
+    previous: u64,
+    next: u64,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -59,6 +61,14 @@ pub struct Overlay {
     directory_refs: HashMap<u64, usize>,
     nodes: HashMap<u64, Node>,
     handles: HashMap<u64, Handle>,
+    // Index actual open handles, not all reserved directory children. Lifetime
+    // checks stay independent of unrelated handles and copy-up visits only its
+    // own readers. Both maps have O(number of open handles) retained entries.
+    // Intrusive lists avoid an allocation per inode for its usual single handle.
+    // Zero is the sentinel; actual handle IDs start at one.
+    inode_handles: HashMap<u64, u64>,
+    #[cfg(test)]
+    handle_scan_steps: std::cell::Cell<usize>,
     directories: HashMap<u64, Vec<(u64, FileType, OsString)>>,
     next_ino: u64,
     next_handle: u64,
@@ -129,6 +139,9 @@ impl Overlay {
             directory_refs: HashMap::new(),
             nodes,
             handles: HashMap::new(),
+            inode_handles: HashMap::new(),
+            #[cfg(test)]
+            handle_scan_steps: std::cell::Cell::new(0),
             directories: HashMap::new(),
             next_ino: 2,
             next_handle: 1,
@@ -208,9 +221,12 @@ impl Overlay {
         }
         self.reclaim(ino);
     }
+    fn has_open_handle(&self, ino: u64) -> bool {
+        self.inode_handles.contains_key(&ino)
+    }
     fn reclaim(&mut self, ino: u64) {
         if ino == 1
-            || self.handles.values().any(|h| h.ino == ino)
+            || self.has_open_handle(ino)
             || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0
         {
             return;
@@ -290,7 +306,24 @@ impl Overlay {
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
         let _ = self.refresh_backing_attr(ino);
-        self.handles.remove(&fh);
+        if let Some(handle) = self.handles.remove(&fh) {
+            if handle.previous != 0 {
+                self.handles
+                    .get_mut(&handle.previous)
+                    .expect("previous open handle")
+                    .next = handle.next;
+            } else if handle.next != 0 {
+                self.inode_handles.insert(handle.ino, handle.next);
+            } else {
+                self.inode_handles.remove(&handle.ino);
+            }
+            if handle.next != 0 {
+                self.handles
+                    .get_mut(&handle.next)
+                    .expect("next open handle")
+                    .previous = handle.previous;
+            }
+        }
         let listed = self.directories.remove(&fh).unwrap_or_default();
         for (child, _, _) in &listed {
             if let Some(count) = self.directory_refs.get_mut(child) {
@@ -303,7 +336,7 @@ impl Overlay {
         for (child, _, _) in listed {
             self.reclaim(child);
         }
-        if !self.handles.values().any(|h| h.ino == ino) {
+        if !self.has_open_handle(ino) {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 if n.attr.nlink != 0 {
                     n.file = None;
@@ -444,7 +477,7 @@ impl Overlay {
             }
             None
         };
-        let keep_file = unlinked || self.handles.values().any(|handle| handle.ino == ino);
+        let keep_file = unlinked || self.has_open_handle(ino);
         let node = self.node_mut(ino)?;
         node.immutable = false;
         node.oid = None;
@@ -455,8 +488,13 @@ impl Overlay {
         if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
             self.upper_paths.insert(path, ino);
         }
-        for handle in self.handles.values_mut().filter(|handle| handle.ino == ino) {
+        let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
+        while fh != 0 {
+            #[cfg(test)]
+            self.handle_scan_steps.set(self.handle_scan_steps.get() + 1);
+            let handle = self.handles.get_mut(&fh).expect("indexed open handle");
             handle.reader = None;
+            fh = handle.next;
         }
         Ok(())
     }
@@ -579,12 +617,21 @@ impl Overlay {
     fn new_handle(&mut self, ino: u64, flags: i32) -> u64 {
         let fh = self.next_handle;
         self.next_handle += 1;
+        let next = self.inode_handles.insert(ino, fh).unwrap_or(0);
+        if next != 0 {
+            self.handles
+                .get_mut(&next)
+                .expect("previous inode head")
+                .previous = fh;
+        }
         self.handles.insert(
             fh,
             Handle {
                 ino,
                 flags,
                 reader: None,
+                previous: 0,
+                next,
             },
         );
         fh
@@ -1970,8 +2017,7 @@ mod tests {
             fs.read_data(ino, handle, 0, 100).unwrap(),
             b"pinned content\n"
         );
-        fs.handles.remove(&handle);
-        fs.reclaim(ino);
+        fs.close_handle(ino, handle);
         assert_eq!(fs.nodes.len(), 1);
         assert!(!fs.paths.contains_key(Path::new("tracked.tmp")));
         let replacement = fs.ensure(Path::new("tracked.tmp")).unwrap();
@@ -1997,6 +2043,77 @@ mod tests {
         assert_eq!(fs.nodes.len(), 1);
         assert_eq!(fs.inode_paths.len(), 1);
         assert!(fs.directory_refs.is_empty());
+    }
+    #[test]
+    fn directory_release_does_not_scan_unrelated_open_handles() {
+        let (_tmp, mut fs) = fixture();
+        let file = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let handles: Vec<_> = (0..128)
+            .map(|_| fs.open_file(file, libc::O_RDONLY).unwrap())
+            .collect();
+        let directory = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        fs.handle_scan_steps.set(0);
+        fs.release_handle(1, directory).unwrap();
+        assert_eq!(
+            fs.handle_scan_steps.get(),
+            0,
+            "directory children scanned unrelated handles"
+        );
+        assert_eq!(
+            fs.read_data(file, handles[0], 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        for handle in handles {
+            fs.release_handle(file, handle).unwrap();
+        }
+        fs.forget_inode(file, u64::MAX);
+        assert!(!fs.nodes.contains_key(&file));
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
+    }
+    #[test]
+    fn copy_up_only_visits_its_readers_and_handle_links_survive_any_release_order() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let source = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let unrelated = file(&mut fs, 1, "unrelated");
+        let other: Vec<_> = (0..128)
+            .map(|_| fs.open_file(unrelated, libc::O_RDWR).unwrap())
+            .collect();
+        let readers: Vec<_> = (0..3)
+            .map(|_| fs.open_file(source, libc::O_RDONLY).unwrap())
+            .collect();
+        for handle in &readers {
+            let oid = fs.nodes[&source].oid.unwrap();
+            fs.handles.get_mut(handle).unwrap().reader = Some(fs._snapshot.open(oid).unwrap());
+        }
+        fs.handle_scan_steps.set(0);
+        fs.copy_up(source, true).unwrap();
+        assert_eq!(fs.handle_scan_steps.get(), readers.len());
+        assert!(readers
+            .iter()
+            .all(|handle| fs.handles[handle].reader.is_none()));
+        // Remove middle, head, then tail. Each remaining reader stays usable;
+        // closing the last one drops only this inode's backing descriptor.
+        for index in [1, 2, 0] {
+            fs.release_handle(source, readers[index]).unwrap();
+            assert_eq!(fs.release_handle(source, readers[index]), Err(libc::EBADF));
+            for handle in &readers {
+                if fs.handles.contains_key(handle) {
+                    assert_eq!(
+                        fs.read_data(source, *handle, 0, 100).unwrap(),
+                        b"pinned content\n"
+                    );
+                }
+            }
+        }
+        assert!(!fs.inode_handles.contains_key(&source));
+        assert!(fs.nodes[&source].file.is_none());
+        assert!(fs.nodes[&unrelated].file.is_some());
+        for handle in other.into_iter().rev() {
+            fs.release_handle(unrelated, handle).unwrap();
+        }
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
     }
     #[test]
     fn idle_open_descriptors_do_not_pin_evicted_payloads() {
