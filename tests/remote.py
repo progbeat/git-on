@@ -2140,7 +2140,8 @@ os.execv(native,[native,*args])
         f=self.f; url=self.ignore_policy_fixture()
         cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
         for binary,expected in cases:
-            for fault in ('transport','odb','raw'):
+            faults=('transport','odb') if binary==OPTIONS.before_policy_binary else ('transport','odb','raw')
+            for fault in faults:
                 for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
                     with self.subTest(binary=str(binary),fault=fault,operation=operation):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)

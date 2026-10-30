@@ -2,6 +2,17 @@
 
 ## Invocation-owned demand sessions
 
+The first mounted run at `d8a41d2` exposed three stale fault-injection assertions:
+replacing `objects/pack` cannot break a direct session import that does not use
+that directory. The tests now select the native compatibility path for pack
+faults and additionally corrupt the active raw-parts destination for session
+faults. Both mounted read and ignore-rule mutation controls still require EIO,
+runner status 125, failure latching and cleanup. A no-mount production-loader
+control demonstrates that the unused pack fault permits a session read, while
+the same raw-parts fault rejects the next demand without following a symlink.
+Historical pre-raw-store policy replays retain their original transport/ODB
+faults; they do not claim to test a storage path absent from that binary.
+
 The permanent `test_protocol_v2_reuses_native_clients_after_blob_eviction`
 checks actual Native Git Trace2 process starts, 140 unique blobs, eviction and
 a closed reread. Replaying it with the authentic pre-session production loader
