@@ -378,6 +378,7 @@ jobs:
           python3 tests/test_record_demo.py
           python3 tests/test_io_profile.py
           python3 tests/test_import_profile.py
+          python3 tests/test_metadata_profile.py
       - name: Test lossless conversion and output preservation
         run: |
           sudo apt-get update

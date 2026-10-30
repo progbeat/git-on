@@ -24,6 +24,14 @@ the materializer/kernel remains responsible for an actual host path error.
 Red evidence is `long-name-red.json`, green is `long-name-green.log` in the same
 retained workspace evidence directory. Actual macOS compilation needs final CI.
 
+A fresh full-stage review at `5821425` found no additional runtime defect and
+one P3: the new profile's negative regression suite was omitted from CI's
+explicit Python commands. `test_python_regression_suites_are_registered` fails
+on that workflow and passes after registering `test_metadata_profile.py`.
+It guards all standalone Python regression suites so a new one cannot remain
+local-only unnoticed. The red/green registration logs are retained alongside
+the other metadata-stage evidence.
+
 ## Shared raw spooling under inherited per-file limits
 
 Fresh review of fca7786 found one introduced P2. With RLIMIT_FSIZE=65536 and

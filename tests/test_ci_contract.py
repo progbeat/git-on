@@ -20,6 +20,13 @@ def job(name):return re.search(r'^  '+name+r':\n(.*?)(?=^  [\w-]+:\n|\Z)',WORKFL
 
 
 class CiContractTests(unittest.TestCase):
+    def test_python_regression_suites_are_registered(self):
+        # These standalone suites use explicit workflow commands, not discovery.
+        # Keep newly added negative harness tests from silently staying local.
+        for suite in sorted((ROOT/'tests').glob('test_*.py')):
+            with self.subTest(suite=suite.name):
+                self.assertIn('tests/'+suite.name,WORKFLOW)
+
     def test_package_requires_real_linux_and_macos_builds(self):
         body=job('package-build')
         for expected in ['x86_64-unknown-linux-gnu','aarch64-apple-darwin',
