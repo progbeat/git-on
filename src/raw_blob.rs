@@ -1,16 +1,15 @@
 //! Authenticated per-invocation bytes and a disk-resident randomized index.
-//! Three unlinked files retain constant descriptors and index RAM. Fixed-size
-//! block tags detect changed temporary bytes without rehashing an entire blob.
+//! Three logical files retain constant descriptors and index RAM. Bounded parts
+//! respect per-file limits; block tags authenticate later reads from disk.
+use crate::spool::{Files, Spool};
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
     collections::hash_map::RandomState,
-    fs::File,
     hash::BuildHasher,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
-    os::unix::fs::FileExt,
     path::Path,
     sync::Arc,
 };
@@ -47,8 +46,8 @@ struct Location {
 }
 #[derive(Clone)]
 pub(crate) struct RawBlob {
-    file: Arc<File>,
-    tags: Arc<File>,
+    file: Arc<Spool>,
+    tags: Arc<Spool>,
     key: Key,
     oid: Oid,
     location: Location,
@@ -104,7 +103,7 @@ impl RawBlob {
 }
 /// Only staged, not-yet-trusted native stdout uses this unchecked reader.
 struct StagedReader {
-    file: Arc<File>,
+    file: Arc<Spool>,
     start: u64,
     size: u64,
     position: u64,
@@ -123,7 +122,7 @@ impl Read for StagedReader {
     }
 }
 struct Tags<'a> {
-    output: BufWriter<&'a File>,
+    output: BufWriter<&'a Spool>,
     key: &'a [u8],
     oid: Oid,
     size: u64,
@@ -133,7 +132,7 @@ struct Tags<'a> {
     auth: Auth,
 }
 impl<'a> Tags<'a> {
-    fn new(output: &'a File, key: &'a [u8], oid: Oid, size: u64, generation: [u8; 16]) -> Self {
+    fn new(output: &'a Spool, key: &'a [u8], oid: Oid, size: u64, generation: [u8; 16]) -> Self {
         Self {
             output: BufWriter::with_capacity(64 * 1024, output),
             key,
@@ -180,7 +179,7 @@ impl Write for Tags<'_> {
     }
 }
 struct StoreAndTag<'a> {
-    data: &'a File,
+    data: &'a Spool,
     tags: Tags<'a>,
 }
 impl Write for StoreAndTag<'_> {
@@ -195,9 +194,10 @@ impl Write for StoreAndTag<'_> {
 }
 
 pub(crate) struct RawBlobs {
-    data: Arc<File>,
-    tags: Arc<File>,
-    index: File,
+    files: Files,
+    data: Arc<Spool>,
+    tags: Arc<Spool>,
+    index: Spool,
     key: Key,
     slots: u64,
     hash: RandomState,
@@ -206,9 +206,13 @@ pub(crate) struct RawBlobs {
 }
 impl RawBlobs {
     pub(crate) fn new(directory: &Path) -> Result<Self> {
-        let data = Arc::new(tempfile::tempfile_in(directory)?);
-        let tags = Arc::new(tempfile::tempfile_in(directory)?);
-        let index = tempfile::tempfile_in(directory)?;
+        let files = Files::new(directory)?;
+        Self::with_files(directory, files)
+    }
+    fn with_files(directory: &Path, files: Files) -> Result<Self> {
+        let data = Arc::new(files.file(directory)?);
+        let tags = Arc::new(files.file(directory)?);
+        let index = files.file(directory)?;
         index.set_len(INITIAL_SLOTS * SLOT_BYTES)?;
         // UUID v4 uses the existing OS-random source; neither key nor tags are
         // reused across invocations or exposed through the metrics channel.
@@ -216,6 +220,7 @@ impl RawBlobs {
         key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Self {
+            files,
             data,
             tags,
             index,
@@ -287,15 +292,19 @@ impl RawBlobs {
         }
         Ok(Some((self.blob(oid, location), first)))
     }
-    pub(crate) fn append_output(&self) -> Result<(File, u64)> {
+    pub(crate) fn append_output(&self) -> Result<(RawOutput, u64)> {
         let start = (&*self.data).seek(SeekFrom::End(0))?;
-        Ok((self.data.try_clone()?, start))
+        Ok((
+            RawOutput {
+                file: self.data.clone(),
+            },
+            start,
+        ))
     }
     pub(crate) fn output_reader(&self, start: u64) -> Result<impl Read> {
         let size = self
             .data
-            .metadata()?
-            .len()
+            .len()?
             .checked_sub(start)
             .context("invalid raw output range")?;
         Ok(StagedReader {
@@ -335,7 +344,7 @@ impl RawBlobs {
             .slots
             .checked_mul(2)
             .context("raw-blob index capacity")?;
-        let index = tempfile::tempfile_in(directory)?;
+        let index = self.files.file(directory)?;
         index.set_len(
             slots
                 .checked_mul(SLOT_BYTES)
@@ -445,7 +454,18 @@ impl RawBlobs {
         self.bytes
     }
 }
-fn read_slot(index: &File, slot: u64) -> Result<[u8; SLOT_BYTES as usize]> {
+pub(crate) struct RawOutput {
+    file: Arc<Spool>,
+}
+impl Write for RawOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (&*self.file).write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn read_slot(index: &Spool, slot: u64) -> Result<[u8; SLOT_BYTES as usize]> {
     let mut record = [0; SLOT_BYTES as usize];
     index.read_exact_at(&mut record, slot * SLOT_BYTES)?;
     Ok(record)
@@ -463,6 +483,22 @@ fn decode_location(record: &[u8; SLOT_BYTES as usize]) -> Location {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn authenticated_ranges_cross_finite_parts_and_outlive_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Files::with_limit(root.path(), Some(97)).unwrap();
+        let mut store = RawBlobs::with_files(root.path(), files).unwrap();
+        let bytes: Vec<_> = (0..10000).map(|i| (i % 251) as u8).collect();
+        let oid = Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap();
+        let reader = store
+            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
+            .unwrap();
+        assert_eq!(reader.read(4091, 800).unwrap(), bytes[4091..4891]);
+        drop(store);
+        assert_eq!(reader.read(96, 700).unwrap(), bytes[96..796]);
+        drop(reader);
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
     #[test]
     fn modified_prepared_bytes_are_rejected_before_a_range_is_returned() {
         let directory = tempfile::tempdir().unwrap();
@@ -558,7 +594,7 @@ mod tests {
         assert_eq!(store.entries(), 1);
     }
     #[test]
-    fn growing_index_retains_verified_bytes_without_named_files_or_per_object_fds() {
+    fn growing_index_retains_verified_bytes_without_per_object_fds() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::new(directory.path()).unwrap();
         for i in 0..257 {
@@ -570,8 +606,7 @@ mod tests {
         }
         assert!(std::fs::read_dir(directory.path())
             .unwrap()
-            .next()
-            .is_none());
+            .all(|entry| entry.unwrap().file_type().unwrap().is_dir()));
         assert_eq!(store.entries(), 257);
         for i in (0..257).rev() {
             let bytes = format!("blob-{i}");
@@ -584,6 +619,11 @@ mod tests {
                 &bytes.as_bytes()[bytes.len() - 1..]
             );
         }
+        drop(store);
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
     #[test]
     fn invalid_and_truncated_transfers_do_not_publish_or_damage_previous_data() {

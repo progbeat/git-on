@@ -1,5 +1,25 @@
 # Review regression evidence
 
+## Shared raw spooling under inherited per-file limits
+
+Fresh review of fca7786 found one introduced P2. With RLIMIT_FSIZE=65536 and
+SIGXFSZ ignored, 80 distinct 8192-byte local files fail at the ninth file;
+native clone and exact parent 33548b3 both succeed. Evidence is retained in
+`/tmp/review-raw-fsize-evidence.jsonl`. The permanent
+`MaterializedTests.test_small_files_respect_individual_fsize_limits_without_aggregate_ceiling`
+also fails on fca7786 for local and native file:// sources (two failed subcases)
+and passes after bounded raw parts, with FSIZE=64 KiB and NOFILE=64. Both native
+clones succeed; the child checks every byte twice and private storage cleanup.
+The original native/current/parent reproducer and permanent red/green outputs
+are `/tmp/review-raw-fsize.py` and `/tmp/git-on-140-fsize-{red,permanent-green}.log`.
+
+Raw-store tests cross 97-byte physical boundaries while authenticating 4 KiB
+logical blocks and keep a reader usable after its store drops. Sparse extension,
+truncation, part cleanup, prior integrity regressions and geometric index growth
+remain checked. A native-output writer failure must stop the owned command before
+its delayed completion marker; it preserves the staging error and adds no
+system-limit or security-setting changes.
+
 ## Invocation-local raw reuse and bounded reader retention (1.4.0)
 
 At authentic `325be51`, `blob_cache_is_bounded_and_large_partial_reads_bypass_retention`

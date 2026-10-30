@@ -11,4 +11,5 @@ mod progress;
 mod raw_blob;
 pub mod remote;
 pub mod snapshot;
+mod spool;
 mod wildmatch;

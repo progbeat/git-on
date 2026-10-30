@@ -91,9 +91,11 @@ verified raw bytes, including small blobs after decoded-memory-cache eviction.
 The 140-distinct-blob regression leaves no loose blob copies or retained packs
 and does not fetch or decode the first blob again on its second closed read.
 
-Prepared raw disk bytes must not become a new trust boundary. Three unlinked
-files retain payload, block tags and disk index, with a fourth descriptor only
-during geometric index growth. Initial SHA-1 verification simultaneously writes
+Prepared raw disk bytes must not become a new trust boundary. At the fca7786
+checkpoint, three unlinked files retained payload, block tags and disk index,
+with a fourth descriptor only during geometric index growth. The subsequent
+per-file-limit correction below changes their backing, retaining authentication.
+Initial SHA-1 verification simultaneously writes
 32-byte HMAC-SHA256 tags for 4 KiB logical blocks. A random invocation-only key
 and fresh preparation nonce bind tags to OID, size, generation and block number.
 Index records are authenticated too. Later ranges authenticate exactly the
@@ -150,6 +152,37 @@ FUSE metadata traffic and writable copy-up/materialization copies. Local packed
 decoding constraints remain. Smaller representative production profiles do not
 replace exact-head million-file lazy and supported-platform checks, and neither
 finite counters nor partial pack traces prove the total asymptotic contract.
+
+## Per-file limits and eager request batching
+
+Independent review of fca7786 reproduced an introduced P2: with
+RLIMIT_FSIZE=64 KiB, 80 distinct 8 KiB local files failed at the ninth file because
+all small blobs now shared one aggregate raw file. Exact parent 33548b3 and an
+ordinary native clone succeeded. The permanent materialized regression also
+reproduces the remote variant with compressible distinct blobs, where a native
+file:// clone fits the same limit. Both are checked with NOFILE=64 as well.
+
+Raw payload, tags and index now use bounded physical parts under the private
+invocation directory, outside the child view. Part size is min(1 GiB, inherited
+FSIZE); it is not a total-storage or repository-size ceiling. Arithmetic offsets
+avoid a retained map of all part names. One cached descriptor per logical file
+and one shared directory descriptor remain constant; index rehash adds one.
+No-follow anchored opens reject non-regular, foreign or hardlinked parts.
+HMACs still verify the actual returned bytes. Native stdout uses one bounded
+pipe/writer thread and writes each payload to disk once, without an object-size
+prepass. Output failure stops the owned native operation; cancellation/TTY work
+stays on the requesting thread. This introduces bounded pipe copying, explicitly
+included in total CPU/time, while eliminating an aggregate file-size constraint.
+
+Eager materialization can batch known required entries; lazy FUSE cannot infer
+future requests. Groups of at most 256 IDs from the current prepared directory
+share native fetch/import, skip already available IDs and deduplicate each
+batch. The bounded 302-path/301-blob regression crosses a batch boundary and
+reuses a shared first/last blob: 303 explicit object demands require four native
+fetch/decode operations, and each unique blob is prepared once. Complete byte
+checks and the reduced-FSIZE local/remote regression cover the result. Native
+operation counters and independent process tracing remain distinct from
+object-demand counts.
 
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and

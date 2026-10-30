@@ -21,9 +21,9 @@ class ImportProfileTests(unittest.TestCase):
                 rows=[baseline]
                 for traced in traces:
                     rows.append(dict(identity,type='runner',variant='current',traced=traced,child_observations=observations,
-                        metrics=dict(remote_fetches=count+2,remote_raw_blob_imports=count,remote_raw_blob_bytes=count*8192,blob_loads=count,blob_cache_bytes=1,blob_cache_limit=8388608),
+                        metrics=dict(remote_fetches=count+2,remote_fetch_operations=3 if backend=='materialized' else count+2,remote_decode_operations=3 if backend=='materialized' else count+2,remote_raw_blob_imports=count,remote_raw_blob_bytes=count*8192,blob_loads=count,blob_cache_bytes=1,blob_cache_limit=8388608),
                         fuse_requests={'read':1} if backend=='fuse' else {},waited_user_cpu_s=1,waited_system_cpu_s=1,runner_and_waited_children_peak_resident_kib=1000,
-                        processes={'cat-file':count+2},file_io_by_command={'cat-file':{'other_fixture_files_write_bytes':count*8192}}))
+                        processes={'cat-file':3 if backend=='materialized' else count+2,'fetch':3 if backend=='materialized' else count+2},file_io_by_command={'other':{'raw_parts_write_bytes':count*8192}}))
                 (root/f'import-profile-{backend}.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
             validate_import_profiles(dict(head=head),root)
             path=root/'import-profile-materialized.jsonl';good=path.read_text()

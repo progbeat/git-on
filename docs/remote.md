@@ -49,6 +49,15 @@ ancestor trees. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
+Explicit-all eager materialization already needs every entry it prepares. For
+that backend, at most 256 known object IDs from the current directory share one
+native `fetch --stdin` and decoder operation. Each object is checked for existing
+run-local availability and deduplicated before requesting it; all use `tree:0`.
+This does not add prefetch to lazy FUSE or fetch unknown descendants. The batch
+size bounds request memory/argv work, not repository or file counts. Metrics
+separately report requested-object count (`remote_fetches`) and actual native
+fetch/decode operations; full-process tracing checks those operation counts.
+
 The server must advertise filtering before any object transfer. Rejection of a
 requested unadvertised OID names the OID and includes Git's server diagnostic.
 
@@ -108,10 +117,17 @@ refreshes. Canonical OID verification completes before raw bytes become readable
 Local loose objects stream in 64 KiB chunks with cancellation checks.
 
 All prepared blobs survive close/reopen and bounded-memory-cache eviction in
-unlinked temporary storage until invocation completion. A disk-resident
+private temporary storage until invocation completion. A disk-resident
 randomized hash index avoids one retained descriptor or RAM entry per blob.
-Payload, authentication tags and index retain three descriptors, with one more
-during geometric index growth. A per-invocation memory-only HMAC key authenticates
+Payload, authentication tags and index are logical files split into at most
+1 GiB parts, further capped by inherited `RLIMIT_FSIZE`. Each retains one open
+part, plus one shared directory descriptor: four retained descriptors, five
+during geometric index growth, independent of bytes/object/part counts. Parts
+are created/reopened relative to the owned directory descriptor with no symlink
+following; their directory stays outside the execution view. They are removed
+when their owning readers/store are dropped and remain under invocation cleanup.
+Native output passes through a bounded pipe into these parts, with no additional
+payload disk copy or per-object header/decode prepass. A per-invocation memory-only HMAC key authenticates
 the index and 4 KiB logical payload blocks; range reads verify the returned bytes
 without decoding or hashing the entire blob again. This detects modification of
 prepared disk bytes under the interview's process-memory protection assumption.

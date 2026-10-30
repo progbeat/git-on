@@ -239,6 +239,8 @@ impl Drop for Pin {
 pub struct SnapshotMetrics {
     /// Successful explicit native fetches, including initial ref resolution.
     pub remote_fetches: u64,
+    pub remote_fetch_operations: u64,
+    pub remote_decode_operations: u64,
     pub tree_reads: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
@@ -628,7 +630,13 @@ impl Snapshot {
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
         Self::load_source_with_pin_record(
-            repo_path, None, treeish, false, repo_path, run_id, record,
+            repo_path,
+            None,
+            treeish,
+            false,
+            &std::env::temp_dir(),
+            run_id,
+            record,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -739,7 +747,7 @@ impl Snapshot {
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
                     metrics: SnapshotMetrics::default(),
-                    spool_directory: std::env::temp_dir(),
+                    spool_directory: run_directory.to_path_buf(),
                     _local_object_bridge: local_bridge,
                 }),
                 _pin: pin,
@@ -844,14 +852,34 @@ impl Snapshot {
             })
             .collect()
     }
+    pub(crate) fn prepare_materialization(&self, children: &[(OsString, Entry)]) -> Result<()> {
+        let mut state = self.state()?;
+        let State { repo, remote, .. } = &mut *state;
+        let Some(remote) = remote else { return Ok(()) };
+        // Bounded requests avoid argv limits and O(repository-size) request RAM.
+        // Repeated OIDs in a directory are deduplicated within each batch and
+        // later batches reuse already prepared objects.
+        for children in children.chunks(256) {
+            let oids: Vec<_> = children
+                .iter()
+                .filter(|(_, entry)| entry.mode != 0o160000)
+                .map(|(_, entry)| entry.oid)
+                .collect();
+            remote.ensure_batch_in(repo, &oids)?;
+        }
+        Ok(())
+    }
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
         let mut state = self.state()?;
-        // Own the unlinked files while the validated private directory exists.
+        // Own storage while the validated private directory exists.
         // Later upper-layer failures must not turn policy reads into unrelated
         // object-storage failures merely because that directory was removed.
         if state.remote.is_none() && state.raw_blobs.is_none() {
-            state.raw_blobs = Some(crate::raw_blob::RawBlobs::new(path)?);
+            // Named parts stay outside the execution view.
+            // It remains inside the invocation's owned directory for recovery.
+            let storage = path.parent().context("missing private storage parent")?;
+            state.raw_blobs = Some(crate::raw_blob::RawBlobs::new(storage)?);
         }
         state.spool_directory = path.to_path_buf();
         Ok(())
@@ -906,6 +934,8 @@ impl Snapshot {
         let mut metrics = state.metrics.clone();
         if let Some(remote) = &state.remote {
             metrics.remote_fetches = remote.completed_fetches();
+            metrics.remote_fetch_operations = remote.fetch_operations();
+            metrics.remote_decode_operations = remote.decode_operations();
             metrics.remote_raw_blob_imports = remote.raw_blobs.entries();
             metrics.remote_raw_blob_bytes = remote.raw_blobs.bytes();
             metrics.retained_raw_blob_bytes = remote.raw_blobs.bytes();

@@ -31,7 +31,8 @@ def trace_summary(paths,root):
             if 'execve(' in line:
                 args=[ast.literal_eval(s) for s in STRINGS.findall(line)]
                 break
-        command=next((name for name in ('unpack-objects','index-pack','pack-objects','fetch','cat-file') if name in args),'other')
+        command=next((name for name in ('unpack-objects','index-pack','pack-objects','fetch','cat-file','rev-list','upload-pack')
+            if name in args or any(Path(arg).name=='git-'+name for arg in args)),'other')
         processes[command]+=1;pending=None
         for line in text.splitlines():
             if '<unfinished ...>' in line:
@@ -47,7 +48,8 @@ def trace_summary(paths,root):
                         requests[OPCODES.get(opcode,str(opcode))]+=1
             descriptor=re.search(r'\b(?:write|writev|pwrite64|fsync|fdatasync)\(\d+<([^>]*)>',line)
             if not descriptor or str(root) not in descriptor[1]:continue
-            category='objects' if '/remote-repository/objects/' in descriptor[1] else 'other_fixture_files'
+            category=('objects' if '/remote-repository/objects/' in descriptor[1]
+                else 'raw_parts' if '/raw-parts-' in descriptor[1] else 'other_fixture_files')
             match=re.search(r'\b(write|writev|pwrite64)\([^\n]* = (\d+)',line)
             if match:
                 writes[command][category+'_write_calls']+=1

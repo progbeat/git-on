@@ -27,6 +27,7 @@ class IoProfileTests(unittest.TestCase):
                 'write(1<pipe:[12]>, "observer", 8) = 8 <0.001>\n')
             with trace.open('a') as output:
                 output.write(f'write(1<pipe:[12]>, "{root}/not-a-file-write", 100) = 100 <0.001>\n')
+                output.write(f'write(9<{root}/run/raw-parts-fixture/0-0>, "raw", 3) = 3 <0.001>\n')
             fuse=root/'trace.2';fuse.write_text(
                 'read(7</dev/fuse<char 10:229>>, "\\x40\\0\\0\\0\\x01\\0\\0\\0", 131072) = 64 <0.001>\n'
                 'read(7</dev/fuse<char 10:229>>,  <unfinished ...>\n'
@@ -35,6 +36,7 @@ class IoProfileTests(unittest.TestCase):
             self.assertEqual(result['processes']['unpack-objects'],1)
             self.assertEqual(result['file_io_by_command']['unpack-objects']['objects_write_bytes'],4)
             self.assertEqual(result['file_io_by_command']['unpack-objects']['objects_sync_calls'],1)
+            self.assertEqual(result['file_io_by_command']['unpack-objects']['raw_parts_write_bytes'],3)
             self.assertEqual(result['fuse_requests'],{'lookup':1,'read':1})
 
     def test_child_checks_bytes_and_names_on_both_passes(self):

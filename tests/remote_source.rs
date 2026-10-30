@@ -193,6 +193,59 @@ fn remote_materialization_preserves_the_selected_tree_without_a_checkout() {
     assert!(!destination.join(".git").exists());
 }
 #[test]
+fn eager_remote_batches_are_bounded_and_reuse_objects_across_batch_boundaries() {
+    let (temp, parent, _, _) = fixture();
+    let server = Repository::open_bare(temp.path().join("server")).unwrap();
+    let mut tree = server.treebuilder(None).unwrap();
+    for index in 0..300 {
+        let bytes = format!("distinct-{index}\n");
+        tree.insert(
+            format!("f{index:04}"),
+            server.blob(bytes.as_bytes()).unwrap(),
+            0o100644,
+        )
+        .unwrap();
+    }
+    let shared = server.blob(b"shared\n").unwrap();
+    tree.insert("a-shared", shared, 0o100644).unwrap();
+    tree.insert("z-shared", shared, 0o100644).unwrap();
+    let tree = tree.write().unwrap();
+    let sig = Signature::now("Test", "test@example.invalid").unwrap();
+    server
+        .commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "bounded batches",
+            &server.find_tree(tree).unwrap(),
+            &[&server.find_commit(parent).unwrap()],
+        )
+        .unwrap();
+    let snapshot = load(temp.path(), "HEAD", false).unwrap();
+    let destination = temp.path().join("view");
+    std::fs::create_dir(&destination).unwrap();
+    git_on::materialize::materialize(&snapshot, &destination).unwrap();
+    for index in 0..300 {
+        assert_eq!(
+            std::fs::read(destination.join(format!("f{index:04}"))).unwrap(),
+            format!("distinct-{index}\n").as_bytes()
+        );
+    }
+    let metrics = snapshot.metrics();
+    assert_eq!(metrics.remote_fetches, 303);
+    assert_eq!(metrics.remote_fetch_operations, 4);
+    assert_eq!(metrics.remote_decode_operations, 4);
+    assert_eq!(metrics.blob_loads, 301);
+    assert_eq!(
+        std::fs::read(destination.join("a-shared")).unwrap(),
+        b"shared\n"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("z-shared")).unwrap(),
+        b"shared\n"
+    );
+}
+#[test]
 fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
     let (temp, _, tree, _) = fixture();
     let server = Repository::open_bare(temp.path().join("server")).unwrap();

@@ -160,7 +160,8 @@ def validate_import_profiles(plan,root):
             if any(row.get(k,-1)<0 for k in ('waited_user_cpu_s','waited_system_cpu_s','runner_and_waited_children_peak_resident_kib')):raise ValueError('missing full-process resources')
             if traced:
                 if row['processes'].get('unpack-objects',0) or not row['processes'].get('cat-file',0):raise ValueError('native decoder tracing absent/wrong')
-                io=row['file_io_by_command'].get('cat-file',{})
-                if sum(v for k,v in io.items() if k.endswith('_write_bytes'))<count*8192:raise ValueError('raw native stdout was not measured')
+                if row['processes']['cat-file']!=row['metrics']['remote_decode_operations'] or row['processes'].get('fetch')!=row['metrics']['remote_fetch_operations']:raise ValueError('native operation counter differs from full-process trace')
+                raw=sum(io.get('raw_parts_write_bytes',0) for io in row['file_io_by_command'].values())
+                if raw<count*8192:raise ValueError('native output staging writes were not measured')
         result[backend]=dict(distinct_blobs=count,invocations=len(traces),application_passes=2)
     return result

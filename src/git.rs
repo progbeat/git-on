@@ -260,18 +260,65 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
-    run_captured(command, capture, capture)
+    run_captured(command, capture, capture, None)
 }
-/// Stream native stdout to owned staging storage without a full output buffer;
-/// preserve the same cancellation, terminal and child-group lifecycle.
-pub(crate) fn run_to_file(mut command: Command, output: &File) -> Result<std::process::Output> {
-    command.stdout(output.try_clone()?);
-    run_captured(command, false, true)
+/// A bounded pipe transfer is needed when inherited per-file limits require
+/// segmented staging. The caller thread retains request cancellation/TTY
+/// ownership; a writer failure stops the owned native operation as well.
+pub(crate) fn run_to_writer<W: std::io::Write + Send>(
+    mut command: Command,
+    mut output: W,
+) -> Result<std::process::Output> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    command.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+        writer,
+    )));
+    let failed = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    reader.set_read_timeout(Some(std::time::Duration::from_millis(10)))?;
+    std::thread::scope(|scope| {
+        let transfer = std::thread::Builder::new()
+            .name("git-output".into())
+            .spawn_scoped(scope, || {
+                use std::io::Read;
+                let result = (|| -> std::io::Result<()> {
+                    let mut bytes = [0; 64 * 1024];
+                    loop {
+                        match reader.read(&mut bytes) {
+                            Ok(0) => return Ok(()),
+                            Ok(count) => output.write_all(&bytes[..count])?,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                if finished.load(Ordering::Acquire) {
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                })();
+                failed.store(result.is_err(), Ordering::Release);
+                result
+            })?;
+        let result = run_captured(command, false, true, Some(&failed));
+        finished.store(true, Ordering::Release);
+        transfer
+            .join()
+            .map_err(|_| anyhow::anyhow!("native output writer panicked"))??;
+        result
+    })
 }
 fn run_captured(
     mut command: Command,
     capture_stdout: bool,
     capture_stderr: bool,
+    failed_output: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<std::process::Output> {
     use std::{
         io::{Read, Seek},
@@ -329,6 +376,10 @@ fn run_captured(
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.into()),
             Ok(None) => {}
+        }
+        if failed_output.is_some_and(|failed| failed.load(std::sync::atomic::Ordering::Acquire)) {
+            break stop_request_operation(&mut child)
+                .and(Err(anyhow::anyhow!("native Git output staging failed")));
         }
         if let Some(signal) = cancelled_signal() {
             unsafe {
@@ -635,6 +686,35 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::Child;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_output_writer_error_stops_the_owned_operation() {
+        struct Failed;
+        impl std::io::Write for Failed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture output failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("not-stopped");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf payload; sleep 3; printf late > \"$1\"",
+                "fixture",
+            ])
+            .arg(&marker);
+        let error = run_to_writer(command, Failed).unwrap_err();
+        assert!(error.to_string().contains("fixture output failure"));
+        assert!(
+            !marker.exists(),
+            "native operation continued after output failed"
+        );
+    }
 
     struct Requester(Child);
     impl Requester {

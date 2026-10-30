@@ -129,6 +129,10 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
     assert metrics['remote_raw_blob_imports']==count and metrics['remote_raw_blob_bytes']==count*size,metrics
     assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen/eviction'
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
+    if backend:
+        operations=2+(count+255)//256 if backend=='materialized' else count+2
+        assert metrics['remote_fetch_operations']==operations,metrics
+        assert metrics['remote_decode_operations']==operations,metrics
     if backend=='fuse':assert result['fuse_requests'].get('read',0)>0,'real FUSE dispatch missing'
     if backend=='materialized':assert not result['fuse_requests'],'materialization did not bypass FUSE'
 

@@ -135,6 +135,7 @@ pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
 }
 fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
     let children = snapshot.children(relative)?;
+    snapshot.prepare_materialization(&children)?;
     let mut expected = Vec::new();
     for (name, _) in children {
         if let Some(signal) = crate::git::cancelled_signal() {

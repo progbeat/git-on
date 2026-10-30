@@ -63,6 +63,41 @@ class MaterializedTests(unittest.TestCase):
             self.assertIn(b'FUSE unavailable', result.stderr)
             self.clean()
 
+    def test_small_files_respect_individual_fsize_limits_without_aggregate_ceiling(self):
+        import hashlib
+        import resource
+        limit=65536
+        def limits():
+            signal.signal(signal.SIGXFSZ,signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+            resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
+        for index in range(80):
+            # Compressible but distinct objects keep both the ordinary local
+            # clone and native file:// pack below the same per-file limit.
+            (self.repo/f'f{index:05d}').write_bytes(hashlib.sha256(str(index).encode()).digest()+b'\0'*(8192-32))
+        self.git('add','.');self.git('commit','-qm','small-file FSIZE regression')
+        self.before=self.git('status','--porcelain')
+        self.git('config','uploadpack.allowFilter','true')
+        self.git('config','uploadpack.allowAnySHA1InWant','true')
+        code="""
+import hashlib,os
+from pathlib import Path
+assert not any(p.name.startswith('raw-parts-') for p in Path('.').iterdir())
+for _ in range(2):
+ for index in range(80):
+  expected=hashlib.sha256(str(index).encode()).digest()+b'\\0'*(8192-32)
+  assert Path(f'f{index:05d}').read_bytes()==expected
+"""
+        for label,source,operands in [('local',str(self.repo),['HEAD']),('remote','file://'+str(self.repo),['file://'+str(self.repo),'HEAD'])]:
+            with self.subTest(source=label):
+                clone=self.root/f'clone-{label}'
+                result=subprocess.run(['git','clone','--quiet',source,str(clone)],env=self.env,preexec_fn=limits,capture_output=True,timeout=20)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(len(list(clone.glob('f*'))),80)
+                result=subprocess.run([str(BINARY),*operands,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.clean()
+
     def test_bytes_links_modes_argv_identity_freshness_and_source_isolation(self):
         for _ in range(2):
             result = self.invoke("""

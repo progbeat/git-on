@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, Write},
@@ -131,6 +132,8 @@ pub struct Remote {
     source: OsString,
     https_alternative: Option<String>,
     completed_fetches: u64,
+    fetch_operations: u64,
+    decode_operations: u64,
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
@@ -211,6 +214,8 @@ impl Remote {
             source: source.to_os_string(),
             https_alternative: github_https_alternative(&text),
             completed_fetches: 0,
+            fetch_operations: 0,
+            decode_operations: 0,
             socket,
             socket_owner: None,
             ssh,
@@ -354,6 +359,7 @@ impl Remote {
             bail!("native Git fetch did not supply selected object {oid}");
         }
         self.completed_fetches += 1;
+        self.fetch_operations += 1;
         Ok(oid)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
@@ -365,8 +371,31 @@ impl Remote {
             if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
                 return Ok(());
             }
-            self.fetch(repo, oid)
+            self.fetch(repo, &[oid])
         })();
+        self.record_result(outcome)
+    }
+    /// Only eager materialization calls this: every supplied object is already
+    /// needed for the directory being prepared. Lazy filesystem access retains
+    /// its exact one-demand behavior.
+    pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
+        let outcome = (|| {
+            let odb = repo.odb()?;
+            let mut unique = HashSet::new();
+            let mut missing = Vec::new();
+            for oid in oids {
+                if unique.insert(*oid) && self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+                    missing.push(*oid);
+                }
+            }
+            if missing.is_empty() {
+                return Ok(());
+            }
+            self.fetch(repo, &missing)
+        })();
+        self.record_result(outcome)
+    }
+    fn record_result(&mut self, outcome: Result<()>) -> Result<()> {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
@@ -377,20 +406,33 @@ impl Remote {
         }
         outcome
     }
-    fn fetch(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
+    fn fetch(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         let mut command = self.command(false)?;
-        command
-            .args([
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--depth=1",
-                "--filter=tree:0",
-            ])
-            .arg("--")
-            .arg(&self.source)
-            .arg(oid.to_string())
-            .stdin(Stdio::null());
+        command.args([
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--depth=1",
+            "--filter=tree:0",
+        ]);
+        if oids.len() == 1 {
+            command
+                .arg("--")
+                .arg(&self.source)
+                .arg(oids[0].to_string())
+                .stdin(Stdio::null());
+        } else {
+            let mut requests = tempfile::tempfile_in(&self.dir)?;
+            for oid in oids {
+                writeln!(requests, "{oid}")?;
+            }
+            requests.rewind()?;
+            command
+                .arg("--stdin")
+                .arg("--")
+                .arg(&self.source)
+                .stdin(Stdio::from(requests));
+        }
         let out = match crate::git::run(command, true) {
             Ok(out) => out,
             Err(error) => {
@@ -412,7 +454,12 @@ impl Remote {
         };
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
-            bail!("remote fetch of exact object {oid} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}{}", error.trim(), authentication_advice(&error, self.https_alternative.as_deref()));
+            let selected = if oids.len() == 1 {
+                format!("object {}", oids[0])
+            } else {
+                format!("objects ({} requests, first {})", oids.len(), oids[0])
+            };
+            bail!("remote fetch of exact {selected} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}{}", error.trim(), authentication_advice(&error, self.https_alternative.as_deref()));
         }
         if error.contains("filtering not recognized") || error.contains("filter capability") {
             bail!(
@@ -420,10 +467,14 @@ impl Remote {
             );
         }
         self.import_received()?;
-        if self.raw_blobs.get(oid)?.is_none() && !repo.odb()?.exists(oid) {
-            bail!("filtered remote fetch did not supply requested object {oid}");
+        let odb = repo.odb()?;
+        for oid in oids {
+            if self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+                bail!("filtered remote fetch did not supply requested object {oid}");
+            }
         }
-        self.completed_fetches += 1;
+        self.completed_fetches += oids.len() as u64;
+        self.fetch_operations += 1;
         Ok(())
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack
@@ -495,7 +546,7 @@ impl Remote {
             return Ok(());
         }
         requests.rewind()?;
-        let (output_file, start) = self.raw_blobs.append_output()?;
+        let (mut output_file, start) = self.raw_blobs.append_output()?;
         let mut command = self.git.command(Some(&self.dir));
         command
             .env("GIT_OBJECT_DIRECTORY", staging.path().join("objects"))
@@ -507,9 +558,8 @@ impl Remote {
                 "--buffer",
             ])
             .stdin(Stdio::from(requests));
-        let output = crate::git::run_to_file(command, &output_file)
+        let output = crate::git::run_to_writer(command, &mut output_file)
             .context("decode received objects into run-local raw storage")?;
-        drop(output_file);
         if !output.status.success() {
             bail!(
                 "cannot decode received Git objects: {}",
@@ -517,6 +567,7 @@ impl Remote {
             );
         }
         self.import_raw_output(start, &destination)?;
+        self.decode_operations += 1;
         Ok(())
     }
     fn import_raw_output(&mut self, start: u64, destination: &Repository) -> Result<()> {
@@ -616,6 +667,12 @@ impl Remote {
     }
     pub(crate) fn completed_fetches(&self) -> u64 {
         self.completed_fetches
+    }
+    pub(crate) fn fetch_operations(&self) -> u64 {
+        self.fetch_operations
+    }
+    pub(crate) fn decode_operations(&self) -> u64 {
+        self.decode_operations
     }
 }
 impl Drop for Remote {
