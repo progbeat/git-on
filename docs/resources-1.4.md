@@ -184,6 +184,36 @@ checks and the reduced-FSIZE local/remote regression cover the result. Native
 operation counters and independent process tracing remain distinct from
 object-demand counts.
 
+Three paired local production-CLI trials on the final pipe/part candidate used
+160 distinct 8 KiB blobs and two closed read/stat passes. fca7786 total times
+were 6.138/4.492/4.429s, versus 0.599/0.463/0.506s: medians 4.492s and 0.506s
+(8.88x). Waited user+system CPU medians were 4.634s and 0.779s (5.95x). Full
+clone + identical command + cleanup baselines were 0.903/0.411/0.292s, median
+0.411s. Host/page-cache variability is explicit; neither the earlier direct-file
+prototype nor its more favorable timings is substituted for this final pipe
+path. This materially improves eager preparation but is not #20 acceptance or
+a new allowed slowdown. The lazy per-object native-process path remains.
+
+The separate 32-blob trace observes three fetches, three native decoders and
+zero unpack operations. Native output is now IPC; the Rust staging worker writes
+the raw parts. All descendant file I/O is retained: 273,396 raw-part write bytes,
+268,103 index-pack bytes, 971 native metadata bytes, 295,145 other runner/backing
+write bytes, 921 fetch-file bytes and 1,530 upload-pack-file bytes. IPC bytes are
+not mislabeled as disk writes or added to application N. CI compares native
+operation counters to the actual trace and requires the staging disk writes.
+
+A bounded metadata diagnostic confirms the next unresolved cost independently
+of those payload improvements. Ten different stat lookups in a 1k-entry directory
+parse its tree once (55,016 cached bytes). The same ten lookups in a 100k-entry
+directory parse the tree ten times and retain zero tree-cache bytes because its
+decoded metadata exceeds the 4 MiB budget. Individual debug-loader observations
+were 75–118ms each for the wide directory. This is not a complete invocation or
+baseline benchmark: it reproduces the repeated full-directory decode/sort path,
+which costs O(Q * R log R) for Q lookups in an oversized R-entry directory. It
+must be replaced with invocation-local prepared metadata lookup before #20 can
+be claimed. Diagnostic source/results are retained at
+`/tmp/git-on-140-tree-redecode.py` and `/tmp/git-on-140-tree-redecode.jsonl`.
+
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and
 JSONL artifacts are the final acceptance evidence; results from earlier heads
