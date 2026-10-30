@@ -2,7 +2,7 @@
 //! backend currently requires decoded objects (including necessary delta bases).
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid};
-use sha1::{Digest, Sha1};
+use sha1_checked::{Digest, Sha1};
 use std::io::{Read, Write};
 
 #[derive(Debug)]
@@ -22,6 +22,18 @@ pub(crate) fn check_transfer() -> Result<()> {
         bail!("object transfer stopped after command completion");
     }
     crate::git::check_request_interruption()
+}
+
+pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {
+    let result = hash.try_finalize();
+    if result.has_collision() {
+        return Err(InvalidObject("Git SHA-1 collision attack detected".into()).into());
+    }
+    Ok(result
+        .hash()
+        .as_slice()
+        .try_into()
+        .expect("SHA-1 output size"))
 }
 
 /// The destination is staging storage: callers must not expose it until this
@@ -57,7 +69,7 @@ pub(crate) fn copy_verified(
     if input.read(&mut buffer[..1])? != 0 {
         return Err(InvalidObject(format!("oversized Git object {oid}")).into());
     }
-    if hash.finalize().as_slice() != oid.as_bytes() {
+    if finish_sha1(hash)?.as_slice() != oid.as_bytes() {
         return Err(InvalidObject(format!("Git object hash mismatch for {oid}")).into());
     }
     Ok(())
@@ -157,5 +169,16 @@ mod tests {
             copy_verified(Broken, std::io::sink(), ObjectType::Blob, bytes.len(), id).unwrap_err();
         assert!(!error.is::<InvalidObject>());
         assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::*;
+    #[test]
+    fn known_collision_vector_is_rejected_before_trusting_its_digest() {
+        let mut hash = Sha1::new();
+        hash.update(include_bytes!("../tests/fixtures/security/sha-mbles-1.bin"));
+        assert!(finish_sha1(hash).is_err());
     }
 }

@@ -692,13 +692,60 @@ pub(crate) fn check_request_interruption() -> Result<()> {
     Ok(())
 }
 pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
-    error.is::<RequestInterrupted>()
+    request_signal(error).is_some()
+}
+fn request_signal(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<RequestInterrupted>()
+        .map(|marker| marker.0)
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .and_then(|inner| inner.downcast_ref::<RequestInterrupted>())
+                    .map(|marker| marker.0)
+            })
+        })
+}
+/// Preserve the typed requester marker across Read/Write boundaries. Boxing an
+/// anyhow error directly hides its concrete type from std::io's error payload.
+pub(crate) fn transfer_io_error(error: anyhow::Error) -> std::io::Error {
+    match request_signal(&error) {
+        Some(signal) => std::io::Error::other(RequestInterrupted(signal)),
+        None => std::io::Error::other(error),
+    }
+}
+
+#[cfg(test)]
+mod request_error_tests {
+    use super::*;
+    #[test]
+    fn requester_marker_inside_io_is_still_an_interruption() {
+        let error = std::io::Error::other(RequestInterrupted(libc::SIGTERM));
+        let error = anyhow::Error::new(error).context("read demand packet header");
+        assert!(is_request_interruption(&error));
+        let error = transfer_io_error(
+            anyhow::Error::new(RequestInterrupted(libc::SIGTERM)).context("transfer"),
+        );
+        assert!(is_request_interruption(
+            &anyhow::Error::new(error).context("read")
+        ));
+        let first = transfer_io_error(RequestInterrupted(libc::SIGTERM).into());
+        let second = transfer_io_error(anyhow::Error::new(first).context("first reader"));
+        assert!(is_request_interruption(
+            &anyhow::Error::new(second).context("second reader")
+        ));
+        assert!(!is_request_interruption(&anyhow::anyhow!(
+            "filesystem requester interrupted by signal 15"
+        )));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::process::Child;
     use std::time::{Duration, Instant};
 
@@ -855,6 +902,40 @@ mod tests {
         check_request_interruption().unwrap();
     }
 
+    #[test]
+    fn pending_request_signal_preserves_type_through_session_packet_reads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let capability = temporary.path().join("capabilities");
+        let mut bytes = Vec::new();
+        for value in [b"version 2\n".as_slice(), b"fetch=shallow filter\n"] {
+            write!(&mut bytes, "{:04x}", value.len() + 4).unwrap();
+            bytes.extend(value);
+        }
+        bytes.extend(b"0000");
+        std::fs::write(&capability, bytes).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat \"$1\"; exec sleep 300", "request-test"])
+            .arg(&capability);
+        let mut session = crate::transport::Session::connect(command, false)
+            .unwrap()
+            .unwrap();
+        let requester = Requester::stopped("caught");
+        let _request = RequestGuard::enter(requester.0.id());
+        let file = crate::spool::Files::new(temporary.path())
+            .unwrap()
+            .file(temporary.path())
+            .unwrap();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                requester.signal(libc::SIGTERM);
+            });
+            session.fetch(git2::Oid::zero(), &file).unwrap_err()
+        });
+        assert!(is_request_interruption(&error), "{error:#}");
+        session.stop().unwrap();
+    }
     #[test]
     fn pending_request_signal_stops_only_its_owned_operation() {
         let requester = Requester::stopped("caught");

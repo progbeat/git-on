@@ -583,15 +583,8 @@ impl Remote {
                 command.arg("-p").arg(OsStr::from_bytes(port));
             }
             command.arg(OsStr::from_bytes(host));
-            let mut remote = b"git-upload-pack '".to_vec();
-            for byte in path {
-                if *byte == b'\'' {
-                    remote.extend_from_slice(b"'\\''");
-                } else {
-                    remote.push(*byte);
-                }
-            }
-            remote.push(b'\'');
+            let mut remote = b"git-upload-pack ".to_vec();
+            remote.extend_from_slice(&gix_quote::single(path.into()));
             command.arg(OsString::from_vec(remote));
             command
         };
@@ -621,8 +614,8 @@ impl Remote {
     }
     fn fetch_in_session(&mut self, repo: &Repository, oid: Oid) -> Result<bool> {
         if !self.session_checked {
-            self.session_checked = true;
             self.session = self.start_session()?;
+            self.session_checked = true;
         }
         let Some(session) = self.session.as_mut() else {
             return Ok(false);
@@ -689,22 +682,36 @@ impl Remote {
             // through the existing decoder; never repeat the network request.
             let target = Repository::open_bare(&self.dir)?;
             let odb = target.odb()?;
+            let mut transfer_failure = None;
             let mut writer = odb.packwriter()?;
-            writer.progress(|_| crate::object::check_transfer().is_ok());
-            let mut offset = 0;
-            let mut bytes = [0; 65536];
-            let size = pack.len()?;
-            while offset < size {
-                crate::object::check_transfer()?;
-                let count = (size - offset).min(bytes.len() as u64) as usize;
-                pack.read_exact_at(&mut bytes[..count], offset)?;
-                writer.write_all(&bytes[..count])?;
-                offset += count as u64;
-            }
-            writer.commit()?;
+            writer.progress(|_| match crate::object::check_transfer() {
+                Ok(()) => true,
+                Err(error) => {
+                    transfer_failure = Some(error);
+                    false
+                }
+            });
+            let indexed = (|| -> Result<()> {
+                let mut offset = 0;
+                let mut bytes = [0; 65536];
+                let size = pack.len()?;
+                while offset < size {
+                    crate::object::check_transfer()?;
+                    let count = (size - offset).min(bytes.len() as u64) as usize;
+                    pack.read_exact_at(&mut bytes[..count], offset)?;
+                    writer.write_all(&bytes[..count])?;
+                    offset += count as u64;
+                }
+                writer.commit()?;
+                Ok(())
+            })();
             drop(writer);
             drop(odb);
             drop(target);
+            if let Some(error) = transfer_failure {
+                return Err(error);
+            }
+            indexed?;
             self.import_received()?;
         }
         anyhow::ensure!(
@@ -1403,6 +1410,81 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_request_interruption_does_not_poison_later_demands() {
+        struct Requester(std::process::Child);
+        impl Drop for Requester {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temporary.path().join("server")).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowFilter", true)
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowAnySHA1InWant", true)
+            .unwrap();
+        let first = repo.blob(b"first").unwrap();
+        let later = repo.blob(b"later").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("first", first, 0o100644).unwrap();
+        tree.insert("later", later, 0o100644).unwrap();
+        let tree = tree.write().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "request",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let run = tempfile::tempdir_in(temporary.path()).unwrap();
+        let source = format!("file://{}", repo.path().display());
+        let (mut remote, _) = Remote::open(
+            temporary.path(),
+            OsStr::new(&source),
+            OsStr::new("HEAD"),
+            run.path(),
+        )
+        .unwrap();
+        remote.ensure(tree).unwrap();
+        assert!(remote.session.is_some());
+        let requester = Requester(
+            Command::new("sh")
+                .args(["-c", "trap ':' TERM; kill -STOP $$; exec sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+        let pid = requester.0.id();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            if status.lines().any(|line| line.starts_with("State:\tT")) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let guard = crate::git::RequestGuard::enter(pid);
+        let error = remote.ensure(first).unwrap_err();
+        assert!(crate::git::is_request_interruption(&error), "{error:#}");
+        assert!(remote.failure().is_none());
+        drop(guard);
+        remote.ensure(later).unwrap();
+        assert!(remote.failure().is_none());
+        remote.stop_transport().unwrap();
+    }
+
     #[test]
     fn mux_shutdown_rejects_invalid_greetings_before_termination() {
         for greeting in [

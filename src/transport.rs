@@ -3,7 +3,7 @@
 use crate::spool::Spool;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
-use sha1::{Digest, Sha1};
+use sha1_checked::{Digest, Sha1};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
@@ -22,7 +22,7 @@ struct Input(UnixStream);
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(io::Error::other)?;
+            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
@@ -41,7 +41,7 @@ struct Output(UnixStream);
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(io::Error::other)?;
+            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLOUT,
@@ -322,7 +322,7 @@ impl<'a> PackWriter<'a> {
     fn finish(mut self) -> Result<()> {
         self.output.flush()?;
         ensure!(
-            self.tail.len() == 20 && self.hash.finalize().as_slice() == self.tail,
+            self.tail.len() == 20 && crate::object::finish_sha1(self.hash)?.as_slice() == self.tail,
             "received pack checksum mismatch"
         );
         Ok(())
@@ -423,7 +423,7 @@ impl Read for ObjectReader<'_> {
             return Ok(0);
         }
         loop {
-            crate::object::check_transfer().map_err(io::Error::other)?;
+            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
             if self.from == self.to && self.position < self.end {
                 let count = (self.end - self.position).min(self.input.len() as u64) as usize;
                 self.file

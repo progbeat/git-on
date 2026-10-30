@@ -20,6 +20,19 @@ tail bound; completed-request diagnostics are discarded between transactions.
 This bounds diagnostic retention without imposing an object or repository cap.
 Evidence is retained under `/workspace/git-on-evidence/transport-5dd38f9/`.
 
+Independent review of `d8a1015` reproduced a P1: putting RequestInterrupted into
+an opaque anyhow-backed io::Error lost its type, returned EIO instead of EINTR
+and permanently latched the remote failure. The authentic base allowed a later
+demand; the candidate rejected it. Permanent typed-I/O and complete Remote caller
+regressions failed before the fix. Transfer I/O now carries a typed marker and
+classification examines its io payload, without matching remote error text.
+
+The direct path also requires native Git's collision-detection class of defense
+when it bypasses index-pack. Plain SHA-1 accepted a public SHA-mbles vector in
+the digest regression; checked incremental finalization rejects it. Pack and
+canonical object hashes both use the checked implementation before publication.
+This retains the Git format; it does not claim SHA-1 is collision resistant.
+
 ## Prepared tree mode parsing
 
 Independent review of `029872d` found that the new streaming tree parser accepted

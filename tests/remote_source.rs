@@ -233,8 +233,14 @@ fn eager_remote_batches_are_bounded_and_reuse_objects_across_batch_boundaries() 
     }
     let metrics = snapshot.metrics();
     assert_eq!(metrics.remote_fetches, 303);
-    assert_eq!(metrics.remote_fetch_operations, 4);
-    assert_eq!(metrics.remote_decode_operations, 4);
+    assert_eq!(
+        metrics.remote_fetch_operations + metrics.remote_session_fetch_operations,
+        4
+    );
+    assert_eq!(
+        metrics.remote_decode_operations + metrics.remote_session_decode_operations,
+        4
+    );
     assert_eq!(metrics.blob_loads, 301);
     assert_eq!(
         std::fs::read(destination.join("a-shared")).unwrap(),
@@ -294,6 +300,14 @@ fn refused_filter_and_unsigned_objects_fail_before_execution() {
 #[test]
 fn review_run_odb_fetch_failure_is_latched() {
     let (temporary, _, _, _) = fixture();
+    // Explicit fsck selects the native compatibility path whose pack-directory
+    // failure this regression exercises. Session storage has its own control.
+    Repository::init(temporary.path())
+        .unwrap()
+        .config()
+        .unwrap()
+        .set_bool("fetch.fsckObjects", false)
+        .unwrap();
     let snapshot = load(temporary.path(), "HEAD", false).unwrap();
     // Break the private pack destination before a lazy subtree demand. The
     // native fetch must fail, and an application catching EIO cannot turn the
@@ -309,4 +323,40 @@ fn review_run_odb_fetch_failure_is_latched() {
     std::fs::create_dir(&packs).unwrap();
     assert!(snapshot.entry(Path::new("deep/value")).is_err());
     assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
+}
+
+#[test]
+fn session_staging_failure_is_latched_after_the_storage_is_repaired() {
+    let (temporary, _, _, _) = fixture();
+    let snapshot = load(temporary.path(), "HEAD", false).unwrap();
+    snapshot.children(Path::new("")).unwrap();
+    let parts = std::fs::read_dir(snapshot.git_dir.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("raw-parts-")
+        })
+        .unwrap();
+    let mut substituted = Vec::new();
+    for id in 0..256 {
+        let path = parts.join(format!("{id:x}-0"));
+        if !path.exists() {
+            std::os::unix::fs::symlink(temporary.path().join("foreign-target"), &path).unwrap();
+            substituted.push(path);
+        }
+    }
+    let error = snapshot.entry(Path::new("deep/value"));
+    for path in substituted {
+        let _ = std::fs::remove_file(path);
+    }
+    assert!(error.is_err());
+    let failure = snapshot
+        .remote_failure()
+        .expect("session staging failure was not latched");
+    assert!(snapshot.entry(Path::new("deep/value")).is_err());
+    assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
+    assert!(!temporary.path().join("foreign-target").exists());
 }

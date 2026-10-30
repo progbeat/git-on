@@ -124,7 +124,7 @@ impl Read for VerifiedReader {
         let data = self
             .blob
             .read(self.position, bytes.len().min(64 * 1024) as u32)
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::git::transfer_io_error)?;
         bytes[..data.len()].copy_from_slice(&data);
         self.position += data.len() as u64;
         Ok(data.len())
