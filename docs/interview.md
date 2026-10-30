@@ -47,8 +47,6 @@ same user.
 when running a command through Git-on compared with running the same command
 from an ordinary local copy of the repository?
 
-*You can answer qualitatively, without specific numbers.*
-
 **Answer:** Overhead should be minimized. File reads should be lazy, so that
 running a script from a large monorepo can happen almost instantly without
 materializing the whole repository before execution.
@@ -58,6 +56,8 @@ and written to the cache as streams rather than loaded entirely into RAM.
 
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
+
+Under equivalent conditions, the total time of a Git-on invocation must not exceed the time required to materialize the same complete revision using git clone or git checkout and run the same command directly from disk, plus O(N). N is the total volume of data read or written by the command, including metadata API results such as stat, measured in a fixed interface representation. This bound includes all internal work and subprocesses.
 
 **Question:** What scale of repositories should Git-on be designed to handle?
 
