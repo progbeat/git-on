@@ -89,39 +89,3 @@ working take priority?
 
 **Answer:** Changes to Git-on should follow standard semantic versioning and
 deprecation practices so that users know what to expect.
-
-**Question:** How should the total overhead of running a command through Git-on
-compare with materializing the revision and running the same command directly?
-
-**Answer:** Compare one complete Git-on invocation with materializing the same
-complete selected revision using git clone or git checkout, then executing the
-identical command directly from disk. Use comparable source, transport, initial
-object/OS-cache state, host and filesystem conditions. The required bound is:
-
-T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
-
-T_git_on includes the whole invocation: setup, lazy fetching, all child processes,
-decoding, OID/signature verification, all metadata operations and traversals,
-internal reads/copies/writes, unmount and cleanup. No service operation or native
-Git subprocess is excluded. The baseline includes the corresponding complete
-materialization and the same command, with cleanup accounted for explicitly and
-consistently on both sides.
-
-N is the command's transferred read/write payload bytes plus the byte volume
-of its metadata API results, including stat, in a fixed command-facing interface
-representation. The representation must be stated before comparison and kept
-the same across both sides on that platform, without artificial padding or
-counting the same interface bytes twice. It is not Python/Rust heap size,
-Git pack size, internal FUSE traffic, cache/index bytes or redundant internal
-passes. A stat result is counted once at the command interface, not again for
-each internal lookup needed to produce it.
-
-One-time required preparation may happen lazily within the full-revision
-materialization budget. Immutable data already obtained/prepared during the
-invocation must not be fetched or unpacked again, including after close/reopen
-or decoded-memory-cache eviction. Keep only invocation-local temporary storage;
-do not use a global cache.
-
-Big-O bounds the additional complete cost, not the absolute time without
-materialization, and does not justify a large constant overhead. Actual overhead
-must also be minimized. No numerical performance allowance has been agreed.
