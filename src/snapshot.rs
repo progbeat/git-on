@@ -324,6 +324,11 @@ impl BlobReader {
             BlobData::Stored(blob) => blob.read(offset, size),
         }
     }
+    pub(crate) fn len(&self) -> u64 {
+        match &self.0.data {
+            BlobData::Memory { raw, .. } | BlobData::Stored(raw) => raw.len(),
+        }
+    }
 }
 
 /// A byte- and entry-bounded LRU. Values exceeding the budget are never retained.

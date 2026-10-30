@@ -168,6 +168,11 @@ jobs:
         run: |
           python3 tests/import_profile.py --binary target/release/git-on --backend fuse --sizes 160 --output import-profile-fuse.jsonl
           python3 tests/import_profile.py --binary target/release/git-on --backend materialized --sizes 32 --trace --output import-profile-materialized.jsonl
+      - name: Wide-tree preparation and repeated metadata with full disk baseline
+        if: needs.changes.outputs.resources == 'true'
+        run: |
+          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-profile-local.jsonl
+          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-profile-remote.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.changes.outputs.resources == 'true'
         with:
@@ -176,6 +181,8 @@ jobs:
             io-profile.jsonl
             import-profile-fuse.jsonl
             import-profile-materialized.jsonl
+            metadata-profile-local.jsonl
+            metadata-profile-remote.jsonl
           if-no-files-found: error
 
       - name: Real-FUSE generated-file passthrough fallback

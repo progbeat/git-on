@@ -335,6 +335,47 @@ payload demands in a full traversal.
 
 ## Pre-merge repository-scale coverage
 
+### Invocation-local directory preparation increment
+
+The former bounded tree cache re-decoded an oversized 100k-name tree for each
+lookup, and decoded evicted small trees again. `oversized_directory_metadata_is_prepared_once_for_repeated_lookups`
+and `metadata_eviction_keeps_prepared_directory_entries_available` reproduced
+21 versus 1 and 4 versus 2 source-tree loads respectively before the increment.
+Prepared raw trees and sealed name tables now survive memory eviction. A name
+lookup uses a bounded memory map or expected O(1) disk probes plus name bytes;
+enumeration still costs the entries returned. Directory-handle/frontend memory
+and unrelated namespace operations are not covered by that narrow bound.
+
+The permanent `tests/metadata_profile.py` measures optimized CLI preparation,
+two closed stat/read passes and cleanup against a complete native clone plus
+the identical child and cleanup. Its wide tree shares one one-byte blob across
+1k/100k names: three reachable Git objects, explicitly **not** a distinct-object
+or full-payload traversal fixture. The separate import profile retains that
+dimension. N counts each command read and a fixed native stat ABI result; all
+descendant CPU remains included in total costs. Real FUSE execution requires
+an actual device. Source-cache state is declared warm/uncontrolled rather than
+called cold. Final per-head CI records are required; this increment alone does
+not establish the complete issue #20 acceptance contract.
+
+An initial local release diagnostic at `9a1d9e7`, before eliminating redundant
+materializer lookups, measured one invocation per size on the same generated
+source/filesystem. Total materialization, identical command and cleanup were:
+
+| Flat names | Native full baseline | Git-on explicit-all | Git-on waited CPU |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 0.152 s | 0.071 s | 0.071 s |
+| 10,000 | 0.473 s | 0.311 s | 0.310 s |
+| 100,000 | 5.325 s | 3.944 s | 3.920 s |
+
+Each command performed 1,000 stat/read/close operations per pass. An independent
+loader diagnostic on the 100k tree took 1.090 s for startup, ten stat lookups and
+cleanup, with one decode and 100k prepared entries. The first preparation cost
+is included; warmed lookups alone are not the benchmark. These single trials
+have source/OS cache and ordering noise and provide no general performance SLA.
+Evidence and scripts are retained outside /tmp in
+`/workspace/git-on-evidence/metadata-029872d/`. The existing lazy remote FUSE gap,
+including per-object native process startup, remains unresolved by these numbers.
+
 The historical `2062eb8` acceptance run completed 378 invocations, including
 42 full million-leaf reads across fourteen physical scale jobs and two enabled
 passthrough groups. Its full-tree fixture reused nine Git objects and one shared
