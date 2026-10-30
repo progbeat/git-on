@@ -66,6 +66,14 @@ pub struct Overlay {
 }
 
 impl Overlay {
+    pub(crate) fn protected_source(&self, ino: u64) -> bool {
+        self.write_policy != WritePolicy::All
+            && self
+                .nodes
+                .get(&ino)
+                .is_some_and(|node| node.immutable && node.snapshot_path.is_some())
+    }
+
     pub fn new(snapshot: Snapshot, backing: PathBuf) -> Result<Self> {
         Self::with_write_policy(snapshot, backing, WritePolicy::Ignored)
     }

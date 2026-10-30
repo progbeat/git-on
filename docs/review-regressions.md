@@ -2012,3 +2012,26 @@ regular file or dangling symlink in both traversal modes, including before a
 generated-write command. A positive case still creates and verifies `out/generated`
 after the full namespace walk. Runtime code and stress sizes are unchanged.
 Focused evidence is `/tmp/git-on-namespace-copilot-{red,green}.log`.
+
+## Required 1.4.0 performance work: first kernel-cache increment
+
+The owner rejected the measured 22–27x full-read overhead and kept #20 within
+1.4.0. Resource-limit passes do not satisfy this acceptance requirement. The
+strict application-byte complexity boundary also needs explicit treatment of
+metadata-only work and first verification of demanded Git objects; no interview
+answer is invented while clarification is pending.
+
+`protocol_kernel_cache_only_retains_protected_source` failed against c42ebf1
+because the protected entry TTL was zero. It now passes for none/ignored/untracked
+and confirms that generated entries and all-mode entries remain uncached.
+Directory attributes remain uncached; readonly protected source uses KEEP_CACHE
+and NOFLUSH. All 20 protocol tests pass. Logs are
+`/tmp/git-on-140-kernel-cache-{red,green}.log`. This is a wire-contract result,
+not proof of a real-kernel speedup or completion of #20.
+
+The bounded real-FUSE I/O diagnostic compares the same instrumented executable
+with the previous uncached-source policy and the new policy. Both walks check
+complete names and bytes. An identical direct-disk command is measured, and a
+separate descendant-following trace counts FUSE opcodes and actual file-write
+syscalls. The trace parser has positive pipe/file, resumed-request and repeated
+child-workload regressions. Traced timing is deliberately not used as throughput.

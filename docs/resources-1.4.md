@@ -1,5 +1,39 @@
 # Resource acceptance for milestone 1.4.0
 
+## Performance acceptance remains in progress
+
+Issue #20 remains mandatory for 1.4.0. The c42ebf1 run's 100k local/remote
+FUSE full-read child times (22.927s/37.700s versus 1.052s/1.397s directly from
+disk) do not establish acceptable overhead. Passing resource limits and a
+linear pack-metadata gate does not establish this requirement either. No
+numerical allowance is inferred from the interview.
+
+A bounded 32/128-unique-object profile included native Git descendants. For
+128 seeded 8 KiB blobs it observed 130 unpack processes, 1,208,006 bytes of
+pack/index file writes followed by 1,054,489 bytes of loose-object writes and
+390 object-file sync calls. These are logical syscall bytes, not assumed SSD
+write volume. Untraced total time was 4.755s, with 2.973s waited user+system CPU;
+the debug probe also serializes its results, so this is attribution evidence,
+not production CLI throughput. Traced timings include substantial observer cost.
+
+The initial independent kernel-cache change gives positive lookup/data cache
+lifetimes only to policy-protected pinned source. Directory attributes remain
+uncached because generated children change timestamps/link counts. Mutable
+entries and `all` keep the previous behavior. The wire regression checks these
+boundaries. `tests/io_profile.py` uses real FUSE to compare two complete 1k walks
+with that policy enabled/disabled in the same instrumented executable, plus the
+identical command directly from disk. It captures all descendant processes,
+logical file writes/syncs and kernel request opcodes; only untraced timings are
+benchmark observations. The private comparison knob exists only in test-metrics
+builds. This initial change is not claimed to complete #20.
+
+The raw-object path still needs redesign to avoid unnecessary recompression and
+repeated intermediate writes, retaining verified bytes only within one run.
+Strict application-byte O(N) also needs a stated boundary for metadata/setup and
+the necessary full verification of a newly demanded Git object before its first
+small range. The interview is not rewritten or given an invented answer while
+that clarification is pending.
+
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and
 JSONL artifacts are the final acceptance evidence; results from earlier heads
@@ -175,4 +209,4 @@ validates the conservative change plan, all base jobs and actual artifacts for
 every required scale/stress/lazy/resource case. Required skipped or missing
 coverage fails the gate. A manual exhaustive matrix is available before release;
 no important case is intentionally deferred until after merge. Final readiness still requires exact-head CI,
-a fresh independent review and final Copilot review.
+a fresh independent review. The owner cancelled further Copilot reviews.

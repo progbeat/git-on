@@ -270,6 +270,46 @@ fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
 }
 
 #[test]
+fn protocol_kernel_cache_only_retains_protected_source() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let mut p = Peer::with_policy(policy);
+        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+        let ino = num(&entry, 0);
+        let protected = policy != WritePolicy::All;
+        assert_eq!(num(&entry, 16) != 0, protected, "entry TTL: {policy:?}");
+        assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
+        let attributes = p.ok(3, ino, vec![0; 16]);
+        assert_eq!(num(&attributes, 0) != 0, protected);
+        // Source directories can contain generated children; their mutable
+        // timestamps/link counts must still be obtained from the daemon.
+        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0), 0);
+        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+        let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+        assert_eq!(
+            flags & ((1 << 1) | (1 << 5)),
+            if protected { (1 << 1) | (1 << 5) } else { 0 }
+        );
+        p.release(ino, num(&opened, 0));
+        if policy != WritePolicy::None {
+            let (generated, handle) = p.create("generated.tmp");
+            let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
+            assert_eq!(num(&entry, 16), 0);
+            assert_eq!(num(&entry, 24), 0);
+            let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
+            let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+            assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
+            p.release(generated, num(&opened, 0));
+            p.release(generated, handle);
+        }
+    }
+}
+
+#[test]
 fn protocol_lifecycle_lookup_forget_and_batch_forget() {
     let mut p = Peer::new();
     let ino = p.lookup(1, "tracked");

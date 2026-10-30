@@ -20,11 +20,16 @@ use std::{
     time::{Duration, SystemTime},
 };
 const TTL: Duration = Duration::ZERO;
+// Only pinned, policy-protected names/data may outlive a kernel request. Mutable
+// entries and directory attributes retain their existing uncached behavior.
+const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct Fuse {
     state: Mutex<State>,
 }
 struct State {
     core: Overlay,
+    #[cfg(feature = "test-metrics")]
+    profile_uncached_source: bool,
     #[cfg(target_os = "linux")]
     enabled: bool,
     #[cfg(target_os = "linux")]
@@ -37,6 +42,8 @@ impl Fuse {
         Self {
             state: Mutex::new(State {
                 core,
+                #[cfg(feature = "test-metrics")]
+                profile_uncached_source: std::env::var_os("GIT_ON_TEST_UNCACHED_SOURCE").is_some(),
                 #[cfg(target_os = "linux")]
                 enabled: false,
                 #[cfg(target_os = "linux")]
@@ -51,6 +58,27 @@ impl Fuse {
     }
 }
 impl State {
+    fn source_cacheable(&self, ino: u64) -> bool {
+        #[cfg(feature = "test-metrics")]
+        if self.profile_uncached_source {
+            return false;
+        }
+        self.core.protected_source(ino)
+    }
+    fn cache_ttls(&self, a: &FileAttr) -> (Duration, Duration) {
+        if self.source_cacheable(a.ino) {
+            (
+                if a.kind == FileType::Directory {
+                    TTL
+                } else {
+                    PINNED_TTL
+                },
+                PINNED_TTL,
+            )
+        } else {
+            (TTL, TTL)
+        }
+    }
     #[cfg(target_os = "linux")]
     fn backing(
         &mut self,
@@ -166,13 +194,24 @@ impl Filesystem for Fuse {
     }
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _request = crate::git::RequestGuard::enter(req.pid());
-        entry(reply, self.state().core.lookup_entry(parent.0, name));
+        let mut state = self.state();
+        match state.core.lookup_entry(parent.0, name) {
+            Ok(a) => {
+                let (attr_ttl, entry_ttl) = state.cache_ttls(&a);
+                reply.entry_with_ttls(&attr_ttl, &entry_ttl, &attr(a), Generation(0));
+            }
+            Err(error) => reply.error(Errno::from_i32(error)),
+        }
     }
     fn forget(&self, _req: &Request, ino: INodeNo, count: u64) {
         self.state().core.forget_inode(ino.0, count);
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        attributes(reply, self.state().core.attributes(ino.0, fh.map(|h| h.0)));
+        let mut state = self.state();
+        match state.core.attributes(ino.0, fh.map(|h| h.0)) {
+            Ok(a) => reply.attr(&state.cache_ttls(&a).0, &attr(a)),
+            Err(error) => reply.error(Errno::from_i32(error)),
+        }
     }
     fn setattr(
         &self,
@@ -329,15 +368,22 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         match state.core.open_file(ino.0, flags.0) {
             Ok(fh) => {
+                let cache = if state.source_cacheable(ino.0)
+                    && flags.0 & libc::O_ACCMODE == libc::O_RDONLY
+                {
+                    FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH
+                } else {
+                    FopenFlags::empty()
+                };
                 #[cfg(target_os = "linux")]
                 if let Some(id) = state.backing(ino.0, |file| reply.open_backing(file)) {
                     state.handles.insert(fh, (ino.0, id.clone()));
                     #[cfg(feature = "test-metrics")]
                     state.core.record_passthrough();
-                    reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id);
+                    reply.opened_passthrough(FileHandle(fh), cache, &id);
                     return;
                 }
-                reply.opened(FileHandle(fh), FopenFlags::empty());
+                reply.opened(FileHandle(fh), cache);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
