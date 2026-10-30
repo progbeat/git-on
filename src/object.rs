@@ -1,7 +1,7 @@
 //! Verified, cancellable transfers. libgit2 streams loose objects; its pack
 //! backend currently requires decoded objects (including necessary delta bases).
 use anyhow::{bail, Context, Result};
-use git2::{ObjectType, Odb, Oid};
+use git2::{ObjectType, Oid};
 use sha1::{Digest, Sha1};
 use std::io::{Read, Write};
 
@@ -61,23 +61,6 @@ pub(crate) fn copy_verified(
         return Err(InvalidObject(format!("Git object hash mismatch for {oid}")).into());
     }
     Ok(())
-}
-
-/// Returns whether the transfer used a streaming backend. A failed streaming
-/// open falls back to libgit2 decoding, never to native Git auto-fetch.
-pub(crate) fn copy_from_odb(
-    odb: &Odb<'_>,
-    oid: Oid,
-    mut output: impl Write,
-) -> Result<(usize, ObjectType, bool)> {
-    if let Ok((reader, size, kind)) = odb.reader(oid) {
-        copy_verified(reader, &mut output, kind, size, oid)?;
-        Ok((size, kind, true))
-    } else {
-        let object = odb.read(oid).context("decode Git object")?;
-        copy_verified(object.data(), &mut output, object.kind(), object.len(), oid)?;
-        Ok((object.len(), object.kind(), false))
-    }
 }
 
 /// # Safety

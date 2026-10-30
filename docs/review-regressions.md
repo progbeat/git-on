@@ -2017,9 +2017,10 @@ Focused evidence is `/tmp/git-on-namespace-copilot-{red,green}.log`.
 
 The owner rejected the measured 22–27x full-read overhead and kept #20 within
 1.4.0. Resource-limit passes do not satisfy this acceptance requirement. The
-strict application-byte complexity boundary also needs explicit treatment of
-metadata-only work and first verification of demanded Git objects; no interview
-answer is invented while clarification is pending.
+author clarified that metadata-only operations are outside the data-operation
+complexity criterion. The later full-revision-materialization-plus-direct-command baseline resolves
+the initial short-read accounting question. Already prepared data must not be
+fetched or unpacked repeatedly; no numerical overhead allowance was invented.
 
 `protocol_kernel_cache_only_retains_protected_source` failed against c42ebf1
 because the protected entry TTL was zero. It now passes for none/ignored/untracked
@@ -2045,3 +2046,23 @@ or security settings. Its descriptor regression fails against f12d00f with an
 unsupported metrics argument and passes after the fix (three diagnostic tests).
 Evidence: `/tmp/git-on-io-profile-{red,green}.log`. Native-process file I/O remains
 a separate traced measurement, not a kernel-cache timing claim.
+
+## Disposable object syncs and large-blob close/reopen
+
+`test_private_remote_objects_do_not_sync_disposable_payloads` follows native
+Git descendants under strace and forces caller core.fsync=all. The old probe
+performed 16 private object syncs; the corrected probe performs none, including
+when the deprecated fsyncObjectFiles switch is inherited. Exact bytes, same-run
+fetch reuse and unchanged source configuration are asserted. Evidence:
+`/tmp/git-on-140-sync-{red,green}.log`. The sync reduction is not a latency SLA.
+
+`large_blob_preparation_survives_close_and_reopen_with_bounded_memory` failed
+before the raw store: spool_writes became two after the second open. It now
+passes three separate one-byte reads with a single transfer/verification and no
+retained payload RAM. Raw-store tests cover multiple index growths and reverse
+lookups, absent named files, boundary ranges, invalid hashes, truncated/oversized
+input, rollback and preservation of prior verified data. The real-HTTPS large
+object test also asserts that revisiting a closed blob adds no spool write.
+Evidence: `/tmp/git-on-140-reopen-{red,green}.log`,
+`/tmp/git-on-140-raw-{unit,rust,integrations}.log`. Raw bytes/index are unlinked
+like the prior active-reader spool, and remain invocation-local.

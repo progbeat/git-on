@@ -5,11 +5,10 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fmt,
-    fs::{self, File},
+    fmt, fs,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{symlink, FileExt},
+        fs::symlink,
     },
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -255,6 +254,8 @@ pub struct SnapshotMetrics {
     pub streamed_blob_loads: u64,
     pub spool_writes: u64,
     pub spool_bytes: u64,
+    pub retained_raw_blob_bytes: u64,
+    pub retained_raw_blob_entries: u64,
     #[cfg(feature = "test-metrics")]
     pub passthrough_handles: u64,
     #[cfg(feature = "test-metrics")]
@@ -269,11 +270,10 @@ pub struct SnapshotMetrics {
 
 enum BlobData {
     Memory(Arc<[u8]>),
-    // tempfile() unlinks immediately; only active handles keep this file alive.
-    Spool { file: File, size: u64 },
+    Stored(crate::raw_blob::RawBlob),
 }
-/// A live source-file reader. Large objects decode once into an unlinked spool;
-/// their subsequent partial reads do not decode or copy the full object again.
+/// A live source-file reader. Large objects decode once into unlinked run-local
+/// storage, reused even after every reader has closed.
 #[derive(Clone)]
 pub struct BlobReader(Arc<BlobData>);
 impl BlobReader {
@@ -286,15 +286,7 @@ impl BlobReader {
                 let end = start.saturating_add(size as usize).min(bytes.len());
                 Ok(bytes[start..end].to_vec())
             }
-            BlobData::Spool { file, size: length } => {
-                let length = length.saturating_sub(offset).min(u64::from(size));
-                let mut bytes = vec![0; length as usize];
-                if !bytes.is_empty() {
-                    file.read_exact_at(&mut bytes, offset)
-                        .context("read source blob spool")?;
-                }
-                Ok(bytes)
-            }
+            BlobData::Stored(blob) => blob.read(offset, size),
         }
     }
 }
@@ -349,6 +341,7 @@ struct State {
     headers: Cache<u64>,
     blobs: Cache<Arc<[u8]>>,
     readers: BTreeMap<Oid, Weak<BlobData>>,
+    raw_blobs: Option<crate::raw_blob::RawBlobs>,
     metrics: SnapshotMetrics,
     spool_directory: PathBuf,
     _local_object_bridge: Option<tempfile::TempDir>,
@@ -426,6 +419,15 @@ impl State {
         let data = if let Some(bytes) = self.blobs.get(oid) {
             self.metrics.cache_hits += 1;
             BlobData::Memory(bytes)
+        } else if let Some(blob) = self
+            .raw_blobs
+            .as_ref()
+            .map(|raw| raw.get(oid))
+            .transpose()?
+            .flatten()
+        {
+            self.metrics.cache_hits += 1;
+            BlobData::Stored(blob)
         } else {
             self.metrics.blob_loads += 1;
             self.ensure(oid)?;
@@ -434,22 +436,33 @@ impl State {
                 bail!("snapshot file does not reference a blob");
             }
             if size > self.blobs.byte_limit {
-                let mut file = tempfile::tempfile_in(&self.spool_directory)
-                    .context("create private source blob spool")?;
-                let (copied, kind, streamed) =
-                    crate::object::copy_from_odb(&self.repo.odb()?, oid, &mut file)?;
-                anyhow::ensure!(
-                    kind == ObjectType::Blob && copied == size,
-                    "Git blob changed during transfer"
-                );
+                if self.raw_blobs.is_none() {
+                    self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
+                }
+                let raw = self.raw_blobs.as_mut().unwrap();
+                let odb = self.repo.odb()?;
+                let (blob, streamed) = if let Ok((reader, length, kind)) = odb.reader(oid) {
+                    anyhow::ensure!(
+                        kind == ObjectType::Blob && length == size,
+                        "Git blob changed during transfer"
+                    );
+                    (raw.insert(oid, size, reader, &self.spool_directory)?, true)
+                } else {
+                    let object = odb.read(oid).context("decode Git blob")?;
+                    anyhow::ensure!(
+                        object.kind() == ObjectType::Blob && object.len() == size,
+                        "Git blob changed during transfer"
+                    );
+                    (
+                        raw.insert(oid, size, object.data(), &self.spool_directory)?,
+                        false,
+                    )
+                };
                 self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
                 self.metrics.spool_writes += 1;
                 self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
                 self.metrics.streamed_blob_loads += u64::from(streamed);
-                BlobData::Spool {
-                    file,
-                    size: size as u64,
-                }
+                BlobData::Stored(blob)
             } else {
                 let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
                 let bytes = blob.content();
@@ -641,6 +654,7 @@ impl Snapshot {
                     headers: Cache::new(HEADER_CACHE_ENTRIES * 8, HEADER_CACHE_ENTRIES),
                     blobs: Cache::new(BLOB_CACHE_BYTES, BLOB_CACHE_ENTRIES),
                     readers: BTreeMap::new(),
+                    raw_blobs: None,
                     metrics: SnapshotMetrics::default(),
                     spool_directory: std::env::temp_dir(),
                     _local_object_bridge: local_bridge,
@@ -816,10 +830,14 @@ impl Snapshot {
         metrics.tree_cache_entries = state.trees.values.len();
         metrics.tree_cache_limit = state.trees.byte_limit;
         metrics.header_cache_entries = state.headers.values.len();
+        if let Some(raw) = &state.raw_blobs {
+            metrics.retained_raw_blob_bytes = raw.bytes();
+            metrics.retained_raw_blob_entries = raw.entries();
+        }
         for reader in state.readers.values().filter_map(Weak::upgrade) {
             metrics.active_blob_readers += 1;
-            if let BlobData::Spool { size, .. } = &*reader {
-                metrics.active_spool_bytes = metrics.active_spool_bytes.saturating_add(*size);
+            if let BlobData::Stored(blob) = &*reader {
+                metrics.active_spool_bytes = metrics.active_spool_bytes.saturating_add(blob.len());
             }
         }
         metrics
@@ -1181,7 +1199,7 @@ mod tests {
         assert!(stats.tree_cache_bytes <= TREE_CACHE_BYTES);
     }
     #[test]
-    fn active_large_blob_reader_decodes_once_and_releases_spool() {
+    fn active_large_blob_reader_decodes_once_and_releases_active_accounting() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "spool").unwrap();
@@ -1206,6 +1224,23 @@ mod tests {
         drop(second);
         assert_eq!(snap.metrics().active_spool_bytes, 0);
         assert_eq!(snap.metrics().active_blob_readers, 0);
+    }
+    #[test]
+    fn large_blob_preparation_survives_close_and_reopen_with_bounded_memory() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let size = BLOB_CACHE_BYTES + 123;
+        let oid = repo.blob(&vec![b'x'; size]).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "reopen").unwrap();
+        for offset in [0, size as u64 - 1, 123] {
+            let reader = snap.open(oid).unwrap();
+            assert_eq!(reader.read(offset, 1).unwrap(), b"x");
+            drop(reader);
+            assert_eq!(snap.metrics().active_blob_readers, 0);
+            assert_eq!(snap.metrics().blob_cache_bytes, 0);
+            assert_eq!(snap.metrics().spool_writes, 1);
+            assert_eq!(snap.metrics().blob_loads, 1);
+        }
     }
     #[test]
     fn malformed_symlink_targets_are_rejected_on_readlink() {

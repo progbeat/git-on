@@ -2,6 +2,8 @@
 <!-- Bump: minor -->
 
 - Stream loose Git objects into verified large source spools without an avoidable full decoded RAM buffer. Local packed objects still use libgit2's required object/delta decoding.
+- Reuse verified large-blob bytes after close/reopen for the rest of the invocation, with a disk index and constant retained descriptors. Cache protected source entries/data in the Linux kernel while leaving mutable entries coherent.
+- Avoid durability syncs for disposable remote object storage; caller repositories and signature/hash verification retain their existing contracts.
 - Bound retained pack descriptors using the effective process descriptor limit, leaving room for active files and native Git startup. This fixes cold remote loading that could fail with “Too many open files”; git-on never raises your OS limits.
 - Import received remote packs into loose run storage and reuse the run Repository. Available objects avoid repeated ODB refreshes, and later demands no longer scan all earlier per-object packs. Native Git streams large non-delta imports; necessary delta decoding remains.
 - Remove the global persistent object cache and its disk maintenance. Remote objects stay in the private temporary repository for the invocation and are reused within that run; separate invocations fetch their own demanded objects again. Decoded memory caches remain bounded.

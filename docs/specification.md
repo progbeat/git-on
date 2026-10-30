@@ -232,6 +232,21 @@ checkout or a complete in-memory copy of the selected tree.
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
 
+For comparable source/cache state, the data-I/O acceptance model is
+T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N), where N
+is the command's read/written data bytes. The materialization baseline includes
+cloning/checking out the complete selected revision before the identical direct
+command. Stat and other metadata-only operations are outside this data-I/O
+criterion; their overhead must still be minimized.
+
+One-time required fetch, decoding and verification may fit within that baseline
+preparation budget and may happen lazily. Already prepared data must not be
+fetched or unpacked again within the invocation, including after close/reopen or
+decoded-memory-cache eviction. Count Git children, verification and internal
+reads/writes when measuring work; do not redefine N as redundant internal bytes.
+Expected/amortized complexity does not justify a large constant overhead. No
+global cache or cross-run reuse is required or permitted.
+
 No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
 hardware, software, storage, cache state, fixture shape, and the tested revision.

@@ -104,7 +104,13 @@ earlier per-object packs. Large non-delta blobs stream during import; Git still
 performs required delta decoding. The snapshot reuses its Repository and
 available objects do not trigger unconditional ODB refreshes. Loose objects can
 stream to verified large-file spools in 64 KiB chunks with cancellation checks.
-Hash verification completes before those spools become readable. libgit2's local
+Hash verification completes before those spools become readable. Large-blob
+spools are retained as verified raw bytes until the invocation ends,
+including across close/reopen, in unlinked temporary storage. A disk-resident
+randomized hash index avoids one retained descriptor or RAM entry per blob.
+Two descriptors are retained, with one additional descriptor during geometric
+index growth. Retained-raw disk metrics are separate from active-reader and
+bounded payload-memory metrics. No cross-run reuse is introduced. libgit2's local
 pack backend still requires object/delta decoding, and its loose reader maps the
 compressed source file. Neither mapped OS page cache nor necessary packed decode
 is reported as a retained application payload cache.

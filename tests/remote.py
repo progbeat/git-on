@@ -1306,9 +1306,11 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             value,last=f.operation(process,f'range 13 16 {name}')
             self.assertEqual(bytes(value['bytes']),name.encode()*16)
         self.assertEqual(last['metrics']['remote_fetches'],5)
+        self.assertEqual(last['metrics']['spool_writes'],3)
         requests=len(f.requests)
         value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
         self.assertEqual(len(f.requests),requests,'available run object fetched again')
+        self.assertEqual(last['metrics']['spool_writes'],3,'closed blob was decoded and written again')
         f.finish(process)
         # A separate invocation streams a newly fetched loose object again.
         requests=len(f.requests);process=f.probe(url);f.line(process)
@@ -1390,6 +1392,29 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                     self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
                     if outcome=='error': self.assertIn(b'fetch of exact object',transcript)
                 self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')
+    def test_private_remote_objects_do_not_sync_disposable_payloads(self):
+        f=self.f;trace=f.root/'private-object-io.trace'
+        # The caller can request durability for its real repository. Only the
+        # disposable private destination overrides that policy, not signatures
+        # or object-integrity checks, and no source configuration is rewritten.
+        env=dict(f.env,GIT_CONFIG_COUNT='2',GIT_CONFIG_KEY_0='core.fsync',GIT_CONFIG_VALUE_0='all',
+            GIT_CONFIG_KEY_1='core.fsyncObjectFiles',GIT_CONFIG_VALUE_1='true')
+        before=f.git('config','--list')
+        result=subprocess.run(['strace','--kill-on-exit','-f','-yy','-e','trace=write,fsync,fdatasync',
+            '-o',str(trace),str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],
+            cwd=f.cwd,env=env,input=b'read deep/file\nread deep/file\nreport\nexit\n',capture_output=True,timeout=40)
+        self.assertEqual(result.returncode,0,result.stderr)
+        rows=[json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row['data'] for row in rows if 'data' in row],['expected\n']*2)
+        reports=[row['metrics'] for row in rows if 'metrics' in row]
+        self.assertEqual(reports[-1]['remote_fetches'],4)
+        self.assertEqual(reports[-1]['remote_fetches'],reports[-2]['remote_fetches'])
+        lines=[line for line in trace.read_text().splitlines() if '/remote-repository/objects/' in line]
+        self.assertTrue(any(re.search(r'\bwrite\(',line) for line in lines),'object writes were not traced')
+        self.assertEqual([line for line in lines if re.search(r'\b(fsync|fdatasync)\(',line)],[])
+        self.assertEqual(f.git('config','--list'),before)
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
     def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):

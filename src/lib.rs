@@ -8,6 +8,7 @@ pub mod object;
 pub mod platform;
 pub mod policy;
 mod progress;
+mod raw_blob;
 pub mod remote;
 pub mod snapshot;
 mod wildmatch;

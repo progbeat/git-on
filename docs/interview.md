@@ -89,3 +89,22 @@ working take priority?
 
 **Answer:** Changes to Git-on should follow standard semantic versioning and
 deprecation practices so that users know what to expect.
+
+**Question:** Should the amortized O(N) time requirement for reading or writing
+N application bytes also include metadata-only operations such as stat? For a
+first one-byte read of a large, unverified Git blob, can necessary initial
+verification be accounted for separately?
+
+**Answer:** stat is not an operation that reads or writes data. As for reading
+one byte, that is why I used the word amortized.
+
+**Question:** Which baseline should be used for the amortized O(N) data-I/O
+requirement when Git-on lazily prepares objects before the first short read?
+
+**Answer:** We consider a scenario whose baseline is git clone or git checkout:
+materialize the whole revision, then run the command on top of it. The overhead
+Git-on adds should be O(N), where N is the number of bytes read or written. The
+clone cost has already been accounted for at the beginning. We can fetch the
+required objects lazily through FUSE, but once the objects have been downloaded,
+we must not download them again. The same applies to unpacking. The overhead
+for reading or writing N bytes should be O(N).

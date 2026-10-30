@@ -267,6 +267,11 @@ impl Remote {
             "maintenance.auto=false",
             "-c",
             "fetch.writeCommitGraph=false",
+            // These objects belong to one disposable invocation. A machine
+            // crash ends that invocation; stale cleanup never resumes it.
+            // Durability barriers add no OID-integrity or signature guarantee.
+            "-c",
+            "core.fsync=none",
             // A fetched destination ref names a commit, but its trees and
             // blobs may still be absent. Advertising that commit as a 'have'
             // can make the server omit an explicitly demanded descendant.

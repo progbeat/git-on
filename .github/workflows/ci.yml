@@ -361,6 +361,7 @@ jobs:
           python3 tests/test_scalability_harness.py
           python3 tests/test_ci_plan.py
           python3 tests/test_record_demo.py
+          python3 tests/test_io_profile.py
       - name: Test lossless conversion and output preservation
         run: |
           sudo apt-get update

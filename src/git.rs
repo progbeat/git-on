@@ -96,6 +96,11 @@ impl Git {
                     // reject its intentionally missing tree objects.
                     if key == "core.repositoryformatversion"
                         || key.as_bytes().starts_with(b"extensions.")
+                        // The deprecated loose-object durability switch can
+                        // override core.fsync=none. Private objects are never
+                        // resumed after a crash; preserve the caller's setting
+                        // only for operations in its own repository.
+                        || key == "core.fsyncobjectfiles"
                     {
                         continue;
                     }

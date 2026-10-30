@@ -28,12 +28,53 @@ untraced: ptrace suppresses the setuid mount helper's privileges. Native Git
 file writes/syncs are measured separately with descendant-following tracing. The private comparison knob exists only in test-metrics
 builds. This initial change is not claimed to complete #20.
 
+Real FUSE at 3bc4dc0 (CI 41032542008) measured two complete 1k walks at
+812ms uncached versus 413ms cached, with an identical direct-disk command at
+55ms. Delivered lookup/read/getattr calls fell from 4846/2202/18163 to
+1015/1001/7954; open calls remained 2202. First/repeated walk times were
+380/366ms uncached, 198/150ms cached, 20/17ms direct. This is a real improvement,
+not acceptable-overhead or full-#20 evidence. All normal CI jobs passed.
+
+Private native Git destination commands now disable durability barriers, while
+caller repositories, verification/trust settings and hash-before-trust remain
+unchanged. Interrupted invocation data is not resumed after a machine crash;
+stale cleanup only removes it. An inherited core.fsync=all (and the obsolete
+core.fsyncObjectFiles switch) must not add syncs to disposable object bytes.
+A full-process trace regression observed 16 object syncs before and zero after.
+The 128-object profile changed from 390 to zero sync calls, but its untraced
+wall time increased from 4.755s to 5.245s amid other local work. No wall-time
+speedup is claimed from that single noisy comparison; loose recompression and
+writes remain.
+
+Large verified raw bytes now survive close/reopen until invocation completion.
+An append-only unlinked payload file and an unlinked, randomized, linear-probing
+index retain two descriptors (three during geometric index growth), constant
+index RAM and O(K) disk for K distinct prepared large blobs. Expected amortized
+index lookup/insert is O(1); rehash work is counted, not hidden as a constant.
+Payload transfer and canonical OID verification remain proportional to decoded
+bytes, using a 64KiB buffer. This replaces one active-only spool per blob; no
+named global cache or daemon is introduced. New retained-raw metrics distinguish
+run-retained disk bytes from active readers and bounded decoded RAM caches.
+
+A Linux debug profile read three individual bytes from each local loose blob,
+closing after every read. For 16MiB/64MiB objects, the old path prepared
+48MiB/192MiB (three spools), the new path 16MiB/64MiB (one). Total times changed
+0.702/2.193s to 0.269/0.747s; new repeated one-byte reads took 0.45–0.91ms.
+These observations include waited-child CPU, have uncontrolled page caches and
+are not optimized CLI throughput. Application N=3 still caused 64MiB of first verification/transfer, now accounted
+against the author-clarified full-revision materialization baseline. The repeated
+64MiB preparation is eliminated, rather than excused by amortization.
+
 The raw-object path still needs redesign to avoid unnecessary recompression and
 repeated intermediate writes, retaining verified bytes only within one run.
-Strict application-byte O(N) also needs a stated boundary for metadata/setup and
-the necessary full verification of a newly demanded Git object before its first
-small range. The interview is not rewritten or given an invented answer while
-that clarification is pending.
+The author clarified the baseline as full materialization of the same revision
+followed by the identical direct command: T_git_on <= T_materialize + T_direct
++ O(N). N remains application data bytes, not internal redundant work. Stat is
+outside this data-operation criterion. Required initial fetch/decode/verification
+may use the materialization budget; already prepared data must not be fetched
+or unpacked again, including close/reopen and memory-cache eviction. The
+large-blob change is an increment: small objects evicted from RAM and remote
+pack-to-loose recompression still require changes before #20 is complete.
 
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and
