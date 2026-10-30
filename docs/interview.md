@@ -47,8 +47,6 @@ same user.
 when running a command through Git-on compared with running the same command
 from an ordinary local copy of the repository?
 
-*You can answer qualitatively, without specific numbers.*
-
 **Answer:** Overhead should be minimized. File reads should be lazy, so that
 running a script from a large monorepo can happen almost instantly without
 materializing the whole repository before execution.
@@ -59,40 +57,7 @@ and written to the cache as streams rather than loaded entirely into RAM.
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
 
-Compare one complete Git-on invocation with materializing the same
-complete selected revision using git clone or git checkout, then executing the
-identical command directly from disk. Use comparable source, transport, initial
-object/OS-cache state, host and filesystem conditions. The additional cost is
-amortized over the entire invocation, rather than bounded separately for each
-filesystem call. The required bound is:
-
-T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
-
-T_git_on includes the whole invocation: setup, lazy fetching, all child processes,
-decoding, OID/signature verification, all metadata operations and traversals,
-internal reads/copies/writes, unmount and cleanup. No service operation or native
-Git subprocess is excluded. The baseline includes the corresponding complete
-materialization and the same command, with cleanup accounted for explicitly and
-consistently on both sides.
-
-N is the command's transferred read/write payload bytes plus the byte volume
-of its metadata API results, including stat, in a fixed command-facing interface
-representation. The representation must be stated before comparison and kept
-the same across both sides on that platform, without artificial padding or
-counting the same interface bytes twice. It is not Python/Rust heap size,
-Git pack size, internal FUSE traffic, cache/index bytes or redundant internal
-passes. A stat result is counted once at the command interface, not again for
-each internal lookup needed to produce it.
-
-One-time required preparation may happen lazily within the full-revision
-materialization budget. Immutable data already obtained/prepared during the
-invocation must not be fetched or unpacked again, including after close/reopen
-or decoded-memory-cache eviction. Keep only invocation-local temporary storage;
-do not use a global cache.
-
-Big-O bounds the additional complete cost, not the absolute time without
-materialization, and does not justify a large constant overhead. Actual overhead
-must also be minimized. No numerical performance allowance has been agreed.
+Under equivalent conditions, the total time of a Git-on invocation must not exceed the time required to materialize the same complete revision using git clone or git checkout and run the same command directly from disk, plus O(N). N is the total volume of data read or written by the command, including metadata API results such as stat, measured in a fixed interface representation. This bound includes all internal work and subprocesses.
 
 **Question:** What scale of repositories should Git-on be designed to handle?
 
