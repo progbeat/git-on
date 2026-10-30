@@ -22,9 +22,10 @@ uncached because generated children change timestamps/link counts. Mutable
 entries and `all` keep the previous behavior. The wire regression checks these
 boundaries. `tests/io_profile.py` uses real FUSE to compare two complete 1k walks
 with that policy enabled/disabled in the same instrumented executable, plus the
-identical command directly from disk. It captures all descendant processes,
-logical file writes/syncs and kernel request opcodes; only untraced timings are
-benchmark observations. The private comparison knob exists only in test-metrics
+identical command directly from disk. It captures waited CPU including descendants and counts actual delivered
+lookup/getattr/open/read callbacks in the test-only metrics. The FUSE runs are
+untraced: ptrace suppresses the setuid mount helper's privileges. Native Git
+file writes/syncs are measured separately with descendant-following tracing. The private comparison knob exists only in test-metrics
 builds. This initial change is not claimed to complete #20.
 
 The raw-object path still needs redesign to avoid unnecessary recompression and

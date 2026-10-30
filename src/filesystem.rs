@@ -1301,6 +1301,10 @@ impl Overlay {
     pub(crate) fn record_passthrough(&self) {
         self._snapshot.record_passthrough();
     }
+    #[cfg(all(feature = "test-metrics", target_os = "linux"))]
+    pub(crate) fn record_fuse_request(&self, operation: &'static str) {
+        self._snapshot.record_fuse_request(operation);
+    }
 }
 
 #[cfg(test)]

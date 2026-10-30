@@ -160,7 +160,7 @@ jobs:
           python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on
           python3 tests/native_job_control.py --binary target/release/git-on
 
-      - name: Bounded full-process I/O and kernel-cache profile
+      - name: Bounded kernel-cache and waited-CPU profile
         if: needs.changes.outputs.resources == 'true'
         run: python3 tests/io_profile.py --binary target/release/git-on --files 1000 --output io-profile.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

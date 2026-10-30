@@ -5,10 +5,19 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from io_profile import child_code,trace_summary
+from io_profile import capture,child_code,trace_summary
 
 
 class IoProfileTests(unittest.TestCase):
+    def test_callback_metrics_use_inherited_descriptor_without_tracing(self):
+        code=('import json,os; '
+              'fd=int(os.environ["GIT_ON_TEST_METRICS_FD"]); '
+              'os.write(fd,json.dumps({"fuse_requests":{"lookup":3,"read":2}}).encode())')
+        with tempfile.TemporaryDirectory() as directory:
+            result=capture([sys.executable,'-I','-S','-c',code],directory,{},Path(directory),metrics=True)
+        self.assertEqual(result['fuse_requests'],{'lookup':3,'read':2})
+        self.assertFalse(result['traced'])
+
     def test_trace_includes_native_git_file_writes_and_fuse_request_headers(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);trace=root/'trace.1'

@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 OPCODES={1:'lookup',2:'forget',3:'getattr',14:'open',15:'read',16:'write',18:'release',25:'flush',26:'init',27:'opendir',28:'readdir',29:'releasedir',42:'batch_forget'}
@@ -54,12 +55,19 @@ def trace_summary(paths,root):
     return dict(fuse_requests=dict(requests),processes=dict(processes),file_io_by_command={k:dict(v) for k,v in writes.items()})
 
 
-def capture(argv,cwd,env,root,trace=None):
+def capture(argv,cwd,env,root,trace=None,metrics=False):
+    with tempfile.TemporaryFile() as metrics_output:
+        return capture_process(argv,cwd,env,root,trace,metrics,metrics_output)
+
+
+def capture_process(argv,cwd,env,root,trace,metrics,metrics_output):
     if trace is not None:
         argv=['strace','--kill-on-exit','-ff','-qq','-ttt','-T','-yy','-s','32','-e',
               'trace=process,read,readv,write,writev,pread64,pwrite64,fsync,fdatasync','-o',str(trace),*argv]
+    if metrics:env=dict(env,GIT_ON_TEST_METRICS_FD=str(metrics_output.fileno()))
     before=resource.getrusage(resource.RUSAGE_CHILDREN);begin=time.monotonic_ns()
-    process=subprocess.Popen(argv,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+    process=subprocess.Popen(argv,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,
+        pass_fds=(metrics_output.fileno(),) if metrics else ())
     try:
         stdout,stderr=process.communicate(timeout=60)
     except BaseException:
@@ -76,6 +84,9 @@ def capture(argv,cwd,env,root,trace=None):
         waited_user_cpu_s=after.ru_utime-before.ru_utime,waited_system_cpu_s=after.ru_stime-before.ru_stime,
         phases=[r for r in rows if 'profile_phase' in r],
         child_observations=[r for r in rows if 'completed' in r])
+    if metrics:
+        metrics_output.seek(0);value['metrics']=json.load(metrics_output)
+        value['fuse_requests']=value['metrics']['fuse_requests']
     if trace is not None:value.update(trace_summary(trace.parent.glob(trace.name+'.*'),root))
     return value
 
@@ -95,7 +106,7 @@ def child_code(count,shape):
 def run(options):
     from remote import Fixture
     from scalability import fixture
-    assert sys.platform=='linux' and shutil.which('strace'),'Linux strace required'
+    assert sys.platform=='linux','Linux required'
     assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
     f=Fixture()
     try:
@@ -118,13 +129,14 @@ def run(options):
                 if uncached:env['GIT_ON_TEST_UNCACHED_SOURCE']='1'
                 else:env.pop('GIT_ON_TEST_UNCACHED_SOURCE',None)
                 argv=[str(options.binary.resolve()),'main','--',*child]
-                for traced in (False,True):
-                    trace=f.root/f'trace-{uncached}' if traced else None
-                    record(dict(mode='uncached-source' if uncached else 'cached-source',**capture(argv,f.repo,env,f.root,trace)))
-                    assert not list(f.root.glob('git-on-*')),'private run leaked'
-                    assert f.git('show-ref')==original,'source refs changed'
-            off=next(r for r in observations if r['mode']=='uncached-source' and r['traced'])
-            on=next(r for r in observations if r['mode']=='cached-source' and r['traced'])
+                # Instrument callback delivery directly: ptrace suppresses the
+                # setuid mount helper's privileges. No security settings or
+                # elevated tracer are needed; waited CPU includes descendants.
+                record(dict(mode='uncached-source' if uncached else 'cached-source',**capture(argv,f.repo,env,f.root,metrics=True)))
+                assert not list(f.root.glob('git-on-*')),'private run leaked'
+                assert f.git('show-ref')==original,'source refs changed'
+            off=next(r for r in observations if r['mode']=='uncached-source')
+            on=next(r for r in observations if r['mode']=='cached-source')
             for opcode in ('lookup','read'):
                 assert 0<on['fuse_requests'].get(opcode,0)<off['fuse_requests'].get(opcode,0),(opcode,on,off)
             record(dict(mode='kernel-cache-invariants',result='passed',

@@ -195,6 +195,8 @@ impl Filesystem for Fuse {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("lookup");
         match state.core.lookup_entry(parent.0, name) {
             Ok(a) => {
                 let (attr_ttl, entry_ttl) = state.cache_ttls(&a);
@@ -208,6 +210,8 @@ impl Filesystem for Fuse {
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let mut state = self.state();
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("getattr");
         match state.core.attributes(ino.0, fh.map(|h| h.0)) {
             Ok(a) => reply.attr(&state.cache_ttls(&a).0, &attr(a)),
             Err(error) => reply.error(Errno::from_i32(error)),
@@ -366,6 +370,8 @@ impl Filesystem for Fuse {
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("open");
         match state.core.open_file(ino.0, flags.0) {
             Ok(fh) => {
                 let cache = if state.source_cacheable(ino.0)
@@ -459,11 +465,14 @@ impl Filesystem for Fuse {
         reply: ReplyData,
     ) {
         let _request = crate::git::RequestGuard::enter(req.pid());
+        let mut state = self.state();
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("read");
         data(
             reply,
             i64::try_from(offset)
                 .map_err(|_| libc::EINVAL)
-                .and_then(|offset| self.state().core.read_data(ino.0, fh.0, offset, size)),
+                .and_then(|offset| state.core.read_data(ino.0, fh.0, offset, size)),
         );
     }
     fn write(

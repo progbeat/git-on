@@ -2032,6 +2032,16 @@ not proof of a real-kernel speedup or completion of #20.
 The bounded real-FUSE I/O diagnostic compares the same instrumented executable
 with the previous uncached-source policy and the new policy. Both walks check
 complete names and bytes. An identical direct-disk command is measured, and a
-separate descendant-following trace counts FUSE opcodes and actual file-write
-syscalls. The trace parser has positive pipe/file, resumed-request and repeated
-child-workload regressions. Traced timing is deliberately not used as throughput.
+test-only callback counter measures requests delivered by the kernel without
+ptrace (which suppresses fusermount3 privileges). CPU includes waited descendants.
+The separate native-Git trace parser has positive pipe/file and resumed-request
+regressions. Traced timing is deliberately not used as throughput.
+
+The first real-kernel diagnostic on f12d00f mounted successfully untraced but
+failed under strace: tracing suppresses the setuid fusermount3 privileges.
+The diagnostic now inherits its existing test-metrics descriptor and counts
+lookup/getattr/open/read callback delivery directly, without changing privileges
+or security settings. Its descriptor regression fails against f12d00f with an
+unsupported metrics argument and passes after the fix (three diagnostic tests).
+Evidence: `/tmp/git-on-io-profile-{red,green}.log`. Native-process file I/O remains
+a separate traced measurement, not a kernel-cache timing claim.

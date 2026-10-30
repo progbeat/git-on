@@ -263,6 +263,8 @@ pub struct SnapshotMetrics {
     pub generated_write_callbacks: u64,
     #[cfg(feature = "test-metrics")]
     pub file_sync_callbacks: u64,
+    #[cfg(feature = "test-metrics")]
+    pub fuse_requests: BTreeMap<&'static str, u64>,
 }
 
 enum BlobData {
@@ -786,6 +788,11 @@ impl Snapshot {
         } else {
             state.metrics.generated_read_callbacks += 1;
         }
+    }
+    #[cfg(all(feature = "test-metrics", target_os = "linux"))]
+    pub(crate) fn record_fuse_request(&self, operation: &'static str) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        *state.metrics.fuse_requests.entry(operation).or_default() += 1;
     }
     #[cfg(all(feature = "test-metrics", target_os = "linux"))]
     pub(crate) fn record_passthrough(&self) {
