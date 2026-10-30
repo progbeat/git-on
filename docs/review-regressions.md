@@ -2,6 +2,19 @@
 
 ## Invocation-owned demand sessions
 
+The startup experiment's first CI stopped in the existing sync regression:
+native fetch succeeded but the selected object was absent after import.
+Investigation identified a real output-transfer race consistent with that
+symptom: a socket read can return a timeout, then native Git writes its final
+bytes and exits before the worker observes the completed flag. Returning on
+that stale timeout discards queued output and can hide staging failures. Two
+permanent tests use a real socket, a controlled stale timeout and final write;
+both fail before and pass after a fresh nonblocking drain. The drain adds no
+extra timeout floor or fetch retry. The original CI discarded its temporary
+trace, so the specific CI occurrence is not retrospectively proven to be this
+interleaving. Twenty focused original sync replays passed before the fix; that
+alone was not treated as evidence that the failure could be ignored.
+
 The first mounted run at `d8a41d2` exposed three stale fault-injection assertions:
 replacing `objects/pack` cannot break a direct session import that does not use
 that directory. The tests now select the native compatibility path for pack

@@ -1436,10 +1436,11 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         env=dict(f.env,GIT_CONFIG_COUNT='2',GIT_CONFIG_KEY_0='core.fsync',GIT_CONFIG_VALUE_0='all',
             GIT_CONFIG_KEY_1='core.fsyncObjectFiles',GIT_CONFIG_VALUE_1='true')
         before=f.git('config','--list')
-        result=subprocess.run(['strace','--kill-on-exit','-f','-yy','-e','trace=write,fsync,fdatasync',
+        result=subprocess.run(['strace','--kill-on-exit','-f','-yy','-e','trace=process,read,write,fsync,fdatasync',
             '-o',str(trace),str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],
             cwd=f.cwd,env=env,input=b'read deep/file\nread deep/file\nreport\nexit\n',capture_output=True,timeout=40)
-        self.assertEqual(result.returncode,0,result.stderr)
+        if result.returncode:
+            self.fail(f'private import failed ({result.returncode}): {result.stderr!r}\n'+trace.read_text()[-65536:])
         rows=[json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([row['data'] for row in rows if 'data' in row],['expected\n']*2)
         reports=[row['metrics'] for row in rows if 'metrics' in row]
