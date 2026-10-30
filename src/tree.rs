@@ -522,7 +522,6 @@ impl Tables {
 struct Parser<R> {
     input: BufReader<R>,
     position: u64,
-    mode: Vec<u8>,
     name: Vec<u8>,
 }
 struct Item<'a> {
@@ -545,32 +544,38 @@ impl<R: Read> Parser<R> {
         Self {
             input: BufReader::with_capacity(64 * 1024, input),
             position: 0,
-            mode: Vec::new(),
             name: Vec::new(),
         }
     }
     fn next(&mut self) -> Result<Option<Item<'_>>> {
-        self.mode.clear();
-        let count = Read::by_ref(&mut self.input)
-            .take(12)
-            .read_until(b' ', &mut self.mode)?;
-        if count == 0 {
-            return Ok(None);
-        }
-        if count == 1 || self.mode.last() != Some(&b' ') {
-            return Err(invalid("invalid Git tree mode"));
-        }
-        let mut mode = 0u32;
-        for byte in &self.mode[..count - 1] {
-            if !(b'0'..=b'7').contains(byte) {
+        // libgit2 accepts arbitrarily many leading zeroes but bounds the value
+        // to UINT16_MAX before normalizing legacy modes. Parse incrementally so
+        // preserving that behavior does not need an unbounded text buffer.
+        let mut mode = 0u16;
+        let mut digits = false;
+        loop {
+            let mut byte = [0];
+            if self.input.read(&mut byte)? == 0 {
+                return if digits {
+                    Err(invalid("unterminated Git tree mode"))
+                } else {
+                    Ok(None)
+                };
+            }
+            self.position += 1;
+            if byte[0] == b' ' && digits {
+                break;
+            }
+            if !(b'0'..=b'7').contains(&byte[0]) {
                 return Err(invalid("invalid Git tree mode"));
             }
+            digits = true;
             mode = mode
                 .checked_mul(8)
-                .and_then(|mode| mode.checked_add(u32::from(byte - b'0')))
+                .and_then(|mode| mode.checked_add(u16::from(byte[0] - b'0')))
                 .context("Git tree mode overflow")?;
         }
-        self.position += count as u64;
+        let mode = u32::from(mode);
         let name_offset = self.position;
         self.name.clear();
         Read::by_ref(&mut self.input)

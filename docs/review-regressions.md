@@ -1,5 +1,18 @@
 # Review regression evidence
 
+## Prepared tree mode parsing
+
+Independent review of `029872d` found that the new streaming tree parser accepted
+out-of-range octal modes before normalizing them. A raw tree containing
+`200644 file` is rejected by libgit2 and the previous CLI but was materialized
+successfully by the candidate. The permanent `tree_metadata` integration suite
+reproduced that error both through Snapshot lookup and child launch. It also
+reproduced rejection of long leading-zero modes accepted by libgit2 and native
+Git. All three cases failed before the fix and pass with incremental octal
+parsing bounded to `u16`, without an unbounded mode buffer. Red/green logs are
+retained outside temporary storage in
+`/workspace/git-on-evidence/metadata-029872d/parser-{red,green}.log`.
+
 ## Shared raw spooling under inherited per-file limits
 
 Fresh review of fca7786 found one introduced P2. With RLIMIT_FSIZE=65536 and
