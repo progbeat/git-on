@@ -62,8 +62,9 @@ up file operations, that mode should be used.
 Compare one complete Git-on invocation with materializing the same
 complete selected revision using git clone or git checkout, then executing the
 identical command directly from disk. Use comparable source, transport, initial
-object/OS-cache state, host and filesystem conditions. The additional cost is amortized over the entire invocation, rather than bounded
-separately for each filesystem call. The required bound is:
+object/OS-cache state, host and filesystem conditions. The additional cost is
+amortized over the entire invocation, rather than bounded separately for each
+filesystem call. The required bound is:
 
 T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
 
