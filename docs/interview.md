@@ -129,6 +129,8 @@ object/OS-cache state, host and filesystem conditions. The required bound is:
 
 T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
 
+This final accounting supersedes the earlier data-only/stat-excluded wording.
+
 T_git_on includes the whole invocation: setup, lazy fetching, all child processes,
 decoding, OID/signature verification, all metadata operations and traversals,
 internal reads/copies/writes, unmount and cleanup. No service operation or native
@@ -139,7 +141,8 @@ explicitly and consistently.
 N is the command's transferred read/write payload bytes plus the byte volume
 of its metadata API results, including stat, in a fixed command-facing interface
 representation. The representation must be stated before comparison and kept
-the same across both sides on that platform. It is not Python/Rust heap size,
+the same across both sides on that platform, without artificial padding or
+counting the same interface bytes twice. It is not Python/Rust heap size,
 Git pack size, internal FUSE traffic, cache/index bytes or redundant internal
 passes. A stat result is counted once at the command interface, not again for
 each internal lookup needed to produce it.

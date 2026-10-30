@@ -61,8 +61,11 @@ closing after every read. For 16MiB/64MiB objects, the old path prepared
 48MiB/192MiB (three spools), the new path 16MiB/64MiB (one). Total times changed
 0.702/2.193s to 0.269/0.747s; new repeated one-byte reads took 0.45–0.91ms.
 These observations include waited-child CPU, have uncontrolled page caches and
-are not optimized CLI throughput. Application N=3 still caused 64MiB of first verification/transfer, now accounted
-against the author-clarified full-revision materialization baseline. The repeated
+are not optimized CLI throughput. Three application payload bytes still caused
+64MiB of first verification/transfer. This diagnostic does not count metadata
+interface bytes and does not establish the complete N-based bound. The initial
+preparation is now compared against the author-clarified full-revision
+materialization baseline. The repeated
 64MiB preparation is eliminated, rather than excused by amortization.
 
 The raw-object path still needs redesign to avoid unnecessary recompression and

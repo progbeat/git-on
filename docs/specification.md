@@ -251,6 +251,7 @@ for that platform (for example, the public stat structure for a native stat API)
 or a declared fixed equivalent for a higher-level API. Fix the representation
 before measurement and use it consistently on both sides. Do not count language
 heap allocation, internal wire/storage/index bytes or repeated passes as N.
+Do not add artificial padding or count the same interface bytes twice.
 Failed metadata calls contribute their public result/status representation, not
 an unreturned stat payload. Zero-byte operations do not justify excluding their
 execution cost or inventing internal bytes; N=0 cases still use the complete
