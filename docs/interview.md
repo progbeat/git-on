@@ -89,3 +89,7 @@ working take priority?
 
 **Answer:** Changes to Git-on should follow standard semantic versioning and
 deprecation practices so that users know what to expect.
+
+**Question:** What integrity guarantees must Git-on provide?
+
+**Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
