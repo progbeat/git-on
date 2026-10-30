@@ -16,11 +16,12 @@ class ImportProfileTests(unittest.TestCase):
             observed_start_monotonic_ns=0,observed_end_monotonic_ns=len(PHASES)+1,elapsed_ns=len(PHASES)+1)
         intervals=validate_timing(row)
         self.assertEqual(sum(intervals.values()),len(PHASES)-1)
-        for defect in ('missing','order','clock','total'):
+        for defect in ('missing','order','clock','total','unproven_backend'):
             broken=copy.deepcopy(row)
             if defect=='missing':broken['runner_timeline'].pop()
             elif defect=='order':broken['runner_timeline'].reverse()
             elif defect=='clock':broken['runner_timeline'][0]['monotonic_ns']=-1
+            elif defect=='unproven_backend':broken['runner_timeline'][4]['phase']='backend_ready'
             else:broken['elapsed_ns']-=1
             with self.assertRaises(AssertionError):validate_timing(broken)
 

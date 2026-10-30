@@ -459,7 +459,11 @@ fn execute(
             }
             Some(session)
         };
-        phase!("backend_ready");
+        phase!(if session.is_some() {
+            "backend_fuse_ready"
+        } else {
+            "backend_materialized_ready"
+        });
         if let Some(signal) = signals
             .pending()
             .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))

@@ -6,7 +6,7 @@ from import_profile import CHILD,stat_abi_bytes
 from io_profile import capture
 from remote import Fixture
 
-PHASES=['execute_begin','source_begin','source_ready','backend_begin','backend_ready',
+PHASES=['execute_begin','source_begin','source_ready','backend_begin','backend_fuse_ready',
     'command_spawn_begin','command_started','command_done','unmount_begin','unmount_done',
     'transport_cleanup_begin','transport_cleanup_done','filesystem_cleanup_begin','filesystem_cleanup_done','execute_end']
 
