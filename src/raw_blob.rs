@@ -464,7 +464,16 @@ impl RawBlobs {
         input: impl Read,
         directory: &Path,
     ) -> Result<RawBlob> {
-        self.insert_kind(oid, size, input, directory, git2::ObjectType::Blob)
+        self.insert_kind(oid, size, input, directory, git2::ObjectType::Blob, true)
+    }
+    pub(crate) fn insert_fetched(
+        &mut self,
+        oid: Oid,
+        size: usize,
+        input: impl Read,
+        directory: &Path,
+    ) -> Result<RawBlob> {
+        self.insert_kind(oid, size, input, directory, git2::ObjectType::Blob, false)
     }
     pub(crate) fn insert_tree(
         &mut self,
@@ -473,7 +482,7 @@ impl RawBlobs {
         input: impl Read,
         directory: &Path,
     ) -> Result<RawBlob> {
-        self.insert_kind(oid, size, input, directory, git2::ObjectType::Tree)
+        self.insert_kind(oid, size, input, directory, git2::ObjectType::Tree, true)
     }
     fn insert_kind(
         &mut self,
@@ -482,6 +491,7 @@ impl RawBlobs {
         input: impl Read,
         directory: &Path,
         kind: git2::ObjectType,
+        used: bool,
     ) -> Result<RawBlob> {
         if let Some(blob) = self.get(oid)? {
             return Ok(blob);
@@ -513,7 +523,7 @@ impl RawBlobs {
             generation,
             tree: kind == git2::ObjectType::Tree,
         };
-        self.publish(oid, location, true, directory)?;
+        self.publish(oid, location, used, directory)?;
         Ok(self.blob(oid, location))
     }
     fn publish(

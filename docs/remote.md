@@ -49,6 +49,16 @@ ancestor trees. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
+Where protocol v2 and the caller's policy permit, exact demands share one
+invocation-owned channel. Native Git still resolves the original repository and
+refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
+SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
+Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
+SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
+custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
+retain the native compatibility path. No fetched object is retried merely to
+change decoders, and no unrelated future OID is requested.
+
 Explicit-all eager materialization already needs every entry it prepares. For
 that backend, at most 256 known object IDs from the current directory share one
 native `fetch --stdin` and decoder operation. Each object is checked for existing
@@ -57,6 +67,9 @@ This does not add prefetch to lazy FUSE or fetch unknown descendants. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
 fetch/decode operations; full-process tracing checks those operation counts.
+Session request/decode counts and transport process starts are separate from
+native fetch/cat-file counters. Server-side Git subprocesses remain real work,
+included in waited CPU for local source fixtures.
 
 The server must advertise filtering before any object transfer. Rejection of a
 requested unadvertised OID names the OID and includes Git's server diagnostic.
@@ -107,8 +120,12 @@ and blobs. Git-on does not read, modify, migrate or delete historical
 object cache; native Git's normal configuration and authentication environment
 still applies. No daemon or background cache service is started.
 
-Newly fetched packs are decoded by native Git directly into raw run storage and
-discarded before the next demand. Blob payloads are not recompressed into loose
+Received session packs are checksum-verified in bounded private parts. A
+single non-delta object then streams through zlib and canonical OID verification
+into raw storage, without a per-object fetch or decoder client. Complex packs
+use the existing Git/libgit2 import path without another network request.
+Native fetch packs likewise decode into raw storage and are discarded before
+the next demand. Blob payloads are not recompressed into loose
 copies; commit/tree/tag metadata remains in the native verification ODB. Pack
 discovery does not enumerate earlier per-object packs. Large non-delta blobs
 stream during import; Git still performs required delta decoding. The snapshot

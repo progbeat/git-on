@@ -129,6 +129,21 @@ impl Git {
         }
         command
     }
+    pub(crate) fn demand_session_compatible(&self) -> bool {
+        // Keep caller-defined server programs, server options and fsck policy
+        // on native fetch's complete compatibility path.
+        std::env::var_os("GIT_EXEC_PATH").is_none()
+            && !self.config.iter().any(|(key, value)| {
+                let key = key.as_bytes();
+                key.ends_with(b".uploadpack")
+                    || key.ends_with(b".vcs")
+                    || key.ends_with(b".serveroption")
+                    || key.starts_with(b"fsck.")
+                    || key == b"fetch.fsckobjects"
+                    || key == b"transfer.fsckobjects"
+                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+            })
+    }
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());

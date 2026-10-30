@@ -21,6 +21,7 @@ required-features = ["test-metrics"]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 indicatif = { version = "=0.18.3", default-features = false }
 lru = { version = "=0.16.3", default-features = false }
 gix-glob = "0.29"

@@ -159,7 +159,7 @@ class Fixture:
         self.server = server
         self.env['GIT_SSL_CAINFO'] = str(cert)
         return f'https://127.0.0.1:{server.server_port}/server.git'
-    def ssh(self, encrypted=False):
+    def ssh(self, encrypted=False, protocol_v2=False):
         sshd = shutil.which('sshd') or '/usr/sbin/sshd'
         if not Path(sshd).exists(): raise RuntimeError('OpenSSH server missing; install openssh-server')
         host, identity = self.root/'host', self.root/'identity'
@@ -169,6 +169,8 @@ class Fixture:
         with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port = sock.getsockname()[1]
         config = self.root/'sshd_config'
         config.write_text(f'Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nPidFile {self.root}/sshd.pid\nAuthorizedKeysFile {authorized}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nLogLevel VERBOSE\n')
+        if protocol_v2:
+            with config.open('a') as output:output.write('AcceptEnv GIT_PROTOCOL\n')
         errors = (self.root/'sshd.log').open('w+b'); self.handles.append(errors)
         server = subprocess.Popen([sshd, '-D', '-e', '-f', str(config)], stderr=errors)
         self.children.append(server); self.ssh_server = server
@@ -1326,6 +1328,8 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_materialization_native_git_tty_handoff_with_tostop(self):
         import native_job_control
         f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        # Exercise the native compatibility path; configured fsck stays native.
+        f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
         tools=f.root/'tostop-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
         shell=native_job_control.Shell(f);self.addCleanup(shell.close)
         shell.send(b'stty tostop\n');shell.expect(shell.prompt)
@@ -1349,6 +1353,27 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             output=shell.expect(shell.prompt,timeout=15)
             self.assertIn(b'STATUS:0',output)
             self.assertIn(b'\r\nchild-completed\r\n',output)
+            self.assertEqual(list(f.root.glob('git-on-*')),[])
+        finally:f.resume.set()
+
+    @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
+    def test_session_materialization_keeps_spinner_foreground_with_tostop(self):
+        import native_job_control
+        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        tools=f.root/'session-tostop-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
+        shell=native_job_control.Shell(f);self.addCleanup(shell.close)
+        shell.send(b'stty tostop\n');shell.expect(shell.prompt)
+        f.stalled_oids={f.blob};runner_file=f.root/'session-runner'
+        argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('session-child-completed')"]
+        shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
+        try:
+            self.assertTrue(f.stalled.wait(10),'session did not reach controlled stall')
+            runner=int(runner_file.read_text());shell.groups.add(runner)
+            self.assertEqual(os.tcgetpgrp(shell.fd),runner,'silent session stole terminal ownership')
+            output=shell.expect(b'Preparing snapshot',timeout=5)
+            self.assertNotEqual(native_job_control.state(runner),'T',output)
+            f.resume.set();output=shell.expect(shell.prompt,timeout=15)
+            self.assertIn(b'STATUS:0',output);self.assertIn(b'session-child-completed',output)
             self.assertEqual(list(f.root.glob('git-on-*')),[])
         finally:f.resume.set()
 
@@ -1438,8 +1463,110 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertLessEqual(again['metrics']['blob_cache_entries'],128)
         f.finish(process)
 
+    def test_protocol_v2_reuses_native_clients_after_blob_eviction(self):
+        f=self.f;count=140;entries=[];oids=[]
+        for index in range(count):
+            oid=f.git('hash-object','-w','--stdin',data=f'unique-{index}\n'.encode());oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:04d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode());commit=f.git('commit-tree',tree,data=b'session reuse\n');f.git('update-ref','refs/heads/main',commit)
+        trace=f.root/'native-processes.jsonl';f.env['GIT_TRACE2_EVENT']=str(trace)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'read f{index:04d}')
+            self.assertEqual(value['data'],f'unique-{index}\n')
+        value,again=f.operation(process,'read f0000');self.assertEqual(value['data'],'unique-0\n')
+        self.assertEqual(again['metrics']['blob_loads'],count)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
+        f.finish(process)
+        starts=[r['argv'] for line in trace.read_text().splitlines() if (r:=json.loads(line))['event']=='start']
+        fetches=[args for args in starts if 'fetch' in args]
+        decoders=[args for args in starts if 'cat-file' in args]
+        self.assertEqual(len(fetches),1,'one native fetch process per lazy object returned')
+        self.assertEqual(len(decoders),1,'one native decoder process per lazy object returned')
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_starts'],1)
+        self.assertEqual(set(again['objects']),{commit,tree,*oids})
+
+    def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
+        f=self.f;url=f.ssh(protocol_v2=True)
+        process=f.probe(url);f.line(process)
+        value,report=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
+        self.assertEqual(report['metrics']['remote_session_fetch_operations'],3)
+        self.assertEqual(report['metrics']['remote_session_starts'],1)
+        socket=next(f.root.rglob('ssh-control'))
+        run(['ssh','-F','/dev/null','-S',socket,'-O','exit','fixture-host'],env=f.env)
+        with self.assertRaises(AssertionError):f.operation(process,'read other')
+        self.assertNotEqual(process.wait(timeout=10),0)
+        self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
+
+    def test_session_imports_required_delta_pack_without_a_second_fetch(self):
+        import hashlib,zlib
+        f=self.f;native=shutil.which('git')
+        base=b'a'*20000+b'base';wanted=b'a'*20000+b'changed'
+        base_oid=f.git('hash-object','-w','--stdin',data=base)
+        wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
+        tree=f.git('mktree',data=f'100644 blob {wanted_oid}\tfile\n'.encode())
+        commit=f.git('commit-tree',tree,data=b'delta session\n');f.git('update-ref','refs/heads/main',commit)
+        def integer(value):
+            output=bytearray()
+            while True:
+                byte=value&127;value>>=7;output.append(byte|(128 if value else 0))
+                if not value:return bytes(output)
+        def entry(kind,size):
+            first=(kind<<4)|(size&15);size>>=4
+            return bytes([first|(128 if size else 0)])+(integer(size) if size else b'')
+        delta=integer(len(base))+integer(len(wanted))+bytes([0xb0,20000&255,20000>>8,7])+b'changed'
+        data=b'PACK'+(2).to_bytes(4,'big')+(2).to_bytes(4,'big')
+        data+=entry(3,len(base))+zlib.compress(base)
+        data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
+        data+=hashlib.sha1(data).digest()
+        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],input=(tree+'\n').encode(),env=f.env)
+        tools=f.root/'delta-tools';tools.mkdir();wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,sys
+native={native!r}
+args=sys.argv[1:]
+if 'upload-pack' not in args:os.execv(native,[native,*args])
+packs={dict([(tree,tree_pack),(wanted_oid,data)])!r}
+def send(data):
+ sys.stdout.buffer.write(f'{{len(data)+4:04x}}'.encode()+data)
+def packet():
+ header=sys.stdin.buffer.read(4)
+ if not header:raise SystemExit(0)
+ length=int(header,16)
+ return length if length<4 else sys.stdin.buffer.read(length-4)
+send(b'version 2\\n');send(b'fetch=shallow filter\\n');sys.stdout.buffer.write(b'0000');sys.stdout.buffer.flush()
+while True:
+ wanted=None
+ while True:
+  value=packet()
+  if value==0:break
+  if isinstance(value,bytes) and value.startswith(b'want '):wanted=value[5:].strip().decode()
+ send(b'packfile\\n')
+ for offset in range(0,len(packs[wanted]),60000):send(b'\\x01'+packs[wanted][offset:offset+60000])
+ sys.stdout.buffer.write(b'0000');sys.stdout.buffer.flush()
+''')
+        wrapper.chmod(0o700);f.env['PATH']=str(tools)+os.pathsep+f.env['PATH']
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        value,first=f.operation(process,'range 19990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        f.operation(process,'release')
+        value,again=f.operation(process,'range 19990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        for field in ('remote_fetches','remote_fetch_operations','remote_decode_operations','remote_session_fetch_operations','blob_loads'):
+            self.assertEqual(first['metrics'][field],again['metrics'][field])
+        self.assertEqual(again['metrics']['remote_fetch_operations'],1)
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],2)
+        self.assertEqual(again['metrics']['remote_decode_operations'],2,'generic decoder did not run')
+        self.assertEqual(set(again['objects']),{commit,tree,base_oid,wanted_oid})
+        destination=next(f.root.rglob('remote-repository'))
+        self.assertEqual(list((destination/'objects/pack').iterdir()),[])
+        f.finish(process)
+
     def test_native_raw_import_verifies_oid_before_publishing_bytes(self):
         f=self.f;tools=f.root/'raw-decoder-tools';tools.mkdir()
+        f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
         real_git=shutil.which('git')
         wrapper=tools/'git'
         wrapper.write_text(f'''#!{sys.executable}

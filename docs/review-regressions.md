@@ -1,5 +1,25 @@
 # Review regression evidence
 
+## Invocation-owned demand sessions
+
+The permanent `test_protocol_v2_reuses_native_clients_after_blob_eviction`
+checks actual Native Git Trace2 process starts, 140 unique blobs, eviction and
+a closed reread. Replaying it with the authentic pre-session production loader
+fails because a new fetch/cat-file pair is started for each missing object.
+The session path retains one of each for initial selection and uses a single
+owned server/helper for subsequent exact requests. SHA1 pack trailers, zlib end/
+extent and canonical OIDs are checked independently; altered/truncated/tail
+fixtures never publish raw bytes. A synthetic valid REF_DELTA pack exercises
+the generic decoder without a second network fetch. SSH v2 ownership/loss and
+both native-compatibility and session materialization under `stty tostop` remain
+separate permanent cases.
+
+During implementation review, a diagnostic-tail regression reproduced whole
+stderr-file RAM retention. It fails before and passes after a 64 KiB diagnostic
+tail bound; completed-request diagnostics are discarded between transactions.
+This bounds diagnostic retention without imposing an object or repository cap.
+Evidence is retained under `/workspace/git-on-evidence/transport-5dd38f9/`.
+
 ## Prepared tree mode parsing
 
 Independent review of `029872d` found that the new streaming tree parser accepted

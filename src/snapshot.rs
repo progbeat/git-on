@@ -242,6 +242,9 @@ pub struct SnapshotMetrics {
     pub remote_fetches: u64,
     pub remote_fetch_operations: u64,
     pub remote_decode_operations: u64,
+    pub remote_session_fetch_operations: u64,
+    pub remote_session_decode_operations: u64,
+    pub remote_session_starts: u64,
     pub tree_reads: u64,
     pub prepared_tree_entries: u64,
     pub retained_tree_bytes: u64,
@@ -1010,6 +1013,11 @@ impl Snapshot {
             metrics.remote_fetches = remote.completed_fetches();
             metrics.remote_fetch_operations = remote.fetch_operations();
             metrics.remote_decode_operations = remote.decode_operations();
+            (
+                metrics.remote_session_fetch_operations,
+                metrics.remote_session_decode_operations,
+                metrics.remote_session_starts,
+            ) = remote.session_operations();
             metrics.remote_raw_blob_imports = remote.raw_blobs.entries();
             metrics.remote_raw_blob_bytes = remote.raw_blobs.bytes();
             metrics.retained_raw_blob_bytes = remote.raw_blobs.bytes();
