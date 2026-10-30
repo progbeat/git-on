@@ -1315,7 +1315,8 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         # A separate invocation streams a newly fetched loose object again.
         requests=len(f.requests);process=f.probe(url);f.line(process)
         value,last=f.operation(process,'range 13 16 c');self.assertEqual(bytes(value['bytes']),b'c'*16)
-        self.assertEqual(last['metrics']['streamed_blob_loads'],1)
+        self.assertEqual(last['metrics']['remote_raw_blob_imports'],1)
+        self.assertEqual(last['metrics']['blob_loads'],1)
         self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
         f.finish(process)
         self.assertFalse((f.root/'cache').exists())
@@ -1415,6 +1416,49 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertTrue(any(re.search(r'\bwrite\(',line) for line in lines),'object writes were not traced')
         self.assertEqual([line for line in lines if re.search(r'\b(fsync|fdatasync)\(',line)],[])
         self.assertEqual(f.git('config','--list'),before)
+
+    def test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies(self):
+        f=self.f;entries=[];oids=[]
+        for index in range(140):
+            oid=f.git('hash-object','-w','--stdin',data=f'raw-{index}\n'.encode());oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'raw eviction fixture\n');f.git('update-ref','refs/heads/main',commit)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        for index in range(140):
+            value,last=f.operation(process,f'read f{index:03d}')
+            self.assertEqual(value['data'],f'raw-{index}\n')
+        value,again=f.operation(process,'read f000');self.assertEqual(value['data'],'raw-0\n')
+        self.assertEqual(again['metrics']['remote_fetches'],142)
+        self.assertEqual(again['metrics']['blob_loads'],last['metrics']['blob_loads'],'evicted raw blob was unpacked again')
+        destination=next(f.root.glob('*/remote-repository'))
+        self.assertEqual(list((destination/'objects/pack').iterdir()),[])
+        self.assertFalse(any((destination/'objects'/oid[:2]/oid[2:]).exists() for oid in oids),'received blobs were recompressed into loose files')
+        self.assertEqual(again['metrics']['retained_raw_blob_entries'],140)
+        self.assertLessEqual(again['metrics']['blob_cache_entries'],128)
+        f.finish(process)
+
+    def test_native_raw_import_verifies_oid_before_publishing_bytes(self):
+        f=self.f;tools=f.root/'raw-decoder-tools';tools.mkdir()
+        real_git=shutil.which('git')
+        wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,subprocess,sys
+native={real_git!r}
+args=sys.argv[1:]
+if 'cat-file' in args and '--batch' in args:
+ result=subprocess.run([native,*args],input=sys.stdin.buffer.read(),stdout=subprocess.PIPE)
+ data=result.stdout
+ if b' blob ' in data.split(b'\\n',1)[0]:data=data.replace(b'expected\\n',b'changed!\\n',1)
+ sys.stdout.buffer.write(data)
+ raise SystemExit(result.returncode)
+os.execv(native,[native,*args])
+''')
+        wrapper.chmod(0o700);f.env['PATH']=str(tools)+os.pathsep+f.env['PATH']
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        with self.assertRaisesRegex(AssertionError,'Git object hash mismatch'):
+            f.operation(process,'read deep/file')
+        self.assertNotEqual(process.wait(timeout=10),0)
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
     def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):

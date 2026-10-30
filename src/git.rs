@@ -259,7 +259,20 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 }
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
-pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> {
+pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
+    run_captured(command, capture, capture)
+}
+/// Stream native stdout to owned staging storage without a full output buffer;
+/// preserve the same cancellation, terminal and child-group lifecycle.
+pub(crate) fn run_to_file(mut command: Command, output: &File) -> Result<std::process::Output> {
+    command.stdout(output.try_clone()?);
+    run_captured(command, false, true)
+}
+fn run_captured(
+    mut command: Command,
+    capture_stdout: bool,
+    capture_stderr: bool,
+) -> Result<std::process::Output> {
     use std::{
         io::{Read, Seek},
         os::unix::{io::AsRawFd, process::CommandExt},
@@ -273,12 +286,13 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         bail!("Git operation stopped after command completion");
     }
     check_request_interruption()?;
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
-    if capture {
-        command
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?);
+    let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
+    let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
+    if let Some(stdout) = &stdout {
+        command.stdout(stdout.try_clone()?);
+    }
+    if let Some(stderr) = &stderr {
+        command.stderr(stderr.try_clone()?);
     }
     let tty = std::fs::OpenOptions::new()
         .read(true)
@@ -309,6 +323,7 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
             return Err(error).context("start native Git operation");
         }
     };
+    let wakeup = ChildExitWakeup::new(child.id());
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -341,7 +356,7 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
                 break stop_request_operation(&mut child).and(Err(error));
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wakeup.wait(Duration::from_millis(10));
     };
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
@@ -358,10 +373,12 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     }
     let mut out = Vec::new();
     let mut err = Vec::new();
-    if capture {
+    if let Some(stdout) = &mut stdout {
         stdout.rewind()?;
-        stderr.rewind()?;
         stdout.read_to_end(&mut out)?;
+    }
+    if let Some(stderr) = &mut stderr {
+        stderr.rewind()?;
         stderr.read_to_end(&mut err)?;
     }
     Ok(std::process::Output {
@@ -369,6 +386,49 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         stdout: out,
         stderr: err,
     })
+}
+/// Exit notification removes the artificial polling floor for short native
+/// operations. Cancellation/TTY checks keep the same maximum polling interval.
+/// Unsupported kernels or descriptor pressure retain the existing fallback.
+struct ChildExitWakeup {
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+impl ChildExitWakeup {
+    fn new(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) } as i32;
+            Self {
+                fd: (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+    fn wait(&self, duration: std::time::Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            use std::os::fd::AsRawFd;
+            let mut descriptor = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, duration.as_millis() as i32) };
+            if result < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                std::thread::sleep(duration);
+            }
+            return;
+        }
+        std::thread::sleep(duration);
+    }
 }
 /// Native Git owns a separate group while authenticating/verifying. Observe
 /// stops without consuming its exit status, then suspend the caller's job so

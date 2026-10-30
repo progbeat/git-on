@@ -2,8 +2,10 @@
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags};
 use serde::Serialize;
+#[cfg(feature = "test-metrics")]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, fs,
     os::unix::{
@@ -256,6 +258,8 @@ pub struct SnapshotMetrics {
     pub spool_bytes: u64,
     pub retained_raw_blob_bytes: u64,
     pub retained_raw_blob_entries: u64,
+    pub remote_raw_blob_imports: u64,
+    pub remote_raw_blob_bytes: u64,
     #[cfg(feature = "test-metrics")]
     pub passthrough_handles: u64,
     #[cfg(feature = "test-metrics")]
@@ -269,17 +273,42 @@ pub struct SnapshotMetrics {
 }
 
 enum BlobData {
-    Memory(Arc<[u8]>),
+    Memory {
+        bytes: Weak<[u8]>,
+        raw: crate::raw_blob::RawBlob,
+    },
     Stored(crate::raw_blob::RawBlob),
+}
+type ReaderRegistry = Mutex<HashMap<Oid, Weak<ActiveBlob>>>;
+struct ActiveBlob {
+    oid: Oid,
+    data: BlobData,
+    registry: Weak<ReaderRegistry>,
+}
+impl Drop for ActiveBlob {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+            if registry
+                .get(&self.oid)
+                .is_some_and(|reader| std::ptr::eq(reader.as_ptr(), self))
+            {
+                registry.remove(&self.oid);
+            }
+        }
+    }
 }
 /// A live source-file reader. Large objects decode once into unlinked run-local
 /// storage, reused even after every reader has closed.
 #[derive(Clone)]
-pub struct BlobReader(Arc<BlobData>);
+pub struct BlobReader(Arc<ActiveBlob>);
 impl BlobReader {
     pub fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
-        match &*self.0 {
-            BlobData::Memory(bytes) => {
+        match &self.0.data {
+            BlobData::Memory { bytes, raw } => {
+                let Some(bytes) = bytes.upgrade() else {
+                    return raw.read(offset, size);
+                };
                 let start = usize::try_from(offset)
                     .unwrap_or(usize::MAX)
                     .min(bytes.len());
@@ -340,7 +369,7 @@ struct State {
     trees: Cache<Arc<[TreeItem]>>,
     headers: Cache<u64>,
     blobs: Cache<Arc<[u8]>>,
-    readers: BTreeMap<Oid, Weak<BlobData>>,
+    readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
     metrics: SnapshotMetrics,
     spool_directory: PathBuf,
@@ -398,6 +427,23 @@ impl State {
         }
         self.metrics.header_reads += 1;
         self.ensure(oid)?;
+        if let Some(raw) = self
+            .remote
+            .as_ref()
+            .map(|remote| remote.raw_blobs.get(oid))
+            .transpose()?
+            .flatten()
+            .or(self
+                .raw_blobs
+                .as_ref()
+                .map(|raw| raw.get(oid))
+                .transpose()?
+                .flatten())
+        {
+            let size = raw.len();
+            self.headers.insert(oid, size, std::mem::size_of::<u64>());
+            return Ok(size);
+        }
         let (size, kind) = self
             .repo
             .odb()?
@@ -411,31 +457,66 @@ impl State {
         Ok(size)
     }
     fn open(&mut self, oid: Oid) -> Result<BlobReader> {
-        self.readers.retain(|_, value| value.strong_count() != 0);
-        if let Some(reader) = self.readers.get(&oid).and_then(Weak::upgrade) {
+        let existing = self
+            .readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&oid)
+            .and_then(Weak::upgrade);
+        if let Some(reader) = existing {
             self.metrics.cache_hits += 1;
             return Ok(BlobReader(reader));
         }
         let data = if let Some(bytes) = self.blobs.get(oid) {
             self.metrics.cache_hits += 1;
-            BlobData::Memory(bytes)
-        } else if let Some(blob) = self
-            .raw_blobs
-            .as_ref()
-            .map(|raw| raw.get(oid))
-            .transpose()?
-            .flatten()
-        {
-            self.metrics.cache_hits += 1;
-            BlobData::Stored(blob)
-        } else {
-            self.metrics.blob_loads += 1;
-            self.ensure(oid)?;
-            let (size, kind) = self.repo.odb()?.read_header(oid)?;
-            if kind != ObjectType::Blob {
-                bail!("snapshot file does not reference a blob");
+            let raw = if let Some(remote) = &self.remote {
+                remote.raw_blobs.get(oid)?
+            } else {
+                self.raw_blobs
+                    .as_ref()
+                    .map(|raw| raw.get(oid))
+                    .transpose()?
+                    .flatten()
             }
-            if size > self.blobs.byte_limit {
+            .context("cached blob has no prepared raw storage")?;
+            BlobData::Memory {
+                bytes: Arc::downgrade(&bytes),
+                raw,
+            }
+        } else {
+            let raw = if let Some(remote) = &mut self.remote {
+                remote.ensure_in(&self.repo, oid)?;
+                let (raw, first) = remote
+                    .raw_blobs
+                    .for_read(oid)?
+                    .context("snapshot file does not reference a blob")?;
+                if first {
+                    self.metrics.blob_loads += 1;
+                    self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(raw.len());
+                    if raw.len() > self.blobs.byte_limit as u64 {
+                        self.metrics.spool_writes += 1;
+                        self.metrics.spool_bytes =
+                            self.metrics.spool_bytes.saturating_add(raw.len());
+                    }
+                } else {
+                    self.metrics.cache_hits += 1;
+                }
+                raw
+            } else if let Some(raw) = self
+                .raw_blobs
+                .as_ref()
+                .map(|raw| raw.get(oid))
+                .transpose()?
+                .flatten()
+            {
+                self.metrics.cache_hits += 1;
+                raw
+            } else {
+                let (size, kind) = self.repo.odb()?.read_header(oid)?;
+                anyhow::ensure!(
+                    kind == ObjectType::Blob,
+                    "snapshot file does not reference a blob"
+                );
                 if self.raw_blobs.is_none() {
                     self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
                 }
@@ -458,25 +539,37 @@ impl State {
                         false,
                     )
                 };
+                self.metrics.blob_loads += 1;
                 self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
-                self.metrics.spool_writes += 1;
-                self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
-                self.metrics.streamed_blob_loads += u64::from(streamed);
-                BlobData::Stored(blob)
-            } else {
-                let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
-                let bytes = blob.content();
-                self.metrics.blob_bytes =
-                    self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
-                Self::validate_blob(bytes)?;
+                if size > self.blobs.byte_limit {
+                    self.metrics.spool_writes += 1;
+                    self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
+                    self.metrics.streamed_blob_loads += u64::from(streamed);
+                }
+                blob
+            };
+            if raw.len() <= self.blobs.byte_limit as u64 {
+                let bytes = raw.read_all()?;
+                Self::validate_blob(&bytes)?;
                 let bytes = Arc::<[u8]>::from(bytes);
-                drop(blob);
                 self.blobs.insert(oid, bytes.clone(), bytes.len());
-                BlobData::Memory(bytes)
+                BlobData::Memory {
+                    bytes: Arc::downgrade(&bytes),
+                    raw,
+                }
+            } else {
+                BlobData::Stored(raw)
             }
         };
-        let reader = Arc::new(data);
-        self.readers.insert(oid, Arc::downgrade(&reader));
+        let reader = Arc::new(ActiveBlob {
+            oid,
+            data,
+            registry: Arc::downgrade(&self.readers),
+        });
+        self.readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(oid, Arc::downgrade(&reader));
         Ok(BlobReader(reader))
     }
     fn validate_blob(bytes: &[u8]) -> Result<()> {
@@ -485,26 +578,16 @@ impl State {
         }
         Ok(())
     }
-    /// No retained duplicate of a cached payload. For oversized blobs the
-    /// operation consumes libgit2's borrowed bytes and only its result is copied.
+    /// Full-object consumers explicitly need the returned bytes (ignore rules
+    /// and symlink targets). Ordinary ranged reads use BlobReader directly.
     fn with_blob<T>(&mut self, oid: Oid, consume: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
-        if let Some(bytes) = self.blobs.get(oid) {
-            self.metrics.cache_hits += 1;
-            return consume(&bytes);
-        }
-        self.metrics.blob_loads += 1;
-        self.ensure(oid)?;
-        let blob = self.repo.find_blob(oid).context("read snapshot blob")?;
-        let bytes = blob.content();
-        self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(bytes.len() as u64);
-        Self::validate_blob(bytes)?;
-        if bytes.len() <= self.blobs.byte_limit {
-            let bytes = Arc::<[u8]>::from(bytes);
-            drop(blob);
-            self.blobs.insert(oid, bytes.clone(), bytes.len());
-            consume(&bytes)
-        } else {
-            consume(bytes)
+        let reader = self.open(oid)?;
+        match &reader.0.data {
+            BlobData::Memory { bytes, raw } => match bytes.upgrade() {
+                Some(bytes) => consume(&bytes),
+                None => consume(&raw.read_all()?),
+            },
+            BlobData::Stored(raw) => consume(&raw.read_all()?),
         }
     }
 }
@@ -653,7 +736,7 @@ impl Snapshot {
                     trees: Cache::new(TREE_CACHE_BYTES, TREE_CACHE_ENTRIES),
                     headers: Cache::new(HEADER_CACHE_ENTRIES * 8, HEADER_CACHE_ENTRIES),
                     blobs: Cache::new(BLOB_CACHE_BYTES, BLOB_CACHE_ENTRIES),
-                    readers: BTreeMap::new(),
+                    readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
                     metrics: SnapshotMetrics::default(),
                     spool_directory: std::env::temp_dir(),
@@ -763,20 +846,21 @@ impl Snapshot {
     }
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
-        self.state()?.spool_directory = path.to_path_buf();
+        let mut state = self.state()?;
+        // Own the unlinked files while the validated private directory exists.
+        // Later upper-layer failures must not turn policy reads into unrelated
+        // object-storage failures merely because that directory was removed.
+        if state.remote.is_none() && state.raw_blobs.is_none() {
+            state.raw_blobs = Some(crate::raw_blob::RawBlobs::new(path)?);
+        }
+        state.spool_directory = path.to_path_buf();
         Ok(())
     }
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
         self.state()?.open(oid)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
-        self.state()?.with_blob(oid, |bytes| {
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(bytes.len());
-            let end = start.saturating_add(size as usize).min(bytes.len());
-            Ok(bytes[start..end].to_vec())
-        })
+        self.open(oid)?.read(offset, size)
     }
     pub fn read_link(&self, oid: Oid) -> Result<Vec<u8>> {
         self.state()?.with_blob(oid, |bytes| {
@@ -822,6 +906,10 @@ impl Snapshot {
         let mut metrics = state.metrics.clone();
         if let Some(remote) = &state.remote {
             metrics.remote_fetches = remote.completed_fetches();
+            metrics.remote_raw_blob_imports = remote.raw_blobs.entries();
+            metrics.remote_raw_blob_bytes = remote.raw_blobs.bytes();
+            metrics.retained_raw_blob_bytes = remote.raw_blobs.bytes();
+            metrics.retained_raw_blob_entries = remote.raw_blobs.entries();
         }
         metrics.blob_cache_bytes = state.blobs.bytes;
         metrics.blob_cache_entries = state.blobs.values.len();
@@ -831,16 +919,43 @@ impl Snapshot {
         metrics.tree_cache_limit = state.trees.byte_limit;
         metrics.header_cache_entries = state.headers.values.len();
         if let Some(raw) = &state.raw_blobs {
-            metrics.retained_raw_blob_bytes = raw.bytes();
-            metrics.retained_raw_blob_entries = raw.entries();
+            metrics.retained_raw_blob_bytes += raw.bytes();
+            metrics.retained_raw_blob_entries += raw.entries();
         }
-        for reader in state.readers.values().filter_map(Weak::upgrade) {
+        // Drop the registry lock before dropping any upgraded reader: its last
+        // owner removes itself from that registry, even during metrics sampling.
+        let readers: Vec<_> = state
+            .readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for reader in readers {
             metrics.active_blob_readers += 1;
-            if let BlobData::Stored(blob) = &*reader {
+            if let BlobData::Stored(blob) = &reader.data {
                 metrics.active_spool_bytes = metrics.active_spool_bytes.saturating_add(blob.len());
             }
         }
         metrics
+    }
+    #[cfg(feature = "test-metrics")]
+    pub fn available_objects(&self) -> Result<Vec<Oid>> {
+        let state = self.state()?;
+        let mut objects = Vec::new();
+        state.repo.odb()?.foreach(|oid| {
+            objects.push(*oid);
+            true
+        })?;
+        if let Some(raw) = &state.raw_blobs {
+            objects.extend(raw.oids()?);
+        }
+        if let Some(remote) = &state.remote {
+            objects.extend(remote.raw_blobs.oids()?);
+        }
+        objects.sort_unstable();
+        objects.dedup();
+        Ok(objects)
     }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn record_file_sync(&self) {
@@ -1147,6 +1262,41 @@ mod tests {
         assert!(snap.children(Path::new("unvisited")).is_err());
     }
     #[test]
+    fn reader_registry_releases_closed_entries_without_another_open() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "reader-slots").unwrap();
+        let oid = repo.blob(b"reader").unwrap();
+        let reader = snap.open(oid).unwrap();
+        assert_eq!(snap.metrics().active_blob_readers, 1);
+        drop(reader);
+        assert_eq!(snap.metrics().active_blob_readers, 0);
+        assert_eq!(snap.state().unwrap().readers.lock().unwrap().len(), 0);
+    }
+    #[test]
+    fn active_readers_do_not_pin_evicted_payloads_in_ram() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "active-memory").unwrap();
+        let mut readers = Vec::new();
+        for byte in 0..12u8 {
+            let oid = repo.blob(&vec![byte; 1024 * 1024]).unwrap();
+            readers.push(snap.open(oid).unwrap());
+        }
+        let state = snap.state().unwrap();
+        assert!(
+            state
+                .blobs
+                .values
+                .iter()
+                .all(|(_, (bytes, _))| Arc::strong_count(bytes) == 1),
+            "active readers retained full payloads outside the bounded RAM cache"
+        );
+        drop(state);
+        assert_eq!(readers[0].read(0, 1).unwrap(), [0]);
+        assert_eq!(snap.metrics().blob_loads, 12);
+    }
+    #[test]
     fn blob_cache_is_bounded_and_large_partial_reads_bypass_retention() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
@@ -1164,7 +1314,11 @@ mod tests {
         snap.read(*ids.last().unwrap(), 0, 1).unwrap();
         assert_eq!(snap.metrics().blob_loads, loads);
         snap.read(ids[0], 0, 1).unwrap();
-        assert_eq!(snap.metrics().blob_loads, loads + 1);
+        assert_eq!(
+            snap.metrics().blob_loads,
+            loads,
+            "eviction must not unpack prepared data again"
+        );
         let large = repo.blob(&vec![b'x'; BLOB_CACHE_BYTES + 1]).unwrap();
         let retained = snap.metrics().blob_cache_bytes;
         assert_eq!(snap.read(large, 1000, 5).unwrap(), b"xxxxx");

@@ -132,7 +132,35 @@ def validate_lazy(plan,root):
 def validate_evidence(plan,root):
     result={}
     if plan['required']['scale']:result['scale']=validate_scale(plan,root)
-    if plan['required']['resources']:result['resources']=validate_resources(root)
+    if plan['required']['resources']:
+        result['resources']=validate_resources(root)
+        result['imports']=validate_import_profiles(plan,root)
     if plan['required']['stress']:result['stress']=validate_stress(root)
     if plan['required']['lazy']:result['lazy']=validate_lazy(plan,root)
+    return result
+
+
+def validate_import_profiles(plan,root):
+    from import_profile import validate_runner
+    result={}
+    for name,backend,count,traces in (('import-profile-fuse.jsonl','fuse',160,[False]),('import-profile-materialized.jsonl','materialized',32,[False,True])):
+        paths=list(root.rglob(name))
+        if len(paths)!=1:raise ValueError(f'missing/duplicate production import profile: {name}')
+        data=rows(paths[0])
+        if len(data)!=1+len(traces):raise ValueError('incomplete production profile cases')
+        if any(r.get('head')!=plan['head'] or r.get('working_tree_dirty') is not False or r.get('backend')!=backend or r.get('files')!=count or r.get('blob_bytes')!=8192 for r in data):raise ValueError('wrong production profile identity')
+        baseline=data[0]
+        if baseline['type']!='baseline' or baseline['stat_abi_bytes']<=0:raise ValueError('missing full materialization baseline')
+        if baseline['total_elapsed_ns']!=sum(baseline[k]['elapsed_ns'] for k in ('materialize','command','cleanup')):raise ValueError('baseline omitted preparation or cleanup')
+        for row,traced in zip(data[1:],traces):
+            if row.get('type')!='runner' or row.get('variant')!='current' or row.get('traced') is not traced:raise ValueError('missing/ambiguous production invocation')
+            try:validate_runner(row,count,8192,baseline['stat_abi_bytes'],backend)
+            except (AssertionError,KeyError,TypeError) as error:raise ValueError('incomplete production import execution') from error
+            if row['child_observations']!=baseline['command']['child_observations']:raise ValueError('baseline command differs')
+            if any(row.get(k,-1)<0 for k in ('waited_user_cpu_s','waited_system_cpu_s','runner_and_waited_children_peak_resident_kib')):raise ValueError('missing full-process resources')
+            if traced:
+                if row['processes'].get('unpack-objects',0) or not row['processes'].get('cat-file',0):raise ValueError('native decoder tracing absent/wrong')
+                io=row['file_io_by_command'].get('cat-file',{})
+                if sum(v for k,v in io.items() if k.endswith('_write_bytes'))<count*8192:raise ValueError('raw native stdout was not measured')
+        result[backend]=dict(distinct_blobs=count,invocations=len(traces),application_passes=2)
     return result

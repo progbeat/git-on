@@ -98,18 +98,25 @@ and blobs. Git-on does not read, modify, migrate or delete historical
 object cache; native Git's normal configuration and authentication environment
 still applies. No daemon or background cache service is started.
 
-Newly fetched packs are imported into loose run storage with native Git and
-discarded before the next demand, so pack discovery does not enumerate all
-earlier per-object packs. Large non-delta blobs stream during import; Git still
-performs required delta decoding. The snapshot reuses its Repository and
-available objects do not trigger unconditional ODB refreshes. Loose objects can
-stream to verified large-file spools in 64 KiB chunks with cancellation checks.
-Hash verification completes before those spools become readable. Large-blob
-spools are retained as verified raw bytes until the invocation ends,
-including across close/reopen, in unlinked temporary storage. A disk-resident
+Newly fetched packs are decoded by native Git directly into raw run storage and
+discarded before the next demand. Blob payloads are not recompressed into loose
+copies; commit/tree/tag metadata remains in the native verification ODB. Pack
+discovery does not enumerate earlier per-object packs. Large non-delta blobs
+stream during import; Git still performs required delta decoding. The snapshot
+reuses its Repository and available objects do not trigger unconditional ODB
+refreshes. Canonical OID verification completes before raw bytes become readable.
+Local loose objects stream in 64 KiB chunks with cancellation checks.
+
+All prepared blobs survive close/reopen and bounded-memory-cache eviction in
+unlinked temporary storage until invocation completion. A disk-resident
 randomized hash index avoids one retained descriptor or RAM entry per blob.
-Two descriptors are retained, with one additional descriptor during geometric
-index growth. Retained-raw disk metrics are separate from active-reader and
+Payload, authentication tags and index retain three descriptors, with one more
+during geometric index growth. A per-invocation memory-only HMAC key authenticates
+the index and 4 KiB logical payload blocks; range reads verify the returned bytes
+without decoding or hashing the entire blob again. This detects modification of
+prepared disk bytes under the interview's process-memory protection assumption.
+Readers hold weak references to cached memory and use authenticated raw bytes
+after eviction. Retained-raw disk metrics are separate from active-reader and
 bounded payload-memory metrics. No cross-run reuse is introduced. libgit2's local
 pack backend still requires object/delta decoding, and its loose reader maps the
 compressed source file. Neither mapped OS page cache nor necessary packed decode

@@ -1,5 +1,31 @@
 # Review regression evidence
 
+## Invocation-local raw reuse and bounded reader retention (1.4.0)
+
+At authentic `325be51`, `blob_cache_is_bounded_and_large_partial_reads_bypass_retention`
+decoded the evicted first blob again (13 loads instead of 12), and
+`test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies` counted
+141 loads for 140 distinct blobs. Both now require unchanged unique-load counts
+on closed rereads. The remote regression also asserts no loose blob payloads or
+retained per-demand packs. `test_native_raw_import_verifies_oid_before_publishing_bytes`
+substitutes same-length native decoder output and requires canonical OID failure.
+
+Two additional focused tests failed at `325be51` and pass with the new reader
+lifetime: `reader_registry_releases_closed_entries_without_another_open` found
+one stale registry entry instead of zero; `active_readers_do_not_pin_evicted_payloads_in_ram`
+found active readers strongly retaining payloads outside the bounded cache.
+These are meaningful retention assertions, not counts inferred from process RSS.
+
+An initial unauthenticated raw-storage candidate failed the permanent
+`modified_prepared_bytes_are_rejected_before_a_range_is_returned` regression after
+the prepared payload was overwritten. The corrected store verifies per-block
+HMACs before returning the exact checked bytes. Other permanent raw-store cases
+modify tags/index records and attempt to reuse tags from a failed preparation;
+all must fail without exposing modified bytes. They supplement initial canonical
+OID checking, which remains mandatory before publication. Reduced-RLIMIT remote
+tests still run at 64 and observe constant retained descriptors; no OS limit or
+process-security setting was changed.
+
 This is a historical review record. The owner subsequently selected stock
 cargo-dist release/installer behavior. Earlier custom publisher, hash-hardening
 and assembly sections below are superseded; their replaced code/tests were

@@ -31,7 +31,7 @@ def trace_summary(paths,root):
             if 'execve(' in line:
                 args=[ast.literal_eval(s) for s in STRINGS.findall(line)]
                 break
-        command=next((name for name in ('unpack-objects','index-pack','pack-objects','fetch') if name in args),'other')
+        command=next((name for name in ('unpack-objects','index-pack','pack-objects','fetch','cat-file') if name in args),'other')
         processes[command]+=1;pending=None
         for line in text.splitlines():
             if '<unfinished ...>' in line:
@@ -45,8 +45,9 @@ def trace_summary(paths,root):
                     if len(data)>=8:
                         opcode=int.from_bytes(data[4:8],sys.byteorder)
                         requests[OPCODES.get(opcode,str(opcode))]+=1
-            if str(root) not in line:continue
-            category='objects' if '/remote-repository/objects/' in line else 'other_fixture_files'
+            descriptor=re.search(r'\b(?:write|writev|pwrite64|fsync|fdatasync)\(\d+<([^>]*)>',line)
+            if not descriptor or str(root) not in descriptor[1]:continue
+            category='objects' if '/remote-repository/objects/' in descriptor[1] else 'other_fixture_files'
             match=re.search(r'\b(write|writev|pwrite64)\([^\n]* = (\d+)',line)
             if match:
                 writes[command][category+'_write_calls']+=1
@@ -55,12 +56,15 @@ def trace_summary(paths,root):
     return dict(fuse_requests=dict(requests),processes=dict(processes),file_io_by_command={k:dict(v) for k,v in writes.items()})
 
 
-def capture(argv,cwd,env,root,trace=None,metrics=False):
+def capture(argv,cwd,env,root,trace=None,metrics=False,resource_observer=None):
     with tempfile.TemporaryFile() as metrics_output:
-        return capture_process(argv,cwd,env,root,trace,metrics,metrics_output)
+        return capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer)
 
 
-def capture_process(argv,cwd,env,root,trace,metrics,metrics_output):
+def capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer):
+    rss_output=root/'observer-rss'
+    if resource_observer:
+        argv=[str(resource_observer),str(rss_output),*argv]
     if trace is not None:
         argv=['strace','--kill-on-exit','-ff','-qq','-ttt','-T','-yy','-s','32','-e',
               'trace=process,read,readv,write,writev,pread64,pwrite64,fsync,fdatasync','-o',str(trace),*argv]
@@ -87,6 +91,9 @@ def capture_process(argv,cwd,env,root,trace,metrics,metrics_output):
     if metrics:
         metrics_output.seek(0);value['metrics']=json.load(metrics_output)
         value['fuse_requests']=value['metrics']['fuse_requests']
+    if resource_observer:
+        value['runner_and_waited_children_peak_resident_kib']=int(rss_output.read_text())
+        value['resource_observer']='wait4 observer included; largest waited process RSS, not summed concurrent RSS'
     if trace is not None:value.update(trace_summary(trace.parent.glob(trace.name+'.*'),root))
     return value
 

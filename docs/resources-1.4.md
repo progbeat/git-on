@@ -46,7 +46,7 @@ wall time increased from 4.755s to 5.245s amid other local work. No wall-time
 speedup is claimed from that single noisy comparison; loose recompression and
 writes remain.
 
-Large verified raw bytes now survive close/reopen until invocation completion.
+The initial large-blob increment retained verified raw bytes after close/reopen.
 An append-only unlinked payload file and an unlinked, randomized, linear-probing
 index retain two descriptors (three during geometric index growth), constant
 index RAM and O(K) disk for K distinct prepared large blobs. Expected amortized
@@ -68,8 +68,8 @@ preparation is now compared against the author-clarified full-revision
 materialization baseline. The repeated
 64MiB preparation is eliminated, rather than excused by amortization.
 
-The raw-object path still needs redesign to avoid unnecessary recompression and
-repeated intermediate writes, retaining verified bytes only within one run.
+The subsequent raw-import increment removes blob recompression and duplicate
+loose writes, retaining verified bytes only within one run (details below).
 The author clarified the baseline as full materialization of the same revision
 followed by the identical direct command: T_git_on <= T_materialize + T_direct
 + O(N). N includes command payload bytes and metadata API results, including stat, in
@@ -77,8 +77,79 @@ a fixed interface representation. All metadata operations are included in total
 cost; no internal work or native Git subprocess is excluded. Required initial fetch/decode/verification
 may use the materialization budget; already prepared data must not be fetched
 or unpacked again, including close/reopen and memory-cache eviction. The
-large-blob change is an increment: small objects evicted from RAM and remote
-pack-to-loose recompression still require changes before #20 is complete.
+large-blob change alone did not address small-object eviction or remote
+pack-to-loose recompression and was not completion of #20.
+
+## Raw-import increment and remaining work
+
+Native `cat-file --batch --buffer` writes newly received objects directly to the
+invocation's raw arena. Canonical OID verification then reads those bytes in
+bounded chunks. Blobs are published in place; only commit/tree/tag metadata is
+written into the native ODB needed for resolution/signature verification. The
+received packs are removed before the next demand. Local blobs also retain
+verified raw bytes, including small blobs after decoded-memory-cache eviction.
+The 140-distinct-blob regression leaves no loose blob copies or retained packs
+and does not fetch or decode the first blob again on its second closed read.
+
+Prepared raw disk bytes must not become a new trust boundary. Three unlinked
+files retain payload, block tags and disk index, with a fourth descriptor only
+during geometric index growth. Initial SHA-1 verification simultaneously writes
+32-byte HMAC-SHA256 tags for 4 KiB logical blocks. A random invocation-only key
+and fresh preparation nonce bind tags to OID, size, generation and block number.
+Index records are authenticated too. Later ranges authenticate exactly the
+returned bytes, avoiding whole-blob rehashing and a second unchecked read. This
+adds bounded tag I/O and CPU, not another payload copy; these costs remain in
+the production measurements. The assumed protection of process memory is the
+existing interview model, not a new system/security-setting requirement.
+
+Open readers hold weak cache references and fall back to authenticated raw
+storage after eviction; they do not retain every small payload outside the RAM
+budget. Their registry uses expected O(1) hashing and removes closed readers on
+drop instead of scanning all live readers on each open. The permanent tests
+reproduce both the extra retained RAM and stale registry entry at `325be51`.
+Linux native-operation waiting now uses optional pidfd exit notification, with
+the existing polling fallback on unsupported kernels or descriptor pressure.
+Cancellation and job-control polling retain their previous maximum interval.
+
+`tests/import_profile.py` exercises the optimized production CLI with distinct
+seeded 8 KiB blobs, two complete closed read/stat passes, and a fresh run store.
+The comparison is a full `file://` clone, the identical command, and clone
+cleanup. Wall time and waited descendant CPU include the entire runner and its
+cleanup; an included `wait4` observer records largest waited-process RSS (not a
+sum of concurrent RSS). Native file writes are traced in a separate small
+materialized run, including every Git child. Traced wall time is not used as a
+speed benchmark. The fixed native stat ABI size is recorded; internal bytes are
+never added to application N. CI requires exact-head clean evidence from real
+FUSE and materialized runs, and rejects missing native-write observations.
+
+Three local untraced trials with no concurrent build/test workload used 160
+distinct 8 KiB blobs (1,310,720 source payload bytes). The authentic optimized
+`325be51` binary took 5.432/5.568/6.092s; the raw-import candidate took
+3.143/3.163/3.290s, a 1.76x median wall-time improvement. Waited user+system CPU
+medians were 3.461s and 3.339s: CPU cost barely improved. Full clone + identical
+command + cleanup baselines were 0.163/0.175/0.209s. These uncontrolled warm-page
+cache observations clearly leave a large gap; they do not establish acceptable
+overhead. The current full-process peak observation was 8448 KiB (largest waited
+process, not simultaneous sum). The two application passes transferred
+2,621,440 payload bytes and 46,080 explicit metadata result bytes on this
+144-byte native stat ABI. Internal copies are not added to N.
+
+A separate 32-blob trace recorded 34 native decoders and no `unpack-objects`.
+Decoder output wrote 265,204 bytes directly to raw storage; index-pack wrote
+303,938 pack/index bytes and the main native ODB received only 970 metadata
+bytes. All other fixture writes, including backing copies, raw tags/index and
+cleanup-related files, were observed too (319,706 bytes in the other-process
+category plus 2,192 fetch-output bytes). These are logical successful syscall
+write bytes, not physical device traffic. The retained-pack metadata control at
+32 demands enumerated 16,880 pack-directory bytes in 428 metadata syscalls; it
+remains a partial complexity check, separate from the complete CLI profile.
+
+This increment does not complete #20. Remaining costs include per-object native
+fetch/import processes, native metadata re-decoding after tree-cache eviction,
+FUSE metadata traffic and writable copy-up/materialization copies. Local packed
+decoding constraints remain. Smaller representative production profiles do not
+replace exact-head million-file lazy and supported-platform checks, and neither
+finite counters nor partial pack traces prove the total asymptotic contract.
 
 The implementation is compared with master
 `27cd1e5c336541566f9497186425c44e4aa46f73`. The PR's exact-head Actions runs and
@@ -169,11 +240,11 @@ is not a startup preload or a request for unrelated objects. Operation-local
 Git handles close before return. Snapshot demand reuses its existing Repository
 and no longer unconditionally refreshes the ODB.
 
-The run retains zero per-demand packs between operations, while loose objects
-remain available until run cleanup. Pack discovery sees only the current
-fetch's pack(s), independently of earlier demands. This adds one native unpack
-operation and recompression of received bytes, accounted for separately from
-payload retention; it avoids cumulative pack enumeration/sorting. Over N demands,
+The run retains zero per-demand packs between operations, while metadata and
+raw blobs remain available until run cleanup. Pack discovery sees only the
+current fetch's pack(s), independently of earlier demands. The first fix used
+one native unpack operation and recompression; the raw-import increment replaces
+it with one native decoder and no blob recompression. Over D distinct demands,
 pack maintenance is linear in the actually received packs/objects, plus necessary
 Git decoding and bytes. No cap is imposed on active run storage or repository size.
 

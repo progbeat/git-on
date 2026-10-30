@@ -25,6 +25,8 @@ class IoProfileTests(unittest.TestCase):
                 f'write(4<{root}/run/remote-repository/objects/aa/tmp>, "data", 4) = 4 <0.001>\n'
                 f'fsync(4<{root}/run/remote-repository/objects/aa/tmp>) = 0 <0.001>\n'
                 'write(1<pipe:[12]>, "observer", 8) = 8 <0.001>\n')
+            with trace.open('a') as output:
+                output.write(f'write(1<pipe:[12]>, "{root}/not-a-file-write", 100) = 100 <0.001>\n')
             fuse=root/'trace.2';fuse.write_text(
                 'read(7</dev/fuse<char 10:229>>, "\\x40\\0\\0\\0\\x01\\0\\0\\0", 131072) = 64 <0.001>\n'
                 'read(7</dev/fuse<char 10:229>>,  <unfinished ...>\n'

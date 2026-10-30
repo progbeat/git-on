@@ -163,11 +163,19 @@ jobs:
       - name: Bounded kernel-cache and waited-CPU profile
         if: needs.changes.outputs.resources == 'true'
         run: python3 tests/io_profile.py --binary target/release/git-on --files 1000 --output io-profile.jsonl
+      - name: Distinct-object CLI preparation and closed-reader reuse
+        if: needs.changes.outputs.resources == 'true'
+        run: |
+          python3 tests/import_profile.py --binary target/release/git-on --backend fuse --sizes 160 --output import-profile-fuse.jsonl
+          python3 tests/import_profile.py --binary target/release/git-on --backend materialized --sizes 32 --trace --output import-profile-materialized.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.changes.outputs.resources == 'true'
         with:
           name: io-profile
-          path: io-profile.jsonl
+          path: |
+            io-profile.jsonl
+            import-profile-fuse.jsonl
+            import-profile-materialized.jsonl
           if-no-files-found: error
 
       - name: Real-FUSE generated-file passthrough fallback
@@ -362,6 +370,7 @@ jobs:
           python3 tests/test_ci_plan.py
           python3 tests/test_record_demo.py
           python3 tests/test_io_profile.py
+          python3 tests/test_import_profile.py
       - name: Test lossless conversion and output preservation
         run: |
           sudo apt-get update
@@ -478,6 +487,11 @@ jobs:
         with:
           name: object-scaling
           path: gate-data/resources
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.resources == 'true'
+        with:
+          name: io-profile
+          path: gate-data/imports
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.changes.outputs.lazy == 'true'
         with:

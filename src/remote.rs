@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Seek, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -136,6 +136,7 @@ pub struct Remote {
     ssh: Option<OsString>,
     control_client: Option<ControlClient>,
     failed: Option<String>,
+    pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
 }
 impl Remote {
     pub fn open(cwd: &Path, source: &OsStr, revision: &OsStr, run: &Path) -> Result<(Self, Oid)> {
@@ -215,6 +216,7 @@ impl Remote {
             ssh,
             control_client,
             failed: None,
+            raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
         // Authentication and host-key interaction happen here, before mounting.
         let capabilities = tempfile::NamedTempFile::new_in(run)?;
@@ -272,6 +274,8 @@ impl Remote {
             // Durability barriers add no OID-integrity or signature guarantee.
             "-c",
             "core.fsync=none",
+            "-c",
+            "core.bigFileThreshold=8m",
             // A fetched destination ref names a commit, but its trees and
             // blobs may still be absent. Advertising that commit as a 'have'
             // can make the server omit an explicitly demanded descendant.
@@ -344,9 +348,9 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
-        self.unpack_received()?;
+        self.import_received()?;
         let repo = Repository::open_bare(&self.dir)?;
-        if !repo.odb()?.exists(oid) {
+        if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
             bail!("native Git fetch did not supply selected object {oid}");
         }
         self.completed_fetches += 1;
@@ -358,7 +362,7 @@ impl Remote {
     }
     pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let outcome = (|| {
-            if repo.odb()?.exists(oid) {
+            if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
                 return Ok(());
             }
             self.fetch(repo, oid)
@@ -415,8 +419,8 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        self.unpack_received()?;
-        if !repo.odb()?.exists(oid) {
+        self.import_received()?;
+        if self.raw_blobs.get(oid)?.is_none() && !repo.odb()?.exists(oid) {
             bail!("filtered remote fetch did not supply requested object {oid}");
         }
         self.completed_fetches += 1;
@@ -424,10 +428,10 @@ impl Remote {
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack
     /// per demand makes later Git/libgit2 pack discovery grow with all previous
-    /// demands. Import only the just-received pack(s) into loose run storage,
+    /// demands. Decode only new received objects directly into raw run storage,
     /// then release their files/indexes before the next operation. The private
     /// repository has one serialized writer and no auto-maintenance.
-    fn unpack_received(&self) -> Result<()> {
+    fn import_received(&mut self) -> Result<()> {
         let pack_directory = self.dir.join("objects/pack");
         let mut received = Vec::new();
         for entry in fs::read_dir(&pack_directory)? {
@@ -452,33 +456,122 @@ impl Remote {
         let staging = tempfile::Builder::new()
             .prefix("received-pack-")
             .tempdir_in(&self.dir)?;
-        // Move all companion indexes (including Git's optional .rev) out of
-        // the ODB first: otherwise unpack-objects can see the input itself as
-        // already available and skip writing its loose copy.
+        let mut options = git2::RepositoryInitOptions::new();
+        options.bare(true).external_template(false);
+        let staging_repo = Repository::init_opts(staging.path(), &options)?;
+        let objects = staging.path().join("objects/pack");
+        // The decoder sees only this newly received pack set, never all prior
+        // demands. Companion indexes, including optional .rev, move together.
         for (name, path) in &received {
             crate::object::check_transfer()?;
-            fs::rename(path, staging.path().join(name))?;
+            fs::rename(path, objects.join(name))?;
         }
-        for (name, _) in received {
-            if Path::new(&name).extension() != Some(OsStr::new("pack")) {
-                continue;
+        let destination = Repository::open_bare(&self.dir)?;
+        let mut requests = tempfile::tempfile_in(&self.dir)?;
+        let mut failure = None;
+        let received_odb = staging_repo.odb()?;
+        let iteration = received_odb.foreach(|oid| {
+            let outcome = (|| -> Result<()> {
+                crate::object::check_transfer()?;
+                if self.raw_blobs.get(*oid)?.is_none() && !destination.odb()?.exists(*oid) {
+                    writeln!(requests, "{oid}")?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                failure = Some(error);
+                return false;
             }
+            true
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        iteration?;
+        // Release ODB/pack descriptors before launching the native decoder.
+        drop(received_odb);
+        drop(staging_repo);
+        if requests.stream_position()? == 0 {
+            return Ok(());
+        }
+        requests.rewind()?;
+        let (output_file, start) = self.raw_blobs.append_output()?;
+        let mut command = self.git.command(Some(&self.dir));
+        command
+            .env("GIT_OBJECT_DIRECTORY", staging.path().join("objects"))
+            .args([
+                "-c",
+                "core.bigFileThreshold=8m",
+                "cat-file",
+                "--batch",
+                "--buffer",
+            ])
+            .stdin(Stdio::from(requests));
+        let output = crate::git::run_to_file(command, &output_file)
+            .context("decode received objects into run-local raw storage")?;
+        drop(output_file);
+        if !output.status.success() {
+            bail!(
+                "cannot decode received Git objects: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        self.import_raw_output(start, &destination)?;
+        Ok(())
+    }
+    fn import_raw_output(&mut self, start: u64, destination: &Repository) -> Result<()> {
+        let mut input = BufReader::new(self.raw_blobs.output_reader(start)?);
+        let mut position = start;
+        loop {
             crate::object::check_transfer()?;
-            let mut command = self.command(false)?;
-            command
-                .args(["-c", "core.bigFileThreshold=8m", "unpack-objects", "-q"])
-                .stdin(Stdio::from(File::open(staging.path().join(name))?));
-            // Native Git streams non-delta blobs over this threshold. Delta
-            // objects still require Git's necessary decoding; no new backend
-            // or custom pack parser is introduced.
-            let output = crate::git::run(command, true)
-                .context("import received objects into run-local storage")?;
-            if !output.status.success() {
-                bail!(
-                    "cannot unpack received Git objects: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
+            let mut header = Vec::new();
+            let length = Read::by_ref(&mut input)
+                .take(128)
+                .read_until(b'\n', &mut header)?;
+            if length == 0 {
+                break;
             }
+            anyhow::ensure!(
+                header.last() == Some(&b'\n'),
+                "invalid native Git batch header"
+            );
+            let header = std::str::from_utf8(&header[..length - 1])?;
+            let fields: Vec<_> = header.split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0].len() == 40,
+                "invalid native Git object header"
+            );
+            let oid = Oid::from_str(fields[0])?;
+            let kind = match fields[1] {
+                "blob" => git2::ObjectType::Blob,
+                "tree" => git2::ObjectType::Tree,
+                "commit" => git2::ObjectType::Commit,
+                "tag" => git2::ObjectType::Tag,
+                _ => bail!("unknown received Git object type"),
+            };
+            let size: usize = fields[2].parse().context("native Git object size")?;
+            position = position
+                .checked_add(length as u64)
+                .context("native object offset")?;
+            let mut payload = Read::by_ref(&mut input).take(size as u64);
+            if kind == git2::ObjectType::Blob {
+                self.raw_blobs
+                    .import_blob(oid, position, size, &mut payload, &self.dir)?;
+            } else {
+                // Native verification and revision resolution still use Git's
+                // metadata ODB. Blob payloads never get a second loose copy.
+                let odb = destination.odb()?;
+                let mut writer = odb.writer(size, kind)?;
+                crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
+                anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
+            }
+            let mut delimiter = [0];
+            input.read_exact(&mut delimiter)?;
+            anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
+            position = position
+                .checked_add(size as u64)
+                .and_then(|n| n.checked_add(1))
+                .context("native object offset")?;
         }
         Ok(())
     }

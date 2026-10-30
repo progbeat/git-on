@@ -103,8 +103,15 @@ fn remote_metadata_and_payloads_are_demanded_and_pinned() {
             .split(|x| *x == b'\n')
             .filter(|x| !x.is_empty())
             .count(),
-        4
+        // Blob payloads are verified raw run data, rather than a second
+        // recompressed copy in the metadata ODB.
+        3
     );
+    assert_eq!(snap.metrics().remote_raw_blob_imports, 1);
+    let fetches = snap.metrics().remote_fetches;
+    assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
+    assert_eq!(snap.metrics().remote_fetches, fetches);
+    assert_eq!(snap.metrics().blob_loads, 1);
 }
 #[test]
 fn remote_colon_refspec_selects_full_tree_in_a_private_repository() {

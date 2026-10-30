@@ -10,14 +10,11 @@ fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
     let mut report =
         serde_json::json!({"tree": snapshot.tree_oid.to_string(), "metrics": snapshot.metrics()});
     if include_objects {
-        let repo = git2::Repository::open(&snapshot.git_dir)?;
-        let odb = repo.odb()?;
-        let mut objects = Vec::new();
-        odb.foreach(|oid| {
-            objects.push(oid.to_string());
-            true
-        })?;
-        objects.sort();
+        let objects: Vec<_> = snapshot
+            .available_objects()?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         report["objects"] = serde_json::json!(objects);
     }
     println!("{report}");
