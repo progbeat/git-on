@@ -7,9 +7,23 @@ import tempfile
 import unittest
 from import_profile import CHILD,validate_runner
 from ci_evidence import validate_import_profiles
+from startup_profile import PHASES,validate_timing
 
 
 class ImportProfileTests(unittest.TestCase):
+    def test_full_timeline_rejects_missing_or_reordered_phases_and_excluded_time(self):
+        row=dict(runner_timeline=[dict(phase=phase,monotonic_ns=i+1) for i,phase in enumerate(PHASES)],
+            observed_start_monotonic_ns=0,observed_end_monotonic_ns=len(PHASES)+1,elapsed_ns=len(PHASES)+1)
+        intervals=validate_timing(row)
+        self.assertEqual(sum(intervals.values()),len(PHASES)-1)
+        for defect in ('missing','order','clock','total'):
+            broken=copy.deepcopy(row)
+            if defect=='missing':broken['runner_timeline'].pop()
+            elif defect=='order':broken['runner_timeline'].reverse()
+            elif defect=='clock':broken['runner_timeline'][0]['monotonic_ns']=-1
+            else:broken['elapsed_ns']-=1
+            with self.assertRaises(AssertionError):validate_timing(broken)
+
     def test_gate_requires_current_head_complete_baseline_and_native_io(self):
         head='a'*40
         with tempfile.TemporaryDirectory() as directory:

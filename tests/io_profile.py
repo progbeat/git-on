@@ -58,12 +58,17 @@ def trace_summary(paths,root):
     return dict(fuse_requests=dict(requests),processes=dict(processes),file_io_by_command={k:dict(v) for k,v in writes.items()})
 
 
-def capture(argv,cwd,env,root,trace=None,metrics=False,resource_observer=None):
+def capture(argv,cwd,env,root,trace=None,metrics=False,resource_observer=None,timing=False):
     with tempfile.TemporaryFile() as metrics_output:
+        if timing:
+            with tempfile.TemporaryFile() as timing_output:
+                result=capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer,timing_output)
+                timing_output.seek(0);result['runner_timeline']=json.load(timing_output)
+                return result
         return capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer)
 
 
-def capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer):
+def capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_observer,timing_output=None):
     rss_output=root/'observer-rss'
     if resource_observer:
         argv=[str(resource_observer),str(rss_output),*argv]
@@ -71,9 +76,10 @@ def capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_obse
         argv=['strace','--kill-on-exit','-ff','-qq','-ttt','-T','-yy','-s','32','-e',
               'trace=process,read,readv,write,writev,pread64,pwrite64,fsync,fdatasync','-o',str(trace),*argv]
     if metrics:env=dict(env,GIT_ON_TEST_METRICS_FD=str(metrics_output.fileno()))
+    if timing_output is not None:env=dict(env,GIT_ON_TEST_TIMING_FD=str(timing_output.fileno()))
     before=resource.getrusage(resource.RUSAGE_CHILDREN);begin=time.monotonic_ns()
     process=subprocess.Popen(argv,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,
-        pass_fds=(metrics_output.fileno(),) if metrics else ())
+        pass_fds=tuple(([metrics_output.fileno()] if metrics else [])+([timing_output.fileno()] if timing_output is not None else [])))
     try:
         stdout,stderr=process.communicate(timeout=60)
     except BaseException:
@@ -84,12 +90,13 @@ def capture_process(argv,cwd,env,root,trace,metrics,metrics_output,resource_obse
             os.killpg(process.pid,signal.SIGKILL);process.communicate(timeout=5)
         raise
     if process.returncode:raise RuntimeError(f'profile command failed ({process.returncode}): {stderr.decode(errors="replace")}')
-    elapsed=time.monotonic_ns()-begin;after=resource.getrusage(resource.RUSAGE_CHILDREN)
+    end=time.monotonic_ns();elapsed=end-begin;after=resource.getrusage(resource.RUSAGE_CHILDREN)
     rows=[json.loads(line) for line in stdout.splitlines()]
     value=dict(traced=trace is not None,elapsed_ns=elapsed,
         waited_user_cpu_s=after.ru_utime-before.ru_utime,waited_system_cpu_s=after.ru_stime-before.ru_stime,
         phases=[r for r in rows if 'profile_phase' in r],
         child_observations=[r for r in rows if 'completed' in r])
+    if timing_output is not None:value.update(observed_start_monotonic_ns=begin,observed_end_monotonic_ns=end)
     if metrics:
         metrics_output.seek(0);value['metrics']=json.load(metrics_output)
         value['fuse_requests']=value['metrics']['fuse_requests']

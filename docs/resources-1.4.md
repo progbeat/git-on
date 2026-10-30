@@ -1,5 +1,25 @@
 # Resource acceptance for milestone 1.4.0
 
+## Fixed setup versus demand work
+
+`tests/startup_profile.py` uses a fixed 160-distinct-blob source, a minimal
+`true` command and the same Python command reading 0/1/16/64/160 files. Each
+Python command performs first and closed-repeat passes in one invocation.
+Three shuffled trials per local/remote source use fresh invocation storage and
+fresh complete native clones; source OS caches are warm/uncontrolled. Total
+clone + identical command + cleanup remains the baseline. Fixed setup is never
+subtracted from acceptance, nor labelled unavoidable merely because it appears
+in a no-op run. All waited subprocess CPU and baseline cleanup CPU are recorded.
+
+Only `test-metrics` binaries recognize the private timing descriptor. Fifteen
+monotonic events separate source resolution/preparation, backend setup, command
+spawn/run, unmount, transport/raw-store cleanup and filesystem/pin cleanup. The
+full parent-observed time also includes program load/CLI parsing and diagnostic
+serialization outside those events. The private channel is close-on-exec;
+child stdout/stderr and exit status remain ordinary. Missing/reordered events
+or partial cleanup fail the diagnostic; actual FUSE is required. These phases
+and size curves diagnose costs, not a numerical SLA or an asymptotic proof.
+
 ## Performance acceptance remains in progress
 
 Issue #20 remains mandatory for 1.4.0. The c42ebf1 run's 100k local/remote

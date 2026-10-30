@@ -25,6 +25,8 @@ use std::{
 };
 
 mod cli;
+#[cfg(feature = "test-metrics")]
+mod startup_timing;
 
 // Ephemeral recovery information only: no invocation history, arguments or logs.
 #[derive(Serialize, Deserialize)]
@@ -362,6 +364,15 @@ fn execute(
     verify: bool,
     write_policy: git_on::policy::WritePolicy,
 ) -> Result<ExitStatus> {
+    #[cfg(feature = "test-metrics")]
+    let mut timing = startup_timing::Timing::new()?;
+    macro_rules! phase {
+        ($name:expr) => {
+            #[cfg(feature = "test-metrics")]
+            timing.mark($name);
+        };
+    }
+    phase!("execute_begin");
     let mut signals = subscribe_signals()?;
     if let Some(signal) = git_on::git::cancelled_signal() {
         return Ok(ExitStatus::from_raw(signal));
@@ -395,6 +406,7 @@ fn execute(
             }
         }
         save(&dir, &state)?;
+        phase!("source_begin");
         let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
             source.as_deref(),
@@ -410,8 +422,10 @@ fn execute(
             },
         )?;
         observed = Some(snapshot.clone());
+        phase!("source_ready");
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
+        phase!("backend_begin");
         let unavailable = git_on::platform::fuse_unavailable()?;
         let mut session = if let Some(reason) = unavailable {
             if write_policy != git_on::policy::WritePolicy::All {
@@ -445,6 +459,7 @@ fn execute(
             }
             Some(session)
         };
+        phase!("backend_ready");
         if let Some(signal) = signals
             .pending()
             .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
@@ -473,6 +488,7 @@ fn execute(
                 Ok(())
             });
         }
+        phase!("command_spawn_begin");
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -492,9 +508,11 @@ fn execute(
                     .with_context(|| format!("cannot start command {:?}; {next_step}", args[0]));
             }
         };
+        phase!("command_started");
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
         let outcome = supervise(&mut child, &mut signals, &terminal);
+        phase!("command_done");
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
                 git_on::git::cancel_by_signal(signal);
@@ -508,7 +526,9 @@ fn execute(
             let _ = child.wait();
         }
         drop(terminal);
+        phase!("unmount_begin");
         let unmount = session.as_mut().map_or(Ok(()), Mounted::finish);
+        phase!("unmount_done");
         match (outcome, unmount) {
             (Ok(status), Ok(())) => Ok(status),
             (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
@@ -518,6 +538,7 @@ fn execute(
     // Also cover errors before the child could start. State inspection below
     // must never wait behind an owned operation that the run no longer needs.
     git_on::git::stop_operations();
+    phase!("transport_cleanup_begin");
     let mut transport_cleanup_failure = None;
     if let Some(snapshot) = observed.take() {
         if let Some(failure) = snapshot.remote_failure() {
@@ -538,6 +559,8 @@ fn execute(
             std::mem::forget(snapshot);
         }
     }
+    phase!("transport_cleanup_done");
+    phase!("filesystem_cleanup_begin");
     let cleanup_result = (|| -> Result<()> {
         if let Some(error) = transport_cleanup_failure {
             return Err(error).with_context(|| {
@@ -569,6 +592,7 @@ fn execute(
         fs::remove_dir_all(&dir)?;
         Ok(())
     })();
+    phase!("filesystem_cleanup_done");
     if let Err(e) = cleanup_result {
         result = Err(match result {
             Ok(_) => e,
