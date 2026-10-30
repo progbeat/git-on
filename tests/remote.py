@@ -52,6 +52,14 @@ def run(argv, **kwargs):
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
 
+def private_storage_fault(fault, root="Path.cwd().parent"):
+    """Corrupt the storage used by the selected import path, before a demand."""
+    if fault=='odb':
+        return f"packs={root}/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
+    assert fault=='raw'
+    return (f"parts=next(({root}).glob('raw-parts-*')); target={root}/'unexpected-target'\n"
+            "for index in range(256):\n path=parts/f'{index:x}-0'\n if not os.path.lexists(path): path.symlink_to(target)\n")
+
 def exec_fixture_child(argv, cwd, env):
     try:
         os.chdir(cwd)
@@ -1532,6 +1540,23 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertNotEqual(process.wait(timeout=10),0)
         self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
 
+    def test_session_storage_fault_targets_the_active_parts_instead_of_unused_packs(self):
+        f=self.f
+        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        f.children.append(process);f.line(process)
+        root=next(f.root.glob('*/remote-repository')).parent
+        selected=f"Path({str(root)!r})"
+        exec(private_storage_fault('odb',selected),{'Path':Path})
+        value,report=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n')
+        self.assertEqual(report['metrics']['remote_session_starts'],1)
+        exec(private_storage_fault('raw',selected),{'Path':Path,'os':os})
+        with self.assertRaisesRegex(AssertionError,'Too many levels of symbolic links'):
+            f.operation(process,'read other')
+        self.assertNotEqual(process.wait(timeout=10),0)
+        self.assertFalse((root/'unexpected-target').exists())
+
     def test_session_imports_required_delta_pack_without_a_second_fetch(self):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
@@ -2087,12 +2112,19 @@ os.execv(native,[native,*args])
     def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        code="import errno; from pathlib import Path; packs=Path.cwd().parent/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private ODB fault not observed')\n"
-        result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
-        self.assertEqual(result.returncode,125,result.stderr)
-        self.assertIn(b'remote object loading failed',result.stderr)
-        self.assertIn(b'execution incomplete',result.stderr)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        for fault in ('odb','raw'):
+            with self.subTest(fault=fault):
+                env=dict(f.env)
+                if fault=='odb':
+                    env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                code="import errno,os; from pathlib import Path\n"+private_storage_fault(fault)
+                code+="try:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
+                if fault=='raw':code+="assert not target.exists()\n"
+                result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=env,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,125,result.stderr)
+                self.assertIn(b'remote object loading failed',result.stderr)
+                self.assertIn(b'execution incomplete',result.stderr)
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     def ignore_policy_fixture(self):
         f=self.f
@@ -2108,18 +2140,20 @@ os.execv(native,[native,*args])
         f=self.f; url=self.ignore_policy_fixture()
         cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
         for binary,expected in cases:
-            for fault in ('transport','odb'):
+            for fault in ('transport','odb','raw'):
                 for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
                     with self.subTest(binary=str(binary),fault=fault,operation=operation):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)
                         f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
                         code="import json,os,sys; from pathlib import Path\n"
-                        if fault=='odb':
-                            code+="packs=Path.cwd().parent/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
+                        if fault!='transport':code+=private_storage_fault(fault)
                         code+="try:\n"
                         code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
                         code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
-                        result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                        if fault=='raw':code+="assert not target.exists()\n"
+                        env=dict(f.env)
+                        if fault=='odb':env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                        result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,capture_output=True,timeout=30)
                         self.assertEqual(result.returncode,125,result.stderr)
                         self.assertEqual(json.loads(result.stdout),{'errno':expected,'exists':False},result.stderr)
                         self.assertIn(b'execution incomplete',result.stderr)
