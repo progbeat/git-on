@@ -232,20 +232,38 @@ checkout or a complete in-memory copy of the selected tree.
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
 
-For comparable source/cache state, the data-I/O acceptance model is
-T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N), where N
-is the command's read/written data bytes. The materialization baseline includes
-cloning/checking out the complete selected revision before the identical direct
-command. Stat and other metadata-only operations are outside this data-I/O
-criterion; their overhead must still be minimized.
+The explicit [interview acceptance contract](interview.md#interview) is mandatory
+for [1.4.0 issue #20](https://github.com/progbeat/git-on/issues/20):
 
-One-time required fetch, decoding and verification may fit within that baseline
-preparation budget and may happen lazily. Already prepared data must not be
-fetched or unpacked again within the invocation, including after close/reopen or
-decoded-memory-cache eviction. Count Git children, verification and internal
-reads/writes when measuring work; do not redefine N as redundant internal bytes.
-Expected/amortized complexity does not justify a large constant overhead. No
-global cache or cross-run reuse is required or permitted.
+T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
+
+Compare one complete invocation with git clone/git checkout materializing the
+same complete selected revision and then the identical direct-disk command.
+Declare the same host/filesystem, source/transport, initial object and OS-cache
+conditions; separate cold and warm cases. Account for cleanup explicitly on both
+sides, without excluding Git-on's unmount or cleanup from T_git_on. Setup, every
+process, fetch, decode, verification, metadata operation, traversal, internal
+read/copy/write and cleanup are included in the total cost.
+
+N is command-facing transferred read/write payload bytes plus metadata API
+result bytes, including stat. Use the documented native API/ABI result layout
+for that platform (for example, the public stat structure for a native stat API),
+or a declared fixed equivalent for a higher-level API. Fix the representation
+before measurement and use it consistently on both sides. Do not count language
+heap allocation, internal wire/storage/index bytes or repeated passes as N.
+Failed metadata calls contribute their public result/status representation, not
+an unreturned stat payload. Zero-byte operations do not justify excluding their
+execution cost or inventing internal bytes; N=0 cases still use the complete
+materialize-plus-command comparison.
+
+One-time required fetch, decode and verification may happen lazily within the
+materialization budget. Immutable data already obtained/prepared must not be
+fetched or unpacked again in the same invocation, including close/reopen and
+decoded-memory-cache eviction. Invocation-local temporary storage must support
+that reuse; no global cache or cross-run reuse is introduced. Count all work,
+including native Git children, rather than proving this contract from loader-only
+counters. Amortized/expected Big-O does not justify a large constant: minimizing
+measured real overhead also remains required.
 
 No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report

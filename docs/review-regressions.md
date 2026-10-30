@@ -2017,8 +2017,9 @@ Focused evidence is `/tmp/git-on-namespace-copilot-{red,green}.log`.
 
 The owner rejected the measured 22–27x full-read overhead and kept #20 within
 1.4.0. Resource-limit passes do not satisfy this acceptance requirement. The
-author clarified that metadata-only operations are outside the data-operation
-complexity criterion. The later full-revision-materialization-plus-direct-command baseline resolves
+author clarified that metadata results (including stat) contribute fixed
+interface bytes to N, and all metadata/internal work contributes to total cost.
+The full-revision-materialization-plus-direct-command baseline resolves
 the initial short-read accounting question. Already prepared data must not be
 fetched or unpacked repeatedly; no numerical overhead allowance was invented.
 

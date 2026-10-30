@@ -108,3 +108,50 @@ clone cost has already been accounted for at the beginning. We can fetch the
 required objects lazily through FUSE, but once the objects have been downloaded,
 we must not download them again. The same applies to unpacking. The overhead
 for reading or writing N bytes should be O(N).
+
+**Question:** Does the additional-cost bound include every internal operation,
+including metadata and repeated traversals, and should a stat result count in N?
+Should this restriction be recorded explicitly?
+
+**Answer:** Yes: absolutely all operations must be included, including unpacking
+and any traversals. The entire overhead must satisfy the O(N) bound. In this
+formulation, stat should probably count as reading too: its result can be
+represented by a number of bytes, which should be included in N. This restriction
+must be recorded clearly and explicitly, without ambiguous interpretations.
+
+**Question:** What is the explicit performance acceptance contract for
+[milestone 1.4.0 issue #20](https://github.com/progbeat/git-on/issues/20)?
+
+**Answer:** Compare one complete Git-on invocation with materializing the same
+complete selected revision using git clone or git checkout, then executing the
+identical command directly from disk. Use comparable source, transport, initial
+object/OS-cache state, host and filesystem conditions. The required bound is:
+
+T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
+
+T_git_on includes the whole invocation: setup, lazy fetching, all child processes,
+decoding, OID/signature verification, all metadata operations and traversals,
+internal reads/copies/writes, unmount and cleanup. No service operation or native
+Git subprocess is excluded. The baseline includes the corresponding complete
+materialization and the same command, with its scenario cleanup accounted for
+explicitly and consistently.
+
+N is the command's transferred read/write payload bytes plus the byte volume
+of its metadata API results, including stat, in a fixed command-facing interface
+representation. The representation must be stated before comparison and kept
+the same across both sides on that platform. It is not Python/Rust heap size,
+Git pack size, internal FUSE traffic, cache/index bytes or redundant internal
+passes. A stat result is counted once at the command interface, not again for
+each internal lookup needed to produce it.
+
+One-time required preparation may happen lazily within the full-revision
+materialization budget. Immutable data already obtained/prepared during the
+invocation must not be fetched or unpacked again, including after close/reopen
+or decoded-memory-cache eviction. Keep only invocation-local temporary storage;
+do not restore a global cache.
+
+Big-O is a bound on the additional complete cost, not an absolute O(N) claim
+without materialization, and not a justification for a large constant overhead.
+Actual overhead must also be minimized. Issue #20 must be satisfied in 1.4.0;
+passing selected counters or resource limits alone does not establish acceptance.
+No numerical performance allowance has been agreed.

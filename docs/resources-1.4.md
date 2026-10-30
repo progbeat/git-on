@@ -69,8 +69,9 @@ The raw-object path still needs redesign to avoid unnecessary recompression and
 repeated intermediate writes, retaining verified bytes only within one run.
 The author clarified the baseline as full materialization of the same revision
 followed by the identical direct command: T_git_on <= T_materialize + T_direct
-+ O(N). N remains application data bytes, not internal redundant work. Stat is
-outside this data-operation criterion. Required initial fetch/decode/verification
++ O(N). N includes command payload bytes and metadata API results, including stat, in
+a fixed interface representation. All metadata operations are included in total
+cost; no internal work or native Git subprocess is excluded. Required initial fetch/decode/verification
 may use the materialization budget; already prepared data must not be fetched
 or unpacked again, including close/reopen and memory-cache eviction. The
 large-blob change is an increment: small objects evicted from RAM and remote
