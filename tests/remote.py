@@ -1488,6 +1488,38 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(again['metrics']['remote_session_starts'],1)
         self.assertEqual(set(again['objects']),{commit,tree,*oids})
 
+    @unittest.skipUnless(sys.platform=='linux', 'Linux process resource limits')
+    def test_session_pack_and_raw_storage_respect_fsize_and_descriptor_limits(self):
+        import hashlib,resource
+        f=self.f;count=140;limit=8192;entries=[]
+        for index in range(count):
+            data=hashlib.shake_256(f'session-parts:{index}'.encode()).digest(limit)
+            oid=f.git('hash-object','-w','--stdin',data=data)
+            entries.append(f'100644 blob {oid}\tf{index:04d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'bounded session parts\n');f.git('update-ref','refs/heads/main',commit)
+        def reduced_limits():
+            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+            resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
+        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,preexec_fn=reduced_limits,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        f.children.append(process);f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'range 0 32 f{index:04d}')
+            self.assertEqual(value['bytes'],list(hashlib.shake_256(f'session-parts:{index}'.encode()).digest(32)))
+            f.operation(process,'release')
+        value,again=f.operation(process,'range 0 32 f0000')
+        self.assertEqual(value['bytes'],list(hashlib.shake_256(b'session-parts:0').digest(32)))
+        self.assertEqual(again['metrics']['blob_loads'],count)
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_starts'],1)
+        parts=[p for directory in f.root.rglob('raw-parts-*') for p in directory.iterdir()]
+        self.assertGreater(sum(p.stat().st_size for p in parts),limit)
+        self.assertTrue(all(p.stat().st_size<=limit for p in parts),'a logical raw or pack file exceeded inherited FSIZE')
+        self.assertLessEqual(len(list(Path(f'/proc/{process.pid}/fd').iterdir())),48)
+        f.finish(process)
+
     def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
         f=self.f;url=f.ssh(protocol_v2=True)
         process=f.probe(url);f.line(process)
