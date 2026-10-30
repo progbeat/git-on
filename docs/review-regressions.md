@@ -13,6 +13,17 @@ parsing bounded to `u16`, without an unbounded mode buffer. Red/green logs are
 retained outside temporary storage in
 `/workspace/git-on-evidence/metadata-029872d/parser-{red,green}.log`.
 
+The first published metadata CI at `15b9e4b` then failed all macOS builds because
+Darwin's libc crate does not export `NAME_MAX`. Removing that parser-level host
+limit also preserves Git tree names independently of the current host's path
+limits. The permanent `tree_parser_does_not_apply_a_host_filename_limit` reads
+a 1024-byte tree name through Snapshot. The prior production source probe fails
+on that exact raw tree; the fixed integration suite passes all four cases.
+The parser retains one active name, whose size is part of the active operation;
+the materializer/kernel remains responsible for an actual host path error.
+Red evidence is `long-name-red.json`, green is `long-name-green.log` in the same
+retained workspace evidence directory. Actual macOS compilation needs final CI.
+
 ## Shared raw spooling under inherited per-file limits
 
 Fresh review of fca7786 found one introduced P2. With RLIMIT_FSIZE=65536 and

@@ -578,11 +578,12 @@ impl<R: Read> Parser<R> {
         let mode = u32::from(mode);
         let name_offset = self.position;
         self.name.clear();
-        Read::by_ref(&mut self.input)
-            .take(libc::NAME_MAX as u64 + 1)
-            .read_until(0, &mut self.name)?;
+        // Git tree names have no platform NAME_MAX field. Keep one active name
+        // rather than imposing a parser limit from the current host filesystem;
+        // a materializer/kernel reports its actual representation limitation.
+        self.input.read_until(0, &mut self.name)?;
         if self.name.last() != Some(&0) {
-            return Err(invalid("invalid or unsupported Git tree name"));
+            return Err(invalid("unterminated Git tree name"));
         }
         let length = self.name.len() - 1;
         let name = &self.name[..length];

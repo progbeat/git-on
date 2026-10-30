@@ -54,6 +54,21 @@ fn leading_zero_modes_preserve_native_tree_semantics() {
 }
 
 #[test]
+fn tree_parser_does_not_apply_a_host_filename_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    let blob = repo.blob(b"payload").unwrap();
+    let name = "n".repeat(1024);
+    let mut bytes = format!("100644 {name}\0").into_bytes();
+    bytes.extend(blob.as_bytes());
+    let tree = repo.odb().unwrap().write(ObjectType::Tree, &bytes).unwrap();
+    assert!(repo.find_tree(tree).unwrap().get_name(&name).is_some());
+    let snapshot = Snapshot::load(temp.path(), OsStr::new(&tree.to_string()), "long-name").unwrap();
+    let entry = snapshot.entry(Path::new(&name)).unwrap().unwrap();
+    assert_eq!(snapshot.read(entry.oid, 0, 100).unwrap(), b"payload");
+}
+
+#[test]
 fn materialization_does_not_launch_on_an_out_of_range_mode() {
     let temp = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp.path()).unwrap();
