@@ -613,7 +613,18 @@ impl Remote {
                 // metadata ODB. Blob payloads never get a second loose copy.
                 let odb = destination.odb()?;
                 let mut writer = odb.writer(size, kind)?;
-                crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
+                if kind == git2::ObjectType::Tree {
+                    self.raw_blobs.import_tree(
+                        oid,
+                        position,
+                        size,
+                        &mut payload,
+                        &mut writer,
+                        &self.dir,
+                    )?;
+                } else {
+                    crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
+                }
                 anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
             }
             let mut delimiter = [0];

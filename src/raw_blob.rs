@@ -43,6 +43,7 @@ struct Location {
     size: u64,
     tags: u64,
     generation: [u8; 16],
+    tree: bool,
 }
 #[derive(Clone)]
 pub(crate) struct RawBlob {
@@ -53,6 +54,13 @@ pub(crate) struct RawBlob {
     location: Location,
 }
 impl RawBlob {
+    pub(crate) fn kind(&self) -> git2::ObjectType {
+        if self.location.tree {
+            git2::ObjectType::Tree
+        } else {
+            git2::ObjectType::Blob
+        }
+    }
     pub(crate) fn len(&self) -> u64 {
         self.location.size
     }
@@ -64,6 +72,12 @@ impl RawBlob {
     }
     pub(crate) fn read_all(&self) -> Result<Vec<u8>> {
         self.range(0, self.len())
+    }
+    pub(crate) fn reader(&self) -> impl Read {
+        VerifiedReader {
+            blob: self.clone(),
+            position: 0,
+        }
     }
     fn range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
         if length == 0 {
@@ -99,6 +113,21 @@ impl RawBlob {
         data.copy_within(prefix..prefix + length, 0);
         data.truncate(length);
         Ok(data)
+    }
+}
+struct VerifiedReader {
+    blob: RawBlob,
+    position: u64,
+}
+impl Read for VerifiedReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let data = self
+            .blob
+            .read(self.position, bytes.len().min(64 * 1024) as u32)
+            .map_err(std::io::Error::other)?;
+        bytes[..data.len()].copy_from_slice(&data);
+        self.position += data.len() as u64;
+        Ok(data.len())
     }
 }
 /// Only staged, not-yet-trusted native stdout uses this unchecked reader.
@@ -201,10 +230,15 @@ pub(crate) struct RawBlobs {
     key: Key,
     slots: u64,
     hash: RandomState,
-    entries: u64,
-    bytes: u64,
+    indexed_entries: u64,
+    blob_entries: u64,
+    blob_bytes: u64,
+    tree_bytes: u64,
 }
 impl RawBlobs {
+    pub(crate) fn index_file(&self, directory: &Path) -> Result<Spool> {
+        Ok(self.files.file(directory)?)
+    }
     pub(crate) fn new(directory: &Path) -> Result<Self> {
         let files = Files::new(directory)?;
         Self::with_files(directory, files)
@@ -227,8 +261,10 @@ impl RawBlobs {
             key: Arc::new(key),
             slots: INITIAL_SLOTS,
             hash: RandomState::new(),
-            entries: 0,
-            bytes: 0,
+            indexed_entries: 0,
+            blob_entries: 0,
+            blob_bytes: 0,
+            tree_bytes: 0,
         })
     }
     fn seal(&self, record: &mut [u8; SLOT_BYTES as usize]) {
@@ -237,7 +273,7 @@ impl RawBlobs {
         record[64..].copy_from_slice(&auth.finalize().into_bytes());
     }
     fn verify(&self, record: &[u8; SLOT_BYTES as usize]) -> Result<()> {
-        if record[0] != 1 {
+        if record[0] != 1 || record[62] > 1 {
             return Err(invalid("invalid private raw-blob index"));
         }
         let mut auth = authenticator(self.key.as_ref(), b"git-on-raw-index-v1");
@@ -284,6 +320,7 @@ impl RawBlobs {
             return Err(invalid("private raw-blob locator changed"));
         }
         let location = decode_location(&record);
+        anyhow::ensure!(!location.tree, "snapshot file does not reference a blob");
         let first = record[45] == 0;
         if first {
             record[45] = 1;
@@ -322,10 +359,61 @@ impl RawBlobs {
         input: impl Read,
         directory: &Path,
     ) -> Result<()> {
+        self.import(
+            Incoming {
+                oid,
+                offset,
+                size,
+                tree: false,
+            },
+            input,
+            std::io::sink(),
+            directory,
+        )
+    }
+    pub(crate) fn import_tree(
+        &mut self,
+        oid: Oid,
+        offset: u64,
+        size: usize,
+        input: impl Read,
+        metadata: impl Write,
+        directory: &Path,
+    ) -> Result<()> {
+        self.import(
+            Incoming {
+                oid,
+                offset,
+                size,
+                tree: true,
+            },
+            input,
+            metadata,
+            directory,
+        )
+    }
+    fn import(
+        &mut self,
+        object: Incoming,
+        input: impl Read,
+        mut metadata: impl Write,
+        directory: &Path,
+    ) -> Result<()> {
+        let Incoming {
+            oid,
+            offset,
+            size,
+            tree,
+        } = object;
         let tags = (&*self.tags).seek(SeekFrom::End(0))?;
         let generation = *uuid::Uuid::new_v4().as_bytes();
         let mut output = Tags::new(&self.tags, self.key.as_ref(), oid, size as u64, generation);
-        crate::object::copy_verified(input, &mut output, git2::ObjectType::Blob, size, oid)?;
+        let kind = if tree {
+            git2::ObjectType::Tree
+        } else {
+            git2::ObjectType::Blob
+        };
+        crate::object::copy_verified(input, Tee(&mut output, &mut metadata), kind, size, oid)?;
         output.finish()?;
         self.publish(
             oid,
@@ -334,6 +422,7 @@ impl RawBlobs {
                 size: size as u64,
                 tags,
                 generation,
+                tree,
             },
             false,
             directory,
@@ -375,6 +464,25 @@ impl RawBlobs {
         input: impl Read,
         directory: &Path,
     ) -> Result<RawBlob> {
+        self.insert_kind(oid, size, input, directory, git2::ObjectType::Blob)
+    }
+    pub(crate) fn insert_tree(
+        &mut self,
+        oid: Oid,
+        size: usize,
+        input: impl Read,
+        directory: &Path,
+    ) -> Result<RawBlob> {
+        self.insert_kind(oid, size, input, directory, git2::ObjectType::Tree)
+    }
+    fn insert_kind(
+        &mut self,
+        oid: Oid,
+        size: usize,
+        input: impl Read,
+        directory: &Path,
+        kind: git2::ObjectType,
+    ) -> Result<RawBlob> {
         if let Some(blob) = self.get(oid)? {
             return Ok(blob);
         }
@@ -386,7 +494,7 @@ impl RawBlobs {
                 data: &self.data,
                 tags: Tags::new(&self.tags, self.key.as_ref(), oid, size as u64, generation),
             };
-            crate::object::copy_verified(input, &mut output, git2::ObjectType::Blob, size, oid)
+            crate::object::copy_verified(input, &mut output, kind, size, oid)
                 .and_then(|()| output.tags.finish())
         };
         if let Err(error) = outcome {
@@ -403,6 +511,7 @@ impl RawBlobs {
             size: size as u64,
             tags,
             generation,
+            tree: kind == git2::ObjectType::Tree,
         };
         self.publish(oid, location, true, directory)?;
         Ok(self.blob(oid, location))
@@ -417,7 +526,7 @@ impl RawBlobs {
         if self.get(oid)?.is_some() {
             return Ok(());
         }
-        if self.entries >= self.slots / 2 {
+        if self.indexed_entries >= self.slots / 2 {
             self.grow(directory)?;
         }
         let mut record = [0; SLOT_BYTES as usize];
@@ -428,11 +537,17 @@ impl RawBlobs {
         record[37..45].copy_from_slice(&location.tags.to_le_bytes());
         record[45] = u8::from(used);
         record[46..62].copy_from_slice(&location.generation);
+        record[62] = u8::from(location.tree);
         self.seal(&mut record);
         let (slot, _) = self.locate(oid)?;
         self.index.write_all_at(&record, slot * SLOT_BYTES)?;
-        self.entries += 1;
-        self.bytes += location.size;
+        self.indexed_entries += 1;
+        if location.tree {
+            self.tree_bytes += location.size;
+        } else {
+            self.blob_entries += 1;
+            self.blob_bytes += location.size;
+        }
         Ok(())
     }
     #[cfg(feature = "test-metrics")]
@@ -448,10 +563,31 @@ impl RawBlobs {
         Ok(oids)
     }
     pub(crate) fn entries(&self) -> u64 {
-        self.entries
+        self.blob_entries
     }
     pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
+        self.blob_bytes
+    }
+    pub(crate) fn tree_bytes(&self) -> u64 {
+        self.tree_bytes
+    }
+}
+struct Incoming {
+    oid: Oid,
+    offset: u64,
+    size: usize,
+    tree: bool,
+}
+struct Tee<A, B>(A, B);
+impl<A: Write, B: Write> Write for Tee<A, B> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write_all(bytes)?;
+        self.1.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()?;
+        self.1.flush()
     }
 }
 pub(crate) struct RawOutput {
@@ -476,6 +612,7 @@ fn decode_location(record: &[u8; SLOT_BYTES as usize]) -> Location {
         size: u64::from_le_bytes(record[29..37].try_into().unwrap()),
         tags: u64::from_le_bytes(record[37..45].try_into().unwrap()),
         generation: record[46..62].try_into().unwrap(),
+        tree: record[62] != 0,
     }
 }
 

@@ -12,4 +12,5 @@ mod raw_blob;
 pub mod remote;
 pub mod snapshot;
 mod spool;
+mod tree;
 mod wildmatch;

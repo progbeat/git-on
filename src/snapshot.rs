@@ -1,4 +1,5 @@
 //! Immutable, demand-loaded objects from the pinned Git tree.
+use crate::tree::{Directory, PreparedTrees, TreeItem};
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags};
 use serde::Serialize;
@@ -242,6 +243,9 @@ pub struct SnapshotMetrics {
     pub remote_fetch_operations: u64,
     pub remote_decode_operations: u64,
     pub tree_reads: u64,
+    pub prepared_tree_entries: u64,
+    pub retained_tree_bytes: u64,
+    pub tree_index_probes: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
     pub blob_bytes: u64,
@@ -359,16 +363,11 @@ impl<V: Clone> Cache<V> {
     }
 }
 
-#[derive(Debug)]
-struct TreeItem {
-    name: OsString,
-    mode: u32,
-    oid: Oid,
-}
 struct State {
     repo: Repository,
     remote: Option<crate::remote::Remote>,
-    trees: Cache<Arc<[TreeItem]>>,
+    trees: Cache<Arc<Directory>>,
+    prepared_trees: Option<PreparedTrees>,
     headers: Cache<u64>,
     blobs: Cache<Arc<[u8]>>,
     readers: Arc<ReaderRegistry>,
@@ -384,43 +383,93 @@ impl State {
         }
         Ok(())
     }
-    fn tree(&mut self, oid: Oid) -> Result<Arc<[TreeItem]>> {
+    fn raw_store(&self) -> Option<&crate::raw_blob::RawBlobs> {
+        self.remote
+            .as_ref()
+            .map(|remote| &remote.raw_blobs)
+            .or(self.raw_blobs.as_ref())
+    }
+    fn tree(&mut self, oid: Oid) -> Result<Arc<Directory>> {
         if let Some(tree) = self.trees.get(oid) {
             self.metrics.cache_hits += 1;
             return Ok(tree);
         }
-        self.metrics.tree_reads += 1;
+        if let Some(raw) = self
+            .raw_store()
+            .map(|store| store.get(oid))
+            .transpose()?
+            .flatten()
+        {
+            anyhow::ensure!(
+                raw.kind() == ObjectType::Tree,
+                "snapshot directory does not reference a tree"
+            );
+            if let Some(tree) = self
+                .prepared_trees
+                .as_ref()
+                .map(|store| store.open(oid, raw))
+                .transpose()?
+                .flatten()
+            {
+                self.metrics.cache_hits += 1;
+                let tree = Arc::new(tree);
+                self.trees.insert(oid, tree.clone(), tree.weight());
+                return Ok(tree);
+            }
+        }
         self.ensure(oid)?;
-        let (entries, weight) = {
-            let tree = self.repo.find_tree(oid).context("read snapshot tree")?;
-            let mut entries = Vec::with_capacity(tree.len());
-            let mut weight = std::mem::size_of::<usize>() * 2;
-            for item in tree.iter() {
-                let bytes = item.name_bytes();
-                if bytes.is_empty()
-                    || bytes.contains(&b'/')
-                    || bytes.contains(&0)
-                    || bytes == b"."
-                    || bytes == b".."
-                {
-                    bail!("invalid name in Git tree");
-                }
-                // This copies only this directory's metadata, never descendants.
-                weight = weight.saturating_add(std::mem::size_of::<TreeItem>() + bytes.len());
-                entries.push(TreeItem {
-                    name: OsString::from_vec(bytes.to_vec()),
-                    mode: item.filemode() as u32,
-                    oid: item.id(),
-                });
-            }
-            entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-            if entries.windows(2).any(|pair| pair[0].name == pair[1].name) {
-                bail!("duplicate path in Git tree");
-            }
-            (Arc::<[TreeItem]>::from(entries), weight)
+        if self.remote.is_none() && self.raw_blobs.is_none() {
+            self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
+        }
+        let raw = if let Some(raw) = self.raw_store().unwrap().get(oid)? {
+            anyhow::ensure!(
+                raw.kind() == ObjectType::Tree,
+                "snapshot directory does not reference a tree"
+            );
+            raw
+        } else {
+            let odb = self.repo.odb()?;
+            let storage = if let Some(remote) = &mut self.remote {
+                &mut remote.raw_blobs
+            } else {
+                self.raw_blobs.as_mut().unwrap()
+            };
+            let decoded = if let Ok((reader, size, kind)) = odb.reader(oid) {
+                anyhow::ensure!(
+                    kind == ObjectType::Tree,
+                    "snapshot directory does not reference a tree"
+                );
+                storage.insert_tree(oid, size, reader, &self.spool_directory)?
+            } else {
+                let object = odb.read(oid).context("decode snapshot tree")?;
+                anyhow::ensure!(
+                    object.kind() == ObjectType::Tree,
+                    "snapshot directory does not reference a tree"
+                );
+                storage.insert_tree(oid, object.len(), object.data(), &self.spool_directory)?
+            };
+            decoded
         };
-        self.trees.insert(oid, entries.clone(), weight);
-        Ok(entries)
+        let storage = self
+            .remote
+            .as_ref()
+            .map(|remote| &remote.raw_blobs)
+            .or(self.raw_blobs.as_ref())
+            .unwrap();
+        if self.prepared_trees.is_none() {
+            self.prepared_trees = Some(PreparedTrees::new(storage, &self.spool_directory)?);
+        }
+        self.metrics.tree_reads += 1;
+        let tree = self.prepared_trees.as_mut().unwrap().prepare(
+            oid,
+            raw,
+            storage,
+            &self.spool_directory,
+            self.trees.byte_limit,
+        )?;
+        let tree = Arc::new(tree);
+        self.trees.insert(oid, tree.clone(), tree.weight());
+        Ok(tree)
     }
     fn size(&mut self, oid: Oid) -> Result<u64> {
         if let Some(size) = self.headers.get(oid) {
@@ -442,6 +491,10 @@ impl State {
                 .transpose()?
                 .flatten())
         {
+            anyhow::ensure!(
+                raw.kind() == ObjectType::Blob,
+                "snapshot file does not reference a blob"
+            );
             let size = raw.len();
             self.headers.insert(oid, size, std::mem::size_of::<u64>());
             return Ok(size);
@@ -550,6 +603,10 @@ impl State {
                 }
                 blob
             };
+            anyhow::ensure!(
+                raw.kind() == ObjectType::Blob,
+                "snapshot file does not reference a blob"
+            );
             if raw.len() <= self.blobs.byte_limit as u64 {
                 let bytes = raw.read_all()?;
                 Self::validate_blob(&bytes)?;
@@ -687,26 +744,28 @@ impl Snapshot {
             }
             Ok(())
         };
-        let object = repo.find_object(oid, None)?;
+        let kind = |remote: &Option<crate::remote::Remote>, oid| -> Result<ObjectType> {
+            if let Some(raw) = remote
+                .as_ref()
+                .map(|remote| remote.raw_blobs.get(oid))
+                .transpose()?
+                .flatten()
+            {
+                return Ok(raw.kind());
+            }
+            Ok(repo.odb()?.read_header(oid)?.1)
+        };
         if verify {
             let git = remote.as_ref().map(|r| &r.git).or(git.as_ref()).unwrap();
-            git.verify(
-                repo.path(),
-                oid,
-                object.kind().context("unknown Git object type")?,
-            )?;
+            git.verify(repo.path(), oid, kind(&remote, oid)?)?;
         }
-        drop(object);
         let mut selected = oid;
         let tree_oid = loop {
             ensure(&mut remote, selected)?;
-            let object = repo.find_object(selected, None)?;
-            match object.kind() {
-                Some(ObjectType::Tree) => break selected,
-                Some(ObjectType::Commit) => break object.as_commit().unwrap().tree_id(),
-                Some(ObjectType::Tag) => {
-                    selected = object.as_tag().unwrap().target_id();
-                }
+            match kind(&remote, selected)? {
+                ObjectType::Tree => break selected,
+                ObjectType::Commit => break repo.find_commit(selected)?.tree_id(),
+                ObjectType::Tag => selected = repo.find_tag(selected)?.target_id(),
                 _ => bail!("revision does not resolve to a tree"),
             }
         };
@@ -742,6 +801,7 @@ impl Snapshot {
                     repo,
                     remote,
                     trees: Cache::new(TREE_CACHE_BYTES, TREE_CACHE_ENTRIES),
+                    prepared_trees: None,
                     headers: Cache::new(HEADER_CACHE_ENTRIES * 8, HEADER_CACHE_ENTRIES),
                     blobs: Cache::new(BLOB_CACHE_BYTES, BLOB_CACHE_ENTRIES),
                     readers: Arc::new(Mutex::new(HashMap::new())),
@@ -803,10 +863,15 @@ impl Snapshot {
                 bail!("snapshot ancestor is not a directory: {}", path.display());
             }
             let tree = state.tree(entry.oid)?;
-            let Ok(index) = tree.binary_search_by(|item| item.name.as_os_str().cmp(name)) else {
+            let Some(item) = state
+                .prepared_trees
+                .as_ref()
+                .unwrap()
+                .lookup(entry.oid, &tree, name)?
+            else {
                 return Ok(None);
             };
-            entry = Self::metadata(&tree[index], path)?;
+            entry = Self::metadata(&item, path)?;
         }
         Ok(Some(entry))
     }
@@ -832,7 +897,8 @@ impl Snapshot {
         }
         state
             .tree(entry.oid)?
-            .iter()
+            .children()?
+            .into_iter()
             .map(|item| {
                 Ok((
                     item.name.clone(),
@@ -846,7 +912,7 @@ impl Snapshot {
                             size: Some(0),
                         }
                     } else {
-                        Self::metadata(item, &path.join(&item.name))?
+                        Self::metadata(&item, &path.join(&item.name))?
                     },
                 ))
             })
@@ -881,7 +947,10 @@ impl Snapshot {
             let storage = path.parent().context("missing private storage parent")?;
             state.raw_blobs = Some(crate::raw_blob::RawBlobs::new(storage)?);
         }
-        state.spool_directory = path.to_path_buf();
+        state.spool_directory = path
+            .parent()
+            .context("missing private storage parent")?
+            .to_path_buf();
         Ok(())
     }
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
@@ -944,6 +1013,11 @@ impl Snapshot {
         metrics.blob_cache_bytes = state.blobs.bytes;
         metrics.blob_cache_entries = state.blobs.values.len();
         metrics.blob_cache_limit = state.blobs.byte_limit;
+        if let Some(store) = &state.prepared_trees {
+            metrics.prepared_tree_entries = store.entries();
+            metrics.retained_tree_bytes = state.raw_store().map_or(0, |raw| raw.tree_bytes());
+            metrics.tree_index_probes = store.probes();
+        }
         metrics.tree_cache_bytes = state.trees.bytes;
         metrics.tree_cache_entries = state.trees.values.len();
         metrics.tree_cache_limit = state.trees.byte_limit;
@@ -1290,6 +1364,74 @@ mod tests {
         let entry = snap.entry(Path::new("good")).unwrap().unwrap();
         assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"good");
         assert!(snap.children(Path::new("unvisited")).is_err());
+    }
+    #[test]
+    fn oversized_directory_metadata_is_prepared_once_for_repeated_lookups() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        for index in 0..40 {
+            tree.insert(format!("file-{index:03}"), blob, 0o100644)
+                .unwrap();
+        }
+        let tree = tree.write().unwrap();
+        let snapshot = Snapshot::load(
+            tmp.path(),
+            OsStr::new(&tree.to_string()),
+            "oversized-metadata",
+        )
+        .unwrap();
+        snapshot.state().unwrap().trees = Cache::new(128, 1);
+        for index in 0..20 {
+            assert_eq!(
+                snapshot
+                    .entry(Path::new(&format!("file-{index:03}")))
+                    .unwrap()
+                    .unwrap()
+                    .size,
+                Some(1)
+            );
+        }
+        assert!(snapshot.entry(Path::new("absent")).unwrap().is_none());
+        assert_eq!(
+            snapshot.metrics().tree_reads,
+            1,
+            "oversized metadata was decoded/scanned again"
+        );
+        assert_eq!(snapshot.metrics().blob_loads, 0);
+    }
+    #[test]
+    fn metadata_eviction_keeps_prepared_directory_entries_available() {
+        let (tmp, _) = fixture();
+        let snapshot = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "metadata-eviction").unwrap();
+        snapshot.state().unwrap().trees = Cache::new(TREE_CACHE_BYTES, 1);
+        assert_eq!(
+            snapshot
+                .entry(Path::new("dir/child"))
+                .unwrap()
+                .unwrap()
+                .size,
+            Some(9)
+        );
+        let reads = snapshot.metrics().tree_reads;
+        assert_eq!(
+            snapshot.entry(Path::new("script")).unwrap().unwrap().size,
+            Some(9)
+        );
+        assert_eq!(
+            snapshot
+                .entry(Path::new("dir/child"))
+                .unwrap()
+                .unwrap()
+                .size,
+            Some(9)
+        );
+        assert_eq!(
+            snapshot.metrics().tree_reads,
+            reads,
+            "eviction reread a prepared Git tree"
+        );
     }
     #[test]
     fn reader_registry_releases_closed_entries_without_another_open() {
