@@ -211,7 +211,11 @@ def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
         end = time.monotonic_ns(); elapsed = end-begin; after = resource.getrusage(resource.RUSAGE_CHILDREN)
         if code: raise RuntimeError(f'command exited {code}: {errors[-65536:].decode(errors="replace")}')
         rows = [json.loads(line) for line in output.splitlines()]
-        value = dict(argv=observed_argv,elapsed_ns=elapsed, waited_user_cpu_s=after.ru_utime-before.ru_utime,
+        value = dict(argv=observed_argv,elapsed_ns=elapsed,
+            waited_voluntary_context_switches=after.ru_nvcsw-before.ru_nvcsw,
+            waited_involuntary_context_switches=after.ru_nivcsw-before.ru_nivcsw,
+            waited_minor_faults=after.ru_minflt-before.ru_minflt,waited_major_faults=after.ru_majflt-before.ru_majflt,
+            waited_user_cpu_s=after.ru_utime-before.ru_utime,
             waited_system_cpu_s=after.ru_stime-before.ru_stime, memory=samples,
             waited_input_block_bytes=(after.ru_inblock-before.ru_inblock)*512,
             waited_output_block_bytes=(after.ru_oublock-before.ru_oublock)*512,
@@ -448,10 +452,13 @@ def run(options):
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     dirty = bool(subprocess.check_output(['git', 'status', '--porcelain']))
     options.output.parent.mkdir(parents=True, exist_ok=True)
+    # Capture checkout identity before creating this run's untracked report.
+    from benchmark import machine_metadata
+    hardware=machine_metadata(repo,options.output.parent)
+    hardware.update(kernel=os.uname().release,python=sys.version,
+        binary_sha256=hashlib.sha256(options.binary.read_bytes()).hexdigest())
     with tempfile.TemporaryDirectory(prefix='git-on-real-benchmark-') as temporary, options.output.open('w') as output:
         root = Path(temporary); stat_bytes = stat_abi_bytes(root); env = environment()
-        from benchmark import machine_metadata
-        hardware=machine_metadata(repo,root)
         env.update(TMPDIR=str(root), GIT_LFS_SKIP_SMUDGE='1')
         def measured(argv,cwd,env,timeout,metrics=False):
             return observe(argv,cwd,env,timeout,metrics,resource_observer=root/'resource-observer')

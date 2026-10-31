@@ -577,3 +577,36 @@ partial estimate; cross-run timings are not an isolated causal speed comparison.
 This useful small-command result does not complete #20 or justify the full
 traversal cost. The subsequent independent review also found missing final
 failure propagation for caught raw-storage EIO; its fix requires fresh head CI.
+
+### Full-path diagnosis and backing-cache advice
+
+The labelled `082e5f6` diagnostic on a 4-vCPU AMD EPYC / 16 GiB CI VM took
+322.88 s against a 139.32 s complete baseline. This is not an uninstrumented
+speed comparison with f272504: direct command passes also fell from 16.02/14.08 s
+to 10.91/9.01 s on this host. Command time was 262.73 s; owned state cleanup
+(including raw files) took 58.56 s. Inclusive raw disk-read spans totalled
+55.05 s, requester checks 30.74 s and lookup callbacks 16.71 s; nested spans
+must not be added as independent costs. The invocation incurred 5.69 GB of
+waited block input and decoded every nonempty unique blob only once.
+
+All sampled direct-copy pages remained resident. The FUSE view retained fewer
+sampled pages while prepared raw copies also occupied cache; the invocation's
+file cache approached 13.7 GB. This motivates testing Linux NOREUSE on backing reads. DONTNEED is not used:
+Linux's implementation can initiate asynchronous writeback, which is additional
+I/O even without a durability barrier. NOREUSE never changes data, forces
+durability, explicitly drops unread ranges, or bypasses the owned-buffer check. Unsupported kernels/filesystems may ignore it.
+The local host did not discard a controlled clean-file range, so its focused
+page-retention test is explicitly unavailable rather than red/green evidence.
+A separate loader syscall regression checks that the raw read path actually
+requests NOREUSE while preserving bytes and one-time decoding; it does not
+claim the host honors that advice. Full-workload CI measurements are required
+before claiming this optimization effective. Context-switch and page-fault observations accompany
+the next full-path diagnostic; all work and cleanup remain counted.
+
+Requester checks continue reading the current task status on every poll, but
+reuse a thread-local scratch allocation instead of repeatedly growing an empty
+buffer. A paired syscall observation of the existing real-disposition test
+reduced status reads from 125 to 65 while retaining all 30 seeks/polls and
+passing the same signal cases. Large supplementary-group lists still read to
+EOF. This is a focused syscall result, not evidence that the full workload's
+30.74 s requester-check span has disappeared.

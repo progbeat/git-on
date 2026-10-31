@@ -712,6 +712,9 @@ impl std::error::Error for RequestInterrupted {}
 
 thread_local! {
     static REQUEST_STATUS: RefCell<Option<File>> = const { RefCell::new(None) };
+    // Reuse scratch allocation without caching any status/disposition. Large
+    // supplementary-group lists still read to EOF and may grow this buffer.
+    static REQUEST_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
 }
 
 /// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
@@ -779,9 +782,12 @@ pub(crate) fn check_request_interruption() -> Result<()> {
         let mut slot = slot.borrow_mut();
         let status = slot.as_mut()?;
         status.rewind().ok()?;
-        let mut bytes = Vec::new();
-        status.read_to_end(&mut bytes).ok()?;
-        pending_request_signal(&bytes)
+        REQUEST_BUFFER.with(|buffer| {
+            let mut bytes = buffer.borrow_mut();
+            bytes.clear();
+            status.read_to_end(&mut bytes).ok()?;
+            pending_request_signal(&bytes)
+        })
     });
     if let Some(signal) = signal {
         return Err(RequestInterrupted(signal).into());
