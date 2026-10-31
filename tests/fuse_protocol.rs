@@ -72,6 +72,14 @@ impl Peer {
         Self::with_capabilities(policy, extended, 0).0
     }
     fn with_capabilities(policy: WritePolicy, extended: bool, extra: u32) -> (Self, u32) {
+        Self::with_directory_size(policy, extended, extra, 0)
+    }
+    fn with_directory_size(
+        policy: WritePolicy,
+        extended: bool,
+        extra: u32,
+        count: usize,
+    ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -85,6 +93,13 @@ impl Peer {
             .unwrap();
         tree.insert("link", repo.blob(b"tracked").unwrap(), 0o120000)
             .unwrap();
+        if count != 0 {
+            let content = repo.blob(b"unrequested payload").unwrap();
+            for index in 0..count {
+                tree.insert(format!("file-{index:05}"), content, 0o100644)
+                    .unwrap();
+            }
+        }
         let oid = tree.write().unwrap();
         let snapshot =
             Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "protocol").unwrap();
@@ -696,6 +711,77 @@ fn protocol_creation_links_removal_and_rename_flags() {
     p.ok(11, 1, names(vec![], &["cache"]));
     p.ok(10, 1, names(vec![], &["node.tmp"]));
     p.err(10, 1, names(vec![], &["tracked"]), libc::EROFS);
+}
+
+#[test]
+fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 2000);
+        let first = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        assert_eq!(
+            dirents(&p.ok(28, 1, io(first, 0, 32, 0))),
+            [(1, b".".to_vec())]
+        );
+        let second = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let page = p.ok(28, 1, io(first, 100, 48, 0));
+        assert_eq!(dirents(&page).len(), 1);
+        assert_eq!(num(&page, 8), 101);
+        assert_eq!(p.ok(28, 1, io(first, 100, 48, 0)), page);
+        assert_eq!(p.ok(28, 1, io(second, 100, 48, 0)), page);
+        let ino = num(&page, 0);
+        let name = std::str::from_utf8(&dirents(&page)[0].1)
+            .unwrap()
+            .to_owned();
+        p.ok(29, 1, u64s(&[first, 0, 0]));
+        assert_eq!(
+            p.lookup(1, &name),
+            ino,
+            "readdir and lookup identities differ"
+        );
+        p.send(2, ino, u64s(&[1]));
+        p.ok(3, ino, vec![0; 16]);
+        p.ok(29, 1, u64s(&[second, 0, 0]));
+        p.err(3, ino, vec![0; 16], libc::ENOENT);
+        assert_eq!(
+            p.lookup(1, &name),
+            ino,
+            "same source changed identity after metadata eviction"
+        );
+        p.err(28, 1, io(first, 0, 48, 0), libc::EBADF);
+    }
+}
+
+#[test]
+fn protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_close() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let old = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let before = p.ok(28, 1, io(old, 0, 4096, 0));
+    let rows = dirents(&before);
+    let tracked_offset = rows
+        .iter()
+        .position(|(_, name)| name == b"tracked")
+        .unwrap();
+    let tracked_ino = num(&p.ok(28, 1, io(old, tracked_offset as i64, 40, 0)), 0);
+    p.ok(12, 1, names(u64s(&[1]), &["tracked", "renamed"]));
+    let (late, late_fh) = p.create("late");
+    p.release(late, late_fh);
+    let latest = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    p.ok(29, 1, u64s(&[latest, 0, 0]));
+    p.ok(10, 1, names(vec![], &["late"]));
+    p.send(2, late, u64s(&[1]));
+    p.err(3, late, vec![0; 16], libc::ENOENT);
+    p.ok(10, 1, names(vec![], &["renamed"]));
+    assert_eq!(p.ok(28, 1, io(old, 0, 4096, 0)), before);
+    let reader = p.open(tracked_ino, libc::O_RDONLY);
+    assert_eq!(p.ok(15, tracked_ino, io(reader, 0, 100, 0)), b"original\n");
+    p.release(tracked_ino, reader);
+    p.ok(29, 1, u64s(&[old, 0, 0]));
+    p.err(3, tracked_ino, vec![0; 16], libc::ENOENT);
 }
 
 #[test]

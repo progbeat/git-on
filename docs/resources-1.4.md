@@ -634,3 +634,43 @@ checks one decode, one retained cache entry and no handle retention. The mounted
 regression additionally exercises independent opens, dup, mmap, fstat and sync
 on a 17 MiB file; it requires an actual FUSE host. This removes a known source of
 protocol work, but its effect on the complete WebKit workload must be measured.
+
+### Shared directory views and partial enumeration
+
+The old frontend built a fresh vector of every name, inserted a path/inode
+reservation for every child, and walked them all again on close. The focused
+10,000-name regression at `4e0cfd1` failed with 10,001 paths after an opendir
+that consumed only `.`. The replacement keeps one root path in this scenario,
+with no blob-header/payload reads, for all four policies across 16 reopenings.
+
+The verified parsed tree remains shared by OID. Each touched source-directory
+path reserves one checked u64 inode range in constant space; its index gives
+the same child's identity during readdir and subsequent lookup, even if node
+metadata was forgotten. Distinct paths sharing one tree receive distinct
+ranges. These identities are not reassigned to another file. FORGET still
+releases cached nodes and path entries when references permit it. This follows
+the distinction between file identity and cached inode state in
+[libfuse's inode/generation contract](https://libfuse.github.io/doxygen/structfuse__entry__param.html).
+
+An untouched source view borrows names directly from this array. Offset/cookie
+access does not scan earlier entries. Each open adds only a handle and fixed
+dot references. Actual forgotten/removed nodes are deferred once per live
+directory group; the last close reclaims just that work. Binding birth is
+ordered against existing handle IDs, using their intrusive newest-first index,
+so names created after all live views are not pinned. Rename/unlink/hardlink
+tests also cover closing the newest view before deleting a late name.
+
+Namespace changes invalidate a cached merged view without immediately dropping
+its allocation; the next open builds the new version. Existing handles retain
+their previous Arc and cookies. Reopening an unchanged mixed 10,001-name view
+16 times prepares those rows once, not 16 times. Merged-view rebuilding after
+mutations still takes directory/prefix work; this change does not prove the
+complete overhead contract for arbitrary mutation sequences. No extra B-tree,
+disk index, cache daemon or global storage is introduced.
+
+Protocol tests exercise small replies, offset replay, independent streams,
+lookup/forget identity and namespace replacement. The existing mounted mixed
+pagination fixture now also exercises repeated partial streams and inode
+identity, without adding another large fixture. Full WebKit diagnostics record
+opendir/readdir/releasedir and view-building spans; local /dev/fuse is absent,
+so local skips are not mounted evidence. Performance acceptance remains open.

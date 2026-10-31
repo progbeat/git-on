@@ -765,8 +765,8 @@ impl Snapshot {
         }
         Ok(Some(entry))
     }
-    /// Enumerate one directory without reading child tree objects or blob headers.
-    pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
+    /// Share a verified directory without copying names or reading children.
+    pub(crate) fn directory(&self, path: &Path) -> Result<Arc<Directory>> {
         let mut state = self.state()?;
         let entry = self
             .lookup(&mut state, path)?
@@ -774,8 +774,11 @@ impl Snapshot {
         if entry.kind != EntryKind::Directory {
             bail!("snapshot path is not a directory: {}", path.display());
         }
-        state
-            .tree(entry.oid)?
+        state.tree(entry.oid)
+    }
+    /// Enumerate one directory without reading child tree objects or blob headers.
+    pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
+        self.directory(path)?
             .children()?
             .into_iter()
             .map(|item| {

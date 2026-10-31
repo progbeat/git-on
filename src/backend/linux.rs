@@ -610,8 +610,13 @@ impl Filesystem for Fuse {
         empty(reply, result);
     }
     fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_opendir", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
-        match self.state().core.open_directory(ino.0, flags.0) {
+        let mut state = self.state();
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("opendir");
+        match state.core.open_directory(ino.0, flags.0) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -624,16 +629,17 @@ impl Filesystem for Fuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_readdir", 0);
         let state = self.state();
-        match state.core.entries(ino.0, fh.0, offset) {
-            Ok(entries) => {
-                for (i, (ino, k, name)) in entries.iter().enumerate() {
-                    if reply.add(INodeNo(*ino), offset + i as u64 + 1, kind(*k), name) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
+        #[cfg(feature = "test-metrics")]
+        state.core.record_fuse_request("readdir");
+        match state
+            .core
+            .read_directory(ino.0, fh.0, offset, |ino, k, name, cookie| {
+                reply.add(INodeNo(ino), cookie, kind(k), name)
+            }) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -645,6 +651,10 @@ impl Filesystem for Fuse {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_releasedir", 0);
+        #[cfg(feature = "test-metrics")]
+        self.state().core.record_fuse_request("releasedir");
         empty(reply, self.state().release(ino.0, fh.0));
     }
     fn fsyncdir(

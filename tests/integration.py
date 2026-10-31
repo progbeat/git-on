@@ -1114,6 +1114,30 @@ try:
     assert set(os.listdir(b'out/paged')) == expected - {b'.', b'..'}
 finally:
     assert libc.closedir(directory) == 0
+
+# Repeated partial streams must not rebuild or reserve the whole directory.
+# Keep this in the existing mixed fixture so it adds no scale preparation.
+def read_prefix(stream):
+    rows=[]
+    for _ in range(20):
+        entry=libc.readdir64(stream)
+        assert entry, ctypes.get_errno()
+        name=bytes(entry.contents.name);ino=entry.contents.ino
+        if name not in {b'.',b'..'}:
+            assert os.lstat(b'out/paged/'+name).st_ino==ino,(name,ino)
+        rows.append((name,ino))
+    return rows
+for _ in range(16):
+    first=libc.opendir(b'out/paged');second=libc.opendir(b'out/paged')
+    assert first and second,ctypes.get_errno()
+    try:
+        prefix=read_prefix(first)
+        assert read_prefix(second)==prefix
+        libc.seekdir(first,0)
+        assert read_prefix(first)==prefix
+    finally:
+        assert libc.closedir(first)==0
+        assert libc.closedir(second)==0
 ''')
         self.assert_success(result)
         self.assert_no_runtime_files()

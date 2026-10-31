@@ -72,6 +72,14 @@ impl Directory {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
+    pub(crate) fn index(&self, name: &OsStr) -> Option<usize> {
+        self.names.get(name).copied()
+    }
+    pub(crate) fn at(&self, index: usize) -> Option<(&OsStr, u32)> {
+        self.entries
+            .get(index)
+            .map(|node| (node.name.as_ref(), node.mode))
+    }
     fn owned(node: &Node) -> TreeItem {
         TreeItem {
             name: node.name.to_os_string(),
