@@ -223,3 +223,22 @@ complete materialization baselines and both full-read passes. The useful
 32-test invocations themselves took under one second. This separates the cost
 of meaningful pre-merge real-repository validation from the earlier synthetic
 speedup; no expensive legacy full matrix was rerun or silently moved post-merge.
+
+
+For full-path attribution, the current diagnostic stage uses `--profile-full`
+on the existing single WebKit full-read invocation. The workload, baseline,
+number of passes and actual-data gates are unchanged. Results explicitly mark
+profiling; inclusive read/open/hash/spill/decode spans overlap and must not be
+summed. The private complete invocation timeline additionally separates source,
+mount, command, unmount and cleanup and preserves parent-observed total time.
+These diagnoses are not uninstrumented timing comparisons. The useful test
+trials stay unprofiled, and no second full WebKit run is added within the job.
+
+The same diagnostic command samples up to 16 regular-file paths per size bucket
+(<1 KiB, <=64 KiB, <=1 MiB, >1 MiB) after each pass. PROT_NONE mappings and
+mincore inspect existing page residency without reading file payloads; raw and
+FUSE-view pages are reported separately. Missing/protected observations stay
+explicit. Sampling time stays in the diagnostic command/total time. CPU, RAM
+limit and filesystem metadata use the existing benchmark collector; system and
+cgroup file/anonymous-cache observations accompany the samples. These are
+limited observations, not a whole-cache census or a physical-memory peak.

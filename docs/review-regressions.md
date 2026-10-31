@@ -2280,3 +2280,14 @@ Raw read failures now remain in the invocation store and feed the existing
 remote final-status path; request-specific EINTR stays retryable. A real-mount
 regression catches the raw-storage EIO and requires runner status 125, the
 original diagnostic and complete cleanup.
+
+### Reopened small objects avoid repeated format validation
+
+After a 512-byte ordinary blob was verified/read and then evicted, opening a
+new reader reloaded and authenticated all 512 bytes solely to repeat the LFS
+pointer check. The permanent snapshot regression reproduced that extra I/O.
+Successful content-policy validation is now retained with the immutable object's
+trusted descriptor. The regression requires zero spill hydration on reopen and
+512 authenticated bytes when the requested one-byte data range is actually
+read. Failed policy validation is not cached as success; existing repeated LFS
+rejection cases remain in the suite. Block verification is unchanged.

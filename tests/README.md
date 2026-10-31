@@ -19,6 +19,22 @@ package installation is required. The direct command is:
 PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
 ```
 
+An actual Git-on invocation of the same useful command is:
+
+```sh
+git-on file:///absolute/path/to/webkit-fixture/repository.git 4b125afe35a2e95bf764d7a5e2efe7dc574a0653 --write-policy=none -- env PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+```
+
+For the local mode, run from that bare repository's directory and omit the
+`file://...` operand. The reported benchmark uses its external Python wrapper
+to run this test command twice in one mount and retain separate first/repeat
+outputs; `runner.argv` records the exact measured Git-on argv, excluding the
+resource observer prefix. The one-pass command above is the interactive demo. `--profile-full`
+on the harness enables labelled inclusive diagnostics for its one full-read
+case; it does not add another complete traversal. Complete invocation timing
+still includes setup and cleanup. Profiling results are not presented as
+uninstrumented latency measurements.
+
 This is not a public-network latency benchmark. Source and OS-cache
 conditions, complete baseline composition and sampled-memory limitations are
 explicit in each report. See [CI coverage](../docs/ci-performance.md).

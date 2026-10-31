@@ -13,8 +13,9 @@ import unittest
 from unittest import mock
 
 from benchmark import environment
-from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output
+from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, cached_pages, validate_reports,validate_test_output
 from import_profile import stat_abi_bytes
+from startup_profile import PHASES
 
 
 class RealRepositoryTests(unittest.TestCase):
@@ -120,6 +121,38 @@ class RealRepositoryTests(unittest.TestCase):
         with mock.patch('real_repository.Path',return_value=proc),mock.patch.object(Path,'iterdir',directories):
             self.assertEqual(process_snapshot(123),(4321,0,True,False))
 
+    def test_metrics_and_complete_timeline_survive_the_waited_peak_wrapper(self):
+        stat_abi_bytes(self.root)
+        metrics=dict(blob_cache_bytes=0,blob_cache_limit=16*1024*1024,tree_cache_bytes=0,tree_cache_limit=0)
+        code=f"""import json,os,time
+phases={PHASES!r}
+events=[dict(phase=p,monotonic_ns=time.monotonic_ns()) for p in phases]
+for key,value in [('GIT_ON_TEST_METRICS_FD',{metrics!r}),('GIT_ON_TEST_TIMING_FD',events)]:
+ with os.fdopen(int(os.environ[key]),'w') as output:json.dump(value,output)
+print(json.dumps(dict(completed='channels')))
+"""
+        observed=observe([sys.executable,'-I','-S','-c',code],self.root,environment(),5,metrics=True,resource_observer=self.root/'resource-observer')
+        self.assertEqual(observed['metrics'],metrics)
+        self.assertEqual(observed['argv'][0],sys.executable)
+        self.assertNotIn(str(self.root/'resource-observer'),observed['argv'])
+        self.assertEqual([event['phase'] for event in observed['runner_timeline']],PHASES)
+        self.assertGreater(observed['waited_process_peak_rss_kib'],0)
+        self.assertLessEqual(sum(observed['intervals'].values()),observed['elapsed_ns'])
+
+    @unittest.skipUnless(sys.platform=='linux','Linux mincore performance diagnostic')
+    def test_cache_probe_reports_owned_file_residency_without_changing_bytes(self):
+        path=self.root/'cache-observation';data=b'unchanged'*1024;path.write_bytes(data)
+        observed=cached_pages(path,len(data))
+        self.assertGreater(observed['pages'],0)
+        self.assertIsInstance(observed['resident'],int)
+        self.assertLessEqual(observed['resident'],observed['pages'])
+        self.assertEqual(path.read_bytes(),data)
+        self.assertIn('unavailable_errno',cached_pages(self.root/'absent',len(data)))
+        completed=subprocess.run([*command(self.path,'full',144),'--profile-cache'],cwd=self.repo,env=environment(),capture_output=True,check=True)
+        rows=[json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertTrue(all(row['diagnostic_cache']['samples'] for row in rows))
+        self.assertTrue(all(row['files']==self.counts['blob_paths'] for row in rows))
+
     def test_failed_command_is_not_a_successful_measurement(self):
         with self.assertRaises(RuntimeError):observe([sys.executable,'-c','raise SystemExit(3)'],self.root,environment(),5)
 
@@ -186,7 +219,10 @@ time.sleep(30)
             transfer=dict(remote_verified_blob_bytes=metrics['remote_raw_blob_bytes'],remote_verified_blobs=metrics['remote_raw_blob_imports'],
                 session_pack_payload_bytes=metrics['remote_session_pack_bytes'],native_stored_received_pack_bytes=metrics['remote_native_pack_bytes'])
             data.append(dict(type='real_repository',workload=workload,source=source,trial=trial,**identity,
-                baseline=dict(common,direct_command=executed,total_elapsed_ns=35),runner=dict(executed,metrics=metrics),transfer_evidence=transfer))
+                baseline=dict(common,direct_command=executed,total_elapsed_ns=35),
+                runner=dict(executed,metrics=metrics,elapsed_ns=20,observed_start_monotonic_ns=0,observed_end_monotonic_ns=20,
+                    runner_timeline=[dict(phase=p,monotonic_ns=i+1) for i,p in enumerate(PHASES)]),
+                profile_spans_enabled=False,transfer_evidence=transfer))
         validate_reports(data,'c'*40,pin)
         partial=copy.deepcopy(data)
         partial[2]['runner']=copy.deepcopy(partial[2]['runner'])
@@ -199,7 +235,7 @@ time.sleep(30)
         partial[2]['runner']['waited_process_peak_rss_kib']=1234
         partial[2]['runner']['memory']['count']=0
         with self.assertRaises(ValueError):validate_reports(partial,'c'*40,pin)
-        for failure in ('head','missing','duplicate','phase','bytes','decode','setup','memory','cpu','transfer'):
+        for failure in ('head','missing','duplicate','phase','bytes','decode','setup','memory','cpu','transfer','timeline','profiling'):
             bad=copy.deepcopy(data);row=bad[2]
             if failure=='head':row['head']='d'*40
             elif failure=='missing':bad.pop()
@@ -210,7 +246,9 @@ time.sleep(30)
             elif failure=='setup':row['baseline']['total_elapsed_ns']-=20
             elif failure=='memory':row['runner']['waited_process_peak_rss_kib']=None
             elif failure=='cpu':del row['runner']['waited_user_cpu_s']
-            else:row['transfer_evidence']['session_pack_payload_bytes']+=1
+            elif failure=='transfer':row['transfer_evidence']['session_pack_payload_bytes']+=1
+            elif failure=='timeline':row['runner']['runner_timeline'].pop()
+            else:row['profile_spans_enabled']=True
             with self.subTest(failure=failure),self.assertRaises(ValueError):validate_reports(bad,'c'*40,pin)
 
     def test_test_runner_output_requires_all_named_tests_and_no_failures_or_skips(self):

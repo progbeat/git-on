@@ -32,6 +32,7 @@ struct Descriptor {
     blocks: Box<[[u8; 32]]>,
     file: bool,
     used: bool,
+    content_checked: bool,
     directory: Option<Arc<Directory>>,
 }
 impl Descriptor {
@@ -69,6 +70,34 @@ impl RawBlob {
     }
     pub(crate) fn read_all(&self) -> Result<Vec<u8>> {
         self.range(0, self.size)
+    }
+    pub(crate) fn check_content_once(&self, check: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objects
+            .get(&self.oid)
+            .context("missing verified object descriptor")?
+            .content_checked
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("small_blob_policy", self.size);
+        let bytes = self.read_all()?;
+        check(&bytes)?;
+        // The descriptor identifies immutable Git contents; successful format
+        // validation need not hydrate the object again on future opens. This
+        // flag never replaces block authentication of bytes returned to users.
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objects
+            .get_mut(&self.oid)
+            .context("missing verified object descriptor")?
+            .content_checked = true;
+        Ok(())
     }
     pub(crate) fn on_disk(&self) -> bool {
         self.state
@@ -132,8 +161,17 @@ impl RawBlob {
                 file = Some(store.directory.open(self.oid, false, self.size)?);
             }
             let mut bytes = vec![0; size];
-            file.as_ref().unwrap().read_exact_at(&mut bytes, start)?;
-            if Sha256::digest(&bytes).as_slice() != expected {
+            {
+                #[cfg(feature = "test-metrics")]
+                let _profile = crate::profile::span("raw_disk_read", size as u64);
+                file.as_ref().unwrap().read_exact_at(&mut bytes, start)?;
+            }
+            let digest = {
+                #[cfg(feature = "test-metrics")]
+                let _profile = crate::profile::span("raw_block_hash", size as u64);
+                Sha256::digest(&bytes)
+            };
+            if digest.as_slice() != expected {
                 return Err(invalid("verified raw blob bytes were modified"));
             }
             #[cfg(test)]
@@ -176,6 +214,8 @@ impl RawDirectory {
         Ok(Self { fd, _owner: owner })
     }
     fn open_name(&self, name: &CString, flags: i32) -> Result<File> {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("raw_file_open", 0);
         let fd = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
@@ -378,6 +418,7 @@ impl RawBlobs {
                 blocks: digests.into_boxed_slice(),
                 file: !resident,
                 used,
+                content_checked: false,
                 directory: None,
             },
         );
@@ -411,6 +452,7 @@ impl RawBlobs {
                 blocks: Box::new([]),
                 file: false,
                 used: false,
+                content_checked: false,
                 directory: Some(directory),
             },
         );
@@ -601,6 +643,8 @@ impl Store {
                     resident.block == 0 && resident.bytes.len() as u64 == descriptor.size,
                     "unbacked object is not fully resident"
                 );
+                #[cfg(feature = "test-metrics")]
+                let _profile = crate::profile::span("raw_small_spill", descriptor.size);
                 let pending = self.directory.pending()?;
                 pending.file.write_all_at(&resident.bytes, 0)?;
                 pending.commit(oid)?;

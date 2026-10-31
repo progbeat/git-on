@@ -45,6 +45,8 @@ pub(crate) fn copy_verified(
     size: usize,
     oid: Oid,
 ) -> Result<()> {
+    #[cfg(feature = "test-metrics")]
+    let _profile = crate::profile::span("object_verify_copy", size as u64);
     let kind = kind.str();
     let mut hash = Sha1::new();
     hash.update(format!("{kind} {size}\0").as_bytes());

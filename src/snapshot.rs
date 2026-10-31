@@ -480,7 +480,11 @@ impl State {
                 );
                 (raw.insert(oid, size, reader, &self.spool_directory)?, true)
             } else {
-                let object = odb.read(oid).context("decode Git blob")?;
+                let object = {
+                    #[cfg(feature = "test-metrics")]
+                    let _profile = crate::profile::span("local_pack_decode", size as u64);
+                    odb.read(oid).context("decode Git blob")?
+                };
                 anyhow::ensure!(
                     object.kind() == ObjectType::Blob && object.len() == size,
                     "Git blob changed during transfer"
@@ -506,7 +510,7 @@ impl State {
         // Only a complete LFS pointer can need this bounded validation. A cold
         // partial read must not hydrate or authenticate the whole object.
         if raw.len() < 1024 {
-            Self::validate_blob(&raw.read_all()?)?;
+            raw.check_content_once(Self::validate_blob)?;
         }
         let data = raw;
         let reader = Arc::new(ActiveBlob {
@@ -1146,6 +1150,49 @@ mod tests {
         binary.extend_from_slice(b"x-note invalid UTF-8: \xff\n");
         assert!(!is_lfs_pointer(&binary));
         assert!(State::validate_blob(&binary).is_ok());
+    }
+    #[test]
+    fn reopened_small_blob_does_not_reload_spill_for_repeated_policy_check() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let bytes = vec![b'v'; 512];
+        let oid = repo.blob(&bytes).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "policy-reopen").unwrap();
+        assert_eq!(snap.read(oid, 0, 1).unwrap(), b"v");
+        {
+            let mut state = snap.state().unwrap();
+            state
+                .raw_blobs
+                .as_mut()
+                .unwrap()
+                .evict_all_for_test()
+                .unwrap();
+        }
+        let authenticated = || {
+            snap.state()
+                .unwrap()
+                .raw_blobs
+                .as_ref()
+                .unwrap()
+                .tested_authenticated_bytes()
+        };
+        assert_eq!(authenticated(), 0);
+        // A newly opened reader does not request data yet. The immutable
+        // object's successful policy check must not read a spilled payload.
+        let reader = snap.open(oid).unwrap();
+        assert_eq!(
+            authenticated(),
+            0,
+            "reader reopen reauthenticated the whole small spill for LFS policy"
+        );
+        assert_eq!(reader.read(511, 1).unwrap(), b"v");
+        assert_eq!(
+            authenticated(),
+            512,
+            "the actual data read must still authenticate its block"
+        );
+        drop(reader);
+        assert_eq!(snap.metrics().blob_loads, 1);
     }
     #[test]
     fn lfs_prefix_in_ordinary_blobs_is_readable_through_both_read_paths() {
