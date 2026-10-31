@@ -129,13 +129,15 @@ fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
 }
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
+    let _progress = crate::progress::MaterializationProgress::start();
     snapshot.set_spool_directory(root)?;
     directory(snapshot, Path::new(""), root)
 }
 fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
     let children = snapshot.children(relative)?;
-    let mut expected = Vec::new();
-    for (name, _) in children {
+    snapshot.prepare_materialization(&children)?;
+    let mut expected = std::collections::HashSet::new();
+    for (name, entry) in children {
         if let Some(signal) = crate::git::cancelled_signal() {
             bail!("materialization cancelled by signal {signal}");
         }
@@ -151,9 +153,11 @@ fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
         );
         let relative = relative.join(&name);
         let path = root.join(&relative);
-        let entry = snapshot
-            .entry(&relative)?
-            .context("snapshot entry disappeared")?;
+        ensure!(
+            entry.mode != 0o160000,
+            "submodules are unsupported: {}",
+            relative.display()
+        );
         let result = (|| -> Result<()> {
             match entry.kind {
                 EntryKind::Directory => {
@@ -181,7 +185,7 @@ fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
                         .custom_flags(libc::O_NOFOLLOW)
                         .open(&path)?;
                     let reader = snapshot.open(entry.oid)?;
-                    let size = entry.size.context("missing blob size")?;
+                    let size = reader.len();
                     let mut offset = 0;
                     while offset < size {
                         if let Some(signal) = crate::git::cancelled_signal() {
@@ -218,13 +222,11 @@ fn directory(snapshot: &Snapshot, relative: &Path, root: &Path) -> Result<()> {
             }
             return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
         }
-        expected.push(name);
+        expected.insert(name);
     }
-    let mut actual = fs::read_dir(root.join(relative))?
+    let actual = fs::read_dir(root.join(relative))?
         .map(|e| e.map(|e| e.file_name()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    expected.sort();
-    actual.sort();
+        .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
     ensure!(
         actual == expected,
         "host changed snapshot names in {}: expected {:?}, found {:?}",

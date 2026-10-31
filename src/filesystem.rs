@@ -2,16 +2,20 @@
 //! writable layer. During a mount, user-controlled names never become host
 //! filesystem paths. All execution state is disposable.
 use crate::backend::{FileAttr, FileType, SetAttributes, Statistics, TimeOrNow};
+use crate::directory_view::{
+    Cursor as DirectoryCursor, Rows as DirectoryRows, Version as DirectoryVersion,
+};
 use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::{OsStr, OsString};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
@@ -41,6 +45,37 @@ struct Handle {
     ino: u64,
     flags: i32,
     reader: Option<BlobReader>,
+    previous: u64,
+    next: u64,
+}
+// One arithmetic inode range per touched source-directory path. The parsed
+// tree is shared by OID; distinct paths retain distinct inode identities.
+// Reserving the range does not allocate a path/node/reference per child.
+struct SourceDirectory {
+    tree: Arc<crate::tree::Directory>,
+    base: u64,
+}
+enum DirectoryEntries {
+    Source(usize),
+    Merged(DirectoryVersion),
+}
+struct DirectoryView {
+    parent: u64,
+    entries: DirectoryEntries,
+}
+struct DirectoryCache {
+    valid: bool,
+    view: Arc<DirectoryView>,
+    rows: Option<DirectoryRows>,
+}
+struct DirectoryHandle {
+    view: Arc<DirectoryView>,
+    // Acquire a pin only after a row fits the reply. Replayed cookies do not
+    // acquire another pin; unread siblings have no retained reference.
+    seen: HashSet<u64>,
+    // Only issued merged-view cookies need cursors. Source views retain direct
+    // array offsets. A cursor owns its immutable version, including on replay.
+    cursors: HashMap<u64, DirectoryCursor>,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -59,13 +94,56 @@ pub struct Overlay {
     directory_refs: HashMap<u64, usize>,
     nodes: HashMap<u64, Node>,
     handles: HashMap<u64, Handle>,
-    directories: HashMap<u64, Vec<(u64, FileType, OsString)>>,
+    // Index actual open handles, not all reserved directory children. Lifetime
+    // checks stay independent of unrelated handles and copy-up visits only its
+    // own readers. Both maps have O(number of open handles) retained entries.
+    // Intrusive lists avoid an allocation per inode for its usual single handle.
+    // Zero is the sentinel; actual handle IDs start at one.
+    inode_handles: HashMap<u64, u64>,
+    #[cfg(test)]
+    handle_scan_steps: std::cell::Cell<usize>,
+    directories: HashMap<u64, DirectoryHandle>,
+    directory_cache: HashMap<u64, DirectoryCache>,
+    dirty_directories: HashSet<u64>,
+    source_directories: Vec<SourceDirectory>,
+    source_directory_keys: HashMap<PathBuf, usize>,
+    #[cfg(test)]
+    directory_prepared_rows: usize,
     next_ino: u64,
     next_handle: u64,
     snapshot_time: SystemTime,
 }
 
 impl Overlay {
+    pub(crate) fn read_only(&self) -> bool {
+        self.write_policy == WritePolicy::None
+    }
+    pub(crate) fn readonly_file_attributes(&self, ino: u64) -> FsResult<FileAttr> {
+        if !self.read_only() {
+            return Err(libc::EBADF);
+        }
+        let node = self.node(ino)?;
+        match node.attr.kind {
+            FileType::RegularFile => Ok(node.attr),
+            FileType::Directory => Err(libc::EISDIR),
+            _ => Err(libc::ELOOP),
+        }
+    }
+    pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
+        self.nodes.get(&ino).is_some_and(|node| {
+            node.immutable
+                && node.snapshot_path.is_some()
+                && node.attr.kind == FileType::RegularFile
+        })
+    }
+    pub(crate) fn protected_source(&self, ino: u64) -> bool {
+        self.write_policy != WritePolicy::All
+            && self
+                .nodes
+                .get(&ino)
+                .is_some_and(|node| node.immutable && node.snapshot_path.is_some())
+    }
+
     pub fn new(snapshot: Snapshot, backing: PathBuf) -> Result<Self> {
         Self::with_write_policy(snapshot, backing, WritePolicy::Ignored)
     }
@@ -121,7 +199,16 @@ impl Overlay {
             directory_refs: HashMap::new(),
             nodes,
             handles: HashMap::new(),
+            inode_handles: HashMap::new(),
+            #[cfg(test)]
+            handle_scan_steps: std::cell::Cell::new(0),
             directories: HashMap::new(),
+            directory_cache: HashMap::new(),
+            dirty_directories: HashSet::new(),
+            source_directories: Vec::new(),
+            source_directory_keys: HashMap::new(),
+            #[cfg(test)]
+            directory_prepared_rows: 0,
             next_ino: 2,
             next_handle: 1,
             snapshot_time,
@@ -152,13 +239,13 @@ impl Overlay {
             .entry(&source)
             .map_err(snapshot_errno)?
             .ok_or(libc::ENOENT)?;
-        let ino = if let Some(ino) = self.paths.get(path) {
-            *ino
-        } else {
-            let ino = self.next_ino;
-            self.next_ino = self.next_ino.checked_add(1).ok_or(libc::ENOSPC)?;
-            ino
-        };
+        let source_parent = self.source_directory(source.parent().ok_or(libc::EIO)?)?;
+        let directory = &self.source_directories[source_parent];
+        let index = directory
+            .tree
+            .index(source.file_name().ok_or(libc::EIO)?)
+            .ok_or(libc::EIO)?;
+        let ino = directory.base + index as u64;
         let kind = match entry.kind {
             EntryKind::File => FileType::RegularFile,
             EntryKind::Directory => FileType::Directory,
@@ -200,9 +287,12 @@ impl Overlay {
         }
         self.reclaim(ino);
     }
+    fn has_open_handle(&self, ino: u64) -> bool {
+        self.inode_handles.contains_key(&ino)
+    }
     fn reclaim(&mut self, ino: u64) {
         if ino == 1
-            || self.handles.values().any(|h| h.ino == ino)
+            || self.has_open_handle(ino)
             || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0
         {
             return;
@@ -212,11 +302,49 @@ impl Overlay {
             .get(&ino)
             .is_none_or(|n| n.lookups == 0 && (n.immutable || n.attr.nlink == 0));
         if removable {
+            if self
+                .nodes
+                .get(&ino)
+                .is_some_and(|node| node.attr.nlink == 0 || node.snapshot_path.is_none())
+            {
+                self.directory_cache.remove(&ino);
+                self.dirty_directories.remove(&ino);
+            }
             self.nodes.remove(&ino);
             if let Some(path) = self.inode_paths.remove(&ino) {
                 self.paths.remove(&path);
             }
             // Unlinked mutable nodes have no pathname left to remove.
+        }
+    }
+    fn source_directory(&mut self, source: &Path) -> FsResult<usize> {
+        if let Some(key) = self.source_directory_keys.get(source) {
+            return Ok(*key);
+        }
+        let tree = self._snapshot.directory(source).map_err(snapshot_errno)?;
+        let base = self.next_ino;
+        self.next_ino = base
+            .checked_add(u64::try_from(tree.len()).map_err(|_| libc::ENOSPC)?)
+            .ok_or(libc::ENOSPC)?;
+        let key = self.source_directories.len();
+        self.source_directories.push(SourceDirectory { tree, base });
+        self.source_directory_keys.insert(source.to_path_buf(), key);
+        Ok(key)
+    }
+    fn release_directory_ref(&mut self, ino: u64) {
+        if let Some(count) = self.directory_refs.get_mut(&ino) {
+            *count -= 1;
+            if *count == 0 {
+                self.directory_refs.remove(&ino);
+            }
+        }
+        self.reclaim(ino);
+    }
+    fn listed_kind(mode: u32) -> FileType {
+        match mode & 0o170000 {
+            0o040000 | 0o160000 => FileType::Directory,
+            0o120000 => FileType::Symlink,
+            _ => FileType::RegularFile,
         }
     }
     pub(crate) fn open_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
@@ -228,74 +356,144 @@ impl Overlay {
             Some(parent) => self.ensure(parent)?,
             None => 1,
         };
-        let mut entries = vec![
-            (ino, FileType::Directory, OsString::from(".")),
-            (parent, FileType::Directory, OsString::from("..")),
-        ];
-        if let Some(source) = self.node(ino)?.snapshot_path.clone() {
-            for (name, entry) in self._snapshot.children(&source).map_err(snapshot_errno)? {
-                let child_path = path.join(&name);
-                if self.upper_paths.contains_key(&child_path)
-                    || self.lower_path(&child_path).is_none()
-                {
-                    continue;
-                }
-                let kind = match entry.kind {
-                    EntryKind::Directory => FileType::Directory,
-                    EntryKind::Symlink => FileType::Symlink,
-                    EntryKind::File => FileType::RegularFile,
-                };
-                let child = if let Some(id) = self.paths.get(&child_path) {
-                    *id
-                } else {
-                    let id = self.next_ino;
-                    self.next_ino = self.next_ino.checked_add(1).ok_or(libc::ENOSPC)?;
-                    self.inode_paths.insert(id, child_path.clone());
-                    self.paths.insert(child_path, id);
-                    id
-                };
-                entries.push((child, kind, name));
-            }
-        }
-        for (p, child) in self
-            .upper_paths
-            .range(path.clone()..)
-            .take_while(|(p, _)| p.starts_with(&path))
+        let cached = self
+            .directory_cache
+            .get(&ino)
+            .filter(|cached| cached.valid && cached.view.parent == parent)
+            .map(|cached| cached.view.clone());
+        let view = if let Some(view) = cached {
+            view
+        } else if let Some(cache) = self
+            .directory_cache
+            .get_mut(&ino)
+            .filter(|cache| cache.rows.is_some())
         {
-            if p != &path
-                && p.parent() == Some(path.as_path())
-                && self.nodes.get(child).is_some_and(|n| !n.immutable)
-            {
-                entries.push((
-                    *child,
-                    self.node(*child)?.attr.kind,
-                    p.file_name().ok_or(libc::EIO)?.to_os_string(),
-                ));
-            }
-        }
+            // A moved directory changes '..', not its prepared child list.
+            let view = Arc::new(DirectoryView {
+                parent,
+                entries: DirectoryEntries::Merged(cache.rows.as_ref().unwrap().snapshot()),
+            });
+            cache.view = view.clone();
+            cache.valid = true;
+            view
+        } else {
+            #[cfg(feature = "test-metrics")]
+            let _profile = crate::profile::span("directory_view", 0);
+            let source = self
+                .node(ino)?
+                .snapshot_path
+                .clone()
+                .map(|source| self.source_directory(&source))
+                .transpose()?;
+            let mut rows = None;
+            let entries =
+                if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
+                    DirectoryEntries::Source(key)
+                } else {
+                    // Namespace changes create a new enumeration snapshot. Handles
+                    // on the previous Arc keep their original names and cookies.
+                    let mut entries = DirectoryRows::default();
+                    if let Some(key) = source {
+                        let directory = &self.source_directories[key];
+                        for index in 0..directory.tree.len() {
+                            if index.is_multiple_of(256) {
+                                crate::object::check_transfer().map_err(snapshot_errno)?;
+                            }
+                            let (name, mode) = directory.tree.shared_at(index).ok_or(libc::EIO)?;
+                            let child_path = path.join(name.as_ref());
+                            if self.upper_paths.contains_key(&child_path)
+                                || self.lower_path(&child_path).is_none()
+                            {
+                                continue;
+                            }
+                            entries.insert(
+                                directory.base + index as u64,
+                                Self::listed_kind(mode),
+                                name,
+                            );
+                        }
+                    }
+                    for (index, (child_path, child)) in self
+                        .upper_paths
+                        .range(path.clone()..)
+                        .take_while(|(p, _)| p.starts_with(&path))
+                        .enumerate()
+                    {
+                        if index.is_multiple_of(256) {
+                            crate::object::check_transfer().map_err(snapshot_errno)?;
+                        }
+                        if child_path != &path
+                            && child_path.parent() == Some(path.as_path())
+                            && self.nodes.get(child).is_some_and(|node| !node.immutable)
+                        {
+                            entries.insert(
+                                *child,
+                                self.node(*child)?.attr.kind,
+                                Arc::from(child_path.file_name().ok_or(libc::EIO)?),
+                            );
+                        }
+                    }
+                    #[cfg(test)]
+                    {
+                        self.directory_prepared_rows += entries.len();
+                    }
+                    let version = entries.snapshot();
+                    rows = Some(entries);
+                    DirectoryEntries::Merged(version)
+                };
+            let view = Arc::new(DirectoryView { parent, entries });
+            self.directory_cache.insert(
+                ino,
+                DirectoryCache {
+                    valid: true,
+                    view: view.clone(),
+                    rows,
+                },
+            );
+            view
+        };
         let fh = self.new_handle(ino, flags);
-        for (child, _, _) in &entries {
-            *self.directory_refs.entry(*child).or_default() += 1;
-        }
-        self.directories.insert(fh, entries);
+        // Dot entries have constant-size lifetime accounting.
+        *self.directory_refs.entry(ino).or_default() += 1;
+        *self.directory_refs.entry(parent).or_default() += 1;
+        self.directories.insert(
+            fh,
+            DirectoryHandle {
+                view,
+                seen: HashSet::new(),
+                cursors: HashMap::new(),
+            },
+        );
         Ok(fh)
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
         let _ = self.refresh_backing_attr(ino);
-        self.handles.remove(&fh);
-        let listed = self.directories.remove(&fh).unwrap_or_default();
-        for (child, _, _) in &listed {
-            if let Some(count) = self.directory_refs.get_mut(child) {
-                *count -= 1;
-                if *count == 0 {
-                    self.directory_refs.remove(child);
-                }
+        if let Some(handle) = self.handles.remove(&fh) {
+            if handle.previous != 0 {
+                self.handles
+                    .get_mut(&handle.previous)
+                    .expect("previous open handle")
+                    .next = handle.next;
+            } else if handle.next != 0 {
+                self.inode_handles.insert(handle.ino, handle.next);
+            } else {
+                self.inode_handles.remove(&handle.ino);
+            }
+            if handle.next != 0 {
+                self.handles
+                    .get_mut(&handle.next)
+                    .expect("next open handle")
+                    .previous = handle.previous;
             }
         }
-        for (child, _, _) in listed {
-            self.reclaim(child);
+        if let Some(directory) = self.directories.remove(&fh) {
+            for child in directory.seen {
+                self.release_directory_ref(child);
+            }
+            self.release_directory_ref(ino);
+            self.release_directory_ref(directory.view.parent);
         }
-        if !self.handles.values().any(|h| h.ino == ino) {
+        if !self.has_open_handle(ino) {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 if n.attr.nlink != 0 {
                     n.file = None;
@@ -436,7 +634,7 @@ impl Overlay {
             }
             None
         };
-        let keep_file = unlinked || self.handles.values().any(|handle| handle.ino == ino);
+        let keep_file = unlinked || self.has_open_handle(ino);
         let node = self.node_mut(ino)?;
         node.immutable = false;
         node.oid = None;
@@ -447,8 +645,13 @@ impl Overlay {
         if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
             self.upper_paths.insert(path, ino);
         }
-        for handle in self.handles.values_mut().filter(|handle| handle.ino == ino) {
+        let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
+        while fh != 0 {
+            #[cfg(test)]
+            self.handle_scan_steps.set(self.handle_scan_steps.get() + 1);
+            let handle = self.handles.get_mut(&fh).expect("indexed open handle");
             handle.reader = None;
+            fh = handle.next;
         }
         Ok(())
     }
@@ -490,6 +693,32 @@ impl Overlay {
     }
     fn touch_parent(&mut self, path: &Path) {
         if let Some(ino) = path.parent().and_then(|p| self.paths.get(p)).copied() {
+            self.dirty_directories.insert(ino);
+            let binding = self
+                .paths
+                .get(path)
+                .and_then(|child| self.nodes.get(child).map(|node| (*child, node.attr.kind)));
+            if let Some(cache) = self.directory_cache.get_mut(&ino) {
+                if let Some(rows) = &mut cache.rows {
+                    if rows.update(path.file_name().expect("namespace name"), binding) {
+                        cache.view = Arc::new(DirectoryView {
+                            parent: cache.view.parent,
+                            entries: DirectoryEntries::Merged(rows.snapshot()),
+                        });
+                        cache.valid = true;
+                    } else {
+                        // A generation wrap freezes the old family. Existing
+                        // versions/cursors remain valid; the next open rebuilds
+                        // current state without an arbitrary repository limit.
+                        cache.rows = None;
+                        cache.valid = false;
+                    }
+                } else {
+                    // Convert a pristine source view once, on its first open
+                    // after namespace changes, rather than at mutation time.
+                    cache.valid = false;
+                }
+            }
             // A tracked directory's metadata belongs to the snapshot as well.
             if let Some(node) = self.nodes.get_mut(&ino) {
                 if self.write_policy == WritePolicy::All && node.immutable {
@@ -571,12 +800,21 @@ impl Overlay {
     fn new_handle(&mut self, ino: u64, flags: i32) -> u64 {
         let fh = self.next_handle;
         self.next_handle += 1;
+        let next = self.inode_handles.insert(ino, fh).unwrap_or(0);
+        if next != 0 {
+            self.handles
+                .get_mut(&next)
+                .expect("previous inode head")
+                .previous = fh;
+        }
         self.handles.insert(
             fh,
             Handle {
                 ino,
                 flags,
                 reader: None,
+                previous: 0,
+                next,
             },
         );
         fh
@@ -682,6 +920,24 @@ impl Overlay {
         if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(libc::EBADF);
         }
+        self.read_data_inner(ino, Some(fh), offset, size)
+    }
+    pub(crate) fn read_without_handle(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        size: u32,
+    ) -> FsResult<Vec<u8>> {
+        self.readonly_file_attributes(ino)?;
+        self.read_data_inner(ino, None, offset, size)
+    }
+    fn read_data_inner(
+        &mut self,
+        ino: u64,
+        fh: Option<u64>,
+        offset: i64,
+        size: u32,
+    ) -> FsResult<Vec<u8>> {
         if offset < 0 {
             return Err(libc::EINVAL);
         }
@@ -714,12 +970,13 @@ impl Overlay {
             let oid = n.oid.ok_or(libc::EIO)?;
             // Small payload ownership stays exclusively in the bounded LRU;
             // an idle open descriptor must not pin an evicted whole payload.
-            if n.attr.size <= BLOB_CACHE_BYTES as u64 {
+            if n.attr.size <= BLOB_CACHE_BYTES as u64 || fh.is_none() {
                 return self
                     ._snapshot
                     .read(oid, offset as u64, count as u32)
                     .map_err(snapshot_errno);
             }
+            let fh = fh.unwrap();
             if self.handles[&fh].reader.is_none() {
                 let reader = self._snapshot.open(oid).map_err(snapshot_errno)?;
                 self.handles.get_mut(&fh).ok_or(libc::EBADF)?.reader = Some(reader);
@@ -1175,26 +1432,134 @@ impl Overlay {
         self.node_mut(ino)?.lookups += 1;
         Ok(self.node(ino)?.attr)
     }
-    pub(crate) fn entries(
-        &self,
+    pub(crate) fn read_directory(
+        &mut self,
         ino: u64,
         fh: u64,
         offset: u64,
-    ) -> FsResult<&[(u64, FileType, OsString)]> {
+        mut emit: impl FnMut(u64, FileType, &OsStr, u64) -> bool,
+    ) -> FsResult<()> {
         self.handle(ino, fh)?;
         if offset > i64::MAX as u64 {
             return Err(libc::EINVAL);
         }
-        let entries = self.directories.get(&fh).ok_or(libc::EBADF)?;
-        Ok(entries
-            .get(usize::try_from(offset).map_err(|_| libc::EINVAL)?..)
-            .unwrap_or(&[]))
+        let view = self.directories.get(&fh).ok_or(libc::EBADF)?.view.clone();
+        if let DirectoryEntries::Merged(version) = &view.entries {
+            return self.read_merged_directory(ino, fh, offset, view.parent, version, emit);
+        }
+        let source = match &view.entries {
+            DirectoryEntries::Source(key) => Some(&self.source_directories[*key]),
+            _ => None,
+        };
+        let length = match &view.entries {
+            DirectoryEntries::Source(_) => source.unwrap().tree.len(),
+            DirectoryEntries::Merged(_) => unreachable!(),
+        }
+        .checked_add(2)
+        .ok_or(libc::EOVERFLOW)?;
+        for index in usize::try_from(offset).map_err(|_| libc::EINVAL)?..length {
+            let (child, kind, name) = if index == 0 {
+                (ino, FileType::Directory, OsStr::new("."))
+            } else if index == 1 {
+                (view.parent, FileType::Directory, OsStr::new(".."))
+            } else if let Some(source) = source {
+                let (name, mode) = source.tree.at(index - 2).ok_or(libc::EIO)?;
+                (
+                    source.base + (index - 2) as u64,
+                    Self::listed_kind(mode),
+                    name,
+                )
+            } else {
+                unreachable!()
+            };
+            if emit(child, kind, name, index as u64 + 1) {
+                break;
+            }
+            if index >= 2
+                && self
+                    .directories
+                    .get_mut(&fh)
+                    .ok_or(libc::EBADF)?
+                    .seen
+                    .insert(child)
+            {
+                *self.directory_refs.entry(child).or_default() += 1;
+            }
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn read_merged_directory(
+        &mut self,
+        ino: u64,
+        fh: u64,
+        mut offset: u64,
+        parent: u64,
+        version: &DirectoryVersion,
+        mut emit: impl FnMut(u64, FileType, &OsStr, u64) -> bool,
+    ) -> FsResult<()> {
+        let length = u64::try_from(version.len())
+            .map_err(|_| libc::EOVERFLOW)?
+            .checked_add(2)
+            .filter(|length| *length <= i64::MAX as u64)
+            .ok_or(libc::EOVERFLOW)?;
+        if offset >= length {
+            return Ok(());
+        }
+        if offset == 0 {
+            if emit(ino, FileType::Directory, OsStr::new("."), 1) {
+                return Ok(());
+            }
+            offset = 1;
+        }
+        if offset == 1 {
+            if emit(parent, FileType::Directory, OsStr::new(".."), 2) {
+                return Ok(());
+            }
+            offset = 2;
+        }
+        let mut cursor = if offset == 2 {
+            version.cursor()
+        } else {
+            self.directories
+                .get(&fh)
+                .ok_or(libc::EBADF)?
+                .cursors
+                .get(&offset)
+                .cloned()
+                .ok_or(libc::EINVAL)?
+        };
+        while let Some(entry) = cursor.entry() {
+            let child = entry.ino;
+            let cookie = offset + 1;
+            if emit(child, entry.kind, &entry.name, cookie) {
+                break;
+            }
+            cursor.advance();
+            let handle = self.directories.get_mut(&fh).ok_or(libc::EBADF)?;
+            handle
+                .cursors
+                .entry(cookie)
+                .or_insert_with(|| cursor.clone());
+            if handle.seen.insert(child) {
+                *self.directory_refs.entry(child).or_default() += 1;
+            }
+            offset = cookie;
+        }
+        Ok(())
     }
     pub(crate) fn sync_file(&mut self, ino: u64, fh: u64, datasync: bool) -> FsResult<()> {
+        self.handle(ino, fh)?;
+        self.sync_file_inner(ino, datasync)
+    }
+    pub(crate) fn sync_readonly_file(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
+        self.readonly_file_attributes(ino)?;
+        self.sync_file_inner(ino, datasync)
+    }
+    fn sync_file_inner(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
         #[cfg(feature = "test-metrics")]
         self._snapshot.record_file_sync();
 
-        self.handle(ino, fh)?;
         #[cfg(feature = "test-metrics")]
         if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
             return Err(libc::EIO);
@@ -1293,12 +1658,17 @@ impl Overlay {
     pub(crate) fn record_passthrough(&self) {
         self._snapshot.record_passthrough();
     }
+    #[cfg(all(feature = "test-metrics", target_os = "linux"))]
+    pub(crate) fn record_fuse_request(&self, operation: &'static str) {
+        self._snapshot.record_fuse_request(operation);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use git2::Repository;
+    use std::ffi::OsString;
     use tempfile::TempDir;
 
     #[test]
@@ -1328,6 +1698,16 @@ mod tests {
         assert_eq!(outcomes, [Err(libc::EIO), Err(libc::EIO)]);
         assert_eq!(overlay.nodes.len(), 1);
         assert_eq!(fs::read_dir(&overlay.backing).unwrap().count(), 0);
+    }
+
+    fn directory_rows(fs: &mut Overlay, ino: u64, fh: u64) -> Vec<(u64, FileType, OsString)> {
+        let mut rows = Vec::new();
+        fs.read_directory(ino, fh, 0, |ino, kind, name, _| {
+            rows.push((ino, kind, name.to_os_string()));
+            false
+        })
+        .unwrap();
+        rows
     }
 
     fn fixture() -> (TempDir, Overlay) {
@@ -1550,7 +1930,7 @@ mod tests {
         assert_eq!(overlay.read_data(file, read, 0, 100).unwrap(), b"original");
         overlay.remove(source, OsStr::new("file"), false).unwrap();
         let directory = overlay.open_directory(source, libc::O_RDONLY).unwrap();
-        assert!(!overlay.directories[&directory]
+        assert!(!directory_rows(&mut overlay, source, directory)
             .iter()
             .any(|(_, _, name)| name == "file"));
         overlay.close_handle(source, directory);
@@ -1570,7 +1950,12 @@ mod tests {
         let (temp, mut overlay) = directory_fixture();
         let source = overlay.ensure(Path::new("source")).unwrap();
         let handle = overlay.open_directory(source, libc::O_RDONLY).unwrap();
-        let reserved = overlay.paths[Path::new("source/file")];
+        let reserved = directory_rows(&mut overlay, source, handle)
+            .into_iter()
+            .find(|(_, _, name)| name == "file")
+            .unwrap()
+            .0;
+        assert!(!overlay.paths.contains_key(Path::new("source/file")));
         assert!(!overlay.nodes.contains_key(&reserved));
         let repo = Repository::open(temp.path().join("repo")).unwrap();
         let oid = repo
@@ -1585,7 +1970,15 @@ mod tests {
         overlay
             .rename_path(1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
             .unwrap();
-        assert_eq!(overlay.paths[Path::new("moved/file")], reserved);
+        assert_eq!(
+            directory_rows(&mut overlay, source, handle)
+                .into_iter()
+                .find(|(_, _, name)| name == "file")
+                .unwrap()
+                .0,
+            reserved
+        );
+        assert!(!overlay.paths.contains_key(Path::new("moved/file")));
         assert!(!overlay.nodes.contains_key(&reserved));
         assert_eq!(
             overlay._snapshot.metrics().header_reads,
@@ -1605,7 +1998,7 @@ mod tests {
         assert_eq!(overlay.ensure(Path::new("tracked.tmp")).unwrap(), fresh);
         let directory = overlay.open_directory(1, libc::O_RDONLY).unwrap();
         assert_eq!(
-            overlay.directories[&directory]
+            directory_rows(&mut overlay, 1, directory)
                 .iter()
                 .filter(|(_, _, name)| name == "tracked.tmp")
                 .count(),
@@ -1958,20 +2351,276 @@ mod tests {
             fs.read_data(ino, handle, 0, 100).unwrap(),
             b"pinned content\n"
         );
-        fs.handles.remove(&handle);
-        fs.reclaim(ino);
+        fs.close_handle(ino, handle);
         assert_eq!(fs.nodes.len(), 1);
         assert!(!fs.paths.contains_key(Path::new("tracked.tmp")));
         let replacement = fs.ensure(Path::new("tracked.tmp")).unwrap();
-        assert_ne!(replacement, ino, "never recycle inode IDs");
+        assert_eq!(
+            replacement, ino,
+            "same immutable source keeps its identity; no ID is reassigned to another file"
+        );
         assert_eq!(fs.nodes[&replacement].attr.mtime, original_time);
+    }
+    #[test]
+    fn partial_repeated_directory_reads_do_not_reserve_unread_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        for index in 0..10_000 {
+            builder
+                .insert(format!("file-{index:05}"), blob, 0o100644)
+                .unwrap();
+        }
+        let tree = builder.write().unwrap();
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let snapshot = Snapshot::load(
+                repo.path(),
+                OsStr::new(&tree.to_string()),
+                "partial-directory",
+            )
+            .unwrap();
+            let mut fs = Overlay::with_write_policy(
+                snapshot,
+                temp.path().join(format!("upper-{policy:?}")),
+                policy,
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..16 {
+                let handle = fs.open_directory(1, libc::O_RDONLY).unwrap();
+                let mut first = None;
+                fs.read_directory(1, handle, 0, |_, _, name, _| {
+                    first = Some(name.to_os_string());
+                    true
+                })
+                .unwrap();
+                assert_eq!(first.unwrap(), ".");
+                assert_eq!(fs.paths.len(), 1, "opendir reserved unread source children");
+                assert!(
+                    fs.directory_refs.len() <= 2,
+                    "opendir pinned unread source children"
+                );
+                fs.close_handle(1, handle);
+            }
+            let metrics = fs._snapshot.metrics();
+            assert_eq!(metrics.blob_loads, 0);
+            assert_eq!(metrics.header_reads, 0);
+            assert_eq!(metrics.prepared_tree_entries, 10_000);
+            assert_eq!(fs.paths.len(), 1);
+            assert_eq!(fs.nodes.len(), 1);
+            eprintln!("partial directory evidence: policy={policy:?}, names=10000, opens=16, elapsed={:?}", started.elapsed());
+            if matches!(policy, WritePolicy::Untracked | WritePolicy::All) {
+                file(&mut fs, 1, "created");
+                let before = fs.directory_prepared_rows;
+                for iteration in 0..16 {
+                    if iteration > 0 {
+                        fs.remove(1, OsStr::new("created"), false).unwrap();
+                        file(&mut fs, 1, "created");
+                    }
+                    let handle = fs.open_directory(1, libc::O_RDONLY).unwrap();
+                    fs.read_directory(1, handle, 0, |_, _, _, _| true).unwrap();
+                    assert_eq!(fs.paths.len(), 2);
+                    fs.close_handle(1, handle);
+                }
+                assert_eq!(
+                    fs.directory_prepared_rows - before,
+                    10_001,
+                    "namespace edits rescanned the source instead of updating the unshared view"
+                );
+                let before = fs.directory_prepared_rows;
+                let mut overlapping = Vec::new();
+                for index in 0..16 {
+                    file(&mut fs, 1, &format!("overlap-{index}"));
+                    let handle = fs.open_directory(1, libc::O_RDONLY).unwrap();
+                    fs.read_directory(1, handle, 0, |_, _, _, _| true).unwrap();
+                    overlapping.push(handle);
+                }
+                assert_eq!(
+                    fs.directory_prepared_rows, before,
+                    "overlapping enumeration versions recopied unrelated names"
+                );
+                for handle in overlapping {
+                    fs.close_handle(1, handle);
+                }
+            }
+        }
+    }
+    #[test]
+    fn incremental_directory_rows_preserve_old_views_and_reindex_moved_names() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let old = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let original = directory_rows(&mut fs, 1, old);
+        let mut expected: BTreeSet<_> = original.iter().map(|(_, _, name)| name.clone()).collect();
+        let check = |fs: &mut Overlay, expected: &BTreeSet<OsString>| {
+            let handle = fs.open_directory(1, libc::O_RDONLY).unwrap();
+            let rows = directory_rows(fs, 1, handle);
+            assert_eq!(
+                rows.iter()
+                    .map(|(_, _, name)| name.clone())
+                    .collect::<BTreeSet<_>>(),
+                *expected
+            );
+            for (ino, _, name) in rows {
+                if name != "." && name != ".." {
+                    assert_eq!(fs.ensure(Path::new(&name)).unwrap(), ino);
+                }
+            }
+            fs.close_handle(1, handle);
+        };
+        // The first invalidated version must keep all edits made before its
+        // replacement is opened; an old stream retains its original cookies.
+        for name in ["first", "middle", "last"] {
+            file(&mut fs, 1, name);
+            expected.insert(name.into());
+        }
+        check(&mut fs, &expected);
+        for name in ["first", "middle", "last"] {
+            fs.remove(1, OsStr::new(name), false).unwrap();
+            expected.remove(OsStr::new(name));
+            check(&mut fs, &expected);
+        }
+        let source = OsStr::new("tracked.tmp");
+        fs.remove(1, source, false).unwrap();
+        expected.remove(source);
+        file(&mut fs, 1, "replacement");
+        expected.insert("replacement".into());
+        check(&mut fs, &expected);
+        let ino = fs.ensure(Path::new("replacement")).unwrap();
+        fs.hardlink(ino, 1, OsStr::new("alias")).unwrap();
+        expected.insert("alias".into());
+        check(&mut fs, &expected);
+        fs.remove(1, OsStr::new("replacement"), false).unwrap();
+        expected.remove(OsStr::new("replacement"));
+        check(&mut fs, &expected);
+        assert_eq!(directory_rows(&mut fs, 1, old), original);
+        fs.close_handle(1, old);
+    }
+    #[test]
+    fn closing_last_view_that_returned_a_deleted_entry_reclaims_its_inode() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let oldest = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let _ = directory_rows(&mut fs, 1, oldest);
+        for index in 0..16 {
+            let name = format!("late-{index}");
+            let ino = file(&mut fs, 1, &name);
+            let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
+            fs.write_data(ino, writer, 0, b"private bytes", 0, libc::O_RDWR)
+                .unwrap();
+            fs.close_handle(ino, writer);
+            let newest = fs.open_directory(1, libc::O_RDONLY).unwrap();
+            assert!(directory_rows(&mut fs, 1, newest)
+                .iter()
+                .any(|(id, _, n)| *id == ino && n == name.as_str()));
+            fs.remove(1, OsStr::new(&name), false).unwrap();
+            fs.reclaim(ino);
+            assert!(fs.nodes.get(&ino).unwrap().file.is_some());
+            fs.close_handle(1, newest);
+            assert!(
+                !fs.nodes.contains_key(&ino),
+                "an older view retained an entry it never returned"
+            );
+        }
+        fs.close_handle(1, oldest);
+        assert!(fs.directory_refs.is_empty());
+    }
+    #[test]
+    fn directory_pins_follow_returned_entries_and_handle_lifetimes() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let old = file(&mut fs, 1, "old");
+        let writer = fs.open_file(old, libc::O_RDWR).unwrap();
+        fs.write_data(old, writer, 0, b"old bytes", 0, libc::O_RDWR)
+            .unwrap();
+        fs.close_handle(old, writer);
+        let other = dir(&mut fs, "elsewhere");
+        let elsewhere = file(&mut fs, other, "earlier-inode");
+        let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let _ = directory_rows(&mut fs, 1, first);
+        let late = file(&mut fs, 1, "late");
+        let newest = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        fs.close_handle(1, newest);
+        fs.remove(1, OsStr::new("late"), false).unwrap();
+        fs.reclaim(late);
+        assert!(
+            !fs.nodes.contains_key(&late),
+            "closed newer view pinned a late name"
+        );
+        fs.hardlink(elsewhere, 1, OsStr::new("late-link")).unwrap();
+        fs.remove(other, OsStr::new("earlier-inode"), false)
+            .unwrap();
+        fs.remove(1, OsStr::new("late-link"), false).unwrap();
+        fs.reclaim(elsewhere);
+        assert!(
+            !fs.nodes.contains_key(&elsewhere),
+            "inode birth replaced binding membership"
+        );
+        fs.remove(1, OsStr::new("old"), false).unwrap();
+        fs.reclaim(old);
+        assert!(fs.nodes.contains_key(&old));
+        assert!(directory_rows(&mut fs, 1, first)
+            .iter()
+            .any(|(ino, _, name)| *ino == old && name == "old"));
+        let reader = fs.open_file(old, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_data(old, reader, 0, 100).unwrap(), b"old bytes");
+        fs.close_handle(old, reader);
+        fs.close_handle(1, second);
+        assert!(fs.nodes.contains_key(&old));
+        fs.close_handle(1, first);
+        assert!(!fs.nodes.contains_key(&old));
+        assert!(fs.directory_refs.is_empty());
+    }
+    #[test]
+    fn source_directory_identity_survives_move_and_shared_tree_paths_stay_distinct() {
+        let (_tmp, mut fs) = directory_fixture();
+        let source = fs.ensure(Path::new("source")).unwrap();
+        let twin = fs.ensure(Path::new("untouched")).unwrap();
+        let old = fs.open_directory(source, libc::O_RDONLY).unwrap();
+        let twin_handle = fs.open_directory(twin, libc::O_RDONLY).unwrap();
+        let original = directory_rows(&mut fs, source, old);
+        let copy = directory_rows(&mut fs, twin, twin_handle);
+        assert_ne!(
+            original.iter().find(|(_, _, n)| n == "file").unwrap().0,
+            copy.iter().find(|(_, _, n)| n == "file").unwrap().0
+        );
+        let destination = fs.ensure(Path::new("destination")).unwrap();
+        fs.rename_path(1, OsStr::new("source"), destination, OsStr::new("moved"), 0)
+            .unwrap();
+        let new = fs.open_directory(source, libc::O_RDONLY).unwrap();
+        let moved = directory_rows(&mut fs, source, new);
+        assert_eq!(original[1].0, 1);
+        assert_eq!(moved[1].0, destination);
+        assert_eq!(
+            original[2..]
+                .iter()
+                .map(|(i, _, n)| (*i, n))
+                .collect::<Vec<_>>(),
+            moved[2..]
+                .iter()
+                .map(|(i, _, n)| (*i, n))
+                .collect::<Vec<_>>()
+        );
+        fs.close_handle(source, old);
+        fs.close_handle(source, new);
+        fs.close_handle(twin, twin_handle);
+        assert!(fs.directory_refs.is_empty());
     }
     #[test]
     fn directory_reserved_inodes_are_stable_and_reclaimed() {
         let (_tmp, mut fs) = fixture();
         let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
         let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
-        let reserved = fs.paths[Path::new("tracked.tmp")];
+        let reserved = directory_rows(&mut fs, 1, first)
+            .into_iter()
+            .find(|(_, _, name)| name == "tracked.tmp")
+            .unwrap()
+            .0;
+        assert!(!fs.paths.contains_key(Path::new("tracked.tmp")));
         assert_ne!(reserved, 0);
         assert!(!fs.nodes.contains_key(&reserved));
         assert_eq!(fs.ensure(Path::new("tracked.tmp")).unwrap(), reserved);
@@ -1986,6 +2635,104 @@ mod tests {
         assert_eq!(fs.inode_paths.len(), 1);
         assert!(fs.directory_refs.is_empty());
     }
+    #[test]
+    fn directory_release_does_not_scan_unrelated_open_handles() {
+        let (_tmp, mut fs) = fixture();
+        let file = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let handles: Vec<_> = (0..128)
+            .map(|_| fs.open_file(file, libc::O_RDONLY).unwrap())
+            .collect();
+        let directory = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        fs.handle_scan_steps.set(0);
+        fs.release_handle(1, directory).unwrap();
+        assert_eq!(
+            fs.handle_scan_steps.get(),
+            0,
+            "directory children scanned unrelated handles"
+        );
+        assert_eq!(
+            fs.read_data(file, handles[0], 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        for handle in handles {
+            fs.release_handle(file, handle).unwrap();
+        }
+        fs.forget_inode(file, u64::MAX);
+        assert!(!fs.nodes.contains_key(&file));
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
+    }
+    #[test]
+    fn copy_up_only_visits_its_readers_and_handle_links_survive_any_release_order() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let source = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let unrelated = file(&mut fs, 1, "unrelated");
+        let other: Vec<_> = (0..128)
+            .map(|_| fs.open_file(unrelated, libc::O_RDWR).unwrap())
+            .collect();
+        let readers: Vec<_> = (0..3)
+            .map(|_| fs.open_file(source, libc::O_RDONLY).unwrap())
+            .collect();
+        for handle in &readers {
+            let oid = fs.nodes[&source].oid.unwrap();
+            fs.handles.get_mut(handle).unwrap().reader = Some(fs._snapshot.open(oid).unwrap());
+        }
+        fs.handle_scan_steps.set(0);
+        fs.copy_up(source, true).unwrap();
+        assert_eq!(fs.handle_scan_steps.get(), readers.len());
+        assert!(readers
+            .iter()
+            .all(|handle| fs.handles[handle].reader.is_none()));
+        // Remove middle, head, then tail. Each remaining reader stays usable;
+        // closing the last one drops only this inode's backing descriptor.
+        for index in [1, 2, 0] {
+            fs.release_handle(source, readers[index]).unwrap();
+            assert_eq!(fs.release_handle(source, readers[index]), Err(libc::EBADF));
+            for handle in &readers {
+                if fs.handles.contains_key(handle) {
+                    assert_eq!(
+                        fs.read_data(source, *handle, 0, 100).unwrap(),
+                        b"pinned content\n"
+                    );
+                }
+            }
+        }
+        assert!(!fs.inode_handles.contains_key(&source));
+        assert!(fs.nodes[&source].file.is_none());
+        assert!(fs.nodes[&unrelated].file.is_some());
+        for handle in other.into_iter().rev() {
+            fs.release_handle(unrelated, handle).unwrap();
+        }
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
+    }
+    #[test]
+    fn readonly_stateless_reads_reuse_large_objects_without_retaining_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let size = BLOB_CACHE_BYTES + 1;
+        let oid = repo.blob(&vec![b'q'; size]).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("large", oid, 0o100644).unwrap();
+        let tree = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "stateless").unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::None)
+                .unwrap();
+        let ino = fs.lookup_entry(1, OsStr::new("large")).unwrap().ino;
+        for offset in [size - 1, 0, 65536, 0, size - 1] {
+            assert_eq!(fs.read_without_handle(ino, offset as i64, 1).unwrap(), b"q");
+        }
+        let metrics = fs._snapshot.metrics();
+        assert_eq!(metrics.blob_loads, 1);
+        assert_eq!(metrics.active_blob_readers, 0);
+        assert!(metrics.blob_cache_bytes <= BLOB_CACHE_BYTES);
+        assert_eq!(metrics.blob_cache_entries, 1);
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
+    }
+
     #[test]
     fn idle_open_descriptors_do_not_pin_evicted_payloads() {
         let temp = tempfile::tempdir().unwrap();

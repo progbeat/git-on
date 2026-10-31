@@ -288,6 +288,86 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_readonly_stateless_large_reads_dup_mmap_and_sync(self):
+        size=17*1024*1024
+        (self.repo/'large-readonly').write_bytes(bytes(range(256))*(size//256))
+        git(self.repo,'add','large-readonly');git(self.repo,'commit','-qm','readonly file lifecycle')
+        code=r'''
+import errno,mmap,os
+size=17*1024*1024
+pattern=bytes(range(256))*16
+fds=[os.open('large-readonly',os.O_RDONLY) for _ in range(3)]
+fds.append(os.dup(fds[0]))
+try:
+ for fd in fds:
+  assert os.fstat(fd).st_size==size
+  for offset in (size-4096,0,65536,0):assert os.pread(fd,4096,offset)==pattern
+  os.fsync(fd);os.fdatasync(fd)
+ with mmap.mmap(fds[0],0,access=mmap.ACCESS_READ) as view:
+  assert view[:4096]==pattern and view[-4096:]==pattern
+ os.close(fds.pop())
+ assert os.pread(fds[0],4096,0)==pattern
+ for flags in (os.O_WRONLY,os.O_RDWR,os.O_RDONLY|os.O_TRUNC):
+  try:os.open('large-readonly',flags)
+  except OSError as error:assert error.errno in (errno.EROFS,errno.EACCES),error
+  else:raise AssertionError('readonly source opened for mutation')
+finally:
+ for fd in fds:os.close(fd)
+with open('large-readonly','rb') as reopened:assert reopened.read(4096)==pattern
+'''
+        result,run=self.invoke_argv(['HEAD','--write-policy=none','--',sys.executable,'-I','-S','-c',code])
+        self.assert_success(result);self.assertIsNone(run);self.assert_no_runtime_files()
+
+    def test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes(self):
+        data=b'a'*8192
+        (self.repo/'cached-source').write_bytes(data)
+        git(self.repo,'add','cached-source');git(self.repo,'commit','-qm','cache coherence fixture')
+        code=r'''
+import mmap,os
+from pathlib import Path
+p=Path('cached-source')
+reader=os.open(p,os.O_RDONLY)
+mapping=mmap.mmap(reader,8192,access=mmap.ACCESS_READ)
+assert mapping[:]==b'a'*8192
+assert p.read_bytes()==b'a'*8192  # warm pages, close and reopen
+writer=os.open(p,os.O_RDWR)
+try:
+ os.pwrite(writer,b'b'*8192,0)
+ assert os.pread(reader,8192,0)==b'b'*8192 and mapping[:]==b'b'*8192
+ assert p.read_bytes()==b'b'*8192
+ os.pwrite(writer,b'tail',8192)
+ assert os.fstat(reader).st_size==8196 and p.read_bytes()==b'b'*8192+b'tail'
+ os.ftruncate(writer,4096)
+ assert os.fstat(reader).st_size==4096 and os.pread(reader,8192,0)==b'b'*4096
+ os.ftruncate(writer,8192)
+ assert mapping[:]==b'b'*4096+b'\0'*4096
+ with mmap.mmap(writer,8192,access=mmap.ACCESS_WRITE) as writable:
+  writable[32:36]=b'mmap';writable.flush()
+ assert mapping[32:36]==b'mmap' and os.pread(reader,4,32)==b'mmap'
+ os.chmod(p,0o600)
+ os.link(p,'cached-alias');p.rename('cached-moved')
+ p=Path('cached-moved')
+ assert Path('cached-alias').read_bytes()==p.read_bytes()
+ Path('replacement.tmp').write_bytes(b'replacement')
+ os.replace('replacement.tmp',p)
+ assert p.read_bytes()==b'replacement' and mapping[32:36]==b'mmap'
+ Path('cached-alias').unlink()
+ os.pwrite(writer,b'last',0)
+ assert os.pread(reader,4,0)==b'last' and mapping[:4]==b'last'
+ assert os.fstat(reader).st_nlink==0
+finally:
+ mapping.close();os.close(writer);os.close(reader)
+# O_TRUNC must invalidate untouched source pages kept by an earlier readonly open.
+p=Path('tracked.txt')
+assert p.read_bytes()==b'committed\n'
+with p.open('wb') as f:f.write(b'new')
+assert p.read_bytes()==b'new'
+'''
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',sys.executable,'-c',code])
+        self.assert_success(result)
+        self.assertEqual((self.repo/'cached-source').read_bytes(),data)
+        self.assert_no_runtime_files()
+
     def test_local_unverified_run_requires_native_git_for_revision_resolution(self):
         programs = self.root / "fuse-only"
         programs.mkdir()
@@ -1034,6 +1114,63 @@ try:
     assert set(os.listdir(b'out/paged')) == expected - {b'.', b'..'}
 finally:
     assert libc.closedir(directory) == 0
+
+# Repeated partial streams must not rebuild or reserve the whole directory.
+# Keep this in the existing mixed fixture so it adds no scale preparation.
+def read_prefix(stream):
+    rows=[]
+    for _ in range(20):
+        entry=libc.readdir64(stream)
+        assert entry, ctypes.get_errno()
+        name=bytes(entry.contents.name);ino=entry.contents.ino
+        if name not in {b'.',b'..'}:
+            assert os.lstat(b'out/paged/'+name).st_ino==ino,(name,ino)
+        rows.append((name,ino))
+    return rows
+versions=[]
+for generation in range(8):
+    changing=Path('out/paged/changing-%d.tmp' % generation)
+    changing.write_bytes(b'new generation')
+    first=libc.opendir(b'out/paged');second=libc.opendir(b'out/paged')
+    assert first and second,ctypes.get_errno()
+    try:
+        prefix=read_prefix(first)
+        assert read_prefix(second)==prefix
+        libc.seekdir(first,0)
+        assert read_prefix(first)==prefix
+        # Keep one partly consumed stream across subsequent mutations. There
+        # are enough long names to leave unrequested FUSE pages, not just a
+        # suffix already buffered by libc. Each stream retains its own names.
+        versions.append((first,prefix,libc.telldir(first),changing.name.encode()))
+        first=None
+    finally:
+        if first:
+            assert libc.closedir(first)==0
+        assert libc.closedir(second)==0
+    changing.unlink()
+for stream,prefix,cookie,extra in reversed(versions):
+    try:
+        suffix=[]
+        while True:
+            ctypes.set_errno(0)
+            entry=libc.readdir64(stream)
+            if not entry:
+                assert ctypes.get_errno()==0,ctypes.get_errno()
+                break
+            suffix.append((bytes(entry.contents.name),entry.contents.ino))
+        complete=prefix+suffix
+        wanted=expected|{extra}
+        assert len(complete)==len(wanted) and {name for name,_ in complete}==wanted
+        libc.seekdir(stream,cookie)
+        replay=[]
+        while (entry:=libc.readdir64(stream)):
+            replay.append((bytes(entry.contents.name),entry.contents.ino))
+        assert replay==suffix
+        libc.rewinddir(stream)
+        assert read_prefix(stream)==prefix
+    finally:
+        assert libc.closedir(stream)==0
+assert set(os.listdir(b'out/paged'))==expected-{b'.',b'..'}
 ''')
         self.assert_success(result)
         self.assert_no_runtime_files()

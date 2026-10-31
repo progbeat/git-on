@@ -95,7 +95,7 @@ is part of this bug fix; it does not require a major version increment.
 
 ## Filesystem policy
 
-Remote demand, persistent cache lifetime, native verification, authentication
+Remote demand, run-local object lifetime, native verification, authentication
 limits and acceptance requirements are normative in [the remote guide](remote.md).
 The same FUSE and write-policy contract below applies to local and remote runs.
 
@@ -222,7 +222,7 @@ checkout or a complete in-memory copy of the selected tree.
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.
 6. Repeated operations should reuse useful decoded data instead of repeatedly
-   decoding the same objects. Caching must have an explicit bounded retention
+   decoding the same objects. Decoded memory caching must have an explicit bounded retention
    policy; walking many files must not retain every payload indefinitely.
    Active reads and unavoidable object decoding are accounted for separately.
 7. Do not keep duplicate full source payloads merely to transfer data between
@@ -231,6 +231,40 @@ checkout or a complete in-memory copy of the selected tree.
 8. Failures discovered in objects reached on demand must be reported through
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
+
+The explicit [interview acceptance contract](interview.md#interview) is mandatory
+for [1.4.0 issue #20](https://github.com/progbeat/git-on/issues/20):
+
+T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
+
+Compare one complete invocation with git clone/git checkout materializing the
+same complete selected revision and then the identical direct-disk command.
+Declare the same host/filesystem, source/transport, initial object and OS-cache
+conditions; separate cold and warm cases. Account for cleanup explicitly on both
+sides, without excluding Git-on's unmount or cleanup from T_git_on. Setup, every
+process, fetch, decode, verification, metadata operation, traversal, internal
+read/copy/write and cleanup are included in the total cost.
+
+N is command-facing transferred read/write payload bytes plus metadata API
+result bytes, including stat. Use the documented native API/ABI result layout
+for that platform (for example, the public stat structure for a native stat API),
+or a declared fixed equivalent for a higher-level API. Fix the representation
+before measurement and use it consistently on both sides. Do not count language
+heap allocation, internal wire/storage/index bytes or repeated passes as N.
+Do not add artificial padding or count the same interface bytes twice.
+Failed metadata calls contribute their public result/status representation, not
+an unreturned stat payload. Zero-byte operations do not justify excluding their
+execution cost or inventing internal bytes; N=0 cases still use the complete
+materialize-plus-command comparison.
+
+One-time required fetch, decode and verification may happen lazily within the
+materialization budget. Immutable data already obtained/prepared must not be
+fetched or unpacked again in the same invocation, including close/reopen and
+decoded-memory-cache eviction. Invocation-local temporary storage must support
+that reuse; no global cache or cross-run reuse is introduced. Count all work,
+including native Git children, rather than proving this contract from loader-only
+counters. Amortized/expected Big-O does not justify a large constant: minimizing
+measured real overhead also remains required.
 
 No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
@@ -251,7 +285,9 @@ functional correctness:
   its interpreter startup is required in the measured workload.
 - Measure from git-on invocation until that correct stdout is observed, as well
   as child-start latency, total time, and peak memory where available. Fixture
-  construction is excluded. Repeat trials and identify cold/warm cache state.
+  construction is excluded. Repeat trials and identify OS page-cache conditions
+  where controlled. Remote invocations use independent temporary object stores;
+  distinguish a fresh invocation from repeated access within the same run.
 - Smaller fixtures can diagnose scaling, but do not replace the specified
   million-file case. Keep file contents and object reuse explicit in results.
 - Observe Git object accesses where instrumentation is available. A no-op
@@ -264,7 +300,8 @@ functional correctness:
 - Exercise lookup, `stat`, directory listing, one-file reads, repeated reads,
   and large-file partial reads separately. Record decoding dependencies and
   bytes where observable rather than inferring them from wall time.
-- Visit more content than the cache retention budget and verify eviction; do
+- Visit more content than decoded memory-cache budgets and verify eviction
+  without re-fetching objects already available in the run; do
   not count unavoidable kernel page cache as a second application-owned payload.
 - Run the existing immutable-source, ignore-policy, lifecycle, and real-FUSE
   integration checks after changing the loading architecture. Performance must
@@ -272,6 +309,11 @@ functional correctness:
 
 A benchmark fixture that reuses Git objects must disclose this: it measures
 logical namespace growth but does not by itself model a million distinct blobs.
+The [pre-merge CI coverage map](ci-performance.md) distinguishes complete
+small/medium reads, a million-path namespace traversal with sampled payloads,
+and the unchanged million-distinct-file lazy requirement above. Stress fixture
+counts are test parameters, not product limits; smaller full reads must never
+be reported as full million-file reads.
 
 ## Review regressions and bounded randomized stress
 
@@ -296,9 +338,13 @@ not replace them or establish proof for all possible sequences.
 
 ## Implementation and verification
 
-The second implementation replaces the eager traversal with a shared pinned
-object store, demand-only metadata/blob access, bounded caches, and deferred
-inode creation. The FUSE layer retains no duplicate snapshot payloads. Source
+The implementation uses a shared pinned object store, demand-only metadata/blob
+access, a byte-budgeted content LRU and deferred inode creation. The LRU retains
+at most one entry per original OID across all readers: a complete small object
+or one large-file block. Trusted descriptors/block hashes and parsed directories
+remain in RAM for touched unique objects outside that payload budget. Raw tree
+bytes and disk object/name indexes are not retained. The FUSE layer retains no
+duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail
 metadata access, LFS pointers fail content reads, and unrelated entries remain
 usable. Listing a directory may report a submodule name without following it.

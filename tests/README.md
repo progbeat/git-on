@@ -1,5 +1,66 @@
 # Integration tests
 
+Pinned real-repository coverage runs separately from the small behavior matrix:
+
+```sh
+python3 tests/real_repository.py prepare --directory /path/to/webkit-fixture
+python3 tests/real_repository.py run --fixture /path/to/webkit-fixture --binary target/release/git-on --output webkit-results.jsonl
+```
+
+Build with `--release --locked --features test-metrics` and use real Linux FUSE.
+Preparation downloads one pinned WebKit Git repository (several GiB of logical
+contents); it does not download dependencies or hydrate LFS. The full local
+case checks every path and blob twice. The useful smaller command runs 32 real
+upstream webkitcorepy unit tests, with three fresh local and three file-transport
+invocations, each with first/repeat test processes. No browser/SDK bootstrap or
+package installation is required. The direct command is:
+
+```sh
+PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+```
+
+An actual Git-on invocation of the same useful command is:
+
+```sh
+git-on file:///absolute/path/to/webkit-fixture/repository.git 4b125afe35a2e95bf764d7a5e2efe7dc574a0653 --write-policy=none -- env PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+```
+
+For the local mode, run from that bare repository's directory and omit the
+`file://...` operand. The reported benchmark uses its external Python wrapper
+to run this test command twice in one mount and retain separate first/repeat
+outputs; `runner.argv` records the exact measured Git-on argv, excluding the
+resource observer prefix. The one-pass command above is the interactive demo. `--profile-full`
+on the harness enables labelled inclusive diagnostics for its one full-read
+case; it does not add another complete traversal. Complete invocation timing
+still includes setup and cleanup. Profiling results are not presented as
+uninstrumented latency measurements.
+
+This is not a public-network latency benchmark. Source and OS-cache
+conditions, complete baseline composition and sampled-memory limitations are
+explicit in each report. See [CI coverage](../docs/ci-performance.md).
+
+To attribute measurement overhead on one Linux FUSE host, keep a normal release
+binary before building `--features test-metrics`, then run:
+
+```sh
+python3 tests/instrumentation_profile.py --checkout . --plain /absolute/path/git-on-plain --metrics /absolute/path/git-on-metrics --backend fuse --work /absolute/disk/path/attribution-work --output instrumentation-profile.jsonl
+```
+
+The bounded packed fixture is at most 512 unique 64 KiB blobs. Six shuffled
+variants separate ordinary/metrics builds, report/spans and external sampling;
+three fresh invocation trials read/stat each selected file twice and check exact
+contents. The native shared-clone baseline includes the same command and cleanup,
+with one explicitly shared baseline per demand/trial. Builds must use the same
+compiler/profile and checkout; their SHA-256 values are recorded. Pin execution
+to one available CPU for comparisons and record external load. GNU timeout adds
+the same 25 s graceful/30 s hard wrapper to each measured command. No OS-cache
+flush or privileged setting is used; temporary storage must be on the declared
+disk filesystem. `--backend materialized` is a control for a host without FUSE.
+This diagnostic is not the pinned WebKit acceptance workload or a timing gate.
+An optional `--candidate BINARY --pair` compares only two ordinary binaries;
+record their separate source/build provenance rather than inferring identity
+from the unchanged product version string.
+
 ```console
 cargo build --locked
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
@@ -40,13 +101,13 @@ python3 tests/remote.py
 python3 tests/ssh_regressions.py
 python3 tests/native_job_control.py
 python3 tests/remote.py --require-fuse
-python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
 ```
 
 The source probe exercises the production loader without a mount and records
 received OIDs, requested objects, request/response bytes and loader metrics.
 Tests distinguish listing from stat, repeated reads and large ranges; compare
-cold and warm caches; use distinct trees for moving-ref/replacement checks; and
+independent invocations and same-run reuse; use distinct trees for moving-ref/replacement checks; and
 cover native formats/trust, tag chains, inherited Git settings and server faults.
 OpenPGP cases use a disposable public-only keyring to compare unknown-trust
 commit/tag acceptance with native Git's default and rejection with configured
@@ -58,10 +119,12 @@ The native job-control suite runs an actual interactive Bash in a Linux PTY,
 stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,
 checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
 It fails unsigned native verification after authentication and needs no mount.
-The real-FUSE job additionally replays the authentic `e427743` executable and
-source probe for the SSH argument-boundary, ignore-acquisition errno, and native
-job-control regressions before requiring the fixed behavior.
-SSH shutdown regressions additionally replay `87a11d5`: equal-length client
+The real-FUSE job always runs the SSH argument-boundary, ignore-acquisition
+errno and native job-control regressions. Optional `--before-*` arguments replay
+authentic historical executables; their red-before evidence is recorded in
+[review regressions](../docs/review-regressions.md), without rebuilding known
+failing binaries on every push.
+SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
 retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
 changes the pathname only after file validation, demonstrating the old race;
@@ -75,7 +138,7 @@ digit paths; preparation verifies every leaf before measuring remote demand.
 The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
 mounts for remote writes, keep, cancellation, busy/stale recovery, external
 `git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
-FUSE for the remote million cold no-op/read and warm read. A loader success or
+FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
 availability is not required by these deterministic gates.
 
@@ -228,3 +291,47 @@ and native archive.
 No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
+
+## 1.4 resource and pre-merge scale acceptance
+
+See [resource acceptance](../docs/resources-1.4.md), the
+[CI cost/coverage map](../docs/ci-performance.md), and the
+[dependency audit](../docs/crate-audit-1.4.md). Resource regressions remain in
+`remote.py`; optional `--before-resource-probe` replays exact-master failures.
+`pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
+32/128/512 distinct-object pack metadata work, and verifies the full available
+OID set once after both read passes. The current probe's `--metrics-only` mode
+avoids repeatedly enumerating all OIDs. Historical helpers still include that
+cost; benchmark wall time is not isolated product throughput.
+
+`scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
+defaults to `--profile matrix`: every interaction once at 1k paths. The pinned
+WebKit job supplies the principal real scale control. Use `--policies all` for materialization and
+`--policies ignored` for generated-file passthrough. Full children include stat,
+100 repeated reads, exact varied payloads, complete directory/name sets and
+fresh-output/source/cleanup checks. Instrumented snapshots remain independent
+between cases, with exact remote-demand assertions.
+
+`--profile namespace --backend fuse --source remote --policies ignored` visits
+one million leaf names and samples a payload in every leaf directory. It is
+explicitly **not** reading every million-file payload. The separate million
+**distinct**-blob lazy scenario and native true/cat benchmark remain in default
+pre-merge CI. `--profile exhaustive` is an explicit diagnostic option for full
+million-file reads/materialization and repeated invocations; no correctness
+suite is deferred to a nightly or post-merge job.
+
+All affected source/policy/signature interactions remain pre-merge. Four physical matrix
+jobs group build/setup work; the separate WebKit job acquires its fixture once
+and checks full local reads plus the selected upstream unit tests.
+Enabled passthrough retains actual-kernel capability/ordinary-child checks in
+`real-fuse`, plus both source scale groups. Differential stress keeps
+both seeds in default ignored and its resource bounds; dedicated write-policy
+and protocol suites retain all four policies. Native package/installer
+and Mac checks remain. The required `package` aggregate always checks the change plan, all base jobs
+and every required heavy outcome/artifact. Unknown/shared/workflow/dependency
+changes enable all heavy suites; scoped test-driver changes enable their own
+suite. Recognized non-contract docs run the base. No workflow-level path filter
+can leave required checks pending. `workflow_dispatch` with `full_matrix=true`
+selects the complete exhaustive matrix before release; it never publishes. JSONL includes the complete planned cases, observed counts and
+phase/allocation measurements; final claims must match the actually executed
+head and workload sizes.

@@ -49,6 +49,28 @@ ancestor trees. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
+Where protocol v2 and the caller's policy permit, exact demands share one
+invocation-owned channel. Native Git still resolves the original repository and
+refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
+SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
+Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
+SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
+custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
+retain the native compatibility path. No fetched object is retried merely to
+change decoders, and no unrelated future OID is requested.
+
+Explicit-all eager materialization already needs every entry it prepares. For
+that backend, at most 256 known object IDs from the current directory share one
+native `fetch --stdin` and decoder operation. Each object is checked for existing
+run-local availability and deduplicated before requesting it; all use `tree:0`.
+This does not add prefetch to lazy FUSE or fetch unknown descendants. The batch
+size bounds request memory/argv work, not repository or file counts. Metrics
+separately report requested-object count (`remote_fetches`) and actual native
+fetch/decode operations; full-process tracing checks those operation counts.
+Session request/decode counts and transport process starts are separate from
+native fetch/cat-file counters. Server-side Git subprocesses remain real work,
+included in waited CPU for local source fixtures.
+
 The server must advertise filtering before any object transfer. Rejection of a
 requested unadvertised OID names the OID and includes Git's server diagnostic.
 
@@ -68,13 +90,13 @@ resolution reads its Git objects directly and needs no upload-pack configuration
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
 the runner fail even if the command catches EIO and exits successfully.
-This includes `.gitignore` object and cache acquisition during file/directory
+This includes `.gitignore` object acquisition during file/directory
 creation. A healthy policy denying a write instead returns EROFS.
 
 A pending, unblocked and nonignored SIGINT, SIGTERM, SIGHUP or SIGQUIT in the
 task requesting a remote object interrupts that request with EINTR. The runner
 polls the requesting task's Linux `/proc` status while its owned Git operation
-or cache-lock acquisition waits, because fuser cannot dispatch an INTERRUPT
+waits, because fuser cannot dispatch an INTERRUPT
 request while a synchronous callback is blocked. This interruption cancels
 only the current demand and preserves the command's signal handler and actual
 exit status. It does not latch a transport failure; a handler may return and
@@ -87,25 +109,73 @@ payloads. Applicable `.gitignore` blobs are fetched on demand in default
 write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
 local and remote snapshots.
 
-Persistent objects live in `$XDG_CACHE_HOME/git-on/objects-v1`, falling back to
-`$HOME/.cache/git-on/objects-v1`. Retain at most 256 MiB and 4096 objects, plus a
-zero-length lock. Each record contains its type byte and object bytes. Atomic
-insertion and LRU eviction share an exclusive flock. Acquiring the lock reclaims
-interrupted staging writes. Check restored object hashes. Each active run copies
-demanded cached objects into a private temporary bare repository, so concurrent
-eviction cannot invalidate active reads. Oversized objects stay in run storage.
+Each remote invocation owns a private temporary bare repository. Demanded
+objects remain there until that run is cleaned up, so repeated access does not
+fetch an available object again, including after decoded memory-cache eviction.
+There is no global persistent object cache or cross-run reuse. A later invocation
+resolves its operand through native Git again and fetches its own demanded trees
+and blobs. Git-on does not read, modify, migrate or delete historical
+`$XDG_CACHE_HOME/git-on/objects-v1`, `objects-v2`, or corresponding
+`$HOME/.cache/git-on` directories. HOME/XDG_CACHE_HOME are not required for an
+object cache; native Git's normal configuration and authentication environment
+still applies. No daemon or background cache service is started.
 
-A warm run still performs the initial native fetch to interpret the unchanged
-repository/refspec and select its commit or tag. Cached tree and blob objects
-are restored only when demanded, avoiding their repeated transfer. Cached data
-never substitutes for resolving the current operand through Git.
+Received session packs are checksum-verified in bounded private parts. A
+single non-delta object then streams through zlib and canonical OID verification
+into raw storage, without a per-object fetch or decoder client. Complex packs
+use the existing Git/libgit2 import path without another network request.
+Native fetch packs likewise decode into raw storage and are discarded before
+the next demand. Blob payloads are not recompressed into loose
+copies; commit/tree/tag metadata remains in the native verification ODB. Pack
+discovery does not enumerate earlier per-object packs. Large non-delta blobs
+stream during import; Git still performs required delta decoding. The snapshot
+reuses its Repository and available objects do not trigger unconditional ODB
+refreshes. Canonical OID verification completes before raw bytes become readable.
+Local loose objects stream in 64 KiB chunks with cancellation checks.
 
-These limits bound persistent retention. Active temporary objects and normal
-ignored writes have no runner quota; ordinary system disk limits apply.
-Completion removes the temporary remote repository and owned SSH connection.
-Write required results to explicit external paths. Busy mounts preserve recovery
-state for stale-run cleanup. Explicit-all materialization eagerly fetches every
-selected tree entry; it never bypasses authentication, verification or object errors.
+All prepared blobs survive close/reopen and bounded-memory-cache eviction in
+private temporary storage until invocation completion. Each spilled original
+object has one raw file, opened relative to the owned directory with no symlink
+following. Trusted RAM retains its Git OID, length and packed ordered SHA-256
+hashes of 64 KiB blocks, published only after full canonical OID verification.
+Range reads hash the same owned buffer returned to the caller; neither a disk
+index nor a disk authentication-tag file is trusted. Small resident objects
+spill only on eviction. The byte-accounted 16 MiB data LRU retains one entry per
+original OID: a whole small object or one large-file block. Active buffers and
+retained verification/parsed-directory metadata are accounted for separately;
+this is not a fixed total-RAM bound.
+
+The raw store retains one directory descriptor and one last-read object
+descriptor, independent of object count or open child handles. Each disk-read
+range rechecks file type, owner, link count and trusted length, even on descriptor
+reuse, then authenticates its blocks. A different object replaces the single
+read slot. Active import/spill writes need an additional temporary descriptor.
+Blob readers hold object descriptors rather than cached payloads or open files.
+Native transport/decoder staging still uses bounded logical parts capped by
+inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
+The private files stay outside the execution view and are removed with their
+owning store/readers during invocation cleanup. Retained-raw disk metrics are
+separate from active-reader and bounded payload-memory metrics. No cross-run
+reuse is introduced. libgit2's local
+pack backend still requires object/delta decoding, and its loose reader maps the
+compressed source file. Neither mapped OS page cache nor necessary packed decode
+is reported as a retained application payload cache.
+
+Retained libgit2 pack descriptors are capped before threads start: at most 32,
+and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack
+window). This leaves descriptors for native Git startup, the mount and active
+files; it does not raise OS limits or reserve a quota for the child. Active
+operations can still encounter ordinary OS limits, reported before launch or
+through the lazy operation and runner failure as applicable. No failure reruns
+a started child or silently changes write policy.
+
+Active temporary objects and normal ignored writes have no runner disk quota;
+ordinary system disk limits apply. Payload-cache accounting includes entry
+overhead without an arbitrary object-count cap. Completion removes the temporary remote repository and owned
+SSH connection. Write required results to explicit external paths. Busy mounts
+preserve recovery state for stale-run cleanup. Explicit-all materialization
+eagerly fetches every selected tree entry; it never bypasses authentication,
+verification or object errors. See [resource acceptance](resources-1.4.md).
 
 SIGKILL cannot run cleanup handlers. The runner does not request FUSE
 `auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected
@@ -220,11 +290,12 @@ tests nor sandbox safety.
 
 Required CI uses disposable real HTTPS/upload-pack and OpenSSH servers, remote
 execution outside a checkout, reference/local-content comparison, exact OIDs,
-tags, subtrees, named remotes and moving refs. Cold/warm tests inspect requests,
+tags, subtrees, named remotes and moving refs. Independent-run and same-run reuse tests inspect requests,
 requested OIDs, bytes and received objects, including a million distinct-file
 digit tree. SSH tests count encrypted-identity/agent prompts and authenticated
-connections, refuse authentication and drop the owned connection. Cache tests
-cover concurrent eviction, byte/entry bounds and interrupted writes. Native SSH
+connections, refuse authentication and drop the owned connection. Object-storage
+tests verify same-run availability, fresh-run fetches, no dependence on global
+cache paths and preservation of historical cache directories. Native SSH
 and OpenPGP fixtures cover verification, effective config, tags, raw trees,
 replacements and ref races. Real mounts additionally cover remote ignored writes,
 keep/cleanup/cancellation and transport errors caught by the child. Loader tests

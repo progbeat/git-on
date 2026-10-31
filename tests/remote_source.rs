@@ -2,14 +2,7 @@
 //! real upload-pack protocol and filters; SSH/HTTPS are separately exercised.
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
-use std::{
-    ffi::OsStr,
-    fs::OpenOptions,
-    os::unix::{io::AsRawFd, process::ExitStatusExt},
-    path::Path,
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{ffi::OsStr, path::Path, process::Command};
 #[cfg(target_os = "linux")]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -74,6 +67,73 @@ fn load_operands(
     )
 }
 #[test]
+fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
+    use std::os::unix::fs::FileExt;
+    let (temp, _, _, untouched) = fixture();
+    let repo = Repository::open_bare(temp.path().join("server")).unwrap();
+    let oid = repo.blob(&vec![b'v'; 128 * 1024]).unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("file", oid, 0o100644).unwrap();
+    let tree = builder.write().unwrap();
+    let sig = Signature::now("Test", "test@example.invalid").unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "raw integrity fixture",
+        &repo.find_tree(tree).unwrap(),
+        &[&repo.head().unwrap().peel_to_commit().unwrap()],
+    )
+    .unwrap();
+    for retained_reader in [false, true] {
+        let snap = load(temp.path(), "HEAD", false).unwrap();
+        let entry = snap.entry(Path::new("file")).unwrap().unwrap();
+        let reader = retained_reader.then(|| snap.open(entry.oid).unwrap());
+        let store = std::fs::read_dir(snap.git_dir.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .starts_with(b"raw-objects-")
+            })
+            .unwrap();
+        let path = store.join(oid.to_string());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(b"!", 0)
+            .unwrap();
+        let read = |offset| match &reader {
+            Some(reader) => reader.read(offset, 1),
+            None => snap.read(entry.oid, offset, 1),
+        };
+        let error = read(0).unwrap_err();
+        assert!(
+            error.to_string().contains("bytes were modified"),
+            "{error:#}"
+        );
+        let original = snap
+            .remote_failure()
+            .expect("caught raw EIO must still fail remote invocation");
+        assert!(original.contains("bytes were modified"), "{original}");
+        std::fs::remove_file(path).unwrap();
+        assert!(read(65536).is_err());
+        assert!(
+            snap.read(untouched, 0, 1).is_err(),
+            "a new demand ignored the sticky failure"
+        );
+        assert_eq!(
+            snap.remote_failure().as_deref(),
+            Some(original.as_str()),
+            "later errors replaced the original failure"
+        );
+    }
+}
+
+#[test]
 fn remote_metadata_and_payloads_are_demanded_and_pinned() {
     let (temp, commit, tree, untouched) = fixture();
     let snap = load(temp.path(), "HEAD", false).unwrap();
@@ -110,7 +170,28 @@ fn remote_metadata_and_payloads_are_demanded_and_pinned() {
             .split(|x| *x == b'\n')
             .filter(|x| !x.is_empty())
             .count(),
-        4
+        // Blob payloads are verified raw run data, rather than a second
+        // recompressed copy in the metadata ODB.
+        3
+    );
+    assert_eq!(snap.metrics().remote_raw_blob_imports, 1);
+    let pack_bytes = (
+        snap.metrics().remote_native_pack_bytes,
+        snap.metrics().remote_session_pack_bytes,
+    );
+    assert!(pack_bytes.0 > 0);
+    assert!(pack_bytes.0 + pack_bytes.1 > b"selected\n".len() as u64);
+    let fetches = snap.metrics().remote_fetches;
+    assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
+    assert_eq!(snap.metrics().remote_fetches, fetches);
+    assert_eq!(snap.metrics().blob_loads, 1);
+    assert_eq!(
+        (
+            snap.metrics().remote_native_pack_bytes,
+            snap.metrics().remote_session_pack_bytes,
+        ),
+        pack_bytes,
+        "same-run cache hits must not receive another pack"
     );
 }
 #[test]
@@ -193,6 +274,65 @@ fn remote_materialization_preserves_the_selected_tree_without_a_checkout() {
     assert!(!destination.join(".git").exists());
 }
 #[test]
+fn eager_remote_batches_are_bounded_and_reuse_objects_across_batch_boundaries() {
+    let (temp, parent, _, _) = fixture();
+    let server = Repository::open_bare(temp.path().join("server")).unwrap();
+    let mut tree = server.treebuilder(None).unwrap();
+    for index in 0..300 {
+        let bytes = format!("distinct-{index}\n");
+        tree.insert(
+            format!("f{index:04}"),
+            server.blob(bytes.as_bytes()).unwrap(),
+            0o100644,
+        )
+        .unwrap();
+    }
+    let shared = server.blob(b"shared\n").unwrap();
+    tree.insert("a-shared", shared, 0o100644).unwrap();
+    tree.insert("z-shared", shared, 0o100644).unwrap();
+    let tree = tree.write().unwrap();
+    let sig = Signature::now("Test", "test@example.invalid").unwrap();
+    server
+        .commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "bounded batches",
+            &server.find_tree(tree).unwrap(),
+            &[&server.find_commit(parent).unwrap()],
+        )
+        .unwrap();
+    let snapshot = load(temp.path(), "HEAD", false).unwrap();
+    let destination = temp.path().join("view");
+    std::fs::create_dir(&destination).unwrap();
+    git_on::materialize::materialize(&snapshot, &destination).unwrap();
+    for index in 0..300 {
+        assert_eq!(
+            std::fs::read(destination.join(format!("f{index:04}"))).unwrap(),
+            format!("distinct-{index}\n").as_bytes()
+        );
+    }
+    let metrics = snapshot.metrics();
+    assert_eq!(metrics.remote_fetches, 303);
+    assert_eq!(
+        metrics.remote_fetch_operations + metrics.remote_session_fetch_operations,
+        4
+    );
+    assert_eq!(
+        metrics.remote_decode_operations + metrics.remote_session_decode_operations,
+        4
+    );
+    assert_eq!(metrics.blob_loads, 301);
+    assert_eq!(
+        std::fs::read(destination.join("a-shared")).unwrap(),
+        b"shared\n"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("z-shared")).unwrap(),
+        b"shared\n"
+    );
+}
+#[test]
 fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
     let (temp, _, tree, _) = fixture();
     let server = Repository::open_bare(temp.path().join("server")).unwrap();
@@ -212,61 +352,6 @@ fn a_refspec_selecting_different_objects_cannot_choose_an_arbitrary_snapshot() {
         format!("{error:#}").contains("selected multiple objects"),
         "{error:#}"
     );
-}
-#[test]
-fn review_waiting_for_cache_lock_is_cancellable() {
-    let (temp, _, _, _) = fixture();
-    let cache = temp.path().join("cache/git-on/objects-v1");
-    std::fs::create_dir_all(&cache).unwrap();
-    let held_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(cache.join("lock"))
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(held_lock.as_raw_fd(), libc::LOCK_EX) },
-        0
-    );
-    let source = format!("file://{}", temp.path().join("server").display());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_git-on"))
-        .current_dir(temp.path())
-        .env("XDG_CACHE_HOME", temp.path().join("cache"))
-        .env("TMPDIR", temp.path())
-        .args([source.as_str(), "HEAD", "--", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // The held cache lock prevents startup reaching FUSE. This is a competing
-    // stopped writer, not a slow network or mount prerequisite.
-    std::thread::sleep(Duration::from_millis(400));
-    if let Some(status) = child.try_wait().unwrap() {
-        panic!("runner exited before waiting on the cache: {status}");
-    }
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("runner ignored SIGTERM while another writer held the cache lock");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(status.signal(), Some(libc::SIGTERM));
-    assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("git-on-")
-    }));
 }
 #[test]
 fn refused_filter_and_unsigned_objects_fail_before_execution() {
@@ -294,48 +379,65 @@ fn refused_filter_and_unsigned_objects_fail_before_execution() {
 }
 
 #[test]
-fn review_cache_restore_failure_is_latched() {
-    // Isolate the process-wide cache environment from concurrent loader tests.
-    if std::env::var_os("GIT_ON_REVIEW_CACHE_CHILD").is_none() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "review_cache_restore_failure_is_latched",
-                "--nocapture",
-            ])
-            .env("GIT_ON_REVIEW_CACHE_CHILD", "1")
-            .env("XDG_CACHE_HOME", directory.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated cache failure regression: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+fn review_run_odb_fetch_failure_is_latched() {
     let (temporary, _, _, _) = fixture();
+    // Explicit fsck selects the native compatibility path whose pack-directory
+    // failure this regression exercises. Session storage has its own control.
+    Repository::init(temporary.path())
+        .unwrap()
+        .config()
+        .unwrap()
+        .set_bool("fetch.fsckObjects", false)
+        .unwrap();
     let snapshot = load(temporary.path(), "HEAD", false).unwrap();
-    let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
-        .join("git-on/objects-v1");
-    // A competing/failed cache writer left an unusable directory entry. The
-    // demanded subtree cannot be restored and the affected operation fails.
-    std::fs::write(cache.join("unrecognized-entry"), b"fault").unwrap();
-    let error = snapshot.entry(Path::new("deep/value")).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("unrecognized remote cache entry"));
-    // Returning EIO alone permits the child to catch it and exit 0. The runner
-    // must retain the failure so that an incomplete execution returns 125.
+    // Break the private pack destination before a lazy subtree demand. The
+    // native fetch must fail, and an application catching EIO cannot turn the
+    // resulting incomplete remote execution into success.
+    let packs = snapshot.git_dir.join("objects/pack");
+    std::fs::remove_dir(&packs).unwrap();
+    std::fs::write(&packs, b"blocked private pack directory").unwrap();
+    assert!(snapshot.entry(Path::new("deep/value")).is_err());
     let failure = snapshot
         .remote_failure()
-        .expect("demanded cache failure was not latched for runner failure");
-    assert!(failure.contains("unrecognized remote cache entry"));
-    std::fs::remove_file(cache.join("unrecognized-entry")).unwrap();
-    // Removing the broken record does not authorize reconnecting/refetching
-    // after the latched failure or replace the original diagnostic.
+        .expect("private ODB fetch failure was not latched");
+    std::fs::remove_file(&packs).unwrap();
+    std::fs::create_dir(&packs).unwrap();
     assert!(snapshot.entry(Path::new("deep/value")).is_err());
     assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
+}
+
+#[test]
+fn session_staging_failure_is_latched_after_the_storage_is_repaired() {
+    let (temporary, _, _, _) = fixture();
+    let snapshot = load(temporary.path(), "HEAD", false).unwrap();
+    snapshot.children(Path::new("")).unwrap();
+    let parts = std::fs::read_dir(snapshot.git_dir.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("raw-parts-")
+        })
+        .unwrap();
+    let mut substituted = Vec::new();
+    for id in 0..256 {
+        let path = parts.join(format!("{id:x}-0"));
+        if !path.exists() {
+            std::os::unix::fs::symlink(temporary.path().join("foreign-target"), &path).unwrap();
+            substituted.push(path);
+        }
+    }
+    let error = snapshot.entry(Path::new("deep/value"));
+    for path in substituted {
+        let _ = std::fs::remove_file(path);
+    }
+    assert!(error.is_err());
+    let failure = snapshot
+        .remote_failure()
+        .expect("session staging failure was not latched");
+    assert!(snapshot.entry(Path::new("deep/value")).is_err());
+    assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
+    assert!(!temporary.path().join("foreign-target").exists());
 }

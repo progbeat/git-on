@@ -4,12 +4,13 @@ use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Seek, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, FromRawFd},
         net::UnixStream,
     },
@@ -18,8 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-pub const DISK_CACHE_ENTRIES: usize = 4096;
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 
 fn require_native_git(cwd: &Path) -> Result<()> {
@@ -132,12 +131,23 @@ pub struct Remote {
     pub dir: PathBuf,
     source: OsString,
     https_alternative: Option<String>,
-    cache: DiskCache,
+    completed_fetches: u64,
+    fetch_operations: u64,
+    decode_operations: u64,
+    session_fetch_operations: u64,
+    session_decode_operations: u64,
+    session_starts: u64,
+    native_received_pack_bytes: u64,
+    session_received_pack_bytes: u64,
+    session: Option<crate::transport::Session>,
+    session_checked: bool,
+    demand_url: OsString,
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
     control_client: Option<ControlClient>,
     failed: Option<String>,
+    pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
 }
 impl Remote {
     pub fn open(cwd: &Path, source: &OsStr, revision: &OsStr, run: &Path) -> Result<(Self, Oid)> {
@@ -189,7 +199,6 @@ impl Remote {
             true,
         )?;
         drop(repo);
-        let cache = DiskCache::standard()?;
         let socket = ssh_transport.then(|| run.join("ssh-control"));
         let ssh = socket
             .as_ref()
@@ -212,12 +221,23 @@ impl Remote {
             dir,
             source: source.to_os_string(),
             https_alternative: github_https_alternative(&text),
-            cache,
+            completed_fetches: 0,
+            fetch_operations: 0,
+            decode_operations: 0,
+            session_fetch_operations: 0,
+            session_decode_operations: 0,
+            session_starts: 0,
+            native_received_pack_bytes: 0,
+            session_received_pack_bytes: 0,
+            session: None,
+            session_checked: false,
+            demand_url: OsString::from_vec(url.to_vec()),
             socket,
             socket_owner: None,
             ssh,
             control_client,
             failed: None,
+            raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
         // Authentication and host-key interaction happen here, before mounting.
         let capabilities = tempfile::NamedTempFile::new_in(run)?;
@@ -259,7 +279,7 @@ impl Remote {
         Ok((remote, oid))
     }
     fn command(&self, initial: bool) -> Result<Command> {
-        if let Some(error) = &self.failed {
+        if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
         }
         let mut command = self.git.command(Some(&self.dir));
@@ -270,6 +290,13 @@ impl Remote {
             "maintenance.auto=false",
             "-c",
             "fetch.writeCommitGraph=false",
+            // These objects belong to one disposable invocation. A machine
+            // crash ends that invocation; stale cleanup never resumes it.
+            // Durability barriers add no OID-integrity or signature guarantee.
+            "-c",
+            "core.fsync=none",
+            "-c",
+            "core.bigFileThreshold=8m",
             // A fetched destination ref names a commit, but its trees and
             // blobs may still be absent. Advertising that commit as a 'have'
             // can make the server omit an explicitly demanded descendant.
@@ -301,7 +328,7 @@ impl Remote {
         }
         Ok(command)
     }
-    fn fetch_selected(&self, revision: &OsStr) -> Result<Oid> {
+    fn fetch_selected(&mut self, revision: &OsStr) -> Result<Oid> {
         // A fetch refspec belongs to native Git, including its leading '+',
         // namespace abbreviation and destination. All resulting refs and
         // FETCH_HEAD live in this owned bare repository, never in the caller.
@@ -342,48 +369,94 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
+        self.import_received(true)?;
         let repo = Repository::open_bare(&self.dir)?;
-        if !repo.odb()?.exists(oid) {
+        if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
             bail!("native Git fetch did not supply selected object {oid}");
         }
-        self.cache.store(&repo, oid)?;
+        self.completed_fetches += 1;
+        self.fetch_operations += 1;
         Ok(oid)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
+        let repo = Repository::open_bare(&self.dir)?;
+        self.ensure_in(&repo, oid)
+    }
+    pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let outcome = (|| {
-            let repo = Repository::open_bare(&self.dir)?;
-            if repo.odb()?.exists(oid) {
+            if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
                 return Ok(());
             }
-            if self.cache.restore(&repo, oid)? {
-                return Ok(());
-            }
-            self.fetch(&repo, oid)
+            self.fetch(repo, &[oid])
         })();
+        self.record_result(outcome)
+    }
+    /// Only eager materialization calls this: every supplied object is already
+    /// needed for the directory being prepared. Lazy filesystem access retains
+    /// its exact one-demand behavior.
+    pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
+        let outcome = (|| {
+            let odb = repo.odb()?;
+            let mut unique = HashSet::new();
+            let mut missing = Vec::new();
+            for oid in oids {
+                if unique.insert(*oid) && self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+                    missing.push(*oid);
+                }
+            }
+            if missing.is_empty() {
+                return Ok(());
+            }
+            self.fetch(repo, &missing)
+        })();
+        self.record_result(outcome)
+    }
+    fn record_result(&mut self, outcome: Result<()>) -> Result<()> {
         if let Err(error) = &outcome {
-            // Cache/ODB failures are just as incomplete as a failed fetch. Keep
+            // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if !crate::git::is_request_interruption(error) && self.failed.is_none() {
+            if !crate::git::is_request_interruption(error) && self.failure().is_none() {
                 self.failed = Some(format!("{error:#}"));
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
         }
         outcome
     }
-    fn fetch(&self, repo: &Repository, oid: Oid) -> Result<()> {
+    fn fetch(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
+        // Session reuse bypasses command(), so reject incomplete invocations
+        // before either transport can start another missing-object demand.
+        if let Some(error) = self.failure() {
+            bail!("remote object transport previously failed: {error}");
+        }
+        if oids.len() == 1 && self.fetch_in_session(repo, oids[0])? {
+            return Ok(());
+        }
         let mut command = self.command(false)?;
-        command
-            .args([
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--depth=1",
-                "--filter=tree:0",
-            ])
-            .arg("--")
-            .arg(&self.source)
-            .arg(oid.to_string())
-            .stdin(Stdio::null());
+        command.args([
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--depth=1",
+            "--filter=tree:0",
+        ]);
+        if oids.len() == 1 {
+            command
+                .arg("--")
+                .arg(&self.source)
+                .arg(oids[0].to_string())
+                .stdin(Stdio::null());
+        } else {
+            let mut requests = tempfile::tempfile_in(&self.dir)?;
+            for oid in oids {
+                writeln!(requests, "{oid}")?;
+            }
+            requests.rewind()?;
+            command
+                .arg("--stdin")
+                .arg("--")
+                .arg(&self.source)
+                .stdin(Stdio::from(requests));
+        }
         let out = match crate::git::run(command, true) {
             Ok(out) => out,
             Err(error) => {
@@ -405,22 +478,436 @@ impl Remote {
         };
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
-            bail!("remote fetch of exact object {oid} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}{}", error.trim(), authentication_advice(&error, self.https_alternative.as_deref()));
+            let selected = if oids.len() == 1 {
+                format!("object {}", oids[0])
+            } else {
+                format!("objects ({} requests, first {})", oids.len(), oids[0])
+            };
+            bail!("remote fetch of exact {selected} failed (server must allow requested unadvertised OIDs and filtering; SSH connection must remain alive): {}{}", error.trim(), authentication_advice(&error, self.https_alternative.as_deref()));
         }
         if error.contains("filtering not recognized") || error.contains("filter capability") {
             bail!(
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        repo.odb()?.refresh()?;
-        if !repo.odb()?.exists(oid) {
-            bail!("filtered remote fetch did not supply requested object {oid}");
+        self.import_received(true)?;
+        let odb = repo.odb()?;
+        for oid in oids {
+            if self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+                bail!("filtered remote fetch did not supply requested object {oid}");
+            }
         }
-        self.cache.store(repo, oid)?;
+        self.completed_fetches += oids.len() as u64;
+        self.fetch_operations += 1;
+        Ok(())
+    }
+    fn start_session(&mut self) -> Result<Option<crate::transport::Session>> {
+        if !self.git.demand_session_compatible() || self.demand_url.as_bytes().starts_with(b"-") {
+            return Ok(None);
+        }
+        let url = self.demand_url.as_bytes();
+        if url.starts_with(b"https://") || url.starts_with(b"http://") {
+            let mut command = self.command(false)?;
+            command
+                .args(["-c", "protocol.version=2"])
+                .arg(if url.starts_with(b"https://") {
+                    "remote-https"
+                } else {
+                    "remote-http"
+                })
+                .arg(&self.source)
+                .arg(&self.demand_url);
+            self.session_starts += 1;
+            return crate::transport::Session::connect(command, true);
+        }
+        // Native Git, rather than a second URL grammar, decodes paths, ports,
+        // scp-style names and percent escapes. Unknown diagnostics keep fetch.
+        let mut command = self.command(false)?;
+        command
+            .args(["fetch-pack", "--diag-url"])
+            .arg(&self.demand_url)
+            .stdin(Stdio::null());
+        let diagnostic = crate::git::run(command, true)?;
+        if !diagnostic.status.success() {
+            return Ok(None);
+        }
+        let mut prefix = b"Diag: url=".to_vec();
+        prefix.extend(url);
+        prefix.push(b'\n');
+        let Some(mut remaining) = diagnostic.stdout.strip_prefix(prefix.as_slice()) else {
+            return Ok(None);
+        };
+        fn field<'a>(remaining: &mut &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+            let value = remaining.strip_prefix(prefix)?;
+            let end = value.iter().position(|byte| *byte == b'\n')?;
+            *remaining = &value[end + 1..];
+            Some(&value[..end])
+        }
+        let Some(protocol) = field(&mut remaining, b"Diag: protocol=") else {
+            return Ok(None);
+        };
+        let (host, port) = if protocol == b"ssh" {
+            let Some(host) = field(&mut remaining, b"Diag: userandhost=") else {
+                return Ok(None);
+            };
+            let Some(port) = field(&mut remaining, b"Diag: port=") else {
+                return Ok(None);
+            };
+            (host, port)
+        } else if protocol == b"file" {
+            if field(&mut remaining, b"Diag: hostandport=").is_none() {
+                return Ok(None);
+            }
+            (&b""[..], &b""[..])
+        } else {
+            return Ok(None);
+        };
+        let Some(path) = remaining
+            .strip_prefix(b"Diag: path=")
+            .and_then(|path| path.strip_suffix(b"\n"))
+        else {
+            return Ok(None);
+        };
+        let native = self.command(false)?;
+        let mut command = if protocol == b"file" {
+            let mut command = Command::new("git");
+            command.arg("upload-pack").arg(OsStr::from_bytes(path));
+            command
+        } else {
+            if host.starts_with(b"-") {
+                return Ok(None);
+            }
+            let Some(ssh) = native
+                .get_envs()
+                .find_map(|(key, value)| (key == "GIT_SSH_COMMAND").then_some(value).flatten())
+            else {
+                return Ok(None);
+            };
+            let mut script = ssh.to_os_string();
+            script.push(" \"$@\"");
+            let mut command = Command::new("/bin/sh");
+            command.args([OsStr::new("-c"), &script, OsStr::new("git-on-ssh")]);
+            command.args(["-o", "SendEnv=GIT_PROTOCOL"]);
+            if port != b"NONE" && !port.is_empty() {
+                command.arg("-p").arg(OsStr::from_bytes(port));
+            }
+            command.arg(OsStr::from_bytes(host));
+            let mut remote = b"git-upload-pack ".to_vec();
+            remote.extend_from_slice(&gix_quote::single(path.into()));
+            command.arg(OsString::from_vec(remote));
+            command
+        };
+        command.current_dir(&self.git.cwd);
+        for (key, value) in native.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        // Match native Git's local transport child environment for this exact
+        // installed Git version, including config/object-location overrides.
+        let local = self.git.output(
+            None,
+            &[OsStr::new("rev-parse"), OsStr::new("--local-env-vars")],
+        )?;
+        for key in local
+            .split(|byte| *byte == b'\n')
+            .filter(|key| !key.is_empty())
+        {
+            command.env_remove(OsStr::from_bytes(key));
+        }
+        command.env("GIT_PROTOCOL", "version=2");
+        self.session_starts += 1;
+        crate::transport::Session::connect(command, false)
+    }
+    fn fetch_in_session(&mut self, repo: &Repository, oid: Oid) -> Result<bool> {
+        if !self.session_checked {
+            self.session = self.start_session()?;
+            self.session_checked = true;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(socket) = &self.socket {
+            anyhow::ensure!(
+                self.socket_owner
+                    .as_ref()
+                    .is_some_and(|owner| fs::symlink_metadata(socket).is_ok_and(
+                        |metadata| metadata.file_type().is_socket()
+                            && metadata.dev() == owner.device
+                            && metadata.ino() == owner.inode
+                    )),
+                "owned SSH control connection is unavailable; reconnection is forbidden"
+            );
+        }
+        let pack = self.raw_blobs.scratch_file(&self.dir)?;
+        if let Err(error) = session.fetch(oid, &pack) {
+            let diagnostic = session.error_text();
+            self.session = None;
+            // An interrupted request may open a new session later; already
+            // published objects still bypass every transport operation.
+            if crate::git::is_request_interruption(&error) {
+                self.session_checked = false;
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "remote fetch of exact object {oid} failed: {}",
+                    diagnostic.trim()
+                )
+            });
+        }
+        self.session_fetch_operations += 1;
+        self.session_received_pack_bytes =
+            self.session_received_pack_bytes.saturating_add(pack.len()?);
+        if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
+            match kind {
+                git2::ObjectType::Blob => {
+                    self.raw_blobs
+                        .insert_fetched(oid, size, reader, &self.dir)?;
+                }
+                git2::ObjectType::Tree => {
+                    let odb = repo.odb()?;
+                    let mut writer = odb.writer(size, kind)?;
+                    self.raw_blobs.insert_tree(
+                        oid,
+                        size,
+                        CopyTo {
+                            input: reader,
+                            output: &mut writer,
+                        },
+                        &self.dir,
+                    )?;
+                    anyhow::ensure!(writer.finalize()? == oid, "received tree OID changed");
+                }
+                _ => {
+                    let odb = repo.odb()?;
+                    let mut writer = odb.writer(size, kind)?;
+                    crate::object::copy_verified(reader, &mut writer, kind, size, oid)?;
+                    anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
+                }
+            }
+            self.session_decode_operations += 1;
+        } else {
+            // The generic path handles necessary deltas and multi-object packs
+            // through the existing decoder; never repeat the network request.
+            let target = Repository::open_bare(&self.dir)?;
+            let odb = target.odb()?;
+            let mut transfer_failure = None;
+            let mut writer = odb.packwriter()?;
+            writer.progress(|_| match crate::object::check_transfer() {
+                Ok(()) => true,
+                Err(error) => {
+                    transfer_failure = Some(error);
+                    false
+                }
+            });
+            let indexed = (|| -> Result<()> {
+                let mut offset = 0;
+                let mut bytes = [0; 65536];
+                let size = pack.len()?;
+                while offset < size {
+                    crate::object::check_transfer()?;
+                    let count = (size - offset).min(bytes.len() as u64) as usize;
+                    pack.read_exact_at(&mut bytes[..count], offset)?;
+                    writer.write_all(&bytes[..count])?;
+                    offset += count as u64;
+                }
+                writer.commit()?;
+                Ok(())
+            })();
+            drop(writer);
+            drop(odb);
+            drop(target);
+            if let Some(error) = transfer_failure {
+                return Err(error);
+            }
+            indexed?;
+            self.import_received(false)?;
+        }
+        anyhow::ensure!(
+            self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
+            "remote did not supply requested object {oid}"
+        );
+        self.completed_fetches += 1;
+        Ok(true)
+    }
+    /// Native filtered fetches always retain promisor packs. Keeping one pack
+    /// per demand makes later Git/libgit2 pack discovery grow with all previous
+    /// demands. Decode only new received objects directly into raw run storage,
+    /// then release their files/indexes before the next operation. The private
+    /// repository has one serialized writer and no auto-maintenance.
+    fn import_received(&mut self, count_transfer: bool) -> Result<()> {
+        let pack_directory = self.dir.join("objects/pack");
+        let mut received = Vec::new();
+        for entry in fs::read_dir(&pack_directory)? {
+            crate::object::check_transfer()?;
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else {
+                bail!("invalid received pack filename");
+            };
+            if let Some((hash, _)) = text
+                .strip_prefix("pack-")
+                .and_then(|name| name.split_once('.'))
+            {
+                if hash.len() == 40 && Oid::from_str(hash).is_ok() && entry.file_type()?.is_file() {
+                    received.push((name, entry.path()));
+                }
+            }
+        }
+        if received.is_empty() {
+            return Ok(());
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("received-pack-")
+            .tempdir_in(&self.dir)?;
+        let mut options = git2::RepositoryInitOptions::new();
+        options.bare(true).external_template(false);
+        let staging_repo = Repository::init_opts(staging.path(), &options)?;
+        let objects = staging.path().join("objects/pack");
+        // The decoder sees only this newly received pack set, never all prior
+        // demands. Companion indexes, including optional .rev, move together.
+        for (name, path) in &received {
+            crate::object::check_transfer()?;
+            if count_transfer
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            {
+                self.native_received_pack_bytes = self
+                    .native_received_pack_bytes
+                    .saturating_add(fs::metadata(path)?.len());
+            }
+            fs::rename(path, objects.join(name))?;
+        }
+        let destination = Repository::open_bare(&self.dir)?;
+        let mut requests = tempfile::tempfile_in(&self.dir)?;
+        let mut failure = None;
+        let received_odb = staging_repo.odb()?;
+        let iteration = received_odb.foreach(|oid| {
+            let outcome = (|| -> Result<()> {
+                crate::object::check_transfer()?;
+                if self.raw_blobs.get(*oid)?.is_none() && !destination.odb()?.exists(*oid) {
+                    writeln!(requests, "{oid}")?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                failure = Some(error);
+                return false;
+            }
+            true
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        iteration?;
+        // Release ODB/pack descriptors before launching the native decoder.
+        drop(received_odb);
+        drop(staging_repo);
+        if requests.stream_position()? == 0 {
+            return Ok(());
+        }
+        requests.rewind()?;
+        let (mut output_file, start) = self.raw_blobs.append_output()?;
+        let mut command = self.git.command(Some(&self.dir));
+        command
+            .env("GIT_OBJECT_DIRECTORY", staging.path().join("objects"))
+            .args([
+                "-c",
+                "core.bigFileThreshold=8m",
+                "cat-file",
+                "--batch",
+                "--buffer",
+            ])
+            .stdin(Stdio::from(requests));
+        let output = crate::git::run_to_writer(command, &mut output_file)
+            .context("decode received objects into run-local raw storage")?;
+        if !output.status.success() {
+            bail!(
+                "cannot decode received Git objects: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let imported = self.import_raw_output(start, &destination);
+        self.raw_blobs.release_output();
+        imported?;
+        self.decode_operations += 1;
+        Ok(())
+    }
+    fn import_raw_output(&mut self, start: u64, destination: &Repository) -> Result<()> {
+        let mut input = BufReader::new(self.raw_blobs.output_reader(start)?);
+        let mut position = start;
+        loop {
+            crate::object::check_transfer()?;
+            let mut header = Vec::new();
+            let length = Read::by_ref(&mut input)
+                .take(128)
+                .read_until(b'\n', &mut header)?;
+            if length == 0 {
+                break;
+            }
+            anyhow::ensure!(
+                header.last() == Some(&b'\n'),
+                "invalid native Git batch header"
+            );
+            let header = std::str::from_utf8(&header[..length - 1])?;
+            let fields: Vec<_> = header.split(' ').collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0].len() == 40,
+                "invalid native Git object header"
+            );
+            let oid = Oid::from_str(fields[0])?;
+            let kind = match fields[1] {
+                "blob" => git2::ObjectType::Blob,
+                "tree" => git2::ObjectType::Tree,
+                "commit" => git2::ObjectType::Commit,
+                "tag" => git2::ObjectType::Tag,
+                _ => bail!("unknown received Git object type"),
+            };
+            let size: usize = fields[2].parse().context("native Git object size")?;
+            position = position
+                .checked_add(length as u64)
+                .context("native object offset")?;
+            let mut payload = Read::by_ref(&mut input).take(size as u64);
+            if kind == git2::ObjectType::Blob {
+                self.raw_blobs
+                    .import_blob(oid, position, size, &mut payload, &self.dir)?;
+            } else {
+                // Native verification and revision resolution still use Git's
+                // metadata ODB. Blob payloads never get a second loose copy.
+                let odb = destination.odb()?;
+                let mut writer = odb.writer(size, kind)?;
+                if kind == git2::ObjectType::Tree {
+                    self.raw_blobs.import_tree(
+                        oid,
+                        position,
+                        size,
+                        &mut payload,
+                        &mut writer,
+                        &self.dir,
+                    )?;
+                } else {
+                    crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
+                }
+                anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
+            }
+            let mut delimiter = [0];
+            input.read_exact(&mut delimiter)?;
+            anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
+            position = position
+                .checked_add(size as u64)
+                .and_then(|n| n.checked_add(1))
+                .context("native object offset")?;
+        }
         Ok(())
     }
     /// Release the owned master even when the snapshot pin must remain for recovery.
     pub fn stop_transport(&self) -> Result<()> {
+        if let Some(session) = &self.session {
+            session.stop()?;
+        }
         if let (Some(socket), Some(owner)) = (&self.socket, &self.socket_owner) {
             stop_owned_connection(socket, owner)?;
         }
@@ -456,7 +943,40 @@ impl Remote {
         Ok(())
     }
     pub fn failure(&self) -> Option<String> {
-        self.failed.clone()
+        self.failed.clone().or_else(|| self.raw_blobs.failure())
+    }
+    pub(crate) fn completed_fetches(&self) -> u64 {
+        self.completed_fetches
+    }
+    pub(crate) fn fetch_operations(&self) -> u64 {
+        self.fetch_operations
+    }
+    pub(crate) fn decode_operations(&self) -> u64 {
+        self.decode_operations
+    }
+    pub(crate) fn session_operations(&self) -> (u64, u64, u64) {
+        (
+            self.session_fetch_operations,
+            self.session_decode_operations,
+            self.session_starts,
+        )
+    }
+    pub(crate) fn received_pack_bytes(&self) -> (u64, u64) {
+        (
+            self.native_received_pack_bytes,
+            self.session_received_pack_bytes,
+        )
+    }
+}
+struct CopyTo<R, W> {
+    input: R,
+    output: W,
+}
+impl<R: Read, W: Write> Read for CopyTo<R, W> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.input.read(bytes)?;
+        self.output.write_all(&bytes[..count])?;
+        Ok(count)
     }
 }
 impl Drop for Remote {
@@ -915,179 +1435,84 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     fi
 }"#;
 
-/// Persistent loose objects are copied into each run's private repository.
-/// Eviction cannot invalidate active readers; temporary run storage has no quota.
-pub struct DiskCache {
-    root: PathBuf,
-    budget: u64,
-    entries: usize,
-}
-impl DiskCache {
-    pub fn standard() -> Result<Self> {
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|x| PathBuf::from(x).join(".cache")))
-            .context("remote cache requires XDG_CACHE_HOME or HOME")?
-            .join("git-on/objects-v1");
-        Self::new(root, DISK_CACHE_BYTES, DISK_CACHE_ENTRIES)
-    }
-    pub fn new(root: PathBuf, budget: u64, entries: usize) -> Result<Self> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)?;
-        Ok(Self {
-            root,
-            budget,
-            entries,
-        })
-    }
-    fn lock(&self) -> Result<File> {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.root.join("lock"))?;
-        loop {
-            if let Some(signal) = crate::git::cancelled_signal() {
-                bail!("remote cache lock cancelled by signal {signal}");
-            }
-            if crate::git::operations_stopped() {
-                bail!("remote cache lock stopped after command completion");
-            }
-            crate::git::check_request_interruption()?;
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock
-                && error.kind() != std::io::ErrorKind::Interrupted
-            {
-                return Err(error.into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        self.reconcile()?;
-        Ok(f)
-    }
-    fn reconcile(&self) -> Result<()> {
-        let mut files = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                bail!("unrecognized remote cache entry");
-            };
-            if name == "lock" {
-                continue;
-            }
-            if name.starts_with(".tmp") {
-                // Every writer holds the same flock through atomic publication.
-                // With that lock held, these are interrupted staging files.
-                fs::remove_file(entry.path())?;
-                continue;
-            }
-            if name.len() != 40 || Oid::from_str(name).is_err() || !entry.file_type()?.is_file() {
-                bail!("unrecognized remote cache entry {name:?}");
-            }
-            let metadata = entry.metadata()?;
-            files.push((metadata.modified()?, metadata.len(), entry.path()));
-        }
-        files.sort_by_key(|x| x.0);
-        let mut bytes: u64 = files.iter().map(|x| x.1).sum();
-        let mut count = files.len();
-        for (_, size, path) in files {
-            if bytes <= self.budget && count <= self.entries {
-                break;
-            }
-            fs::remove_file(path)?;
-            bytes = bytes.saturating_sub(size);
-            count -= 1;
-        }
-        Ok(())
-    }
-    fn restore(&self, repo: &Repository, oid: Oid) -> Result<bool> {
-        let _lock = self.lock()?;
-        let file = self.root.join(oid.to_string());
-        let data = match fs::read(&file) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let Some((&kind, data)) = data.split_first() else {
-            fs::remove_file(file)?;
-            return Ok(false);
-        };
-        let Some(kind) = git2::ObjectType::from_raw(i32::from(kind)) else {
-            fs::remove_file(file)?;
-            return Ok(false);
-        };
-        if !matches!(
-            kind,
-            git2::ObjectType::Commit
-                | git2::ObjectType::Tree
-                | git2::ObjectType::Blob
-                | git2::ObjectType::Tag
-        ) || Oid::hash_object(kind, data)? != oid
-        {
-            fs::remove_file(file)?;
-            return Ok(false);
-        }
-        repo.odb()?.write(kind, data)?;
-        File::open(file)?
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
-        Ok(true)
-    }
-    fn store(&self, repo: &Repository, oid: Oid) -> Result<()> {
-        let odb = repo.odb()?;
-        let object = odb.read(oid)?;
-        let weight = object.len() as u64 + 1;
-        let _lock = self.lock()?;
-        let mut files = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.len() == 40 && Oid::from_str(name).is_ok())
-            {
-                let metadata = entry.metadata()?;
-                files.push((metadata.modified()?, metadata.len(), entry.path()));
-            }
-        }
-        files.sort_by_key(|x| x.0);
-        let mut total: u64 = files.iter().map(|x| x.1).sum();
-        let mut count = files.len();
-        let target = self.root.join(oid.to_string());
-        if target.exists() {
-            return Ok(());
-        }
-        let retain = weight <= self.budget && self.entries > 0;
-        for (_, size, path) in files {
-            if total.saturating_add(if retain { weight } else { 0 }) <= self.budget
-                && count + usize::from(retain) <= self.entries
-            {
-                break;
-            }
-            fs::remove_file(path)?;
-            total = total.saturating_sub(size);
-            count -= 1;
-        }
-        if retain {
-            use std::io::Write;
-            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-            temporary.write_all(&[object.kind().raw() as u8])?;
-            temporary.write_all(object.data())?;
-            temporary.persist(target)?;
-        }
-        Ok(())
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_request_interruption_does_not_poison_later_demands() {
+        struct Requester(std::process::Child);
+        impl Drop for Requester {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temporary.path().join("server")).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowFilter", true)
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowAnySHA1InWant", true)
+            .unwrap();
+        let first = repo.blob(b"first").unwrap();
+        let later = repo.blob(b"later").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("first", first, 0o100644).unwrap();
+        tree.insert("later", later, 0o100644).unwrap();
+        let tree = tree.write().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "request",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let run = tempfile::tempdir_in(temporary.path()).unwrap();
+        let source = format!("file://{}", repo.path().display());
+        let (mut remote, _) = Remote::open(
+            temporary.path(),
+            OsStr::new(&source),
+            OsStr::new("HEAD"),
+            run.path(),
+        )
+        .unwrap();
+        remote.ensure(tree).unwrap();
+        assert!(remote.session.is_some());
+        let requester = Requester(
+            Command::new("sh")
+                .args(["-c", "trap ':' TERM; kill -STOP $$; exec sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+        let pid = requester.0.id();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            if status.lines().any(|line| line.starts_with("State:\tT")) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let guard = crate::git::RequestGuard::enter(pid);
+        let error = remote.ensure(first).unwrap_err();
+        assert!(crate::git::is_request_interruption(&error), "{error:#}");
+        assert!(remote.failure().is_none());
+        drop(guard);
+        remote.ensure(later).unwrap();
+        assert!(remote.failure().is_none());
+        remote.stop_transport().unwrap();
+    }
+
     #[test]
     fn mux_shutdown_rejects_invalid_greetings_before_termination() {
         for greeting in [
@@ -1153,55 +1578,5 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         drop(client);
         peer.join().unwrap();
-    }
-    fn total(root: &Path) -> u64 {
-        fs::read_dir(root)
-            .unwrap()
-            .map(|x| x.unwrap().metadata().unwrap().len())
-            .sum()
-    }
-    #[test]
-    fn review_abandoned_staging_files_are_reclaimed_with_cache_lock() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cache");
-        let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-        fs::write(root.join(".tmpAbandonedWrite"), vec![0; 128]).unwrap();
-        let repo = Repository::init_bare(temporary.path().join("repository")).unwrap();
-        let oid = repo.blob(b"demanded").unwrap();
-        cache.store(&repo, oid).unwrap();
-        assert!(!root.join(".tmpAbandonedWrite").exists());
-        assert!(total(&root) <= 64);
-    }
-    #[test]
-    fn concurrent_eviction_keeps_active_run_copies_and_bounds_bytes_entries() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cache");
-        let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-        let original = Repository::init_bare(temporary.path().join("original")).unwrap();
-        let active = Repository::init_bare(temporary.path().join("active")).unwrap();
-        let oid = original.blob(b"active copy").unwrap();
-        cache.store(&original, oid).unwrap();
-        assert!(cache.restore(&active, oid).unwrap());
-        std::thread::scope(|scope| {
-            for worker in 0..4 {
-                let root = root.clone();
-                let path = temporary.path().join(format!("worker-{worker}"));
-                scope.spawn(move || {
-                    let cache = DiskCache::new(root.clone(), 64, 2).unwrap();
-                    let repo = Repository::init_bare(path).unwrap();
-                    for n in 0..30 {
-                        let oid = repo.blob(&[worker, n]).unwrap();
-                        cache.store(&repo, oid).unwrap();
-                        let _lock = cache.lock().unwrap();
-                        assert!(total(&root) <= 64);
-                        assert!(fs::read_dir(&root).unwrap().count() <= 3);
-                    }
-                });
-            }
-        });
-        assert_eq!(active.find_blob(oid).unwrap().content(), b"active copy");
-        let oversized = original.blob(&[0; 65]).unwrap();
-        cache.store(&original, oversized).unwrap();
-        assert!(!root.join(oversized.to_string()).exists());
     }
 }

@@ -4,17 +4,59 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: Exhaustive full-million matrix before release (expensive)
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  # Superseded PR heads may cancel. Master/manual runs keep unique groups so
+  # existing tag/release semantics are unaffected by later pushes.
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      scale: ${{ steps.plan.outputs.scale }}
+      stress: ${{ steps.plan.outputs.stress }}
+      lazy: ${{ steps.plan.outputs.lazy }}
+      resources: ${{ steps.plan.outputs.resources }}
+      profile: ${{ steps.plan.outputs.profile }}
+      scale_matrix: ${{ steps.plan.outputs.scale_matrix }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        run: python3 scripts/ci_plan.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --report ci-plan.json --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-plan
+          path: ci-plan.json
+          if-no-files-found: error
+
   rust:
+    needs: [changes]
+    timeout-minutes: 20
+    outputs:
+      resources_step: ${{ steps.pack_scaling.outcome }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Select stable Rust and quality tools
         run: |
@@ -24,7 +66,7 @@ jobs:
         run: |
           sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes git openssh-server openssl gnupg
+          sudo apt-get install --yes git openssh-server openssl gnupg strace
           git --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -33,7 +75,9 @@ jobs:
       - run: python3 tests/check_fuse_coverage.py --self-test
       - run: python3 tests/check_fuse_coverage.py
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
-      - run: cargo test --locked --all-targets --features test-metrics
+      # This pure native-Git pattern oracle already ran above. Its matcher has
+      # no metrics feature branches; keep every feature-sensitive runtime case.
+      - run: cargo test --locked --all-targets --features test-metrics -- --skip policy::tests::adversarial_patterns_match_git_byte_for_byte
       - name: Check the locked graph at Rust 1.89 MSRV
         run: |
           rustup toolchain install 1.89.0 --profile minimal
@@ -46,14 +90,33 @@ jobs:
         run: python3 tests/materialized.py target/debug/git-on
       - name: Installer smoke test
         run: python3 tests/installer_smoke.py --binary target/debug/git-on
-      - name: Native Git oracle, real HTTPS/OpenSSH, cache and transport regressions
+      - name: Native Git oracle, real HTTPS/OpenSSH, run-storage and transport regressions
         run: |
           cargo build --locked --features test-metrics --example source-probe --bin git-on
           python3 tests/remote.py
           python3 tests/ssh_regressions.py
           python3 tests/native_job_control.py
+      - name: Measure distinct-object pack work
+        id: pack_scaling
+        if: needs.changes.outputs.resources == 'true'
+        # Current regressions run on every PR. Authentic red-before replays are
+        # retained as opt-in commands, not rebuilt on every unchanged push.
+        run: python3 tests/pack_scaling.py --probe target/debug/examples/source-probe --output pack-scaling.jsonl
+      - name: Retain pack metadata measurements
+        if: always() && needs.changes.outputs.resources == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: object-scaling
+          path: |
+            pack-scaling.jsonl
+          if-no-files-found: ignore
 
   real-fuse:
+    needs: [changes]
+    timeout-minutes: ${{ needs.changes.outputs.profile == 'exhaustive' && 360 || 20 }}
+    outputs:
+      stress_step: ${{ steps.stress.outcome }}
+      passthrough_scale: ${{ steps.passthrough.outputs.scale_coverage }}
     # This job intentionally fails if the runner cannot open /dev/fuse or mount.
     # A skipped/emulated filesystem test is never accepted as FUSE evidence.
     runs-on: ubuntu-latest
@@ -67,7 +130,7 @@ jobs:
         run: |
           sudo add-apt-repository --yes ppa:git-core/ppa
           sudo apt-get update
-          sudo apt-get install --yes fuse3 git openssh-server openssl gnupg
+          sudo apt-get install --yes fuse3 git openssh-server openssl gnupg strace
           python3 -m pip install --user 'uv==0.8.22'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Require a usable FUSE device
@@ -90,54 +153,55 @@ jobs:
         run: python3 tests/integration.py --binary target/release/git-on --require-fuse --uv
       - name: All four write policies on real FUSE
         run: python3 tests/write_policy.py --binary target/release/git-on --require-fuse
+      - name: Build private resource instrumentation
+        run: |
+          cp target/release/git-on target/release/git-on-plain
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+      - name: Attribute instrumentation on the same real FUSE host
+        if: needs.changes.outputs.resources == 'true'
+        # Reuse both binaries already built above. This bounded diagnostic
+        # has no timing SLA and adds no second complete WebKit traversal.
+        run: |
+          profile_cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+          taskset -c "$profile_cpu" python3 tests/instrumentation_profile.py --checkout . --plain target/release/git-on-plain --metrics target/release/git-on --backend fuse --counts 128,512 --trials 3 --work "$RUNNER_TEMP/instrumentation-attribution" --output instrumentation-profile.jsonl
+      - name: Separate invocation setup from increasing same-mount demand
+        if: needs.changes.outputs.resources == 'true'
+        run: |
+          python3 tests/startup_profile.py --binary target/release/git-on --output startup-profile.jsonl
+          python3 tests/startup_profile.py --binary target/release/git-on --policies ignored,all --sizes 160 --trials 1 --profile-spans --output callback-profile.jsonl
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
-          BEFORE=92377e27e32ac424d688ae8bcf0fbe6be0081c0c
-          BEFORE_ARGUMENT=()
-          # Historical worktrees must never overwrite the reviewed binaries.
-          # Cargo can consider HEAD fresh after another worktree writes the
-          # same top-level executable in a shared target directory.
-          BEFORE_TARGET=/tmp/git-on-historical-target
-          # Replay the authentic pre-fix feature revision while reviewing this
-          # branch. Later squash merges retain the permanent green tests even
-          # when that intermediate commit is no longer in master's ancestry.
-          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" HEAD; then
-            git worktree add --detach /tmp/git-on-review-before "$BEFORE"
-            cargo build --release --locked --manifest-path /tmp/git-on-review-before/Cargo.toml --target-dir "$BEFORE_TARGET"
-            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-before-bin
-            BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-before-bin)
-          fi
-          LIFECYCLE_BEFORE=8d6c02ede7a6f5d377e2c47c5b2177ee46a477eb
-          if git cat-file -e "$LIFECYCLE_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$LIFECYCLE_BEFORE" HEAD; then
-            git worktree add --detach /tmp/git-on-lifecycle-before "$LIFECYCLE_BEFORE"
-            cargo build --release --locked --manifest-path /tmp/git-on-lifecycle-before/Cargo.toml --target-dir "$BEFORE_TARGET"
-            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-lifecycle-before-bin
-            BEFORE_ARGUMENT+=(--before-lifecycle-binary /tmp/git-on-lifecycle-before-bin)
-          fi
-          REVIEW_BEFORE=e42774399dba61d02c80235ef54bf61c3abd9e63
-          SSH_BEFORE_ARGUMENT=()
-          JOB_BEFORE_ARGUMENT=()
-          if git cat-file -e "$REVIEW_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$REVIEW_BEFORE" HEAD; then
-            git worktree add --detach /tmp/git-on-review-e427 "$REVIEW_BEFORE"
-            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-review-e427/Cargo.toml --target-dir "$BEFORE_TARGET"
-            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-review-e427-bin
-            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-review-e427-probe
-            BEFORE_ARGUMENT+=(--before-policy-binary /tmp/git-on-review-e427-bin)
-            SSH_BEFORE_ARGUMENT=(--before-boundary-probe /tmp/git-on-review-e427-probe)
-            JOB_BEFORE_ARGUMENT=(--before-binary /tmp/git-on-review-e427-bin)
-          fi
-          CLIENT_BEFORE=87a11d5bbc85b9b8b46a55d054a0e1a6538d5203
-          if git cat-file -e "$CLIENT_BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$CLIENT_BEFORE" HEAD; then
-            git worktree add --detach /tmp/git-on-client-before "$CLIENT_BEFORE"
-            cargo build --release --locked --features test-metrics --example source-probe --bin git-on --manifest-path /tmp/git-on-client-before/Cargo.toml --target-dir "$BEFORE_TARGET"
-            cp "$BEFORE_TARGET/release/git-on" /tmp/git-on-client-before-bin
-            cp "$BEFORE_TARGET/release/examples/source-probe" /tmp/git-on-client-before-probe
-            SSH_BEFORE_ARGUMENT+=(--before-client-binary /tmp/git-on-client-before-bin --before-client-probe /tmp/git-on-client-before-probe)
-          fi
-          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
-          python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on "${BEFORE_ARGUMENT[@]}"
-          python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on "${SSH_BEFORE_ARGUMENT[@]}"
-          python3 tests/native_job_control.py --binary target/release/git-on "${JOB_BEFORE_ARGUMENT[@]}"
+          python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on
+          python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on
+          python3 tests/native_job_control.py --binary target/release/git-on
+
+      - name: Bounded kernel-cache and waited-CPU profile
+        if: needs.changes.outputs.resources == 'true'
+        run: python3 tests/io_profile.py --binary target/release/git-on --files 1000 --output io-profile.jsonl
+      - name: Distinct-object CLI preparation and closed-reader reuse
+        if: needs.changes.outputs.resources == 'true'
+        run: |
+          python3 tests/import_profile.py --binary target/release/git-on --backend fuse --sizes 160 --output import-profile-fuse.jsonl
+          python3 tests/import_profile.py --binary target/release/git-on --backend materialized --sizes 32 --trace --output import-profile-materialized.jsonl
+      - name: Wide-tree preparation and repeated metadata with full disk baseline
+        if: needs.changes.outputs.resources == 'true'
+        run: |
+          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-profile-local.jsonl
+          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-profile-remote.jsonl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && needs.changes.outputs.resources == 'true'
+        with:
+          name: io-profile
+          path: |
+            io-profile.jsonl
+            import-profile-fuse.jsonl
+            import-profile-materialized.jsonl
+            metadata-profile-local.jsonl
+            metadata-profile-remote.jsonl
+            startup-profile.jsonl
+            instrumentation-profile.jsonl
+            callback-profile.jsonl
+          if-no-files-found: error
 
       - name: Real-FUSE generated-file passthrough fallback
         run: python3 tests/passthrough.py --binary target/release/git-on --expect=fallback
@@ -149,6 +213,10 @@ jobs:
         run: python3 tests/passthrough_lifecycle.py --binary target/release/git-on --expect=fallback
 
       - name: Actual kernel passthrough with an isolated test-daemon capability
+        id: passthrough
+        env:
+          SCALE_REQUIRED: ${{ needs.changes.outputs.scale }}
+          SCALE_PROFILE: ${{ needs.changes.outputs.profile }}
         run: |
           # Owner-approved test only: never grant a capability to the checkout's
           # binary or run the command as root. Nothing privileged is uploaded.
@@ -172,8 +240,20 @@ jobs:
           # Both suites assert ordinary child UID and zero Eff/Prm/Amb caps.
           python3 tests/passthrough.py --binary "$TEST_BINARY" --expect=enabled
           python3 tests/passthrough_lifecycle.py --binary "$TEST_BINARY" --expect=enabled
+          case "$SCALE_REQUIRED" in
+            true)
+              for SOURCE in local remote; do
+                python3 tests/scalability.py --binary "$TEST_BINARY" --backend passthrough --source "$SOURCE" --policies ignored --profile "$SCALE_PROFILE" --output "stress-artifacts/scale-passthrough-$SOURCE.jsonl"
+              done
+              echo 'scale_coverage=passed' >> "$GITHUB_OUTPUT"
+              ;;
+            false) echo 'scale_coverage=not_required' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'Missing/invalid scale plan' >&2; exit 1 ;;
+          esac
 
       - name: Seeded bounded filesystem differential stress
+        id: stress
+        if: needs.changes.outputs.stress == 'true'
         run: >-
           python3 tests/stress.py --binary target/release/git-on --require-fuse
           --seed 0x5eed --seed 0xc0ffee --operations 400 --max-nodes 64
@@ -187,6 +267,8 @@ jobs:
           if-no-files-found: ignore
 
   lazy-performance:
+    needs: [changes]
+    if: needs.changes.outputs.lazy == 'true'
     # Exact output and demand-count gates; measured timings have no arbitrary SLA.
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -207,11 +289,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
-      - name: Remote million distinct-file cold and warm fetch gates through real FUSE
+      - name: Remote million distinct-file fresh-run fetch gates through real FUSE
         run: >-
           python3 tests/remote.py --require-fuse --million
           --probe target/release/examples/source-probe --binary target/release/git-on
-          RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+          RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch --evidence-output million-remote.json
       - name: Check benchmark harness
         run: python3 tests/benchmark.py self-test
       - name: Prepare the million-file fixture outside timed runs
@@ -238,6 +320,91 @@ jobs:
             if test -f "$directory/results.jsonl"; then cat "$directory/results.jsonl"; fi
           done
 
+      - name: Retain lazy-access evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lazy-performance
+          path: |
+            million-remote.json
+            benchmark-results/results.jsonl
+            benchmark-small/results.jsonl
+            benchmark-secondary/results.jsonl
+          if-no-files-found: error
+
+  repository-scale:
+    needs: [changes]
+    if: needs.changes.outputs.scale == 'true'
+    # Selection is conservative; the aggregate checks every expected report.
+    timeout-minutes: ${{ needs.changes.outputs.profile == 'exhaustive' && 360 || 20 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.scale_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes fuse3 git openssl
+      - run: |
+          rustup toolchain install stable --profile minimal
+          cargo build --release --locked --features test-metrics --bin git-on
+      - name: Source, policy and signature behavior matrix
+        env:
+          SOURCES: ${{ matrix.sources }}
+          BACKEND: ${{ matrix.backend }}
+          POLICIES: ${{ matrix.policies }}
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          for SOURCE in ${SOURCES//,/ }; do
+            python3 tests/scalability.py --binary target/release/git-on --backend "$BACKEND" --source "$SOURCE" --policies "$POLICIES" --profile "$PROFILE" --output "scale-results-$SOURCE.jsonl"
+          done
+      - name: Retain scenario plans and phase measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scale-${{ matrix.runner }}-${{ matrix.backend }}-${{ matrix.sources }}-${{ matrix.profile }}
+          path: scale-results-*.jsonl
+          if-no-files-found: ignore
+
+  webkit-scale:
+    needs: [changes]
+    if: needs.changes.outputs.scale == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install native Git and require real FUSE
+        run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes fuse3 git
+          test -c /dev/fuse
+          command -v fusermount3
+      - name: Build optimized instrumented runner
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo build --release --locked --features test-metrics --bin git-on
+      - name: Acquire and verify the pinned source once
+        run: python3 tests/real_repository.py prepare --directory "$RUNNER_TEMP/webkit-fixture"
+      - name: Full real snapshot and useful tooling command with complete baselines
+        run: python3 tests/real_repository.py run --fixture "$RUNNER_TEMP/webkit-fixture" --binary target/release/git-on --profile-full --output webkit-results.jsonl
+      - name: Retain real repository evidence, including partial failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: webkit-scale
+          path: webkit-results.jsonl
+          if-no-files-found: error
+
   release-policy:
     runs-on: ubuntu-24.04
     outputs:
@@ -257,7 +424,13 @@ jobs:
           python3 tests/test_write_policy_harness.py
           python3 tests/test_passthrough_lifecycle_harness.py
           python3 tests/test_ci_contract.py
+          python3 tests/test_scalability_harness.py
+          python3 tests/test_ci_plan.py
           python3 tests/test_record_demo.py
+          python3 tests/test_io_profile.py
+          python3 tests/test_import_profile.py
+          python3 tests/test_metadata_profile.py
+          python3 tests/test_real_repository.py
       - name: Test lossless conversion and output preservation
         run: |
           sudo apt-get update
@@ -271,7 +444,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$EVENT" = pull_request ]; then
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ]; then
             # Fetch through the authenticated checkout helper without persisting credentials.
             BASE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
             git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" fetch --no-tags origin "$BASE"
@@ -309,7 +482,7 @@ jobs:
         include:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     env:
@@ -345,15 +518,60 @@ jobs:
           python3 tests/materialized.py unpacked/git-on-${{ matrix.target }}/git-on
 
   package:
+    # Keep this existing required check present even when optional jobs skip.
     if: always()
-    needs: [package-build]
+    needs: [changes, rust, real-fuse, lazy-performance, repository-scale, webkit-scale, release-policy, macos, package-build]
     runs-on: ubuntu-latest
     steps:
-      - run: test '${{ needs.package-build.result }}' = success
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.result == 'success'
+        with:
+          name: ci-plan
+          path: gate-data/plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.scale == 'true'
+        with:
+          pattern: scale-*
+          path: gate-data/scale
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.scale == 'true'
+        with:
+          name: webkit-scale
+          path: gate-data/webkit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.scale == 'true' || needs.changes.outputs.stress == 'true'
+        with:
+          name: filesystem-stress-traces
+          path: gate-data/runtime
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.resources == 'true'
+        with:
+          name: object-scaling
+          path: gate-data/resources
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.resources == 'true'
+        with:
+          name: io-profile
+          path: gate-data/imports
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.lazy == 'true'
+        with:
+          name: lazy-performance
+          path: gate-data/lazy
+      - name: Enforce job outcomes and complete required coverage
+        if: always()
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/ci_plan.py check --plan gate-data/plan/ci-plan.json --head "$EXPECTED_HEAD" --evidence gate-data
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.release-policy.outputs.release_required == 'true'
-    needs: [rust, macos, real-fuse, lazy-performance, release-policy, package]
+    needs: [rust, macos, real-fuse, lazy-performance, repository-scale, release-policy, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

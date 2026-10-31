@@ -69,6 +69,17 @@ impl Peer {
         Self::with_init(policy, false)
     }
     fn with_init(policy: WritePolicy, extended: bool) -> Self {
+        Self::with_capabilities(policy, extended, 0).0
+    }
+    fn with_capabilities(policy: WritePolicy, extended: bool, extra: u32) -> (Self, u32) {
+        Self::with_directory_size(policy, extended, extra, 0)
+    }
+    fn with_directory_size(
+        policy: WritePolicy,
+        extended: bool,
+        extra: u32,
+        count: usize,
+    ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -82,6 +93,13 @@ impl Peer {
             .unwrap();
         tree.insert("link", repo.blob(b"tracked").unwrap(), 0o120000)
             .unwrap();
+        if count != 0 {
+            let content = repo.blob(b"unrequested payload").unwrap();
+            for index in 0..count {
+                tree.insert(format!("file-{index:05}"), content, 0o100644)
+                    .unwrap();
+            }
+        }
         let oid = tree.write().unwrap();
         let snapshot =
             Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "protocol").unwrap();
@@ -144,7 +162,7 @@ impl Peer {
             7,
             minor,
             0,
-            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
+            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16) | extra,
         ];
         if extended {
             body[3] |= 1 << 30; // FUSE_INIT_EXT
@@ -165,7 +183,7 @@ impl Peer {
             flags & ((1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16)),
             0
         );
-        p
+        (p, flags)
     }
     fn send(&mut self, op: u32, ino: u64, body: Vec<u8>) {
         self.unique += 1;
@@ -270,6 +288,100 @@ fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
 }
 
 #[test]
+fn protocol_kernel_cache_only_retains_protected_source() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let mut p = Peer::with_policy(policy);
+        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+        let ino = num(&entry, 0);
+        let protected = policy != WritePolicy::All;
+        assert_eq!(num(&entry, 16) != 0, protected, "entry TTL: {policy:?}");
+        assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
+        let attributes = p.ok(3, ino, vec![0; 16]);
+        assert_eq!(num(&attributes, 0) != 0, protected);
+        // Protected source metadata stays pinned, including directory attrs.
+        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
+        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+        let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+        assert_eq!(
+            flags & ((1 << 1) | (1 << 5)),
+            (1 << 1) | if protected { 1 << 5 } else { 0 }
+        );
+        p.release(ino, num(&opened, 0));
+        if policy != WritePolicy::None {
+            let (generated, handle) = p.create("generated.tmp");
+            let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
+            assert_eq!(num(&entry, 16), 0);
+            assert_eq!(num(&entry, 24), 0);
+            let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
+            let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+            assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
+            p.release(generated, num(&opened, 0));
+            p.release(generated, handle);
+        }
+    }
+}
+
+#[test]
+fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
+    for policy in [WritePolicy::Ignored, WritePolicy::Untracked] {
+        let mut p = Peer::with_policy(policy);
+        let before = p.ok(3, 1, vec![0; 16]);
+        assert_ne!(num(&before, 0), 0, "protected root metadata is cacheable");
+        let created = p.ok(9, 1, names(u32s(&[0o700, 0]), &["cache"]));
+        let generated = num(&created, 0);
+        assert_eq!(num(&p.ok(3, generated, vec![0; 16]), 0), 0);
+        let after = p.ok(3, 1, vec![0; 16]);
+        assert_eq!(&before[16..], &after[16..], "source metadata stays pinned");
+        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let listed = dirents(&p.ok(28, 1, io(handle, 0, 8192, 0)));
+        assert!(listed.iter().any(|(_, name)| name == b"cache"));
+        p.ok(29, 1, [u64s(&[handle]), u32s(&[0, 0]), u64s(&[0])].concat());
+        p.ok(11, 1, names(vec![], &["cache"]));
+        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let listed = dirents(&p.ok(28, 1, io(handle, 0, 8192, 0)));
+        assert!(!listed.iter().any(|(_, name)| name == b"cache"));
+        p.ok(29, 1, [u64s(&[handle]), u32s(&[0, 0]), u64s(&[0])].concat());
+    }
+}
+
+#[test]
+fn protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+    let ino = num(&entry, 0);
+    assert_eq!(num(&entry, 16), 0);
+    assert_eq!(num(&entry, 24), 0);
+    let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        1 << 1
+    );
+    let reader = num(&opened, 0);
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
+    let writer = p.open(ino, libc::O_RDWR);
+    p.ok(
+        16,
+        ino,
+        [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
+    );
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
+    let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        0
+    );
+    assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
+    p.release(ino, num(&reopened, 0));
+    p.release(ino, writer);
+    p.release(ino, reader);
+}
+
+#[test]
 fn protocol_lifecycle_lookup_forget_and_batch_forget() {
     let mut p = Peer::new();
     let ino = p.lookup(1, "tracked");
@@ -337,6 +449,61 @@ fn protocol_file_io_sync_and_stale_handles() {
         [io(wh, -1, 1, libc::O_WRONLY), vec![1]].concat(),
         libc::EINVAL,
     );
+}
+
+#[test]
+fn protocol_readonly_no_open_negotiation_and_stateless_reads() {
+    const NO_OPEN: u32 = 1 << 17;
+    for policy in [
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, flags) = Peer::with_capabilities(policy, false, NO_OPEN);
+        assert_eq!(flags & NO_OPEN, 0, "mutable namespaces retain real handles");
+        let ino = p.lookup(1, "tracked");
+        p.err(15, ino, io(0, 0, 100, 0), libc::EBADF);
+        let handle = p.open(ino, libc::O_RDONLY);
+        assert_ne!(handle, 0);
+        assert_eq!(p.ok(15, ino, io(handle, 0, 100, 0)), b"original\n");
+        p.release(ino, handle);
+    }
+    let (mut p, flags) = Peer::with_capabilities(WritePolicy::None, false, NO_OPEN);
+    assert_ne!(flags & NO_OPEN, 0, "readonly peer must negotiate no-open");
+    let ino = p.lookup(1, "tracked");
+    p.err(14, ino, u32s(&[libc::O_RDONLY as u32, 0]), libc::ENOSYS);
+    p.err(14, ino, u32s(&[libc::O_RDWR as u32, 0]), libc::EROFS);
+    p.err(
+        14,
+        ino,
+        u32s(&[(libc::O_RDONLY | libc::O_TRUNC) as u32, 0]),
+        libc::EROFS,
+    );
+    p.err(14, 1, u32s(&[0, 0]), libc::EISDIR);
+    let link = p.lookup(1, "link");
+    p.err(14, link, u32s(&[0, 0]), libc::ELOOP);
+    for _ in 0..3 {
+        assert_eq!(p.ok(15, ino, io(0, 0, 4, 0)), b"orig");
+        assert_eq!(p.ok(15, ino, io(0, 4, 100, 0)), b"inal\n");
+        assert!(p.ok(15, ino, io(0, 100, 100, 0)).is_empty());
+    }
+    p.err(15, ino, io(0, -1, 1, 0), libc::EINVAL);
+    p.err(15, ino, io(0, 0, 1, libc::O_WRONLY), libc::EBADF);
+    p.err(15, ino, io(999, 0, 1, 0), libc::EBADF);
+    let attr = p.ok(3, ino, [u32s(&[1, 0]), u64s(&[0])].concat());
+    assert_eq!(num(&attr, 24), 9);
+    for datasync in [0, 1] {
+        p.ok(20, ino, [u64s(&[0]), u32s(&[datasync, 0])].concat());
+    }
+    // Linux memoizes ENOSYS for the entire readonly connection, so repeated
+    // closes need neither flush nor release round trips after this response.
+    p.err(25, ino, u64s(&[0, 0, 0]), libc::ENOSYS);
+    p.err(15, 1, io(0, 0, 1, 0), libc::EISDIR);
+    p.err(15, u64::MAX, io(0, 0, 1, 0), libc::ENOENT);
+    p.send(2, ino, u64s(&[1]));
+    p.err(15, ino, io(0, 0, 1, 0), libc::ENOENT);
+    let reopened = p.lookup(1, "tracked");
+    assert_eq!(p.ok(15, reopened, io(0, 0, 100, 0)), b"original\n");
 }
 
 #[test]
@@ -544,6 +711,165 @@ fn protocol_creation_links_removal_and_rename_flags() {
     p.ok(11, 1, names(vec![], &["cache"]));
     p.ok(10, 1, names(vec![], &["node.tmp"]));
     p.err(10, 1, names(vec![], &["tracked"]), libc::EROFS);
+}
+
+#[test]
+fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 2000);
+        let first = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        assert_eq!(
+            dirents(&p.ok(28, 1, io(first, 0, 32, 0))),
+            [(1, b".".to_vec())]
+        );
+        let second = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let page = p.ok(28, 1, io(first, 100, 48, 0));
+        assert_eq!(dirents(&page).len(), 1);
+        assert_eq!(num(&page, 8), 101);
+        assert_eq!(p.ok(28, 1, io(first, 100, 48, 0)), page);
+        assert_eq!(p.ok(28, 1, io(second, 100, 48, 0)), page);
+        let ino = num(&page, 0);
+        let name = std::str::from_utf8(&dirents(&page)[0].1)
+            .unwrap()
+            .to_owned();
+        let next_name = format!(
+            "file-{:05}",
+            name.strip_prefix("file-")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                + 1
+        );
+        let rejected = p.lookup(1, &next_name);
+        p.send(2, rejected, u64s(&[1]));
+        p.err(3, rejected, vec![0; 16], libc::ENOENT);
+        p.ok(29, 1, u64s(&[first, 0, 0]));
+        assert_eq!(
+            p.lookup(1, &name),
+            ino,
+            "readdir and lookup identities differ"
+        );
+        p.send(2, ino, u64s(&[1]));
+        p.ok(3, ino, vec![0; 16]);
+        p.ok(29, 1, u64s(&[second, 0, 0]));
+        p.err(3, ino, vec![0; 16], libc::ENOENT);
+        assert_eq!(
+            p.lookup(1, &name),
+            ino,
+            "same source changed identity after metadata eviction"
+        );
+        p.err(28, 1, io(first, 0, 48, 0), libc::EBADF);
+    }
+}
+
+#[test]
+fn protocol_overlapping_merged_versions_preserve_issued_cookies() {
+    use std::collections::BTreeSet;
+    for policy in [
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 24);
+        let (ino, file) = p.create("seed.tmp");
+        p.release(ino, file);
+        let mut expected: BTreeSet<Vec<u8>> =
+            [".", "..", ".gitignore", "link", "tracked", "seed.tmp"]
+                .map(|name| name.as_bytes().to_vec())
+                .into_iter()
+                .chain((0..24).map(|index| format!("file-{index:05}").into_bytes()))
+                .collect();
+        let mut versions = Vec::new();
+        for index in 0..8 {
+            let fh = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+            // A rejected/unissued row is not a seek position. Issued cookies,
+            // including rewind and EOF, remain valid on this same handle.
+            p.err(28, 1, io(fh, 7, 48, 0), libc::EINVAL);
+            let prefix = p.ok(28, 1, io(fh, 0, 32, 0));
+            assert_eq!(dirents(&prefix), [(1, b".".to_vec())]);
+            versions.push((fh, prefix, expected.clone()));
+            let name = format!("generation-{index}.tmp");
+            let (ino, file) = p.create(&name);
+            p.release(ino, file);
+            expected.insert(name.into_bytes());
+            if index == 3 {
+                p.ok(10, 1, names(vec![], &["seed.tmp"]));
+                expected.remove(b"seed.tmp".as_slice());
+            }
+            if index == 5 {
+                p.ok(
+                    12,
+                    1,
+                    names(u64s(&[1]), &["generation-0.tmp", "renamed.tmp"]),
+                );
+                expected.remove(b"generation-0.tmp".as_slice());
+                expected.insert(b"renamed.tmp".to_vec());
+            }
+        }
+        for (fh, prefix, expected) in versions.into_iter().rev() {
+            let mut offset = 1;
+            let mut pages = Vec::new();
+            let mut actual = BTreeSet::from([b".".to_vec()]);
+            loop {
+                let page = p.ok(28, 1, io(fh, offset, 48, 0));
+                if page.is_empty() {
+                    break;
+                }
+                let entries = dirents(&page);
+                assert_eq!(entries.len(), 1);
+                assert!(actual.insert(entries[0].1.clone()), "duplicate row");
+                pages.push((offset, page.clone()));
+                offset = entries[0].0 as i64;
+                assert!(
+                    actual.len() <= expected.len(),
+                    "enumeration did not terminate"
+                );
+            }
+            assert_eq!(actual, expected);
+            assert!(p.ok(28, 1, io(fh, offset, 48, 0)).is_empty());
+            assert_eq!(p.ok(28, 1, io(fh, 0, 32, 0)), prefix);
+            for (offset, page) in pages.into_iter().rev() {
+                assert_eq!(p.ok(28, 1, io(fh, offset, 48, 0)), page);
+            }
+            p.ok(29, 1, u64s(&[fh, 0, 0]));
+        }
+    }
+}
+
+#[test]
+fn protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_close() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let old = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let before = p.ok(28, 1, io(old, 0, 4096, 0));
+    let rows = dirents(&before);
+    let tracked_offset = rows
+        .iter()
+        .position(|(_, name)| name == b"tracked")
+        .unwrap();
+    let tracked_ino = num(&p.ok(28, 1, io(old, tracked_offset as i64, 40, 0)), 0);
+    p.ok(12, 1, names(u64s(&[1]), &["tracked", "renamed"]));
+    let (late, late_fh) = p.create("late");
+    p.release(late, late_fh);
+    let latest = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let latest_rows = dirents(&p.ok(28, 1, io(latest, 0, 4096, 0)));
+    assert!(latest_rows.iter().any(|(_, name)| name == b"late"));
+    p.ok(10, 1, names(vec![], &["late"]));
+    p.send(2, late, u64s(&[1]));
+    p.ok(3, late, vec![0; 16]);
+    p.ok(29, 1, u64s(&[latest, 0, 0]));
+    p.err(3, late, vec![0; 16], libc::ENOENT);
+    p.ok(10, 1, names(vec![], &["renamed"]));
+    assert_eq!(p.ok(28, 1, io(old, 0, 4096, 0)), before);
+    let reader = p.open(tracked_ino, libc::O_RDONLY);
+    assert_eq!(p.ok(15, tracked_ino, io(reader, 0, 100, 0)), b"original\n");
+    p.release(tracked_ino, reader);
+    p.ok(29, 1, u64s(&[old, 0, 0]));
+    p.err(3, tracked_ino, vec![0; 16], libc::ENOENT);
 }
 
 #[test]
