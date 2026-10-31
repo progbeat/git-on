@@ -1705,6 +1705,49 @@ os.execv(native,[native,*args])
             self.assertEqual(report['metrics']['remote_fetches'],194)
         self.assertFalse(cache.exists())
 
+    @unittest.skipUnless(sys.platform=='linux', 'Linux source-pack mapping observation')
+    def test_idle_local_pack_mappings_do_not_retain_the_complete_source_pack(self):
+        f=self.f; f.cwd=f.repo; entries=[]; expected=[]; generator=random.Random(140019)
+        for index in range(24):
+            data=generator.randbytes(2*1024*1024)
+            blob=f.git('hash-object','-w','--stdin',data=data)
+            entries.append(f'100644 blob {blob}\tf{index:03d}\n');expected.append((data[0],data[-1]))
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'packed mapping retention fixture\n')
+        f.git('update-ref','refs/heads/main',commit)
+        f.git('-c','core.compression=0','repack','-adf','--window=0','--depth=0')
+        packs=list((f.repo/'objects/pack').glob('*.pack'))
+        self.assertEqual(len(packs),1)
+        self.assertGreater(packs[0].stat().st_size,48*1024*1024)
+        index=packs[0].with_suffix('.idx')
+        packed=f.git('verify-pack','-v',str(index)).splitlines()
+        self.assertEqual(sum(' blob ' in line for line in packed),24)
+        self.assertTrue(all(len(line.split())==5 for line in packed if ' blob ' in line),'fixture acquired delta chains')
+        process=f.probe('local');f.line(process)
+        for number,(first,_) in enumerate(expected):
+            value,report=f.operation(process,f'range 0 1 f{number:03d}')
+            self.assertEqual(value['bytes'],[first])
+        _,report=f.operation(process,'release')
+        self.assertEqual(report['metrics']['active_blob_readers'],0)
+        # smaps Size measures retained mappings, independently of whether clean
+        # file-backed pages have been reclaimed under host memory pressure.
+        text=Path(f'/proc/{process.pid}/smaps').read_text()
+        mapped_kib=0
+        for section in re.split(r'(?=^[0-9a-f]+-[0-9a-f]+ )',text,flags=re.M):
+            if section and str(packs[0]) in section.splitlines()[0]:
+                mapped_kib+=int(re.search(r'^Size:\s+(\d+) kB$',section,re.M)[1])
+        status=Path(f'/proc/{process.pid}/status').read_text()
+        rss_kib=int(re.search(r'^VmRSS:\s+(\d+) kB$',status,re.M)[1])
+        self.assertGreater(mapped_kib,0)
+        self.assertLessEqual(mapped_kib,24*1024,'idle source pack exceeded the 16 MiB soft budget plus an active-window allowance')
+        for number,(_,last) in enumerate(expected):
+            value,again=f.operation(process,f'range {2*1024*1024-1} 1 f{number:03d}')
+            self.assertEqual(value['bytes'],[last])
+        self.assertEqual(again['metrics']['blob_loads'],24,'window eviction triggered object decoding')
+        self.assertEqual(again['metrics']['blob_cache_limit'],16*1024*1024)
+        f.finish(process)
+        print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
+
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
     def test_first_large_loose_range_streams_without_retaining_full_payload(self):
         f=self.f

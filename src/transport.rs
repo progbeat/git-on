@@ -102,6 +102,11 @@ enum Packet {
     End,
     Data(Vec<u8>),
 }
+// Git text pkt-lines accept an optional terminal LF. Never apply this to
+// sideband pack payloads, which remain byte-exact binary data.
+fn packet_text(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
 impl Session {
     /// A missing protocol/helper capability is an optional optimization miss,
     /// before any fetch. Errors after a fetch request must never retry it.
@@ -168,7 +173,8 @@ impl Session {
                 "native helper rejected protocol connection"
             );
         }
-        if self.packet()? != Packet::Data(b"version 2\n".to_vec()) {
+        if !matches!(self.packet()?, Packet::Data(version) if packet_text(&version) == b"version 2")
+        {
             return Ok(false);
         }
         let mut fetch = false;
@@ -184,7 +190,10 @@ impl Session {
                             .any(|value| value == b"filter");
                     }
                     if let Some(format) = capability.strip_prefix(b"object-format=") {
-                        ensure!(format == b"sha1\n", "SHA-256 repositories unsupported");
+                        ensure!(
+                            packet_text(format) == b"sha1",
+                            "SHA-256 repositories unsupported"
+                        );
                     }
                 }
                 _ => bail!("invalid demand capability advertisement"),
@@ -235,9 +244,9 @@ impl Session {
             _ => return Err(invalid("invalid demand packet length")),
         })
     }
-    fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        write!(self.input, "{:04x}", bytes.len() + 4)?;
-        self.input.write_all(bytes)?;
+    fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+        write!(output, "{:04x}", bytes.len() + 4)?;
+        output.extend_from_slice(bytes);
         Ok(())
     }
     pub(crate) fn fetch(&mut self, oid: Oid, pack: &Spool) -> Result<()> {
@@ -247,18 +256,26 @@ impl Session {
         // shared regular-file offset is reset only between transactions.
         self.errors.set_len(0)?;
         self.errors.rewind()?;
-        self.send(b"command=fetch\n")?;
-        self.input.write_all(b"0001")?;
-        self.send(format!("want {oid}\n").as_bytes())?;
-        self.send(b"deepen 1\n")?;
-        self.send(b"filter tree:0\n")?;
-        self.send(b"no-progress\n")?;
-        self.send(b"done\n")?;
-        self.input.write_all(b"0000")?;
+        // One small exact-demand request, not one syscall/signal-status read
+        // for every pkt-line header and body. No future objects are prefetched.
+        let mut request = Vec::with_capacity(256);
+        Self::request_packet(&mut request, b"command=fetch\n")?;
+        request.extend_from_slice(b"0001");
+        Self::request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
+        for value in [
+            b"deepen 1\n".as_slice(),
+            b"filter tree:0\n",
+            b"no-progress\n",
+            b"done\n",
+        ] {
+            Self::request_packet(&mut request, value)?;
+        }
+        request.extend_from_slice(b"0000");
+        self.input.write_all(&request)?;
         loop {
             match self.packet()? {
-                Packet::Data(section) if section == b"packfile\n" => break,
-                Packet::Data(section) if section == b"shallow-info\n" => loop {
+                Packet::Data(section) if packet_text(&section) == b"packfile" => break,
+                Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
                     match self.packet()? {
                         Packet::Delimiter => break,
                         Packet::Data(value)
@@ -499,6 +516,82 @@ mod tests {
         let file = files.file(root).unwrap();
         (&file).write_all(bytes).unwrap();
         file
+    }
+    fn peer_response(bytes: &[u8]) -> (Session, UnixStream) {
+        let (input, peer) = UnixStream::pair().unwrap();
+        let (output, mut source) = UnixStream::pair().unwrap();
+        source.write_all(bytes).unwrap();
+        source.shutdown(std::net::Shutdown::Write).unwrap();
+        let session = Session {
+            owner: Owner(Mutex::new(None)),
+            input: Output(input),
+            output: BufReader::new(Input(output)),
+            errors: tempfile::tempfile().unwrap(),
+            stateless: false,
+        };
+        (session, peer)
+    }
+    fn text_packet(output: &mut Vec<u8>, text: &[u8], lf: bool) {
+        write!(output, "{:04x}", text.len() + usize::from(lf) + 4).unwrap();
+        output.extend_from_slice(text);
+        if lf {
+            output.push(b'\n');
+        }
+    }
+    #[test]
+    fn text_handshake_accepts_optional_lf() {
+        for version_lf in [false, true] {
+            for format_lf in [false, true] {
+                let mut bytes = Vec::new();
+                text_packet(&mut bytes, b"version 2", version_lf);
+                text_packet(&mut bytes, b"fetch=shallow filter", format_lf);
+                text_packet(&mut bytes, b"object-format=sha1", format_lf);
+                bytes.extend_from_slice(b"0000");
+                let (mut session, _request_peer) = peer_response(&bytes);
+                assert!(session.handshake(false).unwrap());
+            }
+        }
+        for lf in [false, true] {
+            let mut bytes = Vec::new();
+            text_packet(&mut bytes, b"version 2", true);
+            text_packet(&mut bytes, b"fetch=shallow filter", true);
+            text_packet(&mut bytes, b"object-format=sha256", lf);
+            bytes.extend_from_slice(b"0000");
+            let (mut session, _request_peer) = peer_response(&bytes);
+            assert!(session.handshake(false).is_err());
+        }
+    }
+    #[test]
+    fn fetch_sections_accept_optional_lf_without_changing_binary() {
+        let root = tempfile::tempdir().unwrap();
+        // Include a binary trailing LF: only text labels may be normalized.
+        let good = (0..65536)
+            .map(|index| pack(format!("binary payload {index}").as_bytes()))
+            .find(|bytes| bytes.last() == Some(&b'\n'))
+            .unwrap();
+        for shallow_lf in [false, true] {
+            for pack_lf in [false, true] {
+                let mut bytes = Vec::new();
+                text_packet(&mut bytes, b"shallow-info", shallow_lf);
+                text_packet(
+                    &mut bytes,
+                    format!("shallow {}", Oid::zero()).as_bytes(),
+                    shallow_lf,
+                );
+                bytes.extend_from_slice(b"0001");
+                text_packet(&mut bytes, b"packfile", pack_lf);
+                write!(bytes, "{:04x}", good.len() + 5).unwrap();
+                bytes.push(1);
+                bytes.extend_from_slice(&good);
+                bytes.extend_from_slice(b"0000");
+                let file = spool(root.path(), &[]);
+                let (mut session, _request_peer) = peer_response(&bytes);
+                session.fetch(Oid::zero(), &file).unwrap();
+                let mut actual = vec![0; good.len()];
+                file.read_exact_at(&mut actual, 0).unwrap();
+                assert_eq!(actual, good);
+            }
+        }
     }
     #[test]
     fn pack_trailer_is_checked_across_all_short_chunk_boundaries() {

@@ -157,29 +157,37 @@ invocation validates the complete namespace, modes, symlinks and contents twice.
 Every source blob OID is checked by the child; empty paths remain in namespace/
 byte checks but are not falsely required to trigger payload decoding.
 
-The useful bounded workload syntax-checks all production Python modules under
-`Tools/Scripts/webkitpy/style` (intentional unittest input fixtures excluded),
-without imports, dependency installation, repository code execution or pycache.
-Three fresh local and three file:// invocations each run first/repeat passes in
-one mount. The small command reads only its selected external manifest, rather
-than scanning the complete repository manifest as benchmark overhead. Its
-decoded-object counts enforce same-run reuse. This does not claim a full remote
+The useful bounded workload runs 32 upstream `webkitcorepy` tests for Version,
+string utilities and filtered calls through the standard Python unittest loader.
+These are modules in test-webkitpy's suite. Its ordinary entrypoint invokes
+AutoInstall.install_everything even for a selected subset, so the lightweight
+path uses the supported DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 switch, -B and -S,
+without the browser build, SDK, third-party site packages or mass installation.
+Three fresh local and three file:// invocations each run two fresh Python test
+processes in one mount, retaining the real test output and rejecting failures,
+skips or a wrong test count. Full/controlled resource cases independently enforce
+exact decode reuse; test invocations record their actual loaded/received data.
+Command N is not inferred from preparation counters. This does not claim a full remote
 WebKit read, full Mac materialization or public-network cold-source performance.
 
 One full native materialization per source is reused for independent direct
 command trials. Each reported complete baseline composes the measured same-source
 clone/checkout, identical direct command and complete cleanup; reused setup and
 cleanup are explicitly marked as one sample, not independent clone trials.
-Local native clone uses shared immutable objects; remote native clone uses the
-same file:// transport. Only the disposable baseline's attributes disable
+Local native clone requests shared objects (native Git may use its transport for
+a shallow source); remote clone uses the same file:// transport. Only the disposable baseline's attributes disable
 checkout transformations to match raw Git blobs. No source/caller configuration
 is changed. LFS hydration and external dependencies are outside the fixture;
 unsupported pointers are not silently excluded from full reads.
 
-CPU accounting includes waited native descendants. Memory is a 20 ms sampled
-simultaneous RSS sum across observable descendant tasks, including children of
-non-main threads; shared pages are counted twice and fast helpers can be missed.
-Missing required observations fail the gate rather than becoming zero overhead.
+CPU accounting includes waited native descendants. A wait4 helper records the
+largest waited process's peak RSS, including descendants; it is not an aggregate
+physical-memory peak. Additional 20 ms process-tree RSS sums are non-atomic,
+count shared pages twice and can miss fast/protected descendants. Partial tree
+observations and independent descriptor denials remain explicit. Missing primary
+wait4 observations fail the gate, rather than becoming zero overhead. This
+replaces the first WebKit gate's invalid demand for complete /proc visibility;
+no process-access or security setting is changed.
 Received session-pack bytes are exact compressed Git payloads; native received
 packs may have been normalized by index-pack. Neither includes protocol/TLS wire
 framing. Decoded verified blob bytes are reported separately. These observations
@@ -187,7 +195,7 @@ do not establish a fixed total-RAM bound or a formal whole-program complexity
 proof. All invocation preparation, command execution and cleanup stay in time.
 
 `package` checks the WebKit job and its actual exact-head reports, including both
-full passes, all six syntax invocations, process resources, transfer counters and
+full passes, all six unit-test invocations, process resources, transfer counters and
 complete baseline components. Missing/stale/duplicate/incomplete reports fail.
 The pinned run must pass before it is cited as evidence; adding this job alone
 does not establish WebKit acceptance or #20 completion.

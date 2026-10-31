@@ -1,5 +1,29 @@
 # Review regression evidence
 
+## Optional LF on protocol text packets
+
+A fresh whole-PR review reproduced a native-compatible upload-pack proxy that
+omits the optional LF from the packfile text label. Native Git fetched through
+it, while the session parser rejected it. Git's pkt-line contract requires
+nonbinary text to be accepted with or without that LF. Permanent tests fail
+before the fix for capability/section text and pass after normalization. The
+binary pack fixture deliberately ends in LF and must remain byte-identical;
+unsupported SHA-256 repository advertisements still fail. Requests now assemble
+their bounded exact-demand framing before one socket write, reducing repeated
+poll/status work without changing the requested OID set or cancellation checks
+around blocking I/O. No fetch retry or future-object prefetch is introduced.
+
+## WebKit memory observation
+
+The first exact-head WebKit workload at e1edf15 completed every full read and
+small command, but the required aggregate failed because process-tree samples
+were marked partial. The run remains failed. Process observation now separates
+descriptor denial from RSS, adds kernel wait4 peak accounting for waited
+descendants, and retains partial/non-atomic tree-sample flags. Missing primary
+peak data still fails validation. This corrects the measurement method; it does
+not grant process access, turn missing samples into zero memory, or claim a
+complete simultaneous physical-memory peak.
+
 ## Real-repository harness and protected directory attributes
 
 The real-repository harness initially required one payload decode per unique
@@ -2226,3 +2250,22 @@ object test also asserts that revisiting a closed blob adds no spool write.
 Evidence: `/tmp/git-on-140-reopen-{red,green}.log`,
 `/tmp/git-on-140-raw-{unit,rust,integrations}.log`. Raw bytes/index are unlinked
 like the prior active-reader spool, and remain invocation-local.
+
+### Retained source-pack mappings
+
+A 48 MiB non-delta packed fixture failed before the window policy: after closing
+all readers it retained 49,160 KiB of source-pack mappings, despite bounded data
+LRU retention. `RemoteTests.test_idle_local_pack_mappings_do_not_retain_the_complete_source_pack`
+checks the production startup policy, source mappings after reader release and
+exact opposite-end rereads without another blob decode. Source mappings are
+clean/reclaimable and separate from anonymous decoder buffers.
+
+### Waited-RSS observer and graceful timeout cleanup
+
+The new real-repository wait4 wrapper initially exited on group SIGTERM before
+the measured command completed its own child-group cleanup. The timeout path
+then killed that command, leaving its separate owned child group alive. A
+focused test reproduced the escaped-child marker with the wrapper and no marker
+without it. The observer now ignores SIGTERM while waiting; its forked child
+restores the normal disposition before exec. The timeout retains its bounded
+final SIGKILL and the earlier same-group TERM-ignoring descendant regression.

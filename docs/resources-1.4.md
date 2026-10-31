@@ -21,6 +21,19 @@ raw tree bytes are released. Parsed directories, verified descriptors and touche
 header sizes grow with demand outside the payload LRU. Report this metadata and
 actual process memory separately: the LRU limit is not a total-RSS guarantee.
 Local packed/delta decoding retains the documented libgit2 memory limitation.
+Libgit2 can also retain decoded delta bases (up to 1 MiB each, 16 MiB per
+pack); anonymous retention is not limited to active decoder buffers.
+Source-pack mappings are a separate
+cache: startup selects 8 MiB windows and a 16 MiB soft mapped-byte budget, as
+well as the existing descriptor cap. This replaces libgit2's 64-bit defaults of
+1 GiB windows / 8 GiB mapped bytes. Active windows and necessary delta decoding
+can exceed those retained-cache budgets; they are not object-size or RSS limits.
+A 192 MiB non-delta source-pack experiment, after all 48 readers closed, retained
+192 MiB of source-pack RSS under the defaults versus 8 MiB with these options;
+process RSS was 206.3 versus 22.3 MiB and the decoded LRU retained 3.0 MiB in
+both. This isolates clean source mappings, not heap buffering or physical
+memory pressure. The permanent 48 MiB packed regression verifies bounded idle
+mappings and exact first/last bytes without decoding objects again.
 Protocol packs and native decoder stdout can still need transient bounded-part
 staging; that I/O and all native children remain inside total-cost measurements.
 No global cache, recovery fallback or corrupt-spill retry is introduced.
@@ -494,11 +507,26 @@ remaining controls and measurement limitations are in
 [the current CI map](ci-performance.md). Adding the job is not evidence that
 WebKit has run or that the whole overhead requirement has been met.
 
-The useful source workload syntax-checks the production `webkitpy/style`
-package, excluding deliberate unittest input fixtures. A selective pinned-source
-preflight verified 39 module paths, 38 distinct blobs, 570,606 path-summed bytes
-and 570,542 distinct bytes. These are not full-repository acquisition or FUSE
-performance measurements. The command performs no imports or dependency setup.
+The useful demo runs 32 upstream `webkitcorepy` unit tests (version, string
+utilities and filtered calls), using the exact command in [the test guide](../tests/README.md).
+Direct `unittest` runs the same tests registered by `test-webkitpy` without that
+entrypoint's unconditional bulk `AutoInstall.install_everything()`. Python `-S`,
+`-B` and the supported autoinstaller disable flag avoid package setup and bytecode
+writes; no browser build or SDK is needed. A selective pinned-source preflight
+passed all 32 tests: three first/repeat trials had median whole-process times of
+288 / 253 ms and a largest waited-process peak near 21 MiB. This is a local
+bootstrap check, not a full-WebKit/FUSE performance claim. The earlier 39-module
+AST workload remains only a diagnostic, superseded as the useful demo.
+
+The first full pinned WebKit CI workload completed both passes with exact names,
+modes and bytes. At `e1edf15`, whole local Git-on time was 457.48 s versus a
+141.94 s composed materialize + command + cleanup baseline; first/repeat reads
+were 228.59 / 184.52 s versus direct 15.57 / 14.27 s. Unique nonempty blobs
+loaded once (411,092); this is not acceptance of the remaining overhead. That
+run's aggregate failed because partial `/proc` visibility was rejected by its
+memory observer. Follow-up evidence uses a primary `wait4` largest waited-process
+peak, while retaining explicitly partial process-tree estimates; no complete
+aggregate physical-memory measurement is claimed.
 
 Linux now returns positive attribute TTLs for protected source directories.
 Their metadata was already immutable under the existing overlay rules; this

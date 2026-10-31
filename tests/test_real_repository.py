@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,8 @@ import unittest
 from unittest import mock
 
 from benchmark import environment
-from real_repository import MODULES, command, entries, git, manifest, observe, prepare, validate_reports
+from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output
+from import_profile import stat_abi_bytes
 
 
 class RealRepositoryTests(unittest.TestCase):
@@ -102,6 +104,21 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertGreater(observed['memory']['peak_rss_sum_kib'],0)
         self.assertIn('shared pages',observed['memory_limits'])
         self.assertEqual(observed['command_observations'],[{'completed':'test'}])
+        stat_abi_bytes(self.root)
+        waited=observe([sys.executable,'-I','-S','-c',code],self.root,environment(),5,resource_observer=self.root/'resource-observer')
+        self.assertGreater(waited['waited_process_peak_rss_kib'],0)
+
+    def test_descriptor_permission_does_not_discard_observable_rss(self):
+        proc=self.root/'proc';base=proc/'123';(base/'task/123').mkdir(parents=True);(base/'fd').mkdir()
+        (base/'stat').write_text('123 (observer) '+ ' '.join(['0']*19+['6789']))
+        (base/'status').write_text('VmRSS: 4321 kB\n')
+        (base/'task/123/children').write_text('')
+        original=Path.iterdir
+        def directories(path):
+            if path==base/'fd':raise PermissionError('protected descriptors')
+            return original(path)
+        with mock.patch('real_repository.Path',return_value=proc),mock.patch.object(Path,'iterdir',directories):
+            self.assertEqual(process_snapshot(123),(4321,0,True,False))
 
     def test_failed_command_is_not_a_successful_measurement(self):
         with self.assertRaises(RuntimeError):observe([sys.executable,'-c','raise SystemExit(3)'],self.root,environment(),5)
@@ -114,21 +131,52 @@ class RealRepositoryTests(unittest.TestCase):
         time.sleep(.7)
         self.assertFalse(marker.exists(),'timed-out measurement left its child running')
 
+    def test_waited_peak_wrapper_preserves_owned_child_graceful_timeout_cleanup(self):
+        stat_abi_bytes(self.root)
+        marker=self.root/'orphan-survived';pidfile=self.root/'owned-child';ready=self.root/'handler-ready'
+        descendant=f'import time;from pathlib import Path;time.sleep(1);Path({str(marker)!r}).write_text("leak")'
+        code=f"""import os,signal,subprocess,sys,time
+from pathlib import Path
+child=subprocess.Popen([sys.executable,'-I','-S','-c',{descendant!r}],start_new_session=True)
+Path({str(pidfile)!r}).write_text(str(child.pid))
+def stop(sig,frame):
+ time.sleep(.2)
+ os.killpg(child.pid,signal.SIGKILL)
+ child.wait()
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,stop)
+Path({str(ready)!r}).touch()
+time.sleep(30)
+"""
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observe([sys.executable,'-I','-S','-c',code],self.root,environment(),.5,resource_observer=self.root/'resource-observer')
+            self.assertTrue(ready.exists(),'measured command never installed its cleanup handler')
+            time.sleep(1.1)
+            self.assertFalse(marker.exists(),'measurement wrapper killed the owner before descendant cleanup')
+        finally:
+            if pidfile.exists():
+                try:os.killpg(int(pidfile.read_text()),signal.SIGKILL)
+                except ProcessLookupError:pass
+
     def test_required_gate_rejects_stale_incomplete_or_unmeasured_reports(self):
         # Synthetic parser records: no real mount or WebKit execution is claimed.
         pin=dict(repository='generated',commit='a'*40,tree='b'*40,
             **{k:self.counts[k] for k in ('blob_paths','logical_blob_bytes','gitlinks')})
         identity=dict(head='c'*40,working_tree_dirty=False,fixture=dict(pin=pin,counts=self.counts))
-        resource=dict(elapsed_ns=10,waited_user_cpu_s=.01,waited_system_cpu_s=.01,
+        resource=dict(elapsed_ns=10,waited_user_cpu_s=.01,waited_system_cpu_s=.01,waited_process_peak_rss_kib=1234,
             waited_input_block_bytes=0,waited_output_block_bytes=0,
             memory=dict(count=1,peak_rss_sum_kib=1234,unavailable=False),command_observations=[])
         common=dict(materialize=dict(elapsed_ns=20,commands=[resource,resource]),cleanup_ns=5,
             shared_materialization_samples=1,stored_received_pack_bytes=123)
         data=[dict(type='real_repository_baseline',source=source,**identity,**common) for source in ('local','remote')]
-        for workload,source,trial in [('full','local',0)]+[('syntax',s,t) for s in ('local','remote') for t in range(3)]:
+        for workload,source,trial in [('full','local',0)]+[('tests',s,t) for s in ('local','remote') for t in range(3)]:
             full=workload=='full';files=self.counts['blob_paths' if full else 'python_modules']
             observations=[dict(completed=p,workload=workload,files=files,syntax_modules=0 if full else files,
                 payload_bytes=self.counts['logical_blob_bytes' if full else 'syntax_path_bytes'],metadata_result_bytes=144*files,elapsed_ns=4) for p in ('first','repeat')]
+            if not full:
+                observations=[dict(completed=p,workload=workload,test_count=32,test_modules=LIGHT_TESTS,
+                    test_output='................................\nRan 32 tests in 0.002s\n\nOK\n',elapsed_ns=4) for p in ('first','repeat')]
             executed=dict(resource,command_observations=observations)
             metrics=dict(blob_loads=self.counts['nonempty_unique_blob_objects' if full else 'syntax_nonempty_unique_blobs'],fuse_requests={'read':1},
                 blob_cache_bytes=1,blob_cache_limit=16*1024*1024,tree_cache_bytes=4096,tree_cache_limit=0,
@@ -140,6 +188,17 @@ class RealRepositoryTests(unittest.TestCase):
             data.append(dict(type='real_repository',workload=workload,source=source,trial=trial,**identity,
                 baseline=dict(common,direct_command=executed,total_elapsed_ns=35),runner=dict(executed,metrics=metrics),transfer_evidence=transfer))
         validate_reports(data,'c'*40,pin)
+        partial=copy.deepcopy(data)
+        partial[2]['runner']=copy.deepcopy(partial[2]['runner'])
+        partial[2]['runner']['memory']['unavailable']=True
+        self.assertEqual(validate_reports(partial,'c'*40,pin)['partial_process_tree_rss_samples'],1)
+        # Partial estimates remain explicit and never replace the primary
+        # waited peak or an entirely absent runner observation.
+        partial[2]['runner']['waited_process_peak_rss_kib']=None
+        with self.assertRaises(ValueError):validate_reports(partial,'c'*40,pin)
+        partial[2]['runner']['waited_process_peak_rss_kib']=1234
+        partial[2]['runner']['memory']['count']=0
+        with self.assertRaises(ValueError):validate_reports(partial,'c'*40,pin)
         for failure in ('head','missing','duplicate','phase','bytes','decode','setup','memory','cpu','transfer'):
             bad=copy.deepcopy(data);row=bad[2]
             if failure=='head':row['head']='d'*40
@@ -149,10 +208,17 @@ class RealRepositoryTests(unittest.TestCase):
             elif failure=='bytes':row['runner']['command_observations'][0]['payload_bytes']-=1
             elif failure=='decode':row['runner']['metrics']['blob_loads']+=1
             elif failure=='setup':row['baseline']['total_elapsed_ns']-=20
-            elif failure=='memory':row['runner']['memory']['unavailable']=True
+            elif failure=='memory':row['runner']['waited_process_peak_rss_kib']=None
             elif failure=='cpu':del row['runner']['waited_user_cpu_s']
             else:row['transfer_evidence']['session_pack_payload_bytes']+=1
             with self.subTest(failure=failure),self.assertRaises(ValueError):validate_reports(bad,'c'*40,pin)
+
+    def test_test_runner_output_requires_all_named_tests_and_no_failures_or_skips(self):
+        good='................................\nRan 32 tests in 0.002s\n\nOK\n'
+        validate_test_output(0,good)
+        for code,output in ((1,good),(0,good.replace('32','31')),(0,good.replace('OK','OK (skipped=1)')),
+                            (0,good.replace('OK','FAILED (failures=1)')),(0,'OK')):
+            with self.subTest(code=code,output=output),self.assertRaises(ValueError):validate_test_output(code,output)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

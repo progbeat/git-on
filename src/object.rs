@@ -77,7 +77,7 @@ pub(crate) fn copy_verified(
 
 /// # Safety
 /// Call once at process startup, before spawning threads or using libgit2.
-/// The option modifies a libgit2 C global without synchronization.
+/// These options modify libgit2 C globals without synchronization.
 pub unsafe fn configure_pack_descriptors() -> Result<usize> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
@@ -87,7 +87,16 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
     // at 32. The remaining descriptors serve Git startup, mounts, active files,
     // cache transfers and caller-inherited descriptors. No OS limit is changed.
     let budget = (unsafe { limit.assume_init() }.rlim_cur / 4).clamp(1, 32) as usize;
-    unsafe { git2::opts::set_mwindow_file_limit(budget) }?;
+    unsafe {
+        git2::opts::set_mwindow_file_limit(budget)?;
+        // A long-lived source repository otherwise keeps 1 GiB windows under
+        // libgit2's 8 GiB mapped-byte default (on 64-bit hosts), independently
+        // of our decoded-data LRU. Size each window as well as the soft total:
+        // one in-use window may exceed the latter, and active delta decoding
+        // still has its own necessary working set. No object-size limit is set.
+        git2::opts::set_mwindow_size(8 * 1024 * 1024)?;
+        git2::opts::set_mwindow_mapped_limit(16 * 1024 * 1024)?;
+    }
     Ok(budget)
 }
 

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import resource
 import signal
 import shutil
@@ -26,6 +27,8 @@ PIN = dict(repository='https://github.com/WebKit/WebKit.git',
     tree='be3bad9ff779597380c7ba741ff250ef8a14225f',
     blob_paths=472895, logical_blob_bytes=5522313781, gitlinks=0)
 MODULES = 'Tools/Scripts/webkitpy/style/'
+LIGHT_TESTS = ('webkitcorepy.tests.version_unittest', 'webkitcorepy.tests.string_utils_unittest',
+    'webkitcorepy.tests.filtered_call_unittest')
 
 
 def environment():
@@ -130,7 +133,7 @@ def process_snapshot(pid):
     Short-lived children may fall between samples. CPU uses waited accounting,
     not these samples. PID identity is checked before/after reading each status.
     """
-    seen = set(); queue = [pid]; rss = 0; descriptors = 0; complete = True
+    seen = set(); queue = [pid]; rss = 0; descriptors = 0; complete = True; fd_complete = True
     while queue:
         current = queue.pop()
         if current in seen: continue
@@ -140,7 +143,8 @@ def process_snapshot(pid):
             identity = (base/'stat').read_text().rsplit(')', 1)[1].split()[19]
             status = (base/'status').read_text()
             resident = next((int(line.split()[1]) for line in status.splitlines() if line.startswith('VmRSS:')), 0)
-            count = len(list((base/'fd').iterdir()))
+            try: count = len(list((base/'fd').iterdir()))
+            except PermissionError: count = 0; fd_complete = False
             children = []
             for task in (base/'task').iterdir():
                 try: children.extend((task/'children').read_text().split())
@@ -150,12 +154,15 @@ def process_snapshot(pid):
             rss += resident; descriptors += count
             queue.extend(map(int, children))
         except (FileNotFoundError, ProcessLookupError): pass
-    return rss, descriptors, complete
+    return rss, descriptors, complete, fd_complete
 
 
-def observe(argv, cwd, env, timeout, metrics=False):
+def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
     """Include launch, native descendants and process exit; no traced timings."""
     with tempfile.TemporaryFile() as counters:
+        if resource_observer:
+            rss_output=resource_observer.with_name('observed-rss')
+            argv=[str(resource_observer),str(rss_output),*argv]
         if metrics: env = dict(env, GIT_ON_TEST_METRICS_FD=str(counters.fileno()))
         before = resource.getrusage(resource.RUSAGE_CHILDREN); begin = time.monotonic_ns()
         # These controlled commands emit bounded JSON/quiet Git diagnostics.
@@ -163,15 +170,16 @@ def observe(argv, cwd, env, timeout, metrics=False):
         # and can add a 50 ms measurement floor to short commands.
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,start_new_session=True,
             pass_fds=(counters.fileno(),) if metrics else ())
-        stop = threading.Event(); samples = dict(count=0, peak_rss_sum_kib=0, peak_fd_sum=0, unavailable=False)
+        stop = threading.Event(); samples = dict(count=0, peak_rss_sum_kib=0, peak_fd_sum=0, unavailable=False,descriptors_unavailable=False)
         def sample():
             while not stop.wait(.02):
                 try:
-                    rss, fds, complete = process_snapshot(process.pid)
+                    rss, fds, complete, fd_complete = process_snapshot(process.pid)
                     samples['peak_rss_sum_kib'] = max(samples['peak_rss_sum_kib'], rss)
                     samples['peak_fd_sum'] = max(samples['peak_fd_sum'], fds)
                     samples['count'] += int(rss>0)
                     samples['unavailable'] |= not complete
+                    samples['descriptors_unavailable'] |= not fd_complete
                 except PermissionError: samples['unavailable'] = True
         thread = threading.Thread(target=sample); thread.start()
         try:
@@ -204,7 +212,8 @@ def observe(argv, cwd, env, timeout, metrics=False):
             waited_system_cpu_s=after.ru_stime-before.ru_stime, memory=samples,
             waited_input_block_bytes=(after.ru_inblock-before.ru_inblock)*512,
             waited_output_block_bytes=(after.ru_oublock-before.ru_oublock)*512,
-            memory_limits='20 ms sampled simultaneous RSS sum; shared pages double counted; short-lived children may be missed',
+            waited_process_peak_rss_kib=int(rss_output.read_text()) if resource_observer else None,
+            memory_limits='wait4 peak is the largest waited process, including native descendants; 20 ms process-tree RSS sums are non-atomic, shared pages double counted, fast/protected descendants may be missed',
             stderr=errors.decode(errors='replace'), command_observations=rows)
         if metrics:
             from benchmark import validate_cache_budgets
@@ -232,6 +241,13 @@ def child(manifest_path, workload, stat_bytes):
             if entry.is_dir(follow_symlinks=False): yield from walk(path)
     for phase in ('first', 'repeat'):
         begin = time.monotonic_ns(); files = 0; payload = 0; metadata = 0; syntax = 0
+        if workload == 'tests':
+            env=dict(os.environ,PYTHONPATH='Tools/Scripts/libraries/webkitcorepy',DISABLE_WEBKITCOREPY_AUTOINSTALLER='1')
+            result=subprocess.run([sys.executable,'-B','-S','-m','unittest',*LIGHT_TESTS],env=env,capture_output=True,text=True)
+            validate_test_output(result.returncode,result.stderr)
+            print(json.dumps(dict(completed=phase,workload=workload,test_count=32,test_modules=LIGHT_TESTS,
+                test_output=result.stderr,elapsed_ns=time.monotonic_ns()-begin)),flush=True)
+            continue
         if workload == 'syntax':
             paths=list(Path(MODULES).rglob('*.py'));selected=[]
             # Fixed rglob-result representation: path_length:u32 + raw path.
@@ -277,6 +293,11 @@ def child(manifest_path, workload, stat_bytes):
             payload_bytes=payload, metadata_result_bytes=metadata, elapsed_ns=time.monotonic_ns()-begin)), flush=True)
 
 
+def validate_test_output(code, output):
+    if code or not re.search(r'(?m)^Ran 32 tests in [0-9.]+s$',output) or not output.strip().endswith('\nOK'):
+        raise ValueError(f'upstream unit tests did not all pass: {code}\n{output}')
+
+
 def validate_reports(data, head, pin=PIN, trials=3):
     """Fail closed on stale heads, missing work or incomplete baseline accounting."""
     from benchmark import validate_cache_budgets
@@ -284,7 +305,7 @@ def validate_reports(data, head, pin=PIN, trials=3):
     runs=[r for r in data if r.get('type')=='real_repository']
     if len(data)!=2+1+2*trials or len(baselines)!=2 or {r['source'] for r in baselines}!={'local','remote'}:
         raise ValueError('missing/duplicate real repository baselines')
-    wanted={('full','local',0)}|{('syntax',source,trial) for source in ('local','remote') for trial in range(trials)}
+    wanted={('full','local',0)}|{('tests',source,trial) for source in ('local','remote') for trial in range(trials)}
     if len(runs)!=len(wanted) or {(r['workload'],r['source'],r['trial']) for r in runs}!=wanted:
         raise ValueError('missing/duplicate real repository commands')
     for row in data:
@@ -304,21 +325,21 @@ def validate_reports(data, head, pin=PIN, trials=3):
         if baseline['total_elapsed_ns']!=baseline['materialize']['elapsed_ns']+baseline['direct_command']['elapsed_ns']+baseline['cleanup_ns']:
             raise ValueError('baseline omitted setup or cleanup')
         observed=runner['command_observations']; direct=baseline['direct_command']['command_observations']
-        strip=lambda rr:[{k:v for k,v in r.items() if k!='elapsed_ns'} for r in rr]
+        strip=lambda rr:[{k:v for k,v in r.items() if k not in ('elapsed_ns','test_output')} for r in rr]
         if strip(observed)!=strip(direct) or [r['completed'] for r in observed]!=['first','repeat']:
             raise ValueError('incomplete/mismatched command execution')
-        if any(r['workload']!=row['workload'] or r['metadata_result_bytes']<=0 or r['elapsed_ns']<=0 for r in observed):
+        if any(r['workload']!=row['workload'] or r['elapsed_ns']<=0 for r in observed):
             raise ValueError('missing command metadata/timings')
         full=row['workload']=='full'
-        expected_files=pin['blob_paths'] if full else counts['python_modules']
-        if expected_files<=0 or any(r['files']!=expected_files for r in observed):
-            raise ValueError('incomplete real repository coverage')
-        if full and any(r['payload_bytes']!=pin['logical_blob_bytes'] for r in observed):
-            raise ValueError('incomplete full payload read')
-        if not full and any(r['syntax_modules']!=expected_files or r['payload_bytes']!=counts['syntax_path_bytes'] for r in observed):
-            raise ValueError('incomplete syntax check')
+        if full:
+            if any(r['files']!=pin['blob_paths'] or r['metadata_result_bytes']<=0 or r['payload_bytes']!=pin['logical_blob_bytes'] for r in observed):
+                raise ValueError('incomplete full namespace/payload read')
+        else:
+            for result in observed+direct:
+                if result['test_count']!=32 or tuple(result['test_modules'])!=LIGHT_TESTS:raise ValueError('wrong upstream test selection')
+                validate_test_output(0,result['test_output'])
         m=runner['metrics']; validate_cache_budgets(m)
-        if m['blob_loads']!=counts['nonempty_unique_blob_objects' if full else 'syntax_nonempty_unique_blobs'] or m['fuse_requests'].get('read',0)<=0:
+        if (full and m['blob_loads']!=counts['nonempty_unique_blob_objects']) or not 0<m['blob_loads']<=counts['nonempty_unique_blob_objects'] or m['fuse_requests'].get('read',0)<=0:
             raise ValueError('repeated decode or missing real FUSE execution')
         transfer=row.get('transfer_evidence',{})
         transfer_fields=dict(remote_verified_blob_bytes='remote_raw_blob_bytes',remote_verified_blobs='remote_raw_blob_imports',
@@ -326,21 +347,25 @@ def validate_reports(data, head, pin=PIN, trials=3):
         if any(type(m.get(metric)) is not int or m[metric]<0 or transfer.get(field)!=m[metric] for field,metric in transfer_fields.items()):
             raise ValueError('missing/inconsistent received-data evidence')
         if row['source']=='remote':
-            if m['remote_session_pack_bytes']+m['remote_native_pack_bytes']<=0 or m['remote_raw_blob_bytes']<counts['syntax_blob_bytes']:
+            if m['remote_session_pack_bytes']+m['remote_native_pack_bytes']<=0 or m['remote_raw_blob_bytes']<=0:
                 raise ValueError('remote transfer was not observed')
             if m['remote_raw_blob_imports']>=counts['unique_blob_objects']:
-                raise ValueError('syntax workload fetched the complete source')
+                raise ValueError('test workload fetched the complete source')
         for index,result in enumerate([runner,baseline['direct_command'],*baseline['materialize']['commands']]):
             if result['elapsed_ns']<=0 or any(result.get(k,-1)<0 for k in ('waited_user_cpu_s','waited_system_cpu_s','waited_input_block_bytes','waited_output_block_bytes')):
                 raise ValueError('missing complete process resources')
             memory=result['memory']
             # Fast setup helpers may exit between samples; never invent their
             # peak. Runner/command and at least one preparation must be seen.
-            if memory['unavailable'] or (index<2 and (memory['count']<=0 or memory['peak_rss_sum_kib']<=0)):
+            if type(result.get('waited_process_peak_rss_kib')) is not int or result['waited_process_peak_rss_kib']<=0:
+                raise ValueError('required waited-process peak RSS unavailable')
+            if type(memory.get('unavailable')) is not bool or (index<2 and (memory['count']<=0 or memory['peak_rss_sum_kib']<=0)):
                 raise ValueError('required real repository memory observation unavailable')
         if not any(r['memory']['count']>0 and r['memory']['peak_rss_sum_kib']>0 for r in baseline['materialize']['commands']):
             raise ValueError('preparation memory was not observed')
-    return dict(pin=pin['commit'],full_local_passes=2,syntax_invocations=2*trials,baseline_materializations=2)
+    partial=sum(r['runner']['memory']['unavailable'] for r in runs)
+    return dict(pin=pin['commit'],full_local_passes=2,test_invocations=2*trials,upstream_tests_per_pass=32,baseline_materializations=2,
+        partial_process_tree_rss_samples=partial,memory_primary='wait4 largest waited process peak, not aggregate physical memory')
 
 
 def run(options):
@@ -356,11 +381,13 @@ def run(options):
     with tempfile.TemporaryDirectory(prefix='git-on-real-benchmark-') as temporary, options.output.open('w') as output:
         root = Path(temporary); stat_bytes = stat_abi_bytes(root); env = environment()
         env.update(TMPDIR=str(root), GIT_LFS_SKIP_SMUDGE='1')
+        def measured(argv,cwd,env,timeout,metrics=False):
+            return observe(argv,cwd,env,timeout,metrics,resource_observer=root/'resource-observer')
         def record(row):
             row.update(head=head, working_tree_dirty=dirty, fixture=metadata, source_cache='complete immutable local ODB; OS caches uncontrolled; fresh invocation storage',
                 source_scope='local or file:// private server; not a public-network latency benchmark')
             output.write(json.dumps(row)+'\n'); output.flush(); print(json.dumps(row), flush=True)
-        plan = [('full', 'local', 0)] + [('syntax', source, trial) for trial in range(options.trials) for source in ('local', 'remote')]
+        plan = [('full', 'local', 0)] + [('tests', source, trial) for trial in range(options.trials) for source in ('local', 'remote')]
         random.Random(260531).shuffle(plan)
         baselines={}
         # One complete materialization per source, then independent direct
@@ -370,14 +397,14 @@ def run(options):
             clone=root/'baseline'; start=time.monotonic_ns()
             clone_argv=['git','clone','--quiet','--no-checkout']
             clone_argv += ['--shared',str(repo)] if source == 'local' else [repo.as_uri()]
-            preparation=[observe([*clone_argv,str(clone)],root,env,options.timeout)]
+            preparation=[measured([*clone_argv,str(clone)],root,env,options.timeout)]
             (clone/'.git/info/attributes').write_text('** -text -ident -filter -working-tree-encoding\n')
-            preparation.append(observe(['git','-C',str(clone),'checkout','--quiet','--detach',PIN['commit']],root,env,options.timeout))
+            preparation.append(measured(['git','-C',str(clone),'checkout','--quiet','--detach',PIN['commit']],root,env,options.timeout))
             prep=dict(elapsed_ns=time.monotonic_ns()-start,commands=preparation)
             direct={}
             for workload,selected_source,trial in plan:
                 if selected_source == source:
-                    direct[workload,trial]=observe(command(tree,workload,stat_bytes),clone,env,options.timeout)
+                    direct[workload,trial]=measured(command(tree,workload,stat_bytes),clone,env,options.timeout)
             received_pack_bytes=sum(p.stat().st_size for p in (clone/'.git/objects/pack').glob('*.pack'))
             start=time.monotonic_ns();cpu=time.process_time_ns();shutil.rmtree(clone);cleanup=time.monotonic_ns()-start
             common=dict(materialize=prep,cleanup_ns=cleanup,cleanup_parent_cpu_ns=time.process_time_ns()-cpu,
@@ -393,22 +420,21 @@ def run(options):
                 argv = [str(options.binary.resolve())]
                 if source == 'remote': argv.append(repo.as_uri())
                 argv += [PIN['commit'], '--write-policy=none', '--', *child_argv]
-                return observe(argv, repo if source == 'local' else root, env, options.timeout, metrics=True)
+                return measured(argv, repo if source == 'local' else root, env, options.timeout, metrics=True)
             before=baselines[workload,source,trial];after=runner()
-            expected = [{k:v for k,v in row.items() if k != 'elapsed_ns'} for row in before['direct_command']['command_observations']]
-            observed = [{k:v for k,v in row.items() if k != 'elapsed_ns'} for row in after['command_observations']]
+            expected = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output')} for row in before['direct_command']['command_observations']]
+            observed = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output')} for row in after['command_observations']]
             assert expected == observed and [r['completed'] for r in observed] == ['first','repeat'], 'baseline command differs'
             m=after['metrics']
-            wanted=metadata['counts']['syntax_nonempty_unique_blobs' if workload == 'syntax' else 'nonempty_unique_blob_objects']
-            assert m['blob_loads'] == wanted, 'prepared data decoded repeatedly or required data missing'
+            if workload=='full':assert m['blob_loads']==metadata['counts']['nonempty_unique_blob_objects'],'prepared data decoded repeatedly or required data missing'
             assert m['fuse_requests'].get('read', 0) > 0, 'no actual FUSE reads'
-            if workload == 'syntax':
-                assert all(r['files'] == metadata['counts']['python_modules'] for r in observed)
+            if workload == 'tests':
+                assert all(r['test_count']==32 for r in observed)
                 assert m['blob_loads'] < metadata['counts']['blob_paths'], 'small workload materialized whole tree'
             else: assert all(r['files'] == PIN['blob_paths'] and r['payload_bytes'] == PIN['logical_blob_bytes'] for r in observed)
             assert not list(root.glob('git-on-*')), 'invocation cleanup incomplete'
             record(dict(type='real_repository', workload=workload, source=source, trial=trial, order=order,
-                baseline=before, runner=after, method='full two-pass real namespace/data; syntax parses complete style package without imports/execution',
+                baseline=before, runner=after, method='full two-pass real namespace/data; 32 upstream webkitcorepy unit tests through stdlib unittest without SDK/autoinstall',
                 transfer_evidence=dict(remote_verified_blob_bytes=m.get('remote_raw_blob_bytes', 0),
                     remote_verified_blobs=m.get('remote_raw_blob_imports', 0),
                     session_pack_payload_bytes=m.get('remote_session_pack_bytes',0),
@@ -422,7 +448,7 @@ def main():
     execute=commands.add_parser('run'); execute.add_argument('--fixture', type=Path, required=True); execute.add_argument('--binary', type=Path, required=True)
     execute.add_argument('--trials', type=int, default=3); execute.add_argument('--timeout', type=int, default=1200); execute.add_argument('--output', type=Path, required=True)
     child_parser=commands.add_parser('child'); child_parser.add_argument('--manifest', type=Path, required=True)
-    child_parser.add_argument('--workload', choices=['full','syntax'], required=True); child_parser.add_argument('--stat-bytes', type=int, required=True)
+    child_parser.add_argument('--workload', choices=['full','syntax','tests'], required=True); child_parser.add_argument('--stat-bytes', type=int, required=True)
     options=parser.parse_args()
     if options.action == 'prepare': print(json.dumps(prepare(options.directory)), flush=True)
     elif options.action == 'child': child(options.manifest, options.workload, options.stat_bytes)

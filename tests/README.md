@@ -10,10 +10,16 @@ python3 tests/real_repository.py run --fixture /path/to/webkit-fixture --binary 
 Build with `--release --locked --features test-metrics` and use real Linux FUSE.
 Preparation downloads one pinned WebKit Git repository (several GiB of logical
 contents); it does not download dependencies or hydrate LFS. The full local
-case checks every path and blob twice. The useful smaller command syntax-checks
-the production `webkitpy/style` modules without importing or executing them,
-three fresh local and three file-transport invocations, each with first/repeat
-passes. This is not a public-network latency benchmark. Source and OS-cache
+case checks every path and blob twice. The useful smaller command runs 32 real
+upstream webkitcorepy unit tests, with three fresh local and three file-transport
+invocations, each with first/repeat test processes. No browser/SDK bootstrap or
+package installation is required. The direct command is:
+
+```sh
+PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+```
+
+This is not a public-network latency benchmark. Source and OS-cache
 conditions, complete baseline composition and sampled-memory limitations are
 explicit in each report. See [CI coverage](../docs/ci-performance.md).
 
@@ -278,7 +284,7 @@ suite is deferred to a nightly or post-merge job.
 
 All affected source/policy/signature interactions remain pre-merge. Four physical matrix
 jobs group build/setup work; the separate WebKit job acquires its fixture once
-and checks full local reads plus the useful production syntax workload.
+and checks full local reads plus the selected upstream unit tests.
 Enabled passthrough retains actual-kernel capability/ordinary-child checks in
 `real-fuse`, plus both source scale groups. Differential stress keeps
 both seeds in default ignored and its resource bounds; dedicated write-policy
