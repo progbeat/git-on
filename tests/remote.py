@@ -1264,6 +1264,29 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
+    def test_real_mount_caught_verified_raw_storage_failure_is_sticky(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;blob=f.git('hash-object','-w','--stdin',data=b'v'*(128*1024))
+        tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=f.git('commit-tree',tree,data=b'raw integrity failure\n');f.git('update-ref','refs/heads/main',commit)
+        code=f"""import errno,os
+from pathlib import Path
+os.stat('file')
+raw=next(Path.cwd().parent.glob('raw-objects-*/{blob}'))
+with raw.open('r+b') as output:output.write(b'!')
+try:
+ with open('file','rb') as source:source.read(1)
+except OSError as error:
+ assert error.errno==errno.EIO,error
+else:raise AssertionError('raw corruption was not rejected')
+print('caught-EIO-and-returned-success')
+"""
+        result=subprocess.run([str(OPTIONS.binary),'file://'+str(f.repo),'HEAD','--write-policy=none','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+        self.assertIn(b'caught-EIO-and-returned-success',result.stdout)
+        self.assertEqual(result.returncode,125,result.stderr)
+        self.assertIn(b'bytes were modified',result.stderr);self.assertIn(b'execution incomplete',result.stderr)
+        self.assertEqual(list(f.root.glob('git-on-*')),[])
+
     def test_remote_never_requires_or_modifies_global_cache(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         original=dict(f.env)

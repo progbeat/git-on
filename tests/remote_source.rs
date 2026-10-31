@@ -67,6 +67,73 @@ fn load_operands(
     )
 }
 #[test]
+fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
+    use std::os::unix::fs::FileExt;
+    let (temp, _, _, untouched) = fixture();
+    let repo = Repository::open_bare(temp.path().join("server")).unwrap();
+    let oid = repo.blob(&vec![b'v'; 128 * 1024]).unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("file", oid, 0o100644).unwrap();
+    let tree = builder.write().unwrap();
+    let sig = Signature::now("Test", "test@example.invalid").unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "raw integrity fixture",
+        &repo.find_tree(tree).unwrap(),
+        &[&repo.head().unwrap().peel_to_commit().unwrap()],
+    )
+    .unwrap();
+    for retained_reader in [false, true] {
+        let snap = load(temp.path(), "HEAD", false).unwrap();
+        let entry = snap.entry(Path::new("file")).unwrap().unwrap();
+        let reader = retained_reader.then(|| snap.open(entry.oid).unwrap());
+        let store = std::fs::read_dir(snap.git_dir.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .starts_with(b"raw-objects-")
+            })
+            .unwrap();
+        let path = store.join(oid.to_string());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(b"!", 0)
+            .unwrap();
+        let read = |offset| match &reader {
+            Some(reader) => reader.read(offset, 1),
+            None => snap.read(entry.oid, offset, 1),
+        };
+        let error = read(0).unwrap_err();
+        assert!(
+            error.to_string().contains("bytes were modified"),
+            "{error:#}"
+        );
+        let original = snap
+            .remote_failure()
+            .expect("caught raw EIO must still fail remote invocation");
+        assert!(original.contains("bytes were modified"), "{original}");
+        std::fs::remove_file(path).unwrap();
+        assert!(read(65536).is_err());
+        assert!(
+            snap.read(untouched, 0, 1).is_err(),
+            "a new demand ignored the sticky failure"
+        );
+        assert_eq!(
+            snap.remote_failure().as_deref(),
+            Some(original.as_str()),
+            "later errors replaced the original failure"
+        );
+    }
+}
+
+#[test]
 fn remote_metadata_and_payloads_are_demanded_and_pinned() {
     let (temp, commit, tree, untouched) = fixture();
     let snap = load(temp.path(), "HEAD", false).unwrap();

@@ -279,7 +279,7 @@ impl Remote {
         Ok((remote, oid))
     }
     fn command(&self, initial: bool) -> Result<Command> {
-        if let Some(error) = &self.failed {
+        if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
         }
         let mut command = self.git.command(Some(&self.dir));
@@ -415,7 +415,7 @@ impl Remote {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if !crate::git::is_request_interruption(error) && self.failed.is_none() {
+            if !crate::git::is_request_interruption(error) && self.failure().is_none() {
                 self.failed = Some(format!("{error:#}"));
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
@@ -423,6 +423,11 @@ impl Remote {
         outcome
     }
     fn fetch(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
+        // Session reuse bypasses command(), so reject incomplete invocations
+        // before either transport can start another missing-object demand.
+        if let Some(error) = self.failure() {
+            bail!("remote object transport previously failed: {error}");
+        }
         if oids.len() == 1 && self.fetch_in_session(repo, oids[0])? {
             return Ok(());
         }
@@ -938,7 +943,7 @@ impl Remote {
         Ok(())
     }
     pub fn failure(&self) -> Option<String> {
-        self.failed.clone()
+        self.failed.clone().or_else(|| self.raw_blobs.failure())
     }
     pub(crate) fn completed_fetches(&self) -> u64 {
         self.completed_fetches

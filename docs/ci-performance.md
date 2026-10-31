@@ -213,3 +213,13 @@ baseline: 12.3x wall and 18.4x job-time reductions. Its 97-case synthetic eviden
 is historical, not a measurement of this replacement. The WebKit-inclusive
 plan needs its own measured final-head run. CI optimization is not a product
 performance SLA or proof of the complete overhead contract.
+
+
+The WebKit-inclusive all-affected run at `9010d4c`, [CI 41183217607](https://github.com/progbeat/git-on/actions/runs/41183217607),
+passed in **16m25s / 40.8 summed job-minutes**: 4.7x wall and 14.4x job-time
+reductions versus the historical starting point. The 10x wall-time target is
+therefore **not met by this plan**. WebKit took 15m57s including source/build,
+complete materialization baselines and both full-read passes. The useful
+32-test invocations themselves took under one second. This separates the cost
+of meaningful pre-merge real-repository validation from the earlier synthetic
+speedup; no expensive legacy full matrix was rerun or silently moved post-merge.

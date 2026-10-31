@@ -538,3 +538,42 @@ timing trials so profiling instrumentation is not presented as uninstrumented
 latency. Session compressed pack payload bytes and native stored received-pack
 bytes are distinct counters; index-pack normalization and wire framing prevent
 treating the latter as an exact on-wire byte count.
+
+### Measured WebKit unit-test demo at 9010d4c
+
+[CI 41183217607](https://github.com/progbeat/git-on/actions/runs/41183217607)
+passed the pinned full-WebKit case and all six fresh local/file:// unit-test
+invocations. Every first/repeat pass ran 32 real upstream tests successfully.
+Use the [exact command](../tests/README.md) on the pinned revision; the runner
+executes it twice with fresh Python processes in one mounting. No SDK, browser
+build, package installation or bytecode writes are needed.
+
+Three-trial medians, optimized binary, warm/uncontrolled source OS caches:
+
+| Measurement | Local Git-on | file:// Git-on | Already materialized direct |
+| --- | ---: | ---: | ---: |
+| Whole invocation, two test processes and cleanup | 415 ms | 599 ms | 347 / 350 ms |
+| First test process | 182 ms | 324 ms | 148 / 150 ms |
+| Repeated test process in the same mount | 164 ms | 167 ms | 149 / 149 ms |
+| Sampled process-tree RSS sum | 60.6 MiB | 68.7 MiB | 47.9 / 48.2 MiB |
+
+Local/remote composed complete-materialization baselines were 114.10 / 113.58 s;
+one measured preparation and cleanup sample per source was reused explicitly.
+Native complete clones retained 1,851,088,455 received pack bytes. The small
+command demanded only 35 unique blobs / 293,353 verified payload bytes and ten
+trees. Remote invocation received 103,382 session-pack payload bytes plus 1,234
+native stored received-pack bytes; these exclude framing and public-network
+costs. No raw payload was spilled while these fitting objects remained resident.
+The largest waited-process peaks were about 27.8 MiB for both Git-on and direct
+commands. The RSS sums above count shared pages repeatedly and are non-atomic;
+their difference is a diagnostic estimate, not additional physical peak memory.
+
+The same head's complete two-pass namespace/payload workload took 495.88 s
+against a 143.96 s complete baseline. First/repeat passes were 235.16 / 214.76 s
+versus direct 15.80 / 14.35 s. All 411,092 nonempty distinct blobs decoded once,
+but significant repeat overhead remains. Its largest waited-process peak was
+788 MiB, with sampled tree RSS 813 MiB. The previous head's larger RSS was a
+partial estimate; cross-run timings are not an isolated causal speed comparison.
+This useful small-command result does not complete #20 or justify the full
+traversal cost. The subsequent independent review also found missing final
+failure propagation for caught raw-storage EIO; its fix requires fresh head CI.

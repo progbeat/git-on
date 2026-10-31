@@ -79,6 +79,22 @@ impl RawBlob {
             .is_some_and(|object| object.file)
     }
     fn range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let result = self.checked_range(offset, length);
+        if let Err(error) = &result {
+            // Reads can outlive the Snapshot lock through an active reader.
+            // Preserve storage failures for the remote runner's final status,
+            // including after a caller catches EIO or all handles close.
+            // A request's signal handler may retry EINTR normally.
+            if !crate::git::is_request_interruption(error) {
+                let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if store.failure.is_none() {
+                    store.failure = Some(format!("{error:#}"));
+                }
+            }
+        }
+        result
+    }
+    fn checked_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
         #[cfg(feature = "test-metrics")]
         let _profile = crate::profile::span("raw_range", length);
         if length == 0 {
@@ -256,6 +272,7 @@ impl RawBlobs {
                 memory_high_water: 0,
                 scratch: None,
                 output: None,
+                failure: None,
                 blob_entries: 0,
                 blob_bytes: 0,
                 disk_entries: 0,
@@ -482,6 +499,13 @@ impl RawBlobs {
             .copied()
             .collect())
     }
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .clone()
+    }
     pub(crate) fn entries(&self) -> u64 {
         self.state
             .lock()
@@ -549,6 +573,7 @@ struct Store {
     memory_high_water: usize,
     scratch: Option<Files>,
     output: Option<Arc<Spool>>,
+    failure: Option<String>,
     blob_entries: u64,
     blob_bytes: u64,
     disk_entries: u64,

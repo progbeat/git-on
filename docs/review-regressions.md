@@ -2269,3 +2269,14 @@ focused test reproduced the escaped-child marker with the wrapper and no marker
 without it. The observer now ignores SIGTERM while waiting; its forked child
 restores the normal disposition before exec. The timeout retains its bounded
 final SIGKILL and the earlier same-group TERM-ignoring descendant regression.
+
+### Caught raw-storage EIO must fail a remote invocation
+
+An already fetched remote blob rejected tampered raw bytes on read, but the
+error bypassed the sticky transport status. A child catching EIO could therefore
+make an incomplete remote invocation appear successful. The new retained-reader
+and close/reopen regression reproduced an absent `remote_failure()` after EIO.
+Raw read failures now remain in the invocation store and feed the existing
+remote final-status path; request-specific EINTR stays retryable. A real-mount
+regression catches the raw-storage EIO and requires runner status 125, the
+original diagnostic and complete cleanup.
