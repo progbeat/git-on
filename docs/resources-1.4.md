@@ -610,3 +610,22 @@ reduced status reads from 125 to 65 while retaining all 30 seeks/polls and
 passing the same signal cases. Large supplementary-group lists still read to
 EOF. This is a focused syscall result, not evidence that the full workload's
 30.74 s requester-check span has disappeared.
+
+### Readonly open/release round trips
+
+For `--write-policy=none`, the Linux adapter now negotiates the existing FUSE
+NO_OPEN_SUPPORT capability when the peer offers it. An initial ENOSYS open
+response lets Linux use fh=0 and omit subsequent open/release requests; one
+ENOSYS flush response similarly disables pointless close-flush requests for
+this immutable connection. Metadata, range reads and explicit sync still have
+their ordinary callbacks. Reads use the same Snapshot and verified owned-buffer
+path, including for objects larger than the data budget. No generated file or
+mutable policy uses this mode. Older peers keep ordinary handles.
+
+The permanent protocol regression fails before negotiation is implemented and
+checks fallback policies, type/mode errors, fh=0 attributes and ranges, explicit
+sync, bad handles, forget and subsequent lookup. A larger-than-budget unit case
+checks one decode, one retained cache entry and no handle retention. The mounted
+regression additionally exercises independent opens, dup, mmap, fstat and sync
+on a 17 MiB file; it requires an actual FUSE host. This removes a known source of
+protocol work, but its effect on the complete WebKit workload must be measured.

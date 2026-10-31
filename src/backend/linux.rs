@@ -29,6 +29,9 @@ pub struct Fuse {
 }
 struct State {
     core: Overlay,
+    // The completely readonly namespace needs no per-open userspace state.
+    // Enabled only after the peer advertises the kernel's no-open contract.
+    no_open: bool,
     #[cfg(feature = "test-metrics")]
     profile_uncached_source: bool,
     #[cfg(target_os = "linux")]
@@ -43,6 +46,7 @@ impl Fuse {
         Self {
             state: Mutex::new(State {
                 core,
+                no_open: false,
                 #[cfg(feature = "test-metrics")]
                 profile_uncached_source: std::env::var_os("GIT_ON_TEST_UNCACHED_SOURCE").is_some(),
                 #[cfg(target_os = "linux")]
@@ -181,6 +185,13 @@ impl Filesystem for Fuse {
         #[cfg(target_os = "linux")]
         {
             let state = self.state.get_mut().expect("filesystem state poisoned");
+            let no_open = state.core.read_only();
+            #[cfg(feature = "test-metrics")]
+            let no_open = no_open && !state.profile_uncached_source;
+            state.no_open = no_open
+                && config
+                    .add_capabilities(fuser::InitFlags::FUSE_NO_OPEN_SUPPORT)
+                    .is_ok();
             state.enabled = crate::platform::has_sys_admin()
                 && config
                     .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
@@ -217,7 +228,12 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("getattr");
-        match state.core.attributes(ino.0, fh.map(|h| h.0)) {
+        let result = if state.no_open && fh == Some(FileHandle(0)) {
+            state.core.readonly_file_attributes(ino.0)
+        } else {
+            state.core.attributes(ino.0, fh.map(|h| h.0))
+        };
+        match result {
             Ok(a) => reply.attr(&state.cache_ttls(&a).0, &attr(a)),
             Err(error) => reply.error(Errno::from_i32(error)),
         }
@@ -379,6 +395,20 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("open");
+        if state.no_open {
+            let error =
+                if flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0 {
+                    libc::EROFS
+                } else {
+                    state
+                        .core
+                        .readonly_file_attributes(ino.0)
+                        .err()
+                        .unwrap_or(libc::ENOSYS)
+                };
+            reply.error(Errno::from_i32(error));
+            return;
+        }
         match state.core.open_file(ino.0, flags.0) {
             Ok(fh) => {
                 let cache = if state.retain_source_data(ino.0)
@@ -475,7 +505,7 @@ impl Filesystem for Fuse {
         fh: FileHandle,
         offset: u64,
         size: u32,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
@@ -489,7 +519,16 @@ impl Filesystem for Fuse {
             reply,
             i64::try_from(offset)
                 .map_err(|_| libc::EINVAL)
-                .and_then(|offset| state.core.read_data(ino.0, fh.0, offset, size)),
+                .and_then(|offset| {
+                    if state.no_open && fh.0 == 0 {
+                        if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
+                            return Err(libc::EBADF);
+                        }
+                        state.core.read_without_handle(ino.0, offset, size)
+                    } else {
+                        state.core.read_data(ino.0, fh.0, offset, size)
+                    }
+                }),
         );
     }
     fn write(
@@ -526,7 +565,19 @@ impl Filesystem for Fuse {
     ) {
         #[cfg(feature = "test-metrics")]
         let _profile = crate::profile::span("fuse_flush", 0);
-        empty(reply, self.state().core.validate_handle(ino.0, fh.0));
+        let state = self.state();
+        if state.no_open && fh.0 == 0 {
+            // Linux remembers ENOSYS, avoiding future flush requests for this
+            // connection. No source in a readonly mount has dirty data to flush.
+            let error = state
+                .core
+                .readonly_file_attributes(ino.0)
+                .err()
+                .unwrap_or(libc::ENOSYS);
+            reply.error(Errno::from_i32(error));
+        } else {
+            empty(reply, state.core.validate_handle(ino.0, fh.0));
+        }
     }
     fn release(
         &self,
@@ -550,7 +601,13 @@ impl Filesystem for Fuse {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        empty(reply, self.state().core.sync_file(ino.0, fh.0, datasync));
+        let mut state = self.state();
+        let result = if state.no_open && fh.0 == 0 {
+            state.core.sync_readonly_file(ino.0, datasync)
+        } else {
+            state.core.sync_file(ino.0, fh.0, datasync)
+        };
+        empty(reply, result);
     }
     fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let _request = crate::git::RequestGuard::enter(req.pid());

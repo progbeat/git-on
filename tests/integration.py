@@ -288,6 +288,36 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_readonly_stateless_large_reads_dup_mmap_and_sync(self):
+        size=17*1024*1024
+        (self.repo/'large-readonly').write_bytes(bytes(range(256))*(size//256))
+        git(self.repo,'add','large-readonly');git(self.repo,'commit','-qm','readonly file lifecycle')
+        code=r'''
+import errno,mmap,os
+size=17*1024*1024
+pattern=bytes(range(256))*16
+fds=[os.open('large-readonly',os.O_RDONLY) for _ in range(3)]
+fds.append(os.dup(fds[0]))
+try:
+ for fd in fds:
+  assert os.fstat(fd).st_size==size
+  for offset in (size-4096,0,65536,0):assert os.pread(fd,4096,offset)==pattern
+  os.fsync(fd);os.fdatasync(fd)
+ with mmap.mmap(fds[0],0,access=mmap.ACCESS_READ) as view:
+  assert view[:4096]==pattern and view[-4096:]==pattern
+ os.close(fds.pop())
+ assert os.pread(fds[0],4096,0)==pattern
+ for flags in (os.O_WRONLY,os.O_RDWR,os.O_RDONLY|os.O_TRUNC):
+  try:os.open('large-readonly',flags)
+  except OSError as error:assert error.errno in (errno.EROFS,errno.EACCES),error
+  else:raise AssertionError('readonly source opened for mutation')
+finally:
+ for fd in fds:os.close(fd)
+with open('large-readonly','rb') as reopened:assert reopened.read(4096)==pattern
+'''
+        result,run=self.invoke_argv(['HEAD','--write-policy=none','--',sys.executable,'-I','-S','-c',code])
+        self.assert_success(result);self.assertIsNone(run);self.assert_no_runtime_files()
+
     def test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes(self):
         data=b'a'*8192
         (self.repo/'cached-source').write_bytes(data)

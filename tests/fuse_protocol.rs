@@ -69,6 +69,9 @@ impl Peer {
         Self::with_init(policy, false)
     }
     fn with_init(policy: WritePolicy, extended: bool) -> Self {
+        Self::with_capabilities(policy, extended, 0).0
+    }
+    fn with_capabilities(policy: WritePolicy, extended: bool, extra: u32) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -144,7 +147,7 @@ impl Peer {
             7,
             minor,
             0,
-            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16),
+            (1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16) | extra,
         ];
         if extended {
             body[3] |= 1 << 30; // FUSE_INIT_EXT
@@ -165,7 +168,7 @@ impl Peer {
             flags & ((1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16)),
             0
         );
-        p
+        (p, flags)
     }
     fn send(&mut self, op: u32, ino: u64, body: Vec<u8>) {
         self.unique += 1;
@@ -431,6 +434,61 @@ fn protocol_file_io_sync_and_stale_handles() {
         [io(wh, -1, 1, libc::O_WRONLY), vec![1]].concat(),
         libc::EINVAL,
     );
+}
+
+#[test]
+fn protocol_readonly_no_open_negotiation_and_stateless_reads() {
+    const NO_OPEN: u32 = 1 << 17;
+    for policy in [
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, flags) = Peer::with_capabilities(policy, false, NO_OPEN);
+        assert_eq!(flags & NO_OPEN, 0, "mutable namespaces retain real handles");
+        let ino = p.lookup(1, "tracked");
+        p.err(15, ino, io(0, 0, 100, 0), libc::EBADF);
+        let handle = p.open(ino, libc::O_RDONLY);
+        assert_ne!(handle, 0);
+        assert_eq!(p.ok(15, ino, io(handle, 0, 100, 0)), b"original\n");
+        p.release(ino, handle);
+    }
+    let (mut p, flags) = Peer::with_capabilities(WritePolicy::None, false, NO_OPEN);
+    assert_ne!(flags & NO_OPEN, 0, "readonly peer must negotiate no-open");
+    let ino = p.lookup(1, "tracked");
+    p.err(14, ino, u32s(&[libc::O_RDONLY as u32, 0]), libc::ENOSYS);
+    p.err(14, ino, u32s(&[libc::O_RDWR as u32, 0]), libc::EROFS);
+    p.err(
+        14,
+        ino,
+        u32s(&[(libc::O_RDONLY | libc::O_TRUNC) as u32, 0]),
+        libc::EROFS,
+    );
+    p.err(14, 1, u32s(&[0, 0]), libc::EISDIR);
+    let link = p.lookup(1, "link");
+    p.err(14, link, u32s(&[0, 0]), libc::ELOOP);
+    for _ in 0..3 {
+        assert_eq!(p.ok(15, ino, io(0, 0, 4, 0)), b"orig");
+        assert_eq!(p.ok(15, ino, io(0, 4, 100, 0)), b"inal\n");
+        assert!(p.ok(15, ino, io(0, 100, 100, 0)).is_empty());
+    }
+    p.err(15, ino, io(0, -1, 1, 0), libc::EINVAL);
+    p.err(15, ino, io(0, 0, 1, libc::O_WRONLY), libc::EBADF);
+    p.err(15, ino, io(999, 0, 1, 0), libc::EBADF);
+    let attr = p.ok(3, ino, [u32s(&[1, 0]), u64s(&[0])].concat());
+    assert_eq!(num(&attr, 24), 9);
+    for datasync in [0, 1] {
+        p.ok(20, ino, [u64s(&[0]), u32s(&[datasync, 0])].concat());
+    }
+    // Linux memoizes ENOSYS for the entire readonly connection, so repeated
+    // closes need neither flush nor release round trips after this response.
+    p.err(25, ino, u64s(&[0, 0, 0]), libc::ENOSYS);
+    p.err(15, 1, io(0, 0, 1, 0), libc::EISDIR);
+    p.err(15, u64::MAX, io(0, 0, 1, 0), libc::ENOENT);
+    p.send(2, ino, u64s(&[1]));
+    p.err(15, ino, io(0, 0, 1, 0), libc::ENOENT);
+    let reopened = p.lookup(1, "tracked");
+    assert_eq!(p.ok(15, reopened, io(0, 0, 100, 0)), b"original\n");
 }
 
 #[test]

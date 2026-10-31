@@ -76,6 +76,20 @@ pub struct Overlay {
 }
 
 impl Overlay {
+    pub(crate) fn read_only(&self) -> bool {
+        self.write_policy == WritePolicy::None
+    }
+    pub(crate) fn readonly_file_attributes(&self, ino: u64) -> FsResult<FileAttr> {
+        if !self.read_only() {
+            return Err(libc::EBADF);
+        }
+        let node = self.node(ino)?;
+        match node.attr.kind {
+            FileType::RegularFile => Ok(node.attr),
+            FileType::Directory => Err(libc::EISDIR),
+            _ => Err(libc::ELOOP),
+        }
+    }
     pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
         self.nodes.get(&ino).is_some_and(|node| {
             node.immutable
@@ -744,6 +758,24 @@ impl Overlay {
         if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(libc::EBADF);
         }
+        self.read_data_inner(ino, Some(fh), offset, size)
+    }
+    pub(crate) fn read_without_handle(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        size: u32,
+    ) -> FsResult<Vec<u8>> {
+        self.readonly_file_attributes(ino)?;
+        self.read_data_inner(ino, None, offset, size)
+    }
+    fn read_data_inner(
+        &mut self,
+        ino: u64,
+        fh: Option<u64>,
+        offset: i64,
+        size: u32,
+    ) -> FsResult<Vec<u8>> {
         if offset < 0 {
             return Err(libc::EINVAL);
         }
@@ -776,12 +808,13 @@ impl Overlay {
             let oid = n.oid.ok_or(libc::EIO)?;
             // Small payload ownership stays exclusively in the bounded LRU;
             // an idle open descriptor must not pin an evicted whole payload.
-            if n.attr.size <= BLOB_CACHE_BYTES as u64 {
+            if n.attr.size <= BLOB_CACHE_BYTES as u64 || fh.is_none() {
                 return self
                     ._snapshot
                     .read(oid, offset as u64, count as u32)
                     .map_err(snapshot_errno);
             }
+            let fh = fh.unwrap();
             if self.handles[&fh].reader.is_none() {
                 let reader = self._snapshot.open(oid).map_err(snapshot_errno)?;
                 self.handles.get_mut(&fh).ok_or(libc::EBADF)?.reader = Some(reader);
@@ -1253,10 +1286,17 @@ impl Overlay {
             .unwrap_or(&[]))
     }
     pub(crate) fn sync_file(&mut self, ino: u64, fh: u64, datasync: bool) -> FsResult<()> {
+        self.handle(ino, fh)?;
+        self.sync_file_inner(ino, datasync)
+    }
+    pub(crate) fn sync_readonly_file(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
+        self.readonly_file_attributes(ino)?;
+        self.sync_file_inner(ino, datasync)
+    }
+    fn sync_file_inner(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
         #[cfg(feature = "test-metrics")]
         self._snapshot.record_file_sync();
 
-        self.handle(ino, fh)?;
         #[cfg(feature = "test-metrics")]
         if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
             return Err(libc::EIO);
@@ -2122,6 +2162,33 @@ mod tests {
         assert!(fs.handles.is_empty());
         assert!(fs.inode_handles.is_empty());
     }
+    #[test]
+    fn readonly_stateless_reads_reuse_large_objects_without_retaining_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let size = BLOB_CACHE_BYTES + 1;
+        let oid = repo.blob(&vec![b'q'; size]).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("large", oid, 0o100644).unwrap();
+        let tree = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "stateless").unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::None)
+                .unwrap();
+        let ino = fs.lookup_entry(1, OsStr::new("large")).unwrap().ino;
+        for offset in [size - 1, 0, 65536, 0, size - 1] {
+            assert_eq!(fs.read_without_handle(ino, offset as i64, 1).unwrap(), b"q");
+        }
+        let metrics = fs._snapshot.metrics();
+        assert_eq!(metrics.blob_loads, 1);
+        assert_eq!(metrics.active_blob_readers, 0);
+        assert!(metrics.blob_cache_bytes <= BLOB_CACHE_BYTES);
+        assert_eq!(metrics.blob_cache_entries, 1);
+        assert!(fs.handles.is_empty());
+        assert!(fs.inode_handles.is_empty());
+    }
+
     #[test]
     fn idle_open_descriptors_do_not_pin_evicted_payloads() {
         let temp = tempfile::tempdir().unwrap();
