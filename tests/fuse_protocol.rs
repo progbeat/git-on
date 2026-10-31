@@ -768,6 +768,80 @@ fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
 }
 
 #[test]
+fn protocol_overlapping_merged_versions_preserve_issued_cookies() {
+    use std::collections::BTreeSet;
+    for policy in [
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 24);
+        let (ino, file) = p.create("seed.tmp");
+        p.release(ino, file);
+        let mut expected: BTreeSet<Vec<u8>> =
+            [".", "..", ".gitignore", "link", "tracked", "seed.tmp"]
+                .map(|name| name.as_bytes().to_vec())
+                .into_iter()
+                .chain((0..24).map(|index| format!("file-{index:05}").into_bytes()))
+                .collect();
+        let mut versions = Vec::new();
+        for index in 0..8 {
+            let fh = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+            // A rejected/unissued row is not a seek position. Issued cookies,
+            // including rewind and EOF, remain valid on this same handle.
+            p.err(28, 1, io(fh, 7, 48, 0), libc::EINVAL);
+            let prefix = p.ok(28, 1, io(fh, 0, 32, 0));
+            assert_eq!(dirents(&prefix), [(1, b".".to_vec())]);
+            versions.push((fh, prefix, expected.clone()));
+            let name = format!("generation-{index}.tmp");
+            let (ino, file) = p.create(&name);
+            p.release(ino, file);
+            expected.insert(name.into_bytes());
+            if index == 3 {
+                p.ok(10, 1, names(vec![], &["seed.tmp"]));
+                expected.remove(b"seed.tmp".as_slice());
+            }
+            if index == 5 {
+                p.ok(
+                    12,
+                    1,
+                    names(u64s(&[1]), &["generation-0.tmp", "renamed.tmp"]),
+                );
+                expected.remove(b"generation-0.tmp".as_slice());
+                expected.insert(b"renamed.tmp".to_vec());
+            }
+        }
+        for (fh, prefix, expected) in versions.into_iter().rev() {
+            let mut offset = 1;
+            let mut pages = Vec::new();
+            let mut actual = BTreeSet::from([b".".to_vec()]);
+            loop {
+                let page = p.ok(28, 1, io(fh, offset, 48, 0));
+                if page.is_empty() {
+                    break;
+                }
+                let entries = dirents(&page);
+                assert_eq!(entries.len(), 1);
+                assert!(actual.insert(entries[0].1.clone()), "duplicate row");
+                pages.push((offset, page.clone()));
+                offset = entries[0].0 as i64;
+                assert!(
+                    actual.len() <= expected.len(),
+                    "enumeration did not terminate"
+                );
+            }
+            assert_eq!(actual, expected);
+            assert!(p.ok(28, 1, io(fh, offset, 48, 0)).is_empty());
+            assert_eq!(p.ok(28, 1, io(fh, 0, 32, 0)), prefix);
+            for (offset, page) in pages.into_iter().rev() {
+                assert_eq!(p.ok(28, 1, io(fh, offset, 48, 0)), page);
+            }
+            p.ok(29, 1, u64s(&[fh, 0, 0]));
+        }
+    }
+}
+
+#[test]
 fn protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_close() {
     let mut p = Peer::with_policy(WritePolicy::All);
     let old = num(&p.ok(27, 1, u32s(&[0, 0])), 0);

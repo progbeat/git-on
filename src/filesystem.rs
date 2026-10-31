@@ -2,6 +2,9 @@
 //! writable layer. During a mount, user-controlled names never become host
 //! filesystem paths. All execution state is disposable.
 use crate::backend::{FileAttr, FileType, SetAttributes, Statistics, TimeOrNow};
+use crate::directory_view::{
+    Cursor as DirectoryCursor, Rows as DirectoryRows, Version as DirectoryVersion,
+};
 use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
@@ -54,38 +57,7 @@ struct SourceDirectory {
 }
 enum DirectoryEntries {
     Source(usize),
-    Merged(DirectoryRows),
-}
-#[derive(Default)]
-struct DirectoryRows {
-    entries: Vec<(u64, FileType, Arc<OsStr>)>,
-    names: HashMap<Arc<OsStr>, usize>,
-}
-impl DirectoryRows {
-    fn insert(&mut self, ino: u64, kind: FileType, name: Arc<OsStr>) {
-        self.names.insert(name.clone(), self.entries.len());
-        self.entries.push((ino, kind, name));
-    }
-    fn update(&mut self, name: &OsStr, binding: Option<(u64, FileType)>) {
-        match (self.names.get(name).copied(), binding) {
-            (Some(index), Some((ino, kind))) => {
-                self.entries[index].0 = ino;
-                self.entries[index].1 = kind;
-            }
-            (Some(index), None) => {
-                self.names.remove(name);
-                self.entries.swap_remove(index);
-                if let Some((_, _, moved)) = self.entries.get(index) {
-                    *self
-                        .names
-                        .get_mut(moved.as_ref())
-                        .expect("indexed directory row") = index;
-                }
-            }
-            (None, Some((ino, kind))) => self.insert(ino, kind, Arc::from(name)),
-            (None, None) => {}
-        }
-    }
+    Merged(DirectoryVersion),
 }
 struct DirectoryView {
     parent: u64,
@@ -94,12 +66,16 @@ struct DirectoryView {
 struct DirectoryCache {
     valid: bool,
     view: Arc<DirectoryView>,
+    rows: Option<DirectoryRows>,
 }
 struct DirectoryHandle {
     view: Arc<DirectoryView>,
     // Acquire a pin only after a row fits the reply. Replayed cookies do not
     // acquire another pin; unread siblings have no retained reference.
     seen: HashSet<u64>,
+    // Only issued merged-view cookies need cursors. Source views retain direct
+    // array offsets. A cursor owns its immutable version, including on replay.
+    cursors: HashMap<u64, DirectoryCursor>,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -387,6 +363,19 @@ impl Overlay {
             .map(|cached| cached.view.clone());
         let view = if let Some(view) = cached {
             view
+        } else if let Some(cache) = self
+            .directory_cache
+            .get_mut(&ino)
+            .filter(|cache| cache.rows.is_some())
+        {
+            // A moved directory changes '..', not its prepared child list.
+            let view = Arc::new(DirectoryView {
+                parent,
+                entries: DirectoryEntries::Merged(cache.rows.as_ref().unwrap().snapshot()),
+            });
+            cache.view = view.clone();
+            cache.valid = true;
+            view
         } else {
             #[cfg(feature = "test-metrics")]
             let _profile = crate::profile::span("directory_view", 0);
@@ -396,6 +385,7 @@ impl Overlay {
                 .clone()
                 .map(|source| self.source_directory(&source))
                 .transpose()?;
+            let mut rows = None;
             let entries =
                 if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
                     DirectoryEntries::Source(key)
@@ -445,9 +435,11 @@ impl Overlay {
                     }
                     #[cfg(test)]
                     {
-                        self.directory_prepared_rows += entries.entries.len();
+                        self.directory_prepared_rows += entries.len();
                     }
-                    DirectoryEntries::Merged(entries)
+                    let version = entries.snapshot();
+                    rows = Some(entries);
+                    DirectoryEntries::Merged(version)
                 };
             let view = Arc::new(DirectoryView { parent, entries });
             self.directory_cache.insert(
@@ -455,6 +447,7 @@ impl Overlay {
                 DirectoryCache {
                     valid: true,
                     view: view.clone(),
+                    rows,
                 },
             );
             view
@@ -468,6 +461,7 @@ impl Overlay {
             DirectoryHandle {
                 view,
                 seen: HashSet::new(),
+                cursors: HashMap::new(),
             },
         );
         Ok(fh)
@@ -705,18 +699,23 @@ impl Overlay {
                 .get(path)
                 .and_then(|child| self.nodes.get(child).map(|node| (*child, node.attr.kind)));
             if let Some(cache) = self.directory_cache.get_mut(&ino) {
-                // Updating an unshared enumeration cannot change any active
-                // stream's names/cookies. Hash-index just the changed binding;
-                // never walk unrelated source names or upper descendants.
-                if let Some(DirectoryView {
-                    entries: DirectoryEntries::Merged(rows),
-                    ..
-                }) = cache.valid.then(|| Arc::get_mut(&mut cache.view)).flatten()
-                {
-                    rows.update(path.file_name().expect("namespace name"), binding);
+                if let Some(rows) = &mut cache.rows {
+                    if rows.update(path.file_name().expect("namespace name"), binding) {
+                        cache.view = Arc::new(DirectoryView {
+                            parent: cache.view.parent,
+                            entries: DirectoryEntries::Merged(rows.snapshot()),
+                        });
+                        cache.valid = true;
+                    } else {
+                        // A generation wrap freezes the old family. Existing
+                        // versions/cursors remain valid; the next open rebuilds
+                        // current state without an arbitrary repository limit.
+                        cache.rows = None;
+                        cache.valid = false;
+                    }
                 } else {
-                    // A live stream keeps its old snapshot. Retire/rebuild it
-                    // only if a new version is opened, as before.
+                    // Convert a pristine source view once, on its first open
+                    // after namespace changes, rather than at mutation time.
                     cache.valid = false;
                 }
             }
@@ -1445,13 +1444,16 @@ impl Overlay {
             return Err(libc::EINVAL);
         }
         let view = self.directories.get(&fh).ok_or(libc::EBADF)?.view.clone();
+        if let DirectoryEntries::Merged(version) = &view.entries {
+            return self.read_merged_directory(ino, fh, offset, view.parent, version, emit);
+        }
         let source = match &view.entries {
             DirectoryEntries::Source(key) => Some(&self.source_directories[*key]),
             _ => None,
         };
         let length = match &view.entries {
             DirectoryEntries::Source(_) => source.unwrap().tree.len(),
-            DirectoryEntries::Merged(entries) => entries.entries.len(),
+            DirectoryEntries::Merged(_) => unreachable!(),
         }
         .checked_add(2)
         .ok_or(libc::EOVERFLOW)?;
@@ -1468,11 +1470,7 @@ impl Overlay {
                     name,
                 )
             } else {
-                let (child, kind, name) = &match &view.entries {
-                    DirectoryEntries::Merged(entries) => &entries.entries,
-                    _ => unreachable!(),
-                }[index - 2];
-                (*child, *kind, name.as_ref())
+                unreachable!()
             };
             if emit(child, kind, name, index as u64 + 1) {
                 break;
@@ -1487,6 +1485,66 @@ impl Overlay {
             {
                 *self.directory_refs.entry(child).or_default() += 1;
             }
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn read_merged_directory(
+        &mut self,
+        ino: u64,
+        fh: u64,
+        mut offset: u64,
+        parent: u64,
+        version: &DirectoryVersion,
+        mut emit: impl FnMut(u64, FileType, &OsStr, u64) -> bool,
+    ) -> FsResult<()> {
+        let length = u64::try_from(version.len())
+            .map_err(|_| libc::EOVERFLOW)?
+            .checked_add(2)
+            .filter(|length| *length <= i64::MAX as u64)
+            .ok_or(libc::EOVERFLOW)?;
+        if offset >= length {
+            return Ok(());
+        }
+        if offset == 0 {
+            if emit(ino, FileType::Directory, OsStr::new("."), 1) {
+                return Ok(());
+            }
+            offset = 1;
+        }
+        if offset == 1 {
+            if emit(parent, FileType::Directory, OsStr::new(".."), 2) {
+                return Ok(());
+            }
+            offset = 2;
+        }
+        let mut cursor = if offset == 2 {
+            version.cursor()
+        } else {
+            self.directories
+                .get(&fh)
+                .ok_or(libc::EBADF)?
+                .cursors
+                .get(&offset)
+                .cloned()
+                .ok_or(libc::EINVAL)?
+        };
+        while let Some(entry) = cursor.entry() {
+            let child = entry.ino;
+            let cookie = offset + 1;
+            if emit(child, entry.kind, &entry.name, cookie) {
+                break;
+            }
+            cursor.advance();
+            let handle = self.directories.get_mut(&fh).ok_or(libc::EBADF)?;
+            handle
+                .cursors
+                .entry(cookie)
+                .or_insert_with(|| cursor.clone());
+            if handle.seen.insert(child) {
+                *self.directory_refs.entry(child).or_default() += 1;
+            }
+            offset = cookie;
         }
         Ok(())
     }
@@ -2375,6 +2433,21 @@ mod tests {
                     10_001,
                     "namespace edits rescanned the source instead of updating the unshared view"
                 );
+                let before = fs.directory_prepared_rows;
+                let mut overlapping = Vec::new();
+                for index in 0..16 {
+                    file(&mut fs, 1, &format!("overlap-{index}"));
+                    let handle = fs.open_directory(1, libc::O_RDONLY).unwrap();
+                    fs.read_directory(1, handle, 0, |_, _, _, _| true).unwrap();
+                    overlapping.push(handle);
+                }
+                assert_eq!(
+                    fs.directory_prepared_rows, before,
+                    "overlapping enumeration versions recopied unrelated names"
+                );
+                for handle in overlapping {
+                    fs.close_handle(1, handle);
+                }
             }
         }
     }

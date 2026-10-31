@@ -1127,8 +1127,9 @@ def read_prefix(stream):
             assert os.lstat(b'out/paged/'+name).st_ino==ino,(name,ino)
         rows.append((name,ino))
     return rows
-for _ in range(16):
-    changing=Path('out/paged/changing.tmp')
+versions=[]
+for generation in range(8):
+    changing=Path('out/paged/changing-%d.tmp' % generation)
     changing.write_bytes(b'new generation')
     first=libc.opendir(b'out/paged');second=libc.opendir(b'out/paged')
     assert first and second,ctypes.get_errno()
@@ -1137,10 +1138,38 @@ for _ in range(16):
         assert read_prefix(second)==prefix
         libc.seekdir(first,0)
         assert read_prefix(first)==prefix
+        # Keep one partly consumed stream across subsequent mutations. There
+        # are enough long names to leave unrequested FUSE pages, not just a
+        # suffix already buffered by libc. Each stream retains its own names.
+        versions.append((first,prefix,libc.telldir(first),changing.name.encode()))
+        first=None
     finally:
-        assert libc.closedir(first)==0
+        if first:
+            assert libc.closedir(first)==0
         assert libc.closedir(second)==0
     changing.unlink()
+for stream,prefix,cookie,extra in reversed(versions):
+    try:
+        suffix=[]
+        while True:
+            ctypes.set_errno(0)
+            entry=libc.readdir64(stream)
+            if not entry:
+                assert ctypes.get_errno()==0,ctypes.get_errno()
+                break
+            suffix.append((bytes(entry.contents.name),entry.contents.ino))
+        complete=prefix+suffix
+        wanted=expected|{extra}
+        assert len(complete)==len(wanted) and {name for name,_ in complete}==wanted
+        libc.seekdir(stream,cookie)
+        replay=[]
+        while (entry:=libc.readdir64(stream)):
+            replay.append((bytes(entry.contents.name),entry.contents.ino))
+        assert replay==suffix
+        libc.rewinddir(stream)
+        assert read_prefix(stream)==prefix
+    finally:
+        assert libc.closedir(stream)==0
 assert set(os.listdir(b'out/paged'))==expected-{b'.',b'..'}
 ''')
         self.assert_success(result)

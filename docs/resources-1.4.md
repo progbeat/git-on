@@ -666,27 +666,84 @@ when a newer stream returned a late file, the file was deleted, and that stream
 closed while an older stream stayed open. Per-handle returned-entry pins replace
 that grouping; binding clocks and source-parent bookkeeping were removed.
 
-When the cached merged view has no active stream, namespace changes update only
-the named binding through its expected-O(1) hash index. Deletion swap-removes a
-row and updates the moved row's index; no live stream can observe this reorder.
-Names share Arc storage with the verified source tree rather than duplicating
-source strings. A mutation/reopen regression at `f92df94` prepared 160,016 rows
-for 16 partial opens in a 10,000-name source directory. The incremental path
-prepares 10,001 rows once, then updates the changed binding without rescanning
-the source or upper descendants. A retained older version does not prevent
-updating a newer unshared cached version.
+The first incremental implementation updated an unshared merged vector by name
+but rebuilt it when an active stream held the current version. Holding 16
+successive versions reproduced 160,151 prepared rows instead of the original
+10,001 at `c8b1117`. This is O(qD) preparation for q overlapping versions of a
+D-entry directory, even when each stream requests only a dot entry.
 
-If a stream still holds the current view, a namespace change invalidates that
-cached version without immediately dropping it. The next open builds a new
-version, preserving the old Arc's names/cookies. Repeated overlapping versions
-can therefore still require directory/prefix work; this does not prove the
-complete overhead contract for arbitrary mutation sequences. No extra B-tree,
+Merged views now use a partially persistent linked enumeration. A name hash
+index and an arena of current predecessor indices locate an edit without
+walking the directory. Each immutable row has one versioned next-link slot.
+An empty slot accepts a change; a full slot causes that row to be copied and
+the pointer change to propagate to its current predecessor. Filling an empty
+slot increases the number of full slots in the current list by one. Copying a
+full slot decreases that potential by one. Each edit creates at most one
+replacement payload row and fills at most one empty slot, so propagation and
+allocation are amortized O(1) per edit. Hash lookup is expected O(1), with name
+hashing/comparison charged by name bytes. Initial merged preparation remains
+O(D); immutable source views continue to use the shared parsed array directly.
+
+Opening a version retains its head, generation and length in O(1). Iteration
+follows one selected next link per returned row. A handle remembers cursors for
+its issued cookies, so replay and resume do not scan earlier rows. Names share
+Arc storage with the verified source tree. The
+[libfuse readdir contract](https://libfuse.github.io/doxygen/structfuse__lowlevel__ops.html)
+requires a nonzero cookie to come from a previous reply on that same handle;
+an unissued interior cookie on a merged stream returns EINVAL. Valid cookies,
+rewind, EOF, dot entries and stable inode identities remain supported. No
+numeric ranking of arbitrary unissued merged cookies is promised.
+
+Only modified rows enter an ordered reclamation queue. Live versions register
+in generation order with O(1) removal; cursors retain their version. Closing an
+old version makes obsolete links eligible for reclamation without scanning
+untouched entries or all other handles. Each queue item is processed once and
+each allocated row is destroyed once, using iterative destruction rather than
+recursion through a large directory. Retained metadata is O(D + edits still
+needed by active old versions + distinct issued cursors), plus names and
+container capacity at the high-water mark. It is outside the payload LRU;
+unreturned rows still acquire no inode lifetime pin or file descriptor.
+Reclamation work is amortized over initial preparation and those edits/reads.
+The u64 generation-wrap path freezes existing versions and rebuilds only the
+current family on a later open; it does not invalidate active streams.
+
+The focused overlap regression now prepares 10,001 rows once, then zero extra
+whole-directory rows. Allocation-bound tests retain 257 versions of a
+10,000-name directory: 256 replacements create 511 extra records, rather than
+256 whole directories. Retiring those versions leaves exactly 10,000 current
+records; dropping the owner releases all of them. Randomized small models check
+insertion, replacement, deletion, slot reuse and arbitrary version retirement.
+Concurrent cursors, owner destruction and small-stack cleanup have separate checks. No B-tree,
 disk index, cache daemon or global storage is introduced.
+
+A same-host release component comparison against `c8b1117` uses five trials
+per case on one CPU, with 100/1,000/10,000 names and 16/64 edits. The host is an
+Intel Xeon Platinum 8573C, x86_64 Linux 6.18.57, Rust 1.99.0;
+temporary fixture/backing paths use the host overlay filesystem. Source fixture
+creation is excluded; initial merged preparation, mutation/open, full newest
+enumeration, version retirement and owner cleanup are timed separately. No
+mount or complete materialize-plus-command baseline is implied. The two binary
+variants ran in blocks with uncontrolled OS caches. For 10,000 names/64 edits:
+
+| Component | Before median (range), ms | After median (range), ms |
+| --- | ---: | ---: |
+| Initial merged view | 2.287 (2.091–5.125) | 3.253 (2.889–4.755) |
+| Edits and overlapping opens | 562.765 (485.812–897.216) | 0.573 (0.430–1.989) |
+| One full newest enumeration | 1.345 (0.930–3.454) | 2.925 (1.992–5.970) |
+| Closing all streams | 15.819 (12.047–22.765) | 1.789 (1.233–12.796) |
+| Owner cleanup | 3.567 (2.073–6.037) | 2.507 (1.971–6.542) |
+
+Extra prepared rows are 642,144 before and zero after. The new version links
+and issued-cookie cursors add constant work to merged enumeration; this is a
+measured tradeoff, not an across-the-board throughput improvement. The unchanged
+immutable source-array path does not use these records. Complete WebKit costs,
+raw I/O and requester/protocol overhead remain separate acceptance work.
 
 Protocol tests exercise small replies, offset replay, independent streams,
 lookup/forget identity and namespace replacement. The existing mounted mixed
-pagination fixture now also exercises repeated partial streams and inode
-identity, without adding another large fixture. Full WebKit diagnostics record
+pagination fixture also keeps partially read merged streams across mutations,
+checks their complete old name sets and seekdir replay, and verifies inode
+identity without adding another large fixture. Full WebKit diagnostics record
 opendir/readdir/releasedir and view-building spans; local /dev/fuse is absent,
 so local skips are not mounted evidence. Performance acceptance remains open.
 
