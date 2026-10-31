@@ -719,8 +719,9 @@ disk index, cache daemon or global storage is introduced.
 A same-host release component comparison against `c8b1117` uses five trials
 per case on one CPU, with 100/1,000/10,000 names and 16/64 edits. The host is an
 Intel Xeon Platinum 8573C, x86_64 Linux 6.18.57, Rust 1.99.0;
-temporary fixture/backing paths use the host overlay filesystem. Source fixture
-creation is excluded; initial merged preparation, mutation/open, full newest
+the default temporary fixture/backing paths use system `/tmp` (tmpfs in this
+executor). This was a namespace/CPU component, not a disk throughput test.
+Fixture/Snapshot/Overlay setup and seed creation are excluded; initial merged preparation, mutation/open, full newest
 enumeration, version retirement and owner cleanup are timed separately. No
 mount or complete materialize-plus-command baseline is implied. The two binary
 variants ran in blocks with uncontrolled OS caches. For 10,000 names/64 edits:
@@ -776,3 +777,62 @@ the change, versus 40 fixture reads and 15 positional polling reads afterward.
 All 15 requester polls remain. This isolates removed syscalls; it does not
 predict the complete workload's latency. Full production-path measurements,
 subprocess resources and cleanup remain required for performance acceptance.
+
+### Instrumentation attribution and already verified native buffers
+
+The `76c836d` full diagnostic enabled 11,960,381 inclusive spans. Replaying that
+exact name/count mix through the same release `profile.rs` implementation on
+one Xeon 8573C CPU took 1.369 s median (1.329–1.369 s), versus 0.020 s with spans
+disabled and a 0.010 s loop control. This is single-thread calibration on that
+host, not a claim about all clock sources or actual FUSE contention. The full
+run's two mincore snapshots themselves totalled 56.5 ms; per-entry reservoir
+selection and external process sampling are separate work. Neither calibration
+alone measures the complete ordinary-binary WebKit latency.
+
+The bounded six-mode attribution helper compares ordinary release, ordinary
+with the RSS/waited-peak observer, metrics without reporting, metrics reporting,
+metrics plus spans, and metrics plus spans/observer. It uses one complete packed
+source of 512 distinct 64 KiB blobs, with 128/512-file two-pass demands, three
+trials and shuffled variant order. Every result checks exact bytes, metadata,
+source refs and invocation cleanup. Baseline is a fresh local shared clone,
+the same command, and cleanup, explicitly shared by variants in that trial.
+Temporary source, backing and clones use an explicit disk-backed TMPDIR; caches
+remain uncontrolled and no cache flush/advice is used. A 25 s TERM / 30 s KILL
+timeout wrapper is included for both runner and baseline commands. These are
+bounded diagnostics, not WebKit or a timing SLA. Local materialized results
+overlap substantially; they cannot establish a precise instrumentation penalty
+for FUSE. The real-FUSE CI diagnostic reuses its two existing builds, adding no
+second full WebKit run. Parent observer CPU is reported separately.
+
+A confirmed production cost is duplicate verification of packed payloads.
+[libgit2 1.9.7](https://github.com/libgit2/libgit2/blob/v1.9.7/src/libgit2/odb.c#L1375-L1382)
+verifies a complete canonical object before returning its owned ODB buffer;
+the [pinned vendored build](https://github.com/rust-lang/git2-rs/blob/6c93812dbc1c34aef6e6464a645545b4a4299807/libgit2-sys/build.rs#L271-L278)
+uses collision-detecting SHA1DC. The old raw importer then hashed those same
+bytes again in Rust, through another 64 KiB intermediate buffer. A 256 KiB
+regression records 262,144 repeated canonical-hash bytes before the fix and zero
+after. Loose streams still verify their full payload independently.
+
+The CLI startup policy explicitly enables strict native verification before Git
+work/threads. Reuse is limited to the audited vendored git2 0.20.4 / libgit2 1.9.7
+combination. Unknown builds and embeddings that do not establish that policy
+keep the previous Rust check. No native verification is disabled. Only a typed
+owned ODB blob with matching OID/type enters this path; arbitrary streams cannot
+request it. Copies remain cancellable in 64 KiB chunks. Trusted block hashes
+are formed from that same buffer before raw publication; disk reload still
+checks the exact served owned buffer. A valid pack with a forged index mapping
+OID A to payload B fails before publication. An isolated embedding fault test
+disables its dependency's check and proves that the independent Rust path still
+rejects B. Corrupting raw bytes after native import also fails authentication.
+
+Five shuffled paired ordinary-binary materialization trials on one Xeon CPU,
+Linux 6.18.57/Rust 1.99, explicit overlay-backed TMPDIR and the same 32 MiB
+packed source give 837.237 ms (753.001–984.273) before versus 688.803 ms
+(579.749–699.499) after: 17.7% lower median full invocation. Median waited user
+CPU is 0.592 → 0.438 s; system CPU 0.242 → 0.193 s. Complete native baseline is
+436.363 ms (380.885–451.536), so this does not complete performance acceptance.
+This is explicit-all materialization on a host without FUSE, not an estimate of
+the full readonly WebKit gain. Native verification cost is inside the existing
+`local_pack_decode` span; `object_preverified_copy` labels its subsequent copy,
+while `object_verify_copy` retains its streaming/Rust meaning. Evidence checks
+require either labelled path and coverage of the loaded payload bytes.

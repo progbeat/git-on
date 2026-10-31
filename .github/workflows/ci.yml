@@ -154,7 +154,16 @@ jobs:
       - name: All four write policies on real FUSE
         run: python3 tests/write_policy.py --binary target/release/git-on --require-fuse
       - name: Build private resource instrumentation
-        run: cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+        run: |
+          cp target/release/git-on target/release/git-on-plain
+          cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+      - name: Attribute instrumentation on the same real FUSE host
+        if: needs.changes.outputs.resources == 'true'
+        # Reuse both binaries already built above. This bounded diagnostic
+        # has no timing SLA and adds no second complete WebKit traversal.
+        run: |
+          profile_cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+          taskset -c "$profile_cpu" python3 tests/instrumentation_profile.py --checkout . --plain target/release/git-on-plain --metrics target/release/git-on --backend fuse --counts 128,512 --trials 3 --work "$RUNNER_TEMP/instrumentation-attribution" --output instrumentation-profile.jsonl
       - name: Separate invocation setup from increasing same-mount demand
         if: needs.changes.outputs.resources == 'true'
         run: |
@@ -190,6 +199,7 @@ jobs:
             metadata-profile-local.jsonl
             metadata-profile-remote.jsonl
             startup-profile.jsonl
+            instrumentation-profile.jsonl
             callback-profile.jsonl
           if-no-files-found: error
 

@@ -224,6 +224,21 @@ time.sleep(30)
                     runner_timeline=[dict(phase=p,monotonic_ns=i+1) for i,p in enumerate(PHASES)]),
                 profile_spans_enabled=False,transfer_evidence=transfer))
         validate_reports(data,'c'*40,pin)
+        profiled=copy.deepcopy(data);row=profiled[2]
+        row['profile_spans_enabled']=True
+        for observation in row['runner']['command_observations']+row['baseline']['direct_command']['command_observations']:
+            observation['diagnostic_cache']=dict(samples=[dict(generated_parser_input=True)])
+        row['runner']['metrics']['blob_bytes']=1024
+        spans={name:dict(calls=1,elapsed_ns=1,bytes=0) for name in
+            ('fuse_lookup','fuse_open','fuse_read','raw_range','raw_disk_read','raw_block_hash','raw_file_open','local_pack_decode','raw_small_spill')}
+        row['runner']['metrics']['profile_spans']=spans
+        for category in ('object_verify_copy','object_preverified_copy'):
+            spans[category]=dict(calls=1,elapsed_ns=1,bytes=1024)
+            validate_reports(profiled,'c'*40,pin)
+            spans[category]['bytes']-=1
+            with self.assertRaises(ValueError):validate_reports(profiled,'c'*40,pin)
+            del spans[category]
+        with self.assertRaises(ValueError):validate_reports(profiled,'c'*40,pin)
         partial=copy.deepcopy(data)
         partial[2]['runner']=copy.deepcopy(partial[2]['runner'])
         partial[2]['runner']['memory']['unavailable']=True

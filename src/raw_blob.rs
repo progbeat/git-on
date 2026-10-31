@@ -396,7 +396,22 @@ impl RawBlobs {
         input: impl Read,
         _directory: &Path,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, size, input, true)
+        self.insert_blob(oid, size, true, |output| {
+            crate::object::copy_verified(input, output, ObjectType::Blob, size, oid)
+        })
+    }
+    pub(crate) fn insert_odb_blob(
+        &mut self,
+        oid: Oid,
+        object: &git2::OdbObject<'_>,
+    ) -> Result<RawBlob> {
+        anyhow::ensure!(
+            object.id() == oid && object.kind() == ObjectType::Blob,
+            "ODB object identity/type changed before raw import"
+        );
+        self.insert_blob(oid, object.len(), true, |output| {
+            crate::object::copy_odb_blob(object, output)
+        })
     }
     pub(crate) fn insert_fetched(
         &mut self,
@@ -405,14 +420,16 @@ impl RawBlobs {
         input: impl Read,
         _directory: &Path,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, size, input, false)
+        self.insert_blob(oid, size, false, |output| {
+            crate::object::copy_verified(input, output, ObjectType::Blob, size, oid)
+        })
     }
     fn insert_blob(
         &mut self,
         oid: Oid,
         size: usize,
-        input: impl Read,
         used: bool,
+        transfer: impl FnOnce(&mut dyn Write) -> Result<()>,
     ) -> Result<RawBlob> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(object) = store.objects.get(&oid) {
@@ -425,7 +442,7 @@ impl RawBlobs {
         let resident = size <= BLOCK && weight.is_some_and(|weight| weight <= store.memory_limit);
         let (digests, buffers) = if resident {
             let mut output = Blocks::new(Vec::with_capacity(size));
-            crate::object::copy_verified(input, &mut output, ObjectType::Blob, size, oid)?;
+            transfer(&mut output)?;
             let (chunks, digests) = output.finish();
             let buffers = if chunks.is_empty() {
                 Vec::new()
@@ -436,7 +453,7 @@ impl RawBlobs {
         } else {
             let mut pending = store.directory.pending()?;
             let mut output = Blocks::new(&mut pending.file);
-            crate::object::copy_verified(input, &mut output, ObjectType::Blob, size, oid)?;
+            transfer(&mut output)?;
             let (_, digests) = output.finish();
             pending.commit(oid)?;
             (digests, Vec::new())

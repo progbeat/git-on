@@ -3,7 +3,40 @@
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+// Enabled only by the single-threaded CLI startup policy, and only for the
+// audited vendored backend. An embedding that does not establish that policy
+// keeps the original Rust verification path.
+static NATIVE_OID_VERIFICATION: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static HASH_PROBE: std::cell::Cell<Option<(Oid, usize)>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct HashProbe;
+#[cfg(test)]
+impl HashProbe {
+    pub(crate) fn start(oid: Oid) -> Self {
+        HASH_PROBE.with(|probe| {
+            assert!(probe.replace(Some((oid, 0))).is_none());
+        });
+        Self
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        HASH_PROBE.with(|probe| probe.get().expect("active hash probe").1)
+    }
+}
+#[cfg(test)]
+impl Drop for HashProbe {
+    fn drop(&mut self) {
+        HASH_PROBE.with(|probe| probe.set(None));
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct InvalidObject(pub String);
@@ -62,6 +95,14 @@ pub(crate) fn copy_verified(
             return Err(InvalidObject(format!("truncated Git object {oid}")).into());
         }
         hash.update(&buffer[..count]);
+        #[cfg(test)]
+        HASH_PROBE.with(|probe| {
+            if let Some((tracked, bytes)) = probe.get() {
+                if tracked == oid {
+                    probe.set(Some((tracked, bytes + count)));
+                }
+            }
+        });
         output
             .write_all(&buffer[..count])
             .context("write Git object stream")?;
@@ -77,9 +118,40 @@ pub(crate) fn copy_verified(
     Ok(())
 }
 
+/// The owned ODB buffer was verified before libgit2 returned it. Only the
+/// audited startup policy establishes that fact; arbitrary streams never use
+/// this route. Block digests are still formed from these same copied bytes.
+pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write) -> Result<()> {
+    anyhow::ensure!(
+        object.kind() == ObjectType::Blob,
+        "ODB object is not a blob"
+    );
+    if !NATIVE_OID_VERIFICATION.load(Ordering::Acquire) {
+        return copy_verified(
+            object.data(),
+            output,
+            ObjectType::Blob,
+            object.len(),
+            object.id(),
+        );
+    }
+    #[cfg(feature = "test-metrics")]
+    let _profile = crate::profile::span("object_preverified_copy", object.len() as u64);
+    for bytes in object.data().chunks(64 * 1024) {
+        check_transfer()?;
+        output
+            .write_all(bytes)
+            .context("copy verified ODB buffer")?;
+    }
+    check_transfer()
+}
+
 /// # Safety
 /// Call once at process startup, before spawning threads or using libgit2.
 /// These options modify libgit2 C globals without synchronization.
+/// Do not disable strict hash verification afterwards. Embeddings calling
+/// this initializer must preserve its policy; without it the importer keeps
+/// independent Rust verification.
 pub unsafe fn configure_pack_descriptors() -> Result<usize> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
@@ -99,6 +171,18 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
         git2::opts::set_mwindow_size(8 * 1024 * 1024)?;
         git2::opts::set_mwindow_mapped_limit(16 * 1024 * 1024)?;
     }
+    // git_odb_read verifies the complete canonical object before publication
+    // (libgit2 1.9.7 odb.c:1375). The pinned vendored build uses SHA1DC and
+    // rejects detected collisions. Never infer the same guarantee from an
+    // unknown system build or future dependency version.
+    git2::opts::strict_hash_verification(true);
+    let version = git2::Version::get();
+    NATIVE_OID_VERIFICATION.store(
+        version.vendored()
+            && version.libgit2_version() == (1, 9, 7)
+            && version.crate_version() == "0.20.4",
+        Ordering::Release,
+    );
     Ok(budget)
 }
 

@@ -489,10 +489,7 @@ impl State {
                     object.kind() == ObjectType::Blob && object.len() == size,
                     "Git blob changed during transfer"
                 );
-                (
-                    raw.insert(oid, size, object.data(), &self.spool_directory)?,
-                    false,
-                )
+                (raw.insert_odb_blob(oid, &object)?, false)
             };
             self.metrics.blob_loads += 1;
             self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
@@ -1006,6 +1003,186 @@ mod tests {
         )
         .unwrap();
         (tmp, oid)
+    }
+    #[test]
+    fn packed_blob_does_not_repeat_a_native_verified_oid_pass() {
+        if std::env::var_os("GIT_ON_NATIVE_VERIFIED_CHILD").is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot::tests::packed_blob_does_not_repeat_a_native_verified_oid_pass",
+                    "--nocapture",
+                ])
+                .env("GIT_ON_NATIVE_VERIFIED_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        // Only this isolated test process uses libgit2. Set process-wide
+        // policy before opening any repository or starting Git work.
+        unsafe { crate::object::configure_pack_descriptors() }.unwrap();
+        let (tmp, _) = fixture();
+        let (oid, tree) = {
+            let repo = Repository::open(tmp.path()).unwrap();
+            let oid = repo.blob(&vec![b'z'; 256 * 1024]).unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert("large", oid, 0o100644).unwrap();
+            let tree = builder.write().unwrap();
+            repo.reference("refs/tests/native-verified", tree, true, "fixture")
+                .unwrap();
+            (oid, tree)
+        };
+        assert!(std::process::Command::new("git")
+            .args(["repack", "-a", "-d", "--window=0"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let snapshot =
+            Snapshot::load(tmp.path(), OsStr::new(&tree.to_string()), "native-verified").unwrap();
+        let probe = crate::object::HashProbe::start(oid);
+        assert_eq!(snapshot.read(oid, 0, 129).unwrap(), vec![b'z'; 129]);
+        assert_eq!(snapshot.read(oid, 128_000, 129).unwrap(), vec![b'z'; 129]);
+        assert_eq!(snapshot.metrics().blob_loads, 1);
+        assert_eq!(
+            probe.bytes(),
+            0,
+            "already native-verified packed bytes were hashed against their OID again"
+        );
+        drop(probe);
+        let loose = vec![b'l'; 128 * 1024];
+        let loose_oid = Repository::open(tmp.path()).unwrap().blob(&loose).unwrap();
+        let probe = crate::object::HashProbe::start(loose_oid);
+        assert_eq!(snapshot.read(loose_oid, 0, 129).unwrap(), vec![b'l'; 129]);
+        assert_eq!(
+            probe.bytes(),
+            loose.len(),
+            "a stream skipped its OID verification"
+        );
+        // Native verification only authenticates the owned import buffer.
+        // A later disk read must still reject changed bytes against its
+        // trusted block digests, even when the original OID was checked in C.
+        let raw = snapshot
+            .state()
+            .unwrap()
+            .raw_blobs
+            .as_ref()
+            .unwrap()
+            .get(oid)
+            .unwrap()
+            .unwrap();
+        raw.corrupt_for_test().unwrap();
+        assert!(snapshot.read(oid, 0, 1).is_err());
+    }
+    #[test]
+    fn corrupt_packed_oid_is_rejected_with_native_or_embedding_verification() {
+        let mode = std::env::var("GIT_ON_NATIVE_CORRUPT_CHILD").ok();
+        if mode.is_none() {
+            for mode in ["native", "embedding"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "snapshot::tests::corrupt_packed_oid_is_rejected_with_native_or_embedding_verification",
+                        "--nocapture",
+                    ])
+                    .env("GIT_ON_NATIVE_CORRUPT_CHILD", mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{mode}: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        }
+        let native = mode.as_deref() == Some("native");
+        if native {
+            unsafe { crate::object::configure_pack_descriptors() }.unwrap();
+        } else {
+            // Fault injection in this isolated process only: an embedding
+            // without CLI policy must retain the full Rust OID check even
+            // when its dependency does not verify a returned ODB buffer.
+            git2::opts::strict_hash_verification(false);
+        }
+        use sha1_checked::{Digest, Sha1};
+        use std::io::Write;
+        let (tmp, _) = fixture();
+        let wanted = vec![b'a'; 256 * 1024];
+        let actual = vec![b'b'; wanted.len()];
+        let repo = Repository::open(tmp.path()).unwrap();
+        let oid = repo.blob(&wanted).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("file", oid, 0o100644).unwrap();
+        let tree = builder.write().unwrap();
+        let objects = repo.path().join("objects");
+        std::fs::remove_file(
+            objects
+                .join(&oid.to_string()[..2])
+                .join(&oid.to_string()[2..]),
+        )
+        .unwrap();
+        // A valid one-object pack/CRC/checksum containing B, with an index
+        // claiming its ID is A. Inflation and header checks alone accept it.
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        let mut size = actual.len();
+        let mut byte = 0x30 | (size as u8 & 15);
+        size >>= 4;
+        while size != 0 {
+            pack.push(byte | 128);
+            byte = size as u8 & 127;
+            size >>= 7;
+        }
+        pack.push(byte);
+        let mut compressed =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressed.write_all(&actual).unwrap();
+        pack.extend(compressed.finish().unwrap());
+        let checksum = crate::object::finish_sha1(Sha1::new().chain_update(&pack)).unwrap();
+        pack.extend(checksum);
+        let mut child = std::process::Command::new("git")
+            .args(["-c", "pack.indexVersion=2", "index-pack", "--stdin"])
+            .current_dir(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&pack).unwrap();
+        assert!(child.wait().unwrap().success());
+        let index = objects
+            .join("pack")
+            .join(format!("pack-{}.idx", Oid::from_bytes(&checksum).unwrap()));
+        let mut bytes = std::fs::read(&index).unwrap();
+        assert_eq!(bytes.len(), 1100);
+        assert_eq!(&bytes[..8], b"\xfftOc\0\0\0\x02");
+        for bucket in 0..256 {
+            bytes[8 + bucket * 4..12 + bucket * 4]
+                .copy_from_slice(&u32::from(bucket >= oid.as_bytes()[0] as usize).to_be_bytes());
+        }
+        bytes[1032..1052].copy_from_slice(oid.as_bytes());
+        let checksum =
+            crate::object::finish_sha1(Sha1::new().chain_update(&bytes[..1080])).unwrap();
+        bytes[1080..].copy_from_slice(&checksum);
+        let replacement = index.with_extension("replacement");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(replacement, index).unwrap();
+        drop(builder);
+        drop(repo);
+        let snapshot =
+            Snapshot::load(tmp.path(), OsStr::new(&tree.to_string()), "native-corrupt").unwrap();
+        let probe = crate::object::HashProbe::start(oid);
+        let error = snapshot.read(oid, 0, 1).unwrap_err();
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
+        assert_eq!(probe.bytes(), if native { 0 } else { actual.len() });
+        assert_eq!(snapshot.metrics().blob_loads, 0);
+        assert_eq!(snapshot.metrics().retained_raw_blob_bytes, 0);
     }
     #[test]
     fn reads_objects_modes_links_and_cleans_pin() {

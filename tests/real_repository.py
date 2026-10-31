@@ -410,9 +410,18 @@ def validate_reports(data, head, pin=PIN, trials=3):
         if row['profile_spans_enabled']:
             if any(not r.get('diagnostic_cache',{}).get('samples') for r in observed+direct):raise ValueError('missing cache residency diagnosis')
             spans=m.get('profile_spans',{})
-            for name in ('fuse_lookup','fuse_open','fuse_read','raw_range','raw_disk_read','raw_block_hash','raw_file_open','local_pack_decode','object_verify_copy','raw_small_spill'):
+            for name in ('fuse_lookup','fuse_open','fuse_read','raw_range','raw_disk_read','raw_block_hash','raw_file_open','local_pack_decode','raw_small_spill'):
                 if not full or row['source']!='local' or any(type(spans.get(name,{}).get(k)) is not int or spans[name][k]<=0 for k in ('calls','elapsed_ns')):
                     raise ValueError('missing full-read profiling category: '+name)
+            # A complete native ODB read already includes canonical SHA1DC
+            # verification in local_pack_decode. Its copy is labelled apart
+            # from unverified streams that still hash in Rust; expose either
+            # cost without demanding a redundant canonical pass.
+            copies=[spans[name] for name in ('object_verify_copy','object_preverified_copy') if name in spans]
+            if (not copies or any(type(span.get(k)) is not int or span[k]<=0 for span in copies for k in ('calls','elapsed_ns'))
+                or any(type(span.get('bytes')) is not int or span['bytes']<0 for span in copies)
+                or sum(span['bytes'] for span in copies)<m.get('blob_bytes',0)):
+                raise ValueError('missing/incomplete verified object copy profiling')
         if (full and m['blob_loads']!=counts['nonempty_unique_blob_objects']) or not 0<m['blob_loads']<=counts['nonempty_unique_blob_objects'] or m['fuse_requests'].get('read',0)<=0:
             raise ValueError('repeated decode or missing real FUSE execution')
         transfer=row.get('transfer_evidence',{})
