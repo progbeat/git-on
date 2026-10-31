@@ -27,15 +27,6 @@ pub(crate) const BLOCK: usize = 64 * 1024;
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
-// The verified FUSE view already has a page cache. Backing reads should not
-// promote duplicate raw pages. NOREUSE is advisory and older/unsupported
-// kernels may ignore it; it neither changes contents nor starts writeback.
-#[cfg(target_os = "linux")]
-fn prefer_view_cache(file: &File) {
-    #[cfg(feature = "test-metrics")]
-    let _profile = crate::profile::span("raw_cache_advice", 0);
-    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_NOREUSE) };
-}
 struct Descriptor {
     size: u64,
     blocks: Box<[[u8; 32]]>,
@@ -259,10 +250,6 @@ impl RawDirectory {
             file.metadata()?.len() == size,
             "verified raw blob length was modified"
         );
-        #[cfg(target_os = "linux")]
-        if !write {
-            prefer_view_cache(&file);
-        }
         Ok(file)
     }
     fn pending(&self) -> Result<Pending<'_>> {

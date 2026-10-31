@@ -591,17 +591,22 @@ waited block input and decoded every nonempty unique blob only once.
 
 All sampled direct-copy pages remained resident. The FUSE view retained fewer
 sampled pages while prepared raw copies also occupied cache; the invocation's
-file cache approached 13.7 GB. This motivates testing Linux NOREUSE on backing reads. DONTNEED is not used:
-Linux's implementation can initiate asynchronous writeback, which is additional
-I/O even without a durability barrier. NOREUSE never changes data, forces
-durability, explicitly drops unread ranges, or bypasses the owned-buffer check. Unsupported kernels/filesystems may ignore it.
-The local host did not discard a controlled clean-file range, so its focused
-page-retention test is explicitly unavailable rather than red/green evidence.
-A separate loader syscall regression checks that the raw read path actually
-requests NOREUSE while preserving bytes and one-time decoding; it does not
-claim the host honors that advice. Full-workload CI measurements are required
-before claiming this optimization effective. Context-switch and page-fault observations accompany
-the next full-path diagnostic; all work and cleanup remain counted.
+file cache approached 13.7 GB. A subsequent Linux NOREUSE experiment requested
+lower backing-page retention without discarding data or initiating explicit
+writeback. Its syscall regression passed, but the real workload did not show a
+reduction in raw disk-read work or physical input. The hint and its advice-only
+test were therefore removed from the final code. DONTNEED was not used because
+Linux's implementation may initiate asynchronous writeback.
+
+CI at `ea351f1` passed all 14 applicable jobs. The full diagnostic took 460.35 s
+against a 163.71 s complete baseline on a different 4-vCPU EPYC 9V74 host;
+its 177.52/208.49 s command passes compare with direct 14.07/11.78 s. Cross-host
+elapsed changes cannot establish causality. Raw disk reads still requested
+9.446 GB in 544,495 calls (previously 9.442 GB / 544,430), with 5.602 GB physical
+input (previously 5.688 GB). Inclusive requester checks fell from 30.74 s to
+27.98 s despite higher pack-decode/lookup times on this host; the paired local
+syscall observation below isolates allocation reuse more reliably. All source
+decoding, subprocess work and cleanup remain included; #20 is not complete.
 
 Requester checks continue reading the current task status on every poll, but
 reuse a thread-local scratch allocation instead of repeatedly growing an empty

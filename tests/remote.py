@@ -1771,26 +1771,6 @@ os.execv(native,[native,*args])
         f.finish(process)
         print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
 
-    @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux loader cache-advice observation')
-    def test_raw_backing_reads_request_noreuse_without_changing_bytes(self):
-        f=self.f;f.cwd=f.repo;block=64*1024;payload=b'v'*(2*block)
-        blob=f.git('hash-object','-w','--stdin',data=payload)
-        tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
-        commit=f.git('commit-tree',tree,data=b'raw page cache fixture\n');f.git('update-ref','refs/heads/main',commit)
-        trace=f.root/'raw-cache.trace'
-        process=subprocess.Popen(['strace','-qq','-yy','-e','trace=fadvise64','-o',str(trace),str(OPTIONS.probe),'local','HEAD','--metrics-only'],
-            cwd=f.cwd,env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-        f.children.append(process);f.line(process)
-        for offset in (0,block,0):
-            value,report=f.operation(process,f'range {offset} 1 file')
-            self.assertEqual(value['bytes'],[ord('v')])
-        self.assertEqual(report['metrics']['blob_loads'],1,'cache advice decoded the source again')
-        f.finish(process)
-        calls=[line for line in trace.read_text().splitlines() if '/raw-objects-' in line]
-        self.assertEqual(sum('POSIX_FADV_NOREUSE' in line for line in calls),3,'prepared backing reads did not request NOREUSE')
-        self.assertFalse(any('POSIX_FADV_DONTNEED' in line for line in calls),'raw reads initiated discard/writeback')
-        print('raw cache advice evidence:',json.dumps(dict(calls=calls,blob_loads=1,scope='loader-only syscall regression; not total overhead or a guarantee the host honors advice')),flush=True)
-
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
     def test_first_large_loose_range_streams_without_retaining_full_payload(self):
         f=self.f
