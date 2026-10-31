@@ -1,0 +1,67 @@
+name: Bounded FUSE profile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Manual diagnostic only. This does not modify or replace required PR checks.
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUBJECT_REVISION: 5f7abb436c28e9851c2cae192e4126fceb7d3d19
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - name: Check out diagnostic driver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: diagnostics
+          persist-credentials: false
+      - name: Check out the exact profiling subject
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 5f7abb436c28e9851c2cae192e4126fceb7d3d19
+          path: subject
+          persist-credentials: false
+      - name: Require existing host tools and FUSE
+        run: |
+          mkdir -p evidence
+          test -c /dev/fuse
+          for tool in fusermount3 strace taskset nice ionice python3 git cc cargo rustc; do
+            command -v "$tool"
+          done
+          git -C subject diff --exit-code
+          test "$(git -C subject rev-parse HEAD)" = "$SUBJECT_REVISION"
+          rustc -vV > evidence/rustc.txt
+          cargo --version > evidence/cargo.txt
+          git --version > evidence/git.txt
+          strace --version > evidence/strace.txt
+          uname -a > evidence/kernel.txt
+      - name: Validate diagnostic driver
+        run: python3 diagnostics/tests/test_fuse_syscall_profile.py
+      - name: Build ordinary release on one CPU
+        run: |
+          profile_cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+          taskset -c "$profile_cpu" nice -n 15 ionice -c 3 cargo build \
+            --manifest-path subject/Cargo.toml --target-dir "$RUNNER_TEMP/fuse-profile-target" \
+            --locked --release --bin git-on > evidence/build.log 2>&1
+          sha256sum "$RUNNER_TEMP/fuse-profile-target/release/git-on" > evidence/binary.sha256
+      - name: One bounded profile with untraced controls
+        run: |
+          set -o pipefail
+          profile_cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+          taskset -c "$profile_cpu" nice -n 15 ionice -c 3 python3 diagnostics/tests/fuse_syscall_profile.py \
+            --checkout subject --binary "$RUNNER_TEMP/fuse-profile-target/release/git-on" \
+            --work "$RUNNER_TEMP/fuse-profile-fixture" --output "$GITHUB_WORKSPACE/evidence/results" \
+            --files 8192 --bytes 4096 2>&1 | tee evidence/profile.log
+      - name: Retain complete or partial diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bounded-fuse-profile-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 7
