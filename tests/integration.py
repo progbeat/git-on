@@ -1128,6 +1128,8 @@ def read_prefix(stream):
         rows.append((name,ino))
     return rows
 for _ in range(16):
+    changing=Path('out/paged/changing.tmp')
+    changing.write_bytes(b'new generation')
     first=libc.opendir(b'out/paged');second=libc.opendir(b'out/paged')
     assert first and second,ctypes.get_errno()
     try:
@@ -1138,6 +1140,8 @@ for _ in range(16):
     finally:
         assert libc.closedir(first)==0
         assert libc.closedir(second)==0
+    changing.unlink()
+assert set(os.listdir(b'out/paged'))==expected-{b'.',b'..'}
 ''')
         self.assert_success(result)
         self.assert_no_runtime_files()

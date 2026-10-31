@@ -80,6 +80,11 @@ impl Directory {
             .get(index)
             .map(|node| (node.name.as_ref(), node.mode))
     }
+    pub(crate) fn shared_at(&self, index: usize) -> Option<(Arc<OsStr>, u32)> {
+        self.entries
+            .get(index)
+            .map(|node| (node.name.clone(), node.mode))
+    }
     fn owned(node: &Node) -> TreeItem {
         TreeItem {
             name: node.name.to_os_string(),

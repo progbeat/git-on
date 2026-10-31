@@ -134,23 +134,29 @@ refreshes. Canonical OID verification completes before raw bytes become readable
 Local loose objects stream in 64 KiB chunks with cancellation checks.
 
 All prepared blobs survive close/reopen and bounded-memory-cache eviction in
-private temporary storage until invocation completion. A disk-resident
-randomized hash index avoids one retained descriptor or RAM entry per blob.
-Payload, authentication tags and index are logical files split into at most
-1 GiB parts, further capped by inherited `RLIMIT_FSIZE`. Each retains one open
-part, plus one shared directory descriptor: four retained descriptors, five
-during geometric index growth, independent of bytes/object/part counts. Parts
-are created/reopened relative to the owned directory descriptor with no symlink
-following; their directory stays outside the execution view. They are removed
-when their owning readers/store are dropped and remain under invocation cleanup.
-Native output passes through a bounded pipe into these parts, with no additional
-payload disk copy or per-object header/decode prepass. A per-invocation memory-only HMAC key authenticates
-the index and 4 KiB logical payload blocks; range reads verify the returned bytes
-without decoding or hashing the entire blob again. This detects modification of
-prepared disk bytes under the interview's process-memory protection assumption.
-Readers hold weak references to cached memory and use authenticated raw bytes
-after eviction. Retained-raw disk metrics are separate from active-reader and
-bounded payload-memory metrics. No cross-run reuse is introduced. libgit2's local
+private temporary storage until invocation completion. Each spilled original
+object has one raw file, opened relative to the owned directory with no symlink
+following. Trusted RAM retains its Git OID, length and packed ordered SHA-256
+hashes of 64 KiB blocks, published only after full canonical OID verification.
+Range reads hash the same owned buffer returned to the caller; neither a disk
+index nor a disk authentication-tag file is trusted. Small resident objects
+spill only on eviction. The byte-accounted 16 MiB data LRU retains one entry per
+original OID: a whole small object or one large-file block. Active buffers and
+retained verification/parsed-directory metadata are accounted for separately;
+this is not a fixed total-RAM bound.
+
+The raw store retains one directory descriptor and one last-read object
+descriptor, independent of object count or open child handles. Each disk-read
+range rechecks file type, owner, link count and trusted length, even on descriptor
+reuse, then authenticates its blocks. A different object replaces the single
+read slot. Active import/spill writes need an additional temporary descriptor.
+Blob readers hold object descriptors rather than cached payloads or open files.
+Native transport/decoder staging still uses bounded logical parts capped by
+inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
+The private files stay outside the execution view and are removed with their
+owning store/readers during invocation cleanup. Retained-raw disk metrics are
+separate from active-reader and bounded payload-memory metrics. No cross-run
+reuse is introduced. libgit2's local
 pack backend still requires object/delta decoding, and its loose reader maps the
 compressed source file. Neither mapped OS page cache nor necessary packed decode
 is reported as a retained application payload cache.
@@ -164,8 +170,8 @@ through the lazy operation and runner failure as applicable. No failure reruns
 a started child or silently changes write policy.
 
 Active temporary objects and normal ignored writes have no runner disk quota;
-ordinary system disk limits apply. Decoded memory caches retain their byte and
-entry budgets. Completion removes the temporary remote repository and owned
+ordinary system disk limits apply. Payload-cache accounting includes entry
+overhead without an arbitrary object-count cap. Completion removes the temporary remote repository and owned
 SSH connection. Write required results to explicit external paths. Busy mounts
 preserve recovery state for stale-run cleanup. Explicit-all materialization
 eagerly fetches every selected tree entry; it never bypasses authentication,

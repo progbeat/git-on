@@ -611,7 +611,7 @@ decoding, subprocess work and cleanup remain included; #20 is not complete.
 Requester checks continue reading the current task status on every poll, but
 reuse a thread-local scratch allocation instead of repeatedly growing an empty
 buffer. A paired syscall observation of the existing real-disposition test
-reduced status reads from 125 to 65 while retaining all 30 seeks/polls and
+reduced status reads from 125 to 65 while retaining all 30 seeks and
 passing the same signal cases. Large supplementary-group lists still read to
 EOF. This is a focused syscall result, not evidence that the full workload's
 30.74 s requester-check span has disappeared.
@@ -666,11 +666,20 @@ when a newer stream returned a late file, the file was deleted, and that stream
 closed while an older stream stayed open. Per-handle returned-entry pins replace
 that grouping; binding clocks and source-parent bookkeeping were removed.
 
-Namespace changes invalidate a cached merged view without immediately dropping
-its allocation; the next open builds the new version. Existing handles retain
-their previous Arc and cookies. Reopening an unchanged mixed 10,001-name view
-16 times prepares those rows once, not 16 times. Merged-view rebuilding after
-mutations still takes directory/prefix work; this change does not prove the
+When the cached merged view has no active stream, namespace changes update only
+the named binding through its expected-O(1) hash index. Deletion swap-removes a
+row and updates the moved row's index; no live stream can observe this reorder.
+Names share Arc storage with the verified source tree rather than duplicating
+source strings. A mutation/reopen regression at `f92df94` prepared 160,016 rows
+for 16 partial opens in a 10,000-name source directory. The incremental path
+prepares 10,001 rows once, then updates the changed binding without rescanning
+the source or upper descendants. A retained older version does not prevent
+updating a newer unshared cached version.
+
+If a stream still holds the current view, a namespace change invalidates that
+cached version without immediately dropping it. The next open builds a new
+version, preserving the old Arc's names/cookies. Repeated overlapping versions
+can therefore still require directory/prefix work; this does not prove the
 complete overhead contract for arbitrary mutation sequences. No extra B-tree,
 disk index, cache daemon or global storage is introduced.
 
@@ -680,3 +689,33 @@ pagination fixture now also exercises repeated partial streams and inode
 identity, without adding another large fixture. Full WebKit diagnostics record
 opendir/readdir/releasedir and view-building spans; local /dev/fuse is absent,
 so local skips are not mounted evidence. Performance acceptance remains open.
+
+### Reusing raw descriptors and reading current signal masks
+
+The raw store retains one shared last-read object descriptor, rather than
+opening the same object for each successive range. The 64-range regression at
+`f92df94` opened the prepared object 64 times; the new path opens it once.
+Changing objects releases the old slot before opening the new one. A focused
+subprocess test lowers RLIMIT_NOFILE, fills the remaining descriptor slots and
+switches objects successfully. Opening the replacement before releasing the
+old slot reproduced EMFILE. Raw metadata (type, owner, link count and exact
+length) is checked afresh for every disk-read range using one fstat, and each
+block is still checked against its trusted RAM digest before copying the same
+owned bytes to the caller. A 257-object test confirms that replaced descriptors
+are dropped and child/blob readers retain no additional object files.
+
+Requester polling now uses positional reads starting at zero and stops once
+all four complete signal masks arrive. Linux's
+[seq_file implementation](https://github.com/torvalds/linux/blob/v6.8/fs/seq_file.c#L171-L179)
+resets the iterator for a zero-offset read. The held task descriptor, polling
+frequency and current disposition checks remain; no status value is cached.
+Long Groups lines and mask fields crossing 4 KiB read boundaries continue
+through subsequent reads. Tests cover changing masks, malformed/missing fields,
+EOF without a final newline and scratch reuse after a shorter status.
+
+The same real-disposition test, traced with child tracing detached at exec to
+avoid interfering with its stopped requester, used 65 reads and 30 seeks before
+the change, versus 40 fixture reads and 15 positional polling reads afterward.
+All 15 requester polls remain. This isolates removed syscalls; it does not
+predict the complete workload's latency. Full production-path measurements,
+subprocess resources and cleanup remain required for performance acceptance.

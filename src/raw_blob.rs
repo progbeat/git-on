@@ -158,7 +158,7 @@ impl RawBlob {
             anyhow::ensure!(object.file, "missing prepared object block");
             let expected = object.blocks[block];
             if file.is_none() {
-                file = Some(store.directory.open(self.oid, false, self.size)?);
+                file = Some(store.directory.reader(self.oid, self.size)?);
             }
             let mut bytes = vec![0; size];
             {
@@ -196,10 +196,14 @@ impl RawBlob {
 }
 
 /// A descriptor for the owned directory anchors operations even after a path
-/// rename. No object file descriptor is retained by a blob or open child handle.
+/// rename. One last-read descriptor is shared by the store; blobs and child
+/// handles do not each retain a descriptor. Every disk read rechecks metadata.
 struct RawDirectory {
     fd: File,
+    reader: Option<(Oid, Arc<File>)>,
     _owner: tempfile::TempDir,
+    #[cfg(test)]
+    open_calls: std::cell::Cell<usize>,
 }
 impl RawDirectory {
     fn new(parent: &Path) -> Result<Self> {
@@ -211,9 +215,33 @@ impl RawDirectory {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(owner.path())?;
-        Ok(Self { fd, _owner: owner })
+        Ok(Self {
+            fd,
+            reader: None,
+            _owner: owner,
+            #[cfg(test)]
+            open_calls: std::cell::Cell::new(0),
+        })
     }
-    fn open_name(&self, name: &CString, flags: i32) -> Result<File> {
+    fn validate(file: &File, size: Option<u64>) -> Result<()> {
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "invalid private raw object"
+        );
+        if let Some(size) = size {
+            anyhow::ensure!(
+                metadata.len() == size,
+                "verified raw blob length was modified"
+            );
+        }
+        Ok(())
+    }
+    fn open_name(&self, name: &CString, flags: i32, size: Option<u64>) -> Result<File> {
+        #[cfg(test)]
+        self.open_calls.set(self.open_calls.get() + 1);
         #[cfg(feature = "test-metrics")]
         let _profile = crate::profile::span("raw_file_open", 0);
         let fd = unsafe {
@@ -228,33 +256,39 @@ impl RawDirectory {
             return Err(io::Error::last_os_error()).context("open private raw object");
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && metadata.nlink() == 1
-                && metadata.uid() == unsafe { libc::geteuid() },
-            "invalid private raw object"
-        );
+        Self::validate(&file, size)?;
         Ok(file)
     }
     fn open(&self, oid: Oid, write: bool, size: u64) -> Result<File> {
-        let file = self.open_name(
+        self.open_name(
             &CString::new(oid.to_string())?,
             if write {
                 libc::O_WRONLY
             } else {
                 libc::O_RDONLY
             },
-        )?;
-        anyhow::ensure!(
-            file.metadata()?.len() == size,
-            "verified raw blob length was modified"
-        );
+            Some(size),
+        )
+    }
+    fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<File>> {
+        if let Some((cached, file)) = &self.reader {
+            if *cached == oid {
+                Self::validate(file, Some(size))?;
+                return Ok(file.clone());
+            }
+        }
+        // Retain one descriptor independent of object count, payload budgets
+        // and open child handles. A different object replaces this one slot.
+        // Release the old slot first: it may be the last available descriptor
+        // under the caller's limit, so opening before replacement can fail.
+        self.reader = None;
+        let file = Arc::new(self.open(oid, false, size)?);
+        self.reader = Some((oid, file.clone()));
         Ok(file)
     }
     fn pending(&self) -> Result<Pending<'_>> {
         let name = CString::new(format!("pending-{}", uuid::Uuid::new_v4()))?;
-        let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)?;
+        let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, None)?;
         Ok(Pending {
             directory: self,
             name,
@@ -819,6 +853,112 @@ mod tests {
         assert_eq!(store.entries(), 160);
     }
     #[test]
+    fn read_slot_releases_its_descriptor_before_replacing_it() {
+        const CHILD: &str = "GIT_ON_TEST_RAW_SLOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "raw_blob::tests::read_slot_releases_its_descriptor_before_replacing_it",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            unsafe {
+                command.pre_exec(|| {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(64);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+        let mut readers = Vec::new();
+        for bytes in [b"first".as_slice(), b"second"] {
+            let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+            readers.push(
+                store
+                    .insert(oid, bytes.len(), bytes, directory.path())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(readers[0].read_all().unwrap(), b"first");
+        let mut held = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        assert_eq!(readers[1].read_all().unwrap(), b"second");
+    }
+    #[test]
+    fn repeated_spilled_ranges_reuse_one_bounded_descriptor_and_check_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+        let bytes: Vec<_> = (0..4 * BLOCK).map(|n| (n % 251) as u8).collect();
+        let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+        let reader = store
+            .insert(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .unwrap();
+        let before = store.state.lock().unwrap().directory.open_calls.get();
+        for index in 0..64 {
+            let offset = (index % 4) * BLOCK;
+            assert_eq!(
+                reader.read(offset as u64, 1).unwrap(),
+                bytes[offset..offset + 1]
+            );
+        }
+        assert_eq!(
+            store.state.lock().unwrap().directory.open_calls.get() - before,
+            1,
+            "consecutive reads of an available raw object reopened its file"
+        );
+        let path = store
+            .state
+            .lock()
+            .unwrap()
+            .directory
+            ._owner
+            .path()
+            .join(oid.to_string());
+        let writer = File::options().write(true).open(path).unwrap();
+        writer.set_len(bytes.len() as u64 - 1).unwrap();
+        assert!(
+            reader.read(0, 1).is_err(),
+            "descriptor reuse skipped fresh length validation"
+        );
+        writer.set_len(bytes.len() as u64).unwrap();
+        writer.write_all_at(&bytes, 0).unwrap();
+        writer.write_all_at(b"!", 0).unwrap();
+        assert!(
+            reader.read(0, 1).is_err(),
+            "descriptor reuse skipped block authentication"
+        );
+    }
+    #[test]
     fn verified_ranges_cross_block_boundaries_and_outlive_the_store() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
@@ -943,7 +1083,7 @@ mod tests {
         assert_eq!(store.entries(), 1);
     }
     #[test]
-    fn many_spilled_objects_remain_available_without_pinned_object_descriptors() {
+    fn many_spilled_objects_remain_available_with_one_shared_descriptor() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         for number in 0..257 {
@@ -953,6 +1093,7 @@ mod tests {
                 .insert(oid, bytes.len(), bytes.as_bytes(), directory.path())
                 .unwrap();
         }
+        let mut previous: Option<std::sync::Weak<File>> = None;
         for number in (0..257).rev() {
             let bytes = format!("blob-{number}");
             let oid = Oid::hash_object(ObjectType::Blob, bytes.as_bytes()).unwrap();
@@ -960,6 +1101,21 @@ mod tests {
                 store.get(oid).unwrap().unwrap().read_all().unwrap(),
                 bytes.as_bytes()
             );
+            if let Some(previous) = previous {
+                assert!(
+                    previous.upgrade().is_none(),
+                    "replaced raw descriptor remained retained"
+                );
+            }
+            let state = store.state.lock().unwrap();
+            let (cached, file) = state.directory.reader.as_ref().unwrap();
+            assert_eq!(*cached, oid);
+            assert_eq!(
+                Arc::strong_count(file),
+                1,
+                "a blob or child reader retained its own file descriptor"
+            );
+            previous = Some(Arc::downgrade(file));
         }
         assert_eq!(store.disk_metrics().1, 257);
         assert_eq!(store.memory_metrics(), (0, 0));

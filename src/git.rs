@@ -712,9 +712,8 @@ impl std::error::Error for RequestInterrupted {}
 
 thread_local! {
     static REQUEST_STATUS: RefCell<Option<File>> = const { RefCell::new(None) };
-    // Reuse scratch allocation without caching any status/disposition. Large
-    // supplementary-group lists still read to EOF and may grow this buffer.
-    static REQUEST_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+    // Reuse scratch allocation, never a status snapshot or signal disposition.
+    static REQUEST_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; 4096]);
 }
 
 /// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
@@ -770,6 +769,46 @@ fn pending_request_signal(status: &[u8]) -> Option<i32> {
         .find(|signal| actionable & (1_u64 << (signal - 1)) != 0)
 }
 
+fn read_request_signal(status: &File, bytes: &mut Vec<u8>) -> Option<i32> {
+    use std::os::unix::fs::FileExt;
+    let mut offset: usize = 0;
+    let mut line_start = 0;
+    let mut fields = 0;
+    loop {
+        let end = offset.checked_add(4096)?;
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        let count = match status.read_at(&mut bytes[offset..end], offset as u64) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        if count == 0 {
+            return pending_request_signal(&bytes[..offset]);
+        }
+        let end = offset + count;
+        for index in offset..end {
+            if bytes[index] != b'\n' {
+                continue;
+            }
+            let (key, _) = bytes[line_start..index].split_once_byte(b':');
+            fields |= match key {
+                b"SigPnd" => 1,
+                b"ShdPnd" => 2,
+                b"SigBlk" => 4,
+                b"SigIgn" => 8,
+                _ => 0,
+            };
+            line_start = index + 1;
+            if fields == 15 {
+                return pending_request_signal(&bytes[..line_start]);
+            }
+        }
+        offset = end;
+    }
+}
+
 /// fuser dispatches synchronously and cannot process INTERRUPT while a native
 /// operation is blocked. Reply EINTR when this requester has a pending signal,
 /// then let its actual disposition/handler determine the command's outcome.
@@ -777,16 +816,15 @@ fn pending_request_signal(status: &[u8]) -> Option<i32> {
 pub(crate) fn check_request_interruption() -> Result<()> {
     #[cfg(feature = "test-metrics")]
     let _profile = crate::profile::span("request_status", 0);
-    use std::io::{Read, Seek};
     let signal = REQUEST_STATUS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let status = slot.as_mut()?;
-        status.rewind().ok()?;
+        let slot = slot.borrow();
+        let status = slot.as_ref()?;
         REQUEST_BUFFER.with(|buffer| {
             let mut bytes = buffer.borrow_mut();
-            bytes.clear();
-            status.read_to_end(&mut bytes).ok()?;
-            pending_request_signal(&bytes)
+            // seq_file positional reads starting at zero regenerate status;
+            // no seek, EOF probe or cached signal state is needed. Keep reading
+            // across large Groups lines until all four complete masks arrive.
+            read_request_signal(status, &mut bytes)
         })
     });
     if let Some(signal) = signal {
@@ -976,6 +1014,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn positional_status_reads_handle_mask_boundaries_long_lines_and_stale_scratch() {
+        use std::os::unix::fs::FileExt;
+        let file = tempfile::tempfile().unwrap();
+        let term = 1_u64 << (libc::SIGTERM - 1);
+        let masks = format!("SigPnd:\t{term:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000");
+        let mut scratch = Vec::new();
+        for prefix in (4000..4200).chain([0, 24_000]) {
+            let mut content = b"Groups:\t".to_vec();
+            content.extend(std::iter::repeat_n(b'1', prefix));
+            content.push(b'\n');
+            content.extend_from_slice(masks.as_bytes());
+            file.set_len(content.len() as u64).unwrap();
+            file.write_all_at(&content, 0).unwrap();
+            assert_eq!(
+                read_request_signal(&file, &mut scratch),
+                Some(libc::SIGTERM)
+            );
+        }
+        for content in [
+            b"".as_slice(),
+            b"SigPnd:\t4000\n",
+            b"SigPnd:\tinvalid\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n",
+        ] {
+            file.set_len(content.len() as u64).unwrap();
+            file.write_all_at(content, 0).unwrap();
+            assert_eq!(
+                read_request_signal(&file, &mut scratch),
+                None,
+                "a short/incomplete poll reused masks from a previous snapshot"
+            );
+        }
+    }
+    #[test]
+    fn request_polls_use_fresh_masks_without_changing_the_held_file_position() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::FileExt;
+        let _request = RequestGuard::enter(0);
+        let mut file = tempfile::tempfile().unwrap();
+        let term = 1_u64 << (libc::SIGTERM - 1);
+        let status = |ignored| {
+            format!("Name:\trequester\nSigPnd:\t{term:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t{ignored:016x}\nUnused:\ttrailing data\n")
+        };
+        file.write_all(status(0).as_bytes()).unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        let mut observer = file.try_clone().unwrap();
+        REQUEST_STATUS.with(|slot| slot.replace(Some(file)));
+        assert!(check_request_interruption().is_err());
+        assert_eq!(
+            observer.stream_position().unwrap(),
+            7,
+            "status polling performed a rewind/read-to-EOF sequence"
+        );
+        observer.write_all_at(status(term).as_bytes(), 0).unwrap();
+        check_request_interruption().unwrap();
+        observer.write_all_at(status(0).as_bytes(), 0).unwrap();
+        assert!(
+            check_request_interruption().is_err(),
+            "cached a signal disposition"
+        );
+        assert_eq!(observer.stream_position().unwrap(), 7);
+    }
     #[test]
     fn request_scope_reads_real_dispositions_and_keeps_original_task_identity() {
         for (mode, signal, interrupts) in [
