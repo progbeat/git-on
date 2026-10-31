@@ -1,5 +1,35 @@
 # Resource acceptance for milestone 1.4.0
 
+## Current simple store (implementation work in progress)
+
+The approved scale reference is WebKit; the absolute clone-success guarantee
+was replaced in the interview. No claim of completed WebKit acceptance follows
+from that wording. The current implementation stores object descriptors and
+packed ordered SHA-256 block hashes in trusted RAM, after full canonical Git
+OID verification of the same stream. A byte-accounted 16 MiB data LRU has no
+independent total-object cap, but retains only one entry per original OID across
+all readers. Objects up to 64 KiB stay whole in RAM until eviction; large objects
+stream to disk and retain at most their most recently read block. A new block
+replaces the old cache entry without invalidating owned buffers of active reads.
+A sequential large scan therefore cannot occupy the LRU with many blocks from
+one object. Backing contents use one raw file per original object. Disk reads verify full intersecting 64 KiB
+blocks before returning bytes from that checked buffer. Resident rereads avoid
+those disk hashes. No disk object/name index or HMAC key remains.
+
+Touched unique directories are parsed once into shared immutable RAM structures;
+raw tree bytes are released. Parsed directories, verified descriptors and touched
+header sizes grow with demand outside the payload LRU. Report this metadata and
+actual process memory separately: the LRU limit is not a total-RSS guarantee.
+Local packed/delta decoding retains the documented libgit2 memory limitation.
+Protocol packs and native decoder stdout can still need transient bounded-part
+staging; that I/O and all native children remain inside total-cost measurements.
+No global cache, recovery fallback or corrupt-spill retry is introduced.
+
+The evidence below refers to the explicitly named historical implementations.
+In particular, old disk-index/HMAC/4 KiB-tag descriptions are history, not the
+current design. New first/repeat, real-FUSE and WebKit measurements are required
+before claiming that the current code satisfies the full overhead contract.
+
 ## Fixed setup versus demand work
 
 `tests/startup_profile.py` uses a fixed 160-distinct-blob source, a minimal

@@ -37,7 +37,7 @@ def validate_runner(result,count,operations,stat_bytes,backend):
     assert metrics['tree_reads']==1,metrics
     assert metrics['prepared_tree_entries']==count,metrics
     assert metrics['blob_loads']==1,metrics
-    assert metrics['tree_cache_bytes']<=metrics['tree_cache_limit'],metrics
+    assert metrics['tree_cache_limit']==0 or metrics['tree_cache_bytes']<=metrics['tree_cache_limit'],metrics
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
     if backend=='fuse':assert result['fuse_requests'].get('read',0)>0,'real FUSE dispatch missing'
     else:assert not result['fuse_requests'],'materialization did not bypass FUSE'

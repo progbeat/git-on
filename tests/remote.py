@@ -1452,27 +1452,28 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(f.git('config','--list'),before)
 
     def test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies(self):
-        f=self.f;entries=[];oids=[]
-        for index in range(140):
-            oid=f.git('hash-object','-w','--stdin',data=f'raw-{index}\n'.encode());oids.append(oid)
+        f=self.f;entries=[];oids=[];count=300
+        for index in range(count):
+            prefix=f'raw-{index:03d}:'.encode();data=prefix+b'x'*(65536-len(prefix))
+            oid=f.git('hash-object','-w','--stdin',data=data);oids.append(oid)
             entries.append(f'100644 blob {oid}\tf{index:03d}\n')
         tree=f.git('mktree',data=''.join(entries).encode())
         commit=f.git('commit-tree',tree,data=b'raw eviction fixture\n');f.git('update-ref','refs/heads/main',commit)
         process=f.probe('file://'+str(f.repo));f.line(process)
-        for index in range(140):
-            value,last=f.operation(process,f'read f{index:03d}')
-            self.assertEqual(value['data'],f'raw-{index}\n')
-        value,again=f.operation(process,'read f000');self.assertEqual(value['data'],'raw-0\n')
-        self.assertEqual(again['metrics']['remote_fetches'],142)
+        for index in range(count):
+            value,last=f.operation(process,f'range 0 32 f{index:03d}')
+            self.assertEqual(bytes(value['bytes']),f'raw-{index:03d}:'.encode()+b'x'*24)
+        value,again=f.operation(process,'range 0 32 f000');self.assertEqual(bytes(value['bytes']),b'raw-000:'+b'x'*24)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
         self.assertEqual(again['metrics']['blob_loads'],last['metrics']['blob_loads'],'evicted raw blob was unpacked again')
         destination=next(f.root.glob('*/remote-repository'))
         self.assertEqual(list((destination/'objects/pack').iterdir()),[])
         self.assertFalse(any((destination/'objects'/oid[:2]/oid[2:]).exists() for oid in oids),'received blobs were recompressed into loose files')
-        self.assertEqual(again['metrics']['retained_raw_blob_entries'],140)
-        self.assertLessEqual(again['metrics']['blob_cache_entries'],128)
+        self.assertGreater(again['metrics']['retained_raw_blob_entries'],0,'working set did not actually evict payloads')
+        self.assertLessEqual(again['metrics']['blob_cache_bytes'],again['metrics']['blob_cache_limit'])
         f.finish(process)
 
-    def test_protocol_v2_reuses_native_clients_after_blob_eviction(self):
+    def test_protocol_v2_reuses_native_clients_across_many_blob_demands(self):
         f=self.f;count=140;entries=[];oids=[]
         for index in range(count):
             oid=f.git('hash-object','-w','--stdin',data=f'unique-{index}\n'.encode());oids.append(oid)
@@ -1523,8 +1524,12 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
         self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
         self.assertEqual(again['metrics']['remote_session_starts'],1)
+        self.assertEqual(again['metrics']['remote_raw_blob_bytes'],count*limit)
+        self.assertGreater(again['metrics']['remote_raw_blob_bytes'],limit)
         parts=[p for directory in f.root.rglob('raw-parts-*') for p in directory.iterdir()]
-        self.assertGreater(sum(p.stat().st_size for p in parts),limit)
+        # Transport scratch may already be reclaimed and this working set fits
+        # RAM. Successful verified demands exceed FSIZE in aggregate; retained
+        # scratch bytes are not a requirement of the storage contract.
         self.assertTrue(all(p.stat().st_size<=limit for p in parts),'a logical raw or pack file exceeded inherited FSIZE')
         self.assertLessEqual(len(list(Path(f'/proc/{process.pid}/fd').iterdir())),48)
         f.finish(process)

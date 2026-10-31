@@ -241,6 +241,8 @@ impl Session {
         Ok(())
     }
     pub(crate) fn fetch(&mut self, oid: Oid, pack: &Spool) -> Result<()> {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("session_fetch", 0);
         // The completed previous response has no diagnostics to retain. A
         // shared regular-file offset is reset only between transactions.
         self.errors.set_len(0)?;

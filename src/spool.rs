@@ -168,6 +168,7 @@ impl Spool {
             Self::Parts { state, .. } => Ok(state.lock().unwrap_or_else(|e| e.into_inner()).length),
         }
     }
+    #[cfg(test)]
     pub(crate) fn set_len(&self, length: u64) -> io::Result<()> {
         match self {
             Self::Single(file) => file.set_len(length),

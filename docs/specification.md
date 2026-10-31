@@ -338,9 +338,13 @@ not replace them or establish proof for all possible sequences.
 
 ## Implementation and verification
 
-The second implementation replaces the eager traversal with a shared pinned
-object store, demand-only metadata/blob access, bounded caches, and deferred
-inode creation. The FUSE layer retains no duplicate snapshot payloads. Source
+The implementation uses a shared pinned object store, demand-only metadata/blob
+access, a byte-budgeted content LRU and deferred inode creation. The LRU retains
+at most one entry per original OID across all readers: a complete small object
+or one large-file block. Trusted descriptors/block hashes and parsed directories
+remain in RAM for touched unique objects outside that payload budget. Raw tree
+bytes and disk object/name indexes are not retained. The FUSE layer retains no
+duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail
 metadata access, LFS pointers fail content reads, and unrelated entries remain
 usable. Listing a directory may report a submodule name without following it.

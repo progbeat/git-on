@@ -76,6 +76,13 @@ pub struct Overlay {
 }
 
 impl Overlay {
+    pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
+        self.nodes.get(&ino).is_some_and(|node| {
+            node.immutable
+                && node.snapshot_path.is_some()
+                && node.attr.kind == FileType::RegularFile
+        })
+    }
     pub(crate) fn protected_source(&self, ino: u64) -> bool {
         self.write_policy != WritePolicy::All
             && self

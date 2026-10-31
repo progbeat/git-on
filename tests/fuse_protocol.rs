@@ -292,7 +292,7 @@ fn protocol_kernel_cache_only_retains_protected_source() {
         let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
         assert_eq!(
             flags & ((1 << 1) | (1 << 5)),
-            if protected { (1 << 1) | (1 << 5) } else { 0 }
+            (1 << 1) | if protected { 1 << 5 } else { 0 }
         );
         p.release(ino, num(&opened, 0));
         if policy != WritePolicy::None {
@@ -307,6 +307,38 @@ fn protocol_kernel_cache_only_retains_protected_source() {
             p.release(generated, handle);
         }
     }
+}
+
+#[test]
+fn protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+    let ino = num(&entry, 0);
+    assert_eq!(num(&entry, 16), 0);
+    assert_eq!(num(&entry, 24), 0);
+    let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        1 << 1
+    );
+    let reader = num(&opened, 0);
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
+    let writer = p.open(ino, libc::O_RDWR);
+    p.ok(
+        16,
+        ino,
+        [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
+    );
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
+    let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        0
+    );
+    assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
+    p.release(ino, num(&reopened, 0));
+    p.release(ino, writer);
+    p.release(ino, reader);
 }
 
 #[test]

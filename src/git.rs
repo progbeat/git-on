@@ -724,6 +724,8 @@ pub(crate) struct RequestGuard {
 #[cfg(target_os = "linux")]
 impl RequestGuard {
     pub(crate) fn enter(pid: u32) -> Self {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("request_bind", 0);
         let status = File::open(format!("/proc/{pid}/status")).ok();
         Self {
             previous: REQUEST_STATUS.with(|slot| slot.replace(status)),
@@ -770,6 +772,8 @@ fn pending_request_signal(status: &[u8]) -> Option<i32> {
 /// then let its actual disposition/handler determine the command's outcome.
 /// This is per-request interruption, never global command cancellation.
 pub(crate) fn check_request_interruption() -> Result<()> {
+    #[cfg(feature = "test-metrics")]
+    let _profile = crate::profile::span("request_status", 0);
     use std::io::{Read, Seek};
     let signal = REQUEST_STATUS.with(|slot| {
         let mut slot = slot.borrow_mut();

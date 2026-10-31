@@ -632,7 +632,7 @@ impl Remote {
                 "owned SSH control connection is unavailable; reconnection is forbidden"
             );
         }
-        let pack = self.raw_blobs.index_file(&self.dir)?;
+        let pack = self.raw_blobs.scratch_file(&self.dir)?;
         if let Err(error) = session.fetch(oid, &pack) {
             let diagnostic = session.error_text();
             self.session = None;
@@ -810,7 +810,9 @@ impl Remote {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        self.import_raw_output(start, &destination)?;
+        let imported = self.import_raw_output(start, &destination);
+        self.raw_blobs.release_output();
+        imported?;
         self.decode_operations += 1;
         Ok(())
     }

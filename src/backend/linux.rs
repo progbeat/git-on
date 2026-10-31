@@ -58,6 +58,13 @@ impl Fuse {
     }
 }
 impl State {
+    fn retain_source_data(&self, ino: u64) -> bool {
+        #[cfg(feature = "test-metrics")]
+        if self.profile_uncached_source {
+            return false;
+        }
+        self.core.unchanged_source_data(ino)
+    }
     fn source_cacheable(&self, ino: u64) -> bool {
         #[cfg(feature = "test-metrics")]
         if self.profile_uncached_source {
@@ -193,6 +200,8 @@ impl Filesystem for Fuse {
         Ok(())
     }
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_lookup", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -209,6 +218,8 @@ impl Filesystem for Fuse {
         self.state().core.forget_inode(ino.0, count);
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_getattr", 0);
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("getattr");
@@ -368,16 +379,26 @@ impl Filesystem for Fuse {
         entry(reply, self.state().core.link_node(ino.0, parent.0, name));
     }
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_open", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("open");
         match state.core.open_file(ino.0, flags.0) {
             Ok(fh) => {
-                let cache = if state.source_cacheable(ino.0)
+                let cache = if state.retain_source_data(ino.0)
                     && flags.0 & libc::O_ACCMODE == libc::O_RDONLY
                 {
-                    FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_NOFLUSH
+                    // Copy-up/mutation still uses this FUSE inode's coherent
+                    // page cache. All-policy names and metadata keep zero TTL.
+                    // NOFLUSH remains limited to source that cannot be mutated.
+                    FopenFlags::FOPEN_KEEP_CACHE
+                        | if state.source_cacheable(ino.0) {
+                            FopenFlags::FOPEN_NOFLUSH
+                        } else {
+                            FopenFlags::empty()
+                        }
                 } else {
                     FopenFlags::empty()
                 };
@@ -464,6 +485,8 @@ impl Filesystem for Fuse {
         _owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_read", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -507,6 +530,8 @@ impl Filesystem for Fuse {
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_flush", 0);
         empty(reply, self.state().core.validate_handle(ino.0, fh.0));
     }
     fn release(
@@ -519,6 +544,8 @@ impl Filesystem for Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("fuse_release", 0);
         empty(reply, self.state().release(ino.0, fh.0));
     }
     fn fsync(

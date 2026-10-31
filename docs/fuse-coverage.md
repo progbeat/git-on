@@ -59,6 +59,7 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | --- | --- | --- |
 | P-life | tests/fuse_protocol.rs | protocol_lifecycle_lookup_forget_and_batch_forget |
 | P-io | tests/fuse_protocol.rs | protocol_file_io_sync_and_stale_handles |
+| P-cache-cow | tests/fuse_protocol.rs | protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls |
 | P-create | tests/fuse_protocol.rs | protocol_creation_links_removal_and_rename_flags |
 | P-dir | tests/fuse_protocol.rs | protocol_directory_pagination_sync_statfs_and_bad_handles |
 | P-access | tests/fuse_protocol.rs | protocol_access_and_setattr_credentials_and_boundaries |
@@ -75,6 +76,7 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-unlinked-cow | tests/fuse_protocol.rs | protocol_all_setattr_on_unlinked_original_read_handle |
 | I-snapshot | tests/integration.py | FuseTests.test_snapshot_ignores_dirty_index_worktree_and_untracked_files |
 | I-file | tests/integration.py | FuseTests.test_file_operation_matrix_preserves_tracked_bytes |
+| I-cache-cow | tests/integration.py | FuseTests.test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes |
 | I-directory | tests/integration.py | FuseTests.test_directory_and_rename_operation_matrix_is_atomic |
 | I-links | tests/integration.py | FuseTests.test_symlink_and_hardlink_lifecycle_matrix |
 | I-lazy | tests/integration.py | FuseTests.test_lazy_metadata_does_not_load_unread_blobs_or_descendant_trees |
@@ -125,7 +127,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | symlink | implemented | P-create | I-links | Real callback creates a symlink; mounted exact target, write-through, dangling link and namespace/policy denial assertions. Embedded NUL is not representable in a well-formed wire pathname. |
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
 | link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. `passthrough_link_reply_refreshes_backing_metadata_without_stat` checks size/blocks/mtime in the LINK reply after bypass writes, before GETATTR or close. |
-| open | implemented | P-io | I-file, I-exec | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. `protocol_kernel_cache_only_retains_protected_source` checks KEEP_CACHE/NOFLUSH only on readonly policy-protected source; mutable/all handles keep ordinary behavior. |
+| open | implemented | P-io, P-cache-cow | I-file, I-exec, I-cache-cow | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Mutable handles use ordinary behavior. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
 | read | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-large, I-partial | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
 | write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
 | flush | implemented | P-io, P-bounds | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. The kernel may skip close-flush for readonly protected source with NOFLUSH; mutable handles and explicit fsync retain their callbacks. Flush is not a persistence/fsync guarantee. |

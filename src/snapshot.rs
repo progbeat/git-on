@@ -1,5 +1,5 @@
 //! Immutable, demand-loaded objects from the pinned Git tree.
-use crate::tree::{Directory, PreparedTrees, TreeItem};
+use crate::tree::{Directory, TreeItem};
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags};
 use serde::Serialize;
@@ -17,11 +17,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
-pub const BLOB_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const BLOB_CACHE_ENTRIES: usize = 128;
-const TREE_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const TREE_CACHE_ENTRIES: usize = 256;
-const HEADER_CACHE_ENTRIES: usize = 4096;
+pub const BLOB_CACHE_BYTES: usize = crate::raw_blob::MEMORY_BUDGET;
 
 /// Recognize complete pointer files, not ordinary source/documentation which
 /// happens to start with the LFS version line. Keep this bounded even for large
@@ -238,6 +234,8 @@ impl Drop for Pin {
 /// libgit2's necessary pack/delta decoding is not separately observable here.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SnapshotMetrics {
+    #[cfg(feature = "test-metrics")]
+    pub profile_spans: BTreeMap<&'static str, crate::profile::Summary>,
     /// Successful explicit native fetches, including initial ref resolution.
     pub remote_fetches: u64,
     pub remote_fetch_operations: u64,
@@ -248,6 +246,7 @@ pub struct SnapshotMetrics {
     pub tree_reads: u64,
     pub prepared_tree_entries: u64,
     pub retained_tree_bytes: u64,
+    pub verification_metadata_bytes: usize,
     pub tree_index_probes: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
@@ -281,17 +280,10 @@ pub struct SnapshotMetrics {
     pub fuse_requests: BTreeMap<&'static str, u64>,
 }
 
-enum BlobData {
-    Memory {
-        bytes: Weak<[u8]>,
-        raw: crate::raw_blob::RawBlob,
-    },
-    Stored(crate::raw_blob::RawBlob),
-}
 type ReaderRegistry = Mutex<HashMap<Oid, Weak<ActiveBlob>>>;
 struct ActiveBlob {
     oid: Oid,
-    data: BlobData,
+    data: crate::raw_blob::RawBlob,
     registry: Weak<ReaderRegistry>,
 }
 impl Drop for ActiveBlob {
@@ -313,71 +305,17 @@ impl Drop for ActiveBlob {
 pub struct BlobReader(Arc<ActiveBlob>);
 impl BlobReader {
     pub fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
-        match &self.0.data {
-            BlobData::Memory { bytes, raw } => {
-                let Some(bytes) = bytes.upgrade() else {
-                    return raw.read(offset, size);
-                };
-                let start = usize::try_from(offset)
-                    .unwrap_or(usize::MAX)
-                    .min(bytes.len());
-                let end = start.saturating_add(size as usize).min(bytes.len());
-                Ok(bytes[start..end].to_vec())
-            }
-            BlobData::Stored(blob) => blob.read(offset, size),
-        }
+        self.0.data.read(offset, size)
     }
     pub(crate) fn len(&self) -> u64 {
-        match &self.0.data {
-            BlobData::Memory { raw, .. } | BlobData::Stored(raw) => raw.len(),
-        }
-    }
-}
-
-/// A byte- and entry-bounded LRU. Values exceeding the budget are never retained.
-struct Cache<V> {
-    values: lru::LruCache<Oid, (V, usize)>,
-    bytes: usize,
-    byte_limit: usize,
-    entry_limit: usize,
-}
-impl<V: Clone> Cache<V> {
-    fn new(byte_limit: usize, entry_limit: usize) -> Self {
-        Self {
-            values: lru::LruCache::unbounded(),
-            bytes: 0,
-            byte_limit,
-            entry_limit,
-        }
-    }
-    fn get(&mut self, oid: Oid) -> Option<V> {
-        self.values.get(&oid).map(|(value, _)| value.clone())
-    }
-    fn insert(&mut self, oid: Oid, value: V, bytes: usize) {
-        if bytes > self.byte_limit || self.entry_limit == 0 {
-            return;
-        }
-        if let Some((_, old_bytes)) = self.values.pop(&oid) {
-            self.bytes -= old_bytes;
-        }
-        while self.values.len() >= self.entry_limit
-            || self.bytes > self.byte_limit.saturating_sub(bytes)
-        {
-            let (_, (_, removed_bytes)) = self.values.pop_lru().expect("cache has a victim");
-            self.bytes -= removed_bytes;
-        }
-        self.values.put(oid, (value, bytes));
-        self.bytes += bytes;
+        self.0.data.len()
     }
 }
 
 struct State {
     repo: Repository,
     remote: Option<crate::remote::Remote>,
-    trees: Cache<Arc<Directory>>,
-    prepared_trees: Option<PreparedTrees>,
-    headers: Cache<u64>,
-    blobs: Cache<Arc<[u8]>>,
+    headers: HashMap<Oid, u64>,
     readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
     metrics: SnapshotMetrics,
@@ -398,89 +336,50 @@ impl State {
             .or(self.raw_blobs.as_ref())
     }
     fn tree(&mut self, oid: Oid) -> Result<Arc<Directory>> {
-        if let Some(tree) = self.trees.get(oid) {
-            self.metrics.cache_hits += 1;
+        if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
+            if first {
+                self.metrics.tree_reads += 1;
+            } else {
+                self.metrics.cache_hits += 1;
+            }
             return Ok(tree);
         }
-        if let Some(raw) = self
-            .raw_store()
-            .map(|store| store.get(oid))
-            .transpose()?
-            .flatten()
-        {
-            anyhow::ensure!(
-                raw.kind() == ObjectType::Tree,
-                "snapshot directory does not reference a tree"
-            );
-            if let Some(tree) = self
-                .prepared_trees
-                .as_ref()
-                .map(|store| store.open(oid, raw))
-                .transpose()?
-                .flatten()
-            {
-                self.metrics.cache_hits += 1;
-                let tree = Arc::new(tree);
-                self.trees.insert(oid, tree.clone(), tree.weight());
-                return Ok(tree);
-            }
-        }
         self.ensure(oid)?;
+        if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
+            self.metrics.tree_reads += u64::from(first);
+            return Ok(tree);
+        }
         if self.remote.is_none() && self.raw_blobs.is_none() {
             self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
         }
-        let raw = if let Some(raw) = self.raw_store().unwrap().get(oid)? {
+        let odb = self.repo.odb()?;
+        let storage = if let Some(remote) = &mut self.remote {
+            &mut remote.raw_blobs
+        } else {
+            self.raw_blobs.as_mut().unwrap()
+        };
+        if let Ok((reader, size, kind)) = odb.reader(oid) {
             anyhow::ensure!(
-                raw.kind() == ObjectType::Tree,
+                kind == ObjectType::Tree,
                 "snapshot directory does not reference a tree"
             );
-            raw
+            storage.insert_tree(oid, size, reader, &self.spool_directory)?;
         } else {
-            let odb = self.repo.odb()?;
-            let storage = if let Some(remote) = &mut self.remote {
-                &mut remote.raw_blobs
-            } else {
-                self.raw_blobs.as_mut().unwrap()
-            };
-            let decoded = if let Ok((reader, size, kind)) = odb.reader(oid) {
-                anyhow::ensure!(
-                    kind == ObjectType::Tree,
-                    "snapshot directory does not reference a tree"
-                );
-                storage.insert_tree(oid, size, reader, &self.spool_directory)?
-            } else {
-                let object = odb.read(oid).context("decode snapshot tree")?;
-                anyhow::ensure!(
-                    object.kind() == ObjectType::Tree,
-                    "snapshot directory does not reference a tree"
-                );
-                storage.insert_tree(oid, object.len(), object.data(), &self.spool_directory)?
-            };
-            decoded
-        };
-        let storage = self
-            .remote
-            .as_ref()
-            .map(|remote| &remote.raw_blobs)
-            .or(self.raw_blobs.as_ref())
-            .unwrap();
-        if self.prepared_trees.is_none() {
-            self.prepared_trees = Some(PreparedTrees::new(storage, &self.spool_directory)?);
+            let object = odb.read(oid).context("decode snapshot tree")?;
+            anyhow::ensure!(
+                object.kind() == ObjectType::Tree,
+                "snapshot directory does not reference a tree"
+            );
+            storage.insert_tree(oid, object.len(), object.data(), &self.spool_directory)?;
         }
-        self.metrics.tree_reads += 1;
-        let tree = self.prepared_trees.as_mut().unwrap().prepare(
-            oid,
-            raw,
-            storage,
-            &self.spool_directory,
-            self.trees.byte_limit,
-        )?;
-        let tree = Arc::new(tree);
-        self.trees.insert(oid, tree.clone(), tree.weight());
+        let (tree, first) = storage
+            .directory(oid)
+            .context("verified directory missing")?;
+        self.metrics.tree_reads += u64::from(first);
         Ok(tree)
     }
     fn size(&mut self, oid: Oid) -> Result<u64> {
-        if let Some(size) = self.headers.get(oid) {
+        if let Some(size) = self.headers.get(&oid).copied() {
             self.metrics.cache_hits += 1;
             return Ok(size);
         }
@@ -504,7 +403,7 @@ impl State {
                 "snapshot file does not reference a blob"
             );
             let size = raw.len();
-            self.headers.insert(oid, size, std::mem::size_of::<u64>());
+            self.headers.insert(oid, size);
             return Ok(size);
         }
         let (size, kind) = self
@@ -516,10 +415,12 @@ impl State {
             bail!("snapshot file does not reference a blob");
         }
         let size = size as u64;
-        self.headers.insert(oid, size, std::mem::size_of::<u64>());
+        self.headers.insert(oid, size);
         Ok(size)
     }
     fn open(&mut self, oid: Oid) -> Result<BlobReader> {
+        #[cfg(feature = "test-metrics")]
+        let _profile = crate::profile::span("snapshot_open", 0);
         let existing = self
             .readers
             .lock()
@@ -530,104 +431,79 @@ impl State {
             self.metrics.cache_hits += 1;
             return Ok(BlobReader(reader));
         }
-        let data = if let Some(bytes) = self.blobs.get(oid) {
-            self.metrics.cache_hits += 1;
-            let raw = if let Some(remote) = &self.remote {
-                remote.raw_blobs.get(oid)?
-            } else {
-                self.raw_blobs
-                    .as_ref()
-                    .map(|raw| raw.get(oid))
-                    .transpose()?
-                    .flatten()
-            }
-            .context("cached blob has no prepared raw storage")?;
-            BlobData::Memory {
-                bytes: Arc::downgrade(&bytes),
-                raw,
-            }
-        } else {
-            let raw = if let Some(remote) = &mut self.remote {
-                remote.ensure_in(&self.repo, oid)?;
-                let (raw, first) = remote
-                    .raw_blobs
-                    .for_read(oid)?
-                    .context("snapshot file does not reference a blob")?;
-                if first {
-                    self.metrics.blob_loads += 1;
-                    self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(raw.len());
-                    if raw.len() > self.blobs.byte_limit as u64 {
-                        self.metrics.spool_writes += 1;
-                        self.metrics.spool_bytes =
-                            self.metrics.spool_bytes.saturating_add(raw.len());
-                    }
-                } else {
-                    self.metrics.cache_hits += 1;
-                }
-                raw
-            } else if let Some(raw) = self
+        let raw = if let Some(remote) = &mut self.remote {
+            remote.ensure_in(&self.repo, oid)?;
+            let (raw, first) = remote
                 .raw_blobs
-                .as_ref()
-                .map(|raw| raw.get(oid))
-                .transpose()?
-                .flatten()
-            {
-                self.metrics.cache_hits += 1;
-                raw
-            } else {
-                let (size, kind) = self.repo.odb()?.read_header(oid)?;
-                anyhow::ensure!(
-                    kind == ObjectType::Blob,
-                    "snapshot file does not reference a blob"
-                );
-                if self.raw_blobs.is_none() {
-                    self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
-                }
-                let raw = self.raw_blobs.as_mut().unwrap();
-                let odb = self.repo.odb()?;
-                let (blob, streamed) = if let Ok((reader, length, kind)) = odb.reader(oid) {
-                    anyhow::ensure!(
-                        kind == ObjectType::Blob && length == size,
-                        "Git blob changed during transfer"
-                    );
-                    (raw.insert(oid, size, reader, &self.spool_directory)?, true)
-                } else {
-                    let object = odb.read(oid).context("decode Git blob")?;
-                    anyhow::ensure!(
-                        object.kind() == ObjectType::Blob && object.len() == size,
-                        "Git blob changed during transfer"
-                    );
-                    (
-                        raw.insert(oid, size, object.data(), &self.spool_directory)?,
-                        false,
-                    )
-                };
+                .for_read(oid)?
+                .context("snapshot file does not reference a blob")?;
+            if first {
                 self.metrics.blob_loads += 1;
-                self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
-                if size > self.blobs.byte_limit {
+                self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(raw.len());
+                if raw.len() > crate::raw_blob::BLOCK as u64 {
                     self.metrics.spool_writes += 1;
-                    self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
-                    self.metrics.streamed_blob_loads += u64::from(streamed);
+                    self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(raw.len());
                 }
-                blob
-            };
+            } else {
+                self.metrics.cache_hits += 1;
+            }
+            raw
+        } else if let Some(raw) = self
+            .raw_blobs
+            .as_ref()
+            .map(|raw| raw.get(oid))
+            .transpose()?
+            .flatten()
+        {
+            self.metrics.cache_hits += 1;
+            raw
+        } else {
+            let (size, kind) = self.repo.odb()?.read_header(oid)?;
             anyhow::ensure!(
-                raw.kind() == ObjectType::Blob,
+                kind == ObjectType::Blob,
                 "snapshot file does not reference a blob"
             );
-            if raw.len() <= self.blobs.byte_limit as u64 {
-                let bytes = raw.read_all()?;
-                Self::validate_blob(&bytes)?;
-                let bytes = Arc::<[u8]>::from(bytes);
-                self.blobs.insert(oid, bytes.clone(), bytes.len());
-                BlobData::Memory {
-                    bytes: Arc::downgrade(&bytes),
-                    raw,
-                }
-            } else {
-                BlobData::Stored(raw)
+            if self.raw_blobs.is_none() {
+                self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
             }
+            let raw = self.raw_blobs.as_mut().unwrap();
+            let odb = self.repo.odb()?;
+            let (blob, streamed) = if let Ok((reader, length, kind)) = odb.reader(oid) {
+                anyhow::ensure!(
+                    kind == ObjectType::Blob && length == size,
+                    "Git blob changed during transfer"
+                );
+                (raw.insert(oid, size, reader, &self.spool_directory)?, true)
+            } else {
+                let object = odb.read(oid).context("decode Git blob")?;
+                anyhow::ensure!(
+                    object.kind() == ObjectType::Blob && object.len() == size,
+                    "Git blob changed during transfer"
+                );
+                (
+                    raw.insert(oid, size, object.data(), &self.spool_directory)?,
+                    false,
+                )
+            };
+            self.metrics.blob_loads += 1;
+            self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
+            if size > crate::raw_blob::BLOCK {
+                self.metrics.spool_writes += 1;
+                self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
+                self.metrics.streamed_blob_loads += u64::from(streamed);
+            }
+            blob
         };
+        anyhow::ensure!(
+            raw.kind() == ObjectType::Blob,
+            "snapshot file does not reference a blob"
+        );
+        // Only a complete LFS pointer can need this bounded validation. A cold
+        // partial read must not hydrate or authenticate the whole object.
+        if raw.len() < 1024 {
+            Self::validate_blob(&raw.read_all()?)?;
+        }
+        let data = raw;
         let reader = Arc::new(ActiveBlob {
             oid,
             data,
@@ -649,13 +525,7 @@ impl State {
     /// and symlink targets). Ordinary ranged reads use BlobReader directly.
     fn with_blob<T>(&mut self, oid: Oid, consume: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
         let reader = self.open(oid)?;
-        match &reader.0.data {
-            BlobData::Memory { bytes, raw } => match bytes.upgrade() {
-                Some(bytes) => consume(&bytes),
-                None => consume(&raw.read_all()?),
-            },
-            BlobData::Stored(raw) => consume(&raw.read_all()?),
-        }
+        consume(&reader.0.data.read_all()?)
     }
 }
 struct Inner {
@@ -808,10 +678,7 @@ impl Snapshot {
                 state: Mutex::new(State {
                     repo,
                     remote,
-                    trees: Cache::new(TREE_CACHE_BYTES, TREE_CACHE_ENTRIES),
-                    prepared_trees: None,
-                    headers: Cache::new(HEADER_CACHE_ENTRIES * 8, HEADER_CACHE_ENTRIES),
-                    blobs: Cache::new(BLOB_CACHE_BYTES, BLOB_CACHE_ENTRIES),
+                    headers: HashMap::new(),
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
                     metrics: SnapshotMetrics::default(),
@@ -871,12 +738,7 @@ impl Snapshot {
                 bail!("snapshot ancestor is not a directory: {}", path.display());
             }
             let tree = state.tree(entry.oid)?;
-            let Some(item) = state
-                .prepared_trees
-                .as_ref()
-                .unwrap()
-                .lookup(entry.oid, &tree, name)?
-            else {
+            let Some(item) = tree.lookup(name) else {
                 return Ok(None);
             };
             entry = Self::metadata(&item, path)?;
@@ -1009,6 +871,10 @@ impl Snapshot {
     pub fn metrics(&self) -> SnapshotMetrics {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut metrics = state.metrics.clone();
+        #[cfg(feature = "test-metrics")]
+        {
+            metrics.profile_spans = crate::profile::summary();
+        }
         if let Some(remote) = &state.remote {
             metrics.remote_fetches = remote.completed_fetches();
             metrics.remote_fetch_operations = remote.fetch_operations();
@@ -1020,25 +886,34 @@ impl Snapshot {
             ) = remote.session_operations();
             metrics.remote_raw_blob_imports = remote.raw_blobs.entries();
             metrics.remote_raw_blob_bytes = remote.raw_blobs.bytes();
-            metrics.retained_raw_blob_bytes = remote.raw_blobs.bytes();
-            metrics.retained_raw_blob_entries = remote.raw_blobs.entries();
+            let (bytes, entries) = remote.raw_blobs.disk_metrics();
+            metrics.retained_raw_blob_bytes = bytes;
+            metrics.retained_raw_blob_entries = entries;
         }
-        metrics.blob_cache_bytes = state.blobs.bytes;
-        metrics.blob_cache_entries = state.blobs.values.len();
-        metrics.blob_cache_limit = state.blobs.byte_limit;
-        if let Some(store) = &state.prepared_trees {
-            metrics.prepared_tree_entries = store.entries();
-            metrics.retained_tree_bytes = state.raw_store().map_or(0, |raw| raw.tree_bytes());
-            metrics.tree_index_probes = store.probes();
+        let (memory_bytes, memory_entries) = state
+            .raw_store()
+            .map_or((0, 0), |store| store.memory_metrics());
+        metrics.blob_cache_bytes = memory_bytes;
+        metrics.blob_cache_entries = memory_entries;
+        metrics.blob_cache_limit = BLOB_CACHE_BYTES;
+        if let Some(raw) = state.raw_store() {
+            let (entries, bytes, count) = raw.tree_metrics();
+            metrics.prepared_tree_entries = entries;
+            metrics.tree_cache_bytes = bytes;
+            metrics.tree_cache_entries = count;
+            metrics.verification_metadata_bytes = raw.verification_bytes();
         }
-        metrics.tree_cache_bytes = state.trees.bytes;
-        metrics.tree_cache_entries = state.trees.values.len();
-        metrics.tree_cache_limit = state.trees.byte_limit;
-        metrics.header_cache_entries = state.headers.values.len();
+        // Parsed metadata is invocation-local and retained for touched OIDs;
+        // it is not part of the byte-budgeted payload LRU.
+        metrics.tree_cache_limit = 0;
+        metrics.header_cache_entries = state.headers.len();
         if let Some(raw) = &state.raw_blobs {
-            metrics.retained_raw_blob_bytes += raw.bytes();
-            metrics.retained_raw_blob_entries += raw.entries();
+            let (bytes, entries) = raw.disk_metrics();
+            metrics.retained_raw_blob_bytes += bytes;
+            metrics.retained_raw_blob_entries += entries;
         }
+        metrics.spool_bytes = metrics.retained_raw_blob_bytes;
+        metrics.spool_writes = metrics.retained_raw_blob_entries;
         // Drop the registry lock before dropping any upgraded reader: its last
         // owner removes itself from that registry, even during metrics sampling.
         let readers: Vec<_> = state
@@ -1050,8 +925,9 @@ impl Snapshot {
             .collect();
         for reader in readers {
             metrics.active_blob_readers += 1;
-            if let BlobData::Stored(blob) = &reader.data {
-                metrics.active_spool_bytes = metrics.active_spool_bytes.saturating_add(blob.len());
+            if reader.data.on_disk() {
+                metrics.active_spool_bytes =
+                    metrics.active_spool_bytes.saturating_add(reader.data.len());
             }
         }
         metrics
@@ -1395,7 +1271,6 @@ mod tests {
             "oversized-metadata",
         )
         .unwrap();
-        snapshot.state().unwrap().trees = Cache::new(128, 1);
         for index in 0..20 {
             assert_eq!(
                 snapshot
@@ -1418,7 +1293,6 @@ mod tests {
     fn metadata_eviction_keeps_prepared_directory_entries_available() {
         let (tmp, _) = fixture();
         let snapshot = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "metadata-eviction").unwrap();
-        snapshot.state().unwrap().trees = Cache::new(TREE_CACHE_BYTES, 1);
         assert_eq!(
             snapshot
                 .entry(Path::new("dir/child"))
@@ -1447,6 +1321,118 @@ mod tests {
         );
     }
     #[test]
+    fn fitting_small_working_set_uses_byte_budget_without_early_disk_spill() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "resident-working-set").unwrap();
+        for index in 0..160u32 {
+            let mut bytes = vec![0; 8192];
+            bytes[..4].copy_from_slice(&index.to_le_bytes());
+            let oid = repo.blob(&bytes).unwrap();
+            assert_eq!(snap.read(oid, 0, 8192).unwrap(), bytes);
+        }
+        assert_eq!(
+            snap.metrics().blob_cache_entries,
+            160,
+            "an unrelated entry cap evicted fitting blobs"
+        );
+        assert_eq!(
+            snap.metrics().retained_raw_blob_bytes,
+            0,
+            "resident blobs were written eagerly"
+        );
+        assert!(snap.metrics().blob_cache_bytes <= snap.metrics().blob_cache_limit);
+    }
+    #[test]
+    fn tiny_reopened_reads_of_spilled_blobs_do_not_refill_entire_objects() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "range-refill").unwrap();
+        let oid = repo.blob(&vec![b'z'; 1024 * 1024]).unwrap();
+        assert_eq!(snap.read(oid, 0, 1).unwrap(), b"z");
+        for index in 0..20u8 {
+            let other = repo.blob(&vec![index; 1024 * 1024]).unwrap();
+            assert_eq!(snap.read(other, 0, 1).unwrap(), [index]);
+        }
+        snap.state()
+            .unwrap()
+            .raw_blobs
+            .as_mut()
+            .unwrap()
+            .evict_all_for_test()
+            .unwrap();
+        let before = snap
+            .state()
+            .unwrap()
+            .raw_blobs
+            .as_ref()
+            .unwrap()
+            .tested_authenticated_bytes();
+        for offset in [100, 8192, 500_000] {
+            assert_eq!(snap.read(oid, offset, 1).unwrap(), b"z");
+        }
+        let after = snap
+            .state()
+            .unwrap()
+            .raw_blobs
+            .as_ref()
+            .unwrap()
+            .tested_authenticated_bytes();
+        assert_eq!(
+            after - before,
+            2 * crate::raw_blob::BLOCK as u64,
+            "tiny reads authenticated whole objects again"
+        );
+        assert_eq!(
+            snap.metrics().blob_loads,
+            21,
+            "a prepared source was decoded again"
+        );
+    }
+    #[test]
+    fn memory_hits_do_not_probe_the_disk_locator_and_evicted_readers_still_verify() {
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "cached-locator").unwrap();
+        let bytes = b"retained memory bytes";
+        let oid = repo.blob(bytes).unwrap();
+        assert_eq!(snap.read(oid, 0, 1024).unwrap(), bytes);
+        for _ in 0..64 {
+            assert_eq!(snap.read(oid, 0, 1024).unwrap(), bytes);
+        }
+        assert_eq!(snap.metrics().blob_loads, 1);
+        assert_eq!(snap.metrics().retained_raw_blob_bytes, 0);
+        let reader = snap.open(oid).unwrap();
+        snap.state()
+            .unwrap()
+            .raw_blobs
+            .as_mut()
+            .unwrap()
+            .evict_all_for_test()
+            .unwrap();
+        assert_eq!(reader.read(0, 1024).unwrap(), bytes);
+        // The retained locator is trusted memory; underlying bytes still pass
+        // through block authentication after memory-cache eviction.
+        let raw = snap
+            .state()
+            .unwrap()
+            .raw_blobs
+            .as_ref()
+            .unwrap()
+            .get(oid)
+            .unwrap()
+            .unwrap();
+        raw.corrupt_for_test().unwrap();
+        snap.state()
+            .unwrap()
+            .raw_blobs
+            .as_mut()
+            .unwrap()
+            .evict_all_for_test()
+            .unwrap();
+        assert!(reader.read(0, 1024).is_err());
+    }
+    #[test]
     fn reader_registry_releases_closed_entries_without_another_open() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
@@ -1464,22 +1450,16 @@ mod tests {
         let repo = Repository::open(tmp.path()).unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "active-memory").unwrap();
         let mut readers = Vec::new();
-        for byte in 0..12u8 {
+        for byte in 0..20u8 {
             let oid = repo.blob(&vec![byte; 1024 * 1024]).unwrap();
             readers.push(snap.open(oid).unwrap());
         }
-        let state = snap.state().unwrap();
         assert!(
-            state
-                .blobs
-                .values
-                .iter()
-                .all(|(_, (bytes, _))| Arc::strong_count(bytes) == 1),
-            "active readers retained full payloads outside the bounded RAM cache"
+            snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES,
+            "active readers pinned payloads outside the RAM budget"
         );
-        drop(state);
         assert_eq!(readers[0].read(0, 1).unwrap(), [0]);
-        assert_eq!(snap.metrics().blob_loads, 12);
+        assert_eq!(snap.metrics().blob_loads, 20);
     }
     #[test]
     fn blob_cache_is_bounded_and_large_partial_reads_bypass_retention() {
@@ -1487,14 +1467,15 @@ mod tests {
         let repo = Repository::open(tmp.path()).unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "bounded").unwrap();
         let mut ids = Vec::new();
-        for n in 0..12u8 {
-            let data = vec![n; 1024 * 1024];
+        for n in 0..300u32 {
+            let mut data = vec![n as u8; crate::raw_blob::BLOCK];
+            data[..4].copy_from_slice(&n.to_le_bytes());
             let oid = repo.blob(&data).unwrap();
             ids.push(oid);
-            assert_eq!(snap.read(oid, 8192, 1).unwrap(), vec![n]);
+            assert_eq!(snap.read(oid, 8192, 1).unwrap(), vec![n as u8]);
             assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
         }
-        assert_eq!(snap.metrics().blob_cache_bytes, BLOB_CACHE_BYTES);
+        assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
         let loads = snap.metrics().blob_loads;
         snap.read(*ids.last().unwrap(), 0, 1).unwrap();
         assert_eq!(snap.metrics().blob_loads, loads);
@@ -1507,35 +1488,38 @@ mod tests {
         let large = repo.blob(&vec![b'x'; BLOB_CACHE_BYTES + 1]).unwrap();
         let retained = snap.metrics().blob_cache_bytes;
         assert_eq!(snap.read(large, 1000, 5).unwrap(), b"xxxxx");
-        assert_eq!(snap.metrics().blob_cache_bytes, retained);
-        assert!(!snap.state().unwrap().blobs.values.contains(&large));
+        assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
+        assert!(snap.metrics().blob_cache_bytes <= retained + crate::raw_blob::BLOCK + 512);
+        assert!(snap.open(large).unwrap().0.data.on_disk());
     }
     #[test]
-    fn cache_entry_limits_bound_empty_blobs_and_directory_metadata() {
-        let mut cache = Cache::new(4, 2);
-        let ids = [
-            Oid::from_bytes(&[1; 20]).unwrap(),
-            Oid::from_bytes(&[2; 20]).unwrap(),
-            Oid::from_bytes(&[3; 20]).unwrap(),
-        ];
-        cache.insert(ids[0], (), 0);
-        cache.insert(ids[1], (), 0);
-        cache.get(ids[0]);
-        cache.insert(ids[2], (), 0);
-        assert!(cache.get(ids[1]).is_none());
-        assert_eq!(cache.values.len(), 2);
+    fn touched_directories_stay_prepared_without_an_entry_cap() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
-        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "tree-bounds").unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "tree-reuse").unwrap();
         let blob = repo.blob(b"x").unwrap();
-        for i in 0..TREE_CACHE_ENTRIES + 10 {
+        let mut ids = Vec::new();
+        for i in 0..300 {
             let mut tree = repo.treebuilder(None).unwrap();
             tree.insert(format!("file-{i}"), blob, 0o100644).unwrap();
-            snap.state().unwrap().tree(tree.write().unwrap()).unwrap();
+            let id = tree.write().unwrap();
+            snap.state().unwrap().tree(id).unwrap();
+            ids.push(id);
+        }
+        for id in ids {
+            snap.state().unwrap().tree(id).unwrap();
         }
         let stats = snap.metrics();
-        assert_eq!(stats.tree_cache_entries, TREE_CACHE_ENTRIES);
-        assert!(stats.tree_cache_bytes <= TREE_CACHE_BYTES);
+        assert_eq!(stats.tree_cache_entries, 300);
+        assert_eq!(
+            stats.tree_reads, 300,
+            "already prepared trees were decoded again"
+        );
+        assert_eq!(stats.prepared_tree_entries, 300);
+        assert_eq!(
+            stats.retained_tree_bytes, 0,
+            "raw trees were retained on disk"
+        );
     }
     #[test]
     fn active_large_blob_reader_decodes_once_and_releases_active_accounting() {
@@ -1557,7 +1541,7 @@ mod tests {
         assert_eq!(snap.metrics().blob_loads, 1);
         assert_eq!(snap.metrics().spool_writes, 1);
         assert_eq!(snap.metrics().active_spool_bytes, size as u64);
-        assert_eq!(snap.metrics().blob_cache_bytes, 0);
+        assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
         drop(reader);
         assert_eq!(snap.metrics().active_spool_bytes, size as u64);
         drop(second);
@@ -1576,7 +1560,7 @@ mod tests {
             assert_eq!(reader.read(offset, 1).unwrap(), b"x");
             drop(reader);
             assert_eq!(snap.metrics().active_blob_readers, 0);
-            assert_eq!(snap.metrics().blob_cache_bytes, 0);
+            assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
             assert_eq!(snap.metrics().spool_writes, 1);
             assert_eq!(snap.metrics().blob_loads, 1);
         }

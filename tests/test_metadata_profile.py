@@ -24,6 +24,8 @@ class MetadataProfileTests(unittest.TestCase):
         good=dict(child_observations=[dict(completed=phase,operations=7,payload_bytes=7,metadata_result_bytes=1008) for phase in ('first','repeat')],
             metrics=dict(tree_reads=1,prepared_tree_entries=100000,blob_loads=1,tree_cache_bytes=216,tree_cache_limit=4194304,blob_cache_bytes=1,blob_cache_limit=8388608),fuse_requests={'read':1})
         validate_runner(good,100000,7,144,'fuse')
+        retained=copy.deepcopy(good);retained['metrics']['tree_cache_limit']=0
+        validate_runner(retained,100000,7,144,'fuse')
         for key in ('tree_reads','prepared_tree_entries','blob_loads','tree_cache_bytes','blob_cache_bytes'):
             bad=copy.deepcopy(good)
             bad['metrics'][key]=100000000

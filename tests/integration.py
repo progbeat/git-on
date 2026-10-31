@@ -288,6 +288,56 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes(self):
+        data=b'a'*8192
+        (self.repo/'cached-source').write_bytes(data)
+        git(self.repo,'add','cached-source');git(self.repo,'commit','-qm','cache coherence fixture')
+        code=r'''
+import mmap,os
+from pathlib import Path
+p=Path('cached-source')
+reader=os.open(p,os.O_RDONLY)
+mapping=mmap.mmap(reader,8192,access=mmap.ACCESS_READ)
+assert mapping[:]==b'a'*8192
+assert p.read_bytes()==b'a'*8192  # warm pages, close and reopen
+writer=os.open(p,os.O_RDWR)
+try:
+ os.pwrite(writer,b'b'*8192,0)
+ assert os.pread(reader,8192,0)==b'b'*8192 and mapping[:]==b'b'*8192
+ assert p.read_bytes()==b'b'*8192
+ os.pwrite(writer,b'tail',8192)
+ assert os.fstat(reader).st_size==8196 and p.read_bytes()==b'b'*8192+b'tail'
+ os.ftruncate(writer,4096)
+ assert os.fstat(reader).st_size==4096 and os.pread(reader,8192,0)==b'b'*4096
+ os.ftruncate(writer,8192)
+ assert mapping[:]==b'b'*4096+b'\0'*4096
+ with mmap.mmap(writer,8192,access=mmap.ACCESS_WRITE) as writable:
+  writable[32:36]=b'mmap';writable.flush()
+ assert mapping[32:36]==b'mmap' and os.pread(reader,4,32)==b'mmap'
+ os.chmod(p,0o600)
+ os.link(p,'cached-alias');p.rename('cached-moved')
+ p=Path('cached-moved')
+ assert Path('cached-alias').read_bytes()==p.read_bytes()
+ Path('replacement.tmp').write_bytes(b'replacement')
+ os.replace('replacement.tmp',p)
+ assert p.read_bytes()==b'replacement' and mapping[32:36]==b'mmap'
+ Path('cached-alias').unlink()
+ os.pwrite(writer,b'last',0)
+ assert os.pread(reader,4,0)==b'last' and mapping[:4]==b'last'
+ assert os.fstat(reader).st_nlink==0
+finally:
+ mapping.close();os.close(writer);os.close(reader)
+# O_TRUNC must invalidate untouched source pages kept by an earlier readonly open.
+p=Path('tracked.txt')
+assert p.read_bytes()==b'committed\n'
+with p.open('wb') as f:f.write(b'new')
+assert p.read_bytes()==b'new'
+'''
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',sys.executable,'-c',code])
+        self.assert_success(result)
+        self.assertEqual((self.repo/'cached-source').read_bytes(),data)
+        self.assert_no_runtime_files()
+
     def test_local_unverified_run_requires_native_git_for_revision_resolution(self):
         programs = self.root / "fuse-only"
         programs.mkdir()

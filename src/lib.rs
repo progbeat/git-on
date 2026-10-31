@@ -7,6 +7,9 @@ pub mod materialize;
 pub mod object;
 pub mod platform;
 pub mod policy;
+#[cfg(feature = "test-metrics")]
+#[doc(hidden)]
+pub mod profile;
 mod progress;
 mod raw_blob;
 pub mod remote;

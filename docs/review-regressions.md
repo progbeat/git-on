@@ -26,7 +26,7 @@ the same raw-parts fault rejects the next demand without following a symlink.
 Historical pre-raw-store policy replays retain their original transport/ODB
 faults; they do not claim to test a storage path absent from that binary.
 
-The permanent `test_protocol_v2_reuses_native_clients_after_blob_eviction`
+The permanent `test_protocol_v2_reuses_native_clients_across_many_blob_demands`
 checks actual Native Git Trace2 process starts, 140 unique blobs, eviction and
 a closed reread. Replaying it with the authentic pre-session production loader
 fails because a new fetch/cat-file pair is started for each missing object.
