@@ -737,6 +737,17 @@ fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
         let name = std::str::from_utf8(&dirents(&page)[0].1)
             .unwrap()
             .to_owned();
+        let next_name = format!(
+            "file-{:05}",
+            name.strip_prefix("file-")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                + 1
+        );
+        let rejected = p.lookup(1, &next_name);
+        p.send(2, rejected, u64s(&[1]));
+        p.err(3, rejected, vec![0; 16], libc::ENOENT);
         p.ok(29, 1, u64s(&[first, 0, 0]));
         assert_eq!(
             p.lookup(1, &name),
@@ -771,9 +782,12 @@ fn protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_cl
     let (late, late_fh) = p.create("late");
     p.release(late, late_fh);
     let latest = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-    p.ok(29, 1, u64s(&[latest, 0, 0]));
+    let latest_rows = dirents(&p.ok(28, 1, io(latest, 0, 4096, 0)));
+    assert!(latest_rows.iter().any(|(_, name)| name == b"late"));
     p.ok(10, 1, names(vec![], &["late"]));
     p.send(2, late, u64s(&[1]));
+    p.ok(3, late, vec![0; 16]);
+    p.ok(29, 1, u64s(&[latest, 0, 0]));
     p.err(3, late, vec![0; 16], libc::ENOENT);
     p.ok(10, 1, names(vec![], &["renamed"]));
     assert_eq!(p.ok(28, 1, io(old, 0, 4096, 0)), before);

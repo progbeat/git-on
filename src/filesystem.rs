@@ -33,7 +33,6 @@ struct Node {
     oid: Option<Oid>,
     lookups: u64,
     snapshot_path: Option<PathBuf>,
-    source_parent: Option<usize>,
     bytes: Vec<u8>,
     file: Option<File>,
     external_io: bool,
@@ -52,7 +51,6 @@ struct Handle {
 struct SourceDirectory {
     tree: Arc<crate::tree::Directory>,
     base: u64,
-    owner: Option<u64>,
 }
 enum DirectoryEntries {
     Source(usize),
@@ -66,12 +64,11 @@ struct DirectoryCache {
     valid: bool,
     view: Arc<DirectoryView>,
 }
-#[derive(Default)]
-struct DirectoryPins {
-    handles: usize,
-    // Only actual forgotten or removed nodes need lifetime accounting. Work
-    // releasing these pins is charged to those events, not all unseen names.
-    deferred: HashSet<u64>,
+struct DirectoryHandle {
+    view: Arc<DirectoryView>,
+    // Acquire a pin only after a row fits the reply. Replayed cookies do not
+    // acquire another pin; unread siblings have no retained reference.
+    seen: HashSet<u64>,
 }
 
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
@@ -98,16 +95,11 @@ pub struct Overlay {
     inode_handles: HashMap<u64, u64>,
     #[cfg(test)]
     handle_scan_steps: std::cell::Cell<usize>,
-    directories: HashMap<u64, Arc<DirectoryView>>,
+    directories: HashMap<u64, DirectoryHandle>,
     directory_cache: HashMap<u64, DirectoryCache>,
     dirty_directories: HashSet<u64>,
-    directory_pins: HashMap<u64, DirectoryPins>,
     source_directories: Vec<SourceDirectory>,
     source_directory_keys: HashMap<PathBuf, usize>,
-    // Binding creation is ordered by the next handle ID. An active directory
-    // snapshot contains a still-present binding iff it opened after that birth.
-    // Source names start at zero; only created/renamed/link names need entries.
-    binding_birth: HashMap<u64, HashMap<OsString, u64>>,
     #[cfg(test)]
     directory_prepared_rows: usize,
     next_ino: u64,
@@ -181,7 +173,6 @@ impl Overlay {
                 oid: Some(snapshot.tree_oid),
                 lookups: 1,
                 snapshot_path: Some(PathBuf::new()),
-                source_parent: None,
                 bytes: Vec::new(),
                 file: None,
                 external_io: false,
@@ -207,10 +198,8 @@ impl Overlay {
             directories: HashMap::new(),
             directory_cache: HashMap::new(),
             dirty_directories: HashSet::new(),
-            directory_pins: HashMap::new(),
             source_directories: Vec::new(),
             source_directory_keys: HashMap::new(),
-            binding_birth: HashMap::new(),
             #[cfg(test)]
             directory_prepared_rows: 0,
             next_ino: 2,
@@ -276,7 +265,6 @@ impl Overlay {
                 oid: Some(entry.oid),
                 lookups: 0,
                 snapshot_path: Some(source),
-                source_parent: Some(source_parent),
                 bytes: Vec::new(),
                 file: None,
                 external_io: false,
@@ -307,12 +295,6 @@ impl Overlay {
             .get(&ino)
             .is_none_or(|n| n.lookups == 0 && (n.immutable || n.attr.nlink == 0));
         if removable {
-            if self.nodes.get(&ino).is_some_and(|node| node.attr.nlink > 0) {
-                self.pin_source_child(ino);
-            }
-            if self.directory_refs.get(&ino).copied().unwrap_or(0) > 0 {
-                return;
-            }
             if self
                 .nodes
                 .get(&ino)
@@ -338,77 +320,9 @@ impl Overlay {
             .checked_add(u64::try_from(tree.len()).map_err(|_| libc::ENOSPC)?)
             .ok_or(libc::ENOSPC)?;
         let key = self.source_directories.len();
-        self.source_directories.push(SourceDirectory {
-            tree,
-            base,
-            owner: None,
-        });
+        self.source_directories.push(SourceDirectory { tree, base });
         self.source_directory_keys.insert(source.to_path_buf(), key);
         Ok(key)
-    }
-    fn pin_directory_child(&mut self, parent: u64, child: u64) {
-        if self
-            .directory_pins
-            .get_mut(&parent)
-            .is_some_and(|pins| pins.deferred.insert(child))
-        {
-            *self.directory_refs.entry(child).or_default() += 1;
-        }
-    }
-    fn pin_source_child(&mut self, ino: u64) {
-        let parent = self
-            .nodes
-            .get(&ino)
-            .and_then(|node| node.source_parent)
-            .and_then(|key| self.source_directories[key].owner);
-        if let Some(parent) = parent {
-            self.pin_directory_child(parent, ino);
-        }
-    }
-    fn pin_removed_binding(&mut self, path: &Path, ino: u64) {
-        let Some(parent) = path.parent().and_then(|path| self.paths.get(path)).copied() else {
-            return;
-        };
-        let Some(name) = path.file_name() else {
-            return;
-        };
-        let birth = self
-            .binding_birth
-            .get(&parent)
-            .and_then(|names| names.get(name))
-            .copied()
-            .unwrap_or(0);
-        // The intrusive handle list is in creation order, so its head is the
-        // latest still-open view. No scan over handles or directory entries.
-        if self
-            .inode_handles
-            .get(&parent)
-            .is_some_and(|handle| *handle >= birth)
-        {
-            self.pin_directory_child(parent, ino);
-        }
-    }
-    fn added_binding(&mut self, path: &Path) {
-        if let Some(parent) = path.parent().and_then(|path| self.paths.get(path)).copied() {
-            if let Some(name) = path.file_name() {
-                self.binding_birth
-                    .entry(parent)
-                    .or_default()
-                    .insert(name.to_os_string(), self.next_handle);
-            }
-        }
-    }
-    fn removed_binding(&mut self, path: &Path) {
-        if let Some(parent) = path.parent().and_then(|path| self.paths.get(path)).copied() {
-            if let Some(names) = self.binding_birth.get_mut(&parent) {
-                if let Some(name) = path.file_name() {
-                    names.remove(name);
-                }
-                if names.is_empty() {
-                    self.binding_birth.remove(&parent);
-                }
-            }
-        }
     }
     fn release_directory_ref(&mut self, ino: u64) {
         if let Some(count) = self.directory_refs.get_mut(&ino) {
@@ -451,9 +365,6 @@ impl Overlay {
                 .clone()
                 .map(|source| self.source_directory(&source))
                 .transpose()?;
-            if let Some(key) = source {
-                self.source_directories[key].owner = Some(ino);
-            }
             let entries =
                 if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
                     DirectoryEntries::Source(key)
@@ -518,11 +429,16 @@ impl Overlay {
             view
         };
         let fh = self.new_handle(ino, flags);
-        self.directory_pins.entry(ino).or_default().handles += 1;
         // Dot entries have constant-size lifetime accounting.
         *self.directory_refs.entry(ino).or_default() += 1;
         *self.directory_refs.entry(parent).or_default() += 1;
-        self.directories.insert(fh, view);
+        self.directories.insert(
+            fh,
+            DirectoryHandle {
+                view,
+                seen: HashSet::new(),
+            },
+        );
         Ok(fh)
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
@@ -545,23 +461,12 @@ impl Overlay {
                     .previous = handle.previous;
             }
         }
-        if let Some(view) = self.directories.remove(&fh) {
-            let pins = self
-                .directory_pins
-                .get_mut(&ino)
-                .expect("open directory pin group");
-            pins.handles -= 1;
-            if pins.handles == 0 {
-                let pins = self
-                    .directory_pins
-                    .remove(&ino)
-                    .expect("last directory pin group");
-                for child in pins.deferred {
-                    self.release_directory_ref(child);
-                }
+        if let Some(directory) = self.directories.remove(&fh) {
+            for child in directory.seen {
+                self.release_directory_ref(child);
             }
             self.release_directory_ref(ino);
-            self.release_directory_ref(view.parent);
+            self.release_directory_ref(directory.view.parent);
         }
         if !self.has_open_handle(ino) {
             if let Some(n) = self.nodes.get_mut(&ino) {
@@ -834,7 +739,6 @@ impl Overlay {
                 oid: None,
                 lookups: 0,
                 snapshot_path: None,
-                source_parent: None,
                 bytes,
                 file: None,
                 external_io: false,
@@ -846,7 +750,6 @@ impl Overlay {
             self.adjust_parent_links(&p, 1);
         }
         self.touch_parent(&p);
-        self.added_binding(&p);
         Ok(ino)
     }
     fn new_handle(&mut self, ino: u64, flags: i32) -> u64 {
@@ -1126,9 +1029,6 @@ impl Overlay {
         Ok(true)
     }
     fn remove_path(&mut self, p: &Path) -> FsResult<()> {
-        if let Some(ino) = self.paths.get(p).copied() {
-            self.pin_removed_binding(p, ino);
-        }
         if let Some(&ino) = self.paths.get(p) {
             let node = self.node(ino)?;
             if !node.immutable
@@ -1177,7 +1077,6 @@ impl Overlay {
         }
         // Keep inode objects and open descriptors for outstanding kernel inode
         // references and open-unlinked handles; all are reclaimed at unmount.
-        self.removed_binding(p);
         Ok(())
     }
     pub(crate) fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
@@ -1282,7 +1181,6 @@ impl Overlay {
             None
         };
         // Every namespace validation precedes copy-up or a visible mutation.
-        self.pin_removed_binding(&from, ino);
         self.copy_up(ino, true)?;
         if destination.is_some() {
             self.remove_path(&to)?;
@@ -1338,8 +1236,6 @@ impl Overlay {
         }
         self.touch_parent(&from);
         self.touch_parent(&to);
-        self.removed_binding(&from);
-        self.added_binding(&to);
         Ok(())
     }
     fn hardlink(&mut self, ino: u64, parent: u64, name: &OsStr) -> FsResult<()> {
@@ -1363,7 +1259,6 @@ impl Overlay {
         self.paths.insert(path.clone(), ino);
         self.upper_paths.insert(path.clone(), ino);
         self.touch_parent(&path);
-        self.added_binding(&path);
         Ok(())
     }
 }
@@ -1493,7 +1388,7 @@ impl Overlay {
         Ok(self.node(ino)?.attr)
     }
     pub(crate) fn read_directory(
-        &self,
+        &mut self,
         ino: u64,
         fh: u64,
         offset: u64,
@@ -1503,7 +1398,7 @@ impl Overlay {
         if offset > i64::MAX as u64 {
             return Err(libc::EINVAL);
         }
-        let view = self.directories.get(&fh).ok_or(libc::EBADF)?;
+        let view = self.directories.get(&fh).ok_or(libc::EBADF)?.view.clone();
         let source = match &view.entries {
             DirectoryEntries::Source(key) => Some(&self.source_directories[*key]),
             _ => None,
@@ -1535,6 +1430,16 @@ impl Overlay {
             };
             if emit(child, kind, name, index as u64 + 1) {
                 break;
+            }
+            if index >= 2
+                && self
+                    .directories
+                    .get_mut(&fh)
+                    .ok_or(libc::EBADF)?
+                    .seen
+                    .insert(child)
+            {
+                *self.directory_refs.entry(child).or_default() += 1;
             }
         }
         Ok(())
@@ -1690,7 +1595,7 @@ mod tests {
         assert_eq!(fs::read_dir(&overlay.backing).unwrap().count(), 0);
     }
 
-    fn directory_rows(fs: &Overlay, ino: u64, fh: u64) -> Vec<(u64, FileType, OsString)> {
+    fn directory_rows(fs: &mut Overlay, ino: u64, fh: u64) -> Vec<(u64, FileType, OsString)> {
         let mut rows = Vec::new();
         fs.read_directory(ino, fh, 0, |ino, kind, name, _| {
             rows.push((ino, kind, name.to_os_string()));
@@ -1920,7 +1825,7 @@ mod tests {
         assert_eq!(overlay.read_data(file, read, 0, 100).unwrap(), b"original");
         overlay.remove(source, OsStr::new("file"), false).unwrap();
         let directory = overlay.open_directory(source, libc::O_RDONLY).unwrap();
-        assert!(!directory_rows(&overlay, source, directory)
+        assert!(!directory_rows(&mut overlay, source, directory)
             .iter()
             .any(|(_, _, name)| name == "file"));
         overlay.close_handle(source, directory);
@@ -1940,7 +1845,7 @@ mod tests {
         let (temp, mut overlay) = directory_fixture();
         let source = overlay.ensure(Path::new("source")).unwrap();
         let handle = overlay.open_directory(source, libc::O_RDONLY).unwrap();
-        let reserved = directory_rows(&overlay, source, handle)
+        let reserved = directory_rows(&mut overlay, source, handle)
             .into_iter()
             .find(|(_, _, name)| name == "file")
             .unwrap()
@@ -1961,7 +1866,7 @@ mod tests {
             .rename_path(1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
             .unwrap();
         assert_eq!(
-            directory_rows(&overlay, source, handle)
+            directory_rows(&mut overlay, source, handle)
                 .into_iter()
                 .find(|(_, _, name)| name == "file")
                 .unwrap()
@@ -1988,7 +1893,7 @@ mod tests {
         assert_eq!(overlay.ensure(Path::new("tracked.tmp")).unwrap(), fresh);
         let directory = overlay.open_directory(1, libc::O_RDONLY).unwrap();
         assert_eq!(
-            directory_rows(&overlay, 1, directory)
+            directory_rows(&mut overlay, 1, directory)
                 .iter()
                 .filter(|(_, _, name)| name == "tracked.tmp")
                 .count(),
@@ -2423,7 +2328,35 @@ mod tests {
         }
     }
     #[test]
-    fn directory_pins_follow_live_snapshot_membership_not_inode_birth() {
+    fn closing_last_view_that_returned_a_deleted_entry_reclaims_its_inode() {
+        let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
+        let oldest = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let _ = directory_rows(&mut fs, 1, oldest);
+        for index in 0..16 {
+            let name = format!("late-{index}");
+            let ino = file(&mut fs, 1, &name);
+            let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
+            fs.write_data(ino, writer, 0, b"private bytes", 0, libc::O_RDWR)
+                .unwrap();
+            fs.close_handle(ino, writer);
+            let newest = fs.open_directory(1, libc::O_RDONLY).unwrap();
+            assert!(directory_rows(&mut fs, 1, newest)
+                .iter()
+                .any(|(id, _, n)| *id == ino && n == name.as_str()));
+            fs.remove(1, OsStr::new(&name), false).unwrap();
+            fs.reclaim(ino);
+            assert!(fs.nodes.get(&ino).unwrap().file.is_some());
+            fs.close_handle(1, newest);
+            assert!(
+                !fs.nodes.contains_key(&ino),
+                "an older view retained an entry it never returned"
+            );
+        }
+        fs.close_handle(1, oldest);
+        assert!(fs.directory_refs.is_empty());
+    }
+    #[test]
+    fn directory_pins_follow_returned_entries_and_handle_lifetimes() {
         let (_tmp, mut fs) = fixture_policy(WritePolicy::All);
         let old = file(&mut fs, 1, "old");
         let writer = fs.open_file(old, libc::O_RDWR).unwrap();
@@ -2434,6 +2367,7 @@ mod tests {
         let elsewhere = file(&mut fs, other, "earlier-inode");
         let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
         let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let _ = directory_rows(&mut fs, 1, first);
         let late = file(&mut fs, 1, "late");
         let newest = fs.open_directory(1, libc::O_RDONLY).unwrap();
         fs.close_handle(1, newest);
@@ -2455,7 +2389,7 @@ mod tests {
         fs.remove(1, OsStr::new("old"), false).unwrap();
         fs.reclaim(old);
         assert!(fs.nodes.contains_key(&old));
-        assert!(directory_rows(&fs, 1, first)
+        assert!(directory_rows(&mut fs, 1, first)
             .iter()
             .any(|(ino, _, name)| *ino == old && name == "old"));
         let reader = fs.open_file(old, libc::O_RDONLY).unwrap();
@@ -2466,7 +2400,6 @@ mod tests {
         fs.close_handle(1, first);
         assert!(!fs.nodes.contains_key(&old));
         assert!(fs.directory_refs.is_empty());
-        assert!(fs.directory_pins.is_empty());
     }
     #[test]
     fn source_directory_identity_survives_move_and_shared_tree_paths_stay_distinct() {
@@ -2475,8 +2408,8 @@ mod tests {
         let twin = fs.ensure(Path::new("untouched")).unwrap();
         let old = fs.open_directory(source, libc::O_RDONLY).unwrap();
         let twin_handle = fs.open_directory(twin, libc::O_RDONLY).unwrap();
-        let original = directory_rows(&fs, source, old);
-        let copy = directory_rows(&fs, twin, twin_handle);
+        let original = directory_rows(&mut fs, source, old);
+        let copy = directory_rows(&mut fs, twin, twin_handle);
         assert_ne!(
             original.iter().find(|(_, _, n)| n == "file").unwrap().0,
             copy.iter().find(|(_, _, n)| n == "file").unwrap().0
@@ -2485,7 +2418,7 @@ mod tests {
         fs.rename_path(1, OsStr::new("source"), destination, OsStr::new("moved"), 0)
             .unwrap();
         let new = fs.open_directory(source, libc::O_RDONLY).unwrap();
-        let moved = directory_rows(&fs, source, new);
+        let moved = directory_rows(&mut fs, source, new);
         assert_eq!(original[1].0, 1);
         assert_eq!(moved[1].0, destination);
         assert_eq!(
@@ -2508,7 +2441,7 @@ mod tests {
         let (_tmp, mut fs) = fixture();
         let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
         let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
-        let reserved = directory_rows(&fs, 1, first)
+        let reserved = directory_rows(&mut fs, 1, first)
             .into_iter()
             .find(|(_, _, name)| name == "tracked.tmp")
             .unwrap()

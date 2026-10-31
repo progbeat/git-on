@@ -654,11 +654,17 @@ the distinction between file identity and cached inode state in
 
 An untouched source view borrows names directly from this array. Offset/cookie
 access does not scan earlier entries. Each open adds only a handle and fixed
-dot references. Actual forgotten/removed nodes are deferred once per live
-directory group; the last close reclaims just that work. Binding birth is
-ordered against existing handle IDs, using their intrusive newest-first index,
-so names created after all live views are not pinned. Rename/unlink/hardlink
-tests also cover closing the newest view before deleting a late name.
+dot references. Each handle pins only inode IDs actually accepted into its
+replies; replayed cookies do not add another pin. Closing the handle releases
+only this set, so its work is amortized over returned metadata, independent of
+unread siblings. An older stream cannot retain a deleted late entry after the
+last stream that returned it closes.
+
+A first implementation aggregated deferred nodes across all handles on a
+directory. A focused red-before regression at `fa1f07d` exposed over-retention
+when a newer stream returned a late file, the file was deleted, and that stream
+closed while an older stream stayed open. Per-handle returned-entry pins replace
+that grouping; binding clocks and source-parent bookkeeping were removed.
 
 Namespace changes invalidate a cached merged view without immediately dropping
 its allocation; the next open builds the new version. Existing handles retain

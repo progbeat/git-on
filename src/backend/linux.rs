@@ -631,7 +631,7 @@ impl Filesystem for Fuse {
     ) {
         #[cfg(feature = "test-metrics")]
         let _profile = crate::profile::span("fuse_readdir", 0);
-        let state = self.state();
+        let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("readdir");
         match state
