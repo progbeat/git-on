@@ -175,6 +175,25 @@ class CiPlanTests(unittest.TestCase):
             self.assertEqual(result['runner_invocations'],378)
             self.assertEqual(result['full_reads_1000000'],42)
 
+    def test_retained_tree_metadata_is_separate_from_the_payload_budget(self):
+        plan=select(['tests/scalability.py'],HEAD)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);write_synthetic_scale_reports(root,plan)
+            for path in root.glob('scale-*.jsonl'):
+                data=[json.loads(line) for line in path.read_text().splitlines()]
+                for row in data:
+                    if row['type']=='runner':row['metrics'].update(tree_cache_bytes=4096,tree_cache_limit=0)
+                path.write_text(''.join(json.dumps(row)+'\n' for row in data))
+            self.assertEqual(validate_scale(plan,root)['runner_invocations'],97)
+            path=root/'scale-0.jsonl';data=[json.loads(line) for line in path.read_text().splitlines()]
+            runner=next(row for row in data if row['type']=='runner')
+            for field,value in [('blob_cache_bytes',2),('tree_cache_bytes',-1),('tree_cache_limit',-1),('blob_cache_limit',-1)]:
+                broken=copy.deepcopy(data)
+                next(row for row in broken if row['type']=='runner')['metrics'][field]=value
+                path.write_text(''.join(json.dumps(row)+'\n' for row in broken))
+                with self.subTest(field=field),self.assertRaises(ValueError):validate_scale(plan,root)
+            self.assertEqual(runner['metrics']['blob_cache_limit'],1)
+
     def test_exhaustive_evidence_still_rejects_wrong_child_reads_and_nonlazy_fuse_access(self):
         plan=select(['tests/scalability.py'],HEAD,full=True)
         with tempfile.TemporaryDirectory() as directory:

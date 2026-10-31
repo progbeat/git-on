@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 from scalability import expected_demands, scenario_plan
+from benchmark import validate_cache_budgets
 
 
 def rows(path):
@@ -55,8 +56,7 @@ def validate_scale(plan,root):
             if type(r['verify']) is not bool:raise ValueError('ambiguous verification mode')
             wants=expected_demands(info,env['backend'],r['workload']) if env['source']=='remote' else set()
             if set(t['objects'])!=wants or m['remote_fetches']!=len(wants):raise ValueError('wrong demanded/fetched object set')
-            for kind in ('blob','tree'):
-                if m[f'{kind}_cache_bytes']>m[f'{kind}_cache_limit']:raise ValueError('memory cache exceeds budget')
+            validate_cache_budgets(m)
             if r['workload']=='full':
                 if child['visited_leaves']!=r['files'] or child['payload_reads']!=r['files']+101:raise ValueError('incomplete full read')
                 total[f'full_reads_{r["files"]}']+=1
