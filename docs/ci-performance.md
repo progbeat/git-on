@@ -6,6 +6,13 @@ required `package` check. Base checks always run; affected scale/stress/resource
 checks must finish before merge. No correctness suite is postponed until after
 merge or release.
 
+The native Apple Silicon package check uses `macos-15`. GitHub's
+[macOS 14 retirement schedule](https://github.com/actions/runner-images/issues/13518)
+cancelled its previous runner before any build step during the October 31
+brownout, and removes that image on November 2, 2026. The supported replacement
+keeps the same package target, extraction/installer/behavior checks and
+`MACOSX_DEPLOYMENT_TARGET=13.0`; it does not raise the product's minimum OS.
+
 ## Measured starting point
 
 [CI 40883051673](https://github.com/progbeat/git-on/actions/runs/40883051673),
