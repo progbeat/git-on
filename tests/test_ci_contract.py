@@ -33,7 +33,7 @@ class CiContractTests(unittest.TestCase):
                          'dist build --artifacts=all','tar -xzf','tests/dist_installer.py','tests/integration.py','tests/materialized.py']:
             self.assertIn(expected,body)
         dependencies=re.search(r'needs: \[(.*?)\]',job('package'))[1].split(', ')
-        self.assertEqual(set(dependencies),{'changes','rust','real-fuse','lazy-performance','repository-scale','release-policy','macos','package-build'})
+        self.assertEqual(set(dependencies),{'changes','rust','real-fuse','lazy-performance','repository-scale','webkit-scale','release-policy','macos','package-build'})
         self.assertIn('if: always()',job('package'))
         self.assertIn('python3 scripts/ci_plan.py check',job('package'))
         self.assertIn('NEEDS_JSON: ${{ toJSON(needs) }}',job('package'))
@@ -62,9 +62,15 @@ class CiContractTests(unittest.TestCase):
         self.assertIn("if: needs.changes.outputs.scale == 'true'",body)
         self.assertIn('matrix: ${{ fromJSON(needs.changes.outputs.scale_matrix) }}',body)
         cells=matrix('matrix')['include']
-        self.assertEqual(len(cells),5)
+        self.assertEqual(len(cells),4)
         interactions={(g['runner'],g['backend'],source,policy,verify) for g in cells if g['profile']=='matrix' for source in g['sources'].split(',') for policy in g['policies'].split(',') for verify in (False,True)}
         self.assertEqual(len(interactions),24)
+        real=job('webkit-scale')
+        self.assertIn("if: needs.changes.outputs.scale == 'true'",real)
+        self.assertIn('tests/real_repository.py prepare',real)
+        self.assertIn('tests/real_repository.py run',real)
+        self.assertIn('webkit-results.jsonl',real)
+        self.assertEqual(real.count('tests/real_repository.py prepare'),1)
         for expected in ['tests/scalability.py','--features test-metrics','--profile "$PROFILE"','scale-results-$SOURCE.jsonl','matrix.profile','matrix.sources']:
             self.assertIn(expected,body)
         self.assertIn('workflow_dispatch:',WORKFLOW)

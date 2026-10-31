@@ -100,7 +100,9 @@ def record(value):
 
 def scenario_plan(backend,source,profile,policies,verification,sizes=None):
     modes={'both':(False,True),'unsigned':(False,),'signed':(True,)}[verification]
-    counts=sizes or ([1_000_000] if profile=='namespace' else [1000,10000,100000] if profile=='matrix' else [1000,10000,1000000])
+    # WebKit supplies the principal real scale/complete namespace and payload
+    # control. The generated matrix preserves every behavior interaction once.
+    counts=sizes or ([1_000_000] if profile=='namespace' else [1000] if profile=='matrix' else [1000,10000,1000000])
     cases=[]
     for count in counts:
         selected_policies=policies

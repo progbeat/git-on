@@ -426,6 +426,8 @@ Evidence and scripts are retained outside /tmp in
 `/workspace/git-on-evidence/metadata-029872d/`. The existing lazy remote FUSE gap,
 including per-object native process startup, remains unresolved by these numbers.
 
+### Historical synthetic CI plans, before the WebKit replacement
+
 The historical `2062eb8` acceptance run completed 378 invocations, including
 42 full million-leaf reads across fourteen physical scale jobs and two enabled
 passthrough groups. Its full-tree fixture reused nine Git objects and one shared
@@ -481,3 +483,30 @@ every required scale/stress/lazy/resource case. Required skipped or missing
 coverage fails the gate. A manual exhaustive matrix is available before release;
 no important case is intentionally deferred until after merge. Final readiness still requires exact-head CI,
 a fresh independent review. The owner cancelled further Copilot reviews.
+
+### WebKit replacement and directory-attribute stage
+
+The synthetic plan above is historical. The current affected plan keeps all
+24 behavior interactions at 1k paths, removes repeated 10k/selected 100k cases
+and the shared-object million-path namespace job, and requires a separate
+WebKit job. The exact pin, baseline composition, process/transfer metrics,
+remaining controls and measurement limitations are in
+[the current CI map](ci-performance.md). Adding the job is not evidence that
+WebKit has run or that the whole overhead requirement has been met.
+
+The useful source workload syntax-checks the production `webkitpy/style`
+package, excluding deliberate unittest input fixtures. A selective pinned-source
+preflight verified 39 module paths, 38 distinct blobs, 570,606 path-summed bytes
+and 570,542 distinct bytes. These are not full-repository acquisition or FUSE
+performance measurements. The command performs no imports or dependency setup.
+
+Linux now returns positive attribute TTLs for protected source directories.
+Their metadata was already immutable under the existing overlay rules; this
+removes redundant callbacks without caching generated membership. The new
+protocol regression preserves generated-name visibility and zero mutable/all
+TTLs. Actual-kernel gain and coherence remain CI evidence, not a protocol-only
+claim. Inclusive callback/transport spans are gathered separately from ordinary
+timing trials so profiling instrumentation is not presented as uninstrumented
+latency. Session compressed pack payload bytes and native stored received-pack
+bytes are distinct counters; index-pack normalization and wire framing prevent
+treating the latter as an exact on-wire byte count.

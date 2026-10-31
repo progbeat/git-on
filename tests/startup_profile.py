@@ -30,16 +30,18 @@ def run(options):
             entries.append(f'100644 blob {oid}\tf{index:05d}\n')
         tree=f.git('mktree',data=''.join(entries).encode());commit=f.git('commit-tree',tree,data=b'fixed-source startup profile\n');f.git('update-ref','refs/heads/main',commit)
         stat_bytes=stat_abi_bytes(f.root);source='file://'+str(f.repo)
-        plan=[(trial,source_kind,count) for trial in range(options.trials) for source_kind in options.sources for count in [-1,*options.sizes]]
+        plan=[(trial,source_kind,policy,count) for trial in range(options.trials) for source_kind in options.sources for policy in options.policies for count in [-1,*options.sizes]]
         random.Random(4261).shuffle(plan)
         options.output.parent.mkdir(parents=True,exist_ok=True)
         with options.output.open('w') as output:
-            for order,(trial,source_kind,count) in enumerate(plan):
+            for order,(trial,source_kind,policy,count) in enumerate(plan):
                 command=[shutil.which('true')] if count<0 else [sys.executable,'-I','-S','-c',CHILD,str(count),str(size),str(stat_bytes)]
                 if source_kind=='local':argv=[str(options.binary.resolve()),'HEAD']
                 else:argv=[str(options.binary.resolve()),source,'HEAD']
-                argv+=['--write-policy=all','--',*command]
-                def runner():return capture(argv,f.repo if source_kind=='local' else f.cwd,f.env,f.root,metrics=True,timing=True,resource_observer=f.root/'resource-observer')
+                argv+=[f'--write-policy={policy}','--',*command]
+                runner_env=dict(f.env)
+                if options.profile_spans:runner_env['GIT_ON_TEST_PROFILE_SPANS']='1'
+                def runner():return capture(argv,f.repo if source_kind=='local' else f.cwd,runner_env,f.root,metrics=True,timing=True,resource_observer=f.root/'resource-observer')
                 def baseline():
                     clone=f.root/'clone'
                     materialize=capture(['git','clone','--quiet',source,str(clone)],f.cwd,f.env,f.root,resource_observer=f.root/'resource-observer')
@@ -55,7 +57,7 @@ def run(options):
                     assert [o['completed'] for o in after['child_observations']]==['first','repeat']
                     assert all(o['files']==count and o['payload_bytes']==count*size and o['metadata_result_bytes']==count*stat_bytes for o in after['child_observations'])
                 assert not list(f.root.glob('git-on-*')),'run not cleaned'
-                row=dict(type='startup_profile',head=head,working_tree_dirty=dirty,backend='fuse',source=source_kind,source_files=total,demanded_files=count,blob_bytes=size,stat_abi_bytes=stat_bytes,trial=trial,order=order,source_cache='same fixed source; source OS cache warm/uncontrolled; fresh clone and invocation each trial',baseline=before,runner=after,intervals=intervals)
+                row=dict(type='startup_profile',head=head,working_tree_dirty=dirty,backend='fuse',source=source_kind,policy=policy,profile_spans_enabled=options.profile_spans,source_files=total,demanded_files=count,blob_bytes=size,stat_abi_bytes=stat_bytes,trial=trial,order=order,source_cache='same fixed source; source OS cache warm/uncontrolled; fresh clone and invocation each trial',baseline=before,runner=after,intervals=intervals)
                 output.write(json.dumps(row)+'\n');output.flush();print(json.dumps(row),flush=True)
     finally:f.close()
 
@@ -64,6 +66,8 @@ if __name__=='__main__':
     parser.add_argument('--binary',type=Path,required=True)
     parser.add_argument('--sizes',type=lambda x:list(map(int,x.split(','))),default=[0,1,16,64,160])
     parser.add_argument('--sources',type=lambda x:x.split(','),default=['local','remote'])
+    parser.add_argument('--policies',type=lambda x:x.split(','),default=['all'])
+    parser.add_argument('--profile-spans',action='store_true',help='inclusive diagnostic spans; do not compare instrumented timings with uninstrumented trials')
     parser.add_argument('--blob-bytes',type=int,default=8192)
     parser.add_argument('--trials',type=int,default=3)
     parser.add_argument('--output',type=Path,required=True)

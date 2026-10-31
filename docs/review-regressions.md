@@ -1,5 +1,29 @@
 # Review regression evidence
 
+## Real-repository harness and protected directory attributes
+
+The real-repository harness initially required one payload decode per unique
+blob, including empty files. An independent reviewer reproduced successful
+empty OPEN/READ/RELEASE through actual fuser dispatch with zero blob loads.
+The old gate therefore rejected correct empty-file behavior. Permanent fixtures
+now include an empty source and empty Python module; namespace/path/byte counts
+still include both, while decode expectations count nonempty unique objects.
+The old-expectation replay fails, and the corrected gate and dispatch pass.
+Evidence is under `review-webkit-empty` in the recorded workspace evidence.
+
+A timeout regression also exposed an observer leaving a descendant alive;
+even sending TERM to the group was insufficient when the child ignored it.
+The observer now grants graceful cleanup, observes root exit without reaping,
+then stops the owned group before final reap. Both failing variants and the
+passing permanent descendant-marker test were retained.
+
+Protected source directory attributes were unchanged by generated-child
+mutations, yet Linux returned zero attribute TTL and forced repeated metadata
+callbacks. A protocol red/green regression checks positive source TTL while
+generated entries keep zero TTL. Directory streams remain uncached, and fresh
+opens observe generated membership creation/removal. All-policy metadata keeps
+zero TTL. These protocol checks do not replace required real-kernel validation.
+
 ## Invocation-owned demand sessions
 
 The startup experiment's first CI stopped in the existing sync regression:

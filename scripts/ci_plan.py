@@ -28,7 +28,6 @@ SCOPED={
 def matrix(profile):
     cases=[dict(runner='ubuntu-latest',backend='fuse',sources=source,policies='none,ignored,untracked,all',profile=profile) for source in ('local','remote')]
     cases += [dict(runner=host,backend='materialized',sources='local,remote',policies='all',profile=profile) for host in ('ubuntu-latest','macos-26')]
-    if profile=='matrix':cases.append(dict(runner='ubuntu-latest',backend='fuse',sources='remote',policies='ignored',profile='namespace'))
     return {'include':cases}
 
 
@@ -64,7 +63,7 @@ def validate_plan(plan,head):
 def validate_jobs(plan,needs):
     for job in ('changes','rust','real-fuse','release-policy','macos','package-build'):
         if needs.get(job,{}).get('result')!='success':raise ValueError(f'mandatory base job did not pass: {job}')
-    for kind,job in (('scale','repository-scale'),('lazy','lazy-performance')):
+    for kind,job in (('scale','repository-scale'),('scale','webkit-scale'),('lazy','lazy-performance')):
         result=needs.get(job,{}).get('result')
         allowed=('success',) if plan['required'][kind] else ('success','skipped')
         if result not in allowed:raise ValueError(f'required {kind} coverage missing/failed: {result}')

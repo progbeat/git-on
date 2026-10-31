@@ -285,9 +285,8 @@ fn protocol_kernel_cache_only_retains_protected_source() {
         assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
         let attributes = p.ok(3, ino, vec![0; 16]);
         assert_eq!(num(&attributes, 0) != 0, protected);
-        // Source directories can contain generated children; their mutable
-        // timestamps/link counts must still be obtained from the daemon.
-        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0), 0);
+        // Protected source metadata stays pinned, including directory attrs.
+        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
         let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
         let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
         assert_eq!(
@@ -306,6 +305,29 @@ fn protocol_kernel_cache_only_retains_protected_source() {
             p.release(generated, num(&opened, 0));
             p.release(generated, handle);
         }
+    }
+}
+
+#[test]
+fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
+    for policy in [WritePolicy::Ignored, WritePolicy::Untracked] {
+        let mut p = Peer::with_policy(policy);
+        let before = p.ok(3, 1, vec![0; 16]);
+        assert_ne!(num(&before, 0), 0, "protected root metadata is cacheable");
+        let created = p.ok(9, 1, names(u32s(&[0o700, 0]), &["cache"]));
+        let generated = num(&created, 0);
+        assert_eq!(num(&p.ok(3, generated, vec![0; 16]), 0), 0);
+        let after = p.ok(3, 1, vec![0; 16]);
+        assert_eq!(&before[16..], &after[16..], "source metadata stays pinned");
+        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let listed = dirents(&p.ok(28, 1, io(handle, 0, 8192, 0)));
+        assert!(listed.iter().any(|(_, name)| name == b"cache"));
+        p.ok(29, 1, [u64s(&[handle]), u32s(&[0, 0]), u64s(&[0])].concat());
+        p.ok(11, 1, names(vec![], &["cache"]));
+        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let listed = dirents(&p.ok(28, 1, io(handle, 0, 8192, 0)));
+        assert!(!listed.iter().any(|(_, name)| name == b"cache"));
+        p.ok(29, 1, [u64s(&[handle]), u32s(&[0, 0]), u64s(&[0])].concat());
     }
 }
 

@@ -1,5 +1,22 @@
 # Integration tests
 
+Pinned real-repository coverage runs separately from the small behavior matrix:
+
+```sh
+python3 tests/real_repository.py prepare --directory /path/to/webkit-fixture
+python3 tests/real_repository.py run --fixture /path/to/webkit-fixture --binary target/release/git-on --output webkit-results.jsonl
+```
+
+Build with `--release --locked --features test-metrics` and use real Linux FUSE.
+Preparation downloads one pinned WebKit Git repository (several GiB of logical
+contents); it does not download dependencies or hydrate LFS. The full local
+case checks every path and blob twice. The useful smaller command syntax-checks
+the production `webkitpy/style` modules without importing or executing them,
+three fresh local and three file-transport invocations, each with first/repeat
+passes. This is not a public-network latency benchmark. Source and OS-cache
+conditions, complete baseline composition and sampled-memory limitations are
+explicit in each report. See [CI coverage](../docs/ci-performance.md).
+
 ```console
 cargo build --locked
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
@@ -244,8 +261,8 @@ avoids repeatedly enumerating all OIDs. Historical helpers still include that
 cost; benchmark wall time is not isolated product throughput.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
-defaults to `--profile matrix`: representative 1k/10k interactions and selected
-signed 100k complete reads. Use `--policies all` for materialization and
+defaults to `--profile matrix`: every interaction once at 1k paths. The pinned
+WebKit job supplies the principal real scale control. Use `--policies all` for materialization and
 `--policies ignored` for generated-file passthrough. Full children include stat,
 100 repeated reads, exact varied payloads, complete directory/name sets and
 fresh-output/source/cleanup checks. Instrumented snapshots remain independent
@@ -260,7 +277,8 @@ million-file reads/materialization and repeated invocations; no correctness
 suite is deferred to a nightly or post-merge job.
 
 All affected source/policy/signature interactions remain pre-merge. Four physical matrix
-jobs group build/setup work; a fifth runs the million-path namespace control.
+jobs group build/setup work; the separate WebKit job acquires its fixture once
+and checks full local reads plus the useful production syntax workload.
 Enabled passthrough retains actual-kernel capability/ordinary-child checks in
 `real-fuse`, plus both source scale groups. Differential stress keeps
 both seeds in default ignored and its resource bounds; dedicated write-policy

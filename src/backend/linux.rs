@@ -20,8 +20,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 const TTL: Duration = Duration::ZERO;
-// Only pinned, policy-protected names/data may outlive a kernel request. Mutable
-// entries and directory attributes retain their existing uncached behavior.
+// Only pinned, policy-protected names/data may outlive a kernel request.
+// Protected directory attributes are immutable too; this does not cache their
+// generated children or directory streams. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct Fuse {
     state: Mutex<State>,
@@ -74,14 +75,7 @@ impl State {
     }
     fn cache_ttls(&self, a: &FileAttr) -> (Duration, Duration) {
         if self.source_cacheable(a.ino) {
-            (
-                if a.kind == FileType::Directory {
-                    TTL
-                } else {
-                    PINNED_TTL
-                },
-                PINNED_TTL,
-            )
+            (PINNED_TTL, PINNED_TTL)
         } else {
             (TTL, TTL)
         }

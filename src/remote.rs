@@ -137,6 +137,8 @@ pub struct Remote {
     session_fetch_operations: u64,
     session_decode_operations: u64,
     session_starts: u64,
+    native_received_pack_bytes: u64,
+    session_received_pack_bytes: u64,
     session: Option<crate::transport::Session>,
     session_checked: bool,
     demand_url: OsString,
@@ -225,6 +227,8 @@ impl Remote {
             session_fetch_operations: 0,
             session_decode_operations: 0,
             session_starts: 0,
+            native_received_pack_bytes: 0,
+            session_received_pack_bytes: 0,
             session: None,
             session_checked: false,
             demand_url: OsString::from_vec(url.to_vec()),
@@ -365,7 +369,7 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
-        self.import_received()?;
+        self.import_received(true)?;
         let repo = Repository::open_bare(&self.dir)?;
         if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
             bail!("native Git fetch did not supply selected object {oid}");
@@ -481,7 +485,7 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        self.import_received()?;
+        self.import_received(true)?;
         let odb = repo.odb()?;
         for oid in oids {
             if self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
@@ -649,6 +653,8 @@ impl Remote {
             });
         }
         self.session_fetch_operations += 1;
+        self.session_received_pack_bytes =
+            self.session_received_pack_bytes.saturating_add(pack.len()?);
         if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
             match kind {
                 git2::ObjectType::Blob => {
@@ -712,7 +718,7 @@ impl Remote {
                 return Err(error);
             }
             indexed?;
-            self.import_received()?;
+            self.import_received(false)?;
         }
         anyhow::ensure!(
             self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
@@ -726,7 +732,7 @@ impl Remote {
     /// demands. Decode only new received objects directly into raw run storage,
     /// then release their files/indexes before the next operation. The private
     /// repository has one serialized writer and no auto-maintenance.
-    fn import_received(&mut self) -> Result<()> {
+    fn import_received(&mut self, count_transfer: bool) -> Result<()> {
         let pack_directory = self.dir.join("objects/pack");
         let mut received = Vec::new();
         for entry in fs::read_dir(&pack_directory)? {
@@ -759,6 +765,15 @@ impl Remote {
         // demands. Companion indexes, including optional .rev, move together.
         for (name, path) in &received {
             crate::object::check_transfer()?;
+            if count_transfer
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            {
+                self.native_received_pack_bytes = self
+                    .native_received_pack_bytes
+                    .saturating_add(fs::metadata(path)?.len());
+            }
             fs::rename(path, objects.join(name))?;
         }
         let destination = Repository::open_bare(&self.dir)?;
@@ -939,6 +954,12 @@ impl Remote {
             self.session_fetch_operations,
             self.session_decode_operations,
             self.session_starts,
+        )
+    }
+    pub(crate) fn received_pack_bytes(&self) -> (u64, u64) {
+        (
+            self.native_received_pack_bytes,
+            self.session_received_pack_bytes,
         )
     }
 }

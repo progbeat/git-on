@@ -104,16 +104,16 @@ actually runs.
 
 | Invariant / distinct fault | Before | Revised pre-merge check |
 | --- | --- | --- |
-| Source/policy/signature interactions | 14 physical jobs, 24 logical combinations, every size/workload/repetition | Same 24 combinations at 1k/10k in four grouped jobs when scale is affected; separate source invocations and fresh snapshots |
-| Full bytes, complete names, stat and repeated reads | Full million-file read in each combination; separate sparse/no-op preparations | Complete 1k/10k reads in every combination; each full child also stats/reads one path 100 times; selective signed 100k full reads on local/remote Linux FUSE, Linux/Mac materialization and enabled passthrough |
+| Source/policy/signature interactions | 14 physical jobs, 24 logical combinations, every size/workload/repetition | Same 24 combinations at 1k in four grouped jobs when scale is affected; separate source invocations and fresh snapshots |
+| Full bytes, complete names, stat and repeated reads | Full million-file read in each combination; separate sparse/no-op preparations | Complete 1k reads in every interaction; each full child also stats/reads one path 100 times. A separate pinned WebKit local FUSE case reads every path/blob twice |
 | Huge lazy startup and selected demand | Separate million-distinct-file fixture and benchmarks | Unchanged million-distinct-file true/cat and unused-subtree/large-range gates through real FUSE |
-| Full million-path namespace and cleanup | Million payload reads mixed with enumeration | Separate real HTTPS/FUSE million-path traversal, every directory/name checked; one sampled payload per leaf directory plus repeated selected reads. **This is not a full million-payload read.** |
+| Large namespace, diverse real payloads and cleanup | Shared-object million-path traversal plus selective 100k reads | WebKit full namespace and payload validation; no separate million-path count checkbox. Small synthetic namespace/corruption regressions remain |
 | Eager materialization | Same preparation repeated for no-op, sparse and full children | Full child records startup, then exercises stat/repeated reads and complete bytes in one snapshot. Inert-child/fallback/interrupt semantics remain in `materialized.py` and remote integration tests |
 | Fresh remote invocations / no global cache | Repeat every workload after every source/size/signature case | Permanent two-process no-cache regression; each matrix invocation asserts its exact demanded OID set. Verified/unverified invocations also use fresh private ODBs |
 | Memory-cache eviction / descriptor growth | 192 and 512 distinct-object controls plus shared-object namespace tests | Same reduced-RLIMIT 192-object test, same-run reread after memory eviction, and 32/128/512 distinct pack controls |
-| Streaming beyond the 8 MiB cache/import threshold | Three 96 MiB remote objects, previously chosen to exceed a removed global 256 MiB cache | Three 16 MiB remote objects still exceed both thresholds; local first-range 16/64/128 MiB scaling remains unchanged |
+| Streaming large-object and import thresholds | Three 96 MiB remote objects, previously chosen to exceed a removed global 256 MiB cache | Three 16 MiB objects exceed the 64 KiB raw streaming threshold and 8 MiB native import threshold; their combined working set exceeds the 16 MiB payload budget. Local 16/64/128 MiB range controls remain |
 | Whole-invocation overhead and native import writes | Loader-only pack metadata trace could not establish total cost | Optimized CLI: 160 distinct 8 KiB blobs through real FUSE; 32 through materialization, with a separate descendant-following file-I/O trace. Both compare complete clone + identical two-pass closed-read/stat command + cleanup. Exact-head evidence, native decoder writes and unique-load reuse are gated; no timing SLA is invented |
-| Long clean unmount / escaped users / cancellation | Full scale plus permanent helper and real-mount regressions | Real 4s-helper regression, 100k full-read teardown, million namespace cleanup and all busy/escaped-reader/signal tests remain. The old million opened-file pressure is not claimed for smaller full reads |
+| Long clean unmount / escaped users / cancellation | Full scale plus permanent helper and real-mount regressions | Real 4s-helper regression, WebKit teardown and all busy/escaped-reader/signal tests remain. Generated million opened-file pressure is not claimed for the replacement |
 | Write permissions, bytes/links/metadata, protocol errors and lifecycle | Unit/protocol, real mount, packages and seeded differential suites | All retained; differential stress parameters remain two seeds in default ignored, 400 operations, 64 nodes and 64 KiB per file |
 | Feature-disabled versus instrumented builds | All Rust tests in both configs, plus Mac | Full normal suite; instrumented suite skips only the already-run expensive pure pattern oracle, with no metrics branches. All snapshot/protocol/runtime tests remain; Mac runs its complete instrumented suite |
 | Reproducing known pre-fix failures | Rebuild several immutable historical executables every push | Red-before evidence remains recorded and replay CLI options remain available. Current permanent regressions run every PR; rebuilding known failing binaries is not required to detect regressions in current code |
@@ -126,8 +126,8 @@ checks remain.
 
 ## Fixture and execution plan
 
-`tests/scalability.py --profile matrix` uses 1k/10k behavior cases and selected
-100k full reads. Wide numeric fanouts reduce directory/path overhead. It uses up
+`tests/scalability.py --profile matrix` now uses 1k behavior cases. Wide numeric
+fanouts reduce directory/path overhead. It uses up
 to sixteen distinct eight-byte payloads and two alternating subtree variants,
 so full reads verify varied bytes, not just one identical payload. A 100k fixture
 has 21 distinct Git objects; a million-path namespace fixture has 23. This is a
@@ -140,13 +140,57 @@ its own temporary repository and writes. Only read-only baseline work and the
 immutable source fixture are reused within a source group. Passthrough's direct
 baseline performs the same generated-write command as its runner case.
 
-The default plan has 97 runner invocations: 66 ordinary FUSE, 20 materialized,
-10 enabled passthrough and one million-path namespace run. There are eight
-100k complete reads, 28 1k complete reads, and 28 10k complete reads; the namespace
-run visits one million leaf names and samples 10,000 leaf payloads, in addition
-to the pinned ignore file and 100 repeated selected reads. No default full read
-is called a million-file full read. `--profile exhaustive` remains available for
-explicit diagnostics; it is not a deferred correctness gate.
+The synthetic matrix has 60 runner invocations: 48 ordinary FUSE, eight
+materialized and four enabled passthrough. All 24 source/backend/policy/signature
+interactions remain; 28 full children validate complete names/bytes plus repeated
+access. Compared with the preceding 97-case optimized plan, 28 repeated 10k full
+reads, eight selected shared-object 100k reads and one shared-object million-path
+namespace run are replaced by the real fixture below. `--profile exhaustive`
+and explicit namespace diagnostics remain available but are not deferred gates.
+
+`webkit-scale` is required whenever scale is affected. It acquires exactly one
+WebKit source at `4b125afe35a2e95bf764d7a5e2efe7dc574a0653`, checks root tree
+`be3bad9ff779597380c7ba741ff250ef8a14225f` and native object integrity, and verifies
+472,895 blob paths / 5,522,313,781 path-summed bytes / zero gitlinks. Path counts,
+unique-object counts and byte volumes are separate. One real local readonly FUSE
+invocation validates the complete namespace, modes, symlinks and contents twice.
+Every source blob OID is checked by the child; empty paths remain in namespace/
+byte checks but are not falsely required to trigger payload decoding.
+
+The useful bounded workload syntax-checks all production Python modules under
+`Tools/Scripts/webkitpy/style` (intentional unittest input fixtures excluded),
+without imports, dependency installation, repository code execution or pycache.
+Three fresh local and three file:// invocations each run first/repeat passes in
+one mount. The small command reads only its selected external manifest, rather
+than scanning the complete repository manifest as benchmark overhead. Its
+decoded-object counts enforce same-run reuse. This does not claim a full remote
+WebKit read, full Mac materialization or public-network cold-source performance.
+
+One full native materialization per source is reused for independent direct
+command trials. Each reported complete baseline composes the measured same-source
+clone/checkout, identical direct command and complete cleanup; reused setup and
+cleanup are explicitly marked as one sample, not independent clone trials.
+Local native clone uses shared immutable objects; remote native clone uses the
+same file:// transport. Only the disposable baseline's attributes disable
+checkout transformations to match raw Git blobs. No source/caller configuration
+is changed. LFS hydration and external dependencies are outside the fixture;
+unsupported pointers are not silently excluded from full reads.
+
+CPU accounting includes waited native descendants. Memory is a 20 ms sampled
+simultaneous RSS sum across observable descendant tasks, including children of
+non-main threads; shared pages are counted twice and fast helpers can be missed.
+Missing required observations fail the gate rather than becoming zero overhead.
+Received session-pack bytes are exact compressed Git payloads; native received
+packs may have been normalized by index-pack. Neither includes protocol/TLS wire
+framing. Decoded verified blob bytes are reported separately. These observations
+do not establish a fixed total-RAM bound or a formal whole-program complexity
+proof. All invocation preparation, command execution and cleanup stay in time.
+
+`package` checks the WebKit job and its actual exact-head reports, including both
+full passes, all six syntax invocations, process resources, transfer counters and
+complete baseline components. Missing/stale/duplicate/incomplete reports fail.
+The pinned run must pass before it is cited as evidence; adding this job alone
+does not establish WebKit acceptance or #20 completion.
 
 The private source probe can report metrics without enumerating the ODB after
 every read, then explicitly enumerate and verify the full available OID set
@@ -155,6 +199,9 @@ executor. This measures test overhead, not product throughput; historical probe
 wall times include their per-read enumeration.
 
 The target is at least 10x lower wall time and substantially less runner time.
-The revised full CI run and PR description record measured results against the
-76m38s / 586.7-minute baseline. These local controls do not establish that target
-by themselves, and the target is not a product performance SLA.
+The preceding all-affected optimized run at `a3d345f`, before this WebKit change,
+passed in 6m13s / 31.8 job-minutes against the 76m38s / 586.7-minute historical
+baseline: 12.3x wall and 18.4x job-time reductions. Its 97-case synthetic evidence
+is historical, not a measurement of this replacement. The WebKit-inclusive
+plan needs its own measured final-head run. CI optimization is not a product
+performance SLA or proof of the complete overhead contract.

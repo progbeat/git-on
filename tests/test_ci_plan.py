@@ -21,6 +21,7 @@ def outcomes(plan):
     required=plan['required']
     result={key:dict(result='success',outputs={}) for key in ('changes','rust','real-fuse','release-policy','macos','package-build')}
     result['repository-scale']=dict(result='success' if required['scale'] else 'skipped')
+    result['webkit-scale']=dict(result='success' if required['scale'] else 'skipped')
     result['lazy-performance']=dict(result='success' if required['lazy'] else 'skipped')
     result['rust']['outputs']['resources_step']='success' if required['resources'] else 'skipped'
     result['real-fuse']['outputs'].update(stress_step='success' if required['stress'] else 'skipped',passthrough_scale='passed' if required['scale'] else 'not_required')
@@ -90,7 +91,7 @@ class CiPlanTests(unittest.TestCase):
             required={('ubuntu-latest','fuse',s,p,v) for s in ('local','remote') for p in ('none','ignored','untracked','all') for v in (False,True)}
             required.update((h,'materialized',s,'all',v) for h in ('ubuntu-latest','macos-26') for s in ('local','remote') for v in (False,True))
             self.assertEqual(interactions,required)
-        self.assertEqual(matrix('matrix')['include'][-1]['profile'],'namespace')
+        self.assertEqual(len(matrix('matrix')['include']),4)
         from scalability import scenario_plan
         cases=[]
         for g in matrix('exhaustive')['include']:
@@ -121,7 +122,7 @@ class CiPlanTests(unittest.TestCase):
 
     def test_required_job_or_step_skip_never_passes_even_when_other_jobs_are_green(self):
         plan=select(['Cargo.lock'],HEAD);needs=outcomes(plan);validate_jobs(plan,needs)
-        for job in ('lazy-performance','repository-scale'):
+        for job in ('lazy-performance','repository-scale','webkit-scale'):
             broken=copy.deepcopy(needs);broken[job]['result']='skipped'
             with self.subTest(job=job),self.assertRaises(ValueError):validate_jobs(plan,broken)
         for job,field,value in (('rust','resources_step','skipped'),('real-fuse','stress_step','skipped'),('real-fuse','passthrough_scale','not_required')):
@@ -157,9 +158,10 @@ class CiPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);write_synthetic_scale_reports(root,plan)
             result=validate_scale(plan,root)
-            self.assertEqual(result['runner_invocations'],97)
-            self.assertEqual(result['full_reads_100000'],8)
-            self.assertEqual(result['namespace_1000000'],1)
+            self.assertEqual(result['runner_invocations'],60)
+            self.assertEqual(result['full_reads_1000'],28)
+            self.assertNotIn('full_reads_100000',result)
+            self.assertNotIn('namespace_1000000',result)
             path=root/'scale-0.jsonl';data=[json.loads(l) for l in path.read_text().splitlines()]
             data.pop(next(i for i,r in enumerate(data) if r['type']=='runner'))
             path.write_text(''.join(json.dumps(r)+'\n' for r in data))
@@ -184,7 +186,7 @@ class CiPlanTests(unittest.TestCase):
                 for row in data:
                     if row['type']=='runner':row['metrics'].update(tree_cache_bytes=4096,tree_cache_limit=0)
                 path.write_text(''.join(json.dumps(row)+'\n' for row in data))
-            self.assertEqual(validate_scale(plan,root)['runner_invocations'],97)
+            self.assertEqual(validate_scale(plan,root)['runner_invocations'],60)
             path=root/'scale-0.jsonl';data=[json.loads(line) for line in path.read_text().splitlines()]
             runner=next(row for row in data if row['type']=='runner')
             for field,value in [('blob_cache_bytes',2),('tree_cache_bytes',-1),('tree_cache_limit',-1),('blob_cache_limit',-1)]:

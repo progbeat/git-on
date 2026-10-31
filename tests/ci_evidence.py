@@ -131,7 +131,12 @@ def validate_lazy(plan,root):
 
 def validate_evidence(plan,root):
     result={}
-    if plan['required']['scale']:result['scale']=validate_scale(plan,root)
+    if plan['required']['scale']:
+        from real_repository import validate_reports
+        result['scale']=validate_scale(plan,root)
+        paths=list(root.rglob('webkit-results.jsonl'))
+        if len(paths)!=1:raise ValueError('missing/duplicate WebKit scale evidence')
+        result['webkit']=validate_reports(rows(paths[0]),plan['head'])
     if plan['required']['resources']:
         result['resources']=validate_resources(root)
         result['imports']=validate_import_profiles(plan,root)

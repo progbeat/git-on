@@ -100,16 +100,16 @@ class ScalabilityHarnessTests(unittest.TestCase):
     def test_plan_preserves_interactions_and_selects_larger_scale_without_cartesian_repetition(self):
         for source in ('local','remote'):
             cases=scenario_plan('fuse',source,'matrix',['none','ignored','untracked','all'],'both')
-            self.assertEqual(len(cases),33)
-            for count in (1000,10000):
+            self.assertEqual(len(cases),24)
+            for count in (1000,):
                 full={(c['policy'],c['verify']) for c in cases if c['files']==count and c['workload']=='full'}
                 self.assertEqual(full,{(p,v) for p in ('none','ignored','untracked','all') for v in (False,True)})
-            self.assertEqual([c for c in cases if c['files']==100000],[dict(files=100000,policy='ignored',verify=True,workload='full',invocation='first' if source=='remote' else 'local')])
+            self.assertFalse(any(c['files']>1000 for c in cases))
             for backend,policy in (('materialized','all'),('passthrough','ignored')):
                 compact=scenario_plan(backend,source,'matrix',[policy],'both')
-                self.assertEqual(len(compact),5)
+                self.assertEqual(len(compact),2)
                 self.assertTrue(all(c['workload']=='full' for c in compact))
-                self.assertEqual({c['verify'] for c in compact if c['files']==10000},{False,True})
+                self.assertEqual({c['verify'] for c in compact},{False,True})
         namespace=scenario_plan('fuse','remote','namespace',['ignored'],'both')
         self.assertEqual(namespace,[dict(files=1000000,policy='ignored',verify=True,workload='enumerate',invocation='first')])
 

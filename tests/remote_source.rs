@@ -108,10 +108,24 @@ fn remote_metadata_and_payloads_are_demanded_and_pinned() {
         3
     );
     assert_eq!(snap.metrics().remote_raw_blob_imports, 1);
+    let pack_bytes = (
+        snap.metrics().remote_native_pack_bytes,
+        snap.metrics().remote_session_pack_bytes,
+    );
+    assert!(pack_bytes.0 > 0);
+    assert!(pack_bytes.0 + pack_bytes.1 > b"selected\n".len() as u64);
     let fetches = snap.metrics().remote_fetches;
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
     assert_eq!(snap.metrics().remote_fetches, fetches);
     assert_eq!(snap.metrics().blob_loads, 1);
+    assert_eq!(
+        (
+            snap.metrics().remote_native_pack_bytes,
+            snap.metrics().remote_session_pack_bytes,
+        ),
+        pack_bytes,
+        "same-run cache hits must not receive another pack"
+    );
 }
 #[test]
 fn remote_colon_refspec_selects_full_tree_in_a_private_repository() {

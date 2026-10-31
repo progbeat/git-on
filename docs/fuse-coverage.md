@@ -60,6 +60,7 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-life | tests/fuse_protocol.rs | protocol_lifecycle_lookup_forget_and_batch_forget |
 | P-io | tests/fuse_protocol.rs | protocol_file_io_sync_and_stale_handles |
 | P-cache-cow | tests/fuse_protocol.rs | protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls |
+| P-dir-attrs | tests/fuse_protocol.rs | protocol_cached_source_directory_attrs_do_not_cache_generated_membership |
 | P-create | tests/fuse_protocol.rs | protocol_creation_links_removal_and_rename_flags |
 | P-dir | tests/fuse_protocol.rs | protocol_directory_pagination_sync_statfs_and_bad_handles |
 | P-access | tests/fuse_protocol.rs | protocol_access_and_setattr_credentials_and_boundaries |
@@ -114,7 +115,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | --- | --- | --- | --- | --- |
 | init | implemented | P-life | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
 | destroy | inherited | P-life | I-snapshot | DESTROY is acknowledged and the session thread joins successfully; no requests follow termination. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
-| lookup | implemented | P-life, P-namespace | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_only_retains_protected_source` checks positive caching only for policy-protected source names; generated names and `all` stay uncached. |
+| lookup | implemented | P-life, P-namespace, P-dir-attrs | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_only_retains_protected_source` checks positive caching only for policy-protected source names and attributes, including directories; generated names and `all` stay uncached. Directory membership/streams remain uncached. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
 | getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. `passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` and the real enabled/fallback suite cover metadata through O_PATH after unlink or replacement. |
