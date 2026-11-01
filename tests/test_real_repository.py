@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from benchmark import environment
-from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output
+from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output,workload_plan
 from benchmark_support import stat_abi_bytes
 
 
@@ -38,6 +38,15 @@ class RealRepositoryTests(unittest.TestCase):
     def execute(self,workload='full',root=None):
         return subprocess.run(command(self.path,workload,144),cwd=root or self.repo,
             env=environment(),capture_output=True)
+
+    def test_workload_plan_keeps_one_full_case_and_each_requested_test_trial(self):
+        plan=workload_plan(3)
+        self.assertEqual(plan,workload_plan(3))
+        self.assertEqual(len(plan),7)
+        self.assertEqual(set(plan),{('full','local',0)}|{('tests',source,trial) for source in ('local','remote') for trial in range(3)})
+        self.assertEqual(len(workload_plan(1)),3)
+        for invalid in (0,-1,True,'3'):
+            with self.assertRaises(ValueError):workload_plan(invalid)
 
     def test_complete_walk_and_syntax_workload_check_two_passes_without_executing_source(self):
         result=self.execute();self.assertEqual(result.returncode,0,result.stderr)

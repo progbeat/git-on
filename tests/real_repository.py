@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import resource
 import signal
@@ -374,6 +375,14 @@ def validate_reports(data, head, pin=PIN, trials=3):
         partial_process_tree_rss_samples=partial,memory_primary='wait4 largest waited process peak, not aggregate physical memory')
 
 
+def workload_plan(trials):
+    """One full traversal plus repeatable, shuffled useful-command trials."""
+    if type(trials) is not int or trials<1:raise ValueError('positive trial count required')
+    plan=[('full','local',0)]+[('tests',source,trial) for trial in range(trials) for source in ('local','remote')]
+    random.Random(260531).shuffle(plan)
+    return plan
+
+
 def run(options):
     from benchmark_support import stat_abi_bytes
     assert sys.platform == 'linux' and Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'), 'real Linux FUSE required'
@@ -398,8 +407,7 @@ def run(options):
             row.update(head=head, working_tree_dirty=dirty, fixture=metadata, hardware=hardware,source_cache='complete immutable local ODB; OS caches uncontrolled; fresh invocation storage',
                 source_scope='local or file:// private server; not a public-network latency benchmark')
             output.write(json.dumps(row)+'\n'); output.flush(); print(json.dumps(row), flush=True)
-        plan = [('full', 'local', 0)] + [('tests', source, trial) for trial in range(options.trials) for source in ('local', 'remote')]
-        random.Random(260531).shuffle(plan)
+        plan=workload_plan(options.trials)
         baselines={}
         # One complete materialization per source, then independent direct
         # commands on that readonly copy. Reuse is explicit: composed baseline
