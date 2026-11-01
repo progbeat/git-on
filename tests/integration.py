@@ -288,6 +288,20 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def test_readonly_directory_pages_preserve_partial_seek_reopen_and_empty(self):
+        from source_cache import directory_child_code,directory_names
+        count=640
+        payload=git(self.repo,'hash-object','-w','--stdin',input=b'unrequested directory payload')
+        empty=git(self.repo,'mktree',input=b'')
+        paged=git(self.repo,'mktree',input=b''.join(f'100644 blob {payload}\t{name}\n'.encode() for name in directory_names(count)))
+        tree=git(self.repo,'mktree',input=f'040000 tree {empty}\tempty\n040000 tree {paged}\tpaged\n'.encode())
+        # A listing must not read leaf headers/content, even on a cold mount.
+        (self.repo/'.git/objects'/payload[:2]/payload[2:]).unlink()
+        result,run=self.invoke_argv([tree,'--write-policy=none','--',sys.executable,'-I','-S','-c',directory_child_code(count)])
+        self.assert_success(result);self.assertIsNone(run);self.assert_no_runtime_files()
+        self.assertEqual([json.loads(row) for row in result.stdout.splitlines()],
+                         [dict(completed=phase,directory_entries=count) for phase in ('first','repeat')])
+
     def test_readonly_stateless_large_reads_dup_mmap_and_sync(self):
         size=17*1024*1024
         (self.repo/'large-readonly').write_bytes(bytes(range(256))*(size//256))

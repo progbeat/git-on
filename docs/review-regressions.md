@@ -1,5 +1,24 @@
 # Review regression evidence
 
+## Readonly directory pages on reopen
+
+At `f538e30`, OPENDIR returned no cache flag even for the fully immutable
+`none` namespace. `protocol_directory_kernel_cache_only_for_readonly_supported_abi`
+fails there for ABI 7.28 (expected FOPEN_CACHE_DIR=8, observed 0). It passes
+after restricting the flag to `none` and ABI 7.28+, including negative cases
+for ABI 7.27 and all three mutable policies. The flag is part of upstream
+FUSE ABI 7.28; it does not require a new capability, thread or payload cache.
+
+The existing real-FUSE cache driver now exercises a 640-long-name directory,
+multiple pages, partial reads, telldir/seekdir/rewind, independent opens and an
+empty directory. With caching enabled it must deliver identical names/inodes
+with fewer readdir callbacks than its disabled-cache control. A missing blob
+and unvisited missing tree make accidental payload/subtree loading fail; the
+case requires zero blob/header reads and exactly three prepared trees. These
+are behavioral/resource assertions, not temporary profiling or a latency SLA.
+The child payload's normal-disk self-test is not a mounted result. Actual FUSE
+execution and any performance improvement require candidate-head validation.
+
 ## Delayed reads without requester signal emulation
 
 Version 1.4 removes the /proc-based requester-signal workaround. A temporarily

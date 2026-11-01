@@ -6,10 +6,23 @@ import sys
 import tempfile
 import unittest
 from process_capture import capture
-from source_cache import child_code
+from source_cache import child_code,directory_child_code,directory_names
 
 
 class SourceCacheTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform=='linux','Linux dirent64 ABI')
+    def test_directory_child_checks_partial_seek_reopen_and_empty_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'paged').mkdir();(root/'empty').mkdir()
+            for name in directory_names(640):(root/'paged'/name).touch()
+            argv=[sys.executable,'-I','-S','-c',directory_child_code(640)]
+            result=subprocess.run(argv,cwd=root,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual([json.loads(row) for row in result.stdout.splitlines()],
+                             [dict(completed=phase,directory_entries=640) for phase in ('first','repeat')])
+            (root/'paged'/directory_names(640)[0]).unlink()
+            self.assertNotEqual(subprocess.run(argv,cwd=root,capture_output=True).returncode,0)
+
     def test_callback_metrics_use_inherited_descriptor_without_tracing(self):
         code=('import json,os; '
               'fd=int(os.environ["GIT_ON_TEST_METRICS_FD"]); '

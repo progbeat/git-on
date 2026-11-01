@@ -81,6 +81,21 @@ impl Peer {
         extra: u32,
         count: usize,
     ) -> (Self, u32) {
+        Self::with_version(
+            policy,
+            extended,
+            extra,
+            count,
+            if extended { 40 } else { 31 },
+        )
+    }
+    fn with_version(
+        policy: WritePolicy,
+        extended: bool,
+        extra: u32,
+        count: usize,
+        minor: u32,
+    ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
@@ -159,7 +174,6 @@ impl Peer {
             pid: 1,
             _temp: temp,
         };
-        let minor = if extended { 40 } else { 31 };
         let mut body = vec![
             7,
             minor,
@@ -1375,6 +1389,30 @@ fn protocol_mutable_directory_links_follow_namespace_changes() {
     p.ok(11, left, names(vec![], &["renamed"]));
     assert_eq!(links(&mut p, left), 2);
     assert_eq!(links(&mut p, child), 0);
+}
+
+#[test]
+fn protocol_directory_kernel_cache_only_for_readonly_supported_abi() {
+    for minor in [27, 28, 31, 40] {
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let (mut peer, _) = Peer::with_version(policy, minor >= 36, 0, 0, minor);
+            let opened = peer.ok(27, 1, u32s(&[libc::O_RDONLY as u32, 0]));
+            let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+            let expected = if policy == WritePolicy::None && minor >= 28 {
+                fuser::FopenFlags::FOPEN_CACHE_DIR.bits()
+            } else {
+                0
+            };
+            assert_eq!(flags, expected, "policy={policy:?}, ABI7.{minor}");
+            let fh = num(&opened, 0);
+            peer.ok(29, 1, [u64s(&[fh]), u32s(&[0, 0]), u64s(&[0])].concat());
+        }
+    }
 }
 
 #[test]

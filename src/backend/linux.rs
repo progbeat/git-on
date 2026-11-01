@@ -22,7 +22,8 @@ use std::{
 const TTL: Duration = Duration::ZERO;
 // Only pinned, policy-protected names/data may outlive a kernel request.
 // Protected directory attributes are immutable too; this does not cache their
-// generated children or directory streams. All-policy metadata stays uncached.
+// generated children or mutable directory streams. A fully readonly namespace
+// may also cache directory pages. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 // TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
 // interrupted without a blocked dispatcher. Do not emulate it by polling
@@ -35,6 +36,9 @@ struct State {
     // The completely readonly namespace needs no per-open userspace state.
     // Enabled only after the peer advertises the kernel's no-open contract.
     no_open: bool,
+    // Directory membership is immutable only for the fully readonly policy.
+    // FOPEN_CACHE_DIR was added in ABI7.28; older peers keep ordinary streams.
+    cache_directories: bool,
     #[cfg(feature = "test-metrics")]
     test_uncached_source: bool,
     #[cfg(target_os = "linux")]
@@ -50,6 +54,7 @@ impl Fuse {
             state: Mutex::new(State {
                 core,
                 no_open: false,
+                cache_directories: false,
                 #[cfg(feature = "test-metrics")]
                 test_uncached_source: std::env::var_os("GIT_ON_TEST_UNCACHED_SOURCE").is_some(),
                 #[cfg(target_os = "linux")]
@@ -188,6 +193,12 @@ impl Filesystem for Fuse {
         #[cfg(target_os = "linux")]
         {
             let state = self.state.get_mut().expect("filesystem state poisoned");
+            state.cache_directories =
+                state.core.read_only() && config.kernel_abi() >= fuser::Version(7, 28);
+            #[cfg(feature = "test-metrics")]
+            {
+                state.cache_directories &= !state.test_uncached_source;
+            }
             let no_open = state.core.read_only();
             #[cfg(feature = "test-metrics")]
             let no_open = no_open && !state.test_uncached_source;
@@ -592,7 +603,14 @@ impl Filesystem for Fuse {
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("opendir");
         match state.core.open_directory(ino.0, flags.0) {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Ok(fh) => reply.opened(
+                FileHandle(fh),
+                if state.cache_directories {
+                    FopenFlags::FOPEN_CACHE_DIR
+                } else {
+                    FopenFlags::empty()
+                },
+            ),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }

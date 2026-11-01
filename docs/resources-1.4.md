@@ -18,7 +18,10 @@ those disk hashes. No disk object/name index or HMAC key remains.
 
 Touched unique directories are parsed once into shared immutable RAM structures;
 raw tree bytes are released. Parsed directories, verified descriptors and touched
-header sizes grow with demand outside the payload LRU. Report this metadata and
+header sizes grow with demand outside the payload LRU. The wholly readonly
+`none` policy also permits kernel directory-page caching on FUSE ABI 7.28+;
+mutable policies retain live directory I/O. This reuses only enumerated pages
+and does not fetch leaf contents or visit unrequested subtrees. Report metadata and
 actual process memory separately: the LRU limit is not a total-RSS guarantee.
 Local packed/delta decoding retains the documented libgit2 memory limitation.
 Libgit2 can also retain decoded delta bases (up to 1 MiB each, 16 MiB per
