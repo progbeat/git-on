@@ -341,83 +341,6 @@ fn copy_native_output<R: std::io::Read>(
     }
 }
 
-#[cfg(test)]
-mod output_race_tests {
-    use super::*;
-    use std::{
-        io::{self, Read, Write},
-        os::unix::net::UnixStream,
-        sync::atomic::{AtomicBool, Ordering},
-    };
-    struct StaleTimeout<'a> {
-        input: UnixStream,
-        writer: UnixStream,
-        finished: &'a AtomicBool,
-        raced: bool,
-    }
-    impl Read for StaleTimeout<'_> {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            if !self.raced {
-                self.raced = true;
-                let stale = self.input.read(output);
-                assert!(
-                    matches!(&stale, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
-                );
-                // A native write and completed-child notification race a read
-                // that has already returned a timeout to the transfer thread.
-                self.writer
-                    .write_all(b"verified output queued before exit")?;
-                self.finished.store(true, Ordering::Release);
-                return stale;
-            }
-            self.input.read(output)
-        }
-    }
-    fn input(finished: &AtomicBool) -> StaleTimeout<'_> {
-        let (input, writer) = UnixStream::pair().unwrap();
-        input
-            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
-            .unwrap();
-        StaleTimeout {
-            input,
-            writer,
-            finished,
-            raced: false,
-        }
-    }
-    #[test]
-    fn finished_output_is_drained_after_a_stale_timeout() {
-        let finished = AtomicBool::new(false);
-        let mut input = input(&finished);
-        let mut output = Vec::new();
-        copy_native_output(&mut input, &mut output, &finished, |input| {
-            input.input.set_nonblocking(true)
-        })
-        .unwrap();
-        assert_eq!(output, b"verified output queued before exit");
-    }
-    #[test]
-    fn final_output_drain_keeps_staging_failures_visible() {
-        struct Failed;
-        impl Write for Failed {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::other("staging failed"))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let finished = AtomicBool::new(false);
-        let mut input = input(&finished);
-        assert!(
-            copy_native_output(&mut input, &mut Failed, &finished, |input| input
-                .input
-                .set_nonblocking(true))
-            .is_err()
-        );
-    }
-}
-
 fn run_captured(
     mut command: Command,
     capture_stdout: bool,
@@ -781,5 +704,82 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod output_race_tests {
+    use super::*;
+    use std::{
+        io::{self, Read, Write},
+        os::unix::net::UnixStream,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    struct StaleTimeout<'a> {
+        input: UnixStream,
+        writer: UnixStream,
+        finished: &'a AtomicBool,
+        raced: bool,
+    }
+    impl Read for StaleTimeout<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.raced {
+                self.raced = true;
+                let stale = self.input.read(output);
+                assert!(
+                    matches!(&stale, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+                );
+                // A native write and completed-child notification race a read
+                // that has already returned a timeout to the transfer thread.
+                self.writer
+                    .write_all(b"verified output queued before exit")?;
+                self.finished.store(true, Ordering::Release);
+                return stale;
+            }
+            self.input.read(output)
+        }
+    }
+    fn input(finished: &AtomicBool) -> StaleTimeout<'_> {
+        let (input, writer) = UnixStream::pair().unwrap();
+        input
+            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+            .unwrap();
+        StaleTimeout {
+            input,
+            writer,
+            finished,
+            raced: false,
+        }
+    }
+    #[test]
+    fn finished_output_is_drained_after_a_stale_timeout() {
+        let finished = AtomicBool::new(false);
+        let mut input = input(&finished);
+        let mut output = Vec::new();
+        copy_native_output(&mut input, &mut output, &finished, |input| {
+            input.input.set_nonblocking(true)
+        })
+        .unwrap();
+        assert_eq!(output, b"verified output queued before exit");
+    }
+    #[test]
+    fn final_output_drain_keeps_staging_failures_visible() {
+        struct Failed;
+        impl Write for Failed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("staging failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let finished = AtomicBool::new(false);
+        let mut input = input(&finished);
+        assert!(
+            copy_native_output(&mut input, &mut Failed, &finished, |input| input
+                .input
+                .set_nonblocking(true))
+            .is_err()
+        );
     }
 }
