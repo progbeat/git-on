@@ -1404,7 +1404,7 @@ fn protocol_directory_kernel_cache_only_for_readonly_supported_abi() {
             let opened = peer.ok(27, 1, u32s(&[libc::O_RDONLY as u32, 0]));
             let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
             let expected = if policy == WritePolicy::None && minor >= 28 {
-                fuser::FopenFlags::FOPEN_CACHE_DIR.bits()
+                (fuser::FopenFlags::FOPEN_CACHE_DIR | fuser::FopenFlags::FOPEN_KEEP_CACHE).bits()
             } else {
                 0
             };

@@ -606,7 +606,9 @@ impl Filesystem for Fuse {
             Ok(fh) => reply.opened(
                 FileHandle(fh),
                 if state.cache_directories {
-                    FopenFlags::FOPEN_CACHE_DIR
+                    // CACHE_DIR fills directory pages; KEEP_CACHE prevents
+                    // open_common from discarding them on the next OPENDIR.
+                    FopenFlags::FOPEN_CACHE_DIR | FopenFlags::FOPEN_KEEP_CACHE
                 } else {
                     FopenFlags::empty()
                 },

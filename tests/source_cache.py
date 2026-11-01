@@ -24,6 +24,17 @@ def directory_names(count):
     return [f'entry-{index:04d}-'+'x'*96 for index in range(count)]
 
 
+def directory_reopen_code(count):
+    # No rewind or seek within one handle: this isolates reuse across opens.
+    return ('import json,os\n'
+            f'expected=set({directory_names(count)!r})\n'
+            'for phase in ("first","repeat"):\n'
+            ' names=os.listdir("paged")\n'
+            ' assert len(names)==len(expected) and set(names)==expected\n'
+            ' assert os.listdir("empty")==[]\n'
+            ' print(json.dumps(dict(completed=phase,directory_entries=len(expected))),flush=True)\n')
+
+
 def directory_child_code(count):
     return 'expected='+repr([name.encode() for name in directory_names(count)])+'\n'+r'''
 import ctypes,json,os
@@ -86,7 +97,7 @@ def directory_cache_case(f,binary,record):
     f.git('update-ref','refs/heads/directory-cache',commit)
     for oid in (missing,unvisited):(f.repo/'objects'/oid[:2]/oid[2:]).unlink()
     original=f.git('show-ref');observations=[]
-    child=[sys.executable,'-I','-S','-c',directory_child_code(count)]
+    child=[sys.executable,'-I','-S','-c',directory_reopen_code(count)]
     for uncached in (True,False):
         env=dict(f.env)
         if uncached:env['GIT_ON_TEST_UNCACHED_SOURCE']='1'
@@ -102,7 +113,7 @@ def directory_cache_case(f,binary,record):
         observations.append(value);record(value)
     off,on=observations
     assert 0<on['fuse_requests']['readdir']<off['fuse_requests']['readdir'],observations
-    record(dict(mode='directory-cache-invariants',files=count,distinct_objects=6,result='passed',unchanged_names_cookies_and_inodes=True,unrequested_data_unavailable=True))
+    record(dict(mode='directory-cache-invariants',files=count,distinct_objects=6,result='passed',unchanged_names_on_reopen=True,unrequested_data_unavailable=True))
 
 
 def run(options):

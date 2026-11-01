@@ -2,17 +2,28 @@
 
 ## Readonly directory pages on reopen
 
-At `f538e30`, OPENDIR returned no cache flag even for the fully immutable
-`none` namespace. `protocol_directory_kernel_cache_only_for_readonly_supported_abi`
-fails there for ABI 7.28 (expected FOPEN_CACHE_DIR=8, observed 0). It passes
-after restricting the flag to `none` and ABI 7.28+, including negative cases
-for ABI 7.27 and all three mutable policies. The flag is part of upstream
-FUSE ABI 7.28; it does not require a new capability, thread or payload cache.
+Follow-up at `ff1c01a`: CACHE_DIR alone cached seek/rewind within one handle,
+but Linux's common open path invalidated the pages on reopen without KEEP_CACHE.
+The original mixed counter case could pass using only within-handle reuse.
+The protocol regression now fails for observed flags 8 versus required 10 before
+the fix; the runtime returns both flags only under the existing readonly/ABI gate.
+The mounted counter workload now performs two independent full listings, with
+no intra-handle seek or rewind, so it specifically requires reuse across opens.
+The separate ordinary-mount test retains partial/seek/rewind/inode checks.
+See [Linux fuse_open_common](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/file.c#L243).
+This follow-up still needs candidate-head actual-FUSE and CI validation.
 
-The existing real-FUSE cache driver now exercises a 640-long-name directory,
-multiple pages, partial reads, telldir/seekdir/rewind, independent opens and an
-empty directory. With caching enabled it must deliver identical names/inodes
-with fewer readdir callbacks than its disabled-cache control. A missing blob
+The initial stage at `f538e30` returned no cache flag even for fully immutable
+`none`. The first version of the protocol regression failed at ABI 7.28
+(expected FOPEN_CACHE_DIR=8, observed 0); its successor above checks the complete
+flag combination. Negative cases retain ordinary streams for ABI 7.27 and all
+three mutable policies. CACHE_DIR is part of upstream FUSE ABI 7.28; no new
+capability, thread or payload cache is required.
+
+The ordinary real-FUSE test exercises a 640-long-name directory, multiple pages,
+partial reads, telldir/seekdir/rewind, independent opens and an empty directory.
+The counter control separately requires fewer readdir callbacks across independent
+opens, without relying on intra-handle replay. A missing blob
 and unvisited missing tree make accidental payload/subtree loading fail; the
 case requires zero blob/header reads and exactly three prepared trees. These
 are behavioral/resource assertions, not temporary profiling or a latency SLA.
