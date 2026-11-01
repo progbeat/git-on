@@ -1,16 +1,36 @@
 # Bounded FUSE syscall diagnostic
 
-`Bounded FUSE profile` is an independent `workflow_dispatch` workflow. It has no
-push, PR, schedule, release or workflow-run trigger. The existing required CI
-workflow and branch protection remain unchanged. GitHub must first find the new
-workflow on the default branch before its initial manual dispatch; this file does
-not bypass that prerequisite.
+Run `tests/fuse_syscall_profile.py` directly on an existing Linux FUSE host before
+merge. It needs no default-branch change or separate PR. Coordinate one active
+profiling invocation on the selected host rather than starting duplicate runs.
 
-The diagnostic builds ordinary release commit
-`5f7abb436c28e9851c2cae192e4126fceb7d3d19` on one CPU, then uses a disposable local
+The optional `Bounded FUSE profile` workflow is manual-only for later standalone
+reproduction. GitHub's default-branch registration prerequisite applies only to
+the first dispatch of that optional workflow, not to profiling itself. Existing
+required CI and branch protection remain unchanged. This diagnostic is included
+in the single 1.4.0 implementation PR.
+
+Profile an ordinary release build of commit
+`5f7abb436c28e9851c2cae192e4126fceb7d3d19` on one CPU, using a disposable local
 packed source with 8,192 distinct 4 KiB blobs (32 MiB). This exceeds the subject's
 16 MiB data LRU. It does not force kernel page-cache misses. Source caches are
 warm/uncontrolled, and no cache-dropping or cache-advice operation runs.
+
+Use separate clean checkouts for the driver and profiling subject. With the
+driver checkout at `DIAGNOSTICS`, subject checkout at `SUBJECT` and an ordinary
+release binary built from `SUBJECT`, the invocation is:
+
+```sh
+taskset -c CPU nice -n 15 ionice -c 3 python3 DIAGNOSTICS/tests/fuse_syscall_profile.py \
+  --checkout SUBJECT --binary SUBJECT/target/release/git-on \
+  --work NEW_FIXTURE_DIRECTORY --output NEW_EVIDENCE_DIRECTORY \
+  --files 8192 --bytes 4096
+```
+
+The subject must be exactly `5f7abb436c28e9851c2cae192e4126fceb7d3d19`; the driver
+refuses a different or dirty subject checkout. Record both checkouts' commits and
+the binary hash. Diagnostic-only consolidation does not change that subject's
+runtime inputs. Keep the work and evidence directories outside the subject.
 
 The seven cases are two untraced full Git-on invocations, two complete shared-clone
 plus identical-command plus cleanup baselines, and separate server, requester and

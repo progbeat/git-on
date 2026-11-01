@@ -428,6 +428,7 @@ jobs:
           python3 tests/test_ci_plan.py
           python3 tests/test_record_demo.py
           python3 tests/test_io_profile.py
+          python3 tests/test_fuse_syscall_profile.py
           python3 tests/test_import_profile.py
           python3 tests/test_metadata_profile.py
           python3 tests/test_real_repository.py
