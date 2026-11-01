@@ -415,7 +415,7 @@ impl Remote {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if !crate::git::is_request_interruption(error) && self.failure().is_none() {
+            if self.failure().is_none() {
                 self.failed = Some(format!("{error:#}"));
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
@@ -460,19 +460,6 @@ impl Remote {
         let out = match crate::git::run(command, true) {
             Ok(out) => out,
             Err(error) => {
-                if crate::git::is_request_interruption(&error) {
-                    // This private repository has one serialized native fetch.
-                    // Its owned group is gone before run returns. A forced
-                    // shutdown may interrupt Git's shallow-lock rollback.
-                    match fs::remove_file(self.dir.join("shallow.lock")) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(error)
-                                .context("clean interrupted private Git shallow lock");
-                        }
-                    }
-                }
                 return Err(error).context("fetch exact remote object");
             }
         };
@@ -645,11 +632,6 @@ impl Remote {
         if let Err(error) = session.fetch(oid, &pack) {
             let diagnostic = session.error_text();
             self.session = None;
-            // An interrupted request may open a new session later; already
-            // published objects still bypass every transport operation.
-            if crate::git::is_request_interruption(&error) {
-                self.session_checked = false;
-            }
             return Err(error).with_context(|| {
                 format!(
                     "remote fetch of exact object {oid} failed: {}",
@@ -1438,81 +1420,6 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn session_request_interruption_does_not_poison_later_demands() {
-        struct Requester(std::process::Child);
-        impl Drop for Requester {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        let repo = Repository::init_bare(temporary.path().join("server")).unwrap();
-        repo.config()
-            .unwrap()
-            .set_bool("uploadpack.allowFilter", true)
-            .unwrap();
-        repo.config()
-            .unwrap()
-            .set_bool("uploadpack.allowAnySHA1InWant", true)
-            .unwrap();
-        let first = repo.blob(b"first").unwrap();
-        let later = repo.blob(b"later").unwrap();
-        let mut tree = repo.treebuilder(None).unwrap();
-        tree.insert("first", first, 0o100644).unwrap();
-        tree.insert("later", later, 0o100644).unwrap();
-        let tree = tree.write().unwrap();
-        let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
-        repo.commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "request",
-            &repo.find_tree(tree).unwrap(),
-            &[],
-        )
-        .unwrap();
-        repo.set_head("refs/heads/main").unwrap();
-        let run = tempfile::tempdir_in(temporary.path()).unwrap();
-        let source = format!("file://{}", repo.path().display());
-        let (mut remote, _) = Remote::open(
-            temporary.path(),
-            OsStr::new(&source),
-            OsStr::new("HEAD"),
-            run.path(),
-        )
-        .unwrap();
-        remote.ensure(tree).unwrap();
-        assert!(remote.session.is_some());
-        let requester = Requester(
-            Command::new("sh")
-                .args(["-c", "trap ':' TERM; kill -STOP $$; exec sleep 30"])
-                .spawn()
-                .unwrap(),
-        );
-        let pid = requester.0.id();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-            if status.lines().any(|line| line.starts_with("State:\tT")) {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
-        let guard = crate::git::RequestGuard::enter(pid);
-        let error = remote.ensure(first).unwrap_err();
-        assert!(crate::git::is_request_interruption(&error), "{error:#}");
-        assert!(remote.failure().is_none());
-        drop(guard);
-        remote.ensure(later).unwrap();
-        assert!(remote.failure().is_none());
-        remote.stop_transport().unwrap();
-    }
-
     #[test]
     fn mux_shutdown_rejects_invalid_greetings_before_termination() {
         for greeting in [

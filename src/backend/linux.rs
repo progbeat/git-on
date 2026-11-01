@@ -24,6 +24,9 @@ const TTL: Duration = Duration::ZERO;
 // Protected directory attributes are immutable too; this does not cache their
 // generated children or directory streams. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+// TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
+// interrupted without a blocked dispatcher. Do not emulate it by polling
+// caller /proc status on ordinary filesystem operations.
 pub struct Fuse {
     state: Mutex<State>,
 }
@@ -204,8 +207,7 @@ impl Filesystem for Fuse {
         let _ = config;
         Ok(())
     }
-    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("lookup");
@@ -252,7 +254,6 @@ impl Filesystem for Fuse {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         attributes(
             reply,
             self.state().core.set_attributes(
@@ -273,8 +274,7 @@ impl Filesystem for Fuse {
             ),
         );
     }
-    fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         data(reply, self.state().core.read_link(ino.0));
     }
     fn mknod(
@@ -287,7 +287,6 @@ impl Filesystem for Fuse {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         #[allow(clippy::useless_conversion)]
         let regular = mode & u32::from(libc::S_IFMT);
         #[allow(clippy::useless_conversion)]
@@ -317,7 +316,6 @@ impl Filesystem for Fuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         entry(
             reply,
             self.state().core.create_node(
@@ -331,12 +329,10 @@ impl Filesystem for Fuse {
             ),
         );
     }
-    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         empty(reply, self.state().core.remove(parent.0, name, false));
     }
-    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         empty(reply, self.state().core.remove(parent.0, name, true));
     }
     fn symlink(
@@ -348,7 +344,6 @@ impl Filesystem for Fuse {
         reply: ReplyEntry,
     ) {
         use std::os::unix::ffi::OsStrExt;
-        let _request = crate::git::RequestGuard::enter(req.pid());
         entry(
             reply,
             self.state().core.create_node(
@@ -364,7 +359,7 @@ impl Filesystem for Fuse {
     }
     fn rename(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -372,7 +367,6 @@ impl Filesystem for Fuse {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         empty(
             reply,
             self.state()
@@ -380,12 +374,10 @@ impl Filesystem for Fuse {
                 .rename_path(parent.0, name, newparent.0, newname, flags.bits()),
         );
     }
-    fn link(&self, req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         entry(reply, self.state().core.link_node(ino.0, parent.0, name));
     }
-    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("open");
@@ -443,7 +435,6 @@ impl Filesystem for Fuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         let result = (|| {
             let a = state.core.create_node(
@@ -494,7 +485,7 @@ impl Filesystem for Fuse {
     }
     fn read(
         &self,
-        req: &Request,
+        _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -503,7 +494,6 @@ impl Filesystem for Fuse {
         _owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("read");
@@ -597,8 +587,7 @@ impl Filesystem for Fuse {
         };
         empty(reply, result);
     }
-    fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let _request = crate::git::RequestGuard::enter(req.pid());
+    fn opendir(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("opendir");

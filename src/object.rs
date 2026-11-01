@@ -54,7 +54,7 @@ pub(crate) fn check_transfer() -> Result<()> {
     if crate::git::operations_stopped() {
         bail!("object transfer stopped after command completion");
     }
-    crate::git::check_request_interruption()
+    Ok(())
 }
 
 pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {

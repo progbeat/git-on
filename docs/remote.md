@@ -93,14 +93,20 @@ the runner fail even if the command catches EIO and exits successfully.
 This includes `.gitignore` object acquisition during file/directory
 creation. A healthy policy denying a write instead returns EROFS.
 
-A pending, unblocked and nonignored SIGINT, SIGTERM, SIGHUP or SIGQUIT in the
-task requesting a remote object interrupts that request with EINTR. The runner
-polls the requesting task's Linux `/proc` status while its owned Git operation
-waits, because fuser cannot dispatch an INTERRUPT
-request while a synchronous callback is blocked. This interruption cancels
-only the current demand and preserves the command's signal handler and actual
-exit status. It does not latch a transport failure; a handler may return and
-retry the read using the same pinned snapshot and owned SSH connection.
+A source that is temporarily slow is awaited: delay alone does not make Git-on
+return an I/O error or invent EINTR. Git-on adds no read deadline. Actual Git,
+transport, integrity and storage errors still fail the relevant operation;
+caller-configured transport timeouts remain effective.
+
+Git-on does not emulate FUSE_INTERRUPT by reading the requesting process's
+`/proc` signal state. The current fuser backend does not implement that protocol
+operation. A signal sent only to a command blocked in FUSE may therefore be
+processed after the outstanding I/O completes, including Ctrl+C handled by the
+command. If the source never responds, such signal handling can remain delayed.
+To cancel the whole invocation independently of that I/O, signal Git-on itself.
+Runner-directed termination and observed command exit stop owned operations
+before unmount/cleanup; they do not depend on requester polling. Native
+request-level interruption remains a TODO for a backend that supports it.
 
 Metadata lookup may fetch the requested blob to determine its size: ordinary
 upload-pack offers no header-only request. Listing does not fetch child sizes or

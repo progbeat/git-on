@@ -2,15 +2,11 @@
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
-    cell::RefCell,
     ffi::{OsStr, OsString},
-    fs::File,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-#[cfg(target_os = "linux")]
-use std::{marker::PhantomData, rc::Rc};
 
 #[derive(Debug)]
 pub struct Git {
@@ -440,7 +436,6 @@ fn run_captured(
     if operations_stopped() {
         bail!("Git operation stopped after command completion");
     }
-    check_request_interruption()?;
     let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
     let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
     if let Some(stdout) = &stdout {
@@ -506,9 +501,6 @@ fn run_captured(
             break Err(anyhow::anyhow!(
                 "Git operation stopped after command completion"
             ));
-        }
-        if let Err(error) = check_request_interruption() {
-            break stop_request_operation(&mut child).and(Err(error));
         }
         if let Some(fd) = tty_fd {
             if let Err(error) = relay_native_job_control(child.id(), fd, parent_group) {
@@ -701,189 +693,9 @@ impl SplitByte for [u8] {
     }
 }
 
-#[derive(Debug)]
-struct RequestInterrupted(i32);
-impl std::fmt::Display for RequestInterrupted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "filesystem requester interrupted by signal {}", self.0)
-    }
-}
-impl std::error::Error for RequestInterrupted {}
-
-thread_local! {
-    static REQUEST_STATUS: RefCell<Option<File>> = const { RefCell::new(None) };
-    // Reuse scratch allocation, never a status snapshot or signal disposition.
-    static REQUEST_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; 4096]);
-}
-
-/// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
-/// proc descriptor open prevents a reused task ID from changing this identity.
-#[cfg(target_os = "linux")]
-pub(crate) struct RequestGuard {
-    previous: Option<File>,
-    _same_thread: PhantomData<Rc<()>>,
-}
-#[cfg(target_os = "linux")]
-impl RequestGuard {
-    pub(crate) fn enter(pid: u32) -> Self {
-        let status = File::open(format!("/proc/{pid}/status")).ok();
-        Self {
-            previous: REQUEST_STATUS.with(|slot| slot.replace(status)),
-            _same_thread: PhantomData,
-        }
-    }
-}
-#[cfg(target_os = "linux")]
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        REQUEST_STATUS.with(|slot| slot.replace(self.previous.take()));
-    }
-}
-
-fn pending_request_signal(status: &[u8]) -> Option<i32> {
-    let mut pending = None;
-    let mut shared = None;
-    let mut blocked = None;
-    let mut ignored = None;
-    for line in status.split(|byte| *byte == b'\n') {
-        let (key, value) = line.split_once_byte(b':');
-        let Some(value) = value else {
-            continue;
-        };
-        let destination = match key {
-            b"SigPnd" => &mut pending,
-            b"ShdPnd" => &mut shared,
-            b"SigBlk" => &mut blocked,
-            b"SigIgn" => &mut ignored,
-            _ => continue,
-        };
-        *destination = std::str::from_utf8(value)
-            .ok()
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok());
-    }
-    let actionable = (pending? | shared?) & !blocked? & !ignored?;
-    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
-        .into_iter()
-        .find(|signal| actionable & (1_u64 << (signal - 1)) != 0)
-}
-
-fn read_request_signal(status: &File, bytes: &mut Vec<u8>) -> Option<i32> {
-    use std::os::unix::fs::FileExt;
-    let mut offset: usize = 0;
-    let mut line_start = 0;
-    let mut fields = 0;
-    loop {
-        let end = offset.checked_add(4096)?;
-        if bytes.len() < end {
-            bytes.resize(end, 0);
-        }
-        let count = match status.read_at(&mut bytes[offset..end], offset as u64) {
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        };
-        if count == 0 {
-            return pending_request_signal(&bytes[..offset]);
-        }
-        let end = offset + count;
-        for index in offset..end {
-            if bytes[index] != b'\n' {
-                continue;
-            }
-            let (key, _) = bytes[line_start..index].split_once_byte(b':');
-            fields |= match key {
-                b"SigPnd" => 1,
-                b"ShdPnd" => 2,
-                b"SigBlk" => 4,
-                b"SigIgn" => 8,
-                _ => 0,
-            };
-            line_start = index + 1;
-            if fields == 15 {
-                return pending_request_signal(&bytes[..line_start]);
-            }
-        }
-        offset = end;
-    }
-}
-
-/// fuser dispatches synchronously and cannot process INTERRUPT while a native
-/// operation is blocked. Reply EINTR when this requester has a pending signal,
-/// then let its actual disposition/handler determine the command's outcome.
-/// This is per-request interruption, never global command cancellation.
-pub(crate) fn check_request_interruption() -> Result<()> {
-    let signal = REQUEST_STATUS.with(|slot| {
-        let slot = slot.borrow();
-        let status = slot.as_ref()?;
-        REQUEST_BUFFER.with(|buffer| {
-            let mut bytes = buffer.borrow_mut();
-            // seq_file positional reads starting at zero regenerate status;
-            // no seek, EOF probe or cached signal state is needed. Keep reading
-            // across large Groups lines until all four complete masks arrive.
-            read_request_signal(status, &mut bytes)
-        })
-    });
-    if let Some(signal) = signal {
-        return Err(RequestInterrupted(signal).into());
-    }
-    Ok(())
-}
-pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
-    request_signal(error).is_some()
-}
-fn request_signal(error: &anyhow::Error) -> Option<i32> {
-    error
-        .downcast_ref::<RequestInterrupted>()
-        .map(|marker| marker.0)
-        .or_else(|| {
-            error.chain().find_map(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(std::io::Error::get_ref)
-                    .and_then(|inner| inner.downcast_ref::<RequestInterrupted>())
-                    .map(|marker| marker.0)
-            })
-        })
-}
-/// Preserve the typed requester marker across Read/Write boundaries. Boxing an
-/// anyhow error directly hides its concrete type from std::io's error payload.
-pub(crate) fn transfer_io_error(error: anyhow::Error) -> std::io::Error {
-    match request_signal(&error) {
-        Some(signal) => std::io::Error::other(RequestInterrupted(signal)),
-        None => std::io::Error::other(error),
-    }
-}
-
-#[cfg(test)]
-mod request_error_tests {
-    use super::*;
-    #[test]
-    fn requester_marker_inside_io_is_still_an_interruption() {
-        let error = std::io::Error::other(RequestInterrupted(libc::SIGTERM));
-        let error = anyhow::Error::new(error).context("read demand packet header");
-        assert!(is_request_interruption(&error));
-        let error = transfer_io_error(
-            anyhow::Error::new(RequestInterrupted(libc::SIGTERM)).context("transfer"),
-        );
-        assert!(is_request_interruption(
-            &anyhow::Error::new(error).context("read")
-        ));
-        let first = transfer_io_error(RequestInterrupted(libc::SIGTERM).into());
-        let second = transfer_io_error(anyhow::Error::new(first).context("first reader"));
-        assert!(is_request_interruption(
-            &anyhow::Error::new(second).context("second reader")
-        ));
-        assert!(!is_request_interruption(&anyhow::anyhow!(
-            "filesystem requester interrupted by signal 15"
-        )));
-    }
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::Child;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -915,46 +727,6 @@ mod tests {
         );
     }
 
-    struct Requester(Child);
-    impl Requester {
-        fn stopped(mode: &str) -> Self {
-            let script = "import ctypes,os,signal,sys,time\nmode=sys.argv[1]\nif mode=='caught': signal.signal(signal.SIGTERM,lambda *_:None)\nif mode=='ignored': signal.signal(signal.SIGTERM,signal.SIG_IGN)\nif mode=='blocked': signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGTERM})\nctypes.CDLL(None).prctl(15,b'\\xffrequester',0,0,0)\nprint('ready',flush=True)\nos.kill(os.getpid(),signal.SIGSTOP)\ntime.sleep(300)";
-            let mut child = Command::new("python3")
-                .args(["-c", script, mode])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap();
-            let mut ready = String::new();
-            BufReader::new(child.stdout.take().unwrap())
-                .read_line(&mut ready)
-                .unwrap();
-            assert_eq!(ready.trim(), "ready");
-            let requester = Self(child);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
-                if status
-                    .split(|byte| *byte == b'\n')
-                    .any(|line| line.starts_with(b"State:\tT"))
-                {
-                    return requester;
-                }
-                assert!(Instant::now() < deadline, "requester never stopped");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        fn signal(&self, signal: i32) {
-            assert_eq!(unsafe { libc::kill(self.0.id() as i32, signal) }, 0);
-        }
-    }
-    impl Drop for Requester {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     fn wait_for_pid(path: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -967,200 +739,6 @@ mod tests {
             assert!(Instant::now() < deadline, "owned operation never started");
             std::thread::sleep(Duration::from_millis(1));
         }
-    }
-
-    #[test]
-    fn request_masks_preserve_blocked_ignored_and_caught_dispositions() {
-        let status = |pending, shared, blocked, ignored| {
-            format!("SigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\nSigCgt:\tffffffffffffffff\n")
-        };
-        let term = 1_u64 << (libc::SIGTERM - 1);
-        for (pending, shared) in [(term, 0), (0, term)] {
-            assert_eq!(
-                pending_request_signal(status(pending, shared, 0, 0).as_bytes()),
-                Some(libc::SIGTERM)
-            );
-            for (blocked, ignored) in [(term, 0), (0, term)] {
-                assert_eq!(
-                    pending_request_signal(status(pending, shared, blocked, ignored).as_bytes()),
-                    None
-                );
-            }
-        }
-        assert_eq!(pending_request_signal(b"SigPnd:\t4000\n"), None);
-        let mut long_status = b"Name:\t\xffrequester\nGroups:\t".to_vec();
-        long_status.extend(b"10000 ".repeat(4096));
-        long_status.extend_from_slice(b"\n");
-        long_status.extend_from_slice(status(0, term, 0, 0).as_bytes());
-        assert_eq!(pending_request_signal(&long_status), Some(libc::SIGTERM));
-        {
-            use std::io::Write;
-            let _request = RequestGuard::enter(0);
-            let mut held = tempfile::tempfile().unwrap();
-            held.write_all(&long_status).unwrap();
-            REQUEST_STATUS.with(|slot| slot.replace(Some(held)));
-            assert!(is_request_interruption(
-                &check_request_interruption().unwrap_err()
-            ));
-        }
-        let user = 1_u64 << (libc::SIGUSR1 - 1);
-        assert_eq!(
-            pending_request_signal(status(0, user, 0, 0).as_bytes()),
-            None
-        );
-    }
-
-    #[test]
-    fn positional_status_reads_handle_mask_boundaries_long_lines_and_stale_scratch() {
-        use std::os::unix::fs::FileExt;
-        let file = tempfile::tempfile().unwrap();
-        let term = 1_u64 << (libc::SIGTERM - 1);
-        let masks = format!("SigPnd:\t{term:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000");
-        let mut scratch = Vec::new();
-        for prefix in (4000..4200).chain([0, 24_000]) {
-            let mut content = b"Groups:\t".to_vec();
-            content.extend(std::iter::repeat_n(b'1', prefix));
-            content.push(b'\n');
-            content.extend_from_slice(masks.as_bytes());
-            file.set_len(content.len() as u64).unwrap();
-            file.write_all_at(&content, 0).unwrap();
-            assert_eq!(
-                read_request_signal(&file, &mut scratch),
-                Some(libc::SIGTERM)
-            );
-        }
-        for content in [
-            b"".as_slice(),
-            b"SigPnd:\t4000\n",
-            b"SigPnd:\tinvalid\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n",
-        ] {
-            file.set_len(content.len() as u64).unwrap();
-            file.write_all_at(content, 0).unwrap();
-            assert_eq!(
-                read_request_signal(&file, &mut scratch),
-                None,
-                "a short/incomplete poll reused masks from a previous snapshot"
-            );
-        }
-    }
-    #[test]
-    fn request_polls_use_fresh_masks_without_changing_the_held_file_position() {
-        use std::io::{Seek, SeekFrom, Write};
-        use std::os::unix::fs::FileExt;
-        let _request = RequestGuard::enter(0);
-        let mut file = tempfile::tempfile().unwrap();
-        let term = 1_u64 << (libc::SIGTERM - 1);
-        let status = |ignored| {
-            format!("Name:\trequester\nSigPnd:\t{term:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t{ignored:016x}\nUnused:\ttrailing data\n")
-        };
-        file.write_all(status(0).as_bytes()).unwrap();
-        file.seek(SeekFrom::Start(7)).unwrap();
-        let mut observer = file.try_clone().unwrap();
-        REQUEST_STATUS.with(|slot| slot.replace(Some(file)));
-        assert!(check_request_interruption().is_err());
-        assert_eq!(
-            observer.stream_position().unwrap(),
-            7,
-            "status polling performed a rewind/read-to-EOF sequence"
-        );
-        observer.write_all_at(status(term).as_bytes(), 0).unwrap();
-        check_request_interruption().unwrap();
-        observer.write_all_at(status(0).as_bytes(), 0).unwrap();
-        assert!(
-            check_request_interruption().is_err(),
-            "cached a signal disposition"
-        );
-        assert_eq!(observer.stream_position().unwrap(), 7);
-    }
-    #[test]
-    fn request_scope_reads_real_dispositions_and_keeps_original_task_identity() {
-        for (mode, signal, interrupts) in [
-            ("default", libc::SIGTERM, true),
-            ("caught", libc::SIGTERM, true),
-            ("python-int", libc::SIGINT, true),
-            ("ignored", libc::SIGTERM, false),
-            ("blocked", libc::SIGTERM, false),
-        ] {
-            let requester = Requester::stopped(mode);
-            let _request = RequestGuard::enter(requester.0.id());
-            requester.signal(signal);
-            match check_request_interruption() {
-                Err(error) => assert!(interrupts && is_request_interruption(&error)),
-                Ok(()) => assert!(!interrupts, "missed pending {signal} in {mode}"),
-            }
-            {
-                let _nested = RequestGuard::enter(0);
-                check_request_interruption().unwrap();
-            }
-            assert_eq!(check_request_interruption().is_err(), interrupts);
-            // The held proc descriptor belongs to this task even after exit;
-            // later checks never reopen its numeric ID or cancel another task.
-            drop(requester);
-            check_request_interruption().unwrap();
-        }
-        check_request_interruption().unwrap();
-    }
-
-    #[test]
-    fn pending_request_signal_preserves_type_through_session_packet_reads() {
-        let temporary = tempfile::tempdir().unwrap();
-        let capability = temporary.path().join("capabilities");
-        let mut bytes = Vec::new();
-        for value in [b"version 2\n".as_slice(), b"fetch=shallow filter\n"] {
-            write!(&mut bytes, "{:04x}", value.len() + 4).unwrap();
-            bytes.extend(value);
-        }
-        bytes.extend(b"0000");
-        std::fs::write(&capability, bytes).unwrap();
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "cat \"$1\"; exec sleep 300", "request-test"])
-            .arg(&capability);
-        let mut session = crate::transport::Session::connect(command, false)
-            .unwrap()
-            .unwrap();
-        let requester = Requester::stopped("caught");
-        let _request = RequestGuard::enter(requester.0.id());
-        let file = crate::spool::Files::new(temporary.path())
-            .unwrap()
-            .file(temporary.path())
-            .unwrap();
-        let error = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(50));
-                requester.signal(libc::SIGTERM);
-            });
-            session.fetch(git2::Oid::zero(), &file).unwrap_err()
-        });
-        assert!(is_request_interruption(&error), "{error:#}");
-        session.stop().unwrap();
-    }
-    #[test]
-    fn pending_request_signal_stops_only_its_owned_operation() {
-        let requester = Requester::stopped("caught");
-        let _request = RequestGuard::enter(requester.0.id());
-        let temporary = tempfile::tempdir().unwrap();
-        let started = temporary.path().join("native-pid");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "echo $$ > \"$1\"; exec sleep 300", "request-test"])
-            .arg(&started);
-        let error = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                wait_for_pid(&started);
-                requester.signal(libc::SIGTERM);
-            });
-            run(command, true).unwrap_err()
-        });
-        assert!(is_request_interruption(&error));
-        let pid = std::fs::read_to_string(&started).unwrap();
-        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
-        assert_eq!(cancelled_signal(), None);
-        assert!(!operations_stopped());
-        let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
-        assert!(status
-            .split(|byte| *byte == b'\n')
-            .any(|line| line.starts_with(b"State:\tT")));
     }
 
     #[test]

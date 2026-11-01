@@ -59,6 +59,7 @@ struct Peer {
     unique: u64,
     uid: u32,
     gid: u32,
+    pid: u32,
     _temp: TempDir,
 }
 impl Peer {
@@ -155,6 +156,7 @@ impl Peer {
             // runner UID. Credential tests override these IDs explicitly.
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
+            pid: 1,
             _temp: temp,
         };
         let minor = if extended { 40 } else { 31 };
@@ -190,7 +192,7 @@ impl Peer {
         let packet = [
             u32s(&[(40 + body.len()) as u32, op]),
             u64s(&[self.unique, ino]),
-            u32s(&[self.uid, self.gid, 1, 0]),
+            u32s(&[self.uid, self.gid, self.pid, 0]),
             body,
         ]
         .concat();
@@ -1373,4 +1375,54 @@ fn protocol_mutable_directory_links_follow_namespace_changes() {
     p.ok(11, left, names(vec![], &["renamed"]));
     assert_eq!(links(&mut p, left), 2);
     assert_eq!(links(&mut p, child), 0);
+}
+
+#[test]
+fn protocol_pending_caller_signal_does_not_invent_read_error() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Requester(Child);
+    impl Drop for Requester {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut requester = Requester(
+        Command::new("sh")
+            .args([
+                "-c",
+                "trap ':' TERM; echo ready; kill -STOP $$; exec sleep 300",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = String::new();
+    BufReader::new(requester.0.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", requester.0.id())).unwrap();
+        if status.lines().any(|line| line.starts_with("State:\tT")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "requester never stopped");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        unsafe { libc::kill(requester.0.id() as i32, libc::SIGTERM) },
+        0
+    );
+    // Only the caller has a pending caught signal. The filesystem daemon has
+    // neither been cancelled nor encountered a source error; return its bytes.
+    let mut peer = Peer::with_policy(WritePolicy::None);
+    peer.pid = requester.0.id();
+    let ino = peer.lookup(1, "tracked");
+    let handle = peer.open(ino, libc::O_RDONLY);
+    assert_eq!(peer.ok(15, ino, io(handle, 0, 100, 0)), b"original\n");
+    peer.release(ino, handle);
 }

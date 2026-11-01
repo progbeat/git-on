@@ -1,5 +1,31 @@
 # Review regression evidence
 
+## Delayed reads without requester signal emulation
+
+Version 1.4 removes the /proc-based requester-signal workaround. A temporarily
+slow source remains pending and returns its verified bytes when available;
+Git-on adds no arbitrary read deadline or synthetic EINTR for caller signals.
+Actual transport/storage/integrity failures remain errors. Signals directed at
+Git-on and observed child completion still stop owned operations before unmount.
+Caller-only signals may wait for current I/O; future native FUSE_INTERRUPT
+support is explicitly deferred.
+
+The permanent wire regression
+`protocol_pending_caller_signal_does_not_invent_read_error` sends real fuser
+requests with a stopped caller's pending caught SIGTERM. The original 416e2277
+runtime returns EINTR (errno 4) from LOOKUP; the changed runtime returns the exact
+source data. The same test fails before and passes after removal. Red/green logs
+are retained outside the repository under
+`/workspace/git-on-evidence/remove-requester-416/`.
+
+The mounted delayed-source regression uses real HTTPS and ordinary libc
+open/read calls so Python cannot hide synthetic EINTR by retrying. It releases
+the valid source after a controlled delay and checks exact data/EOF, handlers,
+exit status and cleanup. Delayed ignore acquisition still forbids mutation
+before the pinned rules are obtained. These require actual FUSE CI; the wire
+regression is not labelled as a mount. Earlier requester-emulation records below
+are historical evidence, not current behavior requirements.
+
 ## Optional LF on protocol text packets
 
 A fresh whole-PR review reproduced a native-compatible upload-pack proxy that
@@ -92,7 +118,7 @@ tail bound; completed-request diagnostics are discarded between transactions.
 This bounds diagnostic retention without imposing an object or repository cap.
 Evidence is retained under `/workspace/git-on-evidence/transport-5dd38f9/`.
 
-Independent review of `d8a1015` reproduced a P1: putting RequestInterrupted into
+Historical requester-emulation review of `d8a1015` reproduced a P1: putting RequestInterrupted into
 an opaque anyhow-backed io::Error lost its type, returned EIO instead of EINTR
 and permanently latched the remote failure. The authentic base allowed a later
 demand; the candidate rejected it. Permanent typed-I/O and complete Remote caller
@@ -459,7 +485,7 @@ operation shutdown before unmount/state locking through a separate flag; this
 does not invent a termination signal. Its real-mounted stalled-read and busy
 recovery evidence is tracked separately and requires exact-head FUSE CI.
 
-## Pending requester signals during a stalled mounted fetch
+## Historical requester signals during a stalled mounted fetch
 
 Actual real-FUSE CI run
 [38164674316](https://github.com/progbeat/git-on/actions/runs/38164674316)
@@ -473,7 +499,7 @@ foreground signal case required an additional fix because the child could not
 exit until its blocked FUSE request received a reply. fuser 0.16 dispatches on
 one synchronous session thread and does not implement FUSE_INTERRUPT.
 
-Demand-capable callbacks now bind cancellation to their actual requesting task
+At that revision demand-capable callbacks bound cancellation to their actual requesting task
 with a held `/proc/TID/status` descriptor. Existing native-operation and cache
 lock polls detect pending unblocked, nonignored INT/TERM/HUP/QUIT signals and
 abort only that request. The typed interruption propagates as EINTR and does
@@ -993,14 +1019,15 @@ removes a real loose `.gitignore` object before policy demand. Inserting only
 this regression into the unchanged before-fix source produces
 `[Err(30), Err(30)]` instead of `[Err(5), Err(5)]`; the corrected source passes
 both file and directory creation checks without inserting namespace or backing
-entries. Policy loader errors now use `snapshot_errno`, retaining EINTR for
-request interruption and EROFS for an ordinary healthy-policy denial.
+entries. Policy loader errors use `snapshot_errno` for EIO and preserve EROFS for an
+ordinary healthy-policy denial. The former requester-specific EINTR mapping was
+part of the historical emulation and is removed in 1.4.
 `RemoteTests.test_review_real_mount_ignore_acquisition_faults_report_eio`
 requires actual FUSE and repeats create/mkdir with an exact remote ignore-object
 403 response and a real invalid cache entry. `--before-policy-binary` checks
 the original EROFS result and the corrected EIO result, failure diagnostics,
 runner status 125 and absence of a created path.
-`test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
+The historical `test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
 the ignore request, signals its requesting task, observes exact libc syscall
 EINTR before releasing the server, and verifies its handler and successful
 retry. EINTR preservation is expected on both revisions. These mount-dependent
@@ -2268,7 +2295,8 @@ error bypassed the sticky transport status. A child catching EIO could therefore
 make an incomplete remote invocation appear successful. The new retained-reader
 and close/reopen regression reproduced an absent `remote_failure()` after EIO.
 Raw read failures now remain in the invocation store and feed the existing
-remote final-status path; request-specific EINTR stays retryable. A real-mount
+remote final-status path. The historical requester-specific EINTR exception is
+removed together with requester emulation in 1.4. A real-mount
 regression catches the raw-storage EIO and requires runner status 125, the
 original diagnostic and complete cleanup.
 

@@ -133,7 +133,7 @@ impl<R: Read> Checked<R> {
 }
 impl<R: Read> Read for Checked<R> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
+        crate::object::check_transfer().map_err(std::io::Error::other)?;
         let length = bytes.len().min(self.remaining);
         if length == 0 {
             return Ok(0);

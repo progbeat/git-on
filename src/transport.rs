@@ -22,7 +22,7 @@ struct Input(UnixStream);
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
@@ -41,7 +41,7 @@ struct Output(UnixStream);
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLOUT,
@@ -440,7 +440,7 @@ impl Read for ObjectReader<'_> {
             return Ok(0);
         }
         loop {
-            crate::object::check_transfer().map_err(crate::git::transfer_io_error)?;
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
             if self.from == self.to && self.position < self.end {
                 let count = (self.end - self.position).min(self.input.len() as u64) as usize;
                 self.file

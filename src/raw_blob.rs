@@ -111,12 +111,9 @@ impl RawBlob {
             // Reads can outlive the Snapshot lock through an active reader.
             // Preserve storage failures for the remote runner's final status,
             // including after a caller catches EIO or all handles close.
-            // A request's signal handler may retry EINTR normally.
-            if !crate::git::is_request_interruption(error) {
-                let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if store.failure.is_none() {
-                    store.failure = Some(format!("{error:#}"));
-                }
+            let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if store.failure.is_none() {
+                store.failure = Some(format!("{error:#}"));
             }
         }
         result

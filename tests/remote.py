@@ -2146,7 +2146,7 @@ os.execv(native,[native,*args])
             self.assertTrue(f.stalled.wait(timeout=20),'lazy fetch never reached controlled server stall')
             self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
             if escaped: exit_file.write_text('exit successfully')
-            else: os.killpg(state['pid'],signal.SIGTERM)
+            else: process.send_signal(signal.SIGTERM)
             try:
                 _,errors=process.communicate(timeout=8)
                 stayed_blocked=False
@@ -2178,7 +2178,7 @@ os.execv(native,[native,*args])
         f=self.f; self.stall_url=f.https(); self.addCleanup(f.server.shutdown)
         for escaped in (False,True):
             with self.subTest(escaped=escaped):
-                if OPTIONS.before_binary: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
+                if OPTIONS.before_binary and escaped: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
                 self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
 
     def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
@@ -2243,111 +2243,99 @@ os.execv(native,[native,*args])
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
-    def test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr(self):
+    def test_real_mount_delayed_ignore_acquisition_preserves_policy(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=self.ignore_policy_fixture()
-        cases=([OPTIONS.before_policy_binary] if OPTIONS.before_policy_binary else [])+[OPTIONS.binary]
-        for binary in cases:
-            for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
-                with self.subTest(binary=str(binary),operation=operation):
-                    shutil.rmtree(f.root/'cache',ignore_errors=True)
-                    f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.ignore}
-                    ready=f.root/'ignore-request-ready'; handled=f.root/'ignore-request-handled'
-                    observed=f.root/'ignore-request-errno'; release=f.root/'ignore-request-release'
-                    for marker in (ready,handled,observed,release): marker.unlink(missing_ok=True)
-                    # ctypes observes the original syscall errno; Python's open
-                    # and mkdir wrappers otherwise retry EINTR automatically.
-                    code="import ctypes,errno,json,os,signal,sys,time; from pathlib import Path\nlibc=ctypes.CDLL(None,use_errno=True)\ndef handler(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handler)\nPath(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
-                    code+=("result=libc.open(os.fsencode(sys.argv[1]),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n" if operation=='create' else "result=libc.mkdir(os.fsencode(sys.argv[1]),0o700)\n")
-                    code+="error=ctypes.get_errno()\nassert result==-1,(result,error)\nassert error==errno.EINTR,error\nassert not os.path.lexists(sys.argv[1])\nPath(os.environ['OBSERVED']).write_text(str(error))\nwhile not Path(os.environ['RELEASE']).exists(): time.sleep(.01)\n"
-                    code+=("fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else "os.mkdir(sys.argv[1])\n")
-                    env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed),RELEASE=str(release))
-                    process=subprocess.Popen([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                    f.children.append(process); state=None
-                    try:
-                        self.assertTrue(f.stalled.wait(timeout=20),'ignore request did not reach controlled acquisition stall')
-                        self.assertTrue(ready.exists()); state=json.loads(ready.read_text())
-                        os.kill(state['pid'],signal.SIGTERM)
-                        deadline=time.monotonic()+5
-                        while not observed.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
-                        self.assertTrue(observed.exists(),'ignore request failed to reply EINTR before server release')
-                        self.assertEqual(int(observed.read_text()),errno.EINTR)
-                        self.assertTrue(handled.exists(),'requester signal handler did not run')
-                        f.resume.set(); release.touch()
-                        _,errors=process.communicate(timeout=20)
-                        self.assertEqual(process.returncode,0,errors)
-                        self.assertNotIn(b'execution incomplete',errors)
-                        self.assertEqual(list(f.root.glob('git-on-*')),[])
-                        print('ignore interruption regression evidence:',json.dumps(dict(binary=str(binary),operation=operation,errno=errno.EINTR,retry_succeeded=True)),flush=True)
-                    finally:
-                        f.resume.set(); f.stalled_oids.clear(); release.touch()
-                        if process.poll() is None:
-                            if state is not None:
-                                with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
-                            process.kill()
-                        process.communicate(timeout=20)
-                        if state is not None and Path(state['run']).exists():
-                            cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',state['run']],capture_output=True,timeout=20)
-                            self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+        for operation,path,allowed in (('create','created.tmp',True),('mkdir','created-dir',True),('create','denied',False),('mkdir','denied-dir',False)):
+            with self.subTest(operation=operation,allowed=allowed):
+                f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.ignore}
+                ready=f.root/'ignore-request-ready'; handled=f.root/'ignore-request-handled';observed=f.root/'ignore-result'
+                for marker in (ready,handled,observed):marker.unlink(missing_ok=True)
+                code="import errno,json,os,signal,sys; from pathlib import Path\ndef handler(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handler)\nPath(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+                code+=f"allowed={allowed!r}\ntry:\n"
+                code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
+                code+="except OSError as error:\n assert not allowed and error.errno==errno.EROFS,error\n assert not os.path.lexists(sys.argv[1])\nelse:\n assert allowed,'forbidden mutation succeeded'\n assert os.path.exists(sys.argv[1])\nassert Path(os.environ['HANDLED']).exists(),'handler not delivered after source completed'\nPath(os.environ['OBSERVED']).write_text(str(allowed))\n"
+                env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed))
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                f.children.append(process); state=None
+                try:
+                    self.assertTrue(f.stalled.wait(timeout=20),'ignore request did not reach controlled source delay')
+                    self.assertTrue(ready.exists());state=json.loads(ready.read_text())
+                    os.kill(state['pid'],signal.SIGTERM)
+                    # Observe completion outside FUSE: probing the mount here
+                    # could itself block behind the controlled callback.
+                    time.sleep(.05)
+                    self.assertFalse(observed.exists(),'write completed before ignore rules were obtained')
+                    self.assertIsNone(process.poll(),'write failed while policy source was merely delayed')
+                    f.resume.set()
+                    _,errors=process.communicate(timeout=20)
+                    self.assertEqual(process.returncode,0,errors)
+                    self.assertTrue(handled.exists())
+                    self.assertEqual(observed.read_text(),str(allowed))
+                    self.assertNotIn(b'execution incomplete',errors)
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                finally:
+                    f.resume.set();f.stalled_oids.clear()
+                    if process.poll() is None:
+                        if state is not None:
+                            with contextlib.suppress(ProcessLookupError):os.killpg(state['pid'],signal.SIGKILL)
+                        process.kill()
+                    process.communicate(timeout=20)
+                    if state is not None and Path(state['run']).exists():
+                        cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',state['run']],capture_output=True,timeout=20)
+                        self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def request_signal_behavior(self, binary, mode, expect_old):
+    def delayed_mount_read(self,mode):
         f=self.f
-        shutil.rmtree(f.root/'cache',ignore_errors=True)
-        f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.blob}
-        ready=f.root/'request-ready'; handled=f.root/'request-handled'
-        ready.unlink(missing_ok=True); handled.unlink(missing_ok=True)
-        code="import json,os,signal,sys; from pathlib import Path\n"
+        f.stalled.clear();f.resume.clear();f.stalled_oids={f.blob}
+        ready=f.root/'request-ready';handled=f.root/'request-handled'
+        for marker in (ready,handled):marker.unlink(missing_ok=True)
+        code="import ctypes,json,os,signal,sys; from pathlib import Path\n"
         if mode=='handled-exit':
             code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\n raise SystemExit(0)\nsignal.signal(signal.SIGTERM,handle)\n"
-        elif mode=='handled-retry':
-            code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handle)\n"
-        code+="Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\nassert open('deep/file').read()=='expected\\n'\nprint('read completed')\n"
-        process=subprocess.Popen([str(binary.resolve()),self.signal_url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready),HANDLED=str(handled)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        f.children.append(process); directory=None; state=None
+        elif mode=='caught-return':
+            code+="def handle(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handle)\n"
+        code+="Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+        if mode in ('plain','caught-return'):
+            # Observe the actual result: Python's file wrappers could hide a
+            # synthetic EINTR by retrying the open/read automatically.
+            code+="libc=ctypes.CDLL(None,use_errno=True)\nlibc.open.argtypes=[ctypes.c_char_p,ctypes.c_int];libc.open.restype=ctypes.c_int\nlibc.read.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_size_t];libc.read.restype=ctypes.c_ssize_t\nfd=libc.open(b'deep/file',os.O_RDONLY);assert fd>=0,('open',ctypes.get_errno())\nbuffer=ctypes.create_string_buffer(64)\ncount=libc.read(fd,buffer,64);assert count==9,('read',count,ctypes.get_errno())\nassert buffer.raw[:count]==b'expected\\n'\nassert libc.read(fd,buffer,64)==0\nlibc.close(fd)\nos.write(1,b'expected\\n')\n"
+            if mode=='caught-return':code+="assert Path(os.environ['HANDLED']).exists()\n"
+        else:code+="assert open('deep/file').read()=='expected\\n'\n"
+        process=subprocess.Popen([str(OPTIONS.binary.resolve()),self.signal_url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process);state=None;directory=None
         try:
-            self.assertTrue(f.stalled.wait(timeout=20),'request did not reach controlled transport stall')
-            self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
-            os.killpg(state['pid'],signal.SIGINT if mode=='python-int' else signal.SIGTERM)
-            if mode=='handled-retry':
-                deadline=time.monotonic()+5
-                while not handled.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
-                stayed_blocked=not handled.exists()
-                if not stayed_blocked: f.resume.set()
-            else:
-                try:
-                    output,errors=process.communicate(timeout=5)
-                    stayed_blocked=False
-                except subprocess.TimeoutExpired:
-                    stayed_blocked=True
-            if expect_old:
-                self.assertTrue(stayed_blocked,'old binary did not reproduce pending requester signal')
-            else:
-                self.assertFalse(stayed_blocked,'pending requester signal did not interrupt native demand')
-                if mode=='handled-retry': output,errors=process.communicate(timeout=15)
-                self.assertEqual(process.returncode,-signal.SIGINT if mode=='python-int' else 0,errors)
-                if mode=='handled-retry': self.assertEqual(output,b'read completed\n')
-                if mode!='python-int': self.assertTrue(handled.exists(),'custom signal handler did not run')
-                self.assertNotIn(b'execution incomplete',errors)
-                self.assertFalse(directory.exists(),'completed command did not clean its run')
-            print('request signal regression evidence:',json.dumps(dict(binary=str(binary),mode=mode,before=expect_old,observed_stall=stayed_blocked)),flush=True)
+            self.assertTrue(f.stalled.wait(timeout=20),'read did not reach controlled source delay')
+            self.assertTrue(ready.exists());state=json.loads(ready.read_text());directory=Path(state['run'])
+            if mode!='plain':os.killpg(state['pid'],signal.SIGINT if mode=='python-int' else signal.SIGTERM)
+            if mode in ('plain','caught-return'):
+                # Harness-only observation window; no product read deadline.
+                # Availability has not changed and no I/O error was injected.
+                time.sleep(.05)
+                self.assertIsNone(process.poll(),'read failed while the valid source was merely delayed')
+            f.resume.set()
+            output,errors=process.communicate(timeout=20)
+            self.assertEqual(process.returncode,-signal.SIGINT if mode=='python-int' else 0,errors)
+            if mode in ('plain','caught-return'):self.assertEqual(output,b'expected\n')
+            if mode in ('caught-return','handled-exit'):self.assertTrue(handled.exists(),'handler did not run')
+            self.assertNotIn(b'execution incomplete',errors)
+            self.assertFalse(directory.exists(),'completed command did not clean its run')
         finally:
+            f.resume.set();f.stalled_oids.clear()
             if process.poll() is None:
                 if state is not None:
-                    with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
+                    with contextlib.suppress(ProcessLookupError):os.killpg(state['pid'],signal.SIGKILL)
                 process.kill()
-            f.resume.set(); f.stalled_oids.clear()
-            process.communicate(timeout=15)
+            process.communicate(timeout=20)
             if directory is not None and directory.exists():
                 cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def test_review_real_mount_pending_request_signals_preserve_handlers(self):
-        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
-        f=self.f; self.signal_url=f.https(); self.addCleanup(f.server.shutdown)
-        for mode in ('python-int','handled-exit','handled-retry'):
-            with self.subTest(mode=mode):
-                if OPTIONS.before_binary: self.request_signal_behavior(OPTIONS.before_binary,mode,True)
-                self.request_signal_behavior(OPTIONS.binary,mode,False)
+    def test_real_mount_delayed_source_returns_data_without_invented_error(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;self.signal_url=f.https();self.addCleanup(f.server.shutdown)
+        for mode in ('plain','caught-return','handled-exit','python-int'):
+            with self.subTest(mode=mode):self.delayed_mount_read(mode)
 
     def test_native_failed_verification_never_executes_command(self):
         f=self.f; signed,allowed=self.signing(); sentinel=f.root/'command-executed'

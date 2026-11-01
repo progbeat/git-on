@@ -22,12 +22,8 @@ pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
-fn snapshot_errno(error: anyhow::Error) -> i32 {
-    if crate::git::is_request_interruption(&error) {
-        libc::EINTR
-    } else {
-        libc::EIO
-    }
+fn snapshot_errno(_error: anyhow::Error) -> i32 {
+    libc::EIO
 }
 
 struct Node {
