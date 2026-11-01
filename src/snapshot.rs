@@ -234,8 +234,6 @@ impl Drop for Pin {
 /// libgit2's necessary pack/delta decoding is not separately observable here.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SnapshotMetrics {
-    #[cfg(feature = "test-metrics")]
-    pub profile_spans: BTreeMap<&'static str, crate::profile::Summary>,
     /// Successful explicit native fetches, including initial ref resolution.
     pub remote_fetches: u64,
     pub remote_fetch_operations: u64,
@@ -424,8 +422,6 @@ impl State {
         Ok(size)
     }
     fn open(&mut self, oid: Oid) -> Result<BlobReader> {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("snapshot_open", 0);
         let existing = self
             .readers
             .lock()
@@ -480,11 +476,7 @@ impl State {
                 );
                 (raw.insert(oid, size, reader, &self.spool_directory)?, true)
             } else {
-                let object = {
-                    #[cfg(feature = "test-metrics")]
-                    let _profile = crate::profile::span("local_pack_decode", size as u64);
-                    odb.read(oid).context("decode Git blob")?
-                };
+                let object = odb.read(oid).context("decode Git blob")?;
                 anyhow::ensure!(
                     object.kind() == ObjectType::Blob && object.len() == size,
                     "Git blob changed during transfer"
@@ -880,10 +872,6 @@ impl Snapshot {
     pub fn metrics(&self) -> SnapshotMetrics {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut metrics = state.metrics.clone();
-        #[cfg(feature = "test-metrics")]
-        {
-            metrics.profile_spans = crate::profile::summary();
-        }
         if let Some(remote) = &state.remote {
             metrics.remote_fetches = remote.completed_fetches();
             metrics.remote_fetch_operations = remote.fetch_operations();

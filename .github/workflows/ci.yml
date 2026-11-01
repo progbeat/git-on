@@ -155,52 +155,36 @@ jobs:
         run: python3 tests/write_policy.py --binary target/release/git-on --require-fuse
       - name: Build private resource instrumentation
         run: |
-          cp target/release/git-on target/release/git-on-plain
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
-      - name: Attribute instrumentation on the same real FUSE host
-        if: needs.changes.outputs.resources == 'true'
-        # Reuse both binaries already built above. This bounded diagnostic
-        # has no timing SLA and adds no second complete WebKit traversal.
-        run: |
-          profile_cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
-          taskset -c "$profile_cpu" python3 tests/instrumentation_profile.py --checkout . --plain target/release/git-on-plain --metrics target/release/git-on --backend fuse --counts 128,512 --trials 3 --work "$RUNNER_TEMP/instrumentation-attribution" --output instrumentation-profile.jsonl
-      - name: Separate invocation setup from increasing same-mount demand
-        if: needs.changes.outputs.resources == 'true'
-        run: |
-          python3 tests/startup_profile.py --binary target/release/git-on --output startup-profile.jsonl
-          python3 tests/startup_profile.py --binary target/release/git-on --policies ignored,all --sizes 160 --trials 1 --profile-spans --output callback-profile.jsonl
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
           python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on
           python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on
           python3 tests/native_job_control.py --binary target/release/git-on
 
-      - name: Bounded kernel-cache and waited-CPU profile
+      - name: Protected-source kernel-cache regression
         if: needs.changes.outputs.resources == 'true'
-        run: python3 tests/io_profile.py --binary target/release/git-on --files 1000 --output io-profile.jsonl
+        run: python3 tests/source_cache.py --binary target/release/git-on --files 1000 --output source-cache.jsonl
       - name: Distinct-object CLI preparation and closed-reader reuse
         if: needs.changes.outputs.resources == 'true'
         run: |
-          python3 tests/import_profile.py --binary target/release/git-on --backend fuse --sizes 160 --output import-profile-fuse.jsonl
-          python3 tests/import_profile.py --binary target/release/git-on --backend materialized --sizes 32 --trace --output import-profile-materialized.jsonl
-      - name: Wide-tree preparation and repeated metadata with full disk baseline
+          python3 tests/object_reuse.py --binary target/release/git-on --backend fuse --sizes 160 --output object-reuse-fuse.jsonl
+          python3 tests/object_reuse.py --binary target/release/git-on --backend materialized --sizes 32 --output object-reuse-materialized.jsonl
+      - name: Wide-tree preparation and repeated metadata reuse
         if: needs.changes.outputs.resources == 'true'
         run: |
-          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-profile-local.jsonl
-          python3 tests/metadata_profile.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-profile-remote.jsonl
+          python3 tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-reuse-local.jsonl
+          python3 tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-reuse-remote.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.changes.outputs.resources == 'true'
         with:
-          name: io-profile
+          name: resource-regressions
           path: |
-            io-profile.jsonl
-            import-profile-fuse.jsonl
-            import-profile-materialized.jsonl
-            metadata-profile-local.jsonl
-            metadata-profile-remote.jsonl
-            startup-profile.jsonl
-            instrumentation-profile.jsonl
-            callback-profile.jsonl
+            source-cache.jsonl
+            object-reuse-fuse.jsonl
+            object-reuse-materialized.jsonl
+            metadata-reuse-local.jsonl
+            metadata-reuse-remote.jsonl
           if-no-files-found: error
 
       - name: Real-FUSE generated-file passthrough fallback
@@ -396,7 +380,7 @@ jobs:
       - name: Acquire and verify the pinned source once
         run: python3 tests/real_repository.py prepare --directory "$RUNNER_TEMP/webkit-fixture"
       - name: Full real snapshot and useful tooling command with complete baselines
-        run: python3 tests/real_repository.py run --fixture "$RUNNER_TEMP/webkit-fixture" --binary target/release/git-on --profile-full --output webkit-results.jsonl
+        run: python3 tests/real_repository.py run --fixture "$RUNNER_TEMP/webkit-fixture" --binary target/release/git-on --output webkit-results.jsonl
       - name: Retain real repository evidence, including partial failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -427,10 +411,9 @@ jobs:
           python3 tests/test_scalability_harness.py
           python3 tests/test_ci_plan.py
           python3 tests/test_record_demo.py
-          python3 tests/test_io_profile.py
-          python3 tests/test_fuse_syscall_profile.py
-          python3 tests/test_import_profile.py
-          python3 tests/test_metadata_profile.py
+          python3 tests/test_source_cache.py
+          python3 tests/test_object_reuse.py
+          python3 tests/test_metadata_reuse.py
           python3 tests/test_real_repository.py
       - name: Test lossless conversion and output preservation
         run: |
@@ -556,7 +539,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.changes.outputs.resources == 'true'
         with:
-          name: io-profile
+          name: resource-regressions
           path: gate-data/imports
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.changes.outputs.lazy == 'true'

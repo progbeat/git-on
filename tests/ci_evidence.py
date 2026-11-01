@@ -139,34 +139,27 @@ def validate_evidence(plan,root):
         result['webkit']=validate_reports(rows(paths[0]),plan['head'])
     if plan['required']['resources']:
         result['resources']=validate_resources(root)
-        result['imports']=validate_import_profiles(plan,root)
+        result['imports']=validate_object_reuse(plan,root)
     if plan['required']['stress']:result['stress']=validate_stress(root)
     if plan['required']['lazy']:result['lazy']=validate_lazy(plan,root)
     return result
 
 
-def validate_import_profiles(plan,root):
-    from import_profile import validate_runner
+def validate_object_reuse(plan,root):
+    from object_reuse import validate_runner
     result={}
-    for name,backend,count,traces in (('import-profile-fuse.jsonl','fuse',160,[False]),('import-profile-materialized.jsonl','materialized',32,[False,True])):
-        paths=list(root.rglob(name))
-        if len(paths)!=1:raise ValueError(f'missing/duplicate production import profile: {name}')
+    for backend,count in (('fuse',160),('materialized',32)):
+        name=f'object-reuse-{backend}.jsonl';paths=list(root.rglob(name))
+        if len(paths)!=1:raise ValueError(f'missing/duplicate object reuse evidence: {name}')
         data=rows(paths[0])
-        if len(data)!=1+len(traces):raise ValueError('incomplete production profile cases')
-        if any(r.get('head')!=plan['head'] or r.get('working_tree_dirty') is not False or r.get('backend')!=backend or r.get('files')!=count or r.get('blob_bytes')!=8192 for r in data):raise ValueError('wrong production profile identity')
-        baseline=data[0]
-        if baseline['type']!='baseline' or baseline['stat_abi_bytes']<=0:raise ValueError('missing full materialization baseline')
-        if baseline['total_elapsed_ns']!=sum(baseline[k]['elapsed_ns'] for k in ('materialize','command','cleanup')):raise ValueError('baseline omitted preparation or cleanup')
-        for row,traced in zip(data[1:],traces):
-            if row.get('type')!='runner' or row.get('variant')!='current' or row.get('traced') is not traced:raise ValueError('missing/ambiguous production invocation')
-            try:validate_runner(row,count,8192,baseline['stat_abi_bytes'],backend)
-            except (AssertionError,KeyError,TypeError) as error:raise ValueError('incomplete production import execution') from error
-            if row['child_observations']!=baseline['command']['child_observations']:raise ValueError('baseline command differs')
-            if any(row.get(k,-1)<0 for k in ('waited_user_cpu_s','waited_system_cpu_s','runner_and_waited_children_peak_resident_kib')):raise ValueError('missing full-process resources')
-            if traced:
-                if row['processes'].get('unpack-objects',0) or not row['processes'].get('cat-file',0):raise ValueError('native decoder tracing absent/wrong')
-                if row['processes']['cat-file']!=row['metrics']['remote_decode_operations'] or row['processes'].get('fetch')!=row['metrics']['remote_fetch_operations']:raise ValueError('native operation counter differs from full-process trace')
-                raw=sum(io.get('raw_parts_write_bytes',0) for io in row['file_io_by_command'].values())
-                if raw<count*8192:raise ValueError('native output staging writes were not measured')
-        result[backend]=dict(distinct_blobs=count,invocations=len(traces),application_passes=2)
+        if len(data)!=1:raise ValueError('missing/duplicate object reuse invocation')
+        row=data[0]
+        if (row.get('head')!=plan['head'] or row.get('working_tree_dirty') is not False
+            or row.get('type')!='runner' or row.get('backend')!=backend
+            or row.get('files')!=count or row.get('blob_bytes')!=8192
+            or type(row.get('stat_abi_bytes')) is not int or row['stat_abi_bytes']<=0):
+            raise ValueError('wrong object reuse identity')
+        try:validate_runner(row,count,8192,row['stat_abi_bytes'],backend)
+        except (AssertionError,KeyError,TypeError) as error:raise ValueError('incomplete object reuse execution') from error
+        result[backend]=dict(distinct_blobs=count,invocations=1,application_passes=2)
     return result

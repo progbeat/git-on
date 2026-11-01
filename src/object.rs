@@ -78,8 +78,6 @@ pub(crate) fn copy_verified(
     size: usize,
     oid: Oid,
 ) -> Result<()> {
-    #[cfg(feature = "test-metrics")]
-    let _profile = crate::profile::span("object_verify_copy", size as u64);
     let kind = kind.str();
     let mut hash = Sha1::new();
     hash.update(format!("{kind} {size}\0").as_bytes());
@@ -135,8 +133,6 @@ pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write
             object.id(),
         );
     }
-    #[cfg(feature = "test-metrics")]
-    let _profile = crate::profile::span("object_preverified_copy", object.len() as u64);
     for bytes in object.data().chunks(64 * 1024) {
         check_transfer()?;
         output

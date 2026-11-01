@@ -377,8 +377,6 @@ impl Overlay {
             cache.valid = true;
             view
         } else {
-            #[cfg(feature = "test-metrics")]
-            let _profile = crate::profile::span("directory_view", 0);
             let source = self
                 .node(ino)?
                 .snapshot_path

@@ -33,7 +33,7 @@ struct State {
     // Enabled only after the peer advertises the kernel's no-open contract.
     no_open: bool,
     #[cfg(feature = "test-metrics")]
-    profile_uncached_source: bool,
+    test_uncached_source: bool,
     #[cfg(target_os = "linux")]
     enabled: bool,
     #[cfg(target_os = "linux")]
@@ -48,7 +48,7 @@ impl Fuse {
                 core,
                 no_open: false,
                 #[cfg(feature = "test-metrics")]
-                profile_uncached_source: std::env::var_os("GIT_ON_TEST_UNCACHED_SOURCE").is_some(),
+                test_uncached_source: std::env::var_os("GIT_ON_TEST_UNCACHED_SOURCE").is_some(),
                 #[cfg(target_os = "linux")]
                 enabled: false,
                 #[cfg(target_os = "linux")]
@@ -65,14 +65,14 @@ impl Fuse {
 impl State {
     fn retain_source_data(&self, ino: u64) -> bool {
         #[cfg(feature = "test-metrics")]
-        if self.profile_uncached_source {
+        if self.test_uncached_source {
             return false;
         }
         self.core.unchanged_source_data(ino)
     }
     fn source_cacheable(&self, ino: u64) -> bool {
         #[cfg(feature = "test-metrics")]
-        if self.profile_uncached_source {
+        if self.test_uncached_source {
             return false;
         }
         self.core.protected_source(ino)
@@ -187,7 +187,7 @@ impl Filesystem for Fuse {
             let state = self.state.get_mut().expect("filesystem state poisoned");
             let no_open = state.core.read_only();
             #[cfg(feature = "test-metrics")]
-            let no_open = no_open && !state.profile_uncached_source;
+            let no_open = no_open && !state.test_uncached_source;
             state.no_open = no_open
                 && config
                     .add_capabilities(fuser::InitFlags::FUSE_NO_OPEN_SUPPORT)
@@ -205,8 +205,6 @@ impl Filesystem for Fuse {
         Ok(())
     }
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_lookup", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -223,8 +221,6 @@ impl Filesystem for Fuse {
         self.state().core.forget_inode(ino.0, count);
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_getattr", 0);
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("getattr");
@@ -389,8 +385,6 @@ impl Filesystem for Fuse {
         entry(reply, self.state().core.link_node(ino.0, parent.0, name));
     }
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_open", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -509,8 +503,6 @@ impl Filesystem for Fuse {
         _owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_read", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -563,8 +555,6 @@ impl Filesystem for Fuse {
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_flush", 0);
         let state = self.state();
         if state.no_open && fh.0 == 0 {
             // Linux remembers ENOSYS, avoiding future flush requests for this
@@ -589,8 +579,6 @@ impl Filesystem for Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_release", 0);
         empty(reply, self.state().release(ino.0, fh.0));
     }
     fn fsync(
@@ -610,8 +598,6 @@ impl Filesystem for Fuse {
         empty(reply, result);
     }
     fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_opendir", 0);
         let _request = crate::git::RequestGuard::enter(req.pid());
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
@@ -629,8 +615,6 @@ impl Filesystem for Fuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_readdir", 0);
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("readdir");
@@ -651,8 +635,6 @@ impl Filesystem for Fuse {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("fuse_releasedir", 0);
         #[cfg(feature = "test-metrics")]
         self.state().core.record_fuse_request("releasedir");
         empty(reply, self.state().release(ino.0, fh.0));

@@ -119,7 +119,7 @@ actually runs.
 | Fresh remote invocations / no global cache | Repeat every workload after every source/size/signature case | Permanent two-process no-cache regression; each matrix invocation asserts its exact demanded OID set. Verified/unverified invocations also use fresh private ODBs |
 | Memory-cache eviction / descriptor growth | 192 and 512 distinct-object controls plus shared-object namespace tests | Same reduced-RLIMIT 192-object test, same-run reread after memory eviction, and 32/128/512 distinct pack controls |
 | Streaming large-object and import thresholds | Three 96 MiB remote objects, previously chosen to exceed a removed global 256 MiB cache | Three 16 MiB objects exceed the 64 KiB raw streaming threshold and 8 MiB native import threshold; their combined working set exceeds the 16 MiB payload budget. Local 16/64/128 MiB range controls remain |
-| Whole-invocation overhead and native import writes | Loader-only pack metadata trace could not establish total cost | Optimized CLI: 160 distinct 8 KiB blobs through real FUSE; 32 through materialization, with a separate descendant-following file-I/O trace. Both compare complete clone + identical two-pass closed-read/stat command + cleanup. Exact-head evidence, native decoder writes and unique-load reuse are gated; no timing SLA is invented |
+| Whole-invocation overhead and unique-object reuse | Loader-only pack metadata trace could not establish total cost | The pinned WebKit benchmark measures complete clone/checkout + identical command + cleanup and Git-on's complete invocation. Separate behavioral CLI regressions use 160 distinct 8 KiB blobs through FUSE and 32 through materialization, check two closed-read/stat passes and one decode per unique object, and audit real native command execution. These regressions do not claim performance acceptance |
 | Long clean unmount / escaped users / cancellation | Full scale plus permanent helper and real-mount regressions | Real 4s-helper regression, WebKit teardown and all busy/escaped-reader/signal tests remain. Generated million opened-file pressure is not claimed for the replacement |
 | Write permissions, bytes/links/metadata, protocol errors and lifecycle | Unit/protocol, real mount, packages and seeded differential suites | All retained; differential stress parameters remain two seeds in default ignored, 400 operations, 64 nodes and 64 KiB per file |
 | Feature-disabled versus instrumented builds | All Rust tests in both configs, plus Mac | Full normal suite; instrumented suite skips only the already-run expensive pure pattern oracle, with no metrics branches. All snapshot/protocol/runtime tests remain; Mac runs its complete instrumented suite |
@@ -232,20 +232,8 @@ of meaningful pre-merge real-repository validation from the earlier synthetic
 speedup; no expensive legacy full matrix was rerun or silently moved post-merge.
 
 
-For full-path attribution, the current diagnostic stage uses `--profile-full`
-on the existing single WebKit full-read invocation. The workload, baseline,
-number of passes and actual-data gates are unchanged. Results explicitly mark
-profiling; inclusive read/open/hash/spill/decode spans overlap and must not be
-summed. The private complete invocation timeline additionally separates source,
-mount, command, unmount and cleanup and preserves parent-observed total time.
-These diagnoses are not uninstrumented timing comparisons. The useful test
-trials stay unprofiled, and no second full WebKit run is added within the job.
-
-The same diagnostic command samples up to 16 regular-file paths per size bucket
-(<1 KiB, <=64 KiB, <=1 MiB, >1 MiB) after each pass. PROT_NONE mappings and
-mincore inspect existing page residency without reading file payloads; raw and
-FUSE-view pages are reported separately. Missing/protected observations stay
-explicit. Sampling time stays in the diagnostic command/total time. CPU, RAM
-limit and filesystem metadata use the existing benchmark collector; system and
-cgroup file/anonymous-cache observations accompany the samples. These are
-limited observations, not a whole-cache census or a physical-memory peak.
+Temporary profiling scripts, syscall summaries, calibration runs and phase/span
+hooks are working evidence outside the repository. CI runs behavioral resource
+regressions and the reproducible WebKit benchmark; it does not integrate a
+profiler. The benchmark retains full wall time, waited-child CPU, peak/sampled
+memory and compressed-payload evidence, with their stated measurement limits.

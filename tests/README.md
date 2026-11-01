@@ -29,37 +29,12 @@ For the local mode, run from that bare repository's directory and omit the
 `file://...` operand. The reported benchmark uses its external Python wrapper
 to run this test command twice in one mount and retain separate first/repeat
 outputs; `runner.argv` records the exact measured Git-on argv, excluding the
-resource observer prefix. The one-pass command above is the interactive demo. `--profile-full`
-on the harness enables labelled inclusive diagnostics for its one full-read
-case; it does not add another complete traversal. Complete invocation timing
-still includes setup and cleanup. Profiling results are not presented as
-uninstrumented latency measurements.
+resource observer prefix. The one-pass command above is the interactive demo.
+Complete invocation timing includes setup, all subprocesses and cleanup.
 
 This is not a public-network latency benchmark. Source and OS-cache
 conditions, complete baseline composition and sampled-memory limitations are
 explicit in each report. See [CI coverage](../docs/ci-performance.md).
-
-To attribute measurement overhead on one Linux FUSE host, keep a normal release
-binary before building `--features test-metrics`, then run:
-
-```sh
-python3 tests/instrumentation_profile.py --checkout . --plain /absolute/path/git-on-plain --metrics /absolute/path/git-on-metrics --backend fuse --work /absolute/disk/path/attribution-work --output instrumentation-profile.jsonl
-```
-
-The bounded packed fixture is at most 512 unique 64 KiB blobs. Six shuffled
-variants separate ordinary/metrics builds, report/spans and external sampling;
-three fresh invocation trials read/stat each selected file twice and check exact
-contents. The native shared-clone baseline includes the same command and cleanup,
-with one explicitly shared baseline per demand/trial. Builds must use the same
-compiler/profile and checkout; their SHA-256 values are recorded. Pin execution
-to one available CPU for comparisons and record external load. GNU timeout adds
-the same 25 s graceful/30 s hard wrapper to each measured command. No OS-cache
-flush or privileged setting is used; temporary storage must be on the declared
-disk filesystem. `--backend materialized` is a control for a host without FUSE.
-This diagnostic is not the pinned WebKit acceptance workload or a timing gate.
-An optional `--candidate BINARY --pair` compares only two ordinary binaries;
-record their separate source/build provenance rather than inferring identity
-from the unchanged product version string.
 
 ```console
 cargo build --locked

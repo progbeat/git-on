@@ -130,9 +130,9 @@ Red evidence is `long-name-red.json`, green is `long-name-green.log` in the same
 retained workspace evidence directory. Actual macOS compilation needs final CI.
 
 A fresh full-stage review at `5821425` found no additional runtime defect and
-one P3: the new profile's negative regression suite was omitted from CI's
+one P3: the new metadata reuse regression suite was omitted from CI's
 explicit Python commands. `test_python_regression_suites_are_registered` fails
-on that workflow and passes after registering `test_metadata_profile.py`.
+on that workflow and passes after registering `test_metadata_reuse.py`.
 It guards all standalone Python regression suites so a new one cannot remain
 local-only unnoticed. The red/green registration logs are retained alongside
 the other metadata-stage evidence.
@@ -2214,22 +2214,13 @@ and NOFLUSH. All 20 protocol tests pass. Logs are
 `/tmp/git-on-140-kernel-cache-{red,green}.log`. This is a wire-contract result,
 not proof of a real-kernel speedup or completion of #20.
 
-The bounded real-FUSE I/O diagnostic compares the same instrumented executable
-with the previous uncached-source policy and the new policy. Both walks check
-complete names and bytes. An identical direct-disk command is measured, and a
-test-only callback counter measures requests delivered by the kernel without
-ptrace (which suppresses fusermount3 privileges). CPU includes waited descendants.
-The separate native-Git trace parser has positive pipe/file and resumed-request
-regressions. Traced timing is deliberately not used as throughput.
-
-The first real-kernel diagnostic on f12d00f mounted successfully untraced but
-failed under strace: tracing suppresses the setuid fusermount3 privileges.
-The diagnostic now inherits its existing test-metrics descriptor and counts
-lookup/getattr/open/read callback delivery directly, without changing privileges
-or security settings. Its descriptor regression fails against f12d00f with an
-unsupported metrics argument and passes after the fix (three diagnostic tests).
-Evidence: `/tmp/git-on-io-profile-{red,green}.log`. Native-process file I/O remains
-a separate traced measurement, not a kernel-cache timing claim.
+The permanent real-FUSE source-cache regression compares the previous
+uncached-source policy and the protected-source policy in the same test build.
+Both walks check complete names and bytes; test-only callback counters assert
+fewer delivered lookup/read requests without tracing or privilege changes.
+The inherited-metrics descriptor and child namespace checks remain negative
+regressions. Temporary profiling scripts and old traced timing evidence are
+kept outside the mergeable tree.
 
 ## Disposable object syncs and large-blob close/reopen
 

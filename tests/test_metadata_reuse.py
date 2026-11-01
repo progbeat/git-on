@@ -5,10 +5,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from metadata_profile import CHILD,validate_runner
+from metadata_reuse import CHILD,validate_runner
 
 
-class MetadataProfileTests(unittest.TestCase):
+class MetadataReuseTests(unittest.TestCase):
     def test_command_checks_bytes_and_metadata_on_two_closed_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

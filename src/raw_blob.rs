@@ -83,8 +83,6 @@ impl RawBlob {
         {
             return Ok(());
         }
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("small_blob_policy", self.size);
         let bytes = self.read_all()?;
         check(&bytes)?;
         // The descriptor identifies immutable Git contents; successful format
@@ -124,8 +122,6 @@ impl RawBlob {
         result
     }
     fn checked_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("raw_range", length);
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -161,16 +157,8 @@ impl RawBlob {
                 file = Some(store.directory.reader(self.oid, self.size)?);
             }
             let mut bytes = vec![0; size];
-            {
-                #[cfg(feature = "test-metrics")]
-                let _profile = crate::profile::span("raw_disk_read", size as u64);
-                file.as_ref().unwrap().read_exact_at(&mut bytes, start)?;
-            }
-            let digest = {
-                #[cfg(feature = "test-metrics")]
-                let _profile = crate::profile::span("raw_block_hash", size as u64);
-                Sha256::digest(&bytes)
-            };
+            file.as_ref().unwrap().read_exact_at(&mut bytes, start)?;
+            let digest = Sha256::digest(&bytes);
             if digest.as_slice() != expected {
                 return Err(invalid("verified raw blob bytes were modified"));
             }
@@ -242,8 +230,6 @@ impl RawDirectory {
     fn open_name(&self, name: &CString, flags: i32, size: Option<u64>) -> Result<File> {
         #[cfg(test)]
         self.open_calls.set(self.open_calls.get() + 1);
-        #[cfg(feature = "test-metrics")]
-        let _profile = crate::profile::span("raw_file_open", 0);
         let fd = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
@@ -694,8 +680,6 @@ impl Store {
                     resident.block == 0 && resident.bytes.len() as u64 == descriptor.size,
                     "unbacked object is not fully resident"
                 );
-                #[cfg(feature = "test-metrics")]
-                let _profile = crate::profile::span("raw_small_spill", descriptor.size);
                 let pending = self.directory.pending()?;
                 pending.file.write_all_at(&resident.bytes, 0)?;
                 pending.commit(oid)?;

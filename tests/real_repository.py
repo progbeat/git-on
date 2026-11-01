@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import random
 import re
 import resource
 import signal
@@ -160,19 +159,18 @@ def process_snapshot(pid):
 
 def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
     """Include launch, native descendants and process exit; no traced timings."""
-    with tempfile.TemporaryFile() as counters, tempfile.TemporaryFile() as timings:
+    with tempfile.TemporaryFile() as counters:
         observed_argv=[os.fspath(value) for value in argv]
         if resource_observer:
             rss_output=resource_observer.with_name('observed-rss')
             argv=[str(resource_observer),str(rss_output),*argv]
-        if metrics: env = dict(env, GIT_ON_TEST_METRICS_FD=str(counters.fileno()),
-            GIT_ON_TEST_TIMING_FD=str(timings.fileno()))
+        if metrics: env = dict(env, GIT_ON_TEST_METRICS_FD=str(counters.fileno()))
         before = resource.getrusage(resource.RUSAGE_CHILDREN); begin = time.monotonic_ns()
         # These controlled commands emit bounded JSON/quiet Git diagnostics.
         # Pipe EOF wakes communicate on exit; wait(timeout) alone busy-polls
         # and can add a 50 ms measurement floor to short commands.
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,start_new_session=True,
-            pass_fds=(counters.fileno(),timings.fileno()) if metrics else ())
+            pass_fds=(counters.fileno(),) if metrics else ())
         stop = threading.Event(); samples = dict(count=0, peak_rss_sum_kib=0, peak_fd_sum=0, unavailable=False,descriptors_unavailable=False)
         def sample():
             while not stop.wait(.02):
@@ -225,66 +223,18 @@ def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
         if metrics:
             from benchmark import validate_cache_budgets
             counters.seek(0); value['metrics'] = json.load(counters)
-            timings.seek(0);value['runner_timeline']=json.load(timings)
-            value.update(observed_start_monotonic_ns=begin,observed_end_monotonic_ns=end)
-            from startup_profile import validate_timing
-            value['intervals']=validate_timing(value)
             validate_cache_budgets(value['metrics'])
         return value
 
 
 
-def cached_pages(path, size):
-    """Linux diagnostic: inspect residency without faulting file data into RAM."""
-    import ctypes
-    library=ctypes.CDLL(None,use_errno=True)
-    library.mmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_long]
-    library.mmap.restype=ctypes.c_void_p
-    library.mincore.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_void_p]
-    library.munmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t]
-    pages=(size+os.sysconf('SC_PAGE_SIZE')-1)//os.sysconf('SC_PAGE_SIZE')
-    if not pages:return dict(pages=0,resident=0)
-    descriptor=None;address=None
-    try:
-        descriptor=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK)
-        # PROT_NONE / MAP_SHARED: mincore observes existing cache pages and
-        # never dereferences this mapping or reads source payload bytes.
-        address=library.mmap(None,size,0,1,descriptor,0)
-        if address==ctypes.c_void_p(-1).value:
-            address=None;raise OSError(ctypes.get_errno(),'mmap residency probe')
-        vector=(ctypes.c_ubyte*pages)()
-        if library.mincore(address,size,vector):raise OSError(ctypes.get_errno(),'mincore residency probe')
-        return dict(pages=pages,resident=sum(bool(v&1) for v in vector))
-    except OSError as error:return dict(pages=pages,resident=None,unavailable_errno=error.errno)
-    finally:
-        if address is not None:library.munmap(address,size)
-        if descriptor is not None:os.close(descriptor)
-
-
-def cache_observation(samples):
-    begin=time.monotonic_ns();roots=list(Path.cwd().parent.glob('raw-objects-*'));records=[]
-    for bucket in samples:
-        for oid,size,path in bucket:
-            raw=roots[0]/oid if len(roots)==1 else None
-            records.append(dict(path=os.fsdecode(path),oid=oid,size=size,view=cached_pages(path,size),
-                raw=cached_pages(raw,size) if raw is not None else None))
-    memory={}
-    for path,names in [('/proc/meminfo',{'MemTotal','MemAvailable','Cached','Dirty','Writeback'}),
-        ('/sys/fs/cgroup/memory.stat',{'anon','file','file_mapped','file_dirty','file_writeback','slab'})]:
-        try:
-            memory[path]={line.split()[0].rstrip(':'):int(line.split()[1]) for line in Path(path).read_text().splitlines() if line.split()[0].rstrip(':') in names}
-        except OSError:memory[path]=None
-    return dict(samples=records,memory=memory,elapsed_ns=time.monotonic_ns()-begin,
-        method='16 deterministic path samples per nonempty regular-file size bucket: <1KiB, <=64KiB, <=1MiB, >1MiB; PROT_NONE mincore; no payload faults; meminfo KiB, cgroup bytes')
-
-
-def command(manifest_path, workload, stat_bytes, profile_cache=False):
+def command(manifest_path, workload, stat_bytes):
     if workload == 'syntax': manifest_path=manifest_path.with_name('syntax.manifest')
     return [sys.executable, '-I', '-S', str(Path(__file__).resolve()), 'child',
-        '--manifest', str(manifest_path), '--workload', workload, '--stat-bytes', str(stat_bytes), *(['--profile-cache'] if profile_cache else [])]
+        '--manifest', str(manifest_path), '--workload', workload, '--stat-bytes', str(stat_bytes)]
 
 
-def child(manifest_path, workload, stat_bytes, profile_cache=False):
+def child(manifest_path, workload, stat_bytes):
     """Syntax-check the real style package, or verify the complete namespace/data."""
     import ast
     def walk(root=b''):
@@ -297,7 +247,6 @@ def child(manifest_path, workload, stat_bytes, profile_cache=False):
             if entry.is_dir(follow_symlinks=False): yield from walk(path)
     for phase in ('first', 'repeat'):
         begin = time.monotonic_ns(); files = 0; payload = 0; metadata = 0; syntax = 0
-        selected=[[],[],[],[]];seen=[0,0,0,0];selector=random.Random(140020)
         if workload == 'tests':
             env=dict(os.environ,PYTHONPATH='Tools/Scripts/libraries/webkitcorepy',DISABLE_WEBKITCOREPY_AUTOINSTALLER='1')
             result=subprocess.run([sys.executable,'-B','-S','-m','unittest',*LIGHT_TESTS],env=env,capture_output=True,text=True)
@@ -343,18 +292,11 @@ def child(manifest_path, workload, stat_bytes, profile_cache=False):
                     else:
                         while data := source.read(1024*1024): hashed.update(data); payload += len(data)
             assert hashed.hexdigest() == oid, path
-            if profile_cache and mode!='120000' and size:
-                bucket=0 if size<1024 else 1 if size<=65536 else 2 if size<=1024*1024 else 3
-                seen[bucket]+=1;index=selector.randrange(seen[bucket])
-                if len(selected[bucket])<16:selected[bucket].append((oid,size,path))
-                elif index<16:selected[bucket][index]=(oid,size,path)
             files += 1
         if actual is not None: assert next(actual, None) is None, 'unexpected final namespace entry'
         assert files > 0, 'empty workload'
-        diagnosis=cache_observation(selected) if profile_cache else None
         print(json.dumps(dict(completed=phase, workload=workload, files=files, syntax_modules=syntax,
-            payload_bytes=payload, metadata_result_bytes=metadata, elapsed_ns=time.monotonic_ns()-begin,
-            **(dict(diagnostic_cache=diagnosis) if profile_cache else {}))), flush=True)
+            payload_bytes=payload, metadata_result_bytes=metadata, elapsed_ns=time.monotonic_ns()-begin)), flush=True)
 
 
 def validate_test_output(code, output):
@@ -389,7 +331,7 @@ def validate_reports(data, head, pin=PIN, trials=3):
         if baseline['total_elapsed_ns']!=baseline['materialize']['elapsed_ns']+baseline['direct_command']['elapsed_ns']+baseline['cleanup_ns']:
             raise ValueError('baseline omitted setup or cleanup')
         observed=runner['command_observations']; direct=baseline['direct_command']['command_observations']
-        strip=lambda rr:[{k:v for k,v in r.items() if k not in ('elapsed_ns','test_output','diagnostic_cache')} for r in rr]
+        strip=lambda rr:[{k:v for k,v in r.items() if k not in ('elapsed_ns','test_output')} for r in rr]
         if strip(observed)!=strip(direct) or [r['completed'] for r in observed]!=['first','repeat']:
             raise ValueError('incomplete/mismatched command execution')
         if any(r['workload']!=row['workload'] or r['elapsed_ns']<=0 for r in observed):
@@ -403,25 +345,6 @@ def validate_reports(data, head, pin=PIN, trials=3):
                 if result['test_count']!=32 or tuple(result['test_modules'])!=LIGHT_TESTS:raise ValueError('wrong upstream test selection')
                 validate_test_output(0,result['test_output'])
         m=runner['metrics']; validate_cache_budgets(m)
-        from startup_profile import validate_timing
-        try:validate_timing(runner)
-        except (AssertionError,KeyError,TypeError) as error:raise ValueError('incomplete full invocation timeline') from error
-        if type(row.get('profile_spans_enabled')) is not bool:raise ValueError('undeclared profiling mode')
-        if row['profile_spans_enabled']:
-            if any(not r.get('diagnostic_cache',{}).get('samples') for r in observed+direct):raise ValueError('missing cache residency diagnosis')
-            spans=m.get('profile_spans',{})
-            for name in ('fuse_lookup','fuse_open','fuse_read','raw_range','raw_disk_read','raw_block_hash','raw_file_open','local_pack_decode','raw_small_spill'):
-                if not full or row['source']!='local' or any(type(spans.get(name,{}).get(k)) is not int or spans[name][k]<=0 for k in ('calls','elapsed_ns')):
-                    raise ValueError('missing full-read profiling category: '+name)
-            # A complete native ODB read already includes canonical SHA1DC
-            # verification in local_pack_decode. Its copy is labelled apart
-            # from unverified streams that still hash in Rust; expose either
-            # cost without demanding a redundant canonical pass.
-            copies=[spans[name] for name in ('object_verify_copy','object_preverified_copy') if name in spans]
-            if (not copies or any(type(span.get(k)) is not int or span[k]<=0 for span in copies for k in ('calls','elapsed_ns'))
-                or any(type(span.get('bytes')) is not int or span['bytes']<0 for span in copies)
-                or sum(span['bytes'] for span in copies)<m.get('blob_bytes',0)):
-                raise ValueError('missing/incomplete verified object copy profiling')
         if (full and m['blob_loads']!=counts['nonempty_unique_blob_objects']) or not 0<m['blob_loads']<=counts['nonempty_unique_blob_objects'] or m['fuse_requests'].get('read',0)<=0:
             raise ValueError('repeated decode or missing real FUSE execution')
         transfer=row.get('transfer_evidence',{})
@@ -452,7 +375,7 @@ def validate_reports(data, head, pin=PIN, trials=3):
 
 
 def run(options):
-    from import_profile import stat_abi_bytes
+    from benchmark_support import stat_abi_bytes
     assert sys.platform == 'linux' and Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'), 'real Linux FUSE required'
     directory = options.fixture.resolve(); metadata = json.loads((directory/'fixture.json').read_text())
     assert metadata['pin'] == PIN, 'unrecognized fixture pin'
@@ -492,7 +415,7 @@ def run(options):
             direct={}
             for workload,selected_source,trial in plan:
                 if selected_source == source:
-                    direct[workload,trial]=measured(command(tree,workload,stat_bytes,workload=='full' and options.profile_full),clone,env,options.timeout)
+                    direct[workload,trial]=measured(command(tree,workload,stat_bytes),clone,env,options.timeout)
             received_pack_bytes=sum(p.stat().st_size for p in (clone/'.git/objects/pack').glob('*.pack'))
             start=time.monotonic_ns();cpu=time.process_time_ns();shutil.rmtree(clone);cleanup=time.monotonic_ns()-start
             common=dict(materialize=prep,cleanup_ns=cleanup,cleanup_parent_cpu_ns=time.process_time_ns()-cpu,
@@ -503,18 +426,15 @@ def run(options):
                 baselines[workload,source,trial]=dict(common,direct_command=value,
                     total_elapsed_ns=prep['elapsed_ns']+value['elapsed_ns']+cleanup)
         for order, (workload, source, trial) in enumerate(plan):
-            child_argv = command(tree, workload, stat_bytes,workload=='full' and options.profile_full)
-            profiled=workload=='full' and options.profile_full
+            child_argv = command(tree, workload, stat_bytes)
             def runner():
                 argv = [str(options.binary.resolve())]
                 if source == 'remote': argv.append(repo.as_uri())
                 argv += [PIN['commit'], '--write-policy=none', '--', *child_argv]
-                runner_env=dict(env)
-                if profiled:runner_env['GIT_ON_TEST_PROFILE_SPANS']='1'
-                return measured(argv, repo if source == 'local' else root, runner_env, options.timeout, metrics=True)
+                return measured(argv, repo if source == 'local' else root, env, options.timeout, metrics=True)
             before=baselines[workload,source,trial];after=runner()
-            expected = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output','diagnostic_cache')} for row in before['direct_command']['command_observations']]
-            observed = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output','diagnostic_cache')} for row in after['command_observations']]
+            expected = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output')} for row in before['direct_command']['command_observations']]
+            observed = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output')} for row in after['command_observations']]
             assert expected == observed and [r['completed'] for r in observed] == ['first','repeat'], 'baseline command differs'
             m=after['metrics']
             if workload=='full':assert m['blob_loads']==metadata['counts']['nonempty_unique_blob_objects'],'prepared data decoded repeatedly or required data missing'
@@ -524,7 +444,7 @@ def run(options):
                 assert m['blob_loads'] < metadata['counts']['blob_paths'], 'small workload materialized whole tree'
             else: assert all(r['files'] == PIN['blob_paths'] and r['payload_bytes'] == PIN['logical_blob_bytes'] for r in observed)
             assert not list(root.glob('git-on-*')), 'invocation cleanup incomplete'
-            record(dict(type='real_repository', workload=workload, source=source, trial=trial, order=order,profile_spans_enabled=profiled,
+            record(dict(type='real_repository', workload=workload, source=source, trial=trial, order=order,
                 baseline=before, runner=after, method='full two-pass real namespace/data; 32 upstream webkitcorepy unit tests through stdlib unittest without SDK/autoinstall',
                 transfer_evidence=dict(remote_verified_blob_bytes=m.get('remote_raw_blob_bytes', 0),
                     remote_verified_blobs=m.get('remote_raw_blob_imports', 0),
@@ -537,14 +457,12 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__); commands=parser.add_subparsers(dest='action', required=True)
     fixture=commands.add_parser('prepare'); fixture.add_argument('--directory', type=Path, required=True)
     execute=commands.add_parser('run'); execute.add_argument('--fixture', type=Path, required=True); execute.add_argument('--binary', type=Path, required=True)
-    execute.add_argument('--profile-full',action='store_true',help='inclusive full-read diagnosis; labelled separately from uninstrumented timings')
     execute.add_argument('--trials', type=int, default=3); execute.add_argument('--timeout', type=int, default=1200); execute.add_argument('--output', type=Path, required=True)
     child_parser=commands.add_parser('child'); child_parser.add_argument('--manifest', type=Path, required=True)
     child_parser.add_argument('--workload', choices=['full','syntax','tests'], required=True); child_parser.add_argument('--stat-bytes', type=int, required=True)
-    child_parser.add_argument('--profile-cache',action='store_true')
     options=parser.parse_args()
     if options.action == 'prepare': print(json.dumps(prepare(options.directory)), flush=True)
-    elif options.action == 'child': child(options.manifest, options.workload, options.stat_bytes,options.profile_cache)
+    elif options.action == 'child': child(options.manifest, options.workload, options.stat_bytes)
     else: run(options)
 
 

@@ -1,32 +1,24 @@
 #!/usr/bin/env python3
-"""Full production invocations on wide trees, with a complete disk baseline.
-
-A shared one-byte blob isolates directory preparation from object diversity;
-import_profile.py supplies the separate distinct-object workload. Repeated
-closed reads/stat calls test reuse. Timings include setup, descendants and
-cleanup; first/repeat child timings are diagnostics, never the total-cost gate.
-"""
+"""Verify one-time preparation of wide directories across repeated closed reads."""
 import argparse
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import time
-from import_profile import observe,stat_abi_bytes
+from benchmark_support import stat_abi_bytes
+from process_capture import capture
 from remote import Fixture
 
 CHILD=r'''
-import json,os,sys,time
+import json,os,sys
 count,operations,stat_bytes=map(int,sys.argv[1:])
 for phase in ('first','repeat'):
- begin=time.monotonic_ns()
  for index in range(operations):
   name=f'f{(index*7919)%count:06d}'
   assert os.stat(name).st_size==1
   with open(name,'rb') as file:assert file.read()==b'x'
  print(json.dumps(dict(completed=phase,operations=operations,payload_bytes=operations,metadata_result_bytes=operations*stat_bytes)),flush=True)
- print(json.dumps(dict(profile_phase=phase,elapsed_ns=time.monotonic_ns()-begin)),flush=True)
 '''
 
 
@@ -60,28 +52,20 @@ def run(options):
                 blob=f.git('hash-object','-w','--stdin',data=b'x')
                 entries=''.join(f'100644 blob {blob}\tf{index:06d}\n' for index in range(count))
                 tree=f.git('mktree',data=entries.encode())
-                commit=f.git('commit-tree',tree,data=b'wide metadata profile\n');f.git('update-ref','refs/heads/main',commit)
+                commit=f.git('commit-tree',tree,data=b'metadata reuse regression\n');f.git('update-ref','refs/heads/main',commit)
                 stat_bytes=stat_abi_bytes(f.root)
                 child=f.root/'command.py';child.write_text(CHILD)
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.operations),str(stat_bytes)]
                 source='file://'+str(f.repo) if options.source=='remote' else str(f.repo)
-                clone=f.root/'clone'
-                materialize=observe(['git','clone','--quiet',source,str(clone)],f.cwd,f.env,f.root)
-                direct=observe(command,clone,f.env,f.root)
-                begin=time.monotonic_ns();cpu=time.process_time_ns();shutil.rmtree(clone)
-                cleanup=dict(elapsed_ns=time.monotonic_ns()-begin,parent_cpu_ns=time.process_time_ns()-cpu)
-                record(dict(type='baseline',files=count,operations=options.operations,stat_abi_bytes=stat_bytes,
-                    materialize=materialize,command=direct,cleanup=cleanup,
-                    total_elapsed_ns=sum(r['elapsed_ns'] for r in (materialize,direct,cleanup))))
                 env=dict(f.env)
                 if options.backend=='materialized':
                     programs=f.root/'programs';programs.mkdir();(programs/'git').symlink_to(shutil.which('git'));env['PATH']=str(programs)
                 argv=[str(options.binary.resolve())]
                 if options.source=='remote':argv.append(source)
                 argv+=['main','--write-policy=all','--',*command]
-                result=observe(argv,f.repo if options.source=='local' else f.cwd,env,f.root,metrics=True)
+                result=capture(argv,f.repo if options.source=='local' else f.cwd,env,f.root,metrics=True)
                 validate_runner(result,count,options.operations,stat_bytes,options.backend)
-                record(dict(type='runner',files=count,operations=options.operations,**result))
+                record(dict(type='runner',files=count,operations=options.operations,stat_abi_bytes=stat_bytes,**result))
                 assert not list(f.root.glob('git-on-*')),'private invocation leaked'
             finally:f.close()
 
