@@ -1,5 +1,5 @@
 //! Immutable, demand-loaded objects from the pinned Git tree.
-use crate::tree::{Directory, TreeItem};
+use crate::tree::Directory;
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags};
 use serde::Serialize;
@@ -706,8 +706,8 @@ impl Snapshot {
             .ok()
             .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
-    fn metadata(item: &TreeItem, path: &Path) -> Result<Entry> {
-        let kind = match item.mode {
+    fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
+        let kind = match mode {
             0o040000 => EntryKind::Directory,
             0o100644 | 0o100755 => EntryKind::File,
             0o120000 => EntryKind::Symlink,
@@ -716,8 +716,8 @@ impl Snapshot {
         };
         Ok(Entry {
             kind,
-            mode: item.mode,
-            oid: item.oid,
+            mode,
+            oid,
             size: (kind == EntryKind::Directory).then_some(0),
         })
     }
@@ -736,10 +736,10 @@ impl Snapshot {
                 bail!("snapshot ancestor is not a directory: {}", path.display());
             }
             let tree = state.tree(entry.oid)?;
-            let Some(item) = tree.lookup(name) else {
+            let Some((mode, oid)) = tree.lookup(name) else {
                 return Ok(None);
             };
-            entry = Self::metadata(&item, path)?;
+            entry = Self::metadata(mode, oid, path)?;
         }
         Ok(Some(entry))
     }
@@ -783,7 +783,7 @@ impl Snapshot {
                             size: Some(0),
                         }
                     } else {
-                        Self::metadata(&item, &path.join(&item.name))?
+                        Self::metadata(item.mode, item.oid, &path.join(&item.name))?
                     },
                 ))
             })

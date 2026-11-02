@@ -1210,8 +1210,8 @@ mod tests {
         let (tree, first) = store.directory(oid).unwrap();
         assert!(first);
         assert_eq!(
-            tree.lookup(std::ffi::OsStr::new("tracked")).unwrap().oid,
-            blob
+            tree.lookup(std::ffi::OsStr::new("tracked")).unwrap(),
+            (0o100644, blob)
         );
         assert!(tree.lookup(std::ffi::OsStr::new("absent")).is_none());
         assert_eq!(

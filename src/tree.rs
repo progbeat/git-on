@@ -92,10 +92,12 @@ impl Directory {
             oid: node.oid,
         }
     }
-    pub(crate) fn lookup(&self, name: &OsStr) -> Option<TreeItem> {
-        self.names
-            .get(name)
-            .map(|index| Self::owned(&self.entries[*index]))
+    /// Resolve metadata without allocating a copy of the already-known name.
+    pub(crate) fn lookup(&self, name: &OsStr) -> Option<(u32, Oid)> {
+        self.names.get(name).map(|index| {
+            let node = &self.entries[*index];
+            (node.mode, node.oid)
+        })
     }
     pub(crate) fn children(&self) -> Result<Vec<TreeItem>> {
         Ok(self.entries.iter().map(Self::owned).collect())
