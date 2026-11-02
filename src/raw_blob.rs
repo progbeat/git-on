@@ -271,6 +271,9 @@ impl RawDirectory {
     }
     fn pending(&self) -> Result<Pending<'_>> {
         let name = CString::new(format!("pending-{}", uuid::Uuid::new_v4()))?;
+        self.pending_name(name)
+    }
+    fn pending_name(&self, name: CString) -> Result<Pending<'_>> {
         let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, None)?;
         Ok(Pending {
             directory: self,
@@ -278,6 +281,16 @@ impl RawDirectory {
             file,
             committed: false,
         })
+    }
+    fn spill(&self, oid: Oid, bytes: &[u8]) -> Result<()> {
+        // These bytes are already verified and fully resident. Store's lock
+        // prevents readers from observing file=true until the write succeeds,
+        // so this path needs no intermediate random name or rename. Exclusive
+        // creation never follows or overwrites an unexpected existing entry.
+        let mut pending = self.pending_name(CString::new(oid.to_string())?)?;
+        pending.file.write_all_at(bytes, 0)?;
+        pending.committed = true;
+        Ok(())
     }
 }
 struct Pending<'a> {
@@ -677,9 +690,7 @@ impl Store {
                     resident.block == 0 && resident.bytes.len() as u64 == descriptor.size,
                     "unbacked object is not fully resident"
                 );
-                let pending = self.directory.pending()?;
-                pending.file.write_all_at(&resident.bytes, 0)?;
-                pending.commit(oid)?;
+                self.directory.spill(oid, &resident.bytes)?;
                 self.disk_entries += 1;
                 self.disk_bytes += descriptor.size;
                 self.objects.get_mut(&oid).unwrap().file = true;
@@ -861,6 +872,89 @@ mod tests {
         store.evict_all_for_test().unwrap();
         assert_eq!(stored_bytes(directory.path()), 160 * 8192);
         assert_eq!(store.entries(), 160);
+    }
+    #[test]
+    fn spill_collision_preserves_the_resident_and_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(root.path()).unwrap();
+        let bytes = b"verified resident";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        let reader = store
+            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
+            .unwrap();
+        let path = store
+            .state
+            .lock()
+            .unwrap()
+            .directory
+            ._owner
+            .path()
+            .join(oid.to_string());
+        std::fs::write(&path, b"unexpected existing entry").unwrap();
+        assert!(store.evict_all_for_test().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unexpected existing entry");
+        assert_eq!(reader.read_all().unwrap(), bytes);
+        assert_eq!(store.memory_metrics().1, 1);
+        assert_eq!(store.disk_metrics(), (0, 0));
+        assert!(!reader.on_disk());
+        std::fs::remove_file(&path).unwrap();
+        store.evict_all_for_test().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(reader.read_all().unwrap(), bytes);
+    }
+    #[test]
+    fn failed_spill_removes_partial_file_without_publishing_or_evicting() {
+        const CHILD: &str = "GIT_ON_TEST_PARTIAL_SPILL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "raw_blob::tests::failed_spill_removes_partial_file_without_publishing_or_evicting",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    let limit = libc::rlimit {
+                        rlim_cur: 3,
+                        rlim_max: 3,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(root.path()).unwrap();
+        let bytes = b"verified resident";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        let reader = store
+            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
+            .unwrap();
+        assert!(store.evict_all_for_test().is_err());
+        let state = store.state.lock().unwrap();
+        assert!(std::fs::read_dir(state.directory._owner.path())
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(!state.objects[&oid].file);
+        drop(state);
+        assert_eq!(store.disk_metrics(), (0, 0));
+        assert_eq!(store.memory_metrics().1, 1);
+        assert_eq!(reader.read_all().unwrap(), bytes);
     }
     #[test]
     fn read_slot_releases_its_descriptor_before_replacing_it() {
