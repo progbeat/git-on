@@ -246,35 +246,44 @@ impl Overlay {
     }
     /// The readonly namespace cannot redirect or shadow its source parent.
     /// Reuse that parent's prepared name index instead of resolving from root.
-    fn ensure_readonly_child(&mut self, parent: u64, path: &Path) -> FsResult<u64> {
+    fn ensure_readonly_child(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
         debug_assert!(self.read_only());
-        if let Some(ino) = self.paths.get(path) {
-            if self.nodes.contains_key(ino) {
-                return Ok(*ino);
-            }
+        let node = self.node(parent)?;
+        if node.attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
         }
-        let parent_path = path.parent().ok_or(libc::EIO)?;
+        let component = Self::child_name(name)?;
+        let parent_path = node.snapshot_path.as_deref().ok_or(libc::EIO)?;
         let key = if let Some(key) = self.source_directory_keys.get(parent_path) {
             *key
         } else {
-            let oid = self.node(parent)?.oid.ok_or(libc::EIO)?;
+            let oid = node.oid.ok_or(libc::EIO)?;
             let tree = self
                 ._snapshot
                 .directory_by_oid(oid)
                 .map_err(snapshot_errno)?;
-            self.insert_source_directory(parent_path, tree)?
+            let source = parent_path.to_path_buf();
+            self.insert_source_directory(source, tree)?
         };
         let directory = &self.source_directories[key];
-        let index = directory
-            .tree
-            .index(path.file_name().ok_or(libc::EIO)?)
-            .ok_or(libc::ENOENT)?;
+        let index = directory.tree.index(component).ok_or(libc::ENOENT)?;
         let ino = directory.base + index as u64;
+        // Readonly source ranges give the same inode on every lookup. Existing
+        // nodes need neither a full pathname allocation nor the ordered index.
+        if self.nodes.contains_key(&ino) {
+            return Ok(ino);
+        }
+        let path = self
+            .node(parent)?
+            .snapshot_path
+            .as_deref()
+            .ok_or(libc::EIO)?
+            .join(name);
         let entry = self
             ._snapshot
-            .directory_entry(&directory.tree, index, path)
+            .directory_entry(&directory.tree, index, &path)
             .map_err(snapshot_errno)?;
-        self.insert_source_inode(path, path.to_path_buf(), entry, ino)
+        self.insert_source_inode(&path, path.to_path_buf(), entry, ino)
     }
     fn insert_source_inode(
         &mut self,
@@ -359,11 +368,11 @@ impl Overlay {
             return Ok(*key);
         }
         let tree = self._snapshot.directory(source).map_err(snapshot_errno)?;
-        self.insert_source_directory(source, tree)
+        self.insert_source_directory(source.to_path_buf(), tree)
     }
     fn insert_source_directory(
         &mut self,
-        source: &Path,
+        source: PathBuf,
         tree: Arc<crate::tree::Directory>,
     ) -> FsResult<usize> {
         let base = self.next_ino;
@@ -372,7 +381,7 @@ impl Overlay {
             .ok_or(libc::ENOSPC)?;
         let key = self.source_directories.len();
         self.source_directories.push(SourceDirectory { tree, base });
-        self.source_directory_keys.insert(source.to_path_buf(), key);
+        self.source_directory_keys.insert(source, key);
         Ok(key)
     }
     fn release_directory_ref(&mut self, ino: u64) {
@@ -595,17 +604,21 @@ impl Overlay {
         if self.node(parent)?.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
+        Self::child_name(name)?;
+        Ok(self.path(parent)?.join(name))
+    }
+    fn child_name(name: &OsStr) -> FsResult<&OsStr> {
         let mut c = Path::new(name).components();
-        if !matches!(c.next(), Some(Component::Normal(_)))
-            || c.next().is_some()
-            || name.as_bytes().contains(&0)
-        {
+        let Some(Component::Normal(component)) = c.next() else {
+            return Err(libc::EINVAL);
+        };
+        if c.next().is_some() || name.as_bytes().contains(&0) {
             return Err(libc::EINVAL);
         }
         if name.as_bytes().len() > 255 {
             return Err(libc::ENAMETOOLONG);
         }
-        Ok(self.path(parent)?.join(name))
+        Ok(component)
     }
     fn writable(&self, ino: u64) -> FsResult<()> {
         let node = self.node(ino)?;
@@ -1352,10 +1365,10 @@ impl Overlay {
 
 impl Overlay {
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
-        let p = self.child(parent, name)?;
         let ino = if self.read_only() {
-            self.ensure_readonly_child(parent, &p)?
+            self.ensure_readonly_child(parent, name)?
         } else {
+            let p = self.child(parent, name)?;
             self.ensure(&p)?
         };
         self.refresh_backing_attr(ino)?;
@@ -1890,6 +1903,66 @@ mod tests {
                     attr.ino
                 );
             }
+        }
+    }
+    #[test]
+    fn child_lookup_preserves_byte_names_errors_and_live_identity_for_every_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"bytes").unwrap();
+        let name = OsStr::from_bytes(b"raw-\xff");
+        let mut bytes = b"100644 raw-\xff\0".to_vec();
+        bytes.extend(blob.as_bytes());
+        let tree = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Tree, &bytes)
+            .unwrap();
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let snapshot =
+                Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "byte-child").unwrap();
+            let mut fs = Overlay::with_write_policy(
+                snapshot,
+                temp.path().join(format!("upper-{policy:?}")),
+                policy,
+            )
+            .unwrap();
+            let first = fs.lookup_entry(1, name).unwrap();
+            for _ in 0..8 {
+                let again = fs.lookup_entry(1, name).unwrap();
+                assert_eq!(again.ino, first.ino);
+                assert_eq!(again.kind, FileType::RegularFile);
+                assert_eq!(again.size, 5);
+                assert_eq!(again.perm, 0o644);
+            }
+            for invalid in ["", ".", "..", "a/b", "/absolute", "nul\0name"] {
+                assert_eq!(
+                    fs.lookup_entry(1, OsStr::new(invalid)).unwrap_err(),
+                    libc::EINVAL
+                );
+            }
+            assert_eq!(
+                fs.lookup_entry(1, OsStr::new(&"n".repeat(256)))
+                    .unwrap_err(),
+                libc::ENAMETOOLONG
+            );
+            assert_eq!(
+                fs.lookup_entry(1, OsStr::new("absent")).unwrap_err(),
+                libc::ENOENT
+            );
+            assert_eq!(
+                fs.lookup_entry(first.ino, OsStr::new("invalid/name"))
+                    .unwrap_err(),
+                libc::ENOTDIR
+            );
+            fs.forget_inode(first.ino, u64::MAX);
+            assert_eq!(fs.lookup_entry(1, name).unwrap().ino, first.ino);
+            assert_eq!(fs.nodes[&first.ino].oid, Some(blob));
         }
     }
     #[test]

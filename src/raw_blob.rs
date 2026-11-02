@@ -704,6 +704,18 @@ impl Store {
         if weight > self.memory_limit {
             return Ok(());
         }
+        if let Some(previous) = self.memory.peek(&oid) {
+            let previous_weight = previous.bytes.capacity() + ENTRY_CHARGE;
+            if weight <= previous_weight {
+                // The existing node already covers this allocation. Replacing
+                // its payload and promoting it cannot require another eviction.
+                // In particular, a one-object scan must not free/reallocate its
+                // LRU node and shrink/regrow the table for every next block.
+                *self.memory.get_mut(&oid).unwrap() = Resident { block, bytes };
+                self.memory_bytes = self.memory_bytes - previous_weight + weight;
+                return Ok(());
+            }
+        }
         // One retained entry per original object, shared by all its readers.
         // Owned buffers of in-flight reads are separate and are not invalidated.
         if let Some(previous) = self.memory.pop(&oid) {
@@ -1195,6 +1207,70 @@ mod tests {
             "one large scan evicted fitting hot files"
         );
         assert_eq!(store.memory_metrics().1, 161);
+    }
+    #[test]
+    fn block_replacement_preserves_byte_budget_recency_and_spill_victims() {
+        fn check(store: &RawBlobs, expected: &[(Oid, usize)]) {
+            let state = store.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .memory
+                    .iter()
+                    .map(|(oid, resident)| (*oid, resident.block))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                state.memory_bytes,
+                state
+                    .memory
+                    .iter()
+                    .map(|(_, resident)| resident.bytes.capacity() + ENTRY_CHARGE)
+                    .sum::<usize>()
+            );
+            assert!(state.memory_bytes <= state.memory_limit);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(root.path()).unwrap();
+        store.state.lock().unwrap().memory_limit = 2 * (BLOCK + ENTRY_CHARGE);
+        let hot_data = vec![b'h'; BLOCK];
+        let hot_oid = Oid::hash_object(ObjectType::Blob, &hot_data).unwrap();
+        let hot = store
+            .insert(hot_oid, hot_data.len(), hot_data.as_slice(), root.path())
+            .unwrap();
+        let mut data = vec![b'a'; BLOCK];
+        data.extend(vec![b'b'; BLOCK]);
+        data.extend([b'c'; 17]);
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let reader = store
+            .insert(oid, data.len(), data.as_slice(), root.path())
+            .unwrap();
+        let first = reader.read(0, 3).unwrap();
+        check(&store, &[(oid, 0), (hot_oid, 0)]);
+        assert_eq!(reader.read(BLOCK as u64, 3).unwrap(), b"bbb");
+        check(&store, &[(oid, 1), (hot_oid, 0)]);
+        assert_eq!(reader.read((2 * BLOCK) as u64, 3).unwrap(), b"ccc");
+        check(&store, &[(oid, 2), (hot_oid, 0)]);
+        assert_eq!(store.memory_metrics().0, BLOCK + 17 + 2 * ENTRY_CHARGE);
+        assert!(!store.state.lock().unwrap().objects[&hot_oid].file);
+        let extra_data = vec![b'e'; BLOCK - 17 - ENTRY_CHARGE];
+        let extra_oid = Oid::hash_object(ObjectType::Blob, &extra_data).unwrap();
+        store
+            .insert(
+                extra_oid,
+                extra_data.len(),
+                extra_data.as_slice(),
+                root.path(),
+            )
+            .unwrap();
+        check(&store, &[(extra_oid, 0), (oid, 2), (hot_oid, 0)]);
+        // A growing replacement must still evict/spill the actual LRU victim.
+        assert_eq!(reader.read(0, 3).unwrap(), b"aaa");
+        check(&store, &[(oid, 0), (extra_oid, 0)]);
+        assert!(store.state.lock().unwrap().objects[&hot_oid].file);
+        assert_eq!(hot.read(0, 3).unwrap(), b"hhh");
+        check(&store, &[(hot_oid, 0), (oid, 0)]);
+        assert_eq!(first, b"aaa", "replacement changed an active result");
     }
     #[test]
     fn parsed_tree_names_and_absence_do_not_depend_on_mutable_disk_indexes() {

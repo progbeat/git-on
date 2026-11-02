@@ -2367,3 +2367,22 @@ policies, including trailing separators and `/.`. The readonly index lookup
 uses the resolved path's filename, as the original source-inode path did.
 Kernel LOOKUP names do not include these separators; this is helper-level
 equivalence coverage, not a claim about kernel pathname traversal.
+
+### Readonly live-inode lookup and non-growing block replacement
+
+Readonly child lookup now borrows the parent's immutable source path, validates
+the component and resolves its arithmetic source inode before allocating a
+full pathname. A live inode avoids the parent reverse-path check and child
+ordered-index lookup. New inode insertion and mutable-policy namespace handling
+retain their existing indexes. Byte-exact names, error precedence, repeated
+lookups and forget/relookup identity are checked for all four policies; existing
+normalization and shared-tree identity regressions remain.
+
+Replacing a retained block with one of equal or smaller allocation weight now
+updates/promotes the existing LRU node. It cannot need another eviction, so it
+avoids pop/free/reinsert and the temporary-empty-table shrink during a
+single-object scan. Growing replacements keep the original eviction path.
+`block_replacement_preserves_byte_budget_recency_and_spill_victims` checks exact
+accounting, recency, equal/short/growing replacements, the actual spilled victim
+and unchanged active results. These are optimization-equivalence checks, not
+claims that the earlier revision returned incorrect bytes or measured slower.
