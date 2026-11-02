@@ -94,10 +94,10 @@ impl Directory {
     }
     /// Resolve metadata without allocating a copy of the already-known name.
     pub(crate) fn lookup(&self, name: &OsStr) -> Option<(u32, Oid)> {
-        self.names.get(name).map(|index| {
-            let node = &self.entries[*index];
-            (node.mode, node.oid)
-        })
+        self.index(name).and_then(|index| self.metadata_at(index))
+    }
+    pub(crate) fn metadata_at(&self, index: usize) -> Option<(u32, Oid)> {
+        self.entries.get(index).map(|node| (node.mode, node.oid))
     }
     pub(crate) fn children(&self) -> Result<Vec<TreeItem>> {
         Ok(self.entries.iter().map(Self::owned).collect())

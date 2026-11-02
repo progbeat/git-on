@@ -432,6 +432,21 @@ impl State {
             self.metrics.cache_hits += 1;
             return Ok(BlobReader(reader));
         }
+        let data = self.prepare_blob(oid)?;
+        let reader = Arc::new(ActiveBlob {
+            oid,
+            data,
+            registry: Arc::downgrade(&self.readers),
+        });
+        self.readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(oid, Arc::downgrade(&reader));
+        Ok(BlobReader(reader))
+    }
+    /// Raw descriptors own no payload buffer or per-reader file descriptor.
+    /// Only callers retaining a BlobReader need active-reader registration.
+    fn prepare_blob(&mut self, oid: Oid) -> Result<crate::raw_blob::RawBlob> {
         let raw = if let Some(remote) = &mut self.remote {
             remote.ensure_in(&self.repo, oid)?;
             let (raw, first) = remote
@@ -501,17 +516,7 @@ impl State {
         if raw.len() < 1024 {
             raw.check_content_once(Self::validate_blob)?;
         }
-        let data = raw;
-        let reader = Arc::new(ActiveBlob {
-            oid,
-            data,
-            registry: Arc::downgrade(&self.readers),
-        });
-        self.readers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(oid, Arc::downgrade(&reader));
-        Ok(BlobReader(reader))
+        Ok(raw)
     }
     fn validate_blob(bytes: &[u8]) -> Result<()> {
         if is_lfs_pointer(bytes) {
@@ -754,6 +759,23 @@ impl Snapshot {
         }
         Ok(Some(entry))
     }
+    /// Resolve a child of an already verified directory without walking its
+    /// ancestors again. Sizes remain demand-only, just as for pathname lookup.
+    pub(crate) fn directory_entry(
+        &self,
+        directory: &Directory,
+        index: usize,
+        path: &Path,
+    ) -> Result<Entry> {
+        let (mode, oid) = directory
+            .metadata_at(index)
+            .context("directory entry missing")?;
+        let mut entry = Self::metadata(mode, oid, path)?;
+        if entry.kind != EntryKind::Directory {
+            entry.size = Some(self.state()?.size(oid)?);
+        }
+        Ok(entry)
+    }
     /// Share a verified directory without copying names or reading children.
     pub(crate) fn directory(&self, path: &Path) -> Result<Arc<Directory>> {
         let mut state = self.state()?;
@@ -764,6 +786,10 @@ impl Snapshot {
             bail!("snapshot path is not a directory: {}", path.display());
         }
         state.tree(entry.oid)
+    }
+    /// The caller already resolved the parent's identity from a verified tree.
+    pub(crate) fn directory_by_oid(&self, oid: Oid) -> Result<Arc<Directory>> {
+        self.state()?.tree(oid)
     }
     /// Enumerate one directory without reading child tree objects or blob headers.
     pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
@@ -828,7 +854,10 @@ impl Snapshot {
         self.state()?.open(oid)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
-        self.open(oid)?.read(offset, size)
+        // Release Snapshot's lock before I/O, retaining the invocation-owned
+        // verified store without allocating/registering a temporary ActiveBlob.
+        let raw = self.state()?.prepare_blob(oid)?;
+        raw.read(offset, size)
     }
     pub fn read_link(&self, oid: Oid) -> Result<Vec<u8>> {
         self.state()?.with_blob(oid, |bytes| {
@@ -1249,10 +1278,15 @@ mod tests {
             let snap = Snapshot::load(tmp.path(), OsStr::new(&tree.to_string()), "demand").unwrap();
             assert_eq!(snap.metrics().blob_loads, 0);
             assert!(snap.entry(Path::new("ordinary")).unwrap().is_some());
+            let directory = snap.directory(Path::new("")).unwrap();
+            let index = directory.index(OsStr::new("unsupported")).unwrap();
+            let child = snap.directory_entry(&directory, index, Path::new("unsupported"));
             if submodule {
                 assert!(snap.entry(Path::new("unsupported")).is_err());
+                assert!(child.is_err());
             } else {
                 let entry = snap.entry(Path::new("unsupported")).unwrap().unwrap();
+                assert_eq!(child.unwrap().oid, entry.oid);
                 assert!(snap.read(entry.oid, 20, 1).is_err());
             }
             assert!(repo.find_reference("refs/git-on/demand").is_ok());
@@ -1655,6 +1689,7 @@ mod tests {
             .evict_all_for_test()
             .unwrap();
         assert!(reader.read(0, 1024).is_err());
+        assert!(snap.read(oid, 0, 1024).is_err());
     }
     #[test]
     fn reader_registry_releases_closed_entries_without_another_open() {
@@ -1667,6 +1702,32 @@ mod tests {
         drop(reader);
         assert_eq!(snap.metrics().active_blob_readers, 0);
         assert_eq!(snap.state().unwrap().readers.lock().unwrap().len(), 0);
+    }
+    #[test]
+    fn transient_read_does_not_wait_for_the_active_reader_registry() {
+        let (tmp, _) = fixture();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "transient-reader").unwrap();
+        let oid = snap.entry(Path::new("script")).unwrap().unwrap().oid;
+        let registry = snap.state().unwrap().readers.clone();
+        let held = registry.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let snapshot = &snap;
+            let worker = scope.spawn(move || send.send(snapshot.read(oid, 2, 3)).unwrap());
+            let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+            // Always release/join before asserting, including the old blocked path.
+            drop(held);
+            worker.join().unwrap();
+            assert_eq!(
+                result
+                    .expect("transient read waited for unrelated reader bookkeeping")
+                    .unwrap(),
+                b"igi"
+            );
+        });
+        assert_eq!(snap.metrics().blob_loads, 1);
+        assert_eq!(snap.metrics().active_blob_readers, 0);
+        assert!(registry.lock().unwrap().is_empty());
     }
     #[test]
     fn active_readers_do_not_pin_evicted_payloads_in_ram() {

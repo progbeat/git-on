@@ -2340,3 +2340,22 @@ trusted descriptor. The regression requires zero spill hydration on reopen and
 512 authenticated bytes when the requested one-byte data range is actually
 read. Failed policy validation is not cached as success; existing repeated LFS
 rejection cases remain in the suite. Block verification is unchanged.
+
+### Transient reads and readonly child metadata reuse
+
+On `2a41951`, `transient_read_does_not_wait_for_the_active_reader_registry`
+blocked behind the active-reader registry until the test released it, despite
+not retaining a reader. The test always releases the lock and joins its worker
+before reporting failure. Transient reads now share the same verified raw
+preparation/range path without constructing a temporary registered reader;
+retained `BlobReader` ownership and cleanup remain unchanged. Existing spill
+corruption coverage checks both retained-reader and transient reads.
+
+`readonly_child_lookups_reuse_prepared_parent_metadata` reproduced five cache
+lookups for one new leaf below prepared ancestors instead of just the shared
+blob header. Readonly child lookup now uses the known parent's OID and prepared
+name index, including during the initial descent. The regression also checks
+negative lookup, modes, identity after forget/relookup, and distinct pathname
+inodes for shared Git trees. Mutable policies keep their redirect/whiteout path.
+These structural regressions do not establish a measured WebKit speedup or
+satisfy the outstanding full-workload performance acceptance.

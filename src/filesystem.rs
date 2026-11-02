@@ -6,7 +6,7 @@ use crate::directory_view::{
     Cursor as DirectoryCursor, Rows as DirectoryRows, Version as DirectoryVersion,
 };
 use crate::policy::{Policy, WritePolicy};
-use crate::snapshot::{BlobReader, EntryKind, Snapshot, BLOB_CACHE_BYTES};
+use crate::snapshot::{BlobReader, Entry, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -242,6 +242,44 @@ impl Overlay {
             .index(source.file_name().ok_or(libc::EIO)?)
             .ok_or(libc::EIO)?;
         let ino = directory.base + index as u64;
+        self.insert_source_inode(path, source, entry, ino)
+    }
+    /// The readonly namespace cannot redirect or shadow its source parent.
+    /// Reuse that parent's prepared name index instead of resolving from root.
+    fn ensure_readonly_child(&mut self, parent: u64, path: &Path, name: &OsStr) -> FsResult<u64> {
+        debug_assert!(self.read_only());
+        if let Some(ino) = self.paths.get(path) {
+            if self.nodes.contains_key(ino) {
+                return Ok(*ino);
+            }
+        }
+        let parent_path = path.parent().ok_or(libc::EIO)?;
+        let key = if let Some(key) = self.source_directory_keys.get(parent_path) {
+            *key
+        } else {
+            let oid = self.node(parent)?.oid.ok_or(libc::EIO)?;
+            let tree = self
+                ._snapshot
+                .directory_by_oid(oid)
+                .map_err(snapshot_errno)?;
+            self.insert_source_directory(parent_path, tree)?
+        };
+        let directory = &self.source_directories[key];
+        let index = directory.tree.index(name).ok_or(libc::ENOENT)?;
+        let ino = directory.base + index as u64;
+        let entry = self
+            ._snapshot
+            .directory_entry(&directory.tree, index, path)
+            .map_err(snapshot_errno)?;
+        self.insert_source_inode(path, path.to_path_buf(), entry, ino)
+    }
+    fn insert_source_inode(
+        &mut self,
+        path: &Path,
+        source: PathBuf,
+        entry: Entry,
+        ino: u64,
+    ) -> FsResult<u64> {
         let kind = match entry.kind {
             EntryKind::File => FileType::RegularFile,
             EntryKind::Directory => FileType::Directory,
@@ -318,6 +356,13 @@ impl Overlay {
             return Ok(*key);
         }
         let tree = self._snapshot.directory(source).map_err(snapshot_errno)?;
+        self.insert_source_directory(source, tree)
+    }
+    fn insert_source_directory(
+        &mut self,
+        source: &Path,
+        tree: Arc<crate::tree::Directory>,
+    ) -> FsResult<usize> {
         let base = self.next_ino;
         self.next_ino = base
             .checked_add(u64::try_from(tree.len()).map_err(|_| libc::ENOSPC)?)
@@ -1305,7 +1350,11 @@ impl Overlay {
 impl Overlay {
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
         let p = self.child(parent, name)?;
-        let ino = self.ensure(&p)?;
+        let ino = if self.read_only() {
+            self.ensure_readonly_child(parent, &p, name)?
+        } else {
+            self.ensure(&p)?
+        };
         self.refresh_backing_attr(ino)?;
         let node = self.node_mut(ino)?;
         node.lookups = node.lookups.saturating_add(1);
@@ -1741,6 +1790,84 @@ mod tests {
         let overlay =
             Overlay::with_write_policy(snapshot, temp.path().join("upper"), mode).unwrap();
         (temp, overlay)
+    }
+    #[test]
+    fn readonly_child_lookups_reuse_prepared_parent_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"source").unwrap();
+        let mut leaf = repo.treebuilder(None).unwrap();
+        leaf.insert("one", blob, 0o100644).unwrap();
+        leaf.insert("two", blob, 0o100755).unwrap();
+        let mut tree = leaf.write().unwrap();
+        for name in ["deep", "nested", "directory"] {
+            let mut parent = repo.treebuilder(None).unwrap();
+            parent.insert(name, tree, 0o040000).unwrap();
+            if name == "directory" {
+                parent.insert("alias", tree, 0o040000).unwrap();
+            }
+            tree = parent.write().unwrap();
+        }
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "parent-lookup").unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::None)
+                .unwrap();
+        let mut parent = 1;
+        for name in ["directory", "nested", "deep"] {
+            parent = fs.lookup_entry(parent, OsStr::new(name)).unwrap().ino;
+        }
+        let first = fs.lookup_entry(parent, OsStr::new("one")).unwrap();
+        assert_eq!(first.perm, 0o644);
+        let before = fs._snapshot.metrics();
+        assert_eq!(
+            before.cache_hits, 0,
+            "cold descent revisited earlier ancestors"
+        );
+        let second = fs.lookup_entry(parent, OsStr::new("two")).unwrap();
+        assert_eq!(second.perm, 0o755);
+        assert_ne!(first.ino, second.ino);
+        let after = fs._snapshot.metrics();
+        assert_eq!(after.tree_reads, before.tree_reads);
+        assert_eq!(after.header_reads, before.header_reads);
+        assert_eq!(
+            after.cache_hits - before.cache_hits,
+            1,
+            "lookup walked already prepared ancestors instead of only reusing the blob header"
+        );
+        assert_eq!(
+            fs.lookup_entry(parent, OsStr::new("absent")).unwrap_err(),
+            libc::ENOENT
+        );
+        assert_eq!(
+            fs._snapshot.metrics().cache_hits,
+            after.cache_hits,
+            "negative child lookup walked ancestors"
+        );
+        fs.forget_inode(second.ino, u64::MAX);
+        assert_eq!(
+            fs.lookup_entry(parent, OsStr::new("two")).unwrap().ino,
+            second.ino
+        );
+        assert_eq!(
+            fs.read_without_handle(second.ino, 0, 100).unwrap(),
+            b"source"
+        );
+        assert_eq!(fs._snapshot.metrics().blob_loads, 1);
+        let mut alias = 1;
+        for name in ["alias", "nested", "deep"] {
+            alias = fs.lookup_entry(alias, OsStr::new(name)).unwrap().ino;
+        }
+        let alias_file = fs.lookup_entry(alias, OsStr::new("two")).unwrap();
+        assert_ne!(
+            alias_file.ino, second.ino,
+            "shared trees merged pathname identities"
+        );
+        assert_eq!(
+            fs.read_without_handle(alias_file.ino, 0, 100).unwrap(),
+            b"source"
+        );
+        assert_eq!(fs._snapshot.metrics().blob_loads, 1);
     }
     #[test]
     fn all_copies_up_tracked_bytes_and_preserves_existing_read_handles() {
