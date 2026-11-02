@@ -24,9 +24,16 @@ enum ReadResponseData {
 }
 
 /// Response data from [`crate::AsyncFilesystem::read`] operation
-#[derive(Debug)]
 pub struct ReadResponse {
     data: ReadResponseData,
+    owner: Option<Box<dyn std::any::Any>>,
+}
+impl std::fmt::Debug for ReadResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadResponse")
+            .field("data", &self.data)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReadResponse {
@@ -34,6 +41,7 @@ impl ReadResponse {
     pub fn new(data: Vec<u8>) -> ReadResponse {
         ReadResponse {
             data: ReadResponseData::Owned(data),
+            owner: None,
         }
     }
 
@@ -45,6 +53,7 @@ impl ReadResponse {
         let end = start.saturating_add(size).min(data.len());
         ReadResponse {
             data: ReadResponseData::Shared { data, start, end },
+            owner: None,
         }
     }
 
@@ -59,7 +68,15 @@ impl ReadResponse {
         let end = start.saturating_add(size).min(data.len());
         ReadResponse {
             data: ReadResponseData::Local { data, start, end },
+            owner: None,
         }
+    }
+
+    /// Retain local operation ownership until the response has been sent or
+    /// dropped, including while a nonblocking reply transport is waiting.
+    pub fn with_owner(mut self, owner: impl std::any::Any) -> Self {
+        self.owner = Some(Box::new(owner));
+        self
     }
 
     pub(super) fn bytes(&self) -> &[u8] {
@@ -81,6 +98,16 @@ impl Response for ReadResponse {
 mod tests {
     use super::ReadResponse;
     use std::sync::Arc;
+
+    #[test]
+    fn response_owns_local_guard_through_payload_borrow() {
+        let owner = std::rc::Rc::new(());
+        let response = ReadResponse::new(b"data".to_vec()).with_owner(owner.clone());
+        assert_eq!(std::rc::Rc::strong_count(&owner), 2);
+        assert_eq!(response.bytes(), b"data");
+        drop(response);
+        assert_eq!(std::rc::Rc::strong_count(&owner), 1);
+    }
 
     #[test]
     fn shared_slice_clamps_to_bounds() {

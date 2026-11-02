@@ -1494,7 +1494,7 @@ for action in [lambda: Path('unused/blob').read_bytes(), lambda: os.listdir('unu
     else: raise AssertionError('missing object unexpectedly readable')
 assert Path('tracked.txt').read_bytes() == b'committed\n'
 """
-        for policy in ("none", "ignored", "untracked"):
+        for policy in ("none", "ignored", "untracked", "all"):
             with self.subTest(policy=policy):
                 result, run = self.invoke_argv(["HEAD", "--write-policy=" + policy,
                                                "--", sys.executable, "-I", "-S", "-c", code])
@@ -1607,7 +1607,7 @@ for action in [lambda: Path('unsupported/lfs.bin').read_bytes(),
     else: raise AssertionError('unsupported object was presented as usable')
 assert Path('unsupported/ordinary.txt').read_text() == 'ordinary\n'
 '''
-        for policy in ("none", "ignored", "untracked"):
+        for policy in ("none", "ignored", "untracked", "all"):
             with self.subTest(policy=policy):
                 result, run = self.invoke_argv(["HEAD", "--write-policy=" + policy,
                                                "--", sys.executable, "-I", "-S", "-c", code])

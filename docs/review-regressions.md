@@ -2518,3 +2518,34 @@ external evidence directory, outside the mergeable tree.
 
 These changes do not finish synchronous backing namespace operations, `all`
 copy-up, remote/fallback sources or performance acceptance.
+
+## Native namespace and all-policy copy-up (in progress)
+
+Native unlink/link/rename now validate explicit plans before awaiting backing
+operations and committing namespace state. `all` uses the loop-owned source
+cache, including streamed copy-up, original open handles and renamed directory
+origins. These paths do not enter the legacy source loader or create a second
+payload cache.
+
+`all_source_read_reply_orders_copy_up_and_cold_redirects_without_legacy_io`
+checks source reads, copy-up/write through existing handles, link/rename/unlink,
+an unvisited child under a renamed source directory, descriptor metadata changes
+after unlink, cache reuse and closed-handle reclamation. Its reply-ownership
+assertion fails when the read guard is released with the handler and passes when
+the response owns that guard until send/drop. Copy-up waits behind the retained
+old response while independent warm source lookup/read can proceed.
+
+The local library's `read_response_keeps_local_owner_while_reply_waits_for_writability`
+uses a real nonblocking socket filled to EAGAIN, verifies ownership while send is
+pending, drains it and checks the actual READ payload. This is transport evidence,
+not a mounted filesystem test. The real-FUSE all-policy coherence and write-policy
+suites separately check mmap, truncation, rename/unlink and live handles.
+Remote/fallback integration and original performance acceptance remain required.
+
+`all_streamed_copy_up_preserves_ranges_and_failed_source_removes_pending_backing`
+checks a multi-block copy with a short final block, sparse extension and original
+read handles. Removing a distinct source blob after its metadata lookup makes
+copy-up fail; the pending numeric backing is removed and the source inode stays
+unchanged. Existing real-mount lazy/missing/unsupported-object cases now include
+`all` as well as the three protected policies, checking readable siblings and
+successful child exit after handled errors.

@@ -52,12 +52,13 @@ identity prevents cleanup from targeting a later filesystem at the same path.
 The original MIT licenses and separate diffs from both upstream sources are
 included with the local crates.
 
-The native local `none`, `ignored` and `untracked` mounts connect lookup/header
+Native local mounts under all four write policies connect lookup/header
 demands, directory
 preparation, read and readlink to `snapshot_async.rs`, `source_async.rs` and
 `raw_blob_async.rs`. Trees, sizes, verified descriptors and the payload LRU belong
-to the loop. No namespace borrow survives a source or disk await. Only cold
-requests pin their inode while waiting; FORGET cannot reclaim it mid-request.
+to the loop. No namespace borrow survives a source or disk await. Operations
+needing an inode across a wait pin it against FORGET. Protected resident-source
+reads keep their direct path without an inode gate or worker job.
 A source boundary owns one decoder thread for libgit2's blocking API, with
 bounded chunk transfer; it is not a worker pool used by every callback. The
 local cache uses Rc-owned verified bytes and native io_uring file operations.
@@ -82,7 +83,7 @@ missing or unsupported object and continue using readable siblings. Such errors
 do not become invocation-wide remote-transport failures.
 
 Private regular-file read/write, open/create, attribute refresh and file/directory
-sync in the protected native policies now prepare operations under short state
+sync in native policies now prepare operations under short state
 borrows and await native I/O outside them. Active handles/operations retain one
 shared descriptor without duplicating it for each request. Per-inode local gates
 order writes, append, truncation and attribute updates; independent source reads
@@ -91,12 +92,19 @@ created bounded I/O actor for syscalls unavailable through the supported native
 ABI. A resident source hit never enters this queue. Shutdown closes the queue,
 awaits its completion and joins the owned worker.
 
-This is not yet a complete asynchronous core. `all`, remote sources and hosts
-without io_uring still use the existing synchronous source core. Protected
-unlink/link/rename can still perform synchronous backing opens, metadata and
-removal. Required remaining work includes porting those paths, async fallback,
-and concurrent copy-up/read coherence,
-complete cancellation/cleanup verification, and paired performance acceptance
+Unlink, link and rename validate prepared metadata before backing I/O and a
+short namespace commit. Numeric backing opens/removal run asynchronously.
+Under `all`, copy-up streams verified source ranges through the same cache to
+the private file without a second payload cache. Shared per-inode read ownership
+survives through the FUSE reply; copy-up/write waits for old replies to finish.
+Directory renames preserve their source origins for later cold child access.
+Cold `all` lookup recomputes its visible path under the namespace gate after
+waiting, while already-resolved source lookups keep their immediate path.
+
+This is not yet a complete asynchronous core. Remote sources and hosts without
+io_uring still use the existing synchronous source core. Required remaining work
+includes async fallback, remote integration, complete cancellation/cleanup
+verification, and paired performance acceptance
 with the complete mounted implementation. Component tests and protocol coverage do not establish
 issue #20 or merge readiness. No temporary profiler or benchmark harness is
 included in the source tree.

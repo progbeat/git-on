@@ -28,6 +28,7 @@ pub struct Fuse {
     policy: crate::policy::LocalPolicy,
     namespace: tokio::sync::Mutex<()>,
     io: crate::backing_async::Backing,
+    native_all: bool,
 }
 struct State {
     core: Overlay,
@@ -47,6 +48,7 @@ fn result<T>(r: FsResult<T>) -> Result<T, f::Errno> {
 impl Fuse {
     pub fn new(core: Overlay) -> Self {
         Self {
+            native_all: false,
             io: crate::backing_async::Backing::default(),
             policy: crate::policy::LocalPolicy::default(),
             namespace: tokio::sync::Mutex::new(()),
@@ -77,6 +79,84 @@ impl Fuse {
             .await
             .map_err(f::Errno::from)
     }
+    async fn prepare_removal(&self, ino: u64) -> Result<Option<PathBuf>, f::Errno> {
+        let path = result(self.state().core.removal_backing(ino))?;
+        if path.is_some() && self.state().core.shared_backing(ino).is_none() {
+            let file = self.backing_file(ino).await?;
+            result(self.state().core.retain_backing(ino, file))?;
+        }
+        Ok(path)
+    }
+    /// Caller owns this inode's exclusive gate. Source reads retain shared
+    /// ownership through their wire reply, so old pages cannot arrive later.
+    async fn copy_up_local(&self, ino: u64, preserve: bool) -> Result<(), f::Errno> {
+        let plan = result(self.state().core.plan_copy_up(ino))?;
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        let objects = self.state().objects.clone().ok_or(f::Errno::EIO)?;
+        let mut bytes = Vec::new();
+        let file = if plan.kind == FileType::RegularFile {
+            let file = crate::backing_async::Backing::open(&plan.path, true)
+                .await
+                .map_err(f::Errno::from)?;
+            let native = self.io.lease(ino, file.clone());
+            let copied = async {
+                if preserve {
+                    let mut offset = 0;
+                    while offset < plan.size {
+                        let data = objects
+                            .read(
+                                plan.oid,
+                                plan.size,
+                                offset,
+                                (plan.size - offset).min(64 * 1024) as u32,
+                            )
+                            .await
+                            .map_err(|_| f::Errno::EIO)?;
+                        if data.as_slice().is_empty() {
+                            return Err(f::Errno::EIO);
+                        }
+                        let length = data.as_slice().len();
+                        let (written, _) = native.file().write_all_at(data, offset).await;
+                        written.map_err(f::Errno::from)?;
+                        offset += length as u64;
+                    }
+                }
+                if plan.unlinked {
+                    tokio_uring::fs::remove_file(&plan.path)
+                        .await
+                        .map_err(f::Errno::from)?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = copied {
+                drop(native);
+                drop(file);
+                let _ = tokio_uring::fs::remove_file(&plan.path).await;
+                return Err(error);
+            }
+            Some(file)
+        } else {
+            if plan.kind == FileType::Symlink {
+                bytes = objects
+                    .read_link(plan.oid, plan.size)
+                    .await
+                    .map_err(|_| f::Errno::EIO)?
+                    .as_slice()
+                    .to_vec();
+            }
+            None
+        };
+        let handles = result(self.state().core.commit_copy_up(ino, file.clone(), bytes))?;
+        if let Some(file) = file {
+            for fh in handles {
+                self.io.opened(ino, fh, file.clone());
+            }
+        }
+        Ok(())
+    }
     async fn refresh_local(&self, ino: u64) -> Result<(), f::Errno> {
         if result(self.state().core.external_backing(ino))? {
             let file = self.backing_file(ino).await?;
@@ -92,7 +172,7 @@ impl Fuse {
         }
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
         result(self.state().core.prepared_attributes(ino, fh))?;
         self.refresh_local(ino).await?;
         let attr = result(self.state().core.prepared_attributes(ino, fh));
@@ -100,12 +180,19 @@ impl Fuse {
     }
     async fn open_local(&self, ino: u64, flags: i32) -> Result<u64, f::Errno> {
         let private = result(self.state().core.validate_open(ino, flags))?;
-        if !private {
+        let all = self.native_all;
+        if !private && !all {
             return result(self.state().core.open_prepared_file(ino, flags, None));
         }
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
+        if all && (flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0) {
+            self.copy_up_local(ino, flags & libc::O_TRUNC == 0).await?;
+        }
+        if !self.state().core.private_regular(ino) {
+            return result(self.state().core.open_prepared_file(ino, flags, None));
+        }
         self.refresh_local(ino).await?;
         let file = self.backing_file(ino).await?;
         if flags & libc::O_TRUNC != 0 {
@@ -133,7 +220,7 @@ impl Fuse {
     ) -> Result<FileAttr, f::Errno> {
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
         result(
             self.state()
                 .core
@@ -142,7 +229,18 @@ impl Fuse {
         if update.size.is_some_and(|size| size > i64::MAX as u64) {
             return Err(f::Errno::EFBIG);
         }
-        let file = if update.size.is_some() || update.atime.is_some() || update.mtime.is_some() {
+        if update.size.is_some()
+            && result(self.state().core.prepared_attributes(ino, None))?.kind
+                != FileType::RegularFile
+        {
+            return Err(f::Errno::EINVAL);
+        }
+        self.copy_up_local(ino, update.size != Some(0)).await?;
+        let regular =
+            result(self.state().core.prepared_attributes(ino, None))?.kind == FileType::RegularFile;
+        let file = if regular
+            && (update.size.is_some() || update.atime.is_some() || update.mtime.is_some())
+        {
             Some(self.backing_file(ino).await?)
         } else {
             None
@@ -158,7 +256,7 @@ impl Fuse {
             result(self.state().core.update_io_metadata(ino, &metadata, true))?;
         }
         let attr = result(self.state().core.apply_set_attributes(ino, update))?;
-        if update.atime.is_some() || update.mtime.is_some() {
+        if regular && (update.atime.is_some() || update.mtime.is_some()) {
             let mut times = std::fs::FileTimes::new();
             if update.atime.is_some() {
                 times = times.set_accessed(attr.atime);
@@ -193,7 +291,16 @@ impl Fuse {
     ) -> Result<Vec<u8>, f::Errno> {
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
+        self.read_backing_unlocked(ino, fh, offset, size).await
+    }
+    async fn read_backing_unlocked(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, f::Errno> {
         let plan = result(self.state().core.prepare_read_io(ino, fh))?;
         let file = self.io.lease(ino, plan.file);
         if plan.external {
@@ -204,6 +311,84 @@ impl Fuse {
         crate::backing_async::Backing::read(file.file(), offset, count)
             .await
             .map_err(f::Errno::from)
+    }
+    async fn read_file(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+        flags: i32,
+    ) -> Result<ReadResponse, f::Errno> {
+        i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
+        let all = self.native_all;
+        let _pin = all.then(|| self.pin(ino));
+        let owner = if all {
+            Some(self.io.gate(ino).read().await)
+        } else {
+            None
+        };
+        let own = |response: ReadResponse| {
+            if let Some(owner) = owner {
+                response.with_owner(owner)
+            } else {
+                response
+            }
+        };
+        let prepared = {
+            let state = self.state();
+            #[cfg(feature = "test-metrics")]
+            state.core.record_fuse_request("read");
+            if let Some(objects) = &state.objects {
+                let fh = if state.no_open && fh == 0 {
+                    if flags & libc::O_ACCMODE == libc::O_WRONLY {
+                        return Err(f::Errno::EBADF);
+                    }
+                    result(state.core.readonly_file_attributes(ino))?;
+                    None
+                } else {
+                    Some(fh)
+                };
+                result(state.core.source_read(ino, fh, offset, size))?
+                    .map(|plan| (objects.clone(), plan))
+            } else {
+                None
+            }
+        };
+        if let Some((objects, (oid, length, count))) = prepared {
+            if count == 0 {
+                return Ok(own(ReadResponse::new(Vec::new())));
+            }
+            let bytes = objects
+                .read(oid, length, offset, count)
+                .await
+                .map_err(|_| f::Errno::EIO)?;
+            let (data, range) = crate::raw_blob_async::RawBlobs::into_local_parts(bytes);
+            return Ok(own(ReadResponse::from_local_slice(
+                data,
+                range.start,
+                range.len(),
+            )));
+        }
+        if self.state().objects.is_some() {
+            let data = if all {
+                self.read_backing_unlocked(ino, fh, offset, size).await?
+            } else {
+                self.read_backing(ino, fh, offset, size).await?
+            };
+            return Ok(own(ReadResponse::new(data)));
+        }
+        let mut state = self.state();
+        let offset = i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
+        let data = if state.no_open && fh == 0 {
+            if flags & libc::O_ACCMODE == libc::O_WRONLY {
+                return Err(f::Errno::EBADF);
+            }
+            state.core.read_without_handle(ino, offset, size)
+        } else {
+            state.core.read_data(ino, fh, offset, size)
+        };
+        Ok(ReadResponse::new(result(data)?))
     }
     async fn write_backing(
         &self,
@@ -216,7 +401,7 @@ impl Fuse {
     ) -> Result<u32, f::Errno> {
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
         let plan = result(self.state().core.prepare_write_io(ino, fh))?;
         let file = self.io.lease(ino, plan.file);
         if plan.external {
@@ -254,7 +439,7 @@ impl Fuse {
     ) -> Result<(), f::Errno> {
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
-        let _guard = gate.mutex.lock().await;
+        let _guard = gate.lock.write().await;
         let file = result(self.state().core.prepare_sync_io(ino, fh))?;
         if let Some(file) = file {
             let file = self.io.lease(ino, file);
@@ -269,15 +454,14 @@ impl Fuse {
     }
     /// Construct the native local object path after entering its I/O runtime.
     pub fn with_async_source(core: Overlay) -> std::io::Result<Self> {
-        let objects = if core.write_policy() != WritePolicy::All {
-            core.snapshot()
-                .async_source()
-                .map_err(std::io::Error::other)?
-                .map(Rc::new)
-        } else {
-            None
-        };
+        let objects = core
+            .snapshot()
+            .async_source()
+            .map_err(std::io::Error::other)?
+            .map(Rc::new);
         let mut filesystem = Self::new(core);
+        filesystem.native_all =
+            objects.is_some() && filesystem.state.get_mut().core.write_policy() == WritePolicy::All;
         if objects.is_some() && !filesystem.state.get_mut().core.read_only() {
             filesystem.state.get_mut().core.enable_local_source();
         }
@@ -295,6 +479,23 @@ impl Fuse {
             let next = result(self.state().core.source_lookup(parent, name))?;
             match next {
                 SourceLookup::Ready(attr) => return Ok(attr),
+                SourceLookup::Path => {
+                    pin.get_or_insert_with(|| self.pin(parent));
+                    let attr = {
+                        let _namespace = self.namespace.lock().await;
+                        let path = result(self.state().core.child_path(parent, name))?;
+                        let ino = self.ensure_local(objects, &path).await?;
+                        let attr = result(self.state().core.finish_source_lookup(ino))?;
+                        attr
+                    };
+                    match self.attributes_local(attr.ino, None).await {
+                        Ok(attr) => return Ok(attr),
+                        Err(error) => {
+                            self.state().core.forget_inode(attr.ino, 1);
+                            return Err(error);
+                        }
+                    }
+                }
                 SourceLookup::Private(attr) => match self.attributes_local(attr.ino, None).await {
                     Ok(attr) => return Ok(attr),
                     Err(error) => {
@@ -486,7 +687,7 @@ impl Fuse {
         let ino = self.ensure_local(objects, &path).await?;
         let _inode = self.pin(ino);
         result(self.state().core.validate_writable(ino))?;
-        let kind = result(self.state().core.attributes(ino, None))?.kind;
+        let kind = result(self.state().core.prepared_attributes(ino, None))?.kind;
         let source = self.state().core.source_path(&path);
         if kind == FileType::Directory {
             if let Some(source) = source {
@@ -496,12 +697,19 @@ impl Fuse {
         let decisions = self
             .authorize(objects, vec![(path, kind == FileType::Directory)])
             .await?;
-        let reply = result(
+        let plan = result(
             self.state()
                 .core
-                .with_authorizations(decisions, |core| core.remove(parent, name, directory)),
-        );
-        reply
+                .with_authorizations(decisions, |core| core.plan_remove(parent, name, directory)),
+        )?;
+        let gate = self.io.gate(plan.ino);
+        let _guard = gate.lock.write().await;
+        let path = self.prepare_removal(plan.ino).await?;
+        result(self.state().core.commit_remove(plan))?;
+        if let Some(path) = path {
+            let _ = tokio_uring::fs::remove_file(path).await;
+        }
+        Ok(())
     }
     async fn rename_local(
         &self,
@@ -533,7 +741,7 @@ impl Fuse {
         };
         let _target = destination.map(|ino| self.pin(ino));
         if let Some(destination) = destination {
-            let kind = result(self.state().core.attributes(destination, None))?.kind;
+            let kind = result(self.state().core.prepared_attributes(destination, None))?.kind;
             let source = self.state().core.source_path(&to);
             if kind == FileType::Directory {
                 if let Some(source) = source {
@@ -547,10 +755,36 @@ impl Fuse {
                 .rename_policy_paths(parent, name, newparent, newname),
         )?;
         let decisions = self.authorize(objects, paths).await?;
-        let reply = result(self.state().core.with_authorizations(decisions, |core| {
-            core.rename_path(parent, name, newparent, newname, flags)
-        }));
-        reply
+        let plan = result(self.state().core.with_authorizations(decisions, |core| {
+            core.plan_rename(parent, name, newparent, newname, flags)
+        }))?;
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        let first = self
+            .io
+            .gate(plan.destination.map_or(plan.ino, |dst| dst.min(plan.ino)));
+        let second = plan
+            .destination
+            .filter(|dst| *dst != plan.ino)
+            .map(|dst| self.io.gate(dst.max(plan.ino)));
+        let _first = first.lock.write().await;
+        let _second = if let Some(second) = &second {
+            Some(second.lock.write().await)
+        } else {
+            None
+        };
+        self.copy_up_local(plan.ino, true).await?;
+        let path = if let Some(dst) = plan.destination {
+            self.prepare_removal(dst).await?
+        } else {
+            None
+        };
+        result(self.state().core.commit_rename(plan))?;
+        if let Some(path) = path {
+            let _ = tokio_uring::fs::remove_file(path).await;
+        }
+        Ok(())
     }
     async fn link_local(
         &self,
@@ -566,17 +800,23 @@ impl Fuse {
             return Err(f::Errno::EROFS);
         }
         let path = result(self.state().core.child_path(parent, name))?;
-        let kind = result(self.state().core.attributes(ino, None))?.kind;
+        let kind = result(self.state().core.prepared_attributes(ino, None))?.kind;
         result(self.state().core.validate_writable(ino))?;
         self.prepare_parent(objects, &path).await?;
         let decisions = self
             .authorize(objects, vec![(path, kind == FileType::Directory)])
             .await?;
-        let reply = result(
+        let path = result(
             self.state()
                 .core
-                .with_authorizations(decisions, |core| core.link_node(ino, parent, name)),
-        );
+                .with_authorizations(decisions, |core| core.plan_link(ino, parent, name)),
+        )?;
+        let gate = self.io.gate(ino);
+        let _guard = gate.lock.write().await;
+        self.refresh_local(ino).await?;
+        self.copy_up_local(ino, true).await?;
+        result(self.state().core.commit_link(ino, path))?;
+        let reply = result(self.state().core.finish_source_lookup(ino));
         reply
     }
     fn pin(&self, ino: u64) -> RequestPin<'_> {
@@ -797,7 +1037,9 @@ impl f::AsyncFilesystem for Fuse {
     ) -> Result<AttrResponse, f::Errno> {
         let private = {
             let state = self.state();
-            state.objects.is_some() && state.core.private_regular(ino.0)
+            state.objects.is_some()
+                && (state.core.private_regular(ino.0)
+                    || state.core.write_policy() == WritePolicy::All)
         };
         let update = SetAttributes {
             mode,
@@ -1088,59 +1330,7 @@ impl f::AsyncFilesystem for Fuse {
         flags: f::OpenFlags,
         _: Option<f::LockOwner>,
     ) -> Result<ReadResponse, f::Errno> {
-        i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
-        let prepared = {
-            let state = self.state();
-            #[cfg(feature = "test-metrics")]
-            state.core.record_fuse_request("read");
-            if let Some(objects) = &state.objects {
-                let fh = if state.no_open && fh.0 == 0 {
-                    if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
-                        return Err(f::Errno::EBADF);
-                    }
-                    result(state.core.readonly_file_attributes(ino.0))?;
-                    None
-                } else {
-                    Some(fh.0)
-                };
-                result(state.core.source_read(ino.0, fh, offset, size))?
-                    .map(|plan| (objects.clone(), plan))
-            } else {
-                None
-            }
-        };
-        if let Some((objects, (oid, length, count))) = prepared {
-            if count == 0 {
-                return Ok(ReadResponse::new(Vec::new()));
-            }
-            let bytes = objects
-                .read(oid, length, offset, count)
-                .await
-                .map_err(|_| f::Errno::EIO)?;
-            let (data, range) = crate::raw_blob_async::RawBlobs::into_local_parts(bytes);
-            return Ok(ReadResponse::from_local_slice(
-                data,
-                range.start,
-                range.len(),
-            ));
-        }
-        if self.state().objects.is_some() {
-            return self
-                .read_backing(ino.0, fh.0, offset, size)
-                .await
-                .map(ReadResponse::new);
-        }
-        let mut state = self.state();
-        let offset = i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
-        let data = if state.no_open && fh.0 == 0 {
-            if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
-                return Err(f::Errno::EBADF);
-            }
-            state.core.read_without_handle(ino.0, offset, size)
-        } else {
-            state.core.read_data(ino.0, fh.0, offset, size)
-        };
-        Ok(ReadResponse::new(result(data)?))
+        self.read_file(ino.0, fh.0, offset, size, flags.0).await
     }
     async fn write(
         &self,
@@ -1198,7 +1388,7 @@ impl f::AsyncFilesystem for Fuse {
         if native {
             let _pin = self.pin(ino.0);
             let gate = self.io.gate(ino.0);
-            let _guard = gate.mutex.lock().await;
+            let _guard = gate.lock.write().await;
             result(self.state().core.validate_handle(ino.0, fh.0))?;
             let plan = self.state().core.metadata_io(ino.0);
             if let Some(plan) = plan.filter(|p| p.external) {
@@ -1259,8 +1449,12 @@ impl f::AsyncFilesystem for Fuse {
             let demand = result(self.state().core.readonly_directory_demand(ino.0))?;
             if let Some((path, oid)) = demand {
                 pin = Some(self.pin(ino.0));
-                let tree = objects.tree(oid).await.map_err(|_| f::Errno::EIO)?;
-                result(self.state().core.prepare_readonly_directory(path, tree))?;
+                if let Some(oid) = oid {
+                    let tree = objects.tree(oid).await.map_err(|_| f::Errno::EIO)?;
+                    result(self.state().core.prepare_readonly_directory(path, tree))?;
+                } else {
+                    self.prepare_directory(objects, &path).await?;
+                }
             }
         }
         let mut state = self.state();
@@ -1452,6 +1646,279 @@ mod tests {
     use git2::Repository;
 
     #[test]
+    fn all_streamed_copy_up_preserves_ranges_and_failed_source_removes_pending_backing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let data: Vec<u8> = (0..1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let large = repo.blob(&data).unwrap();
+        let missing = repo.blob(b"unique missing copy source").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("large", large, 0o100644).unwrap();
+        tree.insert("missing", missing, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "all-copy-failure",
+        )
+        .unwrap();
+        let overlay = Overlay::with_write_policy(
+            snapshot.clone(),
+            temp.path().join("upper"),
+            WritePolicy::All,
+        )
+        .unwrap();
+        tokio_uring::start(async {
+            let mut fs = Fuse::with_async_source(overlay).unwrap();
+            let objects = fs.state().objects.clone().unwrap();
+            let large = fs
+                .lookup_local(&objects, 1, OsStr::new("large"))
+                .await
+                .unwrap()
+                .ino;
+            let reader = fs.open_local(large, libc::O_RDONLY).await.unwrap();
+            let writer = fs.open_local(large, libc::O_RDWR).await.unwrap();
+            for offset in [0, 65530, data.len() - 100] {
+                assert_eq!(
+                    fs.read_backing(large, reader, offset as u64, 100)
+                        .await
+                        .unwrap(),
+                    data[offset..offset + 100]
+                );
+            }
+            fs.write_backing(
+                large,
+                writer,
+                data.len() as u64 + 13,
+                b"tail",
+                0,
+                libc::O_RDWR,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs.read_backing(large, reader, data.len() as u64, 32)
+                    .await
+                    .unwrap(),
+                [vec![0; 13], b"tail".to_vec()].concat()
+            );
+
+            let failed = fs
+                .lookup_local(&objects, 1, OsStr::new("missing"))
+                .await
+                .unwrap()
+                .ino;
+            let oid = missing.to_string();
+            std::fs::remove_file(repo.path().join("objects").join(&oid[..2]).join(&oid[2..]))
+                .unwrap();
+            let path = fs.state().core.backing_path(failed).unwrap();
+            assert_eq!(
+                i32::from(fs.open_local(failed, libc::O_RDWR).await.unwrap_err()),
+                libc::EIO
+            );
+            assert!(
+                !path.exists(),
+                "failed copy-up retained its pending backing"
+            );
+            assert!(fs.state().core.unchanged_source_data(failed));
+            for fh in [reader, writer] {
+                fs.state().core.release_prepared_handle(large, fh).unwrap();
+                fs.io.released(large, fh);
+            }
+            assert_eq!(fs.io.retained(), (0, 0, 0));
+            drop(objects);
+            fs.shutdown().await.unwrap();
+            let metrics = snapshot.metrics();
+            assert!(metrics.blob_cache_bytes <= metrics.blob_cache_limit);
+            assert_eq!(metrics.active_spool_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn all_source_read_reply_orders_copy_up_and_cold_redirects_without_legacy_io() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let payload = repo.blob(b"original contents").unwrap();
+        let mut child = repo.treebuilder(None).unwrap();
+        child.insert("unvisited", payload, 0o100644).unwrap();
+        let directory = child.write().unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", payload, 0o100644).unwrap();
+        tree.insert("orphan", payload, 0o100644).unwrap();
+        tree.insert("directory", directory, 0o040000).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "async-all",
+        )
+        .unwrap();
+        let overlay = Overlay::with_write_policy(
+            snapshot.clone(),
+            temp.path().join("upper"),
+            WritePolicy::All,
+        )
+        .unwrap();
+        tokio_uring::start(async {
+            let mut fs = Fuse::with_async_source(overlay).unwrap();
+            let objects = fs
+                .state()
+                .objects
+                .clone()
+                .expect("all must use the async source");
+            let source = fs
+                .lookup_local(&objects, 1, OsStr::new("source"))
+                .await
+                .unwrap()
+                .ino;
+            let reader = fs.open_local(source, libc::O_RDONLY).await.unwrap();
+            let response = fs
+                .read_file(source, reader, 0, 100, libc::O_RDONLY)
+                .await
+                .unwrap();
+            assert!(
+                fs.io.gate(source).lock.try_write().is_err(),
+                "read ownership ended before the wire response"
+            );
+            let mut writer = Box::pin(fs.open_local(source, libc::O_RDWR));
+            poll_fn(|cx| {
+                assert!(
+                    writer.as_mut().poll(cx).is_pending(),
+                    "copy-up passed an unsent old READ reply"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                fs.lookup_local(&objects, 1, OsStr::new("orphan"))
+                    .await
+                    .unwrap()
+                    .size,
+                17
+            );
+            assert_eq!(
+                objects.read(payload, 17, 0, 100).await.unwrap().as_slice(),
+                b"original contents"
+            );
+            drop(response);
+            let writer = writer.await.unwrap();
+            fs.write_backing(source, writer, 0, b"modified", 0, libc::O_RDWR)
+                .await
+                .unwrap();
+            assert_eq!(
+                fs.read_backing(source, reader, 0, 100).await.unwrap(),
+                b"modified contents"
+            );
+            fs.link_local(&objects, source, 1, OsStr::new("alias"))
+                .await
+                .unwrap();
+            fs.rename_local(&objects, 1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
+                .await
+                .unwrap();
+            fs.remove_local(&objects, 1, OsStr::new("moved"), false)
+                .await
+                .unwrap();
+            fs.remove_local(&objects, 1, OsStr::new("alias"), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                fs.attributes_local(source, Some(reader))
+                    .await
+                    .unwrap()
+                    .nlink,
+                0
+            );
+            assert_eq!(
+                fs.read_backing(source, reader, 0, 100).await.unwrap(),
+                b"modified contents"
+            );
+
+            // Copy a directory's namespace before any of its children were
+            // visited. Its source origin survives clearing its mutation OID.
+            let directory = fs
+                .lookup_local(&objects, 1, OsStr::new("directory"))
+                .await
+                .unwrap()
+                .ino;
+            fs.rename_local(
+                &objects,
+                1,
+                OsStr::new("directory"),
+                1,
+                OsStr::new("renamed"),
+                0,
+            )
+            .await
+            .unwrap();
+            let (path, oid) = fs
+                .state()
+                .core
+                .readonly_directory_demand(directory)
+                .unwrap()
+                .unwrap();
+            assert!(oid.is_none());
+            fs.prepare_directory(&objects, &path).await.unwrap();
+            let leaf = fs
+                .lookup_local(&objects, directory, OsStr::new("unvisited"))
+                .await
+                .unwrap();
+            assert_eq!(leaf.size, 17);
+            assert_eq!(
+                fs.state()
+                    .core
+                    .prepared_attributes(leaf.ino, None)
+                    .unwrap()
+                    .ino,
+                leaf.ino
+            );
+
+            // Metadata mutation on a source file already unlinked through an
+            // outstanding read handle still owns its private copied backing.
+            let orphan = fs
+                .lookup_local(&objects, 1, OsStr::new("orphan"))
+                .await
+                .unwrap()
+                .ino;
+            let orphan_fh = fs.open_local(orphan, libc::O_RDONLY).await.unwrap();
+            fs.remove_local(&objects, 1, OsStr::new("orphan"), false)
+                .await
+                .unwrap();
+            fs.set_attributes_local(
+                orphan,
+                unsafe { libc::geteuid() },
+                SetAttributes {
+                    mode: Some(0o600),
+                    fh: Some(orphan_fh),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs.read_backing(orphan, orphan_fh, 0, 100).await.unwrap(),
+                b"original contents"
+            );
+            for (ino, fh) in [(source, reader), (source, writer), (orphan, orphan_fh)] {
+                fs.state().core.release_prepared_handle(ino, fh).unwrap();
+                fs.io.released(ino, fh);
+            }
+            assert_eq!(fs.io.retained(), (0, 0, 0));
+            let legacy = snapshot.metrics();
+            assert_eq!(
+                (legacy.tree_reads, legacy.header_reads, legacy.blob_loads),
+                (0, 0, 0)
+            );
+            drop(objects);
+            fs.shutdown().await.unwrap();
+            assert_eq!(snapshot.metrics().blob_loads, 1);
+        });
+    }
+
+    #[test]
     fn private_native_io_keeps_handles_and_other_inode_progress_without_a_core_borrow() {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
@@ -1491,7 +1958,7 @@ mod tests {
                 .ino;
             let fh = fs.open_local(ino, libc::O_RDWR).await.unwrap();
             let gate = fs.io.gate(ino);
-            let hold = gate.mutex.lock().await;
+            let hold = gate.lock.write().await;
             let write = fs.write_backing(ino, fh, 2, b"abc", 0, libc::O_RDWR);
             let progress = async {
                 assert_eq!(
@@ -1881,7 +2348,7 @@ mod tests {
                     .readonly_directory_demand(child)
                     .unwrap()
                     .unwrap();
-                let tree = objects.tree(oid).await.unwrap();
+                let tree = objects.tree(oid.unwrap()).await.unwrap();
                 fs.state()
                     .core
                     .prepare_readonly_directory(path, tree)

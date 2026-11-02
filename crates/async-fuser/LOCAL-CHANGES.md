@@ -31,3 +31,6 @@ These fixes have focused regressions with recorded failing predecessors.
 The local `shutdown` hook awaits filesystem-owned asynchronous cleanup after
 request drain and before destroy, including INIT errors. Local Rc-backed read
 and data replies hold immutable payload allocations through reply completion.
+Read responses may also retain a local operation owner through nonblocking
+reply waits, so filesystem mutation ordering can include the wire completion.
+Focused tests keep this owner alive under actual socket backpressure.

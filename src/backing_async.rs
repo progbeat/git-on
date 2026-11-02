@@ -56,12 +56,12 @@ impl Drop for Worker {
 }
 
 type Files = HashMap<u64, (usize, Weak<File>)>;
-type Gates = HashMap<u64, Weak<tokio::sync::Mutex<()>>>;
+type Gates = HashMap<u64, std::sync::Weak<tokio::sync::RwLock<()>>>;
 #[derive(Default)]
 pub(crate) struct Backing {
     files: RefCell<Files>,
     handles: RefCell<HashMap<u64, Rc<File>>>,
-    gates: RefCell<Gates>,
+    gates: Rc<RefCell<Gates>>,
     // Only operations unavailable through the supported io_uring ABI use this
     // one lazily-created, bounded actor. RAM hits never enter its queue.
     worker: RefCell<Option<Worker>>,
@@ -89,21 +89,33 @@ impl Drop for Lease<'_> {
         }
     }
 }
-pub(crate) struct Gate<'a> {
-    owner: &'a Backing,
+pub(crate) struct Gate {
+    gates: Rc<RefCell<Gates>>,
     ino: u64,
-    pub(crate) mutex: Rc<tokio::sync::Mutex<()>>,
+    pub(crate) lock: Arc<tokio::sync::RwLock<()>>,
 }
-impl Drop for Gate<'_> {
+impl Drop for Gate {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.mutex) == 1 {
-            let mut gates = self.owner.gates.borrow_mut();
-            if gates
-                .get(&self.ino)
-                .is_some_and(|weak| weak.as_ptr() == Rc::as_ptr(&self.mutex))
-            {
-                gates.remove(&self.ino);
-            }
+        if Arc::strong_count(&self.lock) == 1 {
+            self.gates.borrow_mut().remove(&self.ino);
+        }
+    }
+}
+pub(crate) struct ReadToken {
+    _gate: Gate,
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+impl Drop for ReadToken {
+    fn drop(&mut self) {
+        self.guard.take();
+    }
+}
+impl Gate {
+    pub(crate) async fn read(self) -> ReadToken {
+        let guard = self.lock.clone().read_owned().await;
+        ReadToken {
+            _gate: self,
+            guard: Some(guard),
         }
     }
 }
@@ -119,7 +131,7 @@ impl Backing {
     pub(crate) async fn finish(&mut self) -> io::Result<()> {
         self.handles.get_mut().clear();
         self.files.get_mut().clear();
-        self.gates.get_mut().clear();
+        self.gates.borrow_mut().clear();
         if let Some(worker) = self.worker.get_mut().take() {
             worker.finish().await?;
         }
@@ -210,17 +222,20 @@ impl Backing {
             files.remove(&ino);
         }
     }
-    pub(crate) fn gate(&self, ino: u64) -> Gate<'_> {
+    pub(crate) fn gate(&self, ino: u64) -> Gate {
         let mut gates = self.gates.borrow_mut();
-        let mutex = gates.get(&ino).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let mutex = Rc::new(tokio::sync::Mutex::new(()));
-            gates.insert(ino, Rc::downgrade(&mutex));
-            mutex
-        });
+        let mutex = gates
+            .get(&ino)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let lock = Arc::new(tokio::sync::RwLock::new(()));
+                gates.insert(ino, Arc::downgrade(&lock));
+                lock
+            });
         Gate {
-            owner: self,
+            gates: self.gates.clone(),
             ino,
-            mutex,
+            lock: mutex,
         }
     }
     pub(crate) async fn read(file: &File, offset: u64, count: usize) -> io::Result<Vec<u8>> {
@@ -378,7 +393,7 @@ mod tests {
                 drop(lease);
                 assert!(backing.files.borrow().is_empty());
                 let gate = backing.gate(ino);
-                let lock = gate.mutex.lock().await;
+                let lock = gate.lock.write().await;
                 drop(lock);
                 drop(gate);
                 assert!(backing.gates.borrow().is_empty());

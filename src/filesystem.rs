@@ -32,6 +32,27 @@ pub(crate) struct Creation {
     attr: FileAttr,
     bytes: Vec<u8>,
 }
+pub(crate) struct Removal {
+    pub(crate) ino: u64,
+    path: PathBuf,
+}
+pub(crate) struct Rename {
+    pub(crate) ino: u64,
+    pub(crate) destination: Option<u64>,
+    from: PathBuf,
+    to: PathBuf,
+    kind: FileType,
+    moves: Vec<(PathBuf, PathBuf, u64)>,
+    origin: Option<PathBuf>,
+}
+#[cfg(target_os = "linux")]
+pub(crate) struct CopyUp {
+    pub(crate) oid: Oid,
+    pub(crate) kind: FileType,
+    pub(crate) size: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) unlinked: bool,
+}
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
@@ -135,6 +156,7 @@ pub struct Overlay {
 pub(crate) enum SourceLookup {
     Ready(FileAttr),
     Private(FileAttr),
+    Path,
     Tree {
         path: PathBuf,
         oid: Oid,
@@ -207,6 +229,19 @@ impl Overlay {
     #[cfg(target_os = "linux")]
     pub(crate) fn shared_backing(&self, ino: u64) -> Option<Arc<File>> {
         self.nodes.get(&ino)?.file.clone()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retain_backing(&mut self, ino: u64, file: Arc<File>) -> FsResult<()> {
+        self.node_mut(ino)?.file = Some(file);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn removal_backing(&self, ino: u64) -> FsResult<Option<PathBuf>> {
+        let n = self.node(ino)?;
+        Ok(
+            (!n.immutable && n.attr.kind == FileType::RegularFile && n.attr.nlink == 1)
+                .then(|| self.backing.join(ino.to_string())),
+        )
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn metadata_io(&self, ino: u64) -> Option<BackingPlan> {
@@ -331,6 +366,54 @@ impl Overlay {
     #[cfg(target_os = "linux")]
     pub(crate) fn validate_writable(&self, ino: u64) -> FsResult<()> {
         self.writable(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn plan_copy_up(&self, ino: u64) -> FsResult<Option<CopyUp>> {
+        self.writable(ino)?;
+        let n = self.node(ino)?;
+        if !n.immutable {
+            return Ok(None);
+        }
+        Ok(Some(CopyUp {
+            oid: n.oid.ok_or(libc::EIO)?,
+            kind: n.attr.kind,
+            size: n.attr.size,
+            path: self.backing.join(ino.to_string()),
+            unlinked: n.attr.nlink == 0,
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_copy_up(
+        &mut self,
+        ino: u64,
+        file: Option<Arc<File>>,
+        bytes: Vec<u8>,
+    ) -> FsResult<Vec<u64>> {
+        let path = match self.path(ino) {
+            Ok(path) => Some(path),
+            Err(libc::ENOENT) if self.node(ino)?.attr.nlink == 0 => None,
+            Err(e) => return Err(e),
+        };
+        let keep = self.node(ino)?.attr.nlink == 0 || self.has_open_handle(ino);
+        let node = self.node_mut(ino)?;
+        node.immutable = false;
+        node.oid = None;
+        node.bytes = bytes;
+        if keep {
+            node.file = file;
+        }
+        if let Some(path) = path.filter(|p| !p.as_os_str().is_empty()) {
+            self.upper_paths.insert(path, ino);
+        }
+        let mut handles = Vec::new();
+        let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
+        while fh != 0 {
+            let handle = self.handles.get_mut(&fh).expect("indexed open handle");
+            handle.reader = None;
+            handles.push(fh);
+            fh = handle.next;
+        }
+        Ok(handles)
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn child_path(&self, parent: u64, name: &OsStr) -> FsResult<PathBuf> {
@@ -485,7 +568,6 @@ impl Overlay {
     /// operation occurs under the adapter's short mutable state borrow.
     #[cfg(target_os = "linux")]
     pub(crate) fn source_lookup(&mut self, parent: u64, name: &OsStr) -> FsResult<SourceLookup> {
-        debug_assert!(self.write_policy != WritePolicy::All);
         let path = if self.read_only() {
             None
         } else {
@@ -496,6 +578,9 @@ impl Overlay {
                 return self.finish_source_lookup(ino).map(SourceLookup::Private);
             }
             return self.finish_source_lookup(ino).map(SourceLookup::Ready);
+        }
+        if self.write_policy == WritePolicy::All {
+            return Ok(SourceLookup::Path);
         }
         let node = self.node(parent)?;
         if node.attr.kind != FileType::Directory {
@@ -527,7 +612,7 @@ impl Overlay {
         }
     }
     #[cfg(target_os = "linux")]
-    fn finish_source_lookup(&mut self, ino: u64) -> FsResult<FileAttr> {
+    pub(crate) fn finish_source_lookup(&mut self, ino: u64) -> FsResult<FileAttr> {
         let node = self.node_mut(ino)?;
         node.lookups = node.lookups.saturating_add(1);
         Ok(node.attr)
@@ -563,7 +648,10 @@ impl Overlay {
         Ok(())
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn readonly_directory_demand(&self, ino: u64) -> FsResult<Option<(PathBuf, Oid)>> {
+    pub(crate) fn readonly_directory_demand(
+        &self,
+        ino: u64,
+    ) -> FsResult<Option<(PathBuf, Option<Oid>)>> {
         let node = self.node(ino)?;
         if node.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
@@ -571,8 +659,7 @@ impl Overlay {
         let Some(path) = node.snapshot_path.as_ref() else {
             return Ok(None);
         };
-        Ok((!self.source_directory_keys.contains_key(path))
-            .then(|| (path.clone(), node.oid.unwrap())))
+        Ok((!self.source_directory_keys.contains_key(path)).then(|| (path.clone(), node.oid)))
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn open_prepared_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
@@ -1189,6 +1276,10 @@ impl Overlay {
         if !node.immutable {
             return Ok(());
         }
+        #[cfg(target_os = "linux")]
+        if self.local_source {
+            return Err(libc::EIO);
+        }
         let kind = node.attr.kind;
         let oid = node.oid.ok_or(libc::EIO)?;
         let unlinked = node.attr.nlink == 0;
@@ -1488,6 +1579,12 @@ impl Overlay {
             .ok_or(libc::EBADF)
     }
     fn refresh_backing_attr(&mut self, ino: u64) -> FsResult<()> {
+        #[cfg(target_os = "linux")]
+        if self.local_source {
+            // Native callers prepare/await metadata outside the core borrow.
+            self.node(ino)?;
+            return Ok(());
+        }
         {
             if self.node(ino)?.external_io {
                 let metadata = self.disk_file(ino)?.metadata().map_err(errno)?;
@@ -1757,6 +1854,10 @@ impl Overlay {
             {
                 // O_PATH can pin an inode without an OPEN handle. Keep its
                 // backing accessible after unlink until FORGET reclaims it.
+                #[cfg(target_os = "linux")]
+                if self.local_source {
+                    return Err(libc::EIO);
+                }
                 let file = self.disk_file(ino)?;
                 self.node_mut(ino)?.file = Some(Arc::new(file));
             }
@@ -1785,7 +1886,13 @@ impl Overlay {
                     });
                 n.attr.ctime = SystemTime::now();
                 if n.attr.nlink == 0 && n.attr.kind == FileType::RegularFile {
-                    let _ = fs::remove_file(self.backing.join(ino.to_string()));
+                    #[cfg(target_os = "linux")]
+                    let native = self.local_source;
+                    #[cfg(not(target_os = "linux"))]
+                    let native = false;
+                    if !native {
+                        let _ = fs::remove_file(self.backing.join(ino.to_string()));
+                    }
                 }
             }
             self.touch_parent(p);
@@ -1798,6 +1905,15 @@ impl Overlay {
         Ok(())
     }
     pub(crate) fn remove(&mut self, parent: u64, name: &OsStr, directory: bool) -> FsResult<()> {
+        let plan = self.plan_remove(parent, name, directory)?;
+        self.commit_remove(plan)
+    }
+    pub(crate) fn plan_remove(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        directory: bool,
+    ) -> FsResult<Removal> {
         let p = self.child(parent, name)?;
         let ino = self.ensure(&p)?;
         self.writable(ino)?;
@@ -1812,8 +1928,10 @@ impl Overlay {
             return Err(libc::ENOTEMPTY);
         }
         self.allowed(&p, kind)?;
-        self.remove_path(&p)?;
-        Ok(())
+        Ok(Removal { ino, path: p })
+    }
+    pub(crate) fn commit_remove(&mut self, plan: Removal) -> FsResult<()> {
+        self.remove_path(&plan.path)
     }
     pub(crate) fn rename_path(
         &mut self,
@@ -1823,6 +1941,20 @@ impl Overlay {
         newname: &OsStr,
         flags: u32,
     ) -> FsResult<()> {
+        let Some(plan) = self.plan_rename(parent, name, newparent, newname, flags)? else {
+            return Ok(());
+        };
+        self.copy_up(plan.ino, true)?;
+        self.commit_rename(plan)
+    }
+    pub(crate) fn plan_rename(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+    ) -> FsResult<Option<Rename>> {
         // Exchange/whiteout would need separate transaction semantics.
         if flags & !1 != 0 {
             return Err(libc::EINVAL);
@@ -1838,7 +1970,7 @@ impl Overlay {
             return if flags & 1 != 0 {
                 Err(libc::EEXIST)
             } else {
-                Ok(())
+                Ok(None)
             };
         }
         if kind == FileType::Directory && to.starts_with(&from) {
@@ -1855,7 +1987,7 @@ impl Overlay {
                 return Err(libc::EEXIST);
             }
             if dst == ino {
-                return Ok(());
+                return Ok(None);
             }
             let dk = self.node(dst)?.attr.kind;
             if kind == FileType::Directory && dk != FileType::Directory {
@@ -1898,8 +2030,26 @@ impl Overlay {
         } else {
             None
         };
-        // Every namespace validation precedes copy-up or a visible mutation.
-        self.copy_up(ino, true)?;
+        Ok(Some(Rename {
+            ino,
+            destination,
+            from,
+            to,
+            kind,
+            moves,
+            origin,
+        }))
+    }
+    pub(crate) fn commit_rename(&mut self, plan: Rename) -> FsResult<()> {
+        let Rename {
+            ino,
+            destination,
+            from,
+            to,
+            kind,
+            moves,
+            origin,
+        } = plan;
         if destination.is_some() {
             self.remove_path(&to)?;
         }
@@ -1957,6 +2107,12 @@ impl Overlay {
         Ok(())
     }
     fn hardlink(&mut self, ino: u64, parent: u64, name: &OsStr) -> FsResult<()> {
+        let path = self.plan_link(ino, parent, name)?;
+        self.refresh_backing_attr(ino)?;
+        self.copy_up(ino, true)?;
+        self.commit_link(ino, path)
+    }
+    pub(crate) fn plan_link(&mut self, ino: u64, parent: u64, name: &OsStr) -> FsResult<PathBuf> {
         self.writable(ino)?;
         let kind = self.node(ino)?.attr.kind;
         if kind == FileType::Directory {
@@ -1966,8 +2122,14 @@ impl Overlay {
         if self.node(ino)?.attr.nlink == 0 {
             return Err(libc::ENOENT);
         }
-        self.refresh_backing_attr(ino)?;
-        self.copy_up(ino, true)?;
+        self.node(ino)?
+            .attr
+            .nlink
+            .checked_add(1)
+            .ok_or(libc::EMLINK)?;
+        Ok(path)
+    }
+    pub(crate) fn commit_link(&mut self, ino: u64, path: PathBuf) -> FsResult<()> {
         let n = self.node_mut(ino)?;
         if n.attr.nlink == 0 {
             return Err(libc::ENOENT);

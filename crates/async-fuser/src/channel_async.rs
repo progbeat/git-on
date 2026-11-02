@@ -147,6 +147,52 @@ mod tests {
     use std::{io::IoSlice, os::fd::OwnedFd, time::Duration};
 
     #[tokio::test(flavor = "current_thread")]
+    async fn read_response_keeps_local_owner_while_reply_waits_for_writability() {
+        use crate::ll::reply::Response;
+        use std::{
+            future::{Future, poll_fn},
+            rc::Rc,
+            task::Poll,
+        };
+        let (device, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        device.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        while device.send(&[0; 1024]).is_ok() {}
+        assert_eq!(
+            device.send(b"full").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let fd: OwnedFd = device.into();
+        let channel = AsyncChannel::new(Arc::new(
+            AsyncDevFuse::from_file(std::fs::File::from(fd)).unwrap(),
+        ));
+        let owner = Rc::new(());
+        let response =
+            crate::reply_async::ReadResponse::new(b"snapshot".to_vec()).with_owner(owner.clone());
+        let mut send = Box::pin(async move {
+            response
+                .send_reply(&channel.sender(), crate::RequestId(1))
+                .await
+        });
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(Rc::strong_count(&owner), 2);
+        let mut bytes = [0; 2048];
+        while peer.recv(&mut bytes).is_ok() {}
+        tokio::time::timeout(Duration::from_secs(2), send.as_mut())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(send);
+        assert_eq!(Rc::strong_count(&owner), 1);
+        let size = peer.recv(&mut bytes).unwrap();
+        assert_eq!(&bytes[size - 8..size], b"snapshot");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_reply_is_an_error_in_release_builds_too() {
         let (device, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         let fd: OwnedFd = device.into();
