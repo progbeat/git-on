@@ -26,7 +26,7 @@ const PINNED_TTL: Duration = Duration::from_secs(86400);
 pub struct Fuse {
     state: RefCell<State>,
     policy: crate::policy::LocalPolicy,
-    namespace: tokio::sync::Mutex<()>,
+    namespace: Arc<tokio::sync::RwLock<()>>,
     io: crate::backing_async::Backing,
     native_all: bool,
 }
@@ -51,7 +51,7 @@ impl Fuse {
             native_all: false,
             io: crate::backing_async::Backing::default(),
             policy: crate::policy::LocalPolicy::default(),
-            namespace: tokio::sync::Mutex::new(()),
+            namespace: Arc::new(tokio::sync::RwLock::new(())),
             state: RefCell::new(State {
                 core,
                 objects: None,
@@ -474,6 +474,40 @@ impl Fuse {
         parent: u64,
         name: &OsStr,
     ) -> Result<FileAttr, f::Errno> {
+        if self.native_all {
+            let _namespace = self.namespace.read().await;
+            return self.lookup_local_inner(objects, parent, name).await;
+        }
+        self.lookup_local_inner(objects, parent, name).await
+    }
+    async fn lookup_all_response(
+        &self,
+        objects: &crate::snapshot_async::Snapshot,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<EntryResponse, f::Errno> {
+        let _pin = self.pin(parent);
+        let owner = self.namespace.clone().read_owned().await;
+        let a = self.lookup_local_inner(objects, parent, name).await?;
+        #[cfg(feature = "test-metrics")]
+        let entry_ttl = if self.state().test_uncached_source {
+            TTL
+        } else {
+            PINNED_TTL
+        };
+        #[cfg(not(feature = "test-metrics"))]
+        let entry_ttl = PINNED_TTL;
+        let reply = EntryResponse::new(TTL, attr(a), f::Generation(0))
+            .with_entry_ttl(entry_ttl)
+            .with_owner(owner);
+        Ok(reply)
+    }
+    async fn lookup_local_inner(
+        &self,
+        objects: &crate::snapshot_async::Snapshot,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<FileAttr, f::Errno> {
         let mut pin = None;
         loop {
             let next = result(self.state().core.source_lookup(parent, name))?;
@@ -482,7 +516,6 @@ impl Fuse {
                 SourceLookup::Path => {
                     pin.get_or_insert_with(|| self.pin(parent));
                     let attr = {
-                        let _namespace = self.namespace.lock().await;
                         let path = result(self.state().core.child_path(parent, name))?;
                         let ino = self.ensure_local(objects, &path).await?;
                         let attr = result(self.state().core.finish_source_lookup(ino))?;
@@ -605,7 +638,7 @@ impl Fuse {
         bytes: Vec<u8>,
         open_flags: Option<i32>,
     ) -> Result<(FileAttr, Option<u64>), f::Errno> {
-        let _namespace = self.namespace.lock().await;
+        let _namespace = self.namespace.write().await;
         let _pin = self.pin(parent);
         if self.state().core.read_only() {
             return Err(f::Errno::EROFS);
@@ -678,7 +711,7 @@ impl Fuse {
         name: &OsStr,
         directory: bool,
     ) -> Result<(), f::Errno> {
-        let _namespace = self.namespace.lock().await;
+        let _namespace = self.namespace.write().await;
         let _parent = self.pin(parent);
         if self.state().core.read_only() {
             return Err(f::Errno::EROFS);
@@ -720,7 +753,7 @@ impl Fuse {
         newname: &OsStr,
         flags: u32,
     ) -> Result<(), f::Errno> {
-        let _namespace = self.namespace.lock().await;
+        let _namespace = self.namespace.write().await;
         if flags & !1 != 0 {
             return Err(f::Errno::EINVAL);
         }
@@ -793,7 +826,7 @@ impl Fuse {
         parent: u64,
         name: &OsStr,
     ) -> Result<FileAttr, f::Errno> {
-        let _namespace = self.namespace.lock().await;
+        let _namespace = self.namespace.write().await;
         let _inode = self.pin(ino);
         let _parent = self.pin(parent);
         if self.state().core.read_only() {
@@ -983,6 +1016,11 @@ impl f::AsyncFilesystem for Fuse {
             state.core.record_fuse_request("lookup");
             state.objects.clone()
         };
+        if self.native_all {
+            return self
+                .lookup_all_response(objects.as_deref().unwrap(), parent.0, name)
+                .await;
+        }
         let a = if let Some(objects) = objects {
             self.lookup_local(&objects, parent.0, name).await?
         } else {
@@ -1644,6 +1682,84 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    fn all_lookup_reply_owns_name_binding_until_mutation_can_commit() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let oid = repo.blob(b"original contents").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "entry-owner",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        tokio_uring::start(async {
+            let mut fs = Fuse::with_async_source(overlay).unwrap();
+            let objects = fs.state().objects.clone().unwrap();
+            let ino = fs
+                .lookup_local(&objects, 1, OsStr::new("source"))
+                .await
+                .unwrap()
+                .ino;
+            objects.read(oid, 17, 0, 100).await.unwrap();
+            let response = fs
+                .lookup_all_response(&objects, 1, OsStr::new("source"))
+                .await
+                .unwrap();
+            assert!(
+                fs.namespace.try_write().is_err(),
+                "name ownership ended before LOOKUP reply"
+            );
+            let mut rename = Box::pin(fs.rename_local(
+                &objects,
+                1,
+                OsStr::new("source"),
+                1,
+                OsStr::new("moved"),
+                0,
+            ));
+            poll_fn(|cx| {
+                assert!(rename.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let fh = fs.open_local(ino, libc::O_RDONLY).await.unwrap();
+            drop(fs.read_file(ino, fh, 0, 100, libc::O_RDONLY).await.unwrap());
+            drop(response);
+            rename.await.unwrap();
+            assert_eq!(
+                i32::from(
+                    fs.lookup_local(&objects, 1, OsStr::new("source"))
+                        .await
+                        .unwrap_err()
+                ),
+                libc::ENOENT
+            );
+            assert_eq!(
+                fs.lookup_local(&objects, 1, OsStr::new("moved"))
+                    .await
+                    .unwrap()
+                    .ino,
+                ino
+            );
+            fs.state().core.release_prepared_handle(ino, fh).unwrap();
+            fs.io.released(ino, fh);
+            assert!(fs.namespace.try_write().is_ok());
+            drop(objects);
+            fs.shutdown().await.unwrap();
+        });
+    }
 
     #[test]
     fn all_streamed_copy_up_preserves_ranges_and_failed_source_removes_pending_backing() {

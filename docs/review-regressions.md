@@ -2549,3 +2549,43 @@ copy-up fail; the pending numeric backing is removed and the source inode stays
 unchanged. Existing real-mount lazy/missing/unsupported-object cases now include
 `all` as well as the three protected policies, checking readable siblings and
 successful child exit after handled errors.
+
+## Native all-policy name-cache coherence
+
+Native `all` previously returned zero name and attribute TTLs together, causing
+Linux to revalidate unchanged positive names on repeated access. Name bindings
+now have their own TTL; attributes remain uncached. The namespace gate permits
+concurrent lookups and excludes mutations. A LOOKUP response retains its shared
+guard through send/drop, including a pending nonblocking reply.
+
+`all_lookup_reply_owns_name_binding_until_mutation_can_commit` retains a reply,
+checks that rename is pending while independent source reads proceed, then
+releases the reply and checks the old/new names. Replacing the retained guard
+with an empty owner makes its ownership assertion fail; restoring the guard
+passes. The library test
+`name_ttl_is_independent_of_attributes_and_retains_owner` checks the actual wire
+TTL fields and owner lifetime. Existing protocol cache tests check zero mutable
+attribute TTLs and copy-up cache behavior.
+Those protocol cases explicitly exercise the native runtime and the legacy
+fallback. The first version incorrectly required native-only name TTLs on the
+fallback too; forcing that backend reproduces the assertion failure, and using
+the selected backend's contract passes both paths.
+
+The real-mount write-policy regression
+`test_all_cached_name_bindings_follow_replacement_links_and_directory_moves`
+checks repeated replacement, live unlinked handles, hardlinks and directory
+moves with cached descendants. `tests/source_cache.py` compares all-policy
+LOOKUP counts using its existing test-only cache switch and checks the same
+bytes/namespace. Callback-count evidence requires that test's instrumented CI
+run; ordinary timing controls are separate evidence, not an opcode trace.
+
+## Configure the invalid-greeting test peer before shutdown
+
+At `20058e3`, macOS CI job `125576310294` failed in
+`mux_shutdown_rejects_invalid_greetings_before_termination`: the test's peer
+called `set_read_timeout` after sending an invalid greeting and received EINVAL.
+The client may already have rejected the greeting and disconnected. Timeout
+configuration now precedes the exchange, while both peers are live. The existing
+regression still requires EOF with no termination packet after every invalid
+greeting. Its Linux run passes; the macOS failure is the recorded predecessor,
+and the next exact-head macOS CI run must establish the platform result.

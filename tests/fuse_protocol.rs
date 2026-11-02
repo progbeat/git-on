@@ -56,6 +56,7 @@ fn dirents(bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
 struct Peer {
     fd: OwnedFd,
     task: Option<JoinHandle<()>>,
+    native_source: bool,
     unique: u64,
     uid: u32,
     gid: u32,
@@ -95,6 +96,19 @@ impl Peer {
         extra: u32,
         count: usize,
         minor: u32,
+    ) -> (Self, u32) {
+        Self::with_runtime(policy, extended, extra, count, minor, true)
+    }
+    fn with_legacy_policy(policy: WritePolicy) -> Self {
+        Self::with_runtime(policy, false, 0, 0, 31, false).0
+    }
+    fn with_runtime(
+        policy: WritePolicy,
+        extended: bool,
+        extra: u32,
+        count: usize,
+        minor: u32,
+        prefer_native: bool,
     ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
@@ -152,9 +166,15 @@ impl Peer {
             },
             0
         );
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let task = std::thread::spawn(move || {
-            let runtime = tokio_uring::Runtime::new(&tokio_uring::builder()).ok();
+            let runtime = if prefer_native {
+                tokio_uring::Runtime::new(&tokio_uring::builder()).ok()
+            } else {
+                None
+            };
             let native = runtime.is_some();
+            ready_tx.send(native).unwrap();
             let work = async {
                 let filesystem = if native {
                     Fuse::with_async_source(overlay).unwrap()
@@ -186,6 +206,7 @@ impl Peer {
         let mut p = Self {
             fd,
             task: Some(task),
+            native_source: ready_rx.recv().unwrap(),
             unique: 0,
             // Tracked entries belong to the mounting process, including CI's
             // runner UID. Credential tests override these IDs explicitly.
@@ -324,40 +345,53 @@ fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
 }
 
 #[test]
-fn protocol_kernel_cache_only_retains_protected_source() {
-    for policy in [
-        WritePolicy::None,
-        WritePolicy::Ignored,
-        WritePolicy::Untracked,
-        WritePolicy::All,
-    ] {
-        let mut p = Peer::with_policy(policy);
-        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
-        let ino = num(&entry, 0);
-        let protected = policy != WritePolicy::All;
-        assert_eq!(num(&entry, 16) != 0, protected, "entry TTL: {policy:?}");
-        assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
-        let attributes = p.ok(3, ino, vec![0; 16]);
-        assert_eq!(num(&attributes, 0) != 0, protected);
-        // Protected source metadata stays pinned, including directory attrs.
-        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
-        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
-        let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
-        assert_eq!(
-            flags & ((1 << 1) | (1 << 5)),
-            (1 << 1) | if protected { 1 << 5 } else { 0 }
-        );
-        p.release(ino, num(&opened, 0));
-        if policy != WritePolicy::None {
-            let (generated, handle) = p.create("generated.tmp");
-            let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
-            assert_eq!(num(&entry, 16), 0);
-            assert_eq!(num(&entry, 24), 0);
-            let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
+fn protocol_kernel_cache_keeps_mutable_attributes_live() {
+    for prefer_native in [false, true] {
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let mut p = if prefer_native {
+                Peer::with_policy(policy)
+            } else {
+                Peer::with_legacy_policy(policy)
+            };
+            let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+            let ino = num(&entry, 0);
+            let protected = policy != WritePolicy::All;
+            assert_eq!(
+                num(&entry, 16) != 0,
+                protected || p.native_source,
+                "positive entry TTL: {policy:?}"
+            );
+            assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
+            let attributes = p.ok(3, ino, vec![0; 16]);
+            assert_eq!(num(&attributes, 0) != 0, protected);
+            // Protected source metadata stays pinned, including directory attrs.
+            assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
+            let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
             let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
-            assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
-            p.release(generated, num(&opened, 0));
-            p.release(generated, handle);
+            assert_eq!(
+                flags & ((1 << 1) | (1 << 5)),
+                (1 << 1) | if protected { 1 << 5 } else { 0 }
+            );
+            p.release(ino, num(&opened, 0));
+            if policy != WritePolicy::None {
+                let (generated, handle) = p.create("generated.tmp");
+                let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
+                assert_eq!(
+                    num(&entry, 16) != 0,
+                    policy == WritePolicy::All && p.native_source
+                );
+                assert_eq!(num(&entry, 24), 0);
+                let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
+                let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+                assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
+                p.release(generated, num(&opened, 0));
+                p.release(generated, handle);
+            }
         }
     }
 }
@@ -386,35 +420,41 @@ fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
 }
 
 #[test]
-fn protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls() {
-    let mut p = Peer::with_policy(WritePolicy::All);
-    let entry = p.ok(1, 1, names(vec![], &["tracked"]));
-    let ino = num(&entry, 0);
-    assert_eq!(num(&entry, 16), 0);
-    assert_eq!(num(&entry, 24), 0);
-    let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
-    assert_eq!(
-        u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
-        1 << 1
-    );
-    let reader = num(&opened, 0);
-    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
-    let writer = p.open(ino, libc::O_RDWR);
-    p.ok(
-        16,
-        ino,
-        [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
-    );
-    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
-    let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
-    assert_eq!(
-        u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
-        0
-    );
-    assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
-    p.release(ino, num(&reopened, 0));
-    p.release(ino, writer);
-    p.release(ino, reader);
+fn protocol_all_source_data_cache_stops_after_copy_up_with_live_attributes() {
+    for prefer_native in [false, true] {
+        let mut p = if prefer_native {
+            Peer::with_policy(WritePolicy::All)
+        } else {
+            Peer::with_legacy_policy(WritePolicy::All)
+        };
+        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+        let ino = num(&entry, 0);
+        assert_eq!(num(&entry, 16) != 0, p.native_source);
+        assert_eq!(num(&entry, 24), 0);
+        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+        assert_eq!(
+            u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+            1 << 1
+        );
+        let reader = num(&opened, 0);
+        assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
+        let writer = p.open(ino, libc::O_RDWR);
+        p.ok(
+            16,
+            ino,
+            [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
+        );
+        assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
+        let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+        assert_eq!(
+            u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+            0
+        );
+        assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
+        p.release(ino, num(&reopened, 0));
+        p.release(ino, writer);
+        p.release(ino, reader);
+    }
 }
 
 #[test]

@@ -164,4 +164,5 @@ cargo install --path . --locked
 
 Mac builds require no FUSE framework or extension: they support startup and
 explicit-all materialization. Native mounts remain deferred to issue #12.
-Linux uses registry fuser 0.18 with no vendored fork.
+Linux uses the pinned local async-fuser adaptation and tokio-uring sources under
+`crates/`; their licenses, upstream identities and separate patches are included.

@@ -34,3 +34,8 @@ and data replies hold immutable payload allocations through reply completion.
 Read responses may also retain a local operation owner through nonblocking
 reply waits, so filesystem mutation ordering can include the wire completion.
 Focused tests keep this owner alive under actual socket backpressure.
+
+Lookup replies expose independent name-binding and attribute TTLs and can retain
+a local namespace owner until send/drop. This lets Git-on reuse positive names
+while mutable attributes stay live and prevents a namespace mutation from
+committing before an older LOOKUP reply finishes.

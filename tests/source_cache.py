@@ -151,6 +151,21 @@ def run(options):
                 assert 0<on['fuse_requests'].get(opcode,0)<off['fuse_requests'].get(opcode,0),(opcode,on,off)
             record(dict(mode='kernel-cache-invariants',result='passed',
                         unchanged_payload_and_namespace=True))
+            all_observations=[]
+            for uncached in (True,False):
+                env=dict(f.env)
+                if uncached:env['GIT_ON_TEST_UNCACHED_SOURCE']='1'
+                else:env.pop('GIT_ON_TEST_UNCACHED_SOURCE',None)
+                argv=[str(options.binary.resolve()),'main','--write-policy=all','--',*child]
+                sample=dict(mode='all-uncached-names' if uncached else 'all-cached-names',
+                            **capture(argv,f.repo,env,f.root,metrics=True))
+                record(sample);all_observations.append(sample)
+                assert not list(f.root.glob('git-on-*')),'private all-policy run leaked'
+                assert f.git('show-ref')==original,'all-policy source refs changed'
+            off,on=all_observations
+            assert 0<on['fuse_requests']['lookup']<off['fuse_requests']['lookup'],all_observations
+            record(dict(mode='all-name-cache-invariants',result='passed',
+                        unchanged_payload_and_namespace=True,attributes_remain_live=True))
             directory_cache_case(f,options.binary,record)
     finally:
         for directory in f.root.glob('git-on-*'):

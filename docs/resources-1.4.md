@@ -99,7 +99,12 @@ the private file without a second payload cache. Shared per-inode read ownership
 survives through the FUSE reply; copy-up/write waits for old replies to finish.
 Directory renames preserve their source origins for later cold child access.
 Cold `all` lookup recomputes its visible path under the namespace gate after
-waiting, while already-resolved source lookups keep their immediate path.
+waiting. Positive `all` name bindings can be cached independently of attributes;
+mutable attributes keep zero TTL. Lookup replies retain shared namespace
+ownership through send/drop, so a rename, unlink or replacement cannot commit
+before an older name reply finishes. Mutations take exclusive ownership, and
+Linux invalidates the affected dentries for its namespace operations. Protected
+source lookups retain their existing direct path.
 
 This is not yet a complete asynchronous core. Remote sources and hosts without
 io_uring still use the existing synchronous source core. Required remaining work
@@ -149,7 +154,8 @@ excluded from the interview's materialization-plus-command baseline.
   demand. Each unique tree is prepared once without a new full traversal for
   every name; `tests/tree_metadata.rs` covers parser correctness.
 - `tests/source_cache.py` compares real kernel callback counts with and without
-  protected-source caching while checking identical namespace/content.
+  protected-source caching and native `all` name caching while checking identical
+  namespace/content. Protocol tests separately keep mutable attribute TTLs zero.
 - `tests/pack_scaling.py` and reduced-RLIMIT tests retain their specific resource
   and complexity assertions; they do not stand in for full invocation timing.
 - `tests/real_repository.py` supplies the pinned WebKit full-namespace/two-pass

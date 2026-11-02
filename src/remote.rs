@@ -1428,13 +1428,15 @@ mod tests {
             vec![0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 4, 0],
         ] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
+            // Configure the live peer before the client can reject the hello
+            // and close it, avoiding a race between socket setup and shutdown.
+            server
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
             let peer = std::thread::spawn(move || {
                 let mut hello = [0; 12];
                 server.read_exact(&mut hello).unwrap();
                 server.write_all(&greeting).unwrap();
-                server
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
                 let mut termination = [0; 12];
                 assert_eq!(server.read(&mut termination).unwrap(), 0);
             });
