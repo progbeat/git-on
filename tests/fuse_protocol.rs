@@ -350,7 +350,7 @@ fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
 }
 
 #[test]
-fn protocol_kernel_cache_keeps_mutable_attributes_live() {
+fn protocol_kernel_cache_tracks_source_and_directory_attributes() {
     for prefer_native in [false, true] {
         for policy in [
             WritePolicy::None,
@@ -371,11 +371,18 @@ fn protocol_kernel_cache_keeps_mutable_attributes_live() {
                 protected || p.async_source,
                 "positive entry TTL: {policy:?}"
             );
-            assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
+            assert_eq!(
+                num(&entry, 24) != 0,
+                protected || p.async_source,
+                "attribute TTL: {policy:?}"
+            );
             let attributes = p.ok(3, ino, vec![0; 16]);
-            assert_eq!(num(&attributes, 0) != 0, protected);
+            assert_eq!(num(&attributes, 0) != 0, protected || p.async_source);
             // Protected source metadata stays pinned, including directory attrs.
-            assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
+            assert_eq!(
+                num(&p.ok(3, 1, vec![0; 16]), 0) != 0,
+                protected || p.async_source
+            );
             let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
             let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
             assert_eq!(
@@ -396,6 +403,19 @@ fn protocol_kernel_cache_keeps_mutable_attributes_live() {
                 assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
                 p.release(generated, num(&opened, 0));
                 p.release(generated, handle);
+                let created = p.ok(9, 1, names(u32s(&[0o700, 0]), &["cache"]));
+                let directory = num(&created, 0);
+                let entry = p.ok(1, 1, names(vec![], &["cache"]));
+                let directory_cache = policy == WritePolicy::All && p.async_source;
+                assert_eq!(num(&entry, 24) != 0, directory_cache);
+                assert_eq!(
+                    num(&p.ok(3, directory, vec![0; 16]), 0) != 0,
+                    directory_cache
+                );
+                assert_eq!(
+                    num(&p.ok(3, 1, vec![0; 16]), 0) != 0,
+                    protected || p.async_source
+                );
             }
         }
     }
@@ -425,7 +445,7 @@ fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
 }
 
 #[test]
-fn protocol_all_source_data_cache_stops_after_copy_up_with_live_attributes() {
+fn protocol_all_source_data_cache_stops_after_copy_up_with_owned_attributes() {
     for prefer_native in [false, true] {
         let mut p = if prefer_native {
             Peer::with_policy(WritePolicy::All)
@@ -435,7 +455,7 @@ fn protocol_all_source_data_cache_stops_after_copy_up_with_live_attributes() {
         let entry = p.ok(1, 1, names(vec![], &["tracked"]));
         let ino = num(&entry, 0);
         assert_eq!(num(&entry, 16) != 0, p.async_source);
-        assert_eq!(num(&entry, 24), 0);
+        assert_eq!(num(&entry, 24) != 0, p.async_source);
         let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
         assert_eq!(
             u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),

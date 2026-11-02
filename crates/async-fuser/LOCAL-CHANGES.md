@@ -39,3 +39,8 @@ Lookup replies expose independent name-binding and attribute TTLs and can retain
 a local namespace owner until send/drop. This lets Git-on reuse positive names
 while mutable attributes stay live and prevents a namespace mutation from
 committing before an older LOOKUP reply finishes.
+
+Attribute replies can retain a local operation owner too. Git-on uses namespace
+and inode read ownership for cached local all-policy attributes so namespace
+edits and copy-up cannot commit before the old reply finishes. The wire format
+and owner-free constructor behavior are unchanged.

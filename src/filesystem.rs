@@ -728,6 +728,12 @@ impl Overlay {
                 .get(&ino)
                 .is_some_and(|node| node.immutable && node.oid.is_some())
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cacheable_all_attributes(&self, ino: u64) -> bool {
+        self.nodes.get(&ino).is_some_and(|node| {
+            node.attr.kind == FileType::Directory || (node.immutable && node.oid.is_some())
+        })
+    }
 
     pub fn new(snapshot: Snapshot, backing: PathBuf) -> Result<Self> {
         Self::with_write_policy(snapshot, backing, WritePolicy::Ignored)

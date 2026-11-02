@@ -98,6 +98,56 @@ assert source.read_bytes() == b'replacement child' and source.stat().st_ino != i
         self.assert_source_unchanged()
         self.assert_no_runtime_files()
 
+    def test_all_cached_attributes_follow_parent_edits_and_source_copy_up(self):
+        result, run = self.policy("all", r'''
+import os, stat
+from pathlib import Path
+root = Path('.')
+epoch = 111111111
+os.utime(root, (epoch, epoch))
+before = root.stat()
+assert int(before.st_mtime) == epoch
+parent = Path('generated-parent')
+parent.mkdir()
+after = root.stat()
+assert after.st_nlink == before.st_nlink + 1
+assert int(after.st_mtime) != epoch
+os.utime(parent, (epoch, epoch))
+initial = parent.stat()
+child = parent / 'child'
+child.write_bytes(b'new file')
+assert int(parent.stat().st_mtime) != epoch
+assert parent.stat().st_nlink == initial.st_nlink
+subdir = parent / 'directory'
+subdir.mkdir()
+assert parent.stat().st_nlink == initial.st_nlink + 1
+os.rename(subdir, 'moved-directory')
+assert parent.stat().st_nlink == initial.st_nlink
+assert root.stat().st_nlink == before.st_nlink + 2
+Path('moved-directory').rmdir()
+child.unlink(); parent.rmdir()
+assert root.stat().st_nlink == before.st_nlink
+source = Path('tracked.txt')
+original = source.stat()
+reader = os.open(source, os.O_RDONLY)
+try:
+ source.chmod(0o600)
+ os.utime(source, (epoch, epoch))
+ assert stat.S_IMODE(source.stat().st_mode) == 0o600
+ assert int(source.stat().st_mtime) == epoch
+ with source.open('r+b', buffering=0) as writer:
+  writer.truncate(3)
+  writer.write(b'new')
+ assert source.stat().st_size == 3 and os.fstat(reader).st_size == 3
+ assert os.pread(reader, 100, 0) == b'new'
+ assert source.stat().st_ino == original.st_ino
+finally: os.close(reader)
+''')
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assert_source_unchanged()
+        self.assert_no_runtime_files()
+
     def test_none_reads_but_denies_mutations_even_in_ignored_paths(self):
         result, run = self.policy("none", r'''
 import errno, os

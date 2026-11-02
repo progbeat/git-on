@@ -178,15 +178,50 @@ impl Fuse {
         let _pin = self.pin(ino);
         let gate = self.io.gate(ino);
         let _guard = gate.lock.write().await;
+        self.attributes_local_unlocked(ino, fh).await
+    }
+    async fn attributes_local_unlocked(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+    ) -> Result<FileAttr, f::Errno> {
         result(self.state().core.prepared_attributes(ino, fh))?;
-        self.refresh_local(ino).await?;
+        if self.state().core.private_regular(ino) {
+            self.refresh_local(ino).await?;
+        }
         let attr = result(self.state().core.prepared_attributes(ino, fh));
         attr
+    }
+    async fn pin_all_attributes(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+    ) -> Result<(FileAttr, crate::backing_async::ReadToken), f::Errno> {
+        let owner = self.io.gate(ino).read().await;
+        // Re-read after acquiring ownership: a writer may have copied up this
+        // inode while this request waited, making its attributes uncacheable.
+        let attr = self.attributes_local_unlocked(ino, fh).await?;
+        Ok((attr, owner))
+    }
+    async fn all_attributes_response(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+    ) -> Result<AttrResponse, f::Errno> {
+        let _pin = self.pin(ino);
+        let namespace = self.namespace.clone().read_owned().await;
+        let (a, inode) = self.pin_all_attributes(ino, fh).await?;
+        let ttl = self.state().all_attribute_ttl(ino);
+        let reply = AttrResponse::new(ttl, attr(a)).with_owner((namespace, inode));
+        Ok(reply)
     }
     async fn open_local(&self, ino: u64, flags: i32) -> Result<u64, f::Errno> {
         let private = result(self.state().core.validate_open(ino, flags))?;
         let all = self.native_all;
-        if !private && !all {
+        let mutating = flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0;
+        if !private && (!all || !mutating) {
+            // No await separates validation from handle insertion. A concurrent
+            // copy-up will include this new handle in its short commit.
             return result(self.state().core.open_prepared_file(ino, flags, None));
         }
         let _pin = self.pin(ino);
@@ -502,6 +537,12 @@ impl Fuse {
         let _pin = self.pin(parent);
         let owner = self.namespace.clone().read_owned().await;
         let a = self.lookup_local_inner(objects, parent, name).await?;
+        let (a, inode_owner) = if self.state().all_attribute_ttl(a.ino) != TTL {
+            let (a, owner) = self.pin_all_attributes(a.ino, None).await?;
+            (a, Some(owner))
+        } else {
+            (a, None)
+        };
         #[cfg(feature = "test-metrics")]
         let entry_ttl = if self.state().test_uncached_source {
             TTL
@@ -510,9 +551,13 @@ impl Fuse {
         };
         #[cfg(not(feature = "test-metrics"))]
         let entry_ttl = PINNED_TTL;
-        let reply = EntryResponse::new(TTL, attr(a), f::Generation(0))
-            .with_entry_ttl(entry_ttl)
-            .with_owner(owner);
+        let reply = EntryResponse::new(
+            self.state().all_attribute_ttl(a.ino),
+            attr(a),
+            f::Generation(0),
+        )
+        .with_entry_ttl(entry_ttl)
+        .with_owner((owner, inode_owner));
         Ok(reply)
     }
     async fn lookup_local_inner(
@@ -903,6 +948,17 @@ impl State {
             TTL
         }
     }
+    fn all_attribute_ttl(&self, ino: u64) -> Duration {
+        #[cfg(feature = "test-metrics")]
+        if self.test_uncached_source {
+            return TTL;
+        }
+        if self.core.cacheable_all_attributes(ino) {
+            PINNED_TTL
+        } else {
+            TTL
+        }
+    }
     fn backing(&mut self, ino: u64) -> Option<Arc<f::AsyncBackingId>> {
         if !self.enabled {
             return None;
@@ -1062,6 +1118,9 @@ impl f::AsyncFilesystem for Fuse {
             state.core.record_fuse_request("getattr");
             (state.objects.is_some(), state.no_open)
         };
+        if self.native_all && self.state().all_attribute_ttl(ino.0) != TTL {
+            return self.all_attributes_response(ino.0, fh.map(|h| h.0)).await;
+        }
         let a = if no_open && fh == Some(f::FileHandle(0)) {
             result(self.state().core.readonly_file_attributes(ino.0))?
         } else if native {
@@ -1713,6 +1772,127 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    fn all_attribute_replies_order_copy_up_and_parent_mutations_without_blocking_readonly_open() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let oid = repo.blob(b"original").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", oid, 0o100644).unwrap();
+        tree.insert("sibling", oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "attribute-owner",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                let objects = fs.state().objects.clone().unwrap();
+                let ino = fs
+                    .lookup_local(&objects, 1, OsStr::new("source"))
+                    .await
+                    .unwrap()
+                    .ino;
+                let sibling = fs
+                    .lookup_local(&objects, 1, OsStr::new("sibling"))
+                    .await
+                    .unwrap()
+                    .ino;
+                objects.read(oid, 8, 0, 100).await.unwrap();
+                let response = fs.all_attributes_response(ino, None).await.unwrap();
+                assert!(
+                    fs.namespace.try_write().is_err(),
+                    "attribute reply lost namespace ownership"
+                );
+                assert!(
+                    fs.io.gate(ino).lock.try_write().is_err(),
+                    "attribute reply lost inode ownership"
+                );
+                let lookup = fs
+                    .lookup_all_response(&objects, 1, OsStr::new("source"))
+                    .await
+                    .unwrap();
+                let mut readonly = Box::pin(fs.open_local(ino, libc::O_RDONLY));
+                let reader = poll_fn(|cx| match readonly.as_mut().poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result.unwrap()),
+                    Poll::Pending => panic!("readonly source open waited for its metadata reply"),
+                })
+                .await;
+                drop(readonly);
+                let mut writer = Box::pin(fs.open_local(ino, libc::O_RDWR));
+                poll_fn(|cx| {
+                    assert!(writer.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let independent = fs.open_local(sibling, libc::O_RDONLY).await.unwrap();
+                drop(
+                    fs.read_file(sibling, independent, 0, 100, libc::O_RDONLY)
+                        .await
+                        .unwrap(),
+                );
+                drop(response);
+                poll_fn(|cx| {
+                    assert!(
+                        writer.as_mut().poll(cx).is_pending(),
+                        "LOOKUP attributes lost inode ownership"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(lookup);
+                let writer = writer.await.unwrap();
+                assert_eq!(fs.state().all_attribute_ttl(ino), TTL);
+                fs.write_backing(ino, writer, 0, b"changed!", 0, libc::O_RDWR)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs.read_backing(ino, reader, 0, 100).await.unwrap(),
+                    b"changed!"
+                );
+                let parent = fs.all_attributes_response(1, None).await.unwrap();
+                let mut rename = Box::pin(fs.rename_local(
+                    &objects,
+                    1,
+                    OsStr::new("sibling"),
+                    1,
+                    OsStr::new("moved"),
+                    0,
+                ));
+                poll_fn(|cx| {
+                    assert!(rename.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(parent);
+                rename.await.unwrap();
+                assert_eq!(
+                    fs.state().all_attribute_ttl(1),
+                    PINNED_TTL,
+                    "mutable directory metadata stays kernel-coherent"
+                );
+                for (ino, fh) in [(ino, reader), (ino, writer), (sibling, independent)] {
+                    fs.state().core.release_prepared_handle(ino, fh).unwrap();
+                    fs.io.released(ino, fh);
+                }
+                drop(objects);
+                fs.shutdown().await.unwrap();
+            });
+    }
 
     #[test]
     #[ignore = "requires real FUSE; executed explicitly by real-fuse CI"]

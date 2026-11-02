@@ -23,6 +23,7 @@ FUSER_UPSTREAM = "c038f63e39fe2e5f87a5311b222deda4d534c735"
 ASYNC_TRAIT_SHA256 = "48f48dfb222897ff28352aa33eeab184caf48f496c83c0d64064027f88538788"
 ASYNC_DISPATCH_SHA256 = "e80c16c17566a47694391f4652320f34a68e39feb8707c19389ed9f726921eef"
 TRAIT_SHA256 = "a194e6a4dc19ae08a007a03d2eee6dc7cf9801da7584e3e13fe7bada7bd47c08"
+MOUNTED_SOURCES = ("tests/integration.py", "tests/write_policy.py")
 
 
 def require(condition, message):
@@ -115,8 +116,8 @@ def validate_rows(rows, expected, aliases):
             for identifier in ids.split(","):
                 identifier = identifier.strip()
                 require(identifier in aliases, "unknown test ID: " + identifier)
-                require(aliases[identifier][0] == ("tests/fuse_protocol.rs" if kind == "protocol"
-                                                   else "tests/integration.py"),
+                require(aliases[identifier][0] in (("tests/fuse_protocol.rs",) if kind == "protocol"
+                                                  else MOUNTED_SOURCES),
                         "wrong evidence layer for " + name + ": " + identifier)
         if classification == "macos-only":
             require(protocol == mounted == "-", "macOS callback cannot claim Linux evidence")
@@ -195,7 +196,7 @@ def check(root=ROOT):
     cached_names = {}
     for identifier, filename, function in table(document, "TEST IDS", 3):
         require(identifier not in aliases, "duplicate test ID: " + identifier)
-        require(filename in ("tests/fuse_protocol.rs", "tests/integration.py"),
+        require(filename in ("tests/fuse_protocol.rs",) + MOUNTED_SOURCES,
                 "unexpected evidence source: " + filename)
         if filename not in cached_names:
             cached_names[filename] = test_names(root / filename)
@@ -219,6 +220,10 @@ class GuardTests(unittest.TestCase):
 
     def test_complete_matrix_is_accepted(self):
         validate_rows(self.rows, self.expected, self.aliases)
+        for source in MOUNTED_SOURCES:
+            rows = [row.copy() for row in self.rows]
+            rows[0][3] = "I"
+            validate_rows(rows, self.expected, {**self.aliases, "I": (source, "test_mounted")})
 
     def test_missing_duplicate_extra_and_misclassified_rows_fail(self):
         variants = [self.rows[:-1], self.rows + [self.rows[0]],
@@ -236,8 +241,9 @@ class GuardTests(unittest.TestCase):
             rows[0][2] = identifier
             with self.subTest(identifier=identifier), self.assertRaises(ValueError):
                 validate_rows(rows, self.expected, self.aliases)
-        with self.assertRaises(ValueError):
-            validate_rows(self.rows, self.expected, {"P": ("tests/integration.py", "test_mounted")})
+        for source in MOUNTED_SOURCES:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                validate_rows(self.rows, self.expected, {"P": (source, "test_mounted")})
 
     def test_parser_preserves_defaults_and_platform_attributes(self):
         source = '''pub trait Filesystem {

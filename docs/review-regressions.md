@@ -2638,3 +2638,37 @@ may retain a descriptor. The worker is joined during shutdown.
 
 Remote integration and the complete
 lifecycle/performance acceptance remain required.
+
+## Cached all-policy attributes retain metadata ownership
+
+Local async `all` now caches unchanged source attributes and directory attributes.
+Modified/generated regular files keep zero attribute TTL, including after
+copy-up and for external backing refresh. Kernel namespace operations invalidate
+directory attributes. Cached LOOKUP and GETATTR replies own namespace and inode
+read guards until send/drop; namespace edits, setattr and copy-up use the
+corresponding exclusive guards. Attributes are obtained again after acquiring
+ownership, since a waiting source request may have become private meanwhile.
+
+`all_attribute_replies_order_copy_up_and_parent_mutations_without_blocking_readonly_open`
+retains both reply kinds, requires copy-up and parent mutation to remain pending,
+and allows independent source reads to progress. Releasing GETATTR alone must
+not release LOOKUP's inode ownership. A clean readonly source open allocates its
+handle without an await or exclusive mutation gate; a concurrent copy-up includes
+that handle in its commit. Removing reply ownership reproduces the ownership
+failure, and restoring the old exclusive readonly-open path reproduces the open
+stall. The connected paths pass. During implementation, the same focused case
+also caught a RefCell temporary surviving until request-pin cleanup; extracting
+the TTL before constructing the return value removes that borrow.
+
+The real-FUSE
+`test_all_cached_attributes_follow_parent_edits_and_source_copy_up` verifies
+parent mtime/link counts after mkdir, cross-parent moves and removal, and source
+chmod/utime/truncation through old handles. Existing replacement/link/mmap cases
+remain part of acceptance. The protocol cache tests check source/directory TTLs,
+zero mutable-file TTLs and the transition after copy-up on native, file-fallback
+and legacy paths. The library's
+`attribute_reply_retains_local_owner_through_wire_payload` checks wire TTL and
+owner lifetime. The instrumented source-cache regression now requires fewer
+GETATTR callbacks with caching while checking identical content and namespace;
+that case requires its exact-head CI execution, not a locally rebuilt metrics
+binary. Performance measurements remain separate from these correctness checks.

@@ -101,12 +101,17 @@ the private file without a second payload cache. Shared per-inode read ownership
 survives through the FUSE reply; copy-up/write waits for old replies to finish.
 Directory renames preserve their source origins for later cold child access.
 Cold `all` lookup recomputes its visible path under the namespace gate after
-waiting. Positive `all` name bindings can be cached independently of attributes;
-mutable attributes keep zero TTL. Lookup replies retain shared namespace
-ownership through send/drop, so a rename, unlink or replacement cannot commit
-before an older name reply finishes. Mutations take exclusive ownership, and
-Linux invalidates the affected dentries for its namespace operations. Protected
-source lookups retain their existing direct path.
+waiting. Positive `all` name bindings cache independently of attributes.
+Unchanged source attributes and directory attributes may also be cached: these
+are owned by the loop and kernel namespace operations invalidate affected
+attributes. LOOKUP and GETATTR retain namespace and inode read ownership through
+send/drop, so namespace edits, copy-up and metadata changes wait for older cached
+replies. Attributes are read again after acquiring ownership. Modified/generated
+regular files keep zero attribute TTL for backing-file refresh, including
+passthrough. Directory contents remain live. Protected source operations retain
+their existing direct path. A readonly open of unchanged all-policy source adds
+its handle without waiting for an exclusive mutation gate; a pending copy-up
+includes that handle when it commits.
 
 The fallback shares the same file worker with truncate, timestamps and statvfs,
 with a 16-job channel. It uses owned buffers and retains the original descriptor

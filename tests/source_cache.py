@@ -166,6 +166,9 @@ def run(options):
             assert 0<on['fuse_requests']['lookup']<off['fuse_requests']['lookup'],all_observations
             record(dict(mode='all-name-cache-invariants',result='passed',
                         unchanged_payload_and_namespace=True,attributes_remain_live=True))
+            assert 0<on['fuse_requests']['getattr']<off['fuse_requests']['getattr'],all_observations
+            record(dict(mode='all-attribute-cache-invariants',result='passed',
+                        unchanged_payload_and_namespace=True))
             directory_cache_case(f,options.binary,record)
     finally:
         for directory in f.root.glob('git-on-*'):
