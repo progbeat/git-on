@@ -75,9 +75,7 @@ impl Fuse {
             return Ok(file);
         }
         let path = result(self.state().core.backing_path(ino))?;
-        crate::backing_async::Backing::open(&path, false)
-            .await
-            .map_err(f::Errno::from)
+        self.io.open(&path, false).await.map_err(f::Errno::from)
     }
     async fn prepare_removal(&self, ino: u64) -> Result<Option<PathBuf>, f::Errno> {
         let path = result(self.state().core.removal_backing(ino))?;
@@ -97,7 +95,9 @@ impl Fuse {
         let objects = self.state().objects.clone().ok_or(f::Errno::EIO)?;
         let mut bytes = Vec::new();
         let file = if plan.kind == FileType::RegularFile {
-            let file = crate::backing_async::Backing::open(&plan.path, true)
+            let file = self
+                .io
+                .open(&plan.path, true)
                 .await
                 .map_err(f::Errno::from)?;
             let native = self.io.lease(ino, file.clone());
@@ -118,13 +118,18 @@ impl Fuse {
                             return Err(f::Errno::EIO);
                         }
                         let length = data.as_slice().len();
-                        let (written, _) = native.file().write_all_at(data, offset).await;
-                        written.map_err(f::Errno::from)?;
+                        native
+                            .file()
+                            .write_all_at(data, offset)
+                            .await
+                            .map_err(f::Errno::from)?;
                         offset += length as u64;
                     }
                 }
                 if plan.unlinked {
-                    tokio_uring::fs::remove_file(&plan.path)
+                    self.io
+                        .io
+                        .remove_file(plan.path.clone())
                         .await
                         .map_err(f::Errno::from)?;
                 }
@@ -134,7 +139,7 @@ impl Fuse {
             if let Err(error) = copied {
                 drop(native);
                 drop(file);
-                let _ = tokio_uring::fs::remove_file(&plan.path).await;
+                let _ = self.io.io.remove_file(plan.path.clone()).await;
                 return Err(error);
             }
             Some(file)
@@ -452,14 +457,22 @@ impl Fuse {
         }
         Ok(())
     }
-    /// Construct the native local object path after entering its I/O runtime.
+    /// Construct the local source after entering the io_uring runtime.
     pub fn with_async_source(core: Overlay) -> std::io::Result<Self> {
+        Self::with_source_io(core, crate::file_async::Io::new(true))
+    }
+    /// Keep the same loop-owned source/cache when io_uring is unavailable.
+    pub fn with_fallback_source(core: Overlay) -> std::io::Result<Self> {
+        Self::with_source_io(core, crate::file_async::Io::new(false))
+    }
+    fn with_source_io(core: Overlay, io: Rc<crate::file_async::Io>) -> std::io::Result<Self> {
         let objects = core
             .snapshot()
-            .async_source()
+            .async_source(io.clone())
             .map_err(std::io::Error::other)?
             .map(Rc::new);
         let mut filesystem = Self::new(core);
+        filesystem.io = crate::backing_async::Backing::new(io);
         filesystem.native_all =
             objects.is_some() && filesystem.state.get_mut().core.write_policy() == WritePolicy::All;
         if objects.is_some() && !filesystem.state.get_mut().core.read_only() {
@@ -653,11 +666,7 @@ impl Fuse {
         }))?;
         let file = if kind == FileType::RegularFile {
             let path = self.state().core.creation_path(&plan);
-            Some(
-                crate::backing_async::Backing::open(&path, true)
-                    .await
-                    .map_err(f::Errno::from)?,
-            )
+            Some(self.io.open(&path, true).await.map_err(f::Errno::from)?)
         } else {
             None
         };
@@ -740,7 +749,7 @@ impl Fuse {
         let path = self.prepare_removal(plan.ino).await?;
         result(self.state().core.commit_remove(plan))?;
         if let Some(path) = path {
-            let _ = tokio_uring::fs::remove_file(path).await;
+            let _ = self.io.io.remove_file(path).await;
         }
         Ok(())
     }
@@ -815,7 +824,7 @@ impl Fuse {
         };
         result(self.state().core.commit_rename(plan))?;
         if let Some(path) = path {
-            let _ = tokio_uring::fs::remove_file(path).await;
+            let _ = self.io.io.remove_file(path).await;
         }
         Ok(())
     }
@@ -964,16 +973,22 @@ fn time(t: f::TimeOrNow) -> TimeOrNow {
 #[allow(clippy::too_many_arguments)]
 impl f::AsyncFilesystem for Fuse {
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.io.finish().await?;
-        let state = self.state.get_mut();
-        if let Some(objects) = state.objects.take() {
-            let objects = Rc::try_unwrap(objects).map_err(|_| {
-                std::io::Error::other("object requests still owned during shutdown")
-            })?;
-            let metrics = objects.finish().await.map_err(std::io::Error::other)?;
-            state.core.snapshot().record_async_observation(metrics);
+        // Raw reader/directory closes may still use the shared fallback worker.
+        // Finish source ownership before closing that worker's intake.
+        let source = async {
+            let state = self.state.get_mut();
+            if let Some(objects) = state.objects.take() {
+                let objects = Rc::try_unwrap(objects).map_err(|_| {
+                    std::io::Error::other("object requests still owned during shutdown")
+                })?;
+                let metrics = objects.finish().await.map_err(std::io::Error::other)?;
+                state.core.snapshot().record_async_observation(metrics);
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let io = self.io.finish().await;
+        source.and(io)
     }
     async fn init(&mut self, _: &f::Request, config: &mut f::KernelConfig) -> std::io::Result<()> {
         // Bound each owned request buffer while allowing arbitrary file sizes.
@@ -1559,7 +1574,10 @@ impl f::AsyncFilesystem for Fuse {
             result(self.state().core.validate_handle(ino.0, fh.0))?;
             let _pin = self.pin(ino.0);
             let path = self.state().core.backing_directory().to_owned();
-            let file = tokio_uring::fs::File::open(path)
+            let file = self
+                .io
+                .io
+                .open_directory(path)
                 .await
                 .map_err(f::Errno::from)?;
             let sync = file.sync_all().await;
@@ -1608,13 +1626,26 @@ pub fn mount(
     id: &str,
     policy: WritePolicy,
 ) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
+    mount_with_runtime(core, path, id, policy, true)
+}
+fn mount_with_runtime(
+    core: Overlay,
+    path: &Path,
+    id: &str,
+    policy: WritePolicy,
+    prefer_native: bool,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
     let path = path.to_owned();
     let id = id.to_owned();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("git-on-fuse".into())
         .spawn(move || {
-            let native_runtime = tokio_uring::Runtime::new(&tokio_uring::builder()).ok();
+            let native_runtime = if prefer_native {
+                tokio_uring::Runtime::new(&tokio_uring::builder()).ok()
+            } else {
+                None
+            };
             let native = native_runtime.is_some();
             let work = async move {
                 let mut config = f::Config::default();
@@ -1631,7 +1662,7 @@ pub fn mount(
                 let filesystem = if native {
                     Fuse::with_async_source(core)?
                 } else {
-                    Fuse::new(core)
+                    Fuse::with_fallback_source(core)?
                 };
                 let mut session = match f::AsyncSessionBuilder::new()
                     .filesystem(filesystem)
@@ -1682,6 +1713,259 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    #[ignore = "requires real FUSE; executed explicitly by real-fuse CI"]
+    fn fallback_real_mount_all_policies() {
+        use std::process::Command;
+        assert!(Path::new("/dev/fuse").exists(), "real FUSE is required");
+        let temp = tempfile::Builder::new()
+            .prefix("git-on-fallback-mount-")
+            .tempdir()
+            .unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert(".gitignore", repo.blob(b"generated*\n").unwrap(), 0o100644)
+            .unwrap();
+        tree.insert(
+            "source",
+            repo.blob(b"committed source\n").unwrap(),
+            0o100644,
+        )
+        .unwrap();
+        let large: Vec<_> = (0..2 * 65536 + 17).map(|i| (i % 251) as u8).collect();
+        let large_oid = repo.blob(&large).unwrap();
+        tree.insert("large", large_oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        for (policy, name) in [
+            (WritePolicy::None, "none"),
+            (WritePolicy::Ignored, "ignored"),
+            (WritePolicy::Untracked, "untracked"),
+            (WritePolicy::All, "all"),
+        ] {
+            let snapshot =
+                crate::snapshot::Snapshot::load(repo.path(), OsStr::new(&root.to_string()), name)
+                    .unwrap();
+            let mountpoint = temp.path().join(format!("mount-{name}"));
+            std::fs::create_dir(&mountpoint).unwrap();
+            let upper = temp.path().join(format!("upper-{name}"));
+            let overlay = Overlay::with_write_policy(snapshot.clone(), upper, policy).unwrap();
+            let session = mount_with_runtime(overlay, &mountpoint, name, policy, false).unwrap();
+            let result = Command::new("timeout")
+                .args([
+                    "--kill-after=5s",
+                    "20s",
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-c",
+                    r#"
+import errno, os, sys
+from pathlib import Path
+policy = sys.argv[1]
+source = Path('source')
+assert source.read_bytes() == b'committed source\n'
+assert source.read_bytes() == b'committed source\n'
+assert Path('large').read_bytes() == bytes(i % 251 for i in range(2 * 65536 + 17))
+if policy == 'none':
+ try: Path('generated').write_bytes(b'forbidden')
+ except OSError as error: assert error.errno == errno.EROFS, error
+ else: raise AssertionError('readonly create succeeded')
+else:
+ if policy != 'all':
+  try: source.write_bytes(b'forbidden')
+  except OSError as error: assert error.errno in (errno.EROFS, errno.EACCES, errno.EPERM), error
+  else: raise AssertionError('protected write succeeded')
+ path = Path('generated')
+ with path.open('w+b', buffering=0) as f:
+  assert f.write(b'abc') == 3
+  assert os.pwrite(f.fileno(), b'tail', 70000) == 4
+  assert os.pread(f.fileno(), 5, 69998) == b'\0\0tai'
+  os.ftruncate(f.fileno(), 32)
+  os.fsync(f.fileno())
+  assert os.fstat(f.fileno()).st_size == 32
+ assert path.read_bytes() == b'abc' + bytes(29)
+ path.chmod(0o600); os.utime(path, (123, 456))
+ assert int(path.stat().st_mtime) == 456
+ os.rename(path, 'generated-moved')
+ assert not path.exists()
+ os.link('generated-moved', path)
+ assert path.stat().st_nlink == 2
+ Path('generated-moved').unlink()
+ assert path.stat().st_nlink == 1
+ os.mkdir('generated-dir')
+ directory = os.open('generated-dir', os.O_RDONLY | os.O_DIRECTORY)
+ try: os.fsync(directory)
+ finally: os.close(directory)
+ assert os.statvfs('.').f_bsize > 0
+ os.rmdir('generated-dir')
+ os.symlink('source', 'generated-link')
+ assert os.readlink('generated-link') == 'source'
+ Path('generated-link').unlink(); path.unlink()
+ if policy == 'all':
+  reader = os.open(source, os.O_RDONLY)
+  writer = os.open(source, os.O_RDWR)
+  try:
+   assert os.pwrite(writer, b'changed', 0) == 7
+   assert os.pread(reader, 100, 0) == b'changeded source\n'
+   os.rename(source, 'moved'); os.link('moved', source)
+   Path('moved').unlink(); source.unlink()
+   assert os.fstat(reader).st_nlink == 0
+   assert os.pread(reader, 100, 0) == b'changeded source\n'
+   os.fsync(writer)
+  finally: os.close(writer); os.close(reader)
+print('fallback-real-mount', policy)
+"#,
+                ])
+                .arg(name)
+                .current_dir(&mountpoint)
+                .output();
+            let unmounted = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mountpoint)
+                .output()
+                .unwrap();
+            assert!(
+                unmounted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&unmounted.stderr)
+            );
+            session.join().unwrap().unwrap();
+            let result = result.unwrap();
+            assert!(
+                result.status.success(),
+                "policy={name}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(repo.find_blob(large_oid).unwrap().content(), large);
+            assert_eq!(
+                snapshot.metrics().blob_loads,
+                if policy == WritePolicy::Ignored { 3 } else { 2 },
+                "only ignored policy needs the pinned ignore blob: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_uses_loop_cache_and_progresses_while_file_worker_waits() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let oid = repo.blob(b"original contents").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "fallback-cache",
+        )
+        .unwrap();
+        let overlay = Overlay::with_write_policy(
+            snapshot.clone(),
+            temp.path().join("upper"),
+            WritePolicy::All,
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                let objects = fs
+                    .state()
+                    .objects
+                    .clone()
+                    .expect("fallback must use the loop-owned cache");
+                let ino = fs
+                    .lookup_local(&objects, 1, OsStr::new("source"))
+                    .await
+                    .unwrap()
+                    .ino;
+                let reader = fs.open_local(ino, libc::O_RDONLY).await.unwrap();
+                drop(
+                    fs.read_file(ino, reader, 0, 100, libc::O_RDONLY)
+                        .await
+                        .unwrap(),
+                );
+                assert_eq!(
+                    objects.read(oid, 17, 0, 100).await.unwrap().as_slice(),
+                    b"original contents"
+                );
+                assert!(
+                    !fs.io.io.worker_started(),
+                    "fitting source reads must not start a file worker"
+                );
+                let demands = objects.tested_demands();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (resume, paused) = std::sync::mpsc::channel();
+                let blocked = fs.io.io.blocking(move || {
+                    entered_tx.send(()).unwrap();
+                    paused
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(std::io::Error::other)
+                });
+                let progress = async {
+                    entered_rx.await.unwrap();
+                    let mut read = Box::pin(fs.read_file(ino, reader, 0, 100, libc::O_RDONLY));
+                    poll_fn(|cx| {
+                        assert!(
+                            matches!(read.as_mut().poll(cx), Poll::Ready(Ok(_))),
+                            "RAM read waited for blocked fallback I/O"
+                        );
+                        Poll::Ready(())
+                    })
+                    .await;
+                    drop(read);
+                    assert_eq!(objects.tested_demands(), demands);
+                    resume.send(()).unwrap();
+                };
+                let (result, ()) = tokio::join!(blocked, progress);
+                result.unwrap();
+                let writer = fs.open_local(ino, libc::O_RDWR).await.unwrap();
+                fs.write_backing(ino, writer, 0, b"modified", 0, libc::O_RDWR)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs.read_backing(ino, reader, 0, 100).await.unwrap(),
+                    b"modified contents"
+                );
+                fs.rename_local(&objects, 1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
+                    .await
+                    .unwrap();
+                fs.remove_local(&objects, 1, OsStr::new("moved"), false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs.attributes_local(ino, Some(reader)).await.unwrap().nlink,
+                    0
+                );
+                assert_eq!(
+                    fs.read_backing(ino, reader, 0, 100).await.unwrap(),
+                    b"modified contents"
+                );
+                fs.sync_backing(ino, Some(writer), false).await.unwrap();
+                for fh in [reader, writer] {
+                    fs.state().core.release_prepared_handle(ino, fh).unwrap();
+                    fs.io.released(ino, fh);
+                }
+                assert_eq!(fs.io.retained(), (0, 0, 0));
+                let legacy = snapshot.metrics();
+                assert_eq!(
+                    (legacy.tree_reads, legacy.header_reads, legacy.blob_loads),
+                    (0, 0, 0)
+                );
+                drop(objects);
+                fs.shutdown().await.unwrap();
+                assert!(!fs.io.io.worker_started());
+                assert_eq!(snapshot.metrics().blob_loads, 1);
+            });
+    }
 
     #[test]
     fn all_lookup_reply_owns_name_binding_until_mutation_can_commit() {
@@ -2109,7 +2393,7 @@ mod tests {
             assert_eq!(fs.read_backing(ino, fh, 0, 100).await.unwrap(), b"\0\0abcd");
             let (started, wait) = tokio::sync::oneshot::channel();
             let (resume, paused) = std::sync::mpsc::channel();
-            let blocked = fs.io.blocking(move || {
+            let blocked = fs.io.io.blocking(move || {
                 started.send(()).unwrap();
                 paused.recv().unwrap();
                 Ok(())

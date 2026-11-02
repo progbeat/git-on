@@ -1,14 +1,15 @@
 //! Event-loop-owned verified payload cache. RAM hits borrow trusted bytes;
 //! only misses/replacement submit native asynchronous file operations.
+use crate::file_async::{File, Io};
 use crate::raw_blob::BLOCK;
 use anyhow::{Context, Result};
 use git2::{ObjectType, Oid};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     cell::RefCell, collections::HashMap, fs::File as StdFile, ops::Range, os::fd::AsRawFd, rc::Rc,
 };
-use tokio_uring::fs::{File, OpenOptions};
 const ENTRY_CHARGE: usize = 512;
 #[derive(Clone)]
 pub(crate) struct Bytes {
@@ -78,6 +79,7 @@ pub(crate) struct RawBlobs {
     state: RefCell<State>,
     directory: Rc<Directory>,
     limit: usize,
+    io: Rc<Io>,
     // This gate coordinates cold admissions only. RAM reads do not take it and
     // no RefCell borrow or interthread cache lock survives a disk await.
     admission: tokio::sync::Mutex<()>,
@@ -108,6 +110,10 @@ impl RawBlobs {
     }
     #[cfg(test)]
     fn with_limit(parent: &std::path::Path, limit: usize) -> Result<Self> {
+        Self::with_limit_io(parent, limit, Io::new(true))
+    }
+    #[cfg(test)]
+    fn with_limit_io(parent: &std::path::Path, limit: usize, io: Rc<Io>) -> Result<Self> {
         let owner = tempfile::Builder::new()
             .prefix("raw-objects-")
             .tempdir_in(parent)?;
@@ -115,12 +121,13 @@ impl RawBlobs {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(owner.path())?;
-        Ok(Self::from_anchor(fd, std::sync::Arc::new(owner), limit))
+        Ok(Self::from_anchor(fd, std::sync::Arc::new(owner), limit, io))
     }
     pub(crate) fn from_anchor(
         fd: StdFile,
         owner: std::sync::Arc<tempfile::TempDir>,
         limit: usize,
+        io: Rc<Io>,
     ) -> Self {
         Self {
             state: RefCell::new(State {
@@ -134,13 +141,26 @@ impl RawBlobs {
                 authenticated_bytes: 0,
             }),
             directory: Rc::new(Directory {
-                fd: File::from_std(fd),
+                fd: io.owned(fd),
                 _owner: owner,
             }),
             limit,
+            io,
             admission: tokio::sync::Mutex::new(()),
             preparing: RefCell::new(HashMap::new()),
         }
+    }
+    pub(crate) async fn finish(self) -> Result<()> {
+        if let Some((_, file)) = self.state.into_inner().reader {
+            Rc::try_unwrap(file)
+                .map_err(|_| anyhow::anyhow!("raw reader still owned"))?
+                .close()
+                .await?;
+        }
+        let directory = Rc::try_unwrap(self.directory)
+            .map_err(|_| anyhow::anyhow!("raw directory still owned"))?;
+        directory.fd.close_directory_anchor().await?;
+        Ok(())
     }
     fn record_io(&self) {
         #[cfg(test)]
@@ -164,14 +184,7 @@ impl RawBlobs {
     }
     async fn pending(&self, name: String) -> Result<Pending> {
         self.record_io();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open_at(&self.directory.fd, &name)
-            .await?;
+        let file = self.io.open_raw(&self.directory.fd, &name, true).await?;
         let pending = Pending {
             directory: self.directory.clone(),
             name: std::ffi::CString::new(name)?,
@@ -208,8 +221,7 @@ impl RawBlobs {
             if !victim.2 {
                 let mut pending = self.pending(victim.0.to_string()).await?;
                 self.record_io();
-                let (r, _) = pending.file.write_all_at(victim.1.clone(), 0).await;
-                r?;
+                pending.file.write_all_at(victim.1.clone(), 0).await?;
                 pending.committed = true;
             }
             // The victim remains available in RAM until the complete write succeeds.
@@ -379,8 +391,7 @@ impl RawBlobs {
                         );
                         hashes.push(Sha256::digest(&bytes).into());
                         self.record_io();
-                        let (result, _) = pending.file.write_all_at(bytes, written as u64).await;
-                        result?;
+                        pending.file.write_all_at(bytes, written as u64).await?;
                         written = written
                             .checked_add(count)
                             .context("source object length overflow")?;
@@ -498,10 +509,8 @@ impl RawBlobs {
         }
         self.record_io();
         let file = Rc::new(
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-                .open_at(&self.directory.fd, oid.to_string())
+            self.io
+                .open_raw(&self.directory.fd, &oid.to_string(), false)
                 .await?,
         );
         self.validate(&file, Some(size)).await?;
@@ -620,6 +629,81 @@ mod tests {
     use super::*;
     fn oid(b: &[u8]) -> Oid {
         Oid::hash_object(ObjectType::Blob, b).unwrap()
+    }
+    #[test]
+    fn fallback_ram_only_run_does_not_start_file_worker_even_during_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store = RawBlobs::with_limit_io(directory.path(), 8192, io.clone()).unwrap();
+                let bytes = b"trusted RAM bytes";
+                store.insert(oid(bytes), bytes.to_vec()).await.unwrap();
+                assert_eq!(
+                    store.read(oid(bytes), 0, 100).await.unwrap().as_slice(),
+                    bytes
+                );
+                assert!(!io.worker_started());
+                store.finish().await.unwrap();
+                assert!(
+                    !io.worker_started(),
+                    "directory cleanup started an unnecessary worker"
+                );
+                io.finish().await.unwrap();
+            });
+    }
+    #[test]
+    fn fallback_streams_large_objects_and_authenticates_reloaded_buffers() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path().join("repo")).unwrap();
+        let bytes: Vec<_> = (0..2 * BLOCK + 17).map(|i| (i % 251) as u8).collect();
+        let oid = repo.blob(&bytes).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store =
+                    RawBlobs::with_limit_io(directory.path(), BLOCK + ENTRY_CHARGE, io.clone())
+                        .unwrap();
+                let source = crate::source_async::Source::new(repo).unwrap();
+                store.prepare(&source, oid).await.unwrap();
+                assert_eq!(
+                    store.read(oid, 0, BLOCK as u32).await.unwrap().as_slice(),
+                    &bytes[..BLOCK]
+                );
+                let authenticated = store.state.borrow().authenticated_bytes;
+                let path = store.directory._owner.path().join(oid.to_string());
+                let attacker = StdFile::options().write(true).open(&path).unwrap();
+                attacker.write_all_at(&[255], 0).unwrap();
+                // Trusted resident bytes remain usable even after disk mutation.
+                assert_eq!(
+                    store.read(oid, 0, BLOCK as u32).await.unwrap().as_slice(),
+                    &bytes[..BLOCK]
+                );
+                assert_eq!(store.state.borrow().authenticated_bytes, authenticated);
+                // One retained block per OID: another block removes the first.
+                assert_eq!(
+                    store
+                        .read(oid, BLOCK as u64, BLOCK as u32)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                    &bytes[BLOCK..2 * BLOCK]
+                );
+                assert_eq!(store.state.borrow().memory.len(), 1);
+                assert!(store.read(oid, 0, 1).await.is_err());
+                assert!(store.state.borrow().memory_bytes <= store.limit);
+                source.finish().await.unwrap();
+                store.finish().await.unwrap();
+                io.finish().await.unwrap();
+                assert!(!io.worker_started());
+            });
     }
     #[test]
     fn fitting_working_set_stays_in_ram_and_shared_results_survive_eviction() {

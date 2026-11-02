@@ -56,7 +56,7 @@ fn dirents(bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
 struct Peer {
     fd: OwnedFd,
     task: Option<JoinHandle<()>>,
-    native_source: bool,
+    async_source: bool,
     unique: u64,
     uid: u32,
     gid: u32,
@@ -97,10 +97,10 @@ impl Peer {
         count: usize,
         minor: u32,
     ) -> (Self, u32) {
-        Self::with_runtime(policy, extended, extra, count, minor, true)
+        Self::with_runtime(policy, extended, extra, count, minor, true, true)
     }
     fn with_legacy_policy(policy: WritePolicy) -> Self {
-        Self::with_runtime(policy, false, 0, 0, 31, false).0
+        Self::with_runtime(policy, false, 0, 0, 31, false, false).0
     }
     fn with_runtime(
         policy: WritePolicy,
@@ -109,6 +109,7 @@ impl Peer {
         count: usize,
         minor: u32,
         prefer_native: bool,
+        asynchronous: bool,
     ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
@@ -168,18 +169,22 @@ impl Peer {
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let task = std::thread::spawn(move || {
-            let runtime = if prefer_native {
+            let runtime = if prefer_native
+                && std::env::var_os("GIT_ON_TEST_PROTOCOL_FILE_FALLBACK").is_none()
+            {
                 tokio_uring::Runtime::new(&tokio_uring::builder()).ok()
             } else {
                 None
             };
             let native = runtime.is_some();
-            ready_tx.send(native).unwrap();
+            ready_tx.send(asynchronous).unwrap();
             let work = async {
-                let filesystem = if native {
+                let filesystem = if !asynchronous {
+                    Fuse::new(overlay)
+                } else if native {
                     Fuse::with_async_source(overlay).unwrap()
                 } else {
-                    Fuse::new(overlay)
+                    Fuse::with_fallback_source(overlay).unwrap()
                 };
                 let mut session = AsyncSession::from_fd(
                     filesystem,
@@ -206,7 +211,7 @@ impl Peer {
         let mut p = Self {
             fd,
             task: Some(task),
-            native_source: ready_rx.recv().unwrap(),
+            async_source: ready_rx.recv().unwrap(),
             unique: 0,
             // Tracked entries belong to the mounting process, including CI's
             // runner UID. Credential tests override these IDs explicitly.
@@ -363,7 +368,7 @@ fn protocol_kernel_cache_keeps_mutable_attributes_live() {
             let protected = policy != WritePolicy::All;
             assert_eq!(
                 num(&entry, 16) != 0,
-                protected || p.native_source,
+                protected || p.async_source,
                 "positive entry TTL: {policy:?}"
             );
             assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
@@ -383,7 +388,7 @@ fn protocol_kernel_cache_keeps_mutable_attributes_live() {
                 let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
                 assert_eq!(
                     num(&entry, 16) != 0,
-                    policy == WritePolicy::All && p.native_source
+                    policy == WritePolicy::All && p.async_source
                 );
                 assert_eq!(num(&entry, 24), 0);
                 let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
@@ -429,7 +434,7 @@ fn protocol_all_source_data_cache_stops_after_copy_up_with_live_attributes() {
         };
         let entry = p.ok(1, 1, names(vec![], &["tracked"]));
         let ino = num(&entry, 0);
-        assert_eq!(num(&entry, 16) != 0, p.native_source);
+        assert_eq!(num(&entry, 16) != 0, p.async_source);
         assert_eq!(num(&entry, 24), 0);
         let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
         assert_eq!(
@@ -1523,4 +1528,22 @@ fn protocol_pending_caller_signal_does_not_invent_read_error() {
     let handle = peer.open(ino, libc::O_RDONLY);
     assert_eq!(peer.ok(15, ino, io(handle, 0, 100, 0)), b"original\n");
     peer.release(ino, handle);
+}
+
+#[test]
+fn protocol_fallback_executes_the_complete_wire_suite() {
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--skip",
+            "protocol_fallback_executes_the_complete_wire_suite",
+        ])
+        .env("GIT_ON_TEST_PROTOCOL_FILE_FALLBACK", "1")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

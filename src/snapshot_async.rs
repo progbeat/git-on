@@ -58,11 +58,12 @@ impl Snapshot {
         root: Oid,
         directory: File,
         owner: Arc<tempfile::TempDir>,
+        io: Rc<crate::file_async::Io>,
     ) -> Result<Self> {
         Ok(Self {
             root,
             source: Source::new(repo)?,
-            raw: RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET),
+            raw: RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io),
             trees: RefCell::new(HashMap::new()),
             headers: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
@@ -230,7 +231,10 @@ impl Snapshot {
         metrics.header_cache_entries = self.headers.into_inner().len();
         metrics.spool_bytes = metrics.retained_raw_blob_bytes;
         metrics.spool_writes = metrics.retained_raw_blob_entries;
-        self.source.finish().await?;
+        let source = self.source.finish().await;
+        let raw = self.raw.finish().await;
+        source?;
+        raw?;
         Ok(metrics)
     }
 }

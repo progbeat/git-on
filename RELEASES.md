@@ -2,6 +2,7 @@
 <!-- Bump: minor -->
 
 - Let ready local protected-source reads progress while unrelated generated-file I/O waits on the native Linux backend. Keep request buffers and descriptors alive through asynchronous completion and drain owned work before unmount.
+- Keep local loading and caches asynchronous when io_uring is unavailable. Use one lazy bounded file worker for disk operations; fitting source reads stay on the event loop without a worker job.
 - Use the same native asynchronous source cache for local `all` operations and copy-up. Preserve renamed directory origins and order mutation after outstanding source READ replies.
 - Reuse positive name lookups in native Linux `all` mounts while keeping mutable attributes live. Order namespace changes after outstanding LOOKUP replies and preserve cached-name coherence across replacement, links and directory moves.
 - Stream loose Git objects into verified large source spools without an avoidable full decoded RAM buffer. Local packed objects still use libgit2's required object/delta decoding.

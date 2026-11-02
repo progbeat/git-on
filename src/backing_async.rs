@@ -1,5 +1,6 @@
-//! Local native I/O ownership. Active handles and requests share the original
+//! Local file ownership. Active handles and requests share the original
 //! standard descriptor; idle/closed inodes do not accumulate a retained FD.
+use crate::file_async::{File, Io};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -8,63 +9,14 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
-use tokio_uring::fs::File;
-
-type Job = Box<dyn FnOnce() + Send>;
-struct Worker {
-    sender: Option<tokio::sync::mpsc::Sender<Job>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    exited: Option<tokio::sync::oneshot::Receiver<()>>,
-}
-impl Worker {
-    fn new() -> io::Result<Self> {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Job>(16);
-        let (done, exited) = tokio::sync::oneshot::channel();
-        let thread = std::thread::Builder::new()
-            .name("git-on-file-io".into())
-            .spawn(move || {
-                while let Some(job) = receiver.blocking_recv() {
-                    job();
-                }
-                let _ = done.send(());
-            })?;
-        Ok(Self {
-            sender: Some(sender),
-            thread: Some(thread),
-            exited: Some(exited),
-        })
-    }
-    async fn finish(mut self) -> io::Result<()> {
-        self.sender.take();
-        // Closing the queue follows all submitted work. Await its exit before
-        // joining so a slow filesystem cannot block the event loop on shutdown.
-        let _ = self.exited.take().unwrap().await;
-        self.thread
-            .take()
-            .unwrap()
-            .join()
-            .map_err(|_| io::Error::other("file I/O worker panicked"))
-    }
-}
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 
 type Files = HashMap<u64, (usize, Weak<File>)>;
 type Gates = HashMap<u64, std::sync::Weak<tokio::sync::RwLock<()>>>;
-#[derive(Default)]
 pub(crate) struct Backing {
     files: RefCell<Files>,
     handles: RefCell<HashMap<u64, Rc<File>>>,
     gates: Rc<RefCell<Gates>>,
-    // Only operations unavailable through the supported io_uring ABI use this
-    // one lazily-created, bounded actor. RAM hits never enter its queue.
-    worker: RefCell<Option<Worker>>,
+    pub(crate) io: Rc<Io>,
 }
 pub(crate) struct Lease<'a> {
     owner: &'a Backing,
@@ -119,7 +71,21 @@ impl Gate {
         }
     }
 }
+impl Default for Backing {
+    fn default() -> Self {
+        Self::new(Io::new(true))
+    }
+}
 impl Backing {
+    pub(crate) fn new(io: Rc<Io>) -> Self {
+        Self {
+            files: RefCell::default(),
+            handles: RefCell::default(),
+            gates: Rc::default(),
+            io,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn retained(&self) -> (usize, usize, usize) {
         (
@@ -132,61 +98,28 @@ impl Backing {
         self.handles.get_mut().clear();
         self.files.get_mut().clear();
         self.gates.borrow_mut().clear();
-        if let Some(worker) = self.worker.get_mut().take() {
-            worker.finish().await?;
-        }
-        Ok(())
+        self.io.finish().await
     }
-    pub(crate) async fn blocking<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> io::Result<T> + Send + 'static,
-    ) -> io::Result<T> {
-        let sender = {
-            let mut worker = self.worker.borrow_mut();
-            if worker.is_none() {
-                *worker = Some(Worker::new()?);
-            }
-            worker.as_ref().unwrap().sender.as_ref().unwrap().clone()
-        };
-        let (done, wait) = tokio::sync::oneshot::channel();
-        sender
-            .send(Box::new(move || {
-                let _ = done.send(work());
-            }))
-            .await
-            .map_err(|_| io::Error::other("file I/O worker stopped"))?;
-        wait.await
-            .map_err(|_| io::Error::other("file I/O worker stopped"))?
-    }
-    pub(crate) async fn open(path: &Path, create: bool) -> io::Result<Arc<fs::File>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = tokio_uring::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(create)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .await?;
-        file.try_into_std()
-            .map(Arc::new)
-            .map_err(|_| io::Error::other("native open still shared"))
+    pub(crate) async fn open(&self, path: &Path, create: bool) -> io::Result<Arc<fs::File>> {
+        self.io.open_backing(path, create).await
     }
     pub(crate) async fn truncate(&self, file: Arc<fs::File>, size: u64) -> io::Result<()> {
-        self.blocking(move || file.set_len(size)).await
+        self.io.blocking(move || file.set_len(size)).await
     }
     pub(crate) async fn set_times(
         &self,
         file: Arc<fs::File>,
         times: fs::FileTimes,
     ) -> io::Result<()> {
-        self.blocking(move || file.set_times(times)).await
+        self.io.blocking(move || file.set_times(times)).await
     }
     pub(crate) async fn statistics(&self, path: PathBuf) -> io::Result<crate::backend::Statistics> {
-        self.blocking(move || {
-            crate::filesystem::Overlay::statistics_at(&path).map_err(io::Error::from_raw_os_error)
-        })
-        .await
+        self.io
+            .blocking(move || {
+                crate::filesystem::Overlay::statistics_at(&path)
+                    .map_err(io::Error::from_raw_os_error)
+            })
+            .await
     }
     pub(crate) fn lease(&self, ino: u64, file: Arc<fs::File>) -> Lease<'_> {
         let key = Arc::as_ptr(&file) as usize;
@@ -196,7 +129,7 @@ impl Backing {
             .filter(|(owner, _)| *owner == key)
             .and_then(|(_, weak)| weak.upgrade())
             .unwrap_or_else(|| {
-                let file = Rc::new(File::from_shared_std(file));
+                let file = Rc::new(self.io.shared(file));
                 files.insert(ino, (key, Rc::downgrade(&file)));
                 file
             });
@@ -239,45 +172,11 @@ impl Backing {
         }
     }
     pub(crate) async fn read(file: &File, offset: u64, count: usize) -> io::Result<Vec<u8>> {
-        use tokio_uring::buf::BoundedBuf;
-        let mut data = Vec::with_capacity(count);
-        while data.len() < count {
-            let done = data.len();
-            let (result, buf) = file
-                .read_at(data.slice(done..count), offset + done as u64)
-                .await;
-            data = buf.into_inner();
-            match result {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(data)
+        file.read_up_to(offset, count).await
     }
-    /// A short write followed by ENOSPC/EFBIG reports the visible progress, just
-    /// as the synchronous path does. The owned copy outlives cancellation.
+    /// Preserve a short write's visible progress, including EFBIG/ENOSPC.
     pub(crate) async fn write(file: &File, offset: u64, data: &[u8]) -> io::Result<usize> {
-        use tokio_uring::buf::BoundedBuf;
-        let mut data = data.to_vec();
-        let mut done = 0;
-        while done < data.len() {
-            let (result, buf) = file
-                .write_at(data.slice(done..), offset + done as u64)
-                .submit()
-                .await;
-            data = buf.into_inner();
-            match result {
-                Ok(0) if done == 0 => return Err(io::Error::from_raw_os_error(libc::EIO)),
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if done == 0 => return Err(e),
-                Err(_) => break,
-            }
-        }
-        Ok(done)
+        file.write_partial(offset, data.to_vec()).await
     }
 }
 
@@ -285,6 +184,7 @@ impl Backing {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use tokio_uring::fs::File as NativeFile;
     #[test]
     fn abandoned_native_opens_release_fds_before_and_after_completion() {
         use std::{
@@ -304,7 +204,7 @@ mod tests {
         for phase in ["submitted", "completed", "shutdown"] {
             tokio_uring::start(async {
                 for _ in 0..16 {
-                    let mut open = Box::pin(File::open(&path));
+                    let mut open = Box::pin(NativeFile::open(&path));
                     poll_fn(|cx| {
                         assert!(open.as_mut().poll(cx).is_pending());
                         Poll::Ready(())
@@ -312,12 +212,22 @@ mod tests {
                     .await;
                     if phase == "completed" {
                         // Drive the CQ before dropping the unconsumed result.
-                        File::open(&path).await.unwrap().close().await.unwrap();
+                        NativeFile::open(&path)
+                            .await
+                            .unwrap()
+                            .close()
+                            .await
+                            .unwrap();
                     }
                     drop(open);
                 }
                 if phase != "shutdown" {
-                    File::open(&path).await.unwrap().close().await.unwrap();
+                    NativeFile::open(&path)
+                        .await
+                        .unwrap()
+                        .close()
+                        .await
+                        .unwrap();
                 }
             });
             assert_eq!(count(), 0, "phase={phase}");
@@ -356,12 +266,16 @@ mod tests {
         tokio_uring::start(async {
             let file = Arc::new(tempfile::tempfile().unwrap());
             let fd = file.as_raw_fd();
-            let native = File::from_shared_std(file.clone());
+            let native = NativeFile::from_shared_std(file.clone());
             assert_eq!(native.as_raw_fd(), fd);
-            Backing::write(&native, 0, b"contents").await.unwrap();
+            native
+                .write_all_at(b"contents".to_vec(), 0)
+                .await
+                .0
+                .unwrap();
             native.close().await.unwrap();
             assert_eq!(file.metadata().unwrap().len(), 8);
-            let native = File::from_shared_std(file.clone());
+            let native = NativeFile::from_shared_std(file.clone());
             let mut request = Box::pin(native.read_at(Vec::with_capacity(8), 0));
             std::future::poll_fn(|cx| {
                 use std::future::Future;
@@ -376,7 +290,7 @@ mod tests {
                 2,
                 "cancelled native operation must own the FD until CQE"
             );
-            let probe = File::from_std(tempfile::tempfile().unwrap());
+            let probe = NativeFile::from_std(tempfile::tempfile().unwrap());
             probe.statx().await.unwrap();
             probe.close().await.unwrap();
             assert_eq!(Arc::strong_count(&file), 1);
@@ -401,7 +315,7 @@ mod tests {
             assert!(backing.handles.borrow().is_empty());
             drop(backing);
             assert_eq!(Arc::strong_count(&file), 1);
-            let native = File::from_std(tempfile::tempfile().unwrap());
+            let native = NativeFile::from_std(tempfile::tempfile().unwrap());
             let fd = native.as_raw_fd();
             let standard = native.try_into_std().expect("unique fd transfer");
             assert_eq!(standard.as_raw_fd(), fd);

@@ -2587,5 +2587,54 @@ called `set_read_timeout` after sending an invalid greeting and received EINVAL.
 The client may already have rejected the greeting and disconnected. Timeout
 configuration now precedes the exchange, while both peers are live. The existing
 regression still requires EOF with no termination packet after every invalid
-greeting. Its Linux run passes; the macOS failure is the recorded predecessor,
-and the next exact-head macOS CI run must establish the platform result.
+greeting. Its Linux run passes; the macOS failure is the recorded predecessor.
+The macOS job `125584968359` at `51b83a9` subsequently passed, including this
+regression. Later revisions still require their own exact-head CI.
+
+## Local asynchronous file fallback
+
+When io_uring is unavailable, the Linux adapter now selects the same local
+source/cache and short namespace commits, with one lazy bounded file worker.
+The worker owns blocking file calls, not the overlay or its caches. Native
+io_uring operations remain native. The fallback reuses the existing inode
+gates, original descriptors and verification rules.
+
+`fallback_uses_loop_cache_and_progresses_while_file_worker_waits` checks that a
+fitting source read starts no file worker, then pauses that worker and requires
+a warm READ to complete immediately without another decoder demand. It also
+checks copy-up, writes, rename/unlink, old handles, sync, reclamation and source
+shutdown. Replacing the new fallback constructor with the former legacy
+constructor makes its loop-cache assertion fail; the connected implementation
+passes. `protocol_fallback_executes_the_complete_wire_suite` runs all other wire
+cases in a child with the fallback explicitly selected; the selector belongs to
+the test harness and is not a production CLI option.
+
+`fallback_streams_large_objects_and_authenticates_reloaded_buffers` verifies a
+multi-block source through the file worker, changes spill bytes, checks that
+trusted resident bytes remain readable and rejects the changed buffer after
+that block is evicted. It retains one cache block per OID and checks shutdown.
+The explicit real-FUSE test `fallback_real_mount_all_policies` mounts the actual
+fallback under all four policies and checks reads, ordinary generated-file I/O,
+namespace operations, metadata, synchronization, copy-up and unlinked handles.
+It runs separately from the ordinary Rust suite; the existing `write_policy.py`
+CI entry point explicitly compiles and runs it from the current checkout.
+
+The initial explicit raw-directory close wrongly required a ring context even
+for RAM-only tests; three existing resident/shutdown regressions reproduced the
+panic. An idle read-only directory anchor now transfers out of the native
+wrapper before close, or closes directly in the fallback. If a native operation
+still owns its anchor, close remains awaited. This avoids creating a file worker
+merely to close an idle directory. The focused
+`fallback_ram_only_run_does_not_start_file_worker_even_during_cleanup` checks the
+fallback invariant through cleanup. Regular-file reads and writes retain their
+owned asynchronous completion paths. The initial cleanup also starts a file
+worker in a RAM-only fallback; reverting the anchor close reproduces the focused
+test's failure, and the idle-anchor path passes.
+
+`cancelled_fallback_jobs_keep_owned_fds_until_worker_drain` pauses the worker,
+queues a read and an open, then drops both waiting futures. The queued read must
+still own its descriptor; after drain neither the read nor the unconsumed open
+may retain a descriptor. The worker is joined during shutdown.
+
+Remote integration and the complete
+lifecycle/performance acceptance remain required.

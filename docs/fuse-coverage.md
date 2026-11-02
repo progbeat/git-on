@@ -22,6 +22,8 @@ adapter overrides/default errors against this complete inventory.
   state are asserted. This is **protocol testing, not a kernel mount**. It makes
   stale handles, caller credentials, narrow reply buffers and callbacks normally
   bypassed by Linux reproducible. It does not emulate Linux's syscall semantics.
+  `protocol_fallback_executes_the_complete_wire_suite` repeats that suite with
+  the file-worker fallback explicitly selected, without disabling host io_uring.
 - `tests/integration.py --require-fuse --uv` exercises actual mounts and caller
   behavior. The existing file/directory/link matrices remain part of acceptance,
   alongside the targeted operation tests below. Missing FUSE must fail rather
@@ -48,7 +50,17 @@ cargo test --locked --test fuse_protocol
 cargo test --locked --all-targets
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
 python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
+cargo test --locked --lib backend::linux::tests::fallback_real_mount_all_policies -- --ignored --exact
 ```
+
+The last test requires real FUSE and explicitly selects the asynchronous file
+fallback under all four policies. It is ignored by the ordinary Rust suite and
+run explicitly by `write_policy.py` in real-fuse CI; an ordinary-suite skip is not its execution
+evidence. It checks source/large reads, protected-write denials, generated I/O,
+copy-up, live unlinked handles, metadata, links, rename and synchronization.
+The Python suite requires Cargo for that source-level test. Its other nine
+tests continue to exercise the CLI selected by `--binary`; the forced fallback
+check compiles the current checkout, not that supplied executable.
 
 The checker resolves the dependency source with `cargo metadata --locked
 --offline --filter-platform <rustc-host>`, deriving the host from `rustc -vV`.

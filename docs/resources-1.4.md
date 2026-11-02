@@ -52,7 +52,7 @@ identity prevents cleanup from targeting a later filesystem at the same path.
 The original MIT licenses and separate diffs from both upstream sources are
 included with the local crates.
 
-Native local mounts under all four write policies connect lookup/header
+Local mounts under all four write policies connect lookup/header
 demands, directory
 preparation, read and readlink to `snapshot_async.rs`, `source_async.rs` and
 `raw_blob_async.rs`. Trees, sizes, verified descriptors and the payload LRU belong
@@ -61,7 +61,9 @@ needing an inode across a wait pin it against FORGET. Protected resident-source
 reads keep their direct path without an inode gate or worker job.
 A source boundary owns one decoder thread for libgit2's blocking API, with
 bounded chunk transfer; it is not a worker pool used by every callback. The
-local cache uses Rc-owned verified bytes and native io_uring file operations.
+local cache uses Rc-owned verified bytes. File operations use native io_uring
+when available; otherwise one lazy bounded I/O worker handles them asynchronously
+without moving the cache or namespace onto that worker.
 A fitting working set performs no payload disk I/O, coalesces concurrent demand
 for an OID, and serves RAM hits while the decoder waits. Shared local bytes stay
 alive through FUSE reply completion without a payload copy. Session shutdown
@@ -106,9 +108,16 @@ before an older name reply finishes. Mutations take exclusive ownership, and
 Linux invalidates the affected dentries for its namespace operations. Protected
 source lookups retain their existing direct path.
 
-This is not yet a complete asynchronous core. Remote sources and hosts without
-io_uring still use the existing synchronous source core. Required remaining work
-includes async fallback, remote integration, complete cancellation/cleanup
+The fallback shares the same file worker with truncate, timestamps and statvfs,
+with a 16-job channel. It uses owned buffers and retains the original descriptor
+through completion. Ordinary RAM hits neither start nor submit to this worker.
+Shutdown closes raw readers and directory anchors before awaiting the shared
+worker's completion. No per-request blocking pool or second payload cache is
+introduced. Native file I/O retains its existing path.
+
+This is not yet a complete asynchronous core. Remote sources still use the
+existing synchronous source core. Required remaining work includes remote
+integration, complete cancellation/cleanup
 verification, and paired performance acceptance
 with the complete mounted implementation. Component tests and protocol coverage do not establish
 issue #20 or merge readiness. No temporary profiler or benchmark harness is

@@ -865,7 +865,10 @@ impl Snapshot {
     /// Invocation pin/alternate aliases and the anchored raw directory remain
     /// owned until both the mounted loop and the ordinary Snapshot have ended.
     #[cfg(target_os = "linux")]
-    pub(crate) fn async_source(&self) -> Result<Option<crate::snapshot_async::Snapshot>> {
+    pub(crate) fn async_source(
+        &self,
+        io: std::rc::Rc<crate::file_async::Io>,
+    ) -> Result<Option<crate::snapshot_async::Snapshot>> {
         let state = self.state()?;
         if state.remote.is_some() {
             return Ok(None);
@@ -885,7 +888,7 @@ impl Snapshot {
             .as_ref()
             .context("raw storage not initialized")?
             .directory_anchor()?;
-        crate::snapshot_async::Snapshot::new(repo, self.tree_oid, fd, owner).map(Some)
+        crate::snapshot_async::Snapshot::new(repo, self.tree_oid, fd, owner, io).map(Some)
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn record_async_observation(&self, metrics: SnapshotMetrics) {
