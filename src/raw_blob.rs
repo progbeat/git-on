@@ -186,7 +186,7 @@ impl RawBlob {
 struct RawDirectory {
     fd: File,
     reader: Option<(Oid, Arc<File>)>,
-    _owner: tempfile::TempDir,
+    _owner: Arc<tempfile::TempDir>,
     #[cfg(test)]
     open_calls: std::cell::Cell<usize>,
 }
@@ -203,7 +203,7 @@ impl RawDirectory {
         Ok(Self {
             fd,
             reader: None,
-            _owner: owner,
+            _owner: Arc::new(owner),
             #[cfg(test)]
             open_calls: std::cell::Cell::new(0),
         })
@@ -359,6 +359,14 @@ impl RawBlobs {
             size: object.size,
             kind: object.kind(),
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_anchor(&self) -> Result<(File, Arc<tempfile::TempDir>)> {
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok((
+            store.directory.fd.try_clone()?,
+            store.directory._owner.clone(),
+        ))
     }
     pub(crate) fn get(&self, oid: Oid) -> Result<Option<RawBlob>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());

@@ -10,8 +10,14 @@ pub mod platform;
 pub mod policy;
 mod progress;
 mod raw_blob;
+#[cfg(target_os = "linux")]
+mod raw_blob_async;
 pub mod remote;
 pub mod snapshot;
+#[cfg(target_os = "linux")]
+mod snapshot_async;
+#[cfg(target_os = "linux")]
+mod source_async;
 mod spool;
 mod transport;
 mod tree;

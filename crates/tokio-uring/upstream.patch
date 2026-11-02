@@ -1,0 +1,82 @@
+diff --git a/src/io/open.rs b/src/io/open.rs
+--- a/src/io/open.rs
++++ b/src/io/open.rs
+@@ -10,6 +10,7 @@
+ /// Open a file
+ #[allow(dead_code)]
+ pub(crate) struct Open {
++    directory: Option<SharedFd>,
+     pub(crate) path: CString,
+     pub(crate) flags: libc::c_int,
+ }
+@@ -17,6 +18,14 @@
+ impl Op<Open> {
+     /// Submit a request to open a file.
+     pub(crate) fn open(path: &Path, options: &OpenOptions) -> io::Result<Op<Open>> {
++        Self::open_at(None, path, options)
++    }
++
++    pub(crate) fn open_at(
++        directory: Option<SharedFd>,
++        path: &Path,
++        options: &OpenOptions,
++    ) -> io::Result<Op<Open>> {
+         use io_uring::{opcode, types};
+         let path = super::util::cstr(path)?;
+         let flags = libc::O_CLOEXEC
+@@ -25,19 +34,31 @@
+             | (options.custom_flags & !libc::O_ACCMODE);
+ 
+         CONTEXT.with(|x| {
+-            x.handle()
+-                .expect("Not in a runtime context")
+-                .submit_op(Open { path, flags }, |open| {
++            x.handle().expect("Not in a runtime context").submit_op(
++                Open {
++                    path,
++                    flags,
++                    directory,
++                },
++                |open| {
+                     // Get a reference to the memory. The string will be held by the
+                     // operation state and will not be accessed again until the operation
+                     // completes.
+                     let p_ref = open.path.as_c_str().as_ptr();
+ 
+-                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), p_ref)
+-                        .flags(flags)
+-                        .mode(options.mode)
+-                        .build()
+-                })
++                    opcode::OpenAt::new(
++                        types::Fd(
++                            open.directory
++                                .as_ref()
++                                .map_or(libc::AT_FDCWD, |fd| fd.raw_fd()),
++                        ),
++                        p_ref,
++                    )
++                    .flags(flags)
++                    .mode(options.mode)
++                    .build()
++                },
++            )
+         })
+     }
+ }
+diff --git a/src/fs/open_options.rs b/src/fs/open_options.rs
+--- a/src/fs/open_options.rs
++++ b/src/fs/open_options.rs
+@@ -336,6 +336,12 @@
+         Op::open(path.as_ref(), self)?.await
+     }
+ 
++    /// Open a path relative to an owned directory descriptor. The descriptor is
++    /// retained by the native operation until completion, including cancellation.
++    pub async fn open_at(&self, directory: &File, path: impl AsRef<Path>) -> io::Result<File> {
++        Op::open_at(Some(directory.fd.clone()), path.as_ref(), self)?.await
++    }
++
+     pub(crate) fn access_mode(&self) -> io::Result<libc::c_int> {
+         match (self.read, self.write, self.append) {
+             (true, false, false) => Ok(libc::O_RDONLY),

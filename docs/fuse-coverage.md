@@ -1,14 +1,23 @@
 # FUSE callback acceptance matrix
 
-This is the reviewed operation inventory for **registry fuser 0.18.0 and Linux ABI 7.40**.
+This is the reviewed operation inventory for **local async-fuser and Linux ABI 7.40**.
 It is a test contract, not an assertion that any particular CI run passed.
 The dependency has 44 trait methods: 26 implemented by the Linux adapter and shared `Overlay`, 2 inherited
 lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
 
+The local crate starts at upstream commit
+`c038f63e39fe2e5f87a5311b222deda4d534c735`; its inherited version number does
+not assert equivalence to a published crate. The complete 44-operation contract
+is retained from the matching synchronous trait. The async trait exposes 36
+methods: batch-forget dispatches to individual forget calls; unsupported Linux
+locking/bmap/poll operations return ENOSYS directly; three callbacks are excluded
+with macOS. The guard pins both traits and the async dispatcher and verifies the
+adapter overrides/default errors against this complete inventory.
+
 ## Evidence layers and limits
 
 - `tests/fuse_protocol.rs` sends encoded FUSE requests through
-  `fuser::Session::from_fd` over a private `SOCK_SEQPACKET` socket. The real fuser
+  `fuser::AsyncSession::from_fd` over a private `SOCK_SEQPACKET` socket. The real fuser
   dispatcher invokes the real `Overlay`; reply bytes, errors and subsequent
   state are asserted. This is **protocol testing, not a kernel mount**. It makes
   stale handles, caller credentials, narrow reply buffers and callbacks normally

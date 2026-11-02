@@ -108,6 +108,13 @@ fn is_lfs_pointer(bytes: &[u8]) -> bool {
     oid && size
 }
 
+pub(crate) fn validate_source_blob(bytes: &[u8]) -> Result<()> {
+    if is_lfs_pointer(bytes) {
+        bail!("Git LFS pointer blobs are unsupported");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     File,
@@ -324,6 +331,8 @@ struct State {
     metrics: SnapshotMetrics,
     spool_directory: PathBuf,
     _local_object_bridge: Option<tempfile::TempDir>,
+    #[cfg(target_os = "linux")]
+    async_observation: Option<(SnapshotMetrics, Option<String>)>,
 }
 impl State {
     fn ensure(&mut self, oid: Oid) -> Result<()> {
@@ -519,10 +528,7 @@ impl State {
         Ok(raw)
     }
     fn validate_blob(bytes: &[u8]) -> Result<()> {
-        if is_lfs_pointer(bytes) {
-            bail!("Git LFS pointer blobs are unsupported");
-        }
-        Ok(())
+        validate_source_blob(bytes)
     }
     /// Full-object consumers explicitly need the returned bytes (ignore rules
     /// and symlink targets). Ordinary ranged reads use BlobReader directly.
@@ -687,6 +693,8 @@ impl Snapshot {
                     metrics: SnapshotMetrics::default(),
                     spool_directory: run_directory.to_path_buf(),
                     _local_object_bridge: local_bridge,
+                    #[cfg(target_os = "linux")]
+                    async_observation: None,
                 }),
                 _pin: pin,
             }),
@@ -707,11 +715,15 @@ impl Snapshot {
         Ok(())
     }
     pub fn remote_failure(&self) -> Option<String> {
-        self.state()
-            .ok()
-            .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
+        self.state().ok().and_then(|s| {
+            #[cfg(target_os = "linux")]
+            if let Some((_, Some(failure))) = &s.async_observation {
+                return Some(failure.clone());
+            }
+            s.remote.as_ref().and_then(|r| r.failure())
+        })
     }
-    fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
+    pub(crate) fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
         let kind = match mode {
             0o040000 => EntryKind::Directory,
             0o100644 | 0o100755 => EntryKind::File,
@@ -853,6 +865,44 @@ impl Snapshot {
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
         self.state()?.open(oid)
     }
+    /// Startup-only handoff: the local decoder gets its own libgit2 handle.
+    /// Invocation pin/alternate aliases and the anchored raw directory remain
+    /// owned until both the mounted loop and the ordinary Snapshot have ended.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn async_source(&self) -> Result<Option<crate::snapshot_async::Snapshot>> {
+        let state = self.state()?;
+        if state.remote.is_some() {
+            return Ok(None);
+        }
+        let repo = if let Some(bridge) = &state._local_object_bridge {
+            Repository::open_bare(bridge.path())?
+        } else {
+            Repository::open_ext(
+                state.repo.path(),
+                RepositoryOpenFlags::FROM_ENV,
+                &[] as &[&Path],
+            )?
+        };
+        repo.remove_namespace()?;
+        let (fd, owner) = state
+            .raw_blobs
+            .as_ref()
+            .context("raw storage not initialized")?
+            .directory_anchor()?;
+        crate::snapshot_async::Snapshot::new(repo, fd, owner).map(Some)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_async_observation(
+        &self,
+        metrics: SnapshotMetrics,
+        failure: Option<String>,
+    ) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .async_observation = Some((metrics, failure));
+    }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
         // verified store without allocating/registering a temporary ActiveBlob.
@@ -959,6 +1009,21 @@ impl Snapshot {
                 metrics.active_spool_bytes =
                     metrics.active_spool_bytes.saturating_add(reader.data.len());
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some((observed, _)) = &state.async_observation {
+            #[cfg(feature = "test-metrics")]
+            {
+                let mut observed = observed.clone();
+                observed.fuse_requests = metrics.fuse_requests;
+                observed.passthrough_handles = metrics.passthrough_handles;
+                observed.generated_read_callbacks = metrics.generated_read_callbacks;
+                observed.generated_write_callbacks = metrics.generated_write_callbacks;
+                observed.file_sync_callbacks = metrics.file_sync_callbacks;
+                return observed;
+            }
+            #[cfg(not(feature = "test-metrics"))]
+            return observed.clone();
         }
         metrics
     }

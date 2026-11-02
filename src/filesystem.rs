@@ -112,7 +112,165 @@ pub struct Overlay {
     snapshot_time: SystemTime,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) enum ReadonlyLookup {
+    Ready(FileAttr),
+    Tree { path: PathBuf, oid: Oid },
+    Header { ino: u64, entry: Entry },
+}
+
 impl Overlay {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        &self._snapshot
+    }
+
+    /// Plan from prepared namespace state only. No object source or filesystem
+    /// operation occurs under the adapter's short mutable state borrow.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn readonly_lookup(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+    ) -> FsResult<ReadonlyLookup> {
+        debug_assert!(self.read_only());
+        let node = self.node(parent)?;
+        if node.attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let component = Self::child_name(name)?;
+        let parent_path = node.snapshot_path.as_deref().ok_or(libc::EIO)?;
+        let Some(key) = self.source_directory_keys.get(parent_path) else {
+            return Ok(ReadonlyLookup::Tree {
+                path: parent_path.to_path_buf(),
+                oid: node.oid.ok_or(libc::EIO)?,
+            });
+        };
+        let directory = &self.source_directories[*key];
+        let index = directory.tree.index(component).ok_or(libc::ENOENT)?;
+        let ino = directory.base + index as u64;
+        if self.nodes.contains_key(&ino) {
+            return self.finish_readonly_lookup(ino).map(ReadonlyLookup::Ready);
+        }
+        let (mode, oid) = directory.tree.metadata_at(index).ok_or(libc::EIO)?;
+        let entry = Snapshot::metadata(mode, oid, Path::new(name)).map_err(snapshot_errno)?;
+        if entry.kind == EntryKind::Directory {
+            let path = parent_path.join(name);
+            self.insert_source_inode(&path, path.clone(), entry, ino)?;
+            self.finish_readonly_lookup(ino).map(ReadonlyLookup::Ready)
+        } else {
+            Ok(ReadonlyLookup::Header { ino, entry })
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn finish_readonly_lookup(&mut self, ino: u64) -> FsResult<FileAttr> {
+        let node = self.node_mut(ino)?;
+        node.lookups = node.lookups.saturating_add(1);
+        Ok(node.attr)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn complete_readonly_lookup(
+        &mut self,
+        ino: u64,
+        mut entry: Entry,
+        size: u64,
+    ) -> FsResult<FileAttr> {
+        if !self.nodes.contains_key(&ino) {
+            entry.size = Some(size);
+            self.insert_source_inode(Path::new(""), PathBuf::new(), entry, ino)?;
+        }
+        self.finish_readonly_lookup(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_readonly_directory(
+        &mut self,
+        path: PathBuf,
+        tree: Arc<crate::tree::Directory>,
+    ) -> FsResult<()> {
+        if !self.source_directory_keys.contains_key(&path) {
+            self.insert_source_directory(path, tree)?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn readonly_directory_demand(&self, ino: u64) -> FsResult<Option<(PathBuf, Oid)>> {
+        let node = self.node(ino)?;
+        if node.attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let path = node.snapshot_path.as_ref().ok_or(libc::EIO)?;
+        Ok((!self.source_directory_keys.contains_key(path))
+            .then(|| (path.clone(), node.oid.unwrap())))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_prepared_directory(&mut self, ino: u64, flags: i32) -> FsResult<u64> {
+        debug_assert!(self.read_only());
+        let path = self.path(ino)?;
+        if let Some(parent) = path.parent() {
+            if !self
+                .paths
+                .get(parent)
+                .is_some_and(|ino| self.nodes.contains_key(ino))
+            {
+                // Its tree/range was prepared on the way to this child. FORGET
+                // may reclaim a parent node, but cannot discard that identity.
+                let key = *self
+                    .source_directory_keys
+                    .get(parent.parent().unwrap_or(Path::new("")))
+                    .ok_or(libc::EIO)?;
+                let directory = &self.source_directories[key];
+                let index = directory
+                    .tree
+                    .index(parent.file_name().ok_or(libc::EIO)?)
+                    .ok_or(libc::EIO)?;
+                let parent_ino = directory.base + index as u64;
+                let (mode, oid) = directory.tree.metadata_at(index).ok_or(libc::EIO)?;
+                let entry = Snapshot::metadata(mode, oid, parent).map_err(snapshot_errno)?;
+                self.insert_source_inode(parent, parent.to_path_buf(), entry, parent_ino)?;
+            }
+        }
+        self.open_directory(ino, flags)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pin_request(&mut self, ino: u64) {
+        if ino != 1 {
+            *self.directory_refs.entry(ino).or_default() += 1;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn unpin_request(&mut self, ino: u64) {
+        if ino != 1 {
+            self.release_directory_ref(ino);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn readonly_read(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+        offset: u64,
+        size: u32,
+    ) -> FsResult<(Oid, u64, u32)> {
+        if let Some(fh) = fh {
+            if self.handle(ino, fh)?.flags & libc::O_ACCMODE == libc::O_WRONLY {
+                return Err(libc::EBADF);
+            }
+        }
+        let attr = self.readonly_file_attributes(ino)?;
+        Ok((
+            self.node(ino)?.oid.ok_or(libc::EIO)?,
+            attr.size,
+            attr.size.saturating_sub(offset).min(u64::from(size)) as u32,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn readonly_link(&self, ino: u64) -> FsResult<(Oid, u64)> {
+        let node = self.node(ino)?;
+        if node.attr.kind != FileType::Symlink {
+            return Err(libc::EINVAL);
+        }
+        Ok((node.oid.ok_or(libc::EIO)?, node.attr.size))
+    }
     pub(crate) fn read_only(&self) -> bool {
         self.write_policy == WritePolicy::None
     }

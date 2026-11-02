@@ -63,13 +63,15 @@ pub struct Statistics {
 
 pub enum Session {
     #[cfg(target_os = "linux")]
-    Linux(fuser::BackgroundSession),
+    Linux(std::thread::JoinHandle<std::io::Result<()>>),
 }
 impl Session {
     pub fn join(self) -> std::io::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Linux(session) => session.join(),
+            Self::Linux(session) => session
+                .join()
+                .map_err(|_| std::io::Error::other("async FUSE event loop panicked"))?,
         }
     }
 }
@@ -81,18 +83,7 @@ pub fn mount(
 ) -> std::io::Result<Session> {
     #[cfg(target_os = "linux")]
     {
-        let mut config = fuser::Config::default();
-        config.mount_options = vec![
-            fuser::MountOption::FSName(format!("git-on:{id}")),
-            fuser::MountOption::Subtype("git-on".into()),
-            fuser::MountOption::NoSuid,
-            fuser::MountOption::NoDev,
-            fuser::MountOption::DefaultPermissions,
-        ];
-        if policy == crate::policy::WritePolicy::None {
-            config.mount_options.push(fuser::MountOption::RO);
-        }
-        fuser::spawn_mount(linux::Fuse::new(overlay), path, &config).map(Session::Linux)
+        linux::mount(overlay, path, id, policy).map(Session::Linux)
     }
     #[cfg(target_os = "macos")]
     {

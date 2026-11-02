@@ -40,6 +40,42 @@ Protocol packs and native decoder stdout can still need transient bounded-part
 staging; that I/O and all native children remain inside total-cost measurements.
 No global cache, recovery fallback or corrupt-spill retry is introduced.
 
+## Local asynchronous port (work in progress)
+
+The Linux mount adapter now uses the pinned local async-fuser adaptation in
+`crates/async-fuser`. One local event loop owns namespace state through RefCell,
+up to 16 outstanding native futures, and reusable request buffers. The adapter
+negotiates 128 KiB writes; the receive buffer also respects Linux's 8 KiB
+minimum before INIT. Pending callbacks do not prevent independent requests from
+running. Explicit unmount cleanup is awaited before runtime shutdown, and mount
+identity prevents cleanup from targeting a later filesystem at the same path.
+The original MIT licenses and separate diffs from both upstream sources are
+included with the local crates.
+
+The native local readonly mount now connects lookup/header demands, directory
+preparation, read and readlink to `snapshot_async.rs`, `source_async.rs` and
+`raw_blob_async.rs`. Trees, sizes, verified descriptors and the payload LRU belong
+to the loop. No namespace borrow survives a source or disk await. Only cold
+requests pin their inode while waiting; FORGET cannot reclaim it mid-request.
+A source boundary owns one decoder thread for libgit2's blocking API, with
+bounded chunk transfer; it is not a worker pool used by every callback. The
+local cache uses Rc-owned verified bytes and native io_uring file operations.
+A fitting working set performs no payload disk I/O, coalesces concurrent demand
+for an OID, and serves RAM hits while the decoder waits. Shared local bytes stay
+alive through FUSE reply completion without a payload copy. Session shutdown
+drains requests, awaits the source thread and then publishes final metrics.
+Objects up to 64 KiB cross the source boundary in one completely verified
+response; larger objects retain bounded streaming. Spill storage remains one
+file per OID.
+
+This is not yet a complete asynchronous core. Mutable policies, remote sources
+and hosts without io_uring still use the existing synchronous core. Required
+remaining work includes porting those paths, asynchronous writable-layer I/O,
+complete cancellation/cleanup verification, and paired performance acceptance
+with the complete mounted implementation. Component tests and protocol coverage do not establish
+issue #20 or merge readiness. No temporary profiler or benchmark harness is
+included in the source tree.
+
 ## Integrity and source decoding
 
 Every source object must match its canonical Git OID before publication.

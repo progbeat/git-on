@@ -47,4 +47,6 @@ inherits = "release"
 lto = "thin"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "=0.18.0", default-features = false }
+fuser = { package = "async-fuser", path = "crates/async-fuser", default-features = false, features = ["async"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
+tokio-uring = { path = "crates/tokio-uring", version = "=0.5.0" }

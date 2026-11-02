@@ -1,0 +1,1919 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+deleted file mode 100644
+--- a/.github/workflows/ci.yml
++++ /dev/null
+@@ -1,221 +0,0 @@
+-name: CI
+-
+-on:
+-  pull_request:
+-  push:
+-    branches:
+-      - master
+-  workflow_dispatch:
+-
+-jobs:
+-  compile:
+-    runs-on: ubuntu-24.04
+-    timeout-minutes: 10
+-    strategy:
+-      matrix:
+-        libfuse: [libfuse-dev, libfuse3-dev]
+-        features: [""]
+-
+-    env:
+-      RUSTFLAGS: --deny warnings
+-      RUSTDOCFLAGS: --deny warnings
+-
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: Cache
+-        id: rust-cache
+-        uses: actions/cache@v4
+-        with:
+-          path: |
+-            ~/.cargo/bin/
+-            ~/.cargo/registry/index/
+-            ~/.cargo/registry/cache/
+-            ~/.cargo/git/db/
+-            ~/.rustup/toolchains/
+-            target/
+-          key: ${{ runner.os }}-cargo-compile-v1-${{ matrix.libfuse }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+-
+-      - name: Non ASCII characters
+-        if: startsWith(matrix.os, 'ubuntu')
+-        run: |
+-          if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
+-          echo "Non-ASCII characters detected"
+-          exit 1
+-          fi
+-
+-      - name: Install packages
+-        run: |
+-          sudo apt update
+-          sudo apt install -y ${{ matrix.libfuse }} build-essential
+-
+-      - name: Install Rust
+-        if: steps.rust-cache.outputs.cache-hit != 'true'
+-        run: |
+-          rustup target add x86_64-unknown-linux-musl
+-
+-      - name: Run tests
+-        run: |
+-          cargo build --all --all-targets --features=libfuse,${{ matrix.features }}
+-          cargo build --all --all-targets --features=${{ matrix.features }}
+-          cargo build --target=x86_64-unknown-linux-musl
+-          cargo test --all --features=libfuse,${{ matrix.features }}
+-          cargo test --all --features=${{ matrix.features }}
+-          cargo doc --all --no-deps --features=${{ matrix.features }}
+-          make test_passthrough
+-
+-  ci:
+-    runs-on: ubuntu-24.04
+-    timeout-minutes: 10
+-    env:
+-      RUSTFLAGS: --deny warnings
+-      RUSTDOCFLAGS: --deny warnings
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: Cache
+-        id: rust-cache
+-        uses: actions/cache@v4
+-        with:
+-          path: |
+-            ~/.cargo/bin/
+-            ~/.cargo/registry/index/
+-            ~/.cargo/registry/cache/
+-            ~/.cargo/git/db/
+-            ~/.rustup/toolchains/
+-            target/
+-          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+-
+-      - name: Install packages
+-        run: |
+-          sudo apt update
+-          sudo apt install -y libfuse-dev libfuse3-dev build-essential
+-
+-      - name: Install Rust
+-        run: |
+-          rustup component add rustfmt
+-          rustup component add clippy
+-          rustc --version
+-          cargo --version
+-
+-      - name: Install cargo-deny
+-        if: steps.rust-cache.outputs.cache-hit != 'true'
+-        run: cargo install --force --version 0.16.2 cargo-deny --locked
+-
+-      - name: Run tests
+-        run: INTERACTIVE="" make pre
+-
+-  mac-ci:
+-    runs-on: macos-26
+-    env:
+-      RUSTFLAGS: --deny warnings
+-      RUSTDOCFLAGS: --deny warnings
+-      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: Cache
+-        id: rust-cache
+-        uses: actions/cache@v4
+-        with:
+-          path: |
+-            ~/.cargo/bin/
+-            ~/.cargo/registry/index/
+-            ~/.cargo/registry/cache/
+-            ~/.cargo/git/db/
+-            ~/.rustup/toolchains/
+-            target/
+-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-compile-v1-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+-
+-      - name: Install packages
+-        run: |
+-          brew update > /dev/null && brew install autoconf automake
+-          brew install --cask macfuse
+-
+-      - name: Install Rust
+-        run: |
+-          rustup component add rustfmt
+-          rustup component add clippy
+-          rustc --version
+-          cargo --version
+-
+-      - name: Install cargo-deny
+-        if: steps.rust-cache.outputs.cache-hit != 'true'
+-        run: cargo install --force --version 0.16.2 cargo-deny --locked
+-
+-      - name: Build
+-        run: |
+-          cargo check --features=macos-no-mount
+-          cargo build --all --all-targets
+-          cargo build --all --all-targets --all-features
+-
+-      - name: Docs
+-        run: cargo doc --all --no-deps --all-features
+-
+-      - name: Lint
+-        run: INTERACTIVE="" make pre
+-
+-  freebsd-ci:
+-    runs-on: ubuntu-24.04
+-    timeout-minutes: 30
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: FreeBSD CI
+-        uses: cross-platform-actions/action@v1.0.0
+-        with:
+-          operating_system: freebsd
+-          version: "14.3"
+-          shell: bash
+-          run: |
+-            sudo kldload fusefs
+-            sudo pkg install -y rust bash
+-            # PJDFS setup
+-            # /etc/fuse.conf isn't used on FreeBSD, but simple.rs uses it
+-            echo user_allow_other | sudo tee /etc/fuse.conf
+-            sudo pkg install -y automake autoconf git
+-            cd /tmp
+-            git clone https://github.com/fleetfs/pjdfstest
+-            cd pjdfstest
+-            git checkout d3beed6f5f15c204a8af3df2f518241931a42e94
+-            autoreconf -ifs
+-            ./configure
+-            make pjdfstest
+-            cd $GITHUB_WORKSPACE
+-
+-            # BSD not supported but we still want to keep sync tested to
+-            # align with the upstream
+-            cargo build --all --all-targets --no-default-features
+-            cargo doc --all --no-deps --no-default-features
+-            cargo test --all --all-targets --no-default-features -- --skip=mnt::test::mount_unmount
+-            sudo cargo run -p fuser-tests -- bsd-mount
+-
+-            sudo ./tests/bsd_pjdfs.sh
+-            # Clean up root-owned files so cross-platform-actions rsync teardown doesn't fail
+-            sudo rm -rf target
+-
+-  test:
+-    runs-on: ubuntu-24.04
+-    timeout-minutes: 120
+-    strategy:
+-      matrix:
+-        test_group: [mount_tests, pjdfs_tests, xfstests]
+-
+-    steps:
+-      # https://github.com/marketplace/actions/maximize-build-disk-space-only-remove-unwanted-software
+-      - name: Maximize build space
+-        uses: AdityaGarg8/remove-unwanted-software@v5
+-        with:
+-          remove-android: "true"
+-          remove-dotnet: "true"
+-          remove-haskell: "true"
+-          remove-codeql: "true"
+-          # remove-docker-images: 'true'
+-          remove-large-packages: "true"
+-          remove-cached-tools: "true"
+-          # verbose: 'true'
+-
+-      - uses: actions/checkout@v4
+-
+-      - name: Run tests
+-        run: INTERACTIVE="" make ${{ matrix.test_group }}
+diff --git a/examples/async_hello.rs b/examples/async_hello.rs
+--- a/examples/async_hello.rs
++++ b/examples/async_hello.rs
+@@ -70,7 +70,6 @@
+ 
+ struct HelloFS;
+ 
+-#[async_trait::async_trait]
+ impl AsyncFilesystem for HelloFS {
+     async fn lookup(
+         &self,
+diff --git a/examples/simple_async.rs b/examples/simple_async.rs
+--- a/examples/simple_async.rs
++++ b/examples/simple_async.rs
+@@ -547,7 +547,6 @@
+     CreateResponse::new(Duration::ZERO, attrs.into(), Generation(0), fh, flags)
+ }
+ 
+-#[async_trait::async_trait]
+ impl AsyncFilesystem for SimpleFS {
+     async fn init(
+         &mut self,
+diff --git a/rust-toolchain b/rust-toolchain
+deleted file mode 100644
+--- a/rust-toolchain
++++ /dev/null
+@@ -1 +0,0 @@
+-1.85
+diff --git a/src/channel_async.rs b/src/channel_async.rs
+--- a/src/channel_async.rs
++++ b/src/channel_async.rs
+@@ -16,7 +16,7 @@
+ /// provides async APIs for receiving data.
+ #[cfg(feature = "async")]
+ #[derive(Debug, Clone)]
+-pub(crate) struct AsyncChannel(Arc<AsyncDevFuse>);
++pub(crate) struct AsyncChannel(pub(crate) Arc<AsyncDevFuse>);
+ 
+ impl AsFd for AsyncChannel {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+@@ -35,7 +35,11 @@
+     /// Receives data up to the capacity of the given buffer.
+     async fn receive(&self, buffer: &mut [u8]) -> tokio::io::Result<usize> {
+         loop {
+-            let mut guard = self.0.0.readable().await?;
++            let mut guard = self
++                .0
++                .0
++                .ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR)
++                .await?;
+             match guard.try_io(|inner| {
+                 nix::unistd::read(inner.get_ref(), buffer)
+                     .map_err(|e| tokio::io::Error::from_raw_os_error(e as i32))
+@@ -110,7 +114,11 @@
+ impl AsyncChannelSender {
+     pub(crate) async fn send(&self, bufs: &[std::io::IoSlice<'_>]) -> tokio::io::Result<()> {
+         loop {
+-            let mut guard = self.0.0.writable().await?;
++            let mut guard = self
++                .0
++                .0
++                .ready(tokio::io::Interest::WRITABLE | tokio::io::Interest::ERROR)
++                .await?;
+ 
+             match guard.try_io(|inner| {
+                 nix::sys::uio::writev(inner.get_ref(), bufs)
+@@ -118,7 +126,13 @@
+                     .map_err(tokio::io::Error::from)
+             }) {
+                 Ok(rc) => {
+-                    debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc?);
++                    let written = rc?;
++                    if written != bufs.iter().map(|b| b.len()).sum::<usize>() {
++                        return Err(tokio::io::Error::new(
++                            tokio::io::ErrorKind::WriteZero,
++                            "short FUSE reply",
++                        ));
++                    }
+                     return Ok(());
+                 }
+                 Err(_would_block) => continue,
+@@ -126,3 +140,29 @@
+         }
+     }
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++    use std::{io::IoSlice, os::fd::OwnedFd, time::Duration};
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn failed_reply_is_an_error_in_release_builds_too() {
++        let (device, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
++        let fd: OwnedFd = device.into();
++        let channel = AsyncChannel::new(Arc::new(
++            AsyncDevFuse::from_file(std::fs::File::from(fd)).unwrap(),
++        ));
++        drop(peer);
++        let result = tokio::time::timeout(
++            Duration::from_secs(2),
++            channel.sender().send(&[IoSlice::new(b"reply")]),
++        )
++        .await
++        .expect("disconnected peer did not wake the reply transport");
++        assert!(
++            result.is_err(),
++            "failed write was reported as a successful reply"
++        );
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -104,6 +104,10 @@
+ mod notify;
+ mod open_flags;
+ mod passthrough;
++#[cfg(feature = "async")]
++mod passthrough_async;
++#[cfg(feature = "async")]
++pub use passthrough_async::{AsyncBackingId, AsyncBackingRegistrar};
+ mod poll_events;
+ mod read_buf;
+ mod rename_flags;
+diff --git a/src/lib_async.rs b/src/lib_async.rs
+--- a/src/lib_async.rs
++++ b/src/lib_async.rs
+@@ -38,8 +38,8 @@
+ /// This API is intended for more IO-bound workloads (e.g. network filesystems), where an
+ /// async model can improve performance by allowing concurrent request handling and
+ /// integrating cleanly with other asynchronous systems.
+-#[async_trait::async_trait]
+-pub trait AsyncFilesystem: Send + Sync + 'static {
++#[allow(async_fn_in_trait)]
++pub trait AsyncFilesystem: 'static {
+     /// Initialize the filesystem. This is called before the kernel is ready to start sending requests
+     /// and to let the filesystem know certain configuration details.
+     async fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+@@ -50,6 +50,12 @@
+     /// lifetime that won't be automatically cleaned up.
+     fn destroy(&mut self) {}
+ 
++    /// Drain filesystem-owned asynchronous work after request futures settle,
++    /// before synchronous destruction. Also called when INIT fails.
++    async fn shutdown(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++
+     /// Look up an entry by name and get its attributes. This is called
+     /// by the kernel when it needs to know if a file exists and what its attributes are.
+     async fn lookup(
+@@ -62,7 +68,7 @@
+             "lookup not implemented for parent inode {}, name {:?}",
+             parent, name
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Get the attributes of an entry. This is called by the kernel when it needs to know the attributes of
+@@ -74,7 +80,7 @@
+         file_handle: Option<FileHandle>,
+     ) -> Result<GetAttrResponse, Errno> {
+         warn!("getattr not implemented for inode {}", ino);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Forget about an inode. Internal only, the kernel is just making us aware for
+@@ -105,13 +111,13 @@
+             "setattr not implemented for inode {}, mode {:?}, uid {:?}, gid {:?}, size {:?}, fh {:?}, flags {:?}",
+             ino, mode, uid, gid, size, fh, flags
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Read a symbolic link.
+     async fn readlink(&self, req: &Request, ino: INodeNo) -> Result<DataResponse, Errno> {
+         warn!("readlink not implemented for inode {}", ino);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Create file node.
+@@ -128,7 +134,7 @@
+             "mknod not implemented for parent inode {}, name {:?}, mode {}, umask {}, rdev {}",
+             parent, name, mode, umask, rdev
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Create a directory.
+@@ -144,7 +150,7 @@
+             "mkdir not implemented for parent inode {}, name {:?}, mode {}, umask {}",
+             parent, name, mode, umask
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Remove a file.
+@@ -153,7 +159,7 @@
+             "unlink not implemented for parent inode {}, name {:?}",
+             parent, name
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Remove a directory.
+@@ -162,7 +168,7 @@
+             "rmdir not implemented for parent inode {}, name {:?}",
+             parent, name
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Create a symbolic link.
+@@ -177,7 +183,7 @@
+             "symlink not implemented for parent inode {}, link_name {:?}, target {:?}",
+             parent, link_name, target
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Rename a file.
+@@ -194,7 +200,7 @@
+             "rename not implemented for parent inode {}, name {:?}, newparent {}, newname {:?}, flags {:?}",
+             parent, name, newparent, newname, flags
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Create a hard link.
+@@ -209,7 +215,7 @@
+             "link not implemented for inode {}, newparent {}, newname {:?}",
+             ino, newparent, newname
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Open a file.
+@@ -220,7 +226,7 @@
+         flags: OpenFlags,
+     ) -> Result<OpenResponse, Errno> {
+         warn!("open not implemented for inode {}, flags {:?}", ino, flags);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Return the data of a file. This is called by the kernel when it needs to read the contents
+@@ -239,7 +245,7 @@
+             "read not implemented for inode {}, offset {}, size {}",
+             ino, offset, size
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Write data.
+@@ -272,7 +278,7 @@
+             offset,
+             data.len()
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Flush method.
+@@ -301,7 +307,7 @@
+         flush: bool,
+     ) -> Result<(), Errno> {
+         warn!("release not implemented for inode {}, fh {:?}", ino, fh);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Open a directory.
+@@ -315,7 +321,7 @@
+             "opendir not implemented for inode {}, flags {:?}",
+             ino, flags
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Construct a directory listing response for the given directory inode. This is called by
+@@ -332,7 +338,7 @@
+             "readdir not implemented for inode {}, offset {}, size {}",
+             ino, offset, size
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Release an open directory.
+@@ -344,7 +350,7 @@
+         flags: OpenFlags,
+     ) -> Result<(), Errno> {
+         warn!("releasedir not implemented for inode {}, fh {:?}", ino, fh);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Construct a directory listing response with attributes.
+@@ -396,7 +402,7 @@
+     /// Get file system statistics.
+     async fn statfs(&self, req: &Request, ino: INodeNo) -> Result<StatfsResponse, Errno> {
+         warn!("statfs not implemented for inode {}", ino);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Set an extended attribute.
+@@ -413,7 +419,7 @@
+             "setxattr not implemented for inode {}, name {:?}, flags {}, position {}",
+             ino, name, flags, position
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Get an extended attribute.
+@@ -428,7 +434,7 @@
+             "getxattr not implemented for inode {}, name {:?}, size {}",
+             ino, name, size
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// List extended attribute names.
+@@ -439,7 +445,7 @@
+         size: u32,
+     ) -> Result<XattrResponse, Errno> {
+         warn!("listxattr not implemented for inode {}, size {}", ino, size);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Remove an extended attribute.
+@@ -448,13 +454,13 @@
+             "removexattr not implemented for inode {}, name {:?}",
+             ino, name
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Check file access permissions.
+     async fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags) -> Result<(), Errno> {
+         warn!("access not implemented for inode {}, mask {:?}", ino, mask);
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Create and open a file.
+@@ -471,7 +477,7 @@
+             "create not implemented for parent inode {}, name {:?}, mode {}, umask {}, flags {}",
+             parent, name, mode, umask, flags
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Preallocate or deallocate file space.
+@@ -488,7 +494,7 @@
+             "fallocate not implemented for inode {}, offset {}, length {}, mode {}",
+             ino, offset, length, mode
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Control device.
+@@ -531,7 +537,7 @@
+             "copy_file_range not implemented for src ({}, {}, {}), dest ({}, {}, {}), len {}, flags {:?}",
+             ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
+         );
+-        Err(Errno::ENOTSUP)
++        Err(Errno::ENOSYS)
+     }
+ 
+     /// Reposition read/write file offset.
+diff --git a/src/ll/reply.rs b/src/ll/reply.rs
+--- a/src/ll/reply.rs
++++ b/src/ll/reply.rs
+@@ -36,7 +36,7 @@
+         None
+     }
+ 
+-    fn payload(&self) -> impl IosliceConcat + Send;
++    fn payload(&self) -> impl IosliceConcat;
+ 
+     fn with_iovec<F: FnOnce(&[IoSlice<'_>]) -> T, T>(&self, unique: RequestId, f: F) -> T {
+         let payload = self.payload();
+@@ -57,10 +57,7 @@
+         &'a self,
+         sender: &'a AsyncChannelSender,
+         unique: RequestId,
+-    ) -> impl Future<Output = Result<(), tokio::io::Error>> + Send + 'a
+-    where
+-        Self: Sync,
+-    {
++    ) -> impl Future<Output = Result<(), tokio::io::Error>> + 'a {
+         async move {
+             let payload = self.payload();
+             let payload_len = payload.sum_len();
+diff --git a/src/ll/reply_async/create.rs b/src/ll/reply_async/create.rs
+--- a/src/ll/reply_async/create.rs
++++ b/src/ll/reply_async/create.rs
+@@ -19,6 +19,7 @@
+     generation: Generation,
+     fh: FileHandle,
+     flags: FopenFlags,
++    backing: Option<std::sync::Arc<crate::AsyncBackingId>>,
+ }
+ 
+ impl CreateResponse {
+@@ -36,7 +37,14 @@
+             generation,
+             fh,
+             flags,
++            backing: None,
+         }
++    }
++    /// Attach a backing registration and retain it through reply transmission.
++    pub fn with_backing(mut self, id: std::sync::Arc<crate::AsyncBackingId>) -> Self {
++        self.flags |= FopenFlags::FOPEN_PASSTHROUGH;
++        self.backing = Some(id);
++        self
+     }
+ }
+ 
+@@ -48,7 +56,7 @@
+             self.generation,
+             self.fh,
+             self.flags,
+-            0,
++            self.backing.as_ref().map_or(0, |b| b.id),
+         )
+     }
+ }
+diff --git a/src/ll/reply_async/data.rs b/src/ll/reply_async/data.rs
+--- a/src/ll/reply_async/data.rs
++++ b/src/ll/reply_async/data.rs
+@@ -8,17 +8,26 @@
+ /// Response data from async operations that return a byte buffer.
+ #[derive(Debug)]
+ pub struct DataResponse {
+-    data: Vec<u8>,
++    data: super::read::ReadResponse,
+ }
+ 
+ impl DataResponse {
+     /// Creates a new [`DataResponse`] with the provided bytes.
+     pub fn new(data: Vec<u8>) -> Self {
+-        Self { data }
++        Self {
++            data: super::read::ReadResponse::new(data),
++        }
++    }
++
++    /// Return shared immutable local bytes without copying their payload.
++    pub fn from_local_slice(data: std::rc::Rc<Vec<u8>>, offset: usize, size: usize) -> Self {
++        Self {
++            data: super::read::ReadResponse::from_local_slice(data, offset, size),
++        }
+     }
+ 
+     fn bytes(&self) -> &[u8] {
+-        self.data.as_slice()
++        self.data.bytes()
+     }
+ }
+ 
+diff --git a/src/ll/reply_async/ioctl.rs b/src/ll/reply_async/ioctl.rs
+--- a/src/ll/reply_async/ioctl.rs
++++ b/src/ll/reply_async/ioctl.rs
+@@ -31,7 +31,7 @@
+ }
+ 
+ impl Response for IoctlResponse {
+-    fn payload(&self) -> impl crate::ll::ioslice_concat::IosliceConcat + Send {
++    fn payload(&self) -> impl crate::ll::ioslice_concat::IosliceConcat {
+         (
+             [IoSlice::new(self.out.as_bytes())],
+             Some([IoSlice::new(&self.data)]).filter(|_| !self.data.is_empty()),
+diff --git a/src/ll/reply_async/open.rs b/src/ll/reply_async/open.rs
+--- a/src/ll/reply_async/open.rs
++++ b/src/ll/reply_async/open.rs
+@@ -11,17 +11,32 @@
+ pub struct OpenResponse {
+     fh: FileHandle,
+     flags: FopenFlags,
++    backing: Option<std::sync::Arc<crate::AsyncBackingId>>,
+ }
+ 
+ impl OpenResponse {
+     /// Creates a new [`OpenResponse`].
+     pub fn new(fh: FileHandle, flags: FopenFlags) -> Self {
+-        Self { fh, flags }
++        Self {
++            fh,
++            flags,
++            backing: None,
++        }
++    }
++    /// Attach a backing registration and retain it through reply transmission.
++    pub fn with_backing(mut self, id: std::sync::Arc<crate::AsyncBackingId>) -> Self {
++        self.flags |= FopenFlags::FOPEN_PASSTHROUGH;
++        self.backing = Some(id);
++        self
+     }
+ }
+ 
+ impl Response for OpenResponse {
+     fn payload(&self) -> impl IosliceConcat {
+-        ResponseStruct::new_open(self.fh, self.flags, 0)
++        ResponseStruct::new_open(
++            self.fh,
++            self.flags,
++            self.backing.as_ref().map_or(0, |b| b.id),
++        )
+     }
+ }
+diff --git a/src/ll/reply_async/read.rs b/src/ll/reply_async/read.rs
+--- a/src/ll/reply_async/read.rs
++++ b/src/ll/reply_async/read.rs
+@@ -13,6 +13,11 @@
+     Owned(Vec<u8>),
+     Shared {
+         data: Arc<[u8]>,
++        start: usize,
++        end: usize,
++    },
++    Local {
++        data: std::rc::Rc<Vec<u8>>,
+         start: usize,
+         end: usize,
+     },
+@@ -43,10 +48,25 @@
+         }
+     }
+ 
+-    fn bytes(&self) -> &[u8] {
++    /// Keep immutable event-loop-owned contents alive through reply completion.
++    /// The range is clamped in the same way as the thread-safe shared form.
++    pub fn from_local_slice(
++        data: std::rc::Rc<Vec<u8>>,
++        offset: usize,
++        size: usize,
++    ) -> ReadResponse {
++        let start = offset.min(data.len());
++        let end = start.saturating_add(size).min(data.len());
++        ReadResponse {
++            data: ReadResponseData::Local { data, start, end },
++        }
++    }
++
++    pub(super) fn bytes(&self) -> &[u8] {
+         match &self.data {
+             ReadResponseData::Owned(data) => data.as_slice(),
+             ReadResponseData::Shared { data, start, end } => &data[*start..*end],
++            ReadResponseData::Local { data, start, end } => &data[*start..*end],
+         }
+     }
+ }
+@@ -73,4 +93,15 @@
+         let response = ReadResponse::from_shared_slice(Arc::from(&b"abcdef"[..]), 99, 4);
+         assert_eq!(response.bytes(), b"");
+     }
++
++    #[test]
++    fn local_slice_keeps_original_allocation_alive_without_copying() {
++        let data = std::rc::Rc::new(b"abcdef".to_vec());
++        let ptr = data.as_ptr();
++        let response = ReadResponse::from_local_slice(data.clone(), 2, usize::MAX);
++        assert_eq!(std::rc::Rc::strong_count(&data), 2);
++        drop(data);
++        assert_eq!(response.bytes(), b"cdef");
++        assert_eq!(response.bytes().as_ptr(), unsafe { ptr.add(2) });
++    }
+ }
+diff --git a/src/ll/request_async/mod.rs b/src/ll/request_async/mod.rs
+--- a/src/ll/request_async/mod.rs
++++ b/src/ll/request_async/mod.rs
+@@ -17,7 +17,6 @@
+ use crate::ll::Errno;
+ use crate::ll::ResponseEmpty;
+ use crate::ll::ResponseErrno;
+-use crate::ll::fuse_abi::fuse_in_header;
+ use crate::ll::reply::Response;
+ use crate::session::SessionACL;
+ use crate::session_async::AsyncSessionEventLoop;
+@@ -25,32 +24,24 @@
+ /// Asynchronous request data structure (request from the kernel along with a
+ /// channel sender clone for sending the reply).
+ #[derive(Debug)]
+-pub(crate) struct AsyncRequestWithSender {
++pub(crate) struct AsyncRequestWithSender<'a> {
+     /// Async sender for sending the reply
+     ch: AsyncChannelSender,
+-    /// Request header copied out of the kernel buffer so the request can be moved to a task.
+-    header: fuse_in_header,
+-    /// Owned request buffer used to re-parse the operation during dispatch.
+-    data: Box<[u8]>,
++    pub(crate) request: ll::AnyRequest<'a>,
+ }
+ 
+-impl AsyncRequestWithSender {
++impl<'a> AsyncRequestWithSender<'a> {
+     /// Create a new request from the given data.
+     pub(crate) fn new(
+         ch: AsyncChannelSender,
+-        data: &[u8],
+-    ) -> Result<AsyncRequestWithSender, tokio::io::Error> {
++        data: &'a [u8],
++    ) -> Result<AsyncRequestWithSender<'a>, tokio::io::Error> {
+         let request = ll::AnyRequest::try_from(data).map_err(|err| {
+             error!("Failed to parse request from kernel: {}", err);
+             tokio::io::Error::new(tokio::io::ErrorKind::InvalidData, "Failed to parse request")
+         })?;
+ 
+-        Ok(Self {
+-            ch,
+-            // SAFETY: `fuse_in_header` is a plain FUSE ABI POD struct with no drop glue.
+-            header: unsafe { std::ptr::read(request.header()) },
+-            data: data.to_vec().into_boxed_slice(),
+-        })
++        Ok(Self { ch, request })
+     }
+ 
+     /// Async dispatch request to the given filesystem, takes the return from the filesystem and
+@@ -59,7 +50,9 @@
+     pub(crate) async fn dispatch<FS: AsyncFilesystem>(&self, session: &AsyncSessionEventLoop<FS>) {
+         debug!(
+             "FUSE({}) ino {:#018x} thread={}",
+-            self.header.unique, self.header.nodeid, session.thread_name
++            self.request.header().unique,
++            self.request.header().nodeid,
++            session.thread_name
+         );
+ 
+         if let Err(errno) = self.dispatch_req(session).await {
+@@ -67,7 +60,7 @@
+             self.reply(&response).await.unwrap_or_else(|e| {
+                 error!(
+                     "Failed to send error reply for request {}: {e:?}",
+-                    self.header.unique
++                    self.request.header().unique
+                 );
+             });
+         }
+@@ -79,7 +72,7 @@
+         &self,
+         session: &AsyncSessionEventLoop<FS>,
+     ) -> Result<(), Errno> {
+-        let request = self.request()?;
++        let request = &self.request;
+         let operation = request.operation().map_err(|_| Errno::ENOSYS)?;
+         let req_uid = nix::unistd::Uid::from_raw(self.request_header().uid());
+         if (session.allowed == SessionACL::RootAndOwner
+@@ -506,7 +499,7 @@
+     }
+ 
+     // Reply to the kernel with the given response payload, it should be called at most once per request.
+-    pub(crate) async fn reply<R: Response + Sync>(&self, response: &R) -> Result<(), Errno> {
++    pub(crate) async fn reply<R: Response>(&self, response: &R) -> Result<(), Errno> {
+         response
+             .send_reply(&self.ch, self.request_header().unique())
+             .await?;
+@@ -514,20 +507,13 @@
+     }
+ 
+     // Helper function to reply with an empty payload (operations that don't need a response to the kernel).
+-    async fn reply_empty(&self) -> Result<(), Errno> {
++    pub(crate) async fn reply_empty(&self) -> Result<(), Errno> {
+         self.reply(&ResponseEmpty).await
+     }
+ 
+     /// Returns a Request reference for this request
+     #[inline]
+     fn request_header(&self) -> &Request {
+-        Request::ref_cast(&self.header)
+-    }
+-
+-    fn request(&self) -> Result<ll::AnyRequest<'_>, Errno> {
+-        ll::AnyRequest::try_from(&self.data[..]).map_err(|err| {
+-            error!("Failed to re-parse owned request buffer: {}", err);
+-            Errno::EIO
+-        })
++        Request::ref_cast(self.request.header())
+     }
+ }
+diff --git a/src/mnt/fuse_async_pure.rs b/src/mnt/fuse_async_pure.rs
+--- a/src/mnt/fuse_async_pure.rs
++++ b/src/mnt/fuse_async_pure.rs
+@@ -79,9 +79,6 @@
+         tokio::spawn(async {
+             // Wait for unmount signal
+             let Ok(mut mount) = rx.await else {
+-                warn!(
+-                    "Unmount signal channel closed, mounting may not have completed successfully",
+-                );
+                 return;
+             };
+ 
+@@ -126,6 +123,11 @@
+         .map_err(|_err| io::Error::other("blocking task panicked"))?
+     }
+ 
++    /// Explicit cleanup or mount replacement makes the fallback unnecessary.
++    pub(crate) fn disarm(&mut self) {
++        self.unmount_tx.take();
++    }
++
+     /// Unmount the filesystem. This is a no-op if the filesystem is already unmounted.
+     pub(crate) fn umount_impl_sync(mut self) -> io::Result<()> {
+         if let Some(tx) = self.unmount_tx.take() {
+diff --git a/src/mnt/mod.rs b/src/mnt/mod.rs
+--- a/src/mnt/mod.rs
++++ b/src/mnt/mod.rs
+@@ -178,6 +178,8 @@
+ pub(crate) struct AsyncMount {
+     mount_impl: Option<AsyncMountImpl>,
+     mount_point: PathBuf,
++    #[cfg(target_os = "linux")]
++    mount_id: Option<Vec<u8>>,
+ }
+ 
+ #[cfg(feature = "async")]
+@@ -188,6 +190,8 @@
+         AsyncMount {
+             mount_impl: None,
+             mount_point: PathBuf::new(),
++            #[cfg(target_os = "linux")]
++            mount_id: None,
+         }
+     }
+ 
+@@ -199,7 +203,7 @@
+         options: &[MountOption],
+         acl: SessionACL,
+     ) -> tokio::io::Result<Self> {
+-        self.mount_point = mountpoint.to_path_buf();
++        self.mount_point = mountpoint.canonicalize()?;
+         let init_mount = fuse_async_pure::AsyncMountImpl::new(mountpoint)
+             .map_err(|e| tokio::io::Error::new(e.kind(), format!("AsyncMountImpl::new: {e}")))?;
+         self.mount_impl = Some(
+@@ -208,6 +212,10 @@
+                 .await
+                 .map_err(|e| tokio::io::Error::new(e.kind(), format!("mount_impl: {e}")))?,
+         );
++        #[cfg(target_os = "linux")]
++        {
++            self.mount_id = mount_id_at(&self.mount_point)?;
++        }
+         Ok(self)
+     }
+ 
+@@ -225,6 +233,38 @@
+         ))
+     }
+ 
++    /// Release this mount before the runtime that drives cleanup is shut down.
++    pub(crate) async fn unmount(&mut self) -> io::Result<()> {
++        let Some(mut mount) = self.mount_impl.take() else {
++            return Ok(());
++        };
++        #[cfg(target_os = "linux")]
++        {
++            let current = match mount_id_at(&self.mount_point) {
++                Ok(current) => current,
++                Err(error) => {
++                    self.mount_impl = Some(mount);
++                    return Err(error);
++                }
++            };
++            if current != self.mount_id {
++                // External unmount or a different filesystem now owns this path.
++                mount.disarm();
++                return Ok(());
++            }
++        }
++        if let Err(error) = mount.umount_impl().await {
++            self.mount_impl = Some(mount);
++            return Err(error);
++        }
++        mount.disarm();
++        #[cfg(target_os = "linux")]
++        {
++            self.mount_id = None;
++        }
++        Ok(())
++    }
++
+     /// Get a reference to the underlying [`AsyncDevFuse`]. This will return `None` if the filesystem is
+     /// not yet mounted.
+     pub(crate) fn dev_fuse(&self) -> Option<&Arc<AsyncDevFuse>> {
+@@ -232,14 +272,50 @@
+     }
+ }
+ 
++#[cfg(all(feature = "async", target_os = "linux"))]
++fn mount_id_at(path: &Path) -> io::Result<Option<Vec<u8>>> {
++    use std::os::unix::ffi::OsStrExt;
++    let table = std::fs::read("/proc/self/mountinfo")?;
++    let mut found = None;
++    for line in table.split(|&b| b == b'\n') {
++        let fields = line.split(|b| b.is_ascii_whitespace()).collect::<Vec<_>>();
++        if fields.len() < 5 {
++            continue;
++        }
++        let mut name = Vec::with_capacity(fields[4].len());
++        let mut input = fields[4];
++        while !input.is_empty() {
++            if input.len() >= 4
++                && input[0] == b'\\'
++                && input[1..4].iter().all(|b| (b'0'..=b'7').contains(b))
++            {
++                name.push((input[1] - b'0') * 64 + (input[2] - b'0') * 8 + input[3] - b'0');
++                input = &input[4..];
++            } else {
++                name.push(input[0]);
++                input = &input[1..];
++            }
++        }
++        if name == path.as_os_str().as_bytes() {
++            found = Some(fields[0].to_vec());
++        }
++    }
++    Ok(found)
++}
++
+ #[cfg(feature = "async")]
+ impl Drop for AsyncMount {
+     /// RAII unmount
+     fn drop(&mut self) {
+         // Mount was either unmounted explicitly, taken, or never mounted at all, so nothing to do.
+-        let Some(mount) = self.mount_impl.take() else {
++        let Some(mut mount) = self.mount_impl.take() else {
+             return;
+         };
++        #[cfg(target_os = "linux")]
++        if !matches!(mount_id_at(&self.mount_point), Ok(id) if id == self.mount_id) {
++            mount.disarm();
++            return;
++        }
+ 
+         mount
+             .umount_impl_sync()
+diff --git a/src/passthrough_async.rs b/src/passthrough_async.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passthrough_async.rs
+@@ -0,0 +1,44 @@
++//! Managed backing registrations for local asynchronous sessions.
++use crate::{BackingId, dev_fuse_async::AsyncDevFuse, ll::ioctl::fuse_dev_ioc_backing_close};
++use std::os::fd::{AsFd, AsRawFd};
++use std::sync::{Arc, Weak};
++
++/// Registers backing files on the live FUSE connection without owning it.
++#[derive(Clone, Debug)]
++pub struct AsyncBackingRegistrar {
++    channel: Weak<AsyncDevFuse>,
++}
++impl AsyncBackingRegistrar {
++    pub(crate) fn new(channel: &Arc<AsyncDevFuse>) -> Self {
++        Self {
++            channel: Arc::downgrade(channel),
++        }
++    }
++    /// Register a file until the returned managed ID is dropped.
++    pub fn open(&self, file: impl AsFd) -> std::io::Result<AsyncBackingId> {
++        let channel = self
++            .channel
++            .upgrade()
++            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
++        Ok(AsyncBackingId {
++            channel: Arc::downgrade(&channel),
++            id: BackingId::create_raw(channel.as_fd(), file)?,
++        })
++    }
++}
++/// A registration retained until all handles and pending replies release it.
++#[derive(Debug)]
++pub struct AsyncBackingId {
++    channel: Weak<AsyncDevFuse>,
++    pub(crate) id: u32,
++}
++impl Drop for AsyncBackingId {
++    fn drop(&mut self) {
++        if let Some(channel) = self.channel.upgrade() {
++            if let Err(error) = unsafe { fuse_dev_ioc_backing_close(channel.as_raw_fd(), &self.id) }
++            {
++                log::error!("Failed to close async backing fd: {error}");
++            }
++        }
++    }
++}
+diff --git a/src/read_buf.rs b/src/read_buf.rs
+--- a/src/read_buf.rs
++++ b/src/read_buf.rs
+@@ -21,8 +21,13 @@
+     ///
+     /// The actual buffer may be slightly larger to accommodate alignment requirements.
+     pub(crate) fn new() -> Self {
++        Self::with_capacity(BUFFER_SIZE)
++    }
++
++    pub(crate) fn with_capacity(size: usize) -> Self {
+         Self {
+-            buffer: vec![0; BUFFER_SIZE],
++            // Linux requires this minimum even for the first INIT read.
++            buffer: vec![0; size.max(8192) + align_of::<abi::fuse_in_header>()],
+         }
+     }
+ 
+@@ -37,3 +42,17 @@
+         }
+     }
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn small_negotiated_requests_still_obey_the_linux_minimum() {
++        // Linux fuse_dev_do_read rejects a smaller buffer with EINVAL,
++        // including the first INIT read before max_write is negotiated.
++        for requested in [0, 1, 4096, 8192] {
++            assert!(FuseReadBuf::with_capacity(requested).as_mut().len() >= 8192);
++        }
++    }
++}
+diff --git a/src/session_async.rs b/src/session_async.rs
+--- a/src/session_async.rs
++++ b/src/session_async.rs
+@@ -10,7 +10,6 @@
+ use std::sync::Arc;
+ 
+ use log::error;
+-use log::warn;
+ use nix::unistd::Uid;
+ use nix::unistd::geteuid;
+ 
+@@ -31,23 +30,16 @@
+ use crate::mnt::mount_options::check_option_conflicts;
+ use crate::read_buf::FuseReadBuf;
+ use crate::session::MAX_WRITE_SIZE;
+-use parking_lot::Mutex;
+-
+-type DropTx<T> = Arc<Mutex<Option<tokio::sync::mpsc::Sender<T>>>>;
+ 
+ /// Calls `destroy` on drop.
+ #[derive(Debug)]
+ pub(crate) struct AsyncSessionGuard<FS: AsyncFilesystem> {
+     pub(crate) fs: Option<FS>,
+-    pub(crate) unmount_tx: DropTx<()>,
+ }
+ 
+ /// Calls `destroy` on drop to do any user-specific cleanup.
+ impl<FS: AsyncFilesystem> AsyncSessionGuard<FS> {
+     fn destroy(&mut self) {
+-        if let Some(tx) = self.unmount_tx.lock().take() {
+-            tx.try_send(()).ok();
+-        }
+         if let Some(mut fs) = self.fs.take() {
+             fs.destroy();
+         }
+@@ -66,7 +58,7 @@
+ #[derive(Default, Debug)]
+ pub struct AsyncSessionBuilder<FS: AsyncFilesystem> {
+     filesystem: Option<FS>,
+-    mountpoint: Option<String>,
++    mountpoint: Option<std::path::PathBuf>,
+     options: Option<Config>,
+ }
+ 
+@@ -88,13 +80,19 @@
+ 
+     /// Set the mountpoint for this session. This is required.
+     pub fn mountpoint(mut self, mountpoint: impl AsRef<Path>) -> Self {
+-        self.mountpoint = Some(mountpoint.as_ref().to_string_lossy().to_string());
++        self.mountpoint = Some(mountpoint.as_ref().to_owned());
+         self
+     }
+ 
+     /// Set the options for this session. This is required.
+     pub fn options(mut self, options: Config) -> io::Result<Self> {
+         check_option_conflicts(&options)?;
++        if options.n_threads.unwrap_or(1) != 1 || options.clone_fd {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "local sessions require one channel",
++            ));
++        }
+ 
+         // validate permissions options
+         if options.mount_options.contains(&MountOption::AutoUnmount)
+@@ -144,9 +142,48 @@
+     /// Config options for this session, used for debugging and for
+     /// feature gating in the future.
+     pub(crate) config: Config,
++    request_buffer_size: usize,
++    mount: Option<AsyncMount>,
+ }
+ 
+ impl<FS: AsyncFilesystem> AsyncSession<FS> {
++    /// Access the filesystem before handing the session to its event loop.
++    pub fn filesystem_mut(&mut self) -> &mut FS {
++        self.guard.fs.as_mut().expect("filesystem was destroyed")
++    }
++    /// Obtain a managed registrar for this connection's backing files.
++    pub fn backing_registrar(&self) -> crate::AsyncBackingRegistrar {
++        crate::AsyncBackingRegistrar::new(&self.ch.0)
++    }
++
++    /// Wrap an already mounted FUSE descriptor and negotiate its protocol.
++    /// The caller owns the mount; this session owns the descriptor and requests.
++    pub async fn from_fd(
++        filesystem: FS,
++        fd: std::os::fd::OwnedFd,
++        acl: SessionACL,
++        config: Config,
++    ) -> io::Result<Self> {
++        let device = crate::dev_fuse_async::AsyncDevFuse::from_file(std::fs::File::from(fd))?;
++        let mut session = Self {
++            guard: AsyncSessionGuard {
++                fs: Some(filesystem),
++            },
++            ch: AsyncChannel::new(Arc::new(device)),
++            allowed: acl,
++            session_owner: geteuid(),
++            proto_version: None,
++            config,
++            request_buffer_size: MAX_WRITE_SIZE + 4096,
++            mount: None,
++        };
++        if let Err(error) = session.handshake().await {
++            let _ = session.filesystem_mut().shutdown().await;
++            return Err(error);
++        }
++        Ok(session)
++    }
++
+     /// Create a new session and mount the given async filesystem to the given mountpoint.
+     ///
+     /// # Errors
+@@ -171,32 +208,32 @@
+         })?;
+         let ch = AsyncChannel::new(file.clone());
+ 
+-        // mount drop guard
+-        let (unmount_tx, mut unmount_rx) = tokio::sync::mpsc::channel::<()>(1);
+-        tokio::spawn({
+-            let mount = Arc::new(Mutex::new(Some(mount)));
+-            async move {
+-                // Wait for the signal to unmount
+-                let _ = unmount_rx.recv().await;
+-                if let Some(mount) = mount.lock().take() {
+-                    drop(mount);
+-                }
+-            }
+-        });
+-
+         let mut session = AsyncSession {
+             guard: AsyncSessionGuard {
+                 fs: Some(filesystem),
+-                unmount_tx: Arc::new(Mutex::new(Some(unmount_tx))),
+             },
+             ch,
+             allowed: options.acl,
+             session_owner: geteuid(),
+             proto_version: None,
+             config: options.clone(),
+-        };
+-
+-        session.handshake().await?;
++            request_buffer_size: MAX_WRITE_SIZE + 4096,
++            mount: Some(mount),
++        };
++
++        if let Err(error) = session.handshake().await {
++            let _ = session.filesystem_mut().shutdown().await;
++            // Complete cleanup while the runtime still drives native/helper I/O.
++            if let Some(mut mount) = session.mount.take() {
++                if let Err(cleanup) = mount.unmount().await {
++                    return Err(io::Error::new(
++                        error.kind(),
++                        format!("{error}; unmount: {cleanup}"),
++                    ));
++                }
++            }
++            return Err(error);
++        }
+ 
+         Ok(session)
+     }
+@@ -214,89 +251,54 @@
+             session_owner,
+             proto_version: _,
+             config,
++            request_buffer_size,
++            mut mount,
+         } = self;
+-        let mut filesystem = Arc::new(guard);
+-
+-        let n_threads = config.n_threads.unwrap_or(1);
+-        if n_threads == 0 {
+-            return Err(io::Error::other("n_threads"));
+-        }
+-        let Some(n_threads_minus_one) = n_threads.checked_sub(1) else {
+-            return Err(io::Error::other("n_threads"));
+-        };
+-        if !cfg!(target_os = "linux") && n_threads != 1 {
+-            return Err(io::Error::other(
+-                "multi-threaded async sessions are only supported on Linux",
+-            ));
+-        }
+-
+-        // Give each individual thread its own channel by cloning or using `FUSE_DEV_IOC_CLONE` if requested,
+-        // which allows for more efficient request processing when multiple threads are used.
+-        let mut channels = Vec::with_capacity(n_threads);
+-        for _ in 0..n_threads_minus_one {
+-            if config.clone_fd {
+-                #[cfg(target_os = "linux")]
+-                {
+-                    channels.push(ch.clone_fd().await?);
+-                    continue;
+-                }
+-                #[cfg(not(target_os = "linux"))]
+-                {
+-                    return Err(io::Error::other("clone_fd is only supported on Linux"));
+-                }
+-            } else {
+-                channels.push(ch.clone());
+-            }
+-        }
+-        channels.push(ch);
+-
+-        // Construct the event loop for each thread.
+-        let mut tasks = Vec::with_capacity(n_threads);
+-        for (i, ch) in channels.into_iter().enumerate() {
+-            let thread_name = format!("fuser-async-{i}");
+-            let event_loop = AsyncSessionEventLoop {
+-                thread_name: thread_name.clone(),
+-                filesystem: filesystem.clone(),
+-                ch,
+-                allowed,
+-                session_owner,
+-            };
+-            tasks.push(tokio::spawn(async move { event_loop.event_loop().await }));
+-        }
+-
+-        // Wait for all event loop tasks to finish (shouldn't happen till unmount), and return the first error
+-        // if any of them fail.
+-        let mut reply: io::Result<()> = Ok(());
+-        for task in tasks {
+-            let res = match task.await {
+-                Ok(res) => res,
+-                Err(_) => {
+-                    return Err(io::Error::other("event loop task panicked"));
+-                }
+-            };
+-            if let Err(e) = res {
+-                if reply.is_ok() {
+-                    reply = Err(e);
+-                }
+-            }
+-        }
++        let mut filesystem = std::rc::Rc::new(guard);
++
++        let invalid_config = config.n_threads.unwrap_or(1) != 1 || config.clone_fd;
++        let event_loop = AsyncSessionEventLoop {
++            thread_name: "fuser-local".into(),
++            filesystem: filesystem.clone(),
++            ch,
++            allowed,
++            session_owner,
++            request_buffer_size,
++        };
++        let reply = if invalid_config {
++            Err(io::Error::other("local sessions require one channel"))
++        } else {
++            event_loop.event_loop().await
++        };
++        drop(event_loop);
+ 
+         // Clean up the filesystem
+-        let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
++        let Some(filesystem) = std::rc::Rc::get_mut(&mut filesystem) else {
+             return Err(io::Error::other(
+                 "BUG: must have one refcount for filesystem",
+             ));
+         };
++        let shutdown = filesystem
++            .fs
++            .as_mut()
++            .expect("filesystem was destroyed")
++            .shutdown()
++            .await;
+         filesystem.destroy();
+-
+-        reply
++        let cleanup = if let Some(mount) = &mut mount {
++            mount.unmount().await
++        } else {
++            Ok(())
++        };
++        reply.and(shutdown).and(cleanup)
+     }
+ 
+     /// Perform the initial handshake with the kernel, which involves receiving the init message,
+     /// replying with the kernel config, and setting the protocol version for this session. This must be
+     /// called before any other communication with the kernel can be done.
+     async fn handshake(&mut self) -> io::Result<()> {
+-        let mut buf = vec![0u8; MAX_WRITE_SIZE];
++        let mut handshake_buffer = FuseReadBuf::with_capacity(4096);
++        let buf = handshake_buffer.as_mut();
+         let sender = self.ch.sender();
+         let Some(fs) = &mut self.guard.fs else {
+             return Err(io::Error::new(
+@@ -308,7 +310,7 @@
+         // Keep checking for an init message from the kernel until we get one with a supported version,
+         // at which point we reply to finish the handshake and return
+         loop {
+-            let size = match self.ch.receive_retrying(&mut buf).await {
++            let size = match self.ch.receive_retrying(buf).await {
+                 Ok(size) => size,
+                 Err(nix::errno::Errno::ENODEV) => {
+                     return Err(io::Error::new(
+@@ -389,6 +391,7 @@
+                 return Err(error);
+             }
+             self.proto_version = Some(v);
++            self.request_buffer_size = config.max_write as usize + 4096;
+             let response = init.reply(&config);
+             response
+                 .send_reply(&sender, request.unique())
+@@ -402,10 +405,11 @@
+ pub(crate) struct AsyncSessionEventLoop<FS: AsyncFilesystem> {
+     /// Cache thread name for faster `debug!`.
+     pub(crate) thread_name: String,
+-    pub(crate) filesystem: Arc<AsyncSessionGuard<FS>>,
++    pub(crate) filesystem: std::rc::Rc<AsyncSessionGuard<FS>>,
+     pub(crate) ch: AsyncChannel,
+     pub(crate) allowed: SessionACL,
+     pub(crate) session_owner: Uid,
++    request_buffer_size: usize,
+ }
+ 
+ impl<FS: AsyncFilesystem> Clone for AsyncSessionEventLoop<FS> {
+@@ -416,37 +420,171 @@
+             ch: self.ch.clone(),
+             allowed: self.allowed,
+             session_owner: self.session_owner,
+-        }
++            request_buffer_size: self.request_buffer_size,
++        }
++    }
++}
++
++// Active requests retain their receive buffers and native local futures until
++// the reply finishes. Cache both allocations for later requests. The ordinary
++// immediately-ready path reuses one slot; only suspended operations grow the
++// pool. This bounds active work, not the size or number of filesystem objects.
++const MAX_IN_FLIGHT: usize = 16;
++struct Requests<F> {
++    slots: Vec<std::pin::Pin<Box<Option<F>>>>,
++    active: Vec<usize>,
++    free: Vec<usize>,
++}
++impl<F: std::future::Future<Output = io::Result<FuseReadBuf>>> Requests<F> {
++    fn new() -> Self {
++        Self {
++            slots: Vec::new(),
++            active: Vec::new(),
++            free: Vec::new(),
++        }
++    }
++    fn insert(&mut self, future: F) {
++        let index = if let Some(index) = self.free.pop() {
++            self.slots[index].as_mut().set(Some(future));
++            index
++        } else {
++            self.slots.push(Box::pin(Some(future)));
++            self.slots.len() - 1
++        };
++        self.active.push(index);
++    }
++    fn poll_completed(
++        &mut self,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<io::Result<FuseReadBuf>> {
++        for position in 0..self.active.len() {
++            let index = self.active[position];
++            let result = self.slots[index].as_mut().as_pin_mut().unwrap().poll(cx);
++            if let std::task::Poll::Ready(result) = result {
++                // Drop a completed future in place before reusing its storage.
++                self.slots[index].as_mut().set(None);
++                self.active.swap_remove(position);
++                self.free.push(index);
++                return std::task::Poll::Ready(result);
++            }
++        }
++        std::task::Poll::Pending
+     }
+ }
+ 
+ impl<FS: AsyncFilesystem> AsyncSessionEventLoop<FS> {
++    async fn dispatch_owned(
++        &self,
++        mut buffer: FuseReadBuf,
++        size: usize,
++    ) -> io::Result<FuseReadBuf> {
++        // Parse once, directly from the owned receive buffer. No copied packet,
++        // reparsed header or spawned worker is needed for a suspended callback.
++        let request = AsyncRequestWithSender::new(self.ch.sender(), &buffer.as_mut()[..size])?;
++        request.dispatch(self).await;
++        Ok(buffer)
++    }
++
+     async fn event_loop(&self) -> io::Result<()> {
+-        let mut buf = FuseReadBuf::new();
+-        let buf = buf.as_mut();
+-
+-        loop {
+-            let resp_size = match self.ch.receive_retrying(buf).await {
+-                Ok(res) => res,
+-                // Fs unmounted or session ended, exit the loop and end the thread
+-                Err(nix::errno::Errno::ENODEV) => return Ok(()),
+-                Err(err) => {
+-                    return Err(io::Error::new(
+-                        io::ErrorKind::Other,
+-                        format!("receive_retrying: {err:?}"),
+-                    ));
++        use std::{
++            future::{Future, poll_fn},
++            task::Poll,
++        };
++        let mut requests = Requests::new();
++        let mut buffers = Vec::new();
++        let result = async {
++            loop {
++                // Poll existing work before taking another buffer. Immediately
++                // ready callbacks therefore recycle without allocating again.
++                poll_fn(|cx| {
++                    while let Poll::Ready(result) = requests.poll_completed(cx) {
++                        buffers.push(result?);
++                    }
++                    if requests.active.len() < MAX_IN_FLIGHT {
++                        Poll::Ready(Ok::<_, io::Error>(()))
++                    } else {
++                        Poll::Pending
++                    }
++                })
++                .await?;
++                let mut buffer = buffers
++                    .pop()
++                    .unwrap_or_else(|| FuseReadBuf::with_capacity(self.request_buffer_size));
++                let size = {
++                    let receive = self.ch.receive_retrying(buffer.as_mut());
++                    let mut receive = std::pin::pin!(receive);
++                    poll_fn(|cx| {
++                        while let Poll::Ready(result) = requests.poll_completed(cx) {
++                            buffers.push(result?);
++                        }
++                        receive
++                            .as_mut()
++                            .poll(cx)
++                            .map(|r| r.map_err(io::Error::from))
++                    })
++                    .await
++                };
++                let size = match size {
++                    Ok(0) => break Ok(()),
++                    Ok(size) => size,
++                    Err(error) if error.raw_os_error() == Some(libc::ENODEV) => break Ok(()),
++                    Err(error) => break Err(error),
++                };
++                // DESTROY is an ordering barrier. Drain all owned callbacks and
++                // replies before acknowledging it, then release the filesystem.
++                let bytes = &buffer.as_mut()[..size];
++                if bytes.get(4..8) == Some(38u32.to_ne_bytes().as_slice()) {
++                    while !requests.active.is_empty() {
++                        let completed = poll_fn(|cx| requests.poll_completed(cx)).await?;
++                        buffers.push(completed);
++                    }
++                    let request = AsyncRequestWithSender::new(self.ch.sender(), bytes)?;
++                    if !matches!(request.request.operation(), Ok(ll::Operation::Destroy(_))) {
++                        break Err(io::Error::other("invalid FUSE_DESTROY"));
++                    }
++                    request
++                        .reply_empty()
++                        .await
++                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
++                    break Ok(());
+                 }
+-            };
+-
+-            let sender = self.ch.sender();
+-            let session = self.clone();
+-            if let Ok(request) = AsyncRequestWithSender::new(sender, &buf[..resp_size]) {
+-                tokio::spawn(async move {
+-                    request.dispatch(&session).await;
+-                });
+-            } else {
+-                warn!("Received invalid request, skipping...");
+-            }
+-        }
+-    }
+-}
++                requests.insert(self.dispatch_owned(buffer, size));
++            }
++        }
++        .await;
++        // EOF, unmount and malformed input also stop intake before destroy.
++        // Pending request futures remain owned and are settled before FS drops.
++        let mut drain_error = None;
++        while !requests.active.is_empty() {
++            if let Err(error) = poll_fn(|cx| requests.poll_completed(cx)).await {
++                drain_error.get_or_insert(error);
++            }
++        }
++        result.and(drain_error.map_or(Ok(()), Err))
++    }
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++    use std::os::unix::ffi::{OsStrExt, OsStringExt};
++
++    #[derive(Debug)]
++    struct Empty;
++    impl AsyncFilesystem for Empty {}
++
++    #[test]
++    fn builder_preserves_native_mountpoint_bytes() {
++        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
++            b"/tmp/native-\xff directory".to_vec(),
++        ));
++        let builder = AsyncSessionBuilder::new()
++            .filesystem(Empty)
++            .mountpoint(&path);
++        let represented = std::path::Path::new(builder.mountpoint.as_ref().unwrap());
++        assert_eq!(
++            represented.as_os_str().as_bytes(),
++            path.as_os_str().as_bytes()
++        );
++    }
++}
+diff --git a/tests/local_async_dispatch.rs b/tests/local_async_dispatch.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/local_async_dispatch.rs
+@@ -0,0 +1,158 @@
++#![cfg(all(feature = "async", target_os = "linux"))]
++use fuser::{
++    AsyncFilesystem, AsyncSession, Config, Errno, FileHandle, INodeNo, LockOwner, OpenFlags,
++    Request, SessionACL,
++    reply_async::{AttrResponse, ReadResponse},
++};
++use std::{cell::Cell, os::fd::OwnedFd, rc::Rc, time::Duration};
++use tokio::{net::UnixDatagram, sync::Notify};
++
++struct DropRead(Rc<Cell<bool>>);
++impl Drop for DropRead {
++    fn drop(&mut self) {
++        self.0.set(false);
++    }
++}
++struct Fs {
++    waiting: Rc<Cell<bool>>,
++    destroyed: Rc<Cell<bool>>,
++    resume: Rc<Notify>,
++    shutdown: Rc<Cell<bool>>,
++}
++impl AsyncFilesystem for Fs {
++    async fn read(
++        &self,
++        _: &Request,
++        _: INodeNo,
++        _: FileHandle,
++        _: u64,
++        _: u32,
++        _: OpenFlags,
++        _: Option<LockOwner>,
++    ) -> Result<ReadResponse, Errno> {
++        self.waiting.set(true);
++        let _read = DropRead(self.waiting.clone());
++        self.resume.notified().await;
++        Ok(ReadResponse::new(b"verified bytes".to_vec()))
++    }
++    async fn getattr(
++        &self,
++        _: &Request,
++        _: INodeNo,
++        _: Option<FileHandle>,
++    ) -> Result<AttrResponse, Errno> {
++        assert!(
++            self.waiting.get(),
++            "lookup must execute while read is suspended"
++        );
++        Err(Errno::ENOENT)
++    }
++    async fn shutdown(&mut self) -> std::io::Result<()> {
++        assert!(!self.waiting.get(), "shutdown ran before requests drained");
++        tokio::task::yield_now().await;
++        self.shutdown.set(true);
++        Ok(())
++    }
++    fn destroy(&mut self) {
++        assert!(
++            self.shutdown.get(),
++            "destroy ran before asynchronous shutdown completed"
++        );
++        assert!(
++            !self.waiting.get(),
++            "destroy ran before the read future ended"
++        );
++        self.destroyed.set(true);
++    }
++}
++fn packet(op: u32, unique: u64, body: &[u8]) -> Vec<u8> {
++    let mut p = Vec::new();
++    p.extend(((40 + body.len()) as u32).to_ne_bytes());
++    p.extend(op.to_ne_bytes());
++    p.extend(unique.to_ne_bytes());
++    p.extend(2u64.to_ne_bytes());
++    for x in [
++        unsafe { libc::geteuid() },
++        unsafe { libc::getegid() },
++        std::process::id(),
++        0,
++    ] {
++        p.extend(x.to_ne_bytes())
++    }
++    p.extend(body);
++    p
++}
++async fn receive(socket: &UnixDatagram) -> (u64, i32, Vec<u8>) {
++    let mut b = vec![0; 4096];
++    let n = socket.recv(&mut b).await.unwrap();
++    assert!(n >= 16);
++    b.truncate(n);
++    (
++        u64::from_ne_bytes(b[8..16].try_into().unwrap()),
++        i32::from_ne_bytes(b[4..8].try_into().unwrap()),
++        b[16..].to_vec(),
++    )
++}
++#[tokio::test(flavor = "current_thread")]
++async fn pending_read_allows_other_requests_and_finishes_before_destroy() {
++    let (client, server) = std::os::unix::net::UnixDatagram::pair().unwrap();
++    client.set_nonblocking(true).unwrap();
++    let client = UnixDatagram::from_std(client).unwrap();
++    let fd: OwnedFd = server.into();
++    let waiting = Rc::new(Cell::new(false));
++    let destroyed = Rc::new(Cell::new(false));
++    let resume = Rc::new(Notify::new());
++    let fs = Fs {
++        waiting: waiting.clone(),
++        destroyed: destroyed.clone(),
++        resume: resume.clone(),
++        shutdown: Rc::new(Cell::new(false)),
++    };
++    let server = async {
++        AsyncSession::from_fd(fs, fd, SessionACL::All, Config::default())
++            .await
++            .unwrap()
++            .run()
++            .await
++            .unwrap();
++    };
++    let client = async {
++        let init = [7u32, 31, 0, 1];
++        let init = init
++            .into_iter()
++            .flat_map(u32::to_ne_bytes)
++            .collect::<Vec<_>>();
++        client.send(&packet(26, 1, &init)).await.unwrap();
++        assert_eq!(receive(&client).await.0, 1);
++        let mut read = Vec::new();
++        read.extend(0u64.to_ne_bytes());
++        read.extend(0u64.to_ne_bytes());
++        read.extend(64u32.to_ne_bytes());
++        read.extend(0u32.to_ne_bytes());
++        read.extend(0u64.to_ne_bytes());
++        read.extend(0u32.to_ne_bytes());
++        read.extend(0u32.to_ne_bytes());
++        client.send(&packet(15, 2, &read)).await.unwrap();
++        while !waiting.get() {
++            tokio::task::yield_now().await
++        }
++        client.send(&packet(3, 3, &[0; 16])).await.unwrap();
++        let (id, error, _) = receive(&client).await;
++        assert_eq!(id, 3);
++        assert_eq!(error, -libc::ENOENT);
++        resume.notify_one();
++        let (id, error, bytes) = receive(&client).await;
++        assert_eq!(id, 2);
++        assert_eq!(error, 0);
++        assert_eq!(bytes, b"verified bytes");
++        client.send(&packet(38, 4, &[])).await.unwrap();
++        assert_eq!(receive(&client).await.0, 4);
++    };
++    tokio::time::timeout(Duration::from_secs(2), async {
++        tokio::join!(server, client)
++    })
++    .await
++    .expect("a pending read blocked independent FUSE requests");
++    assert!(destroyed.get());
++    assert!(!waiting.get());
++}
+diff --git a/tests/local_async_mount.rs b/tests/local_async_mount.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/local_async_mount.rs
+@@ -0,0 +1,63 @@
++#![cfg(all(feature = "async", target_os = "linux"))]
++use fuser::{AsyncFilesystem, AsyncSessionBuilder, Config, KernelConfig, MountOption, Request};
++use std::{io, path::Path, process::Command};
++
++#[derive(Debug)]
++struct RejectInit;
++impl AsyncFilesystem for RejectInit {
++    async fn init(&mut self, _: &Request, _: &mut KernelConfig) -> io::Result<()> {
++        Err(io::Error::from_raw_os_error(libc::EPERM))
++    }
++}
++fn mounted(path: &Path) -> bool {
++    std::fs::read_to_string("/proc/self/mountinfo")
++        .unwrap()
++        .lines()
++        .any(|line| line.split_whitespace().nth(4) == path.to_str())
++}
++#[test]
++fn failed_init_releases_the_mount_before_runtime_shutdown_returns() {
++    assert!(
++        Path::new("/dev/fuse").exists(),
++        "this lifecycle test requires real FUSE"
++    );
++    let directory = tempfile::Builder::new()
++        .prefix("git-on-async-mount-test-")
++        .tempdir()
++        .unwrap();
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap();
++    let mut options = Config::default();
++    options.mount_options = vec![
++        MountOption::RO,
++        MountOption::FSName("git-on-async-lifecycle-test".into()),
++    ];
++    let result = runtime.block_on(
++        AsyncSessionBuilder::new()
++            .filesystem(RejectInit)
++            .mountpoint(directory.path())
++            .options(options)
++            .unwrap()
++            .build(),
++    );
++    assert!(matches!(result, Err(ref e) if e.raw_os_error() == Some(libc::EPERM)));
++    drop(runtime);
++    let leaked = mounted(directory.path());
++    if leaked {
++        // Preserve the failed observation while cleaning only this test's mount.
++        assert!(
++            Command::new("fusermount3")
++                .args(["-u"])
++                .arg(directory.path())
++                .status()
++                .unwrap()
++                .success()
++        );
++    }
++    assert!(
++        !leaked,
++        "failed INIT left a mount after its runtime and FUSE descriptor closed"
++    );
++}

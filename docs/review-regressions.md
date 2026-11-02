@@ -2400,3 +2400,62 @@ optimization replaced a live leaf and returned ENOENT on the subsequent read.
 Preserving the existing inode fixes that controlled red result. Source leaf origin is the
 existing OID; full paths remain for directories and mutable namespace indexes.
 This structural regression does not establish full performance acceptance.
+
+
+### Local asynchronous transport regressions (port in progress)
+
+- A suspended read in the initial serial local dispatcher prevented an unrelated
+  getattr from completing. `crates/async-fuser/tests/local_async_dispatch.rs`
+  reproduces the old timeout and verifies progress while the read is pending,
+  owned buffer lifetime, and completion before destroy.
+- Existing `protocol_all_unsupported_callbacks_refuse_without_mutation` failed
+  against upstream async defaults: SETXATTR returned ENOTSUP rather than ENOSYS.
+  The local defaults now preserve the complete reviewed fallback contract; all
+  28 wire tests pass through the asynchronous adapter.
+- `channel_async::tests::failed_reply_is_an_error_in_release_builds_too` fails
+  against the original sender in release mode: the fallible write result was
+  evaluated only by debug_assert. The result and reply length are now checked in
+  every profile; the release regression passes.
+- Reducing receive allocations initially violated Linux FUSE_MIN_READ_BUFFER.
+  The real mount failed INIT with EINVAL while socket protocol tests passed.
+  `read_buf::tests::small_negotiated_requests_still_obey_the_linux_minimum`
+  reproduces that error in the buffer contract. Buffers now retain the 8 KiB
+  minimum, and the six affected real-mount checks pass again.
+- `crates/async-fuser/tests/local_async_mount.rs` reproduces failed INIT leaving
+  a mount after runtime shutdown. Cleanup is now owned by AsyncSession and
+  explicitly awaited on the error and normal exit paths; the real mount
+  regression passes. The six mounts from the failed integration run were
+  identified from that run's log, unmounted, and their disposable roots removed.
+- The async builder converted mountpoint paths through lossy Unicode.
+  `session_async::tests::builder_preserves_native_mountpoint_bytes` fails against
+  the original builder; PathBuf preserves native bytes in the local adaptation.
+
+Red/green execution logs are retained outside the repository in
+`/tmp/git-on-fuse-path-20261102/evidence/async-*.log`. These observations concern
+this port's intermediate worktree, not final performance acceptance or a claim
+that the complete 1.4.0 goal has been achieved.
+## Mounted local asynchronous object path (in progress)
+
+The local readonly adapter now resolves source tree/header demands and reads
+through the event-loop-owned cache. A permanent paused-source test verifies that
+a warm lookup/read completes while an unrelated cold lookup awaits the decoder,
+that the legacy synchronous payload/metadata path is unused, and that shutdown
+joins the source before publishing its metrics. A second regression forgets a
+parent directory inode and opens its live child, checking the restored `..`
+identity without a synchronous metadata fallback. The source boundary checks
+that a bounded small-object response cannot publish a length mismatch, while
+existing streaming/cancelled-consumer and cache-integrity tests remain.
+
+The local FUSE dispatcher regression also requires awaited asynchronous
+shutdown after request drain and before destroy. Local shared-reply tests retain
+and compare the original allocation through its response lifetime.
+
+Current local checks: 198 default Rust tests, 59 local FUSE-library unit tests,
+the suspended-request dispatcher test, strict root clippy, Rust 1.89 locked
+check, the full 44-operation inventory, release-policy tests and five selected
+real CLI/mount regressions pass. This is component/integration evidence, not
+full-mode or final-head acceptance. Mutable policies, remote sources, I/O
+fallback and complete lifecycle/resource verification still need the async
+port. Paired ordinary-release fitting-RAM controls did not establish a wall-time
+improvement; issue #20 remains incomplete. Temporary controls and their raw
+evidence stay outside this repository.

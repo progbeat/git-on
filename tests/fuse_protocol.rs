@@ -3,7 +3,7 @@
 //! This is not a real mount (see integration.py). It makes kernel-short-circuited
 //! callbacks, malformed handles and caller credentials reproducibly testable.
 #![cfg(target_os = "linux")]
-use fuser::{Session, SessionACL};
+use fuser::{AsyncSession, SessionACL};
 use git2::Repository;
 use git_on::backend::linux::Fuse;
 use git_on::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
@@ -153,15 +153,35 @@ impl Peer {
             0
         );
         let task = std::thread::spawn(move || {
-            Session::from_fd(
-                Fuse::new(overlay),
-                server,
-                SessionACL::All,
-                fuser::Config::default(),
-            )
-            .unwrap()
-            .run()
-            .unwrap();
+            let runtime = tokio_uring::Runtime::new(&tokio_uring::builder()).ok();
+            let native = runtime.is_some();
+            let work = async {
+                let filesystem = if native {
+                    Fuse::with_async_source(overlay).unwrap()
+                } else {
+                    Fuse::new(overlay)
+                };
+                let mut session = AsyncSession::from_fd(
+                    filesystem,
+                    server,
+                    SessionACL::All,
+                    fuser::Config::default(),
+                )
+                .await
+                .unwrap();
+                let registrar = session.backing_registrar();
+                session.filesystem_mut().set_backing_registrar(registrar);
+                session.run().await.unwrap();
+            };
+            if let Some(runtime) = runtime {
+                runtime.block_on(work);
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(work);
+            }
         });
         let mut p = Self {
             fd,
