@@ -2386,3 +2386,17 @@ single-object scan. Growing replacements keep the original eviction path.
 accounting, recency, equal/short/growing replacements, the actual spilled victim
 and unchanged active results. These are optimization-equivalence checks, not
 claims that the earlier revision returned incorrect bytes or measured slower.
+
+## Readonly leaf pathname retention
+
+`filesystem::tests::readonly_leaf_lookups_do_not_retain_namespace_path_indexes`
+looks up and reads 256 pinned files at two directory levels plus a symlink. On
+`951f4b3`, the focused test fails with 259 ordered paths instead of the two
+necessary directory paths. The corrected implementation passes, preserving
+protected-source flags, exact file/link bytes, open/forget/release behavior and
+stable inode identity after metadata reclamation. The same regression also
+replays fallback pathname resolution before a partial FORGET: the intermediate
+optimization replaced a live leaf and returned ENOENT on the subsequent read.
+Preserving the existing inode fixes that controlled red result. Source leaf origin is the
+existing OID; full paths remain for directories and mutable namespace indexes.
+This structural regression does not establish full performance acceptance.

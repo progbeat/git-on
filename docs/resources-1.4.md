@@ -17,7 +17,10 @@ blocks before returning bytes from that checked buffer. Resident rereads avoid
 those disk hashes. No disk object/name index or HMAC key remains.
 
 Touched unique directories are parsed once into shared immutable RAM structures;
-raw tree bytes are released. Parsed directories, verified descriptors and touched
+raw tree bytes are released. Source leaves retain their original OID, not a full
+source path; readonly leaf lookup also omits the ordered/reverse pathname indexes
+used by mutable namespaces. Directory paths remain available for descendant
+resolution. Parsed directories, verified descriptors and touched
 header sizes grow with demand outside the payload LRU. The wholly readonly
 `none` policy also permits kernel directory-page caching on FUSE ABI 7.28+;
 mutable policies retain live directory I/O. This reuses only enumerated pages

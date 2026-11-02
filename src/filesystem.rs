@@ -31,6 +31,8 @@ struct Node {
     immutable: bool,
     oid: Option<Oid>,
     lookups: u64,
+    // Only directories need a path to resolve descendants or preserve their
+    // source origin across a move. A leaf's OID identifies its pinned origin.
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
@@ -127,9 +129,7 @@ impl Overlay {
     }
     pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
         self.nodes.get(&ino).is_some_and(|node| {
-            node.immutable
-                && node.snapshot_path.is_some()
-                && node.attr.kind == FileType::RegularFile
+            node.immutable && node.oid.is_some() && node.attr.kind == FileType::RegularFile
         })
     }
     pub(crate) fn protected_source(&self, ino: u64) -> bool {
@@ -137,7 +137,7 @@ impl Overlay {
             && self
                 .nodes
                 .get(&ino)
-                .is_some_and(|node| node.immutable && node.snapshot_path.is_some())
+                .is_some_and(|node| node.immutable && node.oid.is_some())
     }
 
     pub fn new(snapshot: Snapshot, backing: PathBuf) -> Result<Self> {
@@ -242,6 +242,11 @@ impl Overlay {
             .index(source.file_name().ok_or(libc::EIO)?)
             .ok_or(libc::EIO)?;
         let ino = directory.base + index as u64;
+        // Readonly leaves deliberately have no pathname index. A fallback
+        // pathname resolution must preserve their existing lookup/handle state.
+        if self.read_only() && self.nodes.contains_key(&ino) {
+            return Ok(ino);
+        }
         self.insert_source_inode(path, source, entry, ino)
     }
     /// The readonly namespace cannot redirect or shadow its source parent.
@@ -283,7 +288,12 @@ impl Overlay {
             ._snapshot
             .directory_entry(&directory.tree, index, &path)
             .map_err(snapshot_errno)?;
-        self.insert_source_inode(&path, path.to_path_buf(), entry, ino)
+        let source = if entry.kind == EntryKind::Directory {
+            path.to_path_buf()
+        } else {
+            PathBuf::new()
+        };
+        self.insert_source_inode(&path, source, entry, ino)
     }
     fn insert_source_inode(
         &mut self,
@@ -317,14 +327,20 @@ impl Overlay {
                 immutable: true,
                 oid: Some(entry.oid),
                 lookups: 0,
-                snapshot_path: Some(source),
+                snapshot_path: (kind == FileType::Directory).then_some(source),
                 bytes: Vec::new(),
                 file: None,
                 external_io: false,
             },
         );
-        self.paths.insert(path.to_path_buf(), ino);
-        self.inode_paths.insert(ino, path.to_path_buf());
+        // Immutable leaf callbacks use inode/OID, and lookup already derives
+        // their stable inode from the parent's source range. Only directories
+        // need pathname indexes in the readonly namespace. Mutable policies
+        // keep both indexes for copy-up and namespace changes.
+        if !self.read_only() || kind == FileType::Directory {
+            self.paths.insert(path.to_path_buf(), ino);
+            self.inode_paths.insert(ino, path.to_path_buf());
+        }
         Ok(ino)
     }
     pub(crate) fn forget_inode(&mut self, ino: u64, count: u64) {
@@ -351,7 +367,7 @@ impl Overlay {
             if self
                 .nodes
                 .get(&ino)
-                .is_some_and(|node| node.attr.nlink == 0 || node.snapshot_path.is_none())
+                .is_some_and(|node| node.attr.nlink == 0 || node.oid.is_none())
             {
                 self.directory_cache.remove(&ino);
                 self.dirty_directories.remove(&ino);
@@ -998,7 +1014,7 @@ impl Overlay {
         }
         self.refresh_backing_attr(ino)?;
         #[cfg(feature = "test-metrics")]
-        if self.node(ino)?.snapshot_path.is_none() {
+        if self.node(ino)?.oid.is_none() {
             self._snapshot.record_generated_io(false);
         }
         let n = self.node(ino)?;
@@ -1063,7 +1079,7 @@ impl Overlay {
         }
         self.refresh_backing_attr(ino)?;
         #[cfg(feature = "test-metrics")]
-        if self.node(ino)?.snapshot_path.is_none() {
+        if self.node(ino)?.oid.is_none() {
             self._snapshot.record_generated_io(true);
         }
         let n = self.node_mut(ino)?;
@@ -1702,7 +1718,7 @@ impl Overlay {
     #[cfg(target_os = "linux")]
     pub(crate) fn eligible_backing(&self, ino: u64) -> Option<&File> {
         let node = self.nodes.get(&ino)?;
-        if node.snapshot_path.is_some() || node.attr.kind != FileType::RegularFile {
+        if node.oid.is_some() || node.attr.kind != FileType::RegularFile {
             return None;
         }
         node.file.as_ref()
@@ -2878,6 +2894,73 @@ mod tests {
         assert!(!fs.nodes.contains_key(&file));
         assert!(fs.handles.is_empty());
         assert!(fs.inode_handles.is_empty());
+    }
+    #[test]
+    fn readonly_leaf_lookups_do_not_retain_namespace_path_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"pinned bytes").unwrap();
+        let mut children = repo.treebuilder(None).unwrap();
+        for index in 0..128 {
+            children
+                .insert(format!("file-{index:03}"), blob, 0o100644)
+                .unwrap();
+        }
+        let child_tree = children.write().unwrap();
+        let mut root = repo
+            .treebuilder(Some(&repo.find_tree(child_tree).unwrap()))
+            .unwrap();
+        root.insert("nested", child_tree, 0o040000).unwrap();
+        root.insert("link", repo.blob(b"file-000").unwrap(), 0o120000)
+            .unwrap();
+        let tree = root.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "readonly-paths").unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::None)
+                .unwrap();
+        let nested = fs.lookup_entry(1, OsStr::new("nested")).unwrap().ino;
+        for parent in [1, nested] {
+            for index in 0..128 {
+                let name = format!("file-{index:03}");
+                let ino = fs.lookup_entry(parent, OsStr::new(&name)).unwrap().ino;
+                assert!(fs.protected_source(ino));
+                assert!(fs.unchanged_source_data(ino));
+                assert_eq!(fs.read_without_handle(ino, 0, 64).unwrap(), b"pinned bytes");
+                assert_eq!(fs.writable(ino), Err(libc::EROFS));
+            }
+        }
+        let link = fs.lookup_entry(1, OsStr::new("link")).unwrap().ino;
+        assert!(fs.protected_source(link));
+        assert_eq!(fs.read_link(link).unwrap(), b"file-000");
+        assert_eq!(fs.paths.len(), 2, "readonly leaves retained ordered paths");
+        assert_eq!(
+            fs.inode_paths.len(),
+            2,
+            "readonly leaves retained reverse paths"
+        );
+        assert!(fs.nodes[&link].snapshot_path.is_none());
+        let original = fs.lookup_entry(1, OsStr::new("file-000")).unwrap().ino;
+        assert_eq!(fs.ensure(Path::new("file-000")).unwrap(), original);
+        fs.forget_inode(original, 1);
+        assert_eq!(
+            fs.read_without_handle(original, 0, 64).unwrap(),
+            b"pinned bytes"
+        );
+        let handle = fs.open_file(original, libc::O_RDONLY).unwrap();
+        fs.forget_inode(original, u64::MAX);
+        assert_eq!(
+            fs.read_data(original, handle, 0, 64).unwrap(),
+            b"pinned bytes"
+        );
+        fs.release_handle(original, handle).unwrap();
+        assert!(!fs.nodes.contains_key(&original));
+        assert_eq!(
+            fs.lookup_entry(1, OsStr::new("file-000")).unwrap().ino,
+            original
+        );
+        assert_eq!(fs.paths.len(), 2);
+        assert_eq!(fs.inode_paths.len(), 2);
     }
     #[test]
     fn copy_up_only_visits_its_readers_and_handle_links_survive_any_release_order() {
