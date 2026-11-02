@@ -246,7 +246,7 @@ impl Overlay {
     }
     /// The readonly namespace cannot redirect or shadow its source parent.
     /// Reuse that parent's prepared name index instead of resolving from root.
-    fn ensure_readonly_child(&mut self, parent: u64, path: &Path, name: &OsStr) -> FsResult<u64> {
+    fn ensure_readonly_child(&mut self, parent: u64, path: &Path) -> FsResult<u64> {
         debug_assert!(self.read_only());
         if let Some(ino) = self.paths.get(path) {
             if self.nodes.contains_key(ino) {
@@ -265,7 +265,10 @@ impl Overlay {
             self.insert_source_directory(parent_path, tree)?
         };
         let directory = &self.source_directories[key];
-        let index = directory.tree.index(name).ok_or(libc::ENOENT)?;
+        let index = directory
+            .tree
+            .index(path.file_name().ok_or(libc::EIO)?)
+            .ok_or(libc::ENOENT)?;
         let ino = directory.base + index as u64;
         let entry = self
             ._snapshot
@@ -1351,7 +1354,7 @@ impl Overlay {
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
         let p = self.child(parent, name)?;
         let ino = if self.read_only() {
-            self.ensure_readonly_child(parent, &p, name)?
+            self.ensure_readonly_child(parent, &p)?
         } else {
             self.ensure(&p)?
         };
@@ -1868,6 +1871,26 @@ mod tests {
             b"source"
         );
         assert_eq!(fs._snapshot.metrics().blob_loads, 1);
+    }
+    #[test]
+    fn child_lookup_preserves_existing_single_component_path_normalization() {
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            for name in ["tracked.tmp/", "tracked.tmp/.", "tracked.tmp//"] {
+                let (_temp, mut fs) = fixture_policy(policy);
+                let attr = fs.lookup_entry(1, OsStr::new(name)).unwrap();
+                assert_eq!(attr.kind, FileType::RegularFile);
+                assert_eq!(attr.perm, 0o755);
+                assert_eq!(
+                    fs.lookup_entry(1, OsStr::new("tracked.tmp")).unwrap().ino,
+                    attr.ino
+                );
+            }
+        }
     }
     #[test]
     fn all_copies_up_tracked_bytes_and_preserves_existing_read_handles() {

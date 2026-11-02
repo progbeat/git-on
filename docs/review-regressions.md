@@ -2359,3 +2359,11 @@ negative lookup, modes, identity after forget/relookup, and distinct pathname
 inodes for shared Git trees. Mutable policies keep their redirect/whiteout path.
 These structural regressions do not establish a measured WebKit speedup or
 satisfy the outstanding full-workload performance acceptance.
+
+The follow-up `child_lookup_preserves_existing_single_component_path_normalization`
+reproduced ENOENT on the initial fast path for a cold `tracked.tmp/` lookup.
+It preserves the helper's existing normalized-path behavior across all four
+policies, including trailing separators and `/.`. The readonly index lookup
+uses the resolved path's filename, as the original source-inode path did.
+Kernel LOOKUP names do not include these separators; this is helper-level
+equivalence coverage, not a claim about kernel pathname traversal.
