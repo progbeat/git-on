@@ -1,4 +1,6 @@
 pub mod backend;
+#[cfg(target_os = "linux")]
+mod backing_async;
 mod directory_view;
 // The mount engine is tested on macOS, but 1.3.0 ships Linux mounts only.
 #[cfg_attr(target_os = "macos", allow(dead_code))]

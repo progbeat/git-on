@@ -1,6 +1,6 @@
 use std::{
     io::prelude::*,
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::unix::io::{AsRawFd, RawFd},
 };
 
 use tempfile::NamedTempFile;
@@ -333,13 +333,11 @@ async fn poll_once(future: impl std::future::Future) {
 }
 
 fn assert_invalid_fd(fd: RawFd) {
-    use std::fs::File;
-
-    let mut f = unsafe { File::from_raw_fd(fd) };
-    let mut buf = vec![];
-
-    match f.read_to_end(&mut buf) {
-        Err(ref e) if e.raw_os_error() == Some(libc::EBADF) => {}
-        res => panic!("assert_invalid_fd finds for fd {:?}, res = {:?}", fd, res),
-    }
+    // A closed descriptor cannot be used to construct an owned File: its Drop
+    // would attempt a second close, which aborts on I/O-safety-aware Rust.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
 }

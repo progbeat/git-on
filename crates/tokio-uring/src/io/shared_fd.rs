@@ -3,8 +3,9 @@ use std::future::poll_fn;
 use std::{
     cell::RefCell,
     io,
-    os::unix::io::{FromRawFd, RawFd},
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
     rc::Rc,
+    sync::Arc,
     task::Waker,
 };
 
@@ -26,6 +27,9 @@ pub(crate) struct SharedFd {
 struct Inner {
     // Open file descriptor
     fd: RawFd,
+    // A shared standard owner lets synchronous metadata/passthrough and local
+    // native operations use the same descriptor without dup per operation.
+    owner: Option<Arc<std::fs::File>>,
 
     // Track the sharing state of the file descriptor:
     // normal, being waited on to allow a close by the parent's owner, or already closed.
@@ -48,9 +52,34 @@ impl SharedFd {
         SharedFd {
             inner: Rc::new(Inner {
                 fd,
+                owner: None,
                 state: RefCell::new(State::Init),
             }),
         }
+    }
+
+    pub(crate) fn from_shared_std(owner: Arc<std::fs::File>) -> Self {
+        Self {
+            inner: Rc::new(Inner {
+                fd: owner.as_raw_fd(),
+                owner: Some(owner),
+                state: RefCell::new(State::Init),
+            }),
+        }
+    }
+
+    pub(crate) fn try_into_std(mut self) -> Result<std::fs::File, Self> {
+        if self.inner.owner.is_some()
+            || !matches!(*self.inner.state.borrow(), State::Init)
+            || Rc::strong_count(&self.inner) != 1
+        {
+            return Err(self);
+        }
+        let inner = Rc::get_mut(&mut self.inner).expect("unique file descriptor");
+        *inner.state.get_mut() = State::Closed;
+        // There are no submitted operations or other owners, and Drop has been
+        // disarmed before transferring the one descriptor to its standard owner.
+        Ok(unsafe { std::fs::File::from_raw_fd(inner.fd) })
     }
 
     /// Returns the RawFd
@@ -121,6 +150,9 @@ impl Inner {
 
             *state = State::Closed;
         }
+        if self.owner.take().is_some() {
+            return Ok(());
+        }
         Op::close(self.fd)?.await
     }
 }
@@ -152,7 +184,7 @@ impl Drop for Inner {
 
         let state = self.state.borrow_mut();
 
-        if let State::Closed = *state {
+        if matches!(*state, State::Closed) || self.owner.is_some() {
             return;
         }
         let _ = unsafe { std::fs::File::from_raw_fd(self.fd) };

@@ -131,6 +131,19 @@ impl File {
         File::from_shared_fd(SharedFd::new(file.into_raw_fd()))
     }
 
+    /// Use a shared standard owner without duplicating its descriptor. Every
+    /// submitted operation retains that owner until kernel completion. Closing
+    /// this wrapper releases its ownership; other standard owners remain valid.
+    pub fn from_shared_std(file: std::sync::Arc<std::fs::File>) -> File {
+        File::from_shared_fd(SharedFd::from_shared_std(file))
+    }
+
+    /// Transfer an exclusively owned descriptor with no in-flight operations.
+    /// A shared standard owner or a busy descriptor is returned unchanged.
+    pub fn try_into_std(self) -> Result<std::fs::File, Self> {
+        self.fd.try_into_std().map_err(File::from_shared_fd)
+    }
+
     /// Read some bytes at the specified offset from the file into the specified
     /// buffer, returning how many bytes were read.
     ///

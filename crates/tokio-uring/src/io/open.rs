@@ -69,4 +69,11 @@ impl Completable for Open {
     fn complete(self, cqe: CqeResult) -> Self::Output {
         Ok(File::from_shared_fd(SharedFd::new(cqe.result? as _)))
     }
+
+    fn discard(self, cqe: CqeResult) {
+        if let Ok(fd) = cqe.result {
+            use std::os::fd::FromRawFd;
+            drop(unsafe { std::fs::File::from_raw_fd(fd as _) });
+        }
+    }
 }

@@ -2488,3 +2488,33 @@ configuration initially requested an `exclude-newer` change to fixture locks;
 the final uv run used `UV_NO_CONFIG=1`, preserving the fixtures and host config.
 These checks still do not complete the remaining async `all`/remote/writable-I/O
 port, resource/cancellation audit or final #20 performance acceptance.
+
+## Native private-file I/O and cancellation ownership (in progress)
+
+The native protected-policy adapter prepares private regular-file operations
+under short namespace borrows and awaits disk I/O outside them. The permanent
+`private_native_io_keeps_handles_and_other_inode_progress_without_a_core_borrow`
+case suspends an inode operation and the bounded backing actor separately, while
+warm source lookup/read continue. It also checks sparse writes, append, both
+file sync modes, open/truncate, timestamp updates, shared handles and release.
+Its initial attribute-update path reproduced a RefCell panic when a tail
+temporary outlived the request pin; the final state borrow now ends before pin
+release. The regression fails before that correction and passes afterwards.
+
+`abandoned_native_opens_release_fds_before_and_after_completion` reproduced 16
+leaked descriptors from 16 abandoned opens in the pinned tokio-uring driver.
+It now checks abandonment before completion, after completion and during runtime
+shutdown. Successful resource-producing CQEs are closed even when the caller
+never consumes the result. Abandoned buffers and FD owners survive until the
+final CQE, including driver shutdown.
+
+`failed_native_runtime_initialization_releases_tokio_fds` runs in an isolated
+test process. Four rejected ring initializations previously increased its open
+FD count from 4 to 16; normal RAII before successful driver construction keeps
+the count unchanged. `shared_native_owner_keeps_one_fd_and_closed_handles_do_not_accumulate`
+checks same-FD ownership, cancelled-operation lifetime, unique descriptor
+transfer and reclamation across 128 closed inodes. Red/green logs remain in the
+external evidence directory, outside the mergeable tree.
+
+These changes do not finish synchronous backing namespace operations, `all`
+copy-up, remote/fallback sources or performance acceptance.

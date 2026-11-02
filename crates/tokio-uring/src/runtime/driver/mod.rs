@@ -178,10 +178,11 @@ impl Driver {
 
         match mem::replace(lifecycle, Lifecycle::Submitted) {
             Lifecycle::Submitted | Lifecycle::Waiting(_) => {
-                *lifecycle = Lifecycle::Ignored(Box::new(op.take_data()));
+                *lifecycle = Lifecycle::Ignored(op.ignore());
             }
-            Lifecycle::Completed(..) => {
+            Lifecycle::Completed(cqe) => {
                 self.ops.remove(op.index());
+                op.ignore()(cqe.into());
             }
             Lifecycle::CompletionList(indices) => {
                 // Deallocate list entries, recording if more CQE's are expected
@@ -192,7 +193,7 @@ impl Driver {
                 };
                 if more {
                     // If more are expected, we have to keep the op around
-                    *lifecycle = Lifecycle::Ignored(Box::new(op.take_data()));
+                    *lifecycle = Lifecycle::Ignored(op.ignore());
                 } else {
                     self.ops.remove(op.index());
                 }
@@ -213,7 +214,7 @@ impl Driver {
 
         match mem::replace(lifecycle, Lifecycle::Submitted) {
             Lifecycle::Submitted | Lifecycle::Waiting(_) => {
-                *lifecycle = Lifecycle::Ignored(Box::new(data));
+                *lifecycle = Lifecycle::Ignored(Box::new(move |_| drop(data)));
             }
             Lifecycle::Completed(..) => {
                 self.ops.remove(index);
@@ -227,7 +228,7 @@ impl Driver {
                 };
                 if more {
                     // If more are expected, we have to keep the op around
-                    *lifecycle = Lifecycle::Ignored(Box::new(data));
+                    *lifecycle = Lifecycle::Ignored(Box::new(move |_| drop(data)));
                 } else {
                     self.ops.remove(index);
                 }
@@ -385,7 +386,11 @@ impl Drop for Driver {
         // Pre-determine what to cancel
         // After this pass, all LifeCycles will be marked either as Completed or Ignored, as appropriate
         for (_, cycle) in self.ops.lifecycle.iter_mut() {
-            match std::mem::replace(cycle, Lifecycle::Ignored(Box::new(()))) {
+            match std::mem::replace(cycle, Lifecycle::Ignored(Box::new(|_| {}))) {
+                lc @ Lifecycle::Ignored(_) => {
+                    // Retain operation buffers/FD owners until the final CQE.
+                    *cycle = lc;
+                }
                 lc @ Lifecycle::Completed(_) => {
                     // don't cancel completed items
                     *cycle = lc;

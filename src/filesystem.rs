@@ -21,6 +21,17 @@ use std::time::{Duration, SystemTime};
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 #[cfg(target_os = "linux")]
 pub(crate) type Authorizations = HashMap<PathBuf, (bool, bool)>;
+#[cfg(target_os = "linux")]
+pub(crate) struct BackingPlan {
+    pub(crate) file: Arc<File>,
+    pub(crate) external: bool,
+}
+pub(crate) struct Creation {
+    pub(crate) ino: u64,
+    path: PathBuf,
+    attr: FileAttr,
+    bytes: Vec<u8>,
+}
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
@@ -37,7 +48,7 @@ struct Node {
     // source origin across a move. A leaf's OID identifies its pinned origin.
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
-    file: Option<File>,
+    file: Option<Arc<File>>,
     external_io: bool,
 }
 #[derive(Clone)]
@@ -123,6 +134,7 @@ pub struct Overlay {
 #[cfg(target_os = "linux")]
 pub(crate) enum SourceLookup {
     Ready(FileAttr),
+    Private(FileAttr),
     Tree {
         path: PathBuf,
         oid: Oid,
@@ -135,6 +147,179 @@ pub(crate) enum SourceLookup {
 }
 
 impl Overlay {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn backing_path(&self, ino: u64) -> FsResult<PathBuf> {
+        let n = self.node(ino)?;
+        if n.attr.nlink == 0 {
+            return Err(libc::ENOENT);
+        }
+        Ok(self.backing.join(ino.to_string()))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn backing_directory(&self) -> &Path {
+        &self.backing
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn external_backing(&self, ino: u64) -> FsResult<bool> {
+        Ok(self.node(ino)?.external_io)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepared_attributes(&self, ino: u64, fh: Option<u64>) -> FsResult<FileAttr> {
+        if let Some(fh) = fh {
+            self.handle(ino, fh)?;
+        }
+        Ok(self.node(ino)?.attr)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_open(&self, ino: u64, flags: i32) -> FsResult<bool> {
+        let n = self.node(ino)?;
+        if n.attr.kind != FileType::RegularFile {
+            return Err(if n.attr.kind == FileType::Directory {
+                libc::EISDIR
+            } else {
+                libc::ELOOP
+            });
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0 {
+            self.writable(ino)?;
+        }
+        Ok(!n.immutable)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_prepared_file(
+        &mut self,
+        ino: u64,
+        flags: i32,
+        file: Option<Arc<File>>,
+    ) -> FsResult<u64> {
+        if self.validate_open(ino, flags)? {
+            let file = file.ok_or(libc::EIO)?;
+            self.node_mut(ino)?.file = Some(file);
+        }
+        Ok(self.new_handle(ino, flags))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn private_regular(&self, ino: u64) -> bool {
+        self.nodes
+            .get(&ino)
+            .is_some_and(|n| !n.immutable && n.attr.kind == FileType::RegularFile)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shared_backing(&self, ino: u64) -> Option<Arc<File>> {
+        self.nodes.get(&ino)?.file.clone()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn metadata_io(&self, ino: u64) -> Option<BackingPlan> {
+        let n = self.nodes.get(&ino)?;
+        Some(BackingPlan {
+            file: n.file.clone()?,
+            external: n.external_io,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_read_io(&self, ino: u64, fh: u64) -> FsResult<BackingPlan> {
+        if self.handle(ino, fh)?.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(libc::EBADF);
+        }
+        let n = self.node(ino)?;
+        if n.attr.kind != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+        #[cfg(feature = "test-metrics")]
+        self._snapshot.record_generated_io(false);
+        Ok(BackingPlan {
+            file: n.file.clone().ok_or(libc::EINVAL)?,
+            external: n.external_io,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_write_io(&self, ino: u64, fh: u64) -> FsResult<BackingPlan> {
+        if self.handle(ino, fh)?.flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(libc::EBADF);
+        }
+        self.writable(ino)?;
+        let n = self.node(ino)?;
+        #[cfg(feature = "test-metrics")]
+        self._snapshot.record_generated_io(true);
+        Ok(BackingPlan {
+            file: n.file.clone().ok_or(libc::EINVAL)?,
+            external: n.external_io,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn read_io_size(&self, ino: u64, offset: u64, size: u32) -> FsResult<usize> {
+        Ok(self
+            .node(ino)?
+            .attr
+            .size
+            .saturating_sub(offset)
+            .min(u64::from(size)) as usize)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_io_offset(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: usize,
+        write_flags: u32,
+        flags: i32,
+    ) -> FsResult<u64> {
+        let offset = if write_flags & 1 == 0 && flags & libc::O_APPEND != 0 {
+            self.node(ino)?.attr.size
+        } else {
+            offset
+        };
+        offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= i64::MAX as u64)
+            .ok_or(libc::EFBIG)?;
+        Ok(offset)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn update_io_metadata(
+        &mut self,
+        ino: u64,
+        metadata: &libc::statx,
+        changed: bool,
+    ) -> FsResult<()> {
+        fn time(t: libc::statx_timestamp) -> FsResult<SystemTime> {
+            let time = if t.tv_sec >= 0 {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(t.tv_sec as u64))
+            } else {
+                SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(t.tv_sec.unsigned_abs()))
+            };
+            time.and_then(|t0| t0.checked_add(Duration::from_nanos(u64::from(t.tv_nsec))))
+                .ok_or(libc::EOVERFLOW)
+        }
+        let n = self.node_mut(ino)?;
+        n.attr.size = metadata.stx_size;
+        n.attr.blocks = metadata.stx_blocks;
+        if changed {
+            n.attr.mtime = SystemTime::now();
+            n.attr.ctime = n.attr.mtime;
+        } else {
+            n.attr.atime = time(metadata.stx_atime)?;
+            n.attr.mtime = time(metadata.stx_mtime)?;
+            let ctime = SystemTime::UNIX_EPOCH
+                .checked_add(Duration::new(
+                    metadata.stx_ctime.tv_sec.max(0) as u64,
+                    metadata.stx_ctime.tv_nsec,
+                ))
+                .ok_or(libc::EOVERFLOW)?;
+            n.attr.ctime = n.attr.ctime.max(ctime);
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_sync_io(&self, ino: u64, fh: Option<u64>) -> FsResult<Option<Arc<File>>> {
+        if let Some(fh) = fh {
+            self.handle(ino, fh)?;
+        } else {
+            self.readonly_file_attributes(ino)?;
+        }
+        self.check_file_sync(ino)?;
+        Ok(self.node(ino)?.file.clone())
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn enable_local_source(&mut self) {
         self.local_source = true;
@@ -307,7 +492,9 @@ impl Overlay {
             Some(self.child(parent, name)?)
         };
         if let Some(ino) = path.as_deref().and_then(|path| self.cached_inode(path)) {
-            self.refresh_backing_attr(ino)?;
+            if self.private_regular(ino) {
+                return self.finish_source_lookup(ino).map(SourceLookup::Private);
+            }
             return self.finish_source_lookup(ino).map(SourceLookup::Ready);
         }
         let node = self.node(parent)?;
@@ -880,6 +1067,9 @@ impl Overlay {
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
         let _ = self.refresh_backing_attr(ino);
+        self.close_prepared_handle(ino, fh);
+    }
+    fn close_prepared_handle(&mut self, ino: u64, fh: u64) {
         if let Some(handle) = self.handles.remove(&fh) {
             if handle.previous != 0 {
                 self.handles
@@ -1056,7 +1246,7 @@ impl Overlay {
         node.oid = None;
         node.bytes = bytes;
         if keep_file {
-            node.file = file;
+            node.file = file.map(Arc::new);
         }
         if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
             self.upper_paths.insert(path, ino);
@@ -1177,25 +1367,38 @@ impl Overlay {
         gid: u32,
         bytes: Vec<u8>,
     ) -> FsResult<u64> {
+        let plan = self.reserve_creation(parent, name, kind, mode, uid, gid, bytes)?;
+        let ino = plan.ino;
+        if kind == FileType::RegularFile {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(self.backing.join(ino.to_string()))
+                .map_err(errno)?;
+        }
+        self.commit_creation(plan, None);
+        Ok(ino)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_creation(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        kind: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        bytes: Vec<u8>,
+    ) -> FsResult<Creation> {
+        if kind == FileType::Symlink && bytes.contains(&0) {
+            return Err(libc::EINVAL);
+        }
         let p = self.fresh(parent, name, kind)?;
         let ino = self.next_ino;
         self.next_ino = self.next_ino.checked_add(1).ok_or(libc::ENOSPC)?;
-        // Only generated numeric inode IDs are ever resolved on the host.
-        // O_EXCL and O_NOFOLLOW prevent pre-existing links from being followed.
-        let file = if kind == FileType::RegularFile {
-            Some(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(self.backing.join(ino.to_string()))
-                    .map_err(errno)?,
-            )
-        } else {
-            None
-        };
         let attr = Self::attr(
             ino,
             kind,
@@ -1205,7 +1408,35 @@ impl Overlay {
             gid,
             SystemTime::now(),
         );
-        drop(file);
+        Ok(Creation {
+            ino,
+            path: p,
+            attr,
+            bytes,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn creation_path(&self, plan: &Creation) -> PathBuf {
+        self.backing.join(plan.ino.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_prepared_node(
+        &mut self,
+        plan: Creation,
+        file: Option<Arc<File>>,
+    ) -> FileAttr {
+        let attr = self.commit_creation(plan, file);
+        self.nodes.get_mut(&attr.ino).unwrap().lookups += 1;
+        attr
+    }
+    pub(crate) fn commit_creation(&mut self, plan: Creation, file: Option<Arc<File>>) -> FileAttr {
+        let Creation {
+            ino,
+            path: p,
+            attr,
+            bytes,
+        } = plan;
+        let kind = attr.kind;
         self.nodes.insert(
             ino,
             Node {
@@ -1215,7 +1446,7 @@ impl Overlay {
                 lookups: 0,
                 snapshot_path: None,
                 bytes,
-                file: None,
+                file,
                 external_io: false,
             },
         );
@@ -1225,7 +1456,7 @@ impl Overlay {
             self.adjust_parent_links(&p, 1);
         }
         self.touch_parent(&p);
-        Ok(ino)
+        attr
     }
     fn new_handle(&mut self, ino: u64, flags: i32) -> u64 {
         let fh = self.next_handle;
@@ -1298,7 +1529,7 @@ impl Overlay {
         }
         if !self.node(ino)?.immutable && self.node(ino)?.file.is_none() {
             let file = self.disk_file(ino)?;
-            self.node_mut(ino)?.file = Some(file);
+            self.node_mut(ino)?.file = Some(Arc::new(file));
         }
         Ok(self.new_handle(ino, flags))
     }
@@ -1527,7 +1758,7 @@ impl Overlay {
                 // O_PATH can pin an inode without an OPEN handle. Keep its
                 // backing accessible after unlink until FORGET reclaims it.
                 let file = self.disk_file(ino)?;
-                self.node_mut(ino)?.file = Some(file);
+                self.node_mut(ino)?.file = Some(Arc::new(file));
             }
         }
         self.upper_paths.remove(p);
@@ -1770,29 +2001,16 @@ impl Overlay {
         self.refresh_backing_attr(ino)?;
         Ok(self.node(ino)?.attr)
     }
-    pub(crate) fn set_attributes(
-        &mut self,
+    pub(crate) fn validate_set_attributes(
+        &self,
         ino: u64,
         caller_uid: u32,
         update: SetAttributes,
-    ) -> FsResult<FileAttr> {
-        let SetAttributes {
-            mode,
-            owner: uid,
-            group: gid,
-            size,
-            atime,
-            mtime,
-            ctime,
-            fh,
-            crtime,
-            flags,
-        } = update;
-
+    ) -> FsResult<()> {
         self.writable(ino)?;
-        if let Some(fh) = fh {
+        if let Some(fh) = update.fh {
             let h = self.handle(ino, fh)?;
-            if size.is_some() && h.flags & libc::O_ACCMODE == libc::O_RDONLY {
+            if update.size.is_some() && h.flags & libc::O_ACCMODE == libc::O_RDONLY {
                 return Err(libc::EBADF);
             }
         }
@@ -1800,49 +2018,67 @@ impl Overlay {
         if caller_uid != 0 && caller_uid != n.attr.uid {
             return Err(libc::EPERM);
         }
-        if uid.is_some_and(|u| u != n.attr.uid) || gid.is_some_and(|g| g != n.attr.gid) {
+        if update.owner.is_some_and(|u| u != n.attr.uid)
+            || update.group.is_some_and(|g| g != n.attr.gid)
+        {
             return Err(libc::EPERM);
         }
-        if flags.is_some_and(|f| f != 0) {
+        if update.flags.is_some_and(|f| f != 0) {
             return Err(libc::EOPNOTSUPP);
         }
-        if let Some(size) = size {
+        Ok(())
+    }
+    pub(crate) fn set_attributes(
+        &mut self,
+        ino: u64,
+        caller_uid: u32,
+        update: SetAttributes,
+    ) -> FsResult<FileAttr> {
+        self.validate_set_attributes(ino, caller_uid, update)?;
+        if let Some(size) = update.size {
             self.truncate(ino, size)?;
         } else {
             self.copy_up(ino, true)?;
         }
+        let attr = self.apply_set_attributes(ino, update)?;
+        if attr.kind == FileType::RegularFile && (update.atime.is_some() || update.mtime.is_some())
+        {
+            let mut times = std::fs::FileTimes::new();
+            if update.atime.is_some() {
+                times = times.set_accessed(attr.atime);
+            }
+            if update.mtime.is_some() {
+                times = times.set_modified(attr.mtime);
+            }
+            self.disk_file(ino)?.set_times(times).map_err(errno)?;
+        }
+        self.refresh_backing_attr(ino)?;
+        Ok(self.node(ino)?.attr)
+    }
+    pub(crate) fn apply_set_attributes(
+        &mut self,
+        ino: u64,
+        update: SetAttributes,
+    ) -> FsResult<FileAttr> {
         let n = self.node_mut(ino)?;
-        if let Some(mode) = mode {
+        if let Some(mode) = update.mode {
             n.attr.perm = (mode & 0o777) as u16;
         }
         let time = |v: TimeOrNow| match v {
             TimeOrNow::SpecificTime(t) => t,
             TimeOrNow::Now => SystemTime::now(),
         };
-        if let Some(t) = atime {
+        if let Some(t) = update.atime {
             n.attr.atime = time(t);
         }
-        if let Some(t) = mtime {
+        if let Some(t) = update.mtime {
             n.attr.mtime = time(t);
         }
-        if let Some(t) = crtime {
+        if let Some(t) = update.crtime {
             n.attr.crtime = t;
         }
-        n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-        if n.attr.kind == FileType::RegularFile && (atime.is_some() || mtime.is_some()) {
-            // Unspecified timestamps stay untouched even when a bypass write
-            // has made the cached attributes stale since the last callback.
-            let mut times = std::fs::FileTimes::new();
-            if atime.is_some() {
-                times = times.set_accessed(n.attr.atime);
-            }
-            if mtime.is_some() {
-                times = times.set_modified(n.attr.mtime);
-            }
-            self.disk_file(ino)?.set_times(times).map_err(errno)?;
-        }
-        self.refresh_backing_attr(ino)?;
-        Ok(self.node(ino)?.attr)
+        n.attr.ctime = update.ctime.unwrap_or_else(SystemTime::now);
+        Ok(n.attr)
     }
     pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<Vec<u8>> {
         let n = self.node(ino)?;
@@ -2003,13 +2239,7 @@ impl Overlay {
         self.sync_file_inner(ino, datasync)
     }
     fn sync_file_inner(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
-        #[cfg(feature = "test-metrics")]
-        self._snapshot.record_file_sync();
-
-        #[cfg(feature = "test-metrics")]
-        if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
-            return Err(libc::EIO);
-        }
+        self.check_file_sync(ino)?;
         if let Some(file) = &self.node(ino)?.file {
             if datasync {
                 file.sync_data()
@@ -2018,6 +2248,17 @@ impl Overlay {
             }
             .map_err(errno)?;
         }
+        Ok(())
+    }
+    fn check_file_sync(&self, ino: u64) -> FsResult<()> {
+        #[cfg(feature = "test-metrics")]
+        self._snapshot.record_file_sync();
+
+        #[cfg(feature = "test-metrics")]
+        if std::env::var_os("GIT_ON_TEST_FSYNC_ERROR").as_deref() == Some(OsStr::new("1")) {
+            return Err(libc::EIO);
+        }
+        self.node(ino)?;
         Ok(())
     }
     pub(crate) fn sync_directory(&self, ino: u64, fh: u64) -> FsResult<()> {
@@ -2034,6 +2275,12 @@ impl Overlay {
     pub(crate) fn release_handle(&mut self, ino: u64, fh: u64) -> FsResult<()> {
         self.handle(ino, fh)?;
         self.close_handle(ino, fh);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn release_prepared_handle(&mut self, ino: u64, fh: u64) -> FsResult<()> {
+        self.handle(ino, fh)?;
+        self.close_prepared_handle(ino, fh);
         Ok(())
     }
     pub(crate) fn check_access(&self, ino: u64, uid: u32, gid: u32, mask: i32) -> FsResult<()> {
@@ -2068,8 +2315,10 @@ impl Overlay {
         Ok(())
     }
     pub(crate) fn statistics(&self) -> FsResult<Statistics> {
-        let path = std::ffi::CString::new(self.backing.as_os_str().as_bytes())
-            .map_err(|_| libc::EINVAL)?;
+        Self::statistics_at(&self.backing)
+    }
+    pub(crate) fn statistics_at(path: &Path) -> FsResult<Statistics> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
         let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
             return Err(errno(std::io::Error::last_os_error()));
@@ -2092,7 +2341,7 @@ impl Overlay {
         if node.oid.is_some() || node.attr.kind != FileType::RegularFile {
             return None;
         }
-        node.file.as_ref()
+        node.file.as_deref()
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn enable_external_io(&mut self, ino: u64) {

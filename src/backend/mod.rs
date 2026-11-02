@@ -37,7 +37,7 @@ pub enum TimeOrNow {
     SpecificTime(SystemTime),
     Now,
 }
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct SetAttributes {
     pub mode: Option<u32>,
     pub owner: Option<u32>,

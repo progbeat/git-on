@@ -133,6 +133,9 @@ pub(crate) struct Op<T: 'static, CqeType = SingleCQE> {
     // Per-operation data
     data: Option<T>,
 
+    // Resource-producing operations must dispose of an unconsumed CQE too.
+    discard: fn(T, CqeResult),
+
     // CqeType marker
     _cqe_type: PhantomData<CqeType>,
 }
@@ -148,6 +151,12 @@ pub(crate) trait Completable {
     type Output;
     /// `complete` will be called for cqe's do not have the `more` flag set
     fn complete(self, cqe: CqeResult) -> Self::Output;
+
+    fn discard(self, _cqe: CqeResult)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 pub(crate) trait Updateable: Completable {
@@ -166,7 +175,7 @@ pub(crate) enum Lifecycle {
 
     /// The submitter no longer has interest in the operation result. The state
     /// must be passed to the driver and held until the operation completes.
-    Ignored(Box<dyn std::any::Any>),
+    Ignored(Box<dyn FnOnce(CqeResult)>),
 
     /// The operation has completed with a single cqe result
     Completed(cqueue::Entry),
@@ -197,11 +206,15 @@ impl From<cqueue::Entry> for CqeResult {
 
 impl<T, CqeType> Op<T, CqeType> {
     /// Create a new operation
-    pub(super) fn new(driver: driver::WeakHandle, data: T, index: usize) -> Self {
+    pub(super) fn new(driver: driver::WeakHandle, data: T, index: usize) -> Self
+    where
+        T: Completable,
+    {
         Op {
             driver,
             index,
             data: Some(data),
+            discard: T::discard,
             _cqe_type: PhantomData,
         }
     }
@@ -216,6 +229,12 @@ impl<T, CqeType> Op<T, CqeType> {
 
     pub(super) fn insert_data(&mut self, data: T) {
         self.data = Some(data);
+    }
+
+    pub(super) fn ignore(&mut self) -> Box<dyn FnOnce(CqeResult)> {
+        let data = self.data.take().expect("unconsumed operation data");
+        let discard = self.discard;
+        Box::new(move |cqe| discard(data, cqe))
     }
 }
 
@@ -285,14 +304,15 @@ impl Lifecycle {
                 false
             }
 
-            lifecycle @ Lifecycle::Ignored(..) => {
+            Lifecycle::Ignored(discard) => {
                 if io_uring::cqueue::more(cqe.flags()) {
                     // Not yet complete. The Op has been dropped, so we can drop the CQE
                     // but we must keep the lifecycle alive until no more CQE's expected
-                    *self = lifecycle;
+                    *self = Lifecycle::Ignored(discard);
                     false
                 } else {
                     // This Op has completed, we can drop
+                    discard(cqe.into());
                     true
                 }
             }

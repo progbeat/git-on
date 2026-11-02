@@ -81,10 +81,21 @@ Local request errors remain filesystem errors: a command may handle EIO for a
 missing or unsupported object and continue using readable siblings. Such errors
 do not become invocation-wide remote-transport failures.
 
+Private regular-file read/write, open/create, attribute refresh and file/directory
+sync in the protected native policies now prepare operations under short state
+borrows and await native I/O outside them. Active handles/operations retain one
+shared descriptor without duplicating it for each request. Per-inode local gates
+order writes, append, truncation and attribute updates; independent source reads
+continue. Truncate, timestamp and filesystem-capacity operations use one lazily
+created bounded I/O actor for syscalls unavailable through the supported native
+ABI. A resident source hit never enters this queue. Shutdown closes the queue,
+awaits its completion and joins the owned worker.
+
 This is not yet a complete asynchronous core. `all`, remote sources and hosts
-without io_uring still use the existing synchronous source core. Writable-layer
-I/O in the protected policies also remains synchronous. Required remaining work
-includes porting those paths and handling concurrent copy-up/read coherence,
+without io_uring still use the existing synchronous source core. Protected
+unlink/link/rename can still perform synchronous backing opens, metadata and
+removal. Required remaining work includes porting those paths, async fallback,
+and concurrent copy-up/read coherence,
 complete cancellation/cleanup verification, and paired performance acceptance
 with the complete mounted implementation. Component tests and protocol coverage do not establish
 issue #20 or merge readiness. No temporary profiler or benchmark harness is

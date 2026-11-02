@@ -79,9 +79,10 @@ impl Runtime {
             .enable_all()
             .build()?;
 
+        let driver = driver::Handle::new(b)?;
+        // Keep normal RAII until fallible driver creation has succeeded.
         let tokio_rt = ManuallyDrop::new(rt);
         let local = ManuallyDrop::new(LocalSet::new());
-        let driver = driver::Handle::new(b)?;
 
         start_uring_wakes_task(&tokio_rt, &local, driver.clone());
 

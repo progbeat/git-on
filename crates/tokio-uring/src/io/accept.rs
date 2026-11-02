@@ -41,6 +41,13 @@ impl Op<Accept> {
 impl Completable for Accept {
     type Output = io::Result<(Socket, Option<SocketAddr>)>;
 
+    fn discard(self, cqe: op::CqeResult) {
+        if let Ok(fd) = cqe.result {
+            use std::os::fd::FromRawFd;
+            drop(unsafe { std::fs::File::from_raw_fd(fd as _) });
+        }
+    }
+
     fn complete(self, cqe: op::CqeResult) -> Self::Output {
         let fd = cqe.result?;
         let fd = SharedFd::new(fd as i32);

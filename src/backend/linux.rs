@@ -27,6 +27,7 @@ pub struct Fuse {
     state: RefCell<State>,
     policy: crate::policy::LocalPolicy,
     namespace: tokio::sync::Mutex<()>,
+    io: crate::backing_async::Backing,
 }
 struct State {
     core: Overlay,
@@ -46,6 +47,7 @@ fn result<T>(r: FsResult<T>) -> Result<T, f::Errno> {
 impl Fuse {
     pub fn new(core: Overlay) -> Self {
         Self {
+            io: crate::backing_async::Backing::default(),
             policy: crate::policy::LocalPolicy::default(),
             namespace: tokio::sync::Mutex::new(()),
             state: RefCell::new(State {
@@ -64,6 +66,206 @@ impl Fuse {
     }
     fn state(&self) -> RefMut<'_, State> {
         self.state.borrow_mut()
+    }
+    async fn backing_file(&self, ino: u64) -> Result<Arc<std::fs::File>, f::Errno> {
+        let file = self.state().core.shared_backing(ino);
+        if let Some(file) = file {
+            return Ok(file);
+        }
+        let path = result(self.state().core.backing_path(ino))?;
+        crate::backing_async::Backing::open(&path, false)
+            .await
+            .map_err(f::Errno::from)
+    }
+    async fn refresh_local(&self, ino: u64) -> Result<(), f::Errno> {
+        if result(self.state().core.external_backing(ino))? {
+            let file = self.backing_file(ino).await?;
+            let file = self.io.lease(ino, file);
+            let metadata = file.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, false))?;
+        }
+        Ok(())
+    }
+    async fn attributes_local(&self, ino: u64, fh: Option<u64>) -> Result<FileAttr, f::Errno> {
+        if !self.state().core.private_regular(ino) {
+            return result(self.state().core.prepared_attributes(ino, fh));
+        }
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        result(self.state().core.prepared_attributes(ino, fh))?;
+        self.refresh_local(ino).await?;
+        let attr = result(self.state().core.prepared_attributes(ino, fh));
+        attr
+    }
+    async fn open_local(&self, ino: u64, flags: i32) -> Result<u64, f::Errno> {
+        let private = result(self.state().core.validate_open(ino, flags))?;
+        if !private {
+            return result(self.state().core.open_prepared_file(ino, flags, None));
+        }
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        self.refresh_local(ino).await?;
+        let file = self.backing_file(ino).await?;
+        if flags & libc::O_TRUNC != 0 {
+            self.io
+                .truncate(file.clone(), 0)
+                .await
+                .map_err(f::Errno::from)?;
+            let lease = self.io.lease(ino, file.clone());
+            let metadata = lease.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, true))?;
+        }
+        let fh = result(
+            self.state()
+                .core
+                .open_prepared_file(ino, flags, Some(file.clone())),
+        )?;
+        self.io.opened(ino, fh, file);
+        Ok(fh)
+    }
+    async fn set_attributes_local(
+        &self,
+        ino: u64,
+        caller_uid: u32,
+        update: SetAttributes,
+    ) -> Result<FileAttr, f::Errno> {
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        result(
+            self.state()
+                .core
+                .validate_set_attributes(ino, caller_uid, update),
+        )?;
+        if update.size.is_some_and(|size| size > i64::MAX as u64) {
+            return Err(f::Errno::EFBIG);
+        }
+        let file = if update.size.is_some() || update.atime.is_some() || update.mtime.is_some() {
+            Some(self.backing_file(ino).await?)
+        } else {
+            None
+        };
+        if let Some(size) = update.size {
+            let file = file.as_ref().unwrap();
+            self.io
+                .truncate(file.clone(), size)
+                .await
+                .map_err(f::Errno::from)?;
+            let lease = self.io.lease(ino, file.clone());
+            let metadata = lease.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, true))?;
+        }
+        let attr = result(self.state().core.apply_set_attributes(ino, update))?;
+        if update.atime.is_some() || update.mtime.is_some() {
+            let mut times = std::fs::FileTimes::new();
+            if update.atime.is_some() {
+                times = times.set_accessed(attr.atime);
+            }
+            if update.mtime.is_some() {
+                times = times.set_modified(attr.mtime);
+            }
+            self.io
+                .set_times(file.as_ref().unwrap().clone(), times)
+                .await
+                .map_err(f::Errno::from)?;
+        }
+        if result(self.state().core.external_backing(ino))? {
+            let file = if let Some(file) = file {
+                file
+            } else {
+                self.backing_file(ino).await?
+            };
+            let lease = self.io.lease(ino, file);
+            let metadata = lease.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, false))?;
+        }
+        let attr = result(self.state().core.prepared_attributes(ino, None));
+        attr
+    }
+    async fn read_backing(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, f::Errno> {
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        let plan = result(self.state().core.prepare_read_io(ino, fh))?;
+        let file = self.io.lease(ino, plan.file);
+        if plan.external {
+            let metadata = file.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, false))?;
+        }
+        let count = result(self.state().core.read_io_size(ino, offset, size))?;
+        crate::backing_async::Backing::read(file.file(), offset, count)
+            .await
+            .map_err(f::Errno::from)
+    }
+    async fn write_backing(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+    ) -> Result<u32, f::Errno> {
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        let plan = result(self.state().core.prepare_write_io(ino, fh))?;
+        let file = self.io.lease(ino, plan.file);
+        if plan.external {
+            let metadata = file.file().statx().await.map_err(f::Errno::from)?;
+            result(self.state().core.update_io_metadata(ino, &metadata, false))?;
+        }
+        let offset =
+            result(
+                self.state()
+                    .core
+                    .write_io_offset(ino, offset, data.len(), write_flags, flags),
+            )?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let written = crate::backing_async::Backing::write(file.file(), offset, data)
+            .await
+            .map_err(f::Errno::from)?;
+        let metadata = file.file().statx().await.map_err(f::Errno::from)?;
+        result(self.state().core.update_io_metadata(ino, &metadata, true))?;
+        if write_flags & 1 == 0 {
+            if flags & libc::O_SYNC == libc::O_SYNC {
+                file.file().sync_all().await.map_err(f::Errno::from)?;
+            } else if flags & libc::O_DSYNC != 0 {
+                file.file().sync_data().await.map_err(f::Errno::from)?;
+            }
+        }
+        Ok(written as u32)
+    }
+    async fn sync_backing(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+        datasync: bool,
+    ) -> Result<(), f::Errno> {
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.mutex.lock().await;
+        let file = result(self.state().core.prepare_sync_io(ino, fh))?;
+        if let Some(file) = file {
+            let file = self.io.lease(ino, file);
+            if datasync {
+                file.file().sync_data().await
+            } else {
+                file.file().sync_all().await
+            }
+            .map_err(f::Errno::from)?;
+        }
+        Ok(())
     }
     /// Construct the native local object path after entering its I/O runtime.
     pub fn with_async_source(core: Overlay) -> std::io::Result<Self> {
@@ -93,6 +295,13 @@ impl Fuse {
             let next = result(self.state().core.source_lookup(parent, name))?;
             match next {
                 SourceLookup::Ready(attr) => return Ok(attr),
+                SourceLookup::Private(attr) => match self.attributes_local(attr.ino, None).await {
+                    Ok(attr) => return Ok(attr),
+                    Err(error) => {
+                        self.state().core.forget_inode(attr.ino, 1);
+                        return Err(error);
+                    }
+                },
                 SourceLookup::Tree { path, oid } => {
                     pin.get_or_insert_with(|| self.pin(parent));
                     let tree = objects.tree(oid).await.map_err(|_| f::Errno::EIO)?;
@@ -193,7 +402,8 @@ impl Fuse {
         uid: u32,
         gid: u32,
         bytes: Vec<u8>,
-    ) -> Result<FileAttr, f::Errno> {
+        open_flags: Option<i32>,
+    ) -> Result<(FileAttr, Option<u64>), f::Errno> {
         let _namespace = self.namespace.lock().await;
         let _pin = self.pin(parent);
         if self.state().core.read_only() {
@@ -204,10 +414,37 @@ impl Fuse {
         let decisions = self
             .authorize(objects, vec![(path, kind == FileType::Directory)])
             .await?;
-        let reply = result(self.state().core.with_authorizations(decisions, |core| {
-            core.create_node(parent, name, kind, mode, uid, gid, bytes)
-        }));
-        reply
+        let plan = result(self.state().core.with_authorizations(decisions, |core| {
+            core.reserve_creation(parent, name, kind, mode, uid, gid, bytes)
+        }))?;
+        let file = if kind == FileType::RegularFile {
+            let path = self.state().core.creation_path(&plan);
+            Some(
+                crate::backing_async::Backing::open(&path, true)
+                    .await
+                    .map_err(f::Errno::from)?,
+            )
+        } else {
+            None
+        };
+        let a = self
+            .state()
+            .core
+            .create_prepared_node(plan, file.clone().filter(|_| open_flags.is_some()));
+        let fh = if let Some(flags) = open_flags {
+            let fh = result(
+                self.state()
+                    .core
+                    .open_prepared_file(a.ino, flags, file.clone()),
+            )?;
+            if let Some(file) = file {
+                self.io.opened(a.ino, fh, file);
+            }
+            Some(fh)
+        } else {
+            None
+        };
+        Ok((a, fh))
     }
     #[allow(clippy::too_many_arguments)]
     async fn create_node(
@@ -222,8 +459,9 @@ impl Fuse {
     ) -> Result<FileAttr, f::Errno> {
         let objects = self.state().objects.clone();
         if let Some(objects) = objects {
-            self.create_local(&objects, parent, name, kind, mode, uid, gid, bytes)
+            self.create_local(&objects, parent, name, kind, mode, uid, gid, bytes, None)
                 .await
+                .map(|(attr, _)| attr)
         } else {
             result(
                 self.state()
@@ -400,6 +638,10 @@ impl State {
     }
     fn release(&mut self, ino: u64, handle: u64) -> FsResult<()> {
         self.core.release_handle(ino, handle)?;
+        self.release_registration(ino, handle);
+        Ok(())
+    }
+    fn release_registration(&mut self, ino: u64, handle: u64) {
         self.handles.remove(&handle);
         if self
             .backings
@@ -408,7 +650,6 @@ impl State {
         {
             self.backings.remove(&ino);
         }
-        Ok(())
     }
 }
 fn kind(k: FileType) -> f::FileType {
@@ -450,6 +691,7 @@ fn time(t: f::TimeOrNow) -> TimeOrNow {
 #[allow(clippy::too_many_arguments)]
 impl f::AsyncFilesystem for Fuse {
     async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.io.finish().await?;
         let state = self.state.get_mut();
         if let Some(objects) = state.objects.take() {
             let objects = Rc::try_unwrap(objects).map_err(|_| {
@@ -521,15 +763,20 @@ impl f::AsyncFilesystem for Fuse {
         ino: f::INodeNo,
         fh: Option<f::FileHandle>,
     ) -> Result<AttrResponse, f::Errno> {
-        let mut state = self.state();
-        #[cfg(feature = "test-metrics")]
-        state.core.record_fuse_request("getattr");
-        let a = result(if state.no_open && fh == Some(f::FileHandle(0)) {
-            state.core.readonly_file_attributes(ino.0)
+        let (native, no_open) = {
+            let state = self.state();
+            #[cfg(feature = "test-metrics")]
+            state.core.record_fuse_request("getattr");
+            (state.objects.is_some(), state.no_open)
+        };
+        let a = if no_open && fh == Some(f::FileHandle(0)) {
+            result(self.state().core.readonly_file_attributes(ino.0))?
+        } else if native {
+            self.attributes_local(ino.0, fh.map(|h| h.0)).await?
         } else {
-            state.core.attributes(ino.0, fh.map(|h| h.0))
-        })?;
-        Ok(AttrResponse::new(state.ttl(a.ino), attr(a)))
+            result(self.state().core.attributes(ino.0, fh.map(|h| h.0)))?
+        };
+        Ok(AttrResponse::new(self.state().ttl(a.ino), attr(a)))
     }
     async fn setattr(
         &self,
@@ -548,22 +795,27 @@ impl f::AsyncFilesystem for Fuse {
         _: Option<SystemTime>,
         flags: Option<f::BsdFileFlags>,
     ) -> Result<AttrResponse, f::Errno> {
-        let a = result(self.state().core.set_attributes(
-            ino.0,
-            req.uid(),
-            SetAttributes {
-                mode,
-                owner: uid,
-                group: gid,
-                size,
-                atime: atime.map(time),
-                mtime: mtime.map(time),
-                ctime,
-                fh: fh.map(|h| h.0),
-                crtime,
-                flags: flags.map(|f| f.bits()),
-            },
-        ))?;
+        let private = {
+            let state = self.state();
+            state.objects.is_some() && state.core.private_regular(ino.0)
+        };
+        let update = SetAttributes {
+            mode,
+            owner: uid,
+            group: gid,
+            size,
+            atime: atime.map(time),
+            mtime: mtime.map(time),
+            ctime,
+            fh: fh.map(|h| h.0),
+            crtime,
+            flags: flags.map(|f| f.bits()),
+        };
+        let a = if private {
+            self.set_attributes_local(ino.0, req.uid(), update).await?
+        } else {
+            result(self.state().core.set_attributes(ino.0, req.uid(), update))?
+        };
         Ok(AttrResponse::new(TTL, attr(a)))
     }
     async fn readlink(&self, _: &f::Request, ino: f::INodeNo) -> Result<DataResponse, f::Errno> {
@@ -723,17 +975,25 @@ impl f::AsyncFilesystem for Fuse {
         ino: f::INodeNo,
         flags: f::OpenFlags,
     ) -> Result<OpenResponse, f::Errno> {
-        let mut state = self.state();
-        #[cfg(feature = "test-metrics")]
-        state.core.record_fuse_request("open");
-        if state.no_open {
-            if flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0 {
-                return Err(f::Errno::EROFS);
+        let native = {
+            let state = self.state();
+            #[cfg(feature = "test-metrics")]
+            state.core.record_fuse_request("open");
+            if state.no_open {
+                if flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0 {
+                    return Err(f::Errno::EROFS);
+                }
+                result(state.core.readonly_file_attributes(ino.0))?;
+                return Err(f::Errno::ENOSYS);
             }
-            result(state.core.readonly_file_attributes(ino.0))?;
-            return Err(f::Errno::ENOSYS);
-        }
-        let fh = result(state.core.open_file(ino.0, flags.0))?;
+            state.objects.is_some()
+        };
+        let fh = if native {
+            self.open_local(ino.0, flags.0).await?
+        } else {
+            result(self.state().core.open_file(ino.0, flags.0))?
+        };
+        let mut state = self.state();
         let cache =
             if state.retain_source_data(ino.0) && flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
                 f::FopenFlags::FOPEN_KEEP_CACHE
@@ -763,8 +1023,10 @@ impl f::AsyncFilesystem for Fuse {
         umask: u32,
         flags: i32,
     ) -> Result<CreateResponse, f::Errno> {
-        let a = self
-            .create_node(
+        let objects = self.state().objects.clone();
+        let (a, opened) = if let Some(objects) = objects {
+            self.create_local(
+                &objects,
                 parent.0,
                 name,
                 FileType::RegularFile,
@@ -772,10 +1034,29 @@ impl f::AsyncFilesystem for Fuse {
                 req.uid(),
                 req.gid(),
                 Vec::new(),
+                Some(flags),
             )
-            .await?;
+            .await?
+        } else {
+            (
+                self.create_node(
+                    parent.0,
+                    name,
+                    FileType::RegularFile,
+                    mode & !umask,
+                    req.uid(),
+                    req.gid(),
+                    Vec::new(),
+                )
+                .await?,
+                None,
+            )
+        };
         let mut state = self.state();
-        let fh = match state.core.open_file(a.ino, flags) {
+        let fh = match opened
+            .map(Ok)
+            .unwrap_or_else(|| state.core.open_file(a.ino, flags))
+        {
             Ok(fh) => fh,
             Err(error) => {
                 state.core.forget_inode(a.ino, 1);
@@ -843,6 +1124,12 @@ impl f::AsyncFilesystem for Fuse {
                 range.len(),
             ));
         }
+        if self.state().objects.is_some() {
+            return self
+                .read_backing(ino.0, fh.0, offset, size)
+                .await
+                .map(ReadResponse::new);
+        }
         let mut state = self.state();
         let offset = i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
         let data = if state.no_open && fh.0 == 0 {
@@ -866,7 +1153,14 @@ impl f::AsyncFilesystem for Fuse {
         flags: f::OpenFlags,
         _: Option<f::LockOwner>,
     ) -> Result<WriteResponse, f::Errno> {
-        let offset = i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
+        let signed_offset = i64::try_from(offset).map_err(|_| f::Errno::EINVAL)?;
+        if self.state().objects.is_some() {
+            return self
+                .write_backing(ino.0, fh.0, offset, data, write_flags.bits(), flags.0)
+                .await
+                .map(WriteResponse::new);
+        }
+        let offset = signed_offset;
         Ok(WriteResponse::new(result(self.state().core.write_data(
             ino.0,
             fh.0,
@@ -900,6 +1194,35 @@ impl f::AsyncFilesystem for Fuse {
         _: Option<f::LockOwner>,
         _: bool,
     ) -> Result<(), f::Errno> {
+        let native = self.state().objects.is_some();
+        if native {
+            let _pin = self.pin(ino.0);
+            let gate = self.io.gate(ino.0);
+            let _guard = gate.mutex.lock().await;
+            result(self.state().core.validate_handle(ino.0, fh.0))?;
+            let plan = self.state().core.metadata_io(ino.0);
+            if let Some(plan) = plan.filter(|p| p.external) {
+                let file = self.io.lease(ino.0, plan.file);
+                if let Ok(metadata) = file.file().statx().await {
+                    let _ = self
+                        .state()
+                        .core
+                        .update_io_metadata(ino.0, &metadata, false);
+                }
+            }
+            let reply = {
+                let mut state = self.state();
+                let result = state.core.release_prepared_handle(ino.0, fh.0);
+                if result.is_ok() {
+                    state.release_registration(ino.0, fh.0);
+                }
+                result
+            };
+            if reply.is_ok() {
+                self.io.released(ino.0, fh.0);
+            }
+            return result(reply);
+        }
         result(self.state().release(ino.0, fh.0))
     }
     async fn fsync(
@@ -909,6 +1232,14 @@ impl f::AsyncFilesystem for Fuse {
         fh: f::FileHandle,
         datasync: bool,
     ) -> Result<(), f::Errno> {
+        if self.state().objects.is_some() {
+            let fh = if self.state().no_open && fh.0 == 0 {
+                None
+            } else {
+                Some(fh.0)
+            };
+            return self.sync_backing(ino.0, fh, datasync).await;
+        }
         let mut state = self.state();
         result(if state.no_open && fh.0 == 0 {
             state.core.sync_readonly_file(ino.0, datasync)
@@ -992,10 +1323,27 @@ impl f::AsyncFilesystem for Fuse {
         fh: f::FileHandle,
         _: bool,
     ) -> Result<(), f::Errno> {
+        if self.state().objects.is_some() {
+            result(self.state().core.validate_handle(ino.0, fh.0))?;
+            let _pin = self.pin(ino.0);
+            let path = self.state().core.backing_directory().to_owned();
+            let file = tokio_uring::fs::File::open(path)
+                .await
+                .map_err(f::Errno::from)?;
+            let sync = file.sync_all().await;
+            let close = file.close().await;
+            sync.and(close).map_err(f::Errno::from)?;
+            return Ok(());
+        }
         result(self.state().core.sync_directory(ino.0, fh.0))
     }
     async fn statfs(&self, _: &f::Request, _: f::INodeNo) -> Result<StatfsResponse, f::Errno> {
-        let s = result(self.state().core.statistics())?;
+        let s = if self.state().objects.is_some() {
+            let path = self.state().core.backing_directory().to_owned();
+            self.io.statistics(path).await.map_err(f::Errno::from)?
+        } else {
+            result(self.state().core.statistics())?
+        };
         Ok(StatfsResponse::new(
             s.blocks,
             s.free,
@@ -1021,7 +1369,7 @@ impl f::AsyncFilesystem for Fuse {
     }
 }
 /// Start the one local event loop. Startup channel use is confined to mount
-/// negotiation; ordinary callbacks never cross a worker queue.
+/// negotiation; resident source callbacks never cross a worker queue.
 pub fn mount(
     core: Overlay,
     path: &Path,
@@ -1102,6 +1450,152 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    fn private_native_io_keeps_handles_and_other_inode_progress_without_a_core_borrow() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let oid = repo.blob(b"trusted source").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "native-private",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::Untracked)
+                .unwrap();
+        tokio_uring::start(async {
+            let mut fs = Fuse::with_async_source(overlay).unwrap();
+            let objects = fs.state().objects.clone().unwrap();
+            let attr = fs
+                .lookup_local(&objects, 1, OsStr::new("source"))
+                .await
+                .unwrap();
+            objects.read(oid, attr.size, 0, 100).await.unwrap();
+            let ino = fs
+                .create_node(
+                    1,
+                    OsStr::new("generated"),
+                    FileType::RegularFile,
+                    0o600,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .ino;
+            let fh = fs.open_local(ino, libc::O_RDWR).await.unwrap();
+            let gate = fs.io.gate(ino);
+            let hold = gate.mutex.lock().await;
+            let write = fs.write_backing(ino, fh, 2, b"abc", 0, libc::O_RDWR);
+            let progress = async {
+                assert_eq!(
+                    fs.lookup_local(&objects, 1, OsStr::new("source"))
+                        .await
+                        .unwrap()
+                        .ino,
+                    attr.ino
+                );
+                assert_eq!(
+                    objects
+                        .read(oid, attr.size, 0, 100)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                    b"trusted source"
+                );
+                drop(hold);
+            };
+            let (written, ()) = tokio::join!(write, progress);
+            assert_eq!(written.unwrap(), 3);
+            drop(gate);
+            assert_eq!(fs.read_backing(ino, fh, 0, 100).await.unwrap(), b"\0\0abc");
+            assert_eq!(
+                fs.write_backing(ino, fh, 0, b"d", 0, libc::O_RDWR | libc::O_APPEND)
+                    .await
+                    .unwrap(),
+                1
+            );
+            fs.sync_backing(ino, Some(fh), true).await.unwrap();
+            fs.sync_backing(ino, Some(fh), false).await.unwrap();
+            assert_eq!(fs.read_backing(ino, fh, 0, 100).await.unwrap(), b"\0\0abcd");
+            let (started, wait) = tokio::sync::oneshot::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            let blocked = fs.io.blocking(move || {
+                started.send(()).unwrap();
+                paused.recv().unwrap();
+                Ok(())
+            });
+            let progress = async {
+                wait.await.unwrap();
+                // A blocked backing actor cannot delay ready source data or
+                // metadata on the same loop, and holds no core borrow.
+                assert_eq!(
+                    fs.lookup_local(&objects, 1, OsStr::new("source"))
+                        .await
+                        .unwrap()
+                        .ino,
+                    attr.ino
+                );
+                assert_eq!(
+                    objects
+                        .read(oid, attr.size, 0, 100)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                    b"trusted source"
+                );
+                resume.send(()).unwrap();
+            };
+            let (done, ()) = tokio::join!(blocked, progress);
+            done.unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let changed = fs
+                .set_attributes_local(
+                    ino,
+                    uid,
+                    SetAttributes {
+                        size: Some(9),
+                        mtime: Some(TimeOrNow::SpecificTime(
+                            SystemTime::UNIX_EPOCH + Duration::from_secs(7),
+                        )),
+                        fh: Some(fh),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(changed.size, 9);
+            assert_eq!(
+                changed.mtime,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(7)
+            );
+            assert_eq!(
+                fs.read_backing(ino, fh, 0, 100).await.unwrap(),
+                b"\0\0abcd\0\0\0"
+            );
+            let reopened = fs
+                .open_local(ino, libc::O_RDWR | libc::O_TRUNC)
+                .await
+                .unwrap();
+            assert_eq!(fs.attributes_local(ino, Some(fh)).await.unwrap().size, 0);
+            fs.state()
+                .core
+                .release_prepared_handle(ino, reopened)
+                .unwrap();
+            fs.io.released(ino, reopened);
+            fs.state().core.release_prepared_handle(ino, fh).unwrap();
+            fs.io.released(ino, fh);
+            assert_eq!(fs.io.retained(), (0, 0, 0));
+            drop(objects);
+            f::AsyncFilesystem::shutdown(&mut fs).await.unwrap();
+        });
+    }
 
     #[test]
     fn handled_local_source_errors_do_not_poison_siblings_or_latch_remote_failure() {
@@ -1212,135 +1706,131 @@ mod tests {
             let overlay =
                 Overlay::with_write_policy(snapshot.clone(), temp.path().join("upper"), policy)
                     .unwrap();
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    let mut fs = Fuse::with_async_source(overlay).unwrap();
-                    let objects = fs
-                        .state()
-                        .objects
-                        .clone()
-                        .expect("ordinary protected policies must use the async source");
-                    let a = fs
-                        .lookup_local(&objects, 1, OsStr::new("warm"))
-                        .await
-                        .unwrap();
+            tokio_uring::start(async {
+                let mut fs = Fuse::with_async_source(overlay).unwrap();
+                let objects = fs
+                    .state()
+                    .objects
+                    .clone()
+                    .expect("ordinary protected policies must use the async source");
+                let a = fs
+                    .lookup_local(&objects, 1, OsStr::new("warm"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    objects.read(warm, a.size, 0, 100).await.unwrap().as_slice(),
+                    b"verified source contents"
+                );
+                let uid = unsafe { libc::geteuid() };
+                let gid = unsafe { libc::getegid() };
+                let out = fs
+                    .create_node(
+                        1,
+                        OsStr::new("out"),
+                        FileType::Directory,
+                        0o700,
+                        uid,
+                        gid,
+                        vec![],
+                    )
+                    .await
+                    .unwrap()
+                    .ino;
+                let generated = fs
+                    .create_node(
+                        out,
+                        OsStr::new("generated.tmp"),
+                        FileType::RegularFile,
+                        0o600,
+                        uid,
+                        gid,
+                        vec![],
+                    )
+                    .await
+                    .unwrap()
+                    .ino;
+                let resume = objects.tested_pause().await;
+                let request = fs.lookup_local(&objects, 1, OsStr::new("cold"));
+                let hit = async {
+                    assert_eq!(
+                        fs.lookup_local(&objects, 1, OsStr::new("warm"))
+                            .await
+                            .unwrap()
+                            .ino,
+                        a.ino
+                    );
                     assert_eq!(
                         objects.read(warm, a.size, 0, 100).await.unwrap().as_slice(),
                         b"verified source contents"
                     );
-                    let uid = unsafe { libc::geteuid() };
-                    let gid = unsafe { libc::getegid() };
-                    let out = fs
+                    fs.create_node(
+                        out,
+                        OsStr::new("second.tmp"),
+                        FileType::RegularFile,
+                        0o600,
+                        uid,
+                        gid,
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        fs.link_local(&objects, generated, out, OsStr::new("alias.tmp"))
+                            .await
+                            .unwrap()
+                            .ino,
+                        generated
+                    );
+                    fs.rename_local(
+                        &objects,
+                        out,
+                        OsStr::new("generated.tmp"),
+                        out,
+                        OsStr::new("renamed.tmp"),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    fs.remove_local(&objects, out, OsStr::new("alias.tmp"), false)
+                        .await
+                        .unwrap();
+                    let keep = fs
                         .create_node(
                             1,
-                            OsStr::new("out"),
-                            FileType::Directory,
-                            0o700,
-                            uid,
-                            gid,
-                            vec![],
-                        )
-                        .await
-                        .unwrap()
-                        .ino;
-                    let generated = fs
-                        .create_node(
-                            out,
-                            OsStr::new("generated.tmp"),
+                            OsStr::new("keep.tmp"),
                             FileType::RegularFile,
                             0o600,
                             uid,
                             gid,
                             vec![],
                         )
-                        .await
-                        .unwrap()
-                        .ino;
-                    let resume = objects.tested_pause().await;
-                    let request = fs.lookup_local(&objects, 1, OsStr::new("cold"));
-                    let hit = async {
-                        assert_eq!(
-                            fs.lookup_local(&objects, 1, OsStr::new("warm"))
-                                .await
-                                .unwrap()
-                                .ino,
-                            a.ino
-                        );
-                        assert_eq!(
-                            objects.read(warm, a.size, 0, 100).await.unwrap().as_slice(),
-                            b"verified source contents"
-                        );
-                        fs.create_node(
-                            out,
-                            OsStr::new("second.tmp"),
-                            FileType::RegularFile,
-                            0o600,
-                            uid,
-                            gid,
-                            vec![],
-                        )
-                        .await
-                        .unwrap();
-                        assert_eq!(
-                            fs.link_local(&objects, generated, out, OsStr::new("alias.tmp"))
-                                .await
-                                .unwrap()
-                                .ino,
-                            generated
-                        );
-                        fs.rename_local(
-                            &objects,
-                            out,
-                            OsStr::new("generated.tmp"),
-                            out,
-                            OsStr::new("renamed.tmp"),
-                            0,
-                        )
-                        .await
-                        .unwrap();
-                        fs.remove_local(&objects, out, OsStr::new("alias.tmp"), false)
-                            .await
-                            .unwrap();
-                        let keep = fs
-                            .create_node(
-                                1,
-                                OsStr::new("keep.tmp"),
-                                FileType::RegularFile,
-                                0o600,
-                                uid,
-                                gid,
-                                vec![],
-                            )
-                            .await;
-                        assert_eq!(keep.is_ok(), policy == WritePolicy::Untracked);
-                        resume.send(()).unwrap();
-                    };
-                    let (result, ()) = tokio::join!(request, hit);
-                    result.unwrap();
-                    let legacy = snapshot.metrics();
-                    assert_eq!(
-                        (legacy.tree_reads, legacy.header_reads, legacy.blob_loads),
-                        (0, 0, 0),
-                        "a protected operation entered the old synchronous loader"
-                    );
-                    drop(objects);
-                    fs.shutdown().await.unwrap();
-                    let observed = snapshot.metrics();
-                    assert_eq!(
-                        observed.blob_loads,
-                        if policy == WritePolicy::Ignored { 2 } else { 1 }
-                    );
-                    assert_eq!(
-                        (
-                            observed.retained_raw_blob_entries,
-                            observed.retained_raw_blob_bytes
-                        ),
-                        (0, 0)
-                    );
-                });
+                        .await;
+                    assert_eq!(keep.is_ok(), policy == WritePolicy::Untracked);
+                    resume.send(()).unwrap();
+                };
+                let (result, ()) = tokio::join!(request, hit);
+                result.unwrap();
+                let legacy = snapshot.metrics();
+                assert_eq!(
+                    (legacy.tree_reads, legacy.header_reads, legacy.blob_loads),
+                    (0, 0, 0),
+                    "a protected operation entered the old synchronous loader"
+                );
+                drop(objects);
+                fs.shutdown().await.unwrap();
+                let observed = snapshot.metrics();
+                assert_eq!(
+                    observed.blob_loads,
+                    if policy == WritePolicy::Ignored { 2 } else { 1 }
+                );
+                assert_eq!(
+                    (
+                        observed.retained_raw_blob_entries,
+                        observed.retained_raw_blob_bytes
+                    ),
+                    (0, 0)
+                );
+            });
         }
     }
 
