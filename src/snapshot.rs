@@ -332,7 +332,7 @@ struct State {
     spool_directory: PathBuf,
     _local_object_bridge: Option<tempfile::TempDir>,
     #[cfg(target_os = "linux")]
-    async_observation: Option<(SnapshotMetrics, Option<String>)>,
+    async_observation: Option<SnapshotMetrics>,
 }
 impl State {
     fn ensure(&mut self, oid: Oid) -> Result<()> {
@@ -715,13 +715,9 @@ impl Snapshot {
         Ok(())
     }
     pub fn remote_failure(&self) -> Option<String> {
-        self.state().ok().and_then(|s| {
-            #[cfg(target_os = "linux")]
-            if let Some((_, Some(failure))) = &s.async_observation {
-                return Some(failure.clone());
-            }
-            s.remote.as_ref().and_then(|r| r.failure())
-        })
+        self.state()
+            .ok()
+            .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
     pub(crate) fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
         let kind = match mode {
@@ -889,19 +885,15 @@ impl Snapshot {
             .as_ref()
             .context("raw storage not initialized")?
             .directory_anchor()?;
-        crate::snapshot_async::Snapshot::new(repo, fd, owner).map(Some)
+        crate::snapshot_async::Snapshot::new(repo, self.tree_oid, fd, owner).map(Some)
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn record_async_observation(
-        &self,
-        metrics: SnapshotMetrics,
-        failure: Option<String>,
-    ) {
+    pub(crate) fn record_async_observation(&self, metrics: SnapshotMetrics) {
         self.inner
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .async_observation = Some((metrics, failure));
+            .async_observation = Some(metrics);
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
@@ -1011,7 +1003,7 @@ impl Snapshot {
             }
         }
         #[cfg(target_os = "linux")]
-        if let Some((observed, _)) = &state.async_observation {
+        if let Some(observed) = &state.async_observation {
             #[cfg(feature = "test-metrics")]
             {
                 let mut observed = observed.clone();

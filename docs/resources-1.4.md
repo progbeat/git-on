@@ -52,7 +52,8 @@ identity prevents cleanup from targeting a later filesystem at the same path.
 The original MIT licenses and separate diffs from both upstream sources are
 included with the local crates.
 
-The native local readonly mount now connects lookup/header demands, directory
+The native local `none`, `ignored` and `untracked` mounts connect lookup/header
+demands, directory
 preparation, read and readlink to `snapshot_async.rs`, `source_async.rs` and
 `raw_blob_async.rs`. Trees, sizes, verified descriptors and the payload LRU belong
 to the loop. No namespace borrow survives a source or disk await. Only cold
@@ -68,9 +69,22 @@ Objects up to 64 KiB cross the source boundary in one completely verified
 response; larger objects retain bounded streaming. Spill storage remains one
 file per OID.
 
-This is not yet a complete asynchronous core. Mutable policies, remote sources
-and hosts without io_uring still use the existing synchronous core. Required
-remaining work includes porting those paths, asynchronous writable-layer I/O,
+Protected mutable policies also load pinned ignore rules through that same
+payload cache. Compiled rules reuse the existing parser, matching semantics and
+4 MiB/128-directory retention budget. Policy/source waits finish before a short
+namespace commit, which receives explicit per-path decisions. An asynchronous
+namespace gate orders these mutations without preventing warm reads/lookups
+from progressing. Lookup reuses the parent's prepared name index for all three
+policies; generated entries retain their normal writable namespace identity.
+There is no second legacy payload cache on these native source paths.
+Local request errors remain filesystem errors: a command may handle EIO for a
+missing or unsupported object and continue using readable siblings. Such errors
+do not become invocation-wide remote-transport failures.
+
+This is not yet a complete asynchronous core. `all`, remote sources and hosts
+without io_uring still use the existing synchronous source core. Writable-layer
+I/O in the protected policies also remains synchronous. Required remaining work
+includes porting those paths and handling concurrent copy-up/read coherence,
 complete cancellation/cleanup verification, and paired performance acceptance
 with the complete mounted implementation. Component tests and protocol coverage do not establish
 issue #20 or merge readiness. No temporary profiler or benchmark harness is

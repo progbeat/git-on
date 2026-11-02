@@ -2450,7 +2450,7 @@ The local FUSE dispatcher regression also requires awaited asynchronous
 shutdown after request drain and before destroy. Local shared-reply tests retain
 and compare the original allocation through its response lifetime.
 
-Current local checks: 198 default Rust tests, 59 local FUSE-library unit tests,
+Local checks at `206a2a3`: 198 default Rust tests, 59 local FUSE-library unit tests,
 the suspended-request dispatcher test, strict root clippy, Rust 1.89 locked
 check, the full 44-operation inventory, release-policy tests and five selected
 real CLI/mount regressions pass. This is component/integration evidence, not
@@ -2459,3 +2459,32 @@ fallback and complete lifecycle/resource verification still need the async
 port. Paired ordinary-release fitting-RAM controls did not establish a wall-time
 improvement; issue #20 remains incomplete. Temporary controls and their raw
 evidence stay outside this repository.
+
+## Protected-policy source port and handled local errors
+
+Local `ignored` and `untracked` source reads, lookup and pinned ignore rules now
+use the same loop-owned cache as `none`. The permanent paused-decoder test
+`protected_policies_share_async_source_and_warm_namespace_work_survives_a_paused_decoder`
+checks warm reads plus generated create/link/rename/unlink under both policies,
+while a cold header request is suspended. It checks that the synchronous loader
+was unused, only one source payload cache was populated and no spill occurred.
+The common parser/matcher and compiled-rule cache budget remain unchanged.
+
+The first broader real-mount run exposed invocation-wide failure latching for
+handled local EIO. The child successfully caught missing-object/unsupported
+errors and read valid siblings, but the runner incorrectly replaced its success
+with exit125. A focused permanent unit test reproduces that failure before the
+fix. The existing lazy-metadata and unsupported-entry real-mount regressions
+now cover `none`, `ignored` and `untracked`; both fail on the frozen ordinary
+`206a2a3` binary in `none` and pass after the fix in all three modes. Local
+request errors are returned to the caller without becoming remote-transport
+failures. Remote failure latching retains its original contract. Range/hash,
+streaming and cache-corruption checks remain in the permanent suite.
+
+Validation: 200 default Rust tests, strict root clippy, Rust1.89 locked checks,
+the complete FUSE guard, all70 local CLI/FUSE/integration tests including both
+uv/Numba examples, and all8 write-policy tests pass. The inherited user uv
+configuration initially requested an `exclude-newer` change to fixture locks;
+the final uv run used `UV_NO_CONFIG=1`, preserving the fixtures and host config.
+These checks still do not complete the remaining async `all`/remote/writable-I/O
+port, resource/cancellation audit or final #20 performance acceptance.

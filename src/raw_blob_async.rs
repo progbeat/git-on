@@ -49,7 +49,6 @@ struct State {
     memory: lru::LruCache<Oid, Resident>,
     memory_bytes: usize,
     reader: Option<(Oid, Rc<File>)>,
-    failure: Option<String>,
     #[cfg(test)]
     io_operations: u64,
     #[cfg(test)]
@@ -129,7 +128,6 @@ impl RawBlobs {
                 memory: lru::LruCache::unbounded(),
                 memory_bytes: 0,
                 reader: None,
-                failure: None,
                 #[cfg(test)]
                 io_operations: 0,
                 #[cfg(test)]
@@ -149,21 +147,6 @@ impl RawBlobs {
         {
             self.state.borrow_mut().io_operations += 1;
         }
-    }
-    fn remember<T>(&self, r: Result<T>) -> Result<T> {
-        if let Err(error) = &r {
-            if error
-                .downcast_ref::<crate::object::TransferStopped>()
-                .is_some()
-            {
-                return r;
-            }
-            self.state
-                .borrow_mut()
-                .failure
-                .get_or_insert_with(|| format!("{error:#}"));
-        }
-        r
     }
     async fn validate(&self, file: &File, size: Option<u64>) -> Result<()> {
         self.record_io();
@@ -262,7 +245,7 @@ impl RawBlobs {
     /// this entry point never accepts unverified bytes as resident data.
     #[cfg(test)]
     pub(crate) async fn insert(&self, oid: Oid, bytes: Vec<u8>) -> Result<()> {
-        self.remember(self.insert_inner(oid, bytes, None).await)
+        self.insert_inner(oid, bytes, None).await
     }
     async fn insert_inner(
         &self,
@@ -334,7 +317,7 @@ impl RawBlobs {
         source: &crate::source_async::Source,
         oid: Oid,
     ) -> Result<()> {
-        self.remember(self.prepare_inner(source, oid, None).await)
+        self.prepare_inner(source, oid, None).await
     }
     pub(crate) async fn prepare_with_size(
         &self,
@@ -342,10 +325,8 @@ impl RawBlobs {
         oid: Oid,
         size: u64,
     ) -> Result<()> {
-        self.remember(
-            self.prepare_inner(source, oid, Some(usize::try_from(size)?))
-                .await,
-        )
+        self.prepare_inner(source, oid, Some(usize::try_from(size)?))
+            .await
     }
     async fn prepare_inner(
         &self,
@@ -471,9 +452,6 @@ impl RawBlobs {
             .content_checked = true;
         Ok(())
     }
-    pub(crate) fn failure(&self) -> Option<String> {
-        self.state.borrow().failure.clone()
-    }
     pub(crate) fn metrics(&self) -> crate::snapshot::SnapshotMetrics {
         let s = self.state.borrow();
         crate::snapshot::SnapshotMetrics {
@@ -531,7 +509,7 @@ impl RawBlobs {
         Ok(file)
     }
     pub(crate) async fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Bytes> {
-        self.remember(self.read_inner(oid, offset, size).await)
+        self.read_inner(oid, offset, size).await
     }
     async fn read_inner(&self, oid: Oid, offset: u64, size: u32) -> Result<Bytes> {
         let length = {
@@ -689,7 +667,6 @@ mod tests {
             assert_eq!(store.state.borrow().io_operations, io);
             store.read(oid(&b), 0, 1024).await.unwrap();
             assert!(store.read(oid(&a), 0, 1024).await.is_err());
-            assert!(store.state.borrow().failure.is_some());
         });
     }
     #[test]

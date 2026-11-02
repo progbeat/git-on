@@ -1481,7 +1481,7 @@ print(len(rows))
             loose = self.repo / ".git/objects" / oid[:2] / oid[2:]
             self.assertTrue(loose.is_file(), f"fixture must have a loose object: {path}")
             loose.unlink()
-        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r"""
+        code = r"""
 import os
 from pathlib import Path
 assert 'unused' in os.listdir('.')
@@ -1493,10 +1493,14 @@ for action in [lambda: Path('unused/blob').read_bytes(), lambda: os.listdir('unu
     except OSError: pass
     else: raise AssertionError('missing object unexpectedly readable')
 assert Path('tracked.txt').read_bytes() == b'committed\n'
-""")
-        self.assert_success(result)
-        self.assertIsNone(run)
-        self.assert_no_runtime_files()
+"""
+        for policy in ("none", "ignored", "untracked"):
+            with self.subTest(policy=policy):
+                result, run = self.invoke_argv(["HEAD", "--write-policy=" + policy,
+                                               "--", sys.executable, "-I", "-S", "-c", code])
+                self.assert_success(result)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
 
     def test_large_digit_tree_supports_small_lazy_workloads(self):
         from benchmark import digit_fixture
@@ -1590,7 +1594,7 @@ finally:
         head = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{head},unsupported/module")
         git(self.repo, "commit", "--quiet", "-m", "unsupported objects accessed lazily")
-        result, run = self.invoke(sys.executable, "-I", "-S", "-c", r'''
+        code = r'''
 import errno, os
 from pathlib import Path
 assert Path('tracked.txt').read_text() == 'committed\n'
@@ -1602,10 +1606,14 @@ for action in [lambda: Path('unsupported/lfs.bin').read_bytes(),
     except OSError as error: assert error.errno in (errno.EIO, errno.EOPNOTSUPP, errno.ENOSYS), error
     else: raise AssertionError('unsupported object was presented as usable')
 assert Path('unsupported/ordinary.txt').read_text() == 'ordinary\n'
-''')
-        self.assert_success(result)
-        self.assertIsNone(run)
-        self.assert_no_runtime_files()
+'''
+        for policy in ("none", "ignored", "untracked"):
+            with self.subTest(policy=policy):
+                result, run = self.invoke_argv(["HEAD", "--write-policy=" + policy,
+                                               "--", sys.executable, "-I", "-S", "-c", code])
+                self.assert_success(result)
+                self.assertIsNone(run)
+                self.assert_no_runtime_files()
 
     def test_runtime_ignore_file_cannot_expand_write_policy(self):
         result, _ = self.python('''

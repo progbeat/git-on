@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
+#[cfg(target_os = "linux")]
+pub(crate) type Authorizations = HashMap<PathBuf, (bool, bool)>;
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
@@ -105,6 +107,12 @@ pub struct Overlay {
     dirty_directories: HashSet<u64>,
     source_directories: Vec<SourceDirectory>,
     source_directory_keys: HashMap<PathBuf, usize>,
+    #[cfg(target_os = "linux")]
+    local_source: bool,
+    #[cfg(target_os = "linux")]
+    source_directory_absences: HashSet<PathBuf>,
+    #[cfg(target_os = "linux")]
+    authorizations: Option<Authorizations>,
     #[cfg(test)]
     directory_prepared_rows: usize,
     next_ino: u64,
@@ -113,13 +121,176 @@ pub struct Overlay {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) enum ReadonlyLookup {
+pub(crate) enum SourceLookup {
     Ready(FileAttr),
-    Tree { path: PathBuf, oid: Oid },
-    Header { ino: u64, entry: Entry },
+    Tree {
+        path: PathBuf,
+        oid: Oid,
+    },
+    Header {
+        ino: u64,
+        entry: Entry,
+        path: Option<PathBuf>,
+    },
 }
 
 impl Overlay {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn enable_local_source(&mut self) {
+        self.local_source = true;
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_policy(&self) -> WritePolicy {
+        self.write_policy
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_writable(&self, ino: u64) -> FsResult<()> {
+        self.writable(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_path(&self, parent: u64, name: &OsStr) -> FsResult<PathBuf> {
+        self.child(parent, name)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn source_path(&self, path: &Path) -> Option<PathBuf> {
+        self.lower_path(path)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cached_inode(&self, path: &Path) -> Option<u64> {
+        self.paths
+            .get(path)
+            .copied()
+            .filter(|ino| self.nodes.contains_key(ino))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_source(
+        &mut self,
+        path: &Path,
+        source: PathBuf,
+        entry: Entry,
+    ) -> FsResult<u64> {
+        if let Some(ino) = self.cached_inode(path) {
+            return Ok(ino);
+        }
+        let key = *self
+            .source_directory_keys
+            .get(source.parent().ok_or(libc::EIO)?)
+            .ok_or(libc::EIO)?;
+        let directory = &self.source_directories[key];
+        let ino = directory.base
+            + directory
+                .tree
+                .index(source.file_name().ok_or(libc::EIO)?)
+                .ok_or(libc::EIO)? as u64;
+        if !self.nodes.contains_key(&ino) {
+            self.insert_source_inode(path, source, entry, ino)?;
+        }
+        Ok(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_source_directory(
+        &mut self,
+        path: PathBuf,
+        tree: Option<Arc<crate::tree::Directory>>,
+    ) -> FsResult<()> {
+        if let Some(tree) = tree {
+            self.prepare_readonly_directory(path, tree)
+        } else {
+            self.source_directory_absences.insert(path);
+            Ok(())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn source_directory_ready(&self, path: &Path) -> bool {
+        self.source_directory_keys.contains_key(path)
+            || self.source_directory_absences.contains(path)
+    }
+    #[cfg(target_os = "linux")]
+    fn prepared_source_exists(&self, path: &Path) -> FsResult<bool> {
+        if path.as_os_str().is_empty() {
+            return Ok(true);
+        }
+        let parent = path.parent().ok_or(libc::EIO)?;
+        if self.source_directory_absences.contains(parent) {
+            return Ok(false);
+        }
+        let key = *self.source_directory_keys.get(parent).ok_or(libc::EIO)?;
+        Ok(self.source_directories[key]
+            .tree
+            .index(path.file_name().ok_or(libc::EIO)?)
+            .is_some())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_authorizations<T>(
+        &mut self,
+        authorizations: Authorizations,
+        commit: impl FnOnce(&mut Self) -> FsResult<T>,
+    ) -> FsResult<T> {
+        debug_assert!(self.authorizations.is_none());
+        self.authorizations = Some(authorizations);
+        let result = commit(self);
+        self.authorizations = None;
+        result
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn rename_policy_paths(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+    ) -> FsResult<Vec<(PathBuf, bool)>> {
+        let from = self.child(parent, name)?;
+        let to = self.child(newparent, newname)?;
+        let mut paths = Vec::new();
+        for (old, ino) in self.paths.range(from.clone()..) {
+            if old != &from && !old.starts_with(&from) {
+                break;
+            }
+            if let Some(node) = self.nodes.get(ino) {
+                let directory = node.attr.kind == FileType::Directory;
+                paths.push((old.clone(), directory));
+                paths.push((
+                    to.join(old.strip_prefix(&from).map_err(|_| libc::EIO)?),
+                    directory,
+                ));
+            }
+        }
+        Ok(paths)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn source_read(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+        offset: u64,
+        size: u32,
+    ) -> FsResult<Option<(Oid, u64, u32)>> {
+        if let Some(fh) = fh {
+            if self.handle(ino, fh)?.flags & libc::O_ACCMODE == libc::O_WRONLY {
+                return Err(libc::EBADF);
+            }
+        }
+        let node = self.node(ino)?;
+        if node.attr.kind != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+        Ok(node.oid.filter(|_| node.immutable).map(|oid| {
+            (
+                oid,
+                node.attr.size,
+                node.attr.size.saturating_sub(offset).min(u64::from(size)) as u32,
+            )
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn source_link(&self, ino: u64) -> FsResult<Option<(Oid, u64)>> {
+        let node = self.node(ino)?;
+        if node.attr.kind != FileType::Symlink {
+            return Err(libc::EINVAL);
+        }
+        Ok(node.oid.map(|oid| (oid, node.attr.size)))
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn snapshot(&self) -> &Snapshot {
         &self._snapshot
@@ -128,20 +299,25 @@ impl Overlay {
     /// Plan from prepared namespace state only. No object source or filesystem
     /// operation occurs under the adapter's short mutable state borrow.
     #[cfg(target_os = "linux")]
-    pub(crate) fn readonly_lookup(
-        &mut self,
-        parent: u64,
-        name: &OsStr,
-    ) -> FsResult<ReadonlyLookup> {
-        debug_assert!(self.read_only());
+    pub(crate) fn source_lookup(&mut self, parent: u64, name: &OsStr) -> FsResult<SourceLookup> {
+        debug_assert!(self.write_policy != WritePolicy::All);
+        let path = if self.read_only() {
+            None
+        } else {
+            Some(self.child(parent, name)?)
+        };
+        if let Some(ino) = path.as_deref().and_then(|path| self.cached_inode(path)) {
+            self.refresh_backing_attr(ino)?;
+            return self.finish_source_lookup(ino).map(SourceLookup::Ready);
+        }
         let node = self.node(parent)?;
         if node.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
         let component = Self::child_name(name)?;
-        let parent_path = node.snapshot_path.as_deref().ok_or(libc::EIO)?;
+        let parent_path = node.snapshot_path.as_deref().ok_or(libc::ENOENT)?;
         let Some(key) = self.source_directory_keys.get(parent_path) else {
-            return Ok(ReadonlyLookup::Tree {
+            return Ok(SourceLookup::Tree {
                 path: parent_path.to_path_buf(),
                 oid: node.oid.ok_or(libc::EIO)?,
             });
@@ -150,36 +326,43 @@ impl Overlay {
         let index = directory.tree.index(component).ok_or(libc::ENOENT)?;
         let ino = directory.base + index as u64;
         if self.nodes.contains_key(&ino) {
-            return self.finish_readonly_lookup(ino).map(ReadonlyLookup::Ready);
+            return self.finish_source_lookup(ino).map(SourceLookup::Ready);
         }
         let (mode, oid) = directory.tree.metadata_at(index).ok_or(libc::EIO)?;
         let entry = Snapshot::metadata(mode, oid, Path::new(name)).map_err(snapshot_errno)?;
         if entry.kind == EntryKind::Directory {
-            let path = parent_path.join(name);
-            self.insert_source_inode(&path, path.clone(), entry, ino)?;
-            self.finish_readonly_lookup(ino).map(ReadonlyLookup::Ready)
+            let source = parent_path.join(name);
+            let path = path.unwrap_or_else(|| source.clone());
+            self.insert_source_inode(&path, source, entry, ino)?;
+            self.finish_source_lookup(ino).map(SourceLookup::Ready)
         } else {
-            Ok(ReadonlyLookup::Header { ino, entry })
+            Ok(SourceLookup::Header { ino, entry, path })
         }
     }
     #[cfg(target_os = "linux")]
-    fn finish_readonly_lookup(&mut self, ino: u64) -> FsResult<FileAttr> {
+    fn finish_source_lookup(&mut self, ino: u64) -> FsResult<FileAttr> {
         let node = self.node_mut(ino)?;
         node.lookups = node.lookups.saturating_add(1);
         Ok(node.attr)
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn complete_readonly_lookup(
+    pub(crate) fn complete_source_lookup(
         &mut self,
         ino: u64,
         mut entry: Entry,
         size: u64,
+        path: Option<PathBuf>,
     ) -> FsResult<FileAttr> {
         if !self.nodes.contains_key(&ino) {
             entry.size = Some(size);
-            self.insert_source_inode(Path::new(""), PathBuf::new(), entry, ino)?;
+            self.insert_source_inode(
+                path.as_deref().unwrap_or(Path::new("")),
+                PathBuf::new(),
+                entry,
+                ino,
+            )?;
         }
-        self.finish_readonly_lookup(ino)
+        self.finish_source_lookup(ino)
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn prepare_readonly_directory(
@@ -198,7 +381,9 @@ impl Overlay {
         if node.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
-        let path = node.snapshot_path.as_ref().ok_or(libc::EIO)?;
+        let Some(path) = node.snapshot_path.as_ref() else {
+            return Ok(None);
+        };
         Ok((!self.source_directory_keys.contains_key(path))
             .then(|| (path.clone(), node.oid.unwrap())))
     }
@@ -242,34 +427,6 @@ impl Overlay {
         if ino != 1 {
             self.release_directory_ref(ino);
         }
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn readonly_read(
-        &self,
-        ino: u64,
-        fh: Option<u64>,
-        offset: u64,
-        size: u32,
-    ) -> FsResult<(Oid, u64, u32)> {
-        if let Some(fh) = fh {
-            if self.handle(ino, fh)?.flags & libc::O_ACCMODE == libc::O_WRONLY {
-                return Err(libc::EBADF);
-            }
-        }
-        let attr = self.readonly_file_attributes(ino)?;
-        Ok((
-            self.node(ino)?.oid.ok_or(libc::EIO)?,
-            attr.size,
-            attr.size.saturating_sub(offset).min(u64::from(size)) as u32,
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn readonly_link(&self, ino: u64) -> FsResult<(Oid, u64)> {
-        let node = self.node(ino)?;
-        if node.attr.kind != FileType::Symlink {
-            return Err(libc::EINVAL);
-        }
-        Ok((node.oid.ok_or(libc::EIO)?, node.attr.size))
     }
     pub(crate) fn read_only(&self) -> bool {
         self.write_policy == WritePolicy::None
@@ -361,6 +518,12 @@ impl Overlay {
             dirty_directories: HashSet::new(),
             source_directories: Vec::new(),
             source_directory_keys: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            local_source: false,
+            #[cfg(target_os = "linux")]
+            source_directory_absences: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            authorizations: None,
             #[cfg(test)]
             directory_prepared_rows: 0,
             next_ino: 2,
@@ -388,6 +551,26 @@ impl Overlay {
             }
         }
         let source = self.lower_path(path).ok_or(libc::ENOENT)?;
+        #[cfg(target_os = "linux")]
+        if self.local_source {
+            if !self.prepared_source_exists(&source)? {
+                return Err(libc::ENOENT);
+            }
+            // Async callers install demanded leaf headers before the commit.
+            // A reclaimed directory can be reconstructed using its zero size.
+            let key = self.source_directory_keys[source.parent().ok_or(libc::EIO)?];
+            let directory = &self.source_directories[key];
+            let index = directory
+                .tree
+                .index(source.file_name().ok_or(libc::EIO)?)
+                .ok_or(libc::ENOENT)?;
+            let (mode, oid) = directory.tree.metadata_at(index).ok_or(libc::EIO)?;
+            let entry = Snapshot::metadata(mode, oid, path).map_err(snapshot_errno)?;
+            if entry.kind != EntryKind::Directory {
+                return Err(libc::EIO);
+            }
+            return self.install_source(path, source, entry);
+        }
         let entry = self
             ._snapshot
             .entry(&source)
@@ -540,6 +723,10 @@ impl Overlay {
     fn source_directory(&mut self, source: &Path) -> FsResult<usize> {
         if let Some(key) = self.source_directory_keys.get(source) {
             return Ok(*key);
+        }
+        #[cfg(target_os = "linux")]
+        if self.local_source {
+            return Err(libc::EIO);
         }
         let tree = self._snapshot.directory(source).map_err(snapshot_errno)?;
         self.insert_source_directory(source.to_path_buf(), tree)
@@ -885,6 +1072,18 @@ impl Overlay {
         Ok(())
     }
     fn allowed(&self, p: &Path, kind: FileType) -> FsResult<()> {
+        #[cfg(target_os = "linux")]
+        if self.local_source {
+            let (directory, allowed) = self
+                .authorizations
+                .as_ref()
+                .and_then(|grants| grants.get(p))
+                .ok_or(libc::EIO)?;
+            if *directory != (kind == FileType::Directory) {
+                return Err(libc::EIO);
+            }
+            return if *allowed { Ok(()) } else { Err(libc::EROFS) };
+        }
         if self
             .policy
             .check(p, kind == FileType::Directory)
@@ -898,6 +1097,8 @@ impl Overlay {
     fn fresh(&self, parent: u64, name: &OsStr, kind: FileType) -> FsResult<PathBuf> {
         let p = self.child(parent, name)?;
         let tracked = match self.lower_path(&p) {
+            #[cfg(target_os = "linux")]
+            Some(source) if self.local_source => self.prepared_source_exists(&source)?,
             Some(source) => self
                 ._snapshot
                 .entry(&source)
@@ -1287,6 +1488,18 @@ impl Overlay {
             return Ok(false);
         }
         if let Some(source) = self.lower_path(p) {
+            #[cfg(target_os = "linux")]
+            if self.local_source {
+                if self.source_directory_absences.contains(&source) {
+                    return Ok(true);
+                }
+                let key = *self.source_directory_keys.get(&source).ok_or(libc::EIO)?;
+                let tree = &self.source_directories[key].tree;
+                return Ok(!(0..tree.len()).any(|index| {
+                    self.lower_path(&p.join(tree.at(index).unwrap().0))
+                        .is_some()
+                }));
+            }
             if self
                 ._snapshot
                 .entry(&source)

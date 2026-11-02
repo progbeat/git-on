@@ -102,6 +102,34 @@ impl Rule {
 const RULE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const RULE_CACHE_ENTRIES: usize = 128;
 
+fn parse_rules(data: &[u8]) -> Arc<Vec<Rule>> {
+    let bytes = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
+    Arc::new(
+        bytes
+            .split(|&b| b == b'\n')
+            .filter_map(Rule::parse)
+            .collect(),
+    )
+}
+fn rules_cost(directory: &Path, source_bytes: usize) -> usize {
+    source_bytes
+        .saturating_mul(512)
+        .saturating_add(directory.as_os_str().as_bytes().len())
+        .saturating_add(1024)
+}
+fn ignored_by(applicable: &[(PathBuf, Arc<Vec<Rule>>)], current: &Path, directory: bool) -> bool {
+    let mut ignored = false;
+    for (base, rules) in applicable {
+        let relative = current.strip_prefix(base).expect("ancestor ignore base");
+        for rule in rules.iter() {
+            if rule.matches(relative.as_os_str().as_bytes(), directory) {
+                ignored = !rule.negative;
+            }
+        }
+    }
+    ignored
+}
+
 #[derive(Debug, Default)]
 struct RulesCache {
     entries: BTreeMap<PathBuf, (Arc<Vec<Rule>>, usize, u64)>,
@@ -170,24 +198,15 @@ impl Policy {
             Some(entry) if entry.kind == EntryKind::File => {
                 self.snapshot.with_blob(entry.oid, |data| {
                     source_bytes = data.len();
-                    // Git recognizes only the UTF-8 BOM.
-                    let bytes = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
-                    Ok(bytes
-                        .split(|&b| b == b'\n')
-                        .filter_map(Rule::parse)
-                        .collect())
+                    Ok(parse_rules(data))
                 })?
             }
-            _ => Vec::new(),
+            _ => Arc::new(Vec::new()),
         };
-        let rules = Arc::new(rules);
         // Conservative compiled-memory charge: a byte can become a wildcard
         // atom/class allocation. Also charge paths, empty rules and map overhead.
         // Oversized rules still work for this operation but are never retained.
-        let cost = source_bytes
-            .saturating_mul(512)
-            .saturating_add(directory.as_os_str().as_bytes().len())
-            .saturating_add(1024);
+        let cost = rules_cost(directory, source_bytes);
         cache.insert(directory, rules.clone(), cost);
         Ok(rules)
     }
@@ -225,21 +244,92 @@ impl Policy {
         for (index, component) in components.iter().enumerate() {
             current.push(component.as_os_str());
             let directory = index + 1 < components.len() || is_dir;
-            let mut ignored = false;
-            for (base, rules) in &applicable {
-                let relative = current.strip_prefix(base).expect("ancestor ignore base");
-                for rule in rules.iter() {
-                    if rule.matches(relative.as_os_str().as_bytes(), directory) {
-                        ignored = !rule.negative;
-                    }
-                }
-            }
             // Negation below an excluded parent cannot re-include a child.
-            if ignored {
+            if ignored_by(&applicable, &current, directory) {
                 return Ok(true);
             }
             if index + 1 < components.len() {
                 applicable.push((current.clone(), self.rules_at(&current)?));
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Same pinned-rule semantics, with all source work outside local cache borrows.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(crate) struct LocalPolicy {
+    rules: std::cell::RefCell<RulesCache>,
+}
+#[cfg(target_os = "linux")]
+impl LocalPolicy {
+    async fn rules_at(
+        &self,
+        source: &crate::snapshot_async::Snapshot,
+        directory: &Path,
+    ) -> Result<Arc<Vec<Rule>>> {
+        if let Some(rules) = self.rules.borrow_mut().get(directory) {
+            return Ok(rules);
+        }
+        let (rules, bytes) = match source.entry(&directory.join(".gitignore")).await? {
+            Some(entry) if entry.kind == EntryKind::File => {
+                let size = entry.size.expect("resolved blob size");
+                (
+                    source
+                        .with_blob(entry.oid, size, |data| Ok(parse_rules(data)))
+                        .await?,
+                    usize::try_from(size)?,
+                )
+            }
+            _ => (Arc::new(Vec::new()), 0),
+        };
+        self.rules
+            .borrow_mut()
+            .insert(directory, rules.clone(), rules_cost(directory, bytes));
+        Ok(rules)
+    }
+    pub(crate) async fn check(
+        &self,
+        source: &crate::snapshot_async::Snapshot,
+        mode: WritePolicy,
+        path: &Path,
+        is_dir: bool,
+    ) -> Result<bool> {
+        if path.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        let components: Vec<_> = path.components().collect();
+        if components
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Ok(false);
+        }
+        match mode {
+            WritePolicy::None => return Ok(false),
+            WritePolicy::All => return Ok(true),
+            WritePolicy::Ignored | WritePolicy::Untracked => {}
+        }
+        if source.metadata(path).await?.is_some() {
+            return Ok(false);
+        }
+        if mode == WritePolicy::Untracked {
+            return Ok(true);
+        }
+        let mut current = PathBuf::new();
+        let mut applicable = vec![(PathBuf::new(), self.rules_at(source, Path::new("")).await?)];
+        for (index, component) in components.iter().enumerate() {
+            current.push(component.as_os_str());
+            if ignored_by(
+                &applicable,
+                &current,
+                index + 1 < components.len() || is_dir,
+            ) {
+                return Ok(true);
+            }
+            if index + 1 < components.len() {
+                applicable.push((current.clone(), self.rules_at(source, &current).await?));
             }
         }
         Ok(false)

@@ -19,12 +19,12 @@ use std::{
 
 type MetadataGates = HashMap<(Oid, bool), Weak<tokio::sync::Mutex<()>>>;
 pub(crate) struct Snapshot {
+    root: Oid,
     source: Source,
     raw: RawBlobs,
     trees: RefCell<HashMap<Oid, Arc<Directory>>>,
     headers: RefCell<HashMap<Oid, u64>>,
     pending: RefCell<MetadataGates>,
-    failure: RefCell<Option<String>>,
 }
 struct Demand<'a> {
     owner: &'a Snapshot,
@@ -55,16 +55,17 @@ impl Snapshot {
     }
     pub(crate) fn new(
         repo: Repository,
+        root: Oid,
         directory: File,
         owner: Arc<tempfile::TempDir>,
     ) -> Result<Self> {
         Ok(Self {
+            root,
             source: Source::new(repo)?,
             raw: RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET),
             trees: RefCell::new(HashMap::new()),
             headers: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
-            failure: RefCell::new(None),
         })
     }
     fn demand(&self, oid: Oid, tree: bool) -> Demand<'_> {
@@ -84,19 +85,6 @@ impl Snapshot {
             gate,
         }
     }
-    fn remember<T>(&self, result: Result<T>) -> Result<T> {
-        if let Err(error) = &result {
-            if error
-                .downcast_ref::<crate::object::TransferStopped>()
-                .is_none()
-            {
-                self.failure
-                    .borrow_mut()
-                    .get_or_insert_with(|| format!("{error:#}"));
-            }
-        }
-        result
-    }
     pub(crate) async fn tree(&self, oid: Oid) -> Result<Arc<Directory>> {
         if let Some(tree) = self.trees.borrow().get(&oid) {
             return Ok(tree.clone());
@@ -106,7 +94,7 @@ impl Snapshot {
         if let Some(tree) = self.trees.borrow().get(&oid) {
             return Ok(tree.clone());
         }
-        let tree = Arc::new(self.remember(self.source.tree(oid).await)?);
+        let tree = Arc::new(self.source.tree(oid).await?);
         self.trees.borrow_mut().insert(oid, tree.clone());
         Ok(tree)
     }
@@ -119,29 +107,102 @@ impl Snapshot {
         if let Some(size) = self.headers.borrow().get(&oid) {
             return Ok(*size);
         }
-        let size = self.remember(
-            async {
-                let (size, kind) = self.source.header(oid).await?;
-                anyhow::ensure!(
-                    kind == ObjectType::Blob,
-                    "snapshot file does not reference a blob"
-                );
-                Ok(u64::try_from(size)?)
-            }
-            .await,
-        )?;
+        let (size, kind) = self.source.header(oid).await?;
+        anyhow::ensure!(
+            kind == ObjectType::Blob,
+            "snapshot file does not reference a blob"
+        );
+        let size = u64::try_from(size)?;
         self.headers.borrow_mut().insert(oid, size);
         Ok(size)
     }
+    /// Resolve only verified ancestor trees. Existence/policy checks must not
+    /// fetch a leaf header or payload merely to decide whether it is tracked.
+    pub(crate) async fn metadata(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<crate::snapshot::Entry>> {
+        use crate::snapshot::{Entry, EntryKind};
+        let mut entry = Entry {
+            kind: EntryKind::Directory,
+            mode: 0o040000,
+            oid: self.root,
+            size: Some(0),
+        };
+        for component in path.components() {
+            let std::path::Component::Normal(name) = component else {
+                anyhow::bail!("snapshot path must be relative and contain no parent components");
+            };
+            anyhow::ensure!(
+                entry.kind == EntryKind::Directory,
+                "snapshot ancestor is not a directory: {}",
+                path.display()
+            );
+            let tree = self.tree(entry.oid).await?;
+            let Some((mode, oid)) = tree.lookup(name) else {
+                return Ok(None);
+            };
+            entry = crate::snapshot::Snapshot::metadata(mode, oid, path)?;
+        }
+        Ok(Some(entry))
+    }
+    pub(crate) async fn entry(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<crate::snapshot::Entry>> {
+        let Some(mut entry) = self.metadata(path).await? else {
+            return Ok(None);
+        };
+        if entry.kind != crate::snapshot::EntryKind::Directory {
+            entry.size = Some(self.size(entry.oid).await?);
+        }
+        Ok(Some(entry))
+    }
+    pub(crate) async fn directory(&self, path: &std::path::Path) -> Result<Option<Arc<Directory>>> {
+        let Some(entry) = self.metadata(path).await? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            entry.kind == crate::snapshot::EntryKind::Directory,
+            "snapshot path is not a directory: {}",
+            path.display()
+        );
+        self.tree(entry.oid).await.map(Some)
+    }
+    /// Full-object consumers (ignore parsing) explicitly need these contents.
+    /// Large payload cache retention stays bounded while assembling their input.
+    pub(crate) async fn with_blob<T>(
+        &self,
+        oid: Oid,
+        size: u64,
+        consume: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if size <= crate::raw_blob::BLOCK as u64 {
+            let bytes = self.read(oid, size, 0, size as u32).await?;
+            return consume(bytes.as_slice());
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(usize::try_from(size)?)?;
+        let mut offset = 0;
+        while offset < size {
+            let block = self
+                .read(
+                    oid,
+                    size,
+                    offset,
+                    (size - offset).min(crate::raw_blob::BLOCK as u64) as u32,
+                )
+                .await?;
+            anyhow::ensure!(!block.as_slice().is_empty(), "truncated full object read");
+            offset += block.as_slice().len() as u64;
+            bytes.extend_from_slice(block.as_slice());
+        }
+        consume(&bytes)
+    }
     pub(crate) async fn read(&self, oid: Oid, size: u64, offset: u64, count: u32) -> Result<Bytes> {
-        self.remember(
-            async {
-                self.raw.prepare_with_size(&self.source, oid, size).await?;
-                self.raw.validate_content_once(oid).await?;
-                self.raw.read(oid, offset, count).await
-            }
-            .await,
-        )
+        self.raw.prepare_with_size(&self.source, oid, size).await?;
+        self.raw.validate_content_once(oid).await?;
+        self.raw.read(oid, offset, count).await
     }
     pub(crate) async fn read_link(&self, oid: Oid, size: u64) -> Result<Bytes> {
         let bytes = self
@@ -152,14 +213,13 @@ impl Snapshot {
                 u32::try_from(size).context("symlink target too long")?,
             )
             .await?;
-        self.remember(
-            (!bytes.as_slice().is_empty() && !bytes.as_slice().contains(&0))
-                .then_some(())
-                .context("unusable symlink target"),
-        )?;
+        anyhow::ensure!(
+            !bytes.as_slice().is_empty() && !bytes.as_slice().contains(&0),
+            "unusable symlink target"
+        );
         Ok(bytes)
     }
-    pub(crate) async fn finish(self) -> Result<(SnapshotMetrics, Option<String>)> {
+    pub(crate) async fn finish(self) -> Result<SnapshotMetrics> {
         let mut metrics = self.raw.metrics();
         let trees = self.trees.into_inner();
         metrics.tree_reads = trees.len() as u64;
@@ -170,8 +230,7 @@ impl Snapshot {
         metrics.header_cache_entries = self.headers.into_inner().len();
         metrics.spool_bytes = metrics.retained_raw_blob_bytes;
         metrics.spool_writes = metrics.retained_raw_blob_entries;
-        let failure = self.failure.into_inner().or_else(|| self.raw.failure());
         self.source.finish().await?;
-        Ok((metrics, failure))
+        Ok(metrics)
     }
 }
