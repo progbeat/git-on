@@ -387,7 +387,12 @@ fn protocol_kernel_cache_tracks_source_and_directory_attributes() {
             let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
             assert_eq!(
                 flags & ((1 << 1) | (1 << 5)),
-                (1 << 1) | if protected { 1 << 5 } else { 0 }
+                (1 << 1)
+                    | if protected || p.async_source {
+                        1 << 5
+                    } else {
+                        0
+                    }
             );
             p.release(ino, num(&opened, 0));
             if policy != WritePolicy::None {
@@ -459,7 +464,7 @@ fn protocol_all_source_data_cache_stops_after_copy_up_with_owned_attributes() {
         let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
         assert_eq!(
             u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
-            1 << 1
+            (1 << 1) | if p.async_source { 1 << 5 } else { 0 }
         );
         let reader = num(&opened, 0);
         assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");

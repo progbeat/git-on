@@ -1351,7 +1351,7 @@ impl f::AsyncFilesystem for Fuse {
         let cache =
             if state.retain_source_data(ino.0) && flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
                 f::FopenFlags::FOPEN_KEEP_CACHE
-                    | if state.source_cacheable(ino.0) {
+                    | if state.source_cacheable(ino.0) || self.native_all {
                         f::FopenFlags::FOPEN_NOFLUSH
                     } else {
                         f::FopenFlags::empty()

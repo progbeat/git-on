@@ -2672,3 +2672,20 @@ owner lifetime. The instrumented source-cache regression now requires fewer
 GETATTR callbacks with caching while checking identical content and namespace;
 that case requires its exact-head CI execution, not a locally rebuilt metrics
 binary. Performance measurements remain separate from these correctness checks.
+
+## Readonly all-policy source descriptions omit close flush
+
+Local async `all` source opened readonly now also returns NOFLUSH. Its FLUSH
+handler only validates the description; it performs no persistence operation.
+A later copy-up preserves that description's readonly access and redirects it
+to the same private inode. Writing descriptions and explicit fsync/fdatasync
+retain their existing paths. Generated files and descriptions opened after
+copy-up keep their ordinary flags.
+
+The two permanent protocol cache tests require the source flag and its removal
+after copy-up. With the previous OPEN condition, both reproduce the missing-flag
+assertion; with the new condition the complete wire suite passes, including
+the forced file fallback. The existing mounted all-policy cache/mmap/copy-up
+regression additionally closes duplicated readonly descriptions and explicitly
+syncs the remaining description both before and after copy-up. These checks
+verify the description lifecycle separately from the paired RAM timings.

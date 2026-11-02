@@ -341,12 +341,16 @@ import mmap,os
 from pathlib import Path
 p=Path('cached-source')
 reader=os.open(p,os.O_RDONLY)
+duplicate=os.dup(reader);os.close(duplicate)
+os.fsync(reader);os.fdatasync(reader)
 mapping=mmap.mmap(reader,8192,access=mmap.ACCESS_READ)
 assert mapping[:]==b'a'*8192
 assert p.read_bytes()==b'a'*8192  # warm pages, close and reopen
 writer=os.open(p,os.O_RDWR)
 try:
  os.pwrite(writer,b'b'*8192,0)
+ duplicate=os.dup(reader);os.close(duplicate)
+ os.fsync(reader);os.fdatasync(reader)
  assert os.pread(reader,8192,0)==b'b'*8192 and mapping[:]==b'b'*8192
  assert p.read_bytes()==b'b'*8192
  os.pwrite(writer,b'tail',8192)

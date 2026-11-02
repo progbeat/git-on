@@ -112,6 +112,9 @@ passthrough. Directory contents remain live. Protected source operations retain
 their existing direct path. A readonly open of unchanged all-policy source adds
 its handle without waiting for an exclusive mutation gate; a pending copy-up
 includes that handle when it commits.
+These readonly source descriptions also omit the no-op close FLUSH, including
+when another description later copies up the inode. Explicit fsync/fdatasync
+and writing descriptions retain their normal synchronization paths.
 
 The fallback shares the same file worker with truncate, timestamps and statvfs,
 with a 16-job channel. It uses owned buffers and retains the original descriptor
