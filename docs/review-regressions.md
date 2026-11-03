@@ -2847,3 +2847,27 @@ readonly metadata may disappear while a stream still owns it.
 
 These checks establish compact bookkeeping and lifetime correctness. They do
 not establish full-read performance or completion of issue #20.
+
+
+## Generated directory reverse path lookup
+
+At `3ac365453868b3032660be345b93ae5e23d81409`, creating a directory
+updated the forward namespace indexes without adding the existing reverse
+inode/path binding. Resolving children then fell back to scanning all known
+paths. A focused operation-count regression with 128 unrelated entries and
+128 repeated positive/negative nested lookups inspected 50,176 path
+entries before the correction and zero afterwards. It checks `ignored`,
+`untracked` and `all`, exact file data, rename and removal. The permanent
+`generated_directory_lookups_do_not_scan_unrelated_paths` test counts fallback
+iterator visits only in unit-test builds; ordinary binaries have no counter.
+The correction adds generated directories to the existing reverse index;
+regular-file creation does not add another index.
+
+Bounded ordinary-CLI controls showed mixed wall-time results. With 1,024
+generated directories under `ignored`, the whole-run median changed from
+3.946 to 3.851 seconds across four pairs; other sizes and write policies did
+not consistently improve. Separate source-read controls whose payloads fit
+in RAM were also mixed, with slower first passes in several cases. The
+operation-count regression proves removal of the fallback scan, not a
+general read-speed improvement or absence of latency regressions. Full
+issue #20 acceptance remains incomplete.

@@ -136,6 +136,8 @@ pub struct Overlay {
     inode_handles: HashMap<u64, u64>,
     #[cfg(test)]
     handle_scan_steps: std::cell::Cell<usize>,
+    #[cfg(test)]
+    path_scan_steps: std::cell::Cell<usize>,
     directories: HashMap<u64, DirectoryHandle>,
     directory_cache: HashMap<u64, DirectoryCache>,
     dirty_directories: HashSet<u64>,
@@ -824,6 +826,8 @@ impl Overlay {
             inode_handles: HashMap::new(),
             #[cfg(test)]
             handle_scan_steps: std::cell::Cell::new(0),
+            #[cfg(test)]
+            path_scan_steps: std::cell::Cell::new(0),
             directories: HashMap::new(),
             directory_cache: HashMap::new(),
             dirty_directories: HashSet::new(),
@@ -1276,7 +1280,11 @@ impl Overlay {
         }
         self.paths
             .iter()
-            .find_map(|(p, n)| (*n == ino).then(|| p.clone()))
+            .find_map(|(p, n)| {
+                #[cfg(test)]
+                self.path_scan_steps.set(self.path_scan_steps.get() + 1);
+                (*n == ino).then(|| p.clone())
+            })
             .ok_or(libc::ENOENT)
     }
     fn child(&self, parent: u64, name: &OsStr) -> FsResult<PathBuf> {
@@ -1585,6 +1593,7 @@ impl Overlay {
         self.paths.insert(p.clone(), ino);
         self.upper_paths.insert(p.clone(), ino);
         if kind == FileType::Directory {
+            self.inode_paths.insert(ino, p.clone());
             self.adjust_parent_links(&p, 1);
         }
         self.touch_parent(&p);
@@ -2669,6 +2678,91 @@ mod tests {
             Overlay::with_write_policy(snapshot, temp.path().join("upper"), mode).unwrap();
         (temp, overlay)
     }
+    #[test]
+    fn generated_directory_lookups_do_not_scan_unrelated_paths() {
+        for policy in [
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let (_temp, mut fs) = fixture_policy(policy);
+            for index in 0..128 {
+                file(&mut fs, 1, &format!("a-{index:03}.tmp"));
+            }
+            let parent = dir(&mut fs, "cache");
+            let nested = fs
+                .make(
+                    parent,
+                    OsStr::new("nested"),
+                    FileType::Directory,
+                    0o700,
+                    0,
+                    0,
+                    Vec::new(),
+                )
+                .unwrap();
+            let child = file(&mut fs, nested, "value.tmp");
+            let handle = fs.open_file(child, libc::O_RDWR).unwrap();
+            fs.write_data(child, handle, 0, b"runtime", 0, libc::O_RDWR)
+                .unwrap();
+            fs.path_scan_steps.set(0);
+            for _ in 0..128 {
+                assert_eq!(
+                    fs.lookup_entry(parent, OsStr::new("nested")).unwrap().ino,
+                    nested
+                );
+                assert_eq!(
+                    fs.lookup_entry(nested, OsStr::new("value.tmp"))
+                        .unwrap()
+                        .ino,
+                    child
+                );
+                assert_eq!(
+                    fs.lookup_entry(nested, OsStr::new("absent")).unwrap_err(),
+                    libc::ENOENT
+                );
+                assert_eq!(fs.read_data(child, handle, 0, 64).unwrap(), b"runtime");
+            }
+            assert_eq!(
+                fs.path_scan_steps.get(),
+                0,
+                "generated directory lookup walked unrelated names"
+            );
+            fs.rename_path(
+                parent,
+                OsStr::new("nested"),
+                parent,
+                OsStr::new("renamed"),
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                fs.lookup_entry(parent, OsStr::new("nested")).unwrap_err(),
+                libc::ENOENT
+            );
+            assert_eq!(
+                fs.lookup_entry(parent, OsStr::new("renamed")).unwrap().ino,
+                nested
+            );
+            assert_eq!(
+                fs.lookup_entry(nested, OsStr::new("value.tmp"))
+                    .unwrap()
+                    .ino,
+                child
+            );
+            fs.release_handle(child, handle).unwrap();
+            fs.remove(nested, OsStr::new("value.tmp"), false).unwrap();
+            fs.remove(parent, OsStr::new("renamed"), true).unwrap();
+            fs.remove(1, OsStr::new("cache"), true).unwrap();
+            assert!(!fs.inode_paths.contains_key(&nested));
+            assert!(!fs.inode_paths.contains_key(&parent));
+            assert_eq!(
+                fs.lookup_entry(1, OsStr::new("tracked.tmp")).unwrap().perm,
+                0o755
+            );
+        }
+    }
+
     #[test]
     fn readonly_child_lookups_reuse_prepared_parent_metadata() {
         let temp = tempfile::tempdir().unwrap();

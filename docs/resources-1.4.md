@@ -148,6 +148,10 @@ These readonly source descriptions also omit the no-op close FLUSH, including
 when another description later copies up the inode. Explicit fsync/fdatasync
 and writing descriptions retain their normal synchronization paths.
 
+Newly created directories also enter the existing reverse inode/path index.
+Resolving their children uses that index instead of scanning unrelated source
+or generated paths. Rename updates and unlink removes the same binding.
+
 The fallback shares the same file worker with truncate, timestamps and statvfs,
 with a 16-job channel. It uses owned buffers and retains the original descriptor
 through completion. Ordinary RAM hits neither start nor submit to this worker.
