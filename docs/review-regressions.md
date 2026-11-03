@@ -2549,6 +2549,18 @@ checks same-FD ownership, cancelled-operation lifetime, unique descriptor
 transfer and reclamation across 128 closed inodes. Red/green logs remain in the
 external evidence directory, outside the mergeable tree.
 
+The vendored `tokio-uring` closed-descriptor helper now checks device/inode
+identity with `fstat`. Its previous `F_GETFD == EBADF` assertion could fail
+when a parallel test reused the released numeric slot for another file.
+`released_fd_check_accepts_slot_reuse_and_rejects_a_live_owner` fails with that
+old helper and passes with the identity check: it rejects a still-open original
+owner and accepts a different inode. A standard file owner keeps the original
+inode alive throughout each check, including the open-unlinked drop case.
+The focused replacement case models the state after slot reuse; it does not
+depend on a particular concurrent allocation schedule. All 46 standalone SDK
+library/integration tests pass in parallel after the fix. This corrects test
+evidence and does not change runtime descriptor ownership.
+
 These changes do not finish synchronous backing namespace operations, `all`
 copy-up, remote/fallback sources or performance acceptance.
 
@@ -2795,6 +2807,18 @@ removes the lookup reference. The connected path passes, rejects the closed
 handle, preserves data through the old live handle and releases all backing/gate
 ownership after closing. This is a local ownership test; protocol and real-mount
 suites separately verify callback integration and normal descriptor semantics.
+
+## Select the requested executable for remote Git dispatch tests
+
+The remote tests invoking native `git on` now put a fixture-owned `git-on`
+symlink to the selected `--binary` first on PATH. Previously they only added
+the selected executable's parent directory; an artifact with another basename
+could silently fall through to an installed `git-on`. Both the disposable
+remote lifecycle and native `git -c` verification cases use the corrected path.
+`test_git_on_uses_selected_nonstandard_binary_over_path_fallback` reproduces
+the old behavior with a deliberately failing PATH fallback (status 77) and
+passes after the fix by executing the selected differently named program.
+The fixture changes no caller PATH or installed executable.
 
 ## Compact issued membership for source directory streams
 

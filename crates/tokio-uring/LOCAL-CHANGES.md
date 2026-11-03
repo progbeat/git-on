@@ -21,8 +21,12 @@ descriptor owners. Runtime construction keeps normal RAII until fallible driver
 initialization succeeds, so an unavailable io_uring backend does not leak the
 Tokio runtime's descriptors.
 
-The upstream closed-FD test helper uses fcntl rather than constructing an owned
+The upstream closed-FD test helper uses fstat rather than constructing an owned
 File for an invalid descriptor, which aborts under current Rust I/O safety.
+It accepts either EBADF or a different device/inode at the released numeric
+slot, while another owner keeps the original inode alive. This avoids false
+leak reports when parallel tests reuse a closed descriptor. A focused check
+also rejects a descriptor that still owns the original file.
 
 The separate upstream.patch contains these local changes. No driver, executor
 or syscall implementation is copied into Git-on.

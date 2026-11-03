@@ -52,6 +52,12 @@ def run(argv, **kwargs):
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
 
+def git_on_environment(binary, environment, tools):
+    # Git dispatches by the git-on basename even when --binary names an artifact.
+    tools.mkdir()
+    (tools / 'git-on').symlink_to(binary.resolve())
+    return dict(environment, PATH=str(tools)+os.pathsep+environment['PATH'])
+
 def private_storage_fault(fault, root="Path.cwd().parent"):
     """Corrupt the storage used by the selected import path, before a demand."""
     if fault=='odb':
@@ -233,6 +239,20 @@ class RemoteDiagnosticsTests(unittest.TestCase):
         self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                         XDG_CACHE_HOME=str(self.root / 'cache'), TMPDIR=str(self.root),
                         LC_ALL='C')
+
+    def test_git_on_uses_selected_nonstandard_binary_over_path_fallback(self):
+        selected = self.root / 'chosen-runner'
+        selected.write_text('#!/bin/sh\nprintf selected\n')
+        selected.chmod(0o755)
+        fallback = self.tools / 'git-on'
+        fallback.write_text('#!/bin/sh\nprintf wrong-runner\nexit 77\n')
+        fallback.chmod(0o755)
+        environment = dict(self.env, PATH=str(self.tools)+os.pathsep+self.env['PATH'])
+        environment = git_on_environment(selected, environment, self.root / 'selected-tools')
+        result = subprocess.run([self.native_git, 'on'], cwd=self.root,
+                                env=environment, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'selected')
 
     def native_version(self, version, ssh_failure=False):
         wrapper = self.tools / 'git'
@@ -1060,7 +1080,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_real_mount_remote_disposable_cleanup_and_cancellation(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        result=subprocess.run(['git','-c','http.sslCAInfo='+f.env['GIT_SSL_CAINFO'],'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH']),capture_output=True,timeout=30)
+        result=subprocess.run(['git','-c','http.sslCAInfo='+f.env['GIT_SSL_CAINFO'],'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools'),capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
         self.assertEqual(list(f.root.glob('git-on-*')),[])
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sleep','30'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -1250,7 +1270,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
-        env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH'])
+        env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools')
         for key in list(env):
             if key.startswith('GIT_CONFIG_KEY_') or key.startswith('GIT_CONFIG_VALUE_') or key=='GIT_CONFIG_COUNT': del env[key]
         for cwd,operands in ((f.cwd,[url,signed]),(f.repo,[signed])):

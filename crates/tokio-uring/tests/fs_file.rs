@@ -1,6 +1,9 @@
 use std::{
     io::prelude::*,
-    os::unix::io::{AsRawFd, RawFd},
+    os::unix::{
+        fs::MetadataExt,
+        io::{AsRawFd, RawFd},
+    },
 };
 
 use tempfile::NamedTempFile;
@@ -140,7 +143,7 @@ fn explicit_close() {
 
         file.close().await.unwrap();
 
-        assert_invalid_fd(fd);
+        assert_released_fd(fd, file_identity(&tempfile));
     })
 }
 
@@ -162,15 +165,17 @@ fn drop_open() {
 
 #[test]
 fn drop_off_runtime() {
-    let file = tokio_uring::start(async {
-        let tempfile = tempfile();
-        File::open(tempfile.path()).await.unwrap()
-    });
+    // Keep the original inode alive while checking its released descriptor.
+    let tempfile = tempfile();
+    let file = tokio_uring::start(async { File::open(tempfile.path()).await.unwrap() });
+    // Preserve the original open-unlinked-file case while the standard owner
+    // keeps its inode identity alive for the descriptor-release check.
+    std::fs::remove_file(tempfile.path()).unwrap();
 
     let fd = file.as_raw_fd();
     drop(file);
 
-    assert_invalid_fd(fd);
+    assert_released_fd(fd, file_identity(&tempfile));
 }
 
 #[test]
@@ -332,12 +337,43 @@ async fn poll_once(future: impl std::future::Future) {
     .await;
 }
 
-fn assert_invalid_fd(fd: RawFd) {
-    // A closed descriptor cannot be used to construct an owned File: its Drop
-    // would attempt a second close, which aborts on I/O-safety-aware Rust.
-    assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
+fn file_identity(file: &NamedTempFile) -> (u64, u64) {
+    let metadata = file.as_file().metadata().unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+fn assert_released_fd(fd: RawFd, expected: (u64, u64)) {
+    // Another test may reuse the numeric slot after close. The NamedTempFile
+    // keeps the original inode alive, so its identity cannot be reused here.
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(fd, metadata.as_mut_ptr()) };
+    if result == -1 {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        return;
+    }
+    assert_eq!(result, 0);
+    let metadata = unsafe { metadata.assume_init() };
+    assert_ne!(
+        (metadata.st_dev as u64, metadata.st_ino as u64),
+        expected,
+        "original file is still owned by the supposedly released descriptor"
     );
+}
+
+#[test]
+fn released_fd_check_accepts_slot_reuse_and_rejects_a_live_owner() {
+    let original = tempfile();
+    let replacement = tempfile();
+    let expected = file_identity(&original);
+    assert_ne!(expected, file_identity(&replacement));
+    assert!(
+        std::panic::catch_unwind(|| assert_released_fd(original.as_raw_fd(), expected)).is_err(),
+        "a still-owned original descriptor was accepted as released"
+    );
+    // A closed numeric slot can now refer to an unrelated live file. The check
+    // must distinguish that replacement from a leaked original descriptor.
+    assert_released_fd(replacement.as_raw_fd(), expected);
 }
