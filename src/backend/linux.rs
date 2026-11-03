@@ -492,6 +492,40 @@ impl Fuse {
         }
         Ok(())
     }
+    fn release_prepared_local(&self, ino: u64, fh: u64) -> Result<(), f::Errno> {
+        let reply = {
+            let mut state = self.state();
+            let result = state.core.release_prepared_handle(ino, fh);
+            if result.is_ok() {
+                state.release_registration(ino, fh);
+            }
+            result
+        };
+        if reply.is_ok() {
+            self.io.released(ino, fh);
+        }
+        result(reply)
+    }
+    async fn release_local(&self, ino: u64, fh: u64) -> Result<(), f::Errno> {
+        let source = self.state().core.unchanged_source_data(ino);
+        if source {
+            // Closing this description changes no source bytes or attributes.
+            // Copy-up enumerates the remaining live handles at its short commit.
+            return self.release_prepared_local(ino, fh);
+        }
+        let _pin = self.pin(ino);
+        let gate = self.io.gate(ino);
+        let _guard = gate.lock.write().await;
+        result(self.state().core.validate_handle(ino, fh))?;
+        let plan = self.state().core.metadata_io(ino);
+        if let Some(plan) = plan.filter(|p| p.external) {
+            let file = self.io.lease(ino, plan.file);
+            if let Ok(metadata) = file.file().statx().await {
+                let _ = self.state().core.update_io_metadata(ino, &metadata, false);
+            }
+        }
+        self.release_prepared_local(ino, fh)
+    }
     /// Construct the local source after entering the io_uring runtime.
     pub fn with_async_source(core: Overlay) -> std::io::Result<Self> {
         Self::with_source_io(core, crate::file_async::Io::new(true))
@@ -1504,32 +1538,7 @@ impl f::AsyncFilesystem for Fuse {
     ) -> Result<(), f::Errno> {
         let native = self.state().objects.is_some();
         if native {
-            let _pin = self.pin(ino.0);
-            let gate = self.io.gate(ino.0);
-            let _guard = gate.lock.write().await;
-            result(self.state().core.validate_handle(ino.0, fh.0))?;
-            let plan = self.state().core.metadata_io(ino.0);
-            if let Some(plan) = plan.filter(|p| p.external) {
-                let file = self.io.lease(ino.0, plan.file);
-                if let Ok(metadata) = file.file().statx().await {
-                    let _ = self
-                        .state()
-                        .core
-                        .update_io_metadata(ino.0, &metadata, false);
-                }
-            }
-            let reply = {
-                let mut state = self.state();
-                let result = state.core.release_prepared_handle(ino.0, fh.0);
-                if result.is_ok() {
-                    state.release_registration(ino.0, fh.0);
-                }
-                result
-            };
-            if reply.is_ok() {
-                self.io.released(ino.0, fh.0);
-            }
-            return result(reply);
+            return self.release_local(ino.0, fh.0).await;
         }
         result(self.state().release(ino.0, fh.0))
     }
@@ -1897,6 +1906,92 @@ mod tests {
             assert_eq!(metrics.retained_raw_blob_entries, 0);
             assert!(observer.remote_failure().is_none());
         }
+    }
+
+    #[test]
+    fn readonly_source_close_progresses_while_another_read_reply_orders_copy_up() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let bytes = b"source bytes";
+        let oid = repo.blob(bytes).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", oid, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "source-close",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                let objects = fs.state().objects.clone().unwrap();
+                let ino = fs
+                    .lookup_local(&objects, 1, OsStr::new("source"))
+                    .await
+                    .unwrap()
+                    .ino;
+                let first = fs.open_local(ino, libc::O_RDONLY).await.unwrap();
+                let second = fs.open_local(ino, libc::O_RDONLY).await.unwrap();
+                fs.state().core.forget_inode(ino, 1);
+                let reply = fs
+                    .read_file(ino, first, 0, 100, libc::O_RDONLY)
+                    .await
+                    .unwrap();
+                let mut close = Box::pin(fs.release_local(ino, second));
+                let ready = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+                let progressed = ready.is_ready();
+                if let Poll::Ready(result) = ready {
+                    result.unwrap();
+                }
+                assert!(!fs.io.io.worker_started());
+                let mut writer = Box::pin(fs.open_local(ino, libc::O_RDWR));
+                poll_fn(|cx| {
+                    assert!(
+                        writer.as_mut().poll(cx).is_pending(),
+                        "copy-up overtook the source READ reply"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(reply);
+                if !progressed {
+                    close.as_mut().await.unwrap();
+                }
+                drop(close);
+                let writing = writer.as_mut().await.unwrap();
+                drop(writer);
+                assert_eq!(
+                    fs.state().core.validate_handle(ino, second),
+                    Err(libc::EBADF)
+                );
+                assert_eq!(
+                    fs.io.retained().1,
+                    2,
+                    "copy-up retained the closed source description"
+                );
+                assert_eq!(fs.read_backing(ino, first, 0, 100).await.unwrap(), bytes);
+                fs.release_local(ino, first).await.unwrap();
+                fs.release_local(ino, writing).await.unwrap();
+                assert_eq!(fs.io.retained(), (0, 0, 0));
+                drop(objects);
+                fs.shutdown().await.unwrap();
+                assert!(
+                    progressed,
+                    "readonly source close waited for a different handle's READ reply"
+                );
+            });
     }
 
     #[test]

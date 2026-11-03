@@ -100,6 +100,11 @@ Under `all`, copy-up streams verified source ranges through the same cache to
 the private file without a second payload cache. Shared per-inode read ownership
 survives through the FUSE reply; copy-up/write waits for old replies to finish.
 Directory renames preserve their source origins for later cold child access.
+Closing an unchanged source description is a short loop-owned state change;
+it does not wait for a different description's outstanding READ reply or start
+file I/O. Copy-up still waits for source replies and enumerates the remaining
+live descriptions when committing. Private descriptions retain their ordered
+metadata refresh and close path.
 Cold `all` lookup recomputes its visible path under the namespace gate after
 waiting. Positive `all` name bindings cache independently of attributes.
 Unchanged source attributes and directory attributes may also be cached: these

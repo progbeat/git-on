@@ -2747,3 +2747,18 @@ Successful cleanup preserves the original mount errno. No destroy callback is
 issued for a filesystem that never reached INIT. Handshake errors use the same
 awaited cleanup path and additionally unmount an owned mount. This regression is
 startup ownership testing, not kernel protocol or real-mount execution evidence.
+
+## Close an independent source description while a read reply remains owned
+
+`readonly_source_close_progresses_while_another_read_reply_orders_copy_up`
+holds a source READ response from one description and closes another description
+of the same inode. The former unconditional exclusive inode gate leaves that
+close pending. Unchanged-source close now validates and removes its description
+without an await; the READ owner still prevents copy-up from committing early.
+Copy-up installs backing handles only for descriptions that are still live.
+
+The regression reproduces the old wait before the fix, including after FORGET
+removes the lookup reference. The connected path passes, rejects the closed
+handle, preserves data through the old live handle and releases all backing/gate
+ownership after closing. This is a local ownership test; protocol and real-mount
+suites separately verify callback integration and normal descriptor semantics.
