@@ -141,6 +141,13 @@ The short IDs below keep the matrix readable. References are machine-checked.
 
 ## Callback matrix
 
+The core unit regression
+`readonly_directory_streams_compact_pins_and_preserve_forget_lifetimes` in
+`src/filesystem.rs` separately bounds source-stream membership records and
+checks metadata ownership across FORGET, replay and close. Streams use sparse
+masks; shared reference counts and merged-view ownership are preserved.
+This resource check complements the protocol and mounted evidence below.
+
 The original entries below preserve default `ignored` acceptance. Supplemental
 `P-none`, `P-untracked`, `P-cow` and `P-unlinked-cow` exercise actual protocol
 dispatch for policy denials, unignored creation, tracked copy-up, namespace

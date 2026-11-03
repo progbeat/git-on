@@ -104,7 +104,9 @@ struct DirectoryHandle {
     view: Arc<DirectoryView>,
     // Acquire a pin only after a row fits the reply. Replayed cookies do not
     // acquire another pin; unread siblings have no retained reference.
-    seen: HashSet<u64>,
+    // Sparse masks keep exact issued membership without one hash record for
+    // every returned name. Unread inode ranges allocate no mask.
+    seen: HashMap<u64, u64>,
     // Only issued merged-view cookies need cursors. Source views retain direct
     // array offsets. A cursor owns its immutable version, including on replay.
     cursors: HashMap<u64, DirectoryCursor>,
@@ -1181,7 +1183,7 @@ impl Overlay {
             fh,
             DirectoryHandle {
                 view,
-                seen: HashSet::new(),
+                seen: HashMap::new(),
                 cursors: HashMap::new(),
             },
         );
@@ -1211,8 +1213,12 @@ impl Overlay {
             }
         }
         if let Some(directory) = self.directories.remove(&fh) {
-            for child in directory.seen {
-                self.release_directory_ref(child);
+            for (word, mut mask) in directory.seen {
+                while mask != 0 {
+                    let bit = mask.trailing_zeros();
+                    mask &= mask - 1;
+                    self.release_directory_ref(word * 64 + u64::from(bit));
+                }
             }
             self.release_directory_ref(ino);
             self.release_directory_ref(directory.view.parent);
@@ -2336,6 +2342,7 @@ impl Overlay {
         }
         .checked_add(2)
         .ok_or(libc::EOVERFLOW)?;
+        let mut through = offset;
         for index in usize::try_from(offset).map_err(|_| libc::EINVAL)?..length {
             let (child, kind, name) = if index == 0 {
                 (ino, FileType::Directory, OsStr::new("."))
@@ -2354,16 +2361,34 @@ impl Overlay {
             if emit(child, kind, name, index as u64 + 1) {
                 break;
             }
-            if index >= 2
-                && self
-                    .directories
-                    .get_mut(&fh)
-                    .ok_or(libc::EBADF)?
-                    .seen
-                    .insert(child)
-            {
-                *self.directory_refs.entry(child).or_default() += 1;
+            through = index as u64 + 1;
+        }
+        let from = offset.max(2);
+        if through > from {
+            let base = source.unwrap().base;
+            self.pin_source_directory_range(fh, base + (from - 2), base + (through - 2))?;
+        }
+        Ok(())
+    }
+    fn pin_source_directory_range(&mut self, fh: u64, mut from: u64, end: u64) -> FsResult<()> {
+        let seen = &mut self.directories.get_mut(&fh).ok_or(libc::EBADF)?.seen;
+        while from < end {
+            let bit = from % 64;
+            let count = (end - from).min(64 - bit);
+            let mask = (u64::MAX >> (64 - count)) << bit;
+            let word = from / 64;
+            let issued = seen.entry(word).or_default();
+            let mut added = mask & !*issued;
+            *issued |= mask;
+            while added != 0 {
+                let bit = added.trailing_zeros();
+                added &= added - 1;
+                *self
+                    .directory_refs
+                    .entry(word * 64 + u64::from(bit))
+                    .or_default() += 1;
             }
+            from += count;
         }
         Ok(())
     }
@@ -2420,7 +2445,11 @@ impl Overlay {
                 .cursors
                 .entry(cookie)
                 .or_insert_with(|| cursor.clone());
-            if handle.seen.insert(child) {
+            let mask = 1 << (child % 64);
+            let issued = handle.seen.entry(child / 64).or_default();
+            let added = *issued & mask == 0;
+            *issued |= mask;
+            if added {
                 *self.directory_refs.entry(child).or_default() += 1;
             }
             offset = cookie;
@@ -3410,6 +3439,66 @@ mod tests {
             "same immutable source keeps its identity; no ID is reassigned to another file"
         );
         assert_eq!(fs.nodes[&replacement].attr.mtime, original_time);
+    }
+    #[test]
+    fn readonly_directory_streams_compact_pins_and_preserve_forget_lifetimes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"source").unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        for index in 0..10_000 {
+            builder
+                .insert(format!("file-{index:05}"), blob, 0o100644)
+                .unwrap();
+        }
+        let tree = builder.write().unwrap();
+        let snapshot = Snapshot::load(
+            repo.path(),
+            OsStr::new(&tree.to_string()),
+            "readonly-directory-pins",
+        )
+        .unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::None)
+                .unwrap();
+        let first = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let second = fs.open_directory(1, libc::O_RDONLY).unwrap();
+        let original = directory_rows(&mut fs, 1, first);
+        assert_eq!(original.len(), 10_002);
+        assert!(
+            fs.directories[&first].seen.len() <= 157,
+            "readonly stream retained an individual record for each source name: {}",
+            fs.directories[&first].seen.len()
+        );
+        assert_eq!(fs.nodes.len(), 1);
+        let name = OsStr::new("file-05000");
+        let attr = fs.lookup_entry(1, name).unwrap();
+        assert_eq!(original[5002].0, attr.ino);
+        let opened = fs.open_file(attr.ino, libc::O_RDONLY).unwrap();
+        fs.forget_inode(attr.ino, 1);
+        assert_eq!(fs.read_data(attr.ino, opened, 0, 6).unwrap(), b"source");
+        fs.close_handle(attr.ino, opened);
+        assert!(fs.nodes.contains_key(&attr.ino));
+        assert_eq!(directory_rows(&mut fs, 1, second), original);
+        let mut resumed = None;
+        fs.read_directory(1, first, 5002, |ino, _, name, cookie| {
+            resumed = Some((ino, name.to_owned(), cookie));
+            true
+        })
+        .unwrap();
+        assert_eq!(resumed, Some((attr.ino, name.to_owned(), 5003)));
+        let replacement = fs.lookup_entry(1, name).unwrap();
+        assert_eq!(replacement.ino, attr.ino);
+        assert_eq!(replacement.mtime, attr.mtime);
+        fs.forget_inode(replacement.ino, 1);
+        fs.close_handle(1, first);
+        assert!(fs.nodes.contains_key(&attr.ino));
+        fs.close_handle(1, second);
+        assert!(fs.directory_refs.is_empty());
+        assert_eq!(fs.nodes.len(), 1);
+        let metrics = fs._snapshot.metrics();
+        assert_eq!(metrics.header_reads, 1);
+        assert_eq!(metrics.blob_loads, 1);
     }
     #[test]
     fn partial_repeated_directory_reads_do_not_reserve_unread_children() {

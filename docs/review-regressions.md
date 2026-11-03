@@ -2795,3 +2795,31 @@ removes the lookup reference. The connected path passes, rejects the closed
 handle, preserves data through the old live handle and releases all backing/gate
 ownership after closing. This is a local ownership test; protocol and real-mount
 suites separately verify callback integration and normal descriptor semantics.
+
+## Compact issued membership for source directory streams
+
+`readonly_directory_streams_compact_pins_and_preserve_forget_lifetimes` scans
+10,000 source names with overlapping directory handles. On `8e2f5e9`, the
+per-stream resource assertion fails with 10,000 individual hash records.
+Streams now record issued membership in sparse 64-bit masks: the same scan needs
+at most 157 records per stream, including inode alignment. This applies to
+directory views under every policy. Source pages update masks by their returned
+inode range; merged versions add individual returned inodes and keep their
+version cursors. The mask table replaces the previous set without an additional
+table per handle. Global lifetime counts still cover exactly the returned
+entries. A rejected row, an unread sibling and a repeated cookie never acquire
+an additional reference.
+
+The focused regression also opens a source file, forgets its lookup, verifies
+its bytes, closes it and confirms that the directory still retains its metadata.
+A second stream and a replayed cookie preserve the original inode. Closing the
+last referring stream reclaims forgotten metadata; a later lookup reuses its
+identity and prepared object. The existing
+`protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity`
+checks issued/unissued entries and the exact last-stream/FORGET boundary for
+all policies, through both native I/O and the complete fallback wire suite.
+Directory reference removal is therefore not replaced by an assumption that
+readonly metadata may disappear while a stream still owns it.
+
+These checks establish compact bookkeeping and lifetime correctness. They do
+not establish full-read performance or completion of issue #20.

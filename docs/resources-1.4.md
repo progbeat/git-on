@@ -26,6 +26,13 @@ header sizes grow with demand outside the payload LRU. The wholly readonly
 mutable policies retain live directory I/O. This reuses only enumerated pages
 and does not fetch leaf contents or visit unrequested subtrees. Report metadata and
 actual process memory separately: the LRU limit is not a total-RSS guarantee.
+Directory streams store exact issued membership in sparse 64-bit masks,
+using one hash record for up to 64 inode numbers per stream. Only returned
+entries acquire lifetime references, including across partial pages and cookie
+replay. Shared inode counts preserve metadata after FORGET until the last stream
+that returned that entry closes. Source pages update masks by contiguous inode
+range; merged views retain their version cursors and add only each returned
+inode. Unread gaps allocate no masks. This bookkeeping loads no file payloads.
 Local packed/delta decoding retains the documented libgit2 memory limitation.
 Libgit2 can also retain decoded delta bases (up to 1 MiB each, 16 MiB per
 pack); anonymous retention is not limited to active decoder buffers.
