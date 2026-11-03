@@ -445,7 +445,7 @@ def run(options):
             observed = [{k:v for k,v in row.items() if k not in ('elapsed_ns','test_output')} for row in after['command_observations']]
             assert expected == observed and [r['completed'] for r in observed] == ['first','repeat'], 'baseline command differs'
             m=after['metrics']
-            if workload=='full':assert m['blob_loads']==metadata['counts']['nonempty_unique_blob_objects'],'prepared data decoded repeatedly or required data missing'
+            if workload=='full':assert m['blob_loads']==metadata['counts']['nonempty_unique_blob_objects'],'verified descriptor count differs from demanded unique payloads'
             assert m['fuse_requests'].get('read', 0) > 0, 'no actual FUSE reads'
             if workload == 'tests':
                 assert all(r['test_count']==32 for r in observed)

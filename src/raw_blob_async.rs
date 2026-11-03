@@ -82,6 +82,9 @@ pub(crate) struct RawBlobs {
     state: RefCell<State>,
     directory: Rc<Directory>,
     limit: usize,
+    // Cold small-object misses reuse the pinned local ODB. RAM hits do not
+    // upgrade this reference or enter the decoder; remote data keeps raw storage.
+    local_small_source: Option<std::rc::Weak<crate::source_async::Source>>,
     io: Rc<Io>,
     // This gate coordinates cold admissions only. RAM reads do not take it and
     // no RefCell borrow or interthread cache lock survives a disk await.
@@ -151,10 +154,17 @@ impl RawBlobs {
                 _owner: owner,
             }),
             limit,
+            local_small_source: None,
             io,
             admission: tokio::sync::Mutex::new(()),
             preparing: RefCell::new(HashMap::new()),
         }
+    }
+    pub(crate) fn set_local_small_source(
+        &mut self,
+        source: std::rc::Weak<crate::source_async::Source>,
+    ) {
+        self.local_small_source = Some(source);
     }
     pub(crate) async fn finish(self) -> Result<()> {
         if let Some((_, file)) = self.state.into_inner().reader {
@@ -222,9 +232,12 @@ impl RawBlobs {
                         range: 0..r.bytes.len(),
                     },
                     s.objects[oid].file,
+                    self.local_small_source.is_some() && s.objects[oid].size <= BLOCK as u64,
                 )
             };
-            if !victim.2 {
+            // The original local Git object already supplies encoded backing
+            // storage. Avoid a second per-object file for small local payloads.
+            if !victim.2 && !victim.3 {
                 let mut pending = self.pending(victim.0.to_string()).await?;
                 self.record_io();
                 pending.file.write_all_at(victim.1.clone(), 0).await?;
@@ -233,7 +246,9 @@ impl RawBlobs {
             // The victim remains available in RAM until the complete write succeeds.
             // A failed or cancelled eviction therefore cannot lose verified contents.
             let mut s = self.state.borrow_mut();
-            s.objects.get_mut(&victim.0).unwrap().file = true;
+            if !victim.3 {
+                s.objects.get_mut(&victim.0).unwrap().file = true;
+            }
             let old = s
                 .memory
                 .pop(&victim.0)
@@ -666,21 +681,44 @@ impl RawBlobs {
                 if let Some(bytes) = resident {
                     bytes
                 } else {
-                    let (size, expected) = {
+                    let (size, expected, on_disk) = {
                         let s = self.state.borrow();
                         let d = &s.objects[&oid];
-                        anyhow::ensure!(d.file, "missing prepared object block");
-                        (d.size, d.hashes[block])
+                        (d.size, d.hashes[block], d.file)
                     };
-                    if range_file.is_none() {
-                        range_file = Some(self.reader(oid, size).await?);
-                    }
-                    let file = range_file.as_ref().unwrap();
-                    self.record_io();
-                    let (r, buffer) = file
-                        .read_exact_at(vec![0; ((size - start).min(BLOCK as u64)) as usize], start)
-                        .await;
-                    r?;
+                    let buffer = if on_disk {
+                        if range_file.is_none() {
+                            range_file = Some(self.reader(oid, size).await?);
+                        }
+                        let file = range_file.as_ref().unwrap();
+                        self.record_io();
+                        let (r, buffer) = file
+                            .read_exact_at(
+                                vec![0; ((size - start).min(BLOCK as u64)) as usize],
+                                start,
+                            )
+                            .await;
+                        r?;
+                        buffer
+                    } else {
+                        anyhow::ensure!(
+                            block == 0 && size <= BLOCK as u64,
+                            "missing prepared object block"
+                        );
+                        let source = self
+                            .local_small_source
+                            .as_ref()
+                            .and_then(std::rc::Weak::upgrade)
+                            .context("local small-object source is unavailable")?;
+                        let blob = source.small_blob(oid, usize::try_from(size)?).await?;
+                        anyhow::ensure!(
+                            blob.proof.oid() == oid
+                                && blob.proof.size() as u64 == size
+                                && blob.bytes.len() as u64 == size,
+                            "source proof does not identify the reloaded object"
+                        );
+                        blob.bytes
+                    };
                     anyhow::ensure!(
                         Sha256::digest(&buffer).as_slice() == expected,
                         "verified raw blob bytes were modified"
@@ -717,6 +755,198 @@ mod tests {
     use super::*;
     fn oid(b: &[u8]) -> Oid {
         Oid::hash_object(ObjectType::Blob, b).unwrap()
+    }
+    #[test]
+    fn resident_reads_progress_while_a_local_reload_waits_for_the_source() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        for native in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path().join("repo")).unwrap();
+            let first = vec![b'a'; 6000];
+            let second = vec![b'b'; 6000];
+            let first_oid = repo.blob(&first).unwrap();
+            let second_oid = repo.blob(&second).unwrap();
+            let source = Rc::new(crate::source_async::Source::new(repo).unwrap());
+            tokio_uring::start(async {
+                let io = Io::new(native);
+                let mut store =
+                    RawBlobs::with_limit_io(directory.path(), 8192, io.clone()).unwrap();
+                store.set_local_small_source(Rc::downgrade(&source));
+                store
+                    .prepare_with_size(&source, first_oid, 6000)
+                    .await
+                    .unwrap();
+                store
+                    .prepare_with_size(&source, second_oid, 6000)
+                    .await
+                    .unwrap();
+                let resume = source.tested_pause().await;
+                {
+                    let mut cold = std::pin::pin!(store.read(first_oid, 0, 6000));
+                    poll_fn(|cx| {
+                        assert!(cold.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    let demands = source.tested_demands();
+                    let hashes = store.state.borrow().authenticated_bytes;
+                    let mut resident = std::pin::pin!(store.read(second_oid, 0, 6000));
+                    let retained = poll_fn(|cx| match resident.as_mut().poll(cx) {
+                        Poll::Ready(result) => Poll::Ready(result.unwrap()),
+                        Poll::Pending => panic!("a RAM hit waited for an unrelated source reload"),
+                    })
+                    .await;
+                    assert_eq!(retained.as_slice(), second);
+                    assert_eq!(source.tested_demands(), demands);
+                    assert_eq!(store.state.borrow().authenticated_bytes, hashes);
+                    assert_eq!(store.tested_io_operations(), 0);
+                    resume.send(()).unwrap();
+                    assert_eq!(cold.await.unwrap().as_slice(), first);
+                    assert_eq!(retained.as_slice(), second);
+                }
+                store.finish().await.unwrap();
+                Rc::try_unwrap(source).ok().unwrap().finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        }
+    }
+    #[test]
+    fn local_small_reload_rejects_a_changed_git_object() {
+        use std::io::Write;
+        for native in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path().join("repo")).unwrap();
+            let first = vec![b'a'; 6000];
+            let second = vec![b'b'; 6000];
+            let first_oid = repo.blob(&first).unwrap();
+            let second_oid = repo.blob(&second).unwrap();
+            let id = first_oid.to_string();
+            let path = repo.path().join("objects").join(&id[..2]).join(&id[2..]);
+            let source = Rc::new(crate::source_async::Source::new(repo).unwrap());
+            tokio_uring::start(async {
+                let io = Io::new(native);
+                let mut store =
+                    RawBlobs::with_limit_io(directory.path(), 8192, io.clone()).unwrap();
+                store.set_local_small_source(Rc::downgrade(&source));
+                store
+                    .prepare_with_size(&source, first_oid, 6000)
+                    .await
+                    .unwrap();
+                store
+                    .prepare_with_size(&source, second_oid, 6000)
+                    .await
+                    .unwrap();
+                let mut replacement =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                replacement.write_all(b"blob 6000\0").unwrap();
+                replacement.write_all(&vec![b'x'; 6000]).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(path, replacement.finish().unwrap()).unwrap();
+                assert!(store.read(first_oid, 0, 6000).await.is_err());
+                assert_eq!(store.tested_io_operations(), 0);
+                assert!(store.failure().is_some());
+                store.finish().await.unwrap();
+                Rc::try_unwrap(source).ok().unwrap().finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        }
+    }
+    #[test]
+    fn local_source_reconstruction_keeps_large_objects_streamed_to_raw_storage() {
+        for native in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path().join("repo")).unwrap();
+            let bytes = (0..3 * BLOCK + 17)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>();
+            let id = repo.blob(&bytes).unwrap();
+            let source = Rc::new(crate::source_async::Source::new(repo).unwrap());
+            tokio_uring::start(async {
+                let io = Io::new(native);
+                let mut store =
+                    RawBlobs::with_limit_io(directory.path(), 2 * BLOCK, io.clone()).unwrap();
+                store.set_local_small_source(Rc::downgrade(&source));
+                store
+                    .prepare_with_size(&source, id, bytes.len() as u64)
+                    .await
+                    .unwrap();
+                assert_eq!(store.metrics().retained_raw_blob_entries, 1);
+                assert_eq!(store.metrics().retained_raw_blob_bytes, bytes.len() as u64);
+                for block in [0, 2, 1, 3, 0] {
+                    let start = block * BLOCK;
+                    let end = (start + BLOCK).min(bytes.len());
+                    assert_eq!(
+                        store
+                            .read(id, start as u64, BLOCK as u32)
+                            .await
+                            .unwrap()
+                            .as_slice(),
+                        &bytes[start..end]
+                    );
+                    assert!(store.metrics().blob_cache_bytes <= 2 * BLOCK);
+                    assert_eq!(store.metrics().blob_cache_entries, 1);
+                }
+                assert_eq!(source.tested_demands(), 1);
+                store.finish().await.unwrap();
+                Rc::try_unwrap(source).ok().unwrap().finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        }
+    }
+    #[test]
+    fn local_small_eviction_reuses_git_storage_without_a_raw_copy() {
+        for native in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path().join("repo")).unwrap();
+            let first = vec![b'a'; 6000];
+            let second = vec![b'b'; 6000];
+            let first_oid = repo.blob(&first).unwrap();
+            let second_oid = repo.blob(&second).unwrap();
+            let source = Rc::new(crate::source_async::Source::new(repo).unwrap());
+            tokio_uring::start(async {
+                let io = Io::new(native);
+                let mut store =
+                    RawBlobs::with_limit_io(directory.path(), 8192, io.clone()).unwrap();
+                store.set_local_small_source(Rc::downgrade(&source));
+                store
+                    .prepare_with_size(&source, first_oid, 6000)
+                    .await
+                    .unwrap();
+                store
+                    .prepare_with_size(&source, second_oid, 6000)
+                    .await
+                    .unwrap();
+                let eviction_io = store.tested_io_operations();
+                assert_eq!(
+                    store.read(first_oid, 0, 6000).await.unwrap().as_slice(),
+                    first
+                );
+                let demands = source.tested_demands();
+                let authenticated = store.state.borrow().authenticated_bytes;
+                assert_eq!(
+                    store.read(first_oid, 7, 5).await.unwrap().as_slice(),
+                    &first[7..12]
+                );
+                assert_eq!(source.tested_demands(), demands);
+                assert_eq!(store.state.borrow().authenticated_bytes, authenticated);
+                let raw_entries = store.metrics().retained_raw_blob_entries;
+                store.finish().await.unwrap();
+                Rc::try_unwrap(source).ok().unwrap().finish().await.unwrap();
+                io.finish().await.unwrap();
+                assert_eq!(
+                    eviction_io, 0,
+                    "a small local eviction created a redundant raw copy"
+                );
+                assert_eq!(raw_entries, 0);
+                assert_eq!(
+                    demands, 3,
+                    "a cold reload must use the available Git object; RAM hits must not"
+                );
+            });
+        }
     }
     #[test]
     fn prepared_handoff_moves_resident_allocation_without_file_io() {

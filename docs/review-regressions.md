@@ -2871,3 +2871,36 @@ in RAM were also mixed, with slower first passes in several cases. The
 operation-count regression proves removal of the fallback scan, not a
 general read-speed improvement or absence of latency regressions. Full
 issue #20 acceptance remains incomplete.
+
+
+## Reuse encoded local small objects after RAM eviction
+
+At `39acc81d7d8716ebc22f94ba6c140cb366d9fcee`, evicting a small local
+object created a separate raw file even though the original Git object remained
+available. The focused `local_small_eviction_reuses_git_storage_without_a_raw_copy`
+regression records three cache I/O operations before the change and zero after,
+checks the reconstructed bytes and partial rereads, and drains owned resources.
+It exercises native io_uring and the file fallback. Only the test-only source
+configuration shim is added to the old code for the red run; its runtime remains
+unchanged. The new path retains the original OID, length and SHA-256 expectation
+and checks the actual reconstructed buffer. Additional regressions reject a
+replaced Git object, keep large objects streamed with bounded cache retention,
+and let a resident read complete while a cold reload awaits the source.
+
+Matched same-binary controls used the existing 35,019-file WebKit fast/ tree
+(90,585,598 logical bytes), CPU 0, nice 15, idle I/O and a 4 GiB address-space
+limit. Two ABBA/BAAB blocks used fresh invocations with the same original ODB
+and canonical command. With ordinary kernel caching, first-pass medians changed
+from 18.24 to 13.24 seconds and complete invocation medians from 24.44 to 17.69.
+Warm directions were mixed across blocks. With an identical owned-file
+DONTNEED hint outside the repeat timer on both arms, repeat medians changed from
+10.24 to 9.05 seconds and whole-invocation medians from 30.68 to 23.44; both
+paired blocks improved. Source work intentionally increases on cold local
+reconstruction; this is not another retained decoded cache.
+
+Sixteen separate fitting-RAM controls retained zero raw files and zero source
+CPU on repeat. Their timing directions were mixed; no RAM-hit speedup is
+claimed. Every control verified contents, native I/O selection, absence of a
+file worker, pin cleanup and empty runtime storage. These bounded controls do
+not complete issue #20 or replace full ordinary-binary acceptance. Temporary
+constructor controls, timing observers and raw evidence remain outside the PR.

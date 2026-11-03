@@ -19,7 +19,7 @@ use std::{
 
 type MetadataGates = HashMap<(Oid, bool), Weak<tokio::sync::Mutex<()>>>;
 enum Source {
-    Local(source_async::Source),
+    Local(Rc<source_async::Source>),
     Remote(crate::remote_async::Source),
 }
 pub(crate) struct Finished {
@@ -125,10 +125,13 @@ impl Snapshot {
         owner: Arc<tempfile::TempDir>,
         io: Rc<crate::file_async::Io>,
     ) -> Result<Self> {
+        let source = Rc::new(source_async::Source::new(repo)?);
+        let mut raw = RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io);
+        raw.set_local_small_source(Rc::downgrade(&source));
         Ok(Self {
             root,
-            source: Source::Local(source_async::Source::new(repo)?),
-            raw: RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io),
+            source: Source::Local(source),
+            raw,
             trees: RefCell::new(HashMap::new()),
             headers: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
@@ -351,7 +354,10 @@ impl Snapshot {
         metrics.spool_bytes = metrics.retained_raw_blob_bytes;
         metrics.spool_writes = metrics.retained_raw_blob_entries;
         let source = match self.source {
-            Source::Local(source) => source.finish().await.map(|_| None),
+            Source::Local(source) => match Rc::try_unwrap(source) {
+                Ok(source) => source.finish().await.map(|_| None),
+                Err(_) => Err(anyhow::anyhow!("local source still owned at shutdown")),
+            },
             Source::Remote(source) => source.finish().await.map(Some),
         };
         let raw = self.raw.finish().await;

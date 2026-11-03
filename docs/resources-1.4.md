@@ -12,9 +12,26 @@ all readers. Objects up to 64 KiB stay whole in RAM until eviction; large object
 stream to disk and retain at most their most recently read block. A new block
 replaces the old cache entry without invalidating owned buffers of active reads.
 A sequential large scan therefore cannot occupy the LRU with many blocks from
-one object. Backing contents use one raw file per original object. Disk reads verify full intersecting 64 KiB
-blocks before returning bytes from that checked buffer. Resident rereads avoid
-those disk hashes. No disk object/name index or HMAC key remains.
+one object. Payloads that need temporary backing use one raw file per original
+object. Disk reads verify full intersecting 64 KiB blocks before returning bytes
+from that checked buffer. Resident rereads avoid those disk hashes. No disk
+object/name index or HMAC key remains.
+
+Local Linux FUSE objects up to 64 KiB reuse their original encoded Git storage
+after RAM eviction
+instead of creating an additional raw file. A cold miss reconstructs the object
+on the existing bounded source worker, checks its canonical OID/type/length and
+compares the returned buffer with the original trusted block hash before cache
+admission. RAM hits neither reconstruct nor rehash. Only cold misses upgrade a
+weak source reference; the source remains owned by the snapshot and is drained
+before shutdown. Large local objects still stream to raw storage. Remote objects
+keep their invocation-owned verified storage and never refetch because of a
+decoded-cache eviction.
+
+The `blob_loads` snapshot metric counts verified demanded-object descriptors,
+not native decoder calls. A local reconstruction can repeat decoding without
+increasing that cardinality. Timings and actual source activity must be measured
+separately; this counter alone does not establish absence of repeated work.
 
 Touched unique directories are parsed once into shared immutable RAM structures;
 raw tree bytes are released. Source leaves retain their original OID, not a full
@@ -91,7 +108,8 @@ Returned positive entries acquire lookup references, and namespace/cached inode
 ownership survives reply completion. Mutable attributes retain zero TTL, while
 all-policy name bindings can cache independently. Remote sources retain ordinary
 READDIR because their protocol currently obtains sizes through blob demands.
-Source READ/RAM-hit paths are unchanged; small payloads remain separate objects.
+Adaptive directory replies do not alter RAM-hit handling; small payloads remain
+separate objects.
 
 Repeated pages in mutable namespaces omit another positive reply for existing
 metadata-only source leaves. Ordinary revalidation can still request their
