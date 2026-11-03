@@ -1,5 +1,38 @@
 # Review regression evidence
 
+## Adaptive directory metadata and zero-node-ID replies
+
+The READDIRPLUS port found that the vendored predecessor at `9ae0361` ignored
+the supplied entry node ID and encoded `attr.ino` instead. The permanent SDK
+test `zero_nodeid_lists_a_name_without_adding_a_lookup_reference` failed with
+node ID 7 instead of 0 before the fix and passes after it. Listed inode identity
+remains independent. Linux explicitly permits this omission of attributes in
+[fuse_direntplus_link](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/readdir.c#L151).
+
+The initial forced-PLUS candidate also slowed a names-only cold traversal of
+the fitting WebKit subtree (five paired trials: median 0.027 to 0.106 seconds).
+It was not shipped. Disabling first-page deferral reproduces the permanent
+`directory_plus_bounds_header_work_and_holds_source_reply_ownership` failure:
+two source demands instead of the one prepared tree. Adaptive negotiation and
+deferral now keep cold first-page leaf headers/backing stats demand-driven.
+The same test bounds later header work and holds a reply while checking that
+copy-up and namespace mutation cannot overtake it. Snapshot tests coalesce
+aliases/concurrent size demands and retain readable siblings after header errors.
+Protocol tests cover pagination, exact lookup lifetime, old-view replacements
+and independent mutable-attribute/name TTLs. These component results do not
+establish final performance or the complete release acceptance.
+
+The first adaptive implementation also republished every entry on repeated
+stat-only scans under `all` (ten pairs: median 0.029 to 0.050 seconds). Omitting
+the metadata-only reuse condition makes the permanent wire test
+`protocol_readdirplus_reuses_published_metadata_without_duplicate_lookup_refs`
+fail: a repeated positive node ID instead of zero and an extra lookup reference.
+The corrected test checks that one FORGET after closing the directory releases
+the inode. A new ten-pair control measured 0.0255 to 0.0267 seconds, with mixed
+paired directions; no numerical overhead allowance is inferred. Cold metadata
+improved in all ten pairs for both tested policies. Full-read timing remains
+mixed and does not satisfy the complete performance requirement.
+
 ## Readonly directory pages on reopen
 
 Follow-up at `ff1c01a`: CACHE_DIR alone cached seek/rewind within one handle,

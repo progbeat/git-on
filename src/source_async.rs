@@ -43,8 +43,10 @@ impl BlobStream {
         self.events.recv().await
     }
 }
+type Headers = Vec<(Oid, Result<(usize, ObjectType)>)>;
 enum Demand {
     Header(Oid, oneshot::Sender<Result<(usize, ObjectType)>>),
+    Headers(Vec<Oid>, oneshot::Sender<Result<Headers>>),
     Tree(Oid, oneshot::Sender<Result<Directory>>),
     Blob(Oid, Option<usize>, oneshot::Sender<Result<BlobStream>>),
     SmallBlob(Oid, usize, oneshot::Sender<Result<SmallBlob>>),
@@ -148,6 +150,14 @@ impl Source {
             .spawn(move || {
                 while let Some(demand) = receiver.blocking_recv() {
                     match demand {
+                        Demand::Headers(oids, reply) => {
+                            let result = repository.odb().map_err(Into::into).map(|odb| {
+                                oids.into_iter()
+                                    .map(|oid| (oid, odb.read_header(oid).map_err(Into::into)))
+                                    .collect()
+                            });
+                            let _ = reply.send(result);
+                        }
                         Demand::Header(oid, reply) => {
                             let _ = reply.send(
                                 repository
@@ -270,6 +280,9 @@ impl Source {
     }
     pub(crate) async fn header(&self, oid: Oid) -> Result<(usize, ObjectType)> {
         self.demand(|reply| Demand::Header(oid, reply)).await
+    }
+    pub(crate) async fn headers(&self, oids: Vec<Oid>) -> Result<Headers> {
+        self.demand(|reply| Demand::Headers(oids, reply)).await
     }
     pub(crate) async fn tree(&self, oid: Oid) -> Result<Directory> {
         self.demand(|reply| Demand::Tree(oid, reply)).await

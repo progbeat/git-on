@@ -430,6 +430,27 @@ impl Overlay {
             .copied()
             .filter(|ino| self.nodes.contains_key(ino))
     }
+    /// Inspect the already prepared parent, without traversing ancestors or
+    /// creating per-leaf path indexes for readonly enumeration.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_header(&self, parent: u64, name: &OsStr) -> Option<Oid> {
+        let node = self.nodes.get(&parent)?;
+        let mut source = node.snapshot_path.as_deref()?;
+        let mut component = name;
+        let lower;
+        if !self.read_only() {
+            let path = self.child(parent, name).ok()?;
+            if self.cached_inode(&path).is_some() {
+                return None;
+            }
+            lower = self.lower_path(&path)?;
+            source = lower.parent()?;
+            component = lower.file_name()?;
+        }
+        let directory = &self.source_directories[*self.source_directory_keys.get(source)?];
+        let (mode, oid) = directory.tree.lookup(component)?;
+        matches!(mode, 0o100644 | 0o100755 | 0o120000).then_some(oid)
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn install_source(
         &mut self,
@@ -719,6 +740,14 @@ impl Overlay {
     pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
         self.nodes.get(&ino).is_some_and(|node| {
             node.immutable && node.oid.is_some() && node.attr.kind == FileType::RegularFile
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn source_leaf_oid(&self, ino: u64) -> Option<Oid> {
+        self.nodes.get(&ino).and_then(|node| {
+            (node.immutable && node.attr.kind != FileType::Directory)
+                .then_some(node.oid)
+                .flatten()
         })
     }
     pub(crate) fn protected_source(&self, ino: u64) -> bool {

@@ -137,6 +137,38 @@ fn dirents(bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
     }
     out
 }
+#[derive(Debug)]
+struct PlusEntry {
+    nodeid: u64,
+    ino: u64,
+    next: u64,
+    name: Vec<u8>,
+    size: u64,
+    entry_ttl: u64,
+    attr_ttl: u64,
+}
+fn plusents(bytes: &[u8]) -> Vec<PlusEntry> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        // Linux FUSE 7.31: entry_out=128, dirent header=24, then padded name.
+        assert!(pos + 152 <= bytes.len());
+        let len = u32::from_ne_bytes(bytes[pos + 144..pos + 148].try_into().unwrap()) as usize;
+        let end = pos + ((152 + len + 7) & !7);
+        assert!(end <= bytes.len());
+        out.push(PlusEntry {
+            nodeid: num(bytes, pos),
+            ino: num(bytes, pos + 128),
+            next: num(bytes, pos + 136),
+            name: bytes[pos + 152..pos + 152 + len].to_vec(),
+            size: num(bytes, pos + 48),
+            entry_ttl: num(bytes, pos + 16),
+            attr_ttl: num(bytes, pos + 24),
+        });
+        pos = end;
+    }
+    out
+}
 struct Peer {
     fd: OwnedFd,
     task: Option<JoinHandle<()>>,
@@ -323,12 +355,12 @@ impl Peer {
         // The complete operation suite below still uses the peer's7.31 layout.
         // https://man7.org/linux/man-pages/man4/fuse.4.html (FUSE_INIT)
         assert_eq!(minor.min(daemon_minor), minor);
-        // No POSIX locks, readdirplus or writeback-cache capabilities enabled.
+        // Header-only local sources support adaptive READDIRPLUS. Other
+        // optional lock/writeback capabilities remain disabled.
         let flags = u32::from_ne_bytes(init[12..16].try_into().unwrap());
-        assert_eq!(
-            flags & ((1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16)),
-            0
-        );
+        assert_eq!(flags & ((1 << 1) | (1 << 10) | (1 << 16)), 0);
+        assert_eq!(flags & (1 << 13) != 0, asynchronous && minor >= 21);
+        assert_eq!(flags & (1 << 14) != 0, asynchronous && minor >= 21);
         (p, flags)
     }
     fn send(&mut self, op: u32, ino: u64, body: Vec<u8>) {
@@ -958,6 +990,135 @@ fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
 }
 
 #[test]
+fn protocol_readdirplus_pages_preserve_attributes_cookies_and_lookup_lifetimes() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 64);
+        let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let cold = plusents(&p.ok(44, 1, io(h, 0, 512, 0)));
+        assert!(
+            cold.iter().all(|entry| entry.nodeid == 0),
+            "the initial adaptive probe loaded cold file attributes"
+        );
+        assert!(p.ok(44, 1, io(h, 0, 0, 0)).is_empty());
+        assert!(p.ok(44, 1, io(h, 0, 159, 0)).is_empty());
+        let dot = plusents(&p.ok(44, 1, io(h, 0, 160, 0)));
+        assert_eq!(dot.len(), 1);
+        assert_eq!(
+            (&dot[0].name, dot[0].nodeid, dot[0].ino, dot[0].next),
+            (&b".".to_vec(), 0, 1, 1)
+        );
+        let first = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
+        assert_eq!(first.len(), 1);
+        let first = &first[0];
+        assert_eq!(first.name, b".gitignore");
+        assert_eq!(first.nodeid, first.ino);
+        assert_eq!(first.size, b"*.tmp\n/cache/\n".len() as u64);
+        assert!(first.entry_ttl > 0 && first.attr_ttl > 0);
+        let ino = first.nodeid;
+        p.ok(29, 1, u64s(&[h, 0, 0]));
+        p.send(2, ino, u64s(&[1]));
+        p.err(3, ino, vec![0; 16], libc::ENOENT);
+        assert_eq!(p.lookup(1, ".gitignore"), ino);
+        let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        let expected = dirents(&p.ok(28, 1, io(h, 0, 4096, 0)));
+        let mut got = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = p.ok(44, 1, io(h, offset, 512, 0));
+            assert!(page.len() <= 512);
+            let entries = plusents(&page);
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                assert!(entry.next > offset as u64);
+                offset = entry.next as i64;
+                got.push((entry.next, entry.name));
+            }
+        }
+        assert_eq!(got, expected);
+        assert!(p.ok(44, 1, io(h, 1_000_000, 512, 0)).is_empty());
+        p.err(44, 1, io(h, -1, 512, 0), libc::EINVAL);
+        p.err(44, 1, io(u64::MAX, 0, 512, 0), libc::EBADF);
+        p.err(44, ino, io(h, 0, 512, 0), libc::EBADF);
+        p.ok(29, 1, u64s(&[h, 0, 0]));
+        p.err(44, 1, io(h, 0, 512, 0), libc::EBADF);
+    }
+    let mut legacy = Peer::with_legacy_policy(WritePolicy::None);
+    let h = num(&legacy.ok(27, 1, u32s(&[0, 0])), 0);
+    legacy.err(44, 1, io(h, 0, 4096, 0), libc::ENOSYS);
+}
+
+#[test]
+fn protocol_readdirplus_old_view_does_not_publish_a_replacement_binding() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let listing = dirents(&p.ok(28, 1, io(h, 0, 4096, 0)));
+    let cookie = listing
+        .iter()
+        .find(|(_, name)| name == b"tracked")
+        .unwrap()
+        .0;
+    let old = p.lookup(1, "tracked");
+    p.ok(12, 1, names(u64s(&[1]), &["tracked", "moved"]));
+    let (new, fh) = p.create("tracked");
+    p.ok(
+        16,
+        new,
+        [io(fh, 0, 3, libc::O_RDWR), b"new".to_vec()].concat(),
+    );
+    let page = plusents(&p.ok(44, 1, io(h, cookie as i64 - 1, 160, 0)));
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].name, b"tracked");
+    assert_eq!(page[0].ino, old);
+    assert_eq!(page[0].nodeid, 0);
+    assert_eq!(p.lookup(1, "tracked"), new);
+    assert_eq!(p.lookup(1, "moved"), old);
+    assert_eq!(p.ok(15, new, io(fh, 0, 100, 0)), b"new");
+}
+
+#[test]
+fn protocol_readdirplus_reuses_published_metadata_without_duplicate_lookup_refs() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let first = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
+    assert_eq!(first.len(), 1);
+    let ino = first[0].nodeid;
+    assert_ne!(ino, 0);
+    let again = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
+    assert_eq!(again.len(), 1);
+    assert_eq!((again[0].nodeid, again[0].ino), (0, ino));
+    p.ok(29, 1, u64s(&[h, 0, 0]));
+    p.send(2, ino, u64s(&[1]));
+    p.err(3, ino, vec![0; 16], libc::ENOENT);
+}
+
+#[test]
+fn protocol_readdirplus_keeps_mutable_attributes_live_and_names_cached() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let source = p.lookup(1, "tracked");
+    let writing = p.open(source, libc::O_RDWR);
+    p.ok(
+        16,
+        source,
+        [io(writing, 9, 1, libc::O_RDWR), b"!".to_vec()].concat(),
+    );
+    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+    let entries = plusents(&p.ok(44, 1, io(h, 2, 4096, 0)));
+    let modified = entries.iter().find(|e| e.name == b"tracked").unwrap();
+    assert_eq!(modified.size, 10);
+    assert_eq!(modified.attr_ttl, 0);
+    assert!(modified.entry_ttl > 0);
+    let unchanged = entries.iter().find(|e| e.name == b"link").unwrap();
+    assert!(unchanged.attr_ttl > 0 && unchanged.entry_ttl > 0);
+}
+
+#[test]
 fn protocol_overlapping_merged_versions_preserve_issued_cookies() {
     use std::collections::BTreeSet;
     for policy in [
@@ -1248,7 +1409,8 @@ fn protocol_all_unsupported_callbacks_refuse_without_mutation() {
     for (op, body) in cases {
         p.err(op, ino, body, libc::ENOSYS);
     }
-    p.err(44, 1, io(directory, 0, 4096, 0), libc::ENOSYS);
+    let plus = plusents(&p.ok(44, 1, io(directory, 0, 4096, 0)));
+    assert!(plus.iter().any(|entry| entry.name == b"optional.tmp"));
     assert_eq!(p.ok(15, ino, io(fh, 0, 100, 0)), b"sentinel");
     assert_eq!(p.lookup(1, "optional.tmp"), ino);
     assert_eq!(p.ok(3, ino, vec![0; 16]), before);

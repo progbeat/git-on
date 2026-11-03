@@ -1,6 +1,8 @@
 #![allow(refining_impl_trait)]
 
 #[cfg(feature = "async")]
+use std::ffi::OsStr;
+#[cfg(feature = "async")]
 use std::future::Future;
 use std::io::IoSlice;
 use std::os::unix::prelude::OsStrExt;
@@ -503,7 +505,6 @@ impl DirEntList {
 
 #[derive(Debug)]
 pub(crate) struct DirEntryPlus<T: AsRef<Path>> {
-    #[allow(unused)] // We use `attr.ino` instead
     ino: INodeNo,
     generation: Generation,
     offset: DirEntOffset,
@@ -551,6 +552,11 @@ impl DirEntPlusList {
     }
 
     #[cfg(feature = "async")]
+    pub(crate) fn entry_size(name: &OsStr) -> usize {
+        (std::mem::size_of::<abi::fuse_direntplus>() + name.len() + 7) & !7
+    }
+
+    #[cfg(feature = "async")]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.0.buf.as_slice()
     }
@@ -563,7 +569,7 @@ impl DirEntPlusList {
         let name = x.name.as_ref().as_os_str().as_bytes();
         let header = abi::fuse_direntplus {
             entry_out: abi::fuse_entry_out {
-                nodeid: x.attr.attr.ino,
+                nodeid: x.ino.0,
                 generation: x.generation.into(),
                 entry_valid: x.entry_valid.as_secs(),
                 attr_valid: x.attr_valid.as_secs(),

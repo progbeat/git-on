@@ -72,6 +72,26 @@ Objects up to 64 KiB cross the source boundary in one completely verified
 response; larger objects retain bounded streaming. Spill storage remains one
 file per OID.
 
+Local sources also negotiate adaptive READDIRPLUS when the kernel supports it.
+The initial page returns file attributes only when already available, without
+cold leaf headers or private-file stats for names-only callers. Later adaptive
+PLUS requests batch only the headers that fit their bounded reply page; they do
+not load payloads or descendant trees. Headers and concurrent individual size
+requests share the same per-OID gates/cache. Missing or unsupported metadata
+keeps a listed name with nodeid zero and defers its error to ordinary access.
+Old directory views never publish a replacement binding under an old inode.
+Returned positive entries acquire lookup references, and namespace/cached inode
+ownership survives reply completion. Mutable attributes retain zero TTL, while
+all-policy name bindings can cache independently. Remote sources retain ordinary
+READDIR because their protocol currently obtains sizes through blob demands.
+Source READ/RAM-hit paths are unchanged; small payloads remain separate objects.
+
+Repeated pages in mutable namespaces omit another positive reply for existing
+metadata-only source leaves. Ordinary revalidation can still request their
+attributes; this avoids duplicate lookup ownership and inode gates on repeated
+stat-only scans. Content preparation retains the conservative positive-attribute
+path because file reads may invalidate kernel atime, including cached reads.
+
 Protected mutable policies also load pinned ignore rules through that same
 payload cache. Compiled rules reuse the existing parser, matching semantics and
 4 MiB/128-directory retention budget. Policy/source waits finish before a short

@@ -8,14 +8,14 @@ use crate::{
 use fuser::{
     self as f,
     reply_async::{
-        AttrResponse, CreateResponse, DataResponse, DirectoryResponse, EntryResponse, OpenResponse,
-        ReadResponse, StatfsResponse, WriteResponse,
+        AttrResponse, CreateResponse, DataResponse, DirectoryPlusResponse, DirectoryResponse,
+        EntryResponse, OpenResponse, ReadResponse, StatfsResponse, WriteResponse,
     },
 };
 use std::{
     cell::{RefCell, RefMut},
     collections::HashMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Weak},
@@ -35,6 +35,7 @@ struct State {
     objects: Option<Rc<crate::snapshot_async::Snapshot>>,
     no_open: bool,
     cache_directories: bool,
+    directory_plus: bool,
     enabled: bool,
     registrar: Option<f::AsyncBackingRegistrar>,
     backings: HashMap<u64, Weak<f::AsyncBackingId>>,
@@ -57,6 +58,7 @@ impl Fuse {
                 objects: None,
                 no_open: false,
                 cache_directories: false,
+                directory_plus: false,
                 enabled: false,
                 registrar: None,
                 backings: HashMap::new(),
@@ -645,6 +647,164 @@ impl Fuse {
             }
         }
     }
+    async fn directory_plus_local(
+        &self,
+        ino: u64,
+        fh: u64,
+        size: u32,
+        offset: u64,
+    ) -> Result<DirectoryPlusResponse, f::Errno> {
+        struct Entry {
+            ino: u64,
+            kind: FileType,
+            name: OsString,
+            cookie: u64,
+            header: Option<git2::Oid>,
+            deferred: bool,
+            attr: Option<FileAttr>,
+        }
+        let objects = {
+            let state = self.state();
+            if !state.directory_plus {
+                return Err(f::Errno::ENOSYS);
+            }
+            state.objects.clone().ok_or(f::Errno::ENOSYS)?
+        };
+        let namespace = self.namespace.clone().read_owned().await;
+        let _pin = self.pin(ino);
+        let size = (size as usize).min(128 * 1024);
+        let mut remaining = size;
+        let mut entries = Vec::new();
+        result(
+            self.state()
+                .core
+                .read_directory(ino, fh, offset, |ino, kind, name, cookie| {
+                    let Some(left) = remaining.checked_sub(DirectoryPlusResponse::entry_size(name))
+                    else {
+                        return true;
+                    };
+                    remaining = left;
+                    entries.push(Entry {
+                        ino,
+                        kind,
+                        name: name.to_owned(),
+                        cookie,
+                        header: None,
+                        deferred: false,
+                        attr: None,
+                    });
+                    false
+                }),
+        )?;
+        let placeholder = result(self.state().core.prepared_attributes(ino, None))?;
+        let mutable_namespace = !self.state().core.read_only();
+        let mut oids = Vec::new();
+        for entry in &mut entries {
+            if entry.cookie > 2 {
+                entry.header = self.state().core.directory_header(ino, &entry.name);
+                // Linux probes the first page with PLUS even for names-only
+                // callers. Only return already available file attributes there.
+                // Later adaptive PLUS pages follow observed metadata demand.
+                // Existing metadata-only leaves can use ordinary revalidation
+                // without another lookup reference here. After content has
+                // been prepared, stay conservative about read-invalidated atime.
+                let metadata_only = mutable_namespace
+                    && self
+                        .state()
+                        .core
+                        .source_leaf_oid(entry.ino)
+                        .is_some_and(|oid| !objects.contents_prepared(oid));
+                entry.deferred = metadata_only
+                    || offset == 0
+                        && (entry.header.is_some_and(|oid| !objects.header_ready(oid))
+                            || self.state().core.private_regular(entry.ino));
+                if !entry.deferred {
+                    oids.extend(entry.header);
+                }
+            }
+        }
+        let failed = objects
+            .directory_headers(&oids)
+            .await
+            .unwrap_or_else(|_| oids.into_iter().collect());
+        // Complete lookups before taking attribute read ownership. A later
+        // alias of a private inode may itself need its exclusive refresh gate.
+        for entry in &mut entries {
+            if entry.cookie <= 2
+                || entry.deferred
+                || entry.header.is_some_and(|oid| failed.contains(&oid))
+            {
+                continue;
+            }
+            if let Ok(attr) = self.lookup_local_inner(&objects, ino, &entry.name).await {
+                if attr.ino == entry.ino {
+                    entry.attr = Some(attr);
+                } else {
+                    // Old open views may contain a removed/replaced binding.
+                    // Keep its listed name without publishing a new binding.
+                    self.state().core.forget_inode(attr.ino, 1);
+                }
+            }
+        }
+        let mut owners = Vec::new();
+        if self.native_all {
+            let mut attributes = HashMap::new();
+            for entry in &mut entries {
+                let Some(attr) = entry.attr else { continue };
+                if let std::collections::hash_map::Entry::Vacant(slot) = attributes.entry(attr.ino)
+                {
+                    let attr = if self.state().all_attribute_ttl(attr.ino) != TTL {
+                        match self.pin_all_attributes(attr.ino, None).await {
+                            Ok((attr, owner)) => {
+                                owners.push(owner);
+                                Some(attr)
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        Some(attr)
+                    };
+                    slot.insert(attr);
+                }
+                entry.attr = attributes[&attr.ino];
+                if entry.attr.is_none() {
+                    self.state().core.forget_inode(attr.ino, 1);
+                }
+            }
+        }
+        let mut response = DirectoryPlusResponse::new(size);
+        for entry in entries {
+            let (node, attributes, ttls) = if let Some(attr) = entry.attr {
+                let ttl = if self.native_all {
+                    self.state().all_attribute_ttl(attr.ino)
+                } else {
+                    self.state().ttl(attr.ino)
+                };
+                let entry_ttl = if self.native_all { PINNED_TTL } else { ttl };
+                #[cfg(feature = "test-metrics")]
+                let entry_ttl = if self.state().test_uncached_source {
+                    TTL
+                } else {
+                    entry_ttl
+                };
+                (attr.ino, attr, (entry_ttl, ttl))
+            } else {
+                let mut attr = placeholder;
+                attr.ino = entry.ino;
+                attr.kind = entry.kind;
+                (0, attr, (TTL, TTL))
+            };
+            assert!(!response.add_with_ttls(
+                f::INodeNo(node),
+                entry.cookie,
+                &entry.name,
+                ttls,
+                &attr(attributes),
+                f::Generation(0)
+            ));
+        }
+        Ok(response.with_owner((namespace, owners)))
+    }
     async fn prepare_directory(
         &self,
         objects: &crate::snapshot_async::Snapshot,
@@ -1105,6 +1265,16 @@ impl f::AsyncFilesystem for Fuse {
         state.no_open = no_open
             && config
                 .add_capabilities(f::InitFlags::FUSE_NO_OPEN_SUPPORT)
+                .is_ok();
+        state.directory_plus = state
+            .objects
+            .as_ref()
+            .is_some_and(|source| source.supports_directory_headers())
+            && config.kernel_abi() >= f::Version(7, 21)
+            && config
+                .add_capabilities(
+                    f::InitFlags::FUSE_DO_READDIRPLUS | f::InitFlags::FUSE_READDIRPLUS_AUTO,
+                )
                 .is_ok();
         state.enabled = crate::platform::has_sys_admin()
             && config
@@ -1625,6 +1795,18 @@ impl f::AsyncFilesystem for Fuse {
         )?;
         Ok(response)
     }
+    async fn readdirplus(
+        &self,
+        _: &f::Request,
+        ino: f::INodeNo,
+        fh: f::FileHandle,
+        size: u32,
+        offset: u64,
+    ) -> Result<DirectoryPlusResponse, f::Errno> {
+        #[cfg(feature = "test-metrics")]
+        self.state().core.record_fuse_request("readdirplus");
+        self.directory_plus_local(ino.0, fh.0, size, offset).await
+    }
     async fn releasedir(
         &self,
         _: &f::Request,
@@ -1787,6 +1969,133 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    fn directory_plus_header_failure_keeps_the_name_and_prepares_readable_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let missing = git2::Oid::from_bytes(&[9; 20]).unwrap();
+        let good = repo.blob(b"good").unwrap();
+        let mut bytes = b"100644 broken\0".to_vec();
+        bytes.extend_from_slice(missing.as_bytes());
+        bytes.extend_from_slice(b"100644 good\0");
+        bytes.extend_from_slice(good.as_bytes());
+        let root = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Tree, &bytes)
+            .unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "plus-errors",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                fs.state().directory_plus = true;
+                let objects = fs.state().objects.clone().unwrap();
+                fs.prepare_directory(&objects, Path::new("")).await.unwrap();
+                let h = fs.state().core.open_directory(1, libc::O_RDONLY).unwrap();
+                let before = objects.tested_demands();
+                let reply = fs.directory_plus_local(1, h, 4096, 2).await.unwrap();
+                assert_eq!(objects.tested_demands(), before + 1);
+                assert!(fs.state().core.cached_inode(Path::new("broken")).is_none());
+                assert!(fs.state().core.cached_inode(Path::new("good")).is_some());
+                assert_eq!(objects.size(good).await.unwrap(), 4);
+                assert!(!fs.io.io.worker_started());
+                drop(reply);
+                fs.state().core.release_handle(1, h).unwrap();
+                drop(objects);
+                fs.shutdown().await.unwrap();
+            });
+    }
+    #[test]
+    fn directory_plus_bounds_header_work_and_holds_source_reply_ownership() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("repo")).unwrap();
+        let first = repo.blob(b"first").unwrap();
+        let second = repo.blob(b"second").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("first", first, 0o100644).unwrap();
+        tree.insert("second", second, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let snapshot = crate::snapshot::Snapshot::load(
+            repo.path(),
+            OsStr::new(&root.to_string()),
+            "plus-owner",
+        )
+        .unwrap();
+        let overlay =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                fs.state().directory_plus = true;
+                let objects = fs.state().objects.clone().unwrap();
+                fs.prepare_directory(&objects, Path::new("")).await.unwrap();
+                let h = fs.state().core.open_directory(1, libc::O_RDONLY).unwrap();
+                let before = objects.tested_demands();
+                drop(fs.directory_plus_local(1, h, 4096, 0).await.unwrap());
+                assert_eq!(
+                    objects.tested_demands(),
+                    before,
+                    "the cold first page fetched file headers for a names-only caller"
+                );
+                assert!(fs.state().core.cached_inode(Path::new("first")).is_none());
+                drop(fs.directory_plus_local(1, h, 159, 2).await.unwrap());
+                assert_eq!(
+                    objects.tested_demands(),
+                    before,
+                    "a non-fitting row caused a header demand"
+                );
+                let reply = fs.directory_plus_local(1, h, 160, 2).await.unwrap();
+                assert_eq!(objects.tested_demands(), before + 1);
+                assert!(!fs.io.io.worker_started());
+                let ino = fs.state().core.cached_inode(Path::new("first")).unwrap();
+                let mut writer = Box::pin(fs.open_local(ino, libc::O_RDWR));
+                poll_fn(|cx| {
+                    assert!(
+                        writer.as_mut().poll(cx).is_pending(),
+                        "copy-up passed an older cached directory attribute reply"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(
+                    fs.namespace.try_write().is_err(),
+                    "namespace changed before READDIRPLUS reply completion"
+                );
+                drop(reply);
+                let writing = writer.as_mut().await.unwrap();
+                drop(writer);
+                fs.release_local(ino, writing).await.unwrap();
+                assert_eq!(objects.size(second).await.unwrap(), 6);
+                assert_eq!(
+                    objects.tested_demands(),
+                    before + 3,
+                    "the bounded first page unexpectedly prefetched its next row"
+                );
+                fs.state().core.release_handle(1, h).unwrap();
+                drop(objects);
+                fs.shutdown().await.unwrap();
+            });
+    }
 
     #[test]
     fn remote_all_policies_serve_ram_while_transport_waits_without_file_worker() {

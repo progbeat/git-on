@@ -47,3 +47,10 @@ Attribute replies can retain a local operation owner too. Git-on uses namespace
 and inode read ownership for cached local all-policy attributes so namespace
 edits and copy-up cannot commit before the old reply finishes. The wire format
 and owner-free constructor behavior are unchanged.
+
+Directory-plus replies expose their encoded row length for bounded metadata
+planning, independent name/attribute TTLs and a local owner retained through
+send/drop. A zero node ID is encoded independently of the listed inode number,
+allowing names without attributes or a new lookup reference. A focused test
+reproduces the former ignored node-ID argument; capacity, byte names, TTLs and
+owner retention are checked against the serialized reply.

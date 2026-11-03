@@ -1,6 +1,7 @@
 # 1.4.0
 <!-- Bump: minor -->
 
+- Reuse available attributes in adaptive local Linux directory replies. Keep names-only listings from loading cold file headers, batch metadata only for requested later pages, and preserve directory cookies, inode lifetimes and mutable attributes.
 - Let ready local protected-source reads progress while unrelated generated-file I/O waits on the native Linux backend. Keep request buffers and descriptors alive through asynchronous completion and drain owned work before unmount.
 - Keep local loading and caches asynchronous when io_uring is unavailable. Use one lazy bounded file worker for disk operations; fitting source reads stay on the event loop without a worker job.
 - Use the same native asynchronous source cache for local `all` operations and copy-up. Preserve renamed directory origins and order mutation after outstanding source READ replies.
