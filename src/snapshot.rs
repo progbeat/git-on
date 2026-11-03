@@ -869,9 +869,20 @@ impl Snapshot {
         &self,
         io: std::rc::Rc<crate::file_async::Io>,
     ) -> Result<Option<crate::snapshot_async::Snapshot>> {
-        let state = self.state()?;
-        if state.remote.is_some() {
-            return Ok(None);
+        let mut state = self.state()?;
+        if let Some(remote) = state.remote.as_ref() {
+            let repo = Repository::open_bare(state.repo.path())?;
+            let (fd, owner) = remote.raw_blobs.directory_anchor()?;
+            let remote = state.remote.take().unwrap();
+            return crate::snapshot_async::Snapshot::new_remote(
+                repo,
+                self.tree_oid,
+                remote,
+                fd,
+                owner,
+                io,
+            )
+            .map(Some);
         }
         let repo = if let Some(bridge) = &state._local_object_bridge {
             Repository::open_bare(bridge.path())?
@@ -891,12 +902,16 @@ impl Snapshot {
         crate::snapshot_async::Snapshot::new(repo, self.tree_oid, fd, owner, io).map(Some)
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn record_async_observation(&self, metrics: SnapshotMetrics) {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .async_observation = Some(metrics);
+    pub(crate) fn record_async_observation(
+        &self,
+        metrics: SnapshotMetrics,
+        remote: Option<crate::remote::Remote>,
+    ) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.async_observation = Some(metrics);
+        if remote.is_some() {
+            state.remote = remote;
+        }
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned

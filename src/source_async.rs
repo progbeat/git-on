@@ -74,6 +74,29 @@ fn copy_blob(
     };
     result
 }
+pub(crate) fn read_tree(repository: &Repository, oid: Oid) -> Result<Directory> {
+    let odb = repository.odb()?;
+    let (size, kind) = odb.read_header(oid)?;
+    anyhow::ensure!(
+        kind == ObjectType::Tree,
+        "snapshot directory does not reference a tree"
+    );
+    let parsed = if let Ok((reader, length, kind)) = odb.reader(oid) {
+        anyhow::ensure!(
+            kind == ObjectType::Tree && length == size,
+            "Git tree changed during transfer"
+        );
+        Directory::verified(oid, size, reader)
+    } else {
+        let object = odb.read(oid)?;
+        anyhow::ensure!(
+            object.kind() == ObjectType::Tree && object.len() == size,
+            "Git tree changed during transfer"
+        );
+        Directory::verified(oid, size, object.data())
+    };
+    parsed
+}
 struct ChunkWriter {
     sender: mpsc::Sender<BlobEvent>,
     bytes: Vec<u8>,
@@ -150,29 +173,7 @@ impl Source {
                             let _ = reply.send(result);
                         }
                         Demand::Tree(oid, reply) => {
-                            let result = (|| {
-                                let odb = repository.odb()?;
-                                let (size, kind) = odb.read_header(oid)?;
-                                anyhow::ensure!(
-                                    kind == ObjectType::Tree,
-                                    "snapshot directory does not reference a tree"
-                                );
-                                let parsed = if let Ok((reader, length, kind)) = odb.reader(oid) {
-                                    anyhow::ensure!(
-                                        kind == ObjectType::Tree && length == size,
-                                        "Git tree changed during transfer"
-                                    );
-                                    Directory::verified(oid, size, reader)
-                                } else {
-                                    let object = odb.read(oid)?;
-                                    anyhow::ensure!(
-                                        object.kind() == ObjectType::Tree && object.len() == size,
-                                        "Git tree changed during transfer"
-                                    );
-                                    Directory::verified(oid, size, object.data())
-                                };
-                                parsed
-                            })();
+                            let result = read_tree(&repository, oid);
                             let _ = reply.send(result);
                         }
                         Demand::Blob(oid, known_size, reply) => {

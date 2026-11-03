@@ -17,6 +17,8 @@ mod raw_blob;
 #[cfg(target_os = "linux")]
 mod raw_blob_async;
 pub mod remote;
+#[cfg(target_os = "linux")]
+mod remote_async;
 pub mod snapshot;
 #[cfg(target_os = "linux")]
 mod snapshot_async;

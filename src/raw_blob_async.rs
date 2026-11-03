@@ -1,7 +1,7 @@
 //! Event-loop-owned verified payload cache. RAM hits borrow trusted bytes;
 //! only misses/replacement submit native asynchronous file operations.
 use crate::file_async::{File, Io};
-use crate::raw_blob::BLOCK;
+use crate::raw_blob::{BLOCK, ENTRY_CHARGE};
 use anyhow::{Context, Result};
 use git2::{ObjectType, Oid};
 use sha2::{Digest, Sha256};
@@ -10,7 +10,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     cell::RefCell, collections::HashMap, fs::File as StdFile, ops::Range, os::fd::AsRawFd, rc::Rc,
 };
-const ENTRY_CHARGE: usize = 512;
 #[derive(Clone)]
 pub(crate) struct Bytes {
     data: Rc<Vec<u8>>,
@@ -40,6 +39,7 @@ struct Descriptor {
     hashes: Box<[[u8; 32]]>,
     file: bool,
     content_checked: bool,
+    used: bool,
 }
 struct Resident {
     block: usize,
@@ -50,6 +50,9 @@ struct State {
     memory: lru::LruCache<Oid, Resident>,
     memory_bytes: usize,
     reader: Option<(Oid, Rc<File>)>,
+    imported_disk_bytes: u64,
+    imported_disk_entries: u64,
+    failure: Option<String>,
     #[cfg(test)]
     io_operations: u64,
     #[cfg(test)]
@@ -135,6 +138,9 @@ impl RawBlobs {
                 memory: lru::LruCache::unbounded(),
                 memory_bytes: 0,
                 reader: None,
+                imported_disk_bytes: 0,
+                imported_disk_entries: 0,
+                failure: None,
                 #[cfg(test)]
                 io_operations: 0,
                 #[cfg(test)]
@@ -252,6 +258,71 @@ impl RawBlobs {
         debug_assert!(s.memory_bytes <= self.limit);
         Bytes { data, range }
     }
+    /// Adopt the source's canonical verification and allocation. The source
+    /// and loop must share the same anchored raw directory.
+    pub(crate) async fn adopt(&self, handoff: crate::raw_blob::BlobHandoff) -> Result<()> {
+        let result = self.adopt_inner(handoff).await;
+        self.record_result(result)
+    }
+    async fn adopt_inner(&self, handoff: crate::raw_blob::BlobHandoff) -> Result<()> {
+        let oid = handoff.blob().oid();
+        let _admission = self.admission.lock().await;
+        anyhow::ensure!(
+            !self.state.borrow().objects.contains_key(&oid),
+            "duplicate prepared object"
+        );
+        self.make_room(handoff.blob().resident_weight()).await?;
+        // Keep the return guard intact across waits. Move the allocation and
+        // descriptor only once admission can commit without yielding.
+        self.adopt_initial(handoff.commit())?;
+        Ok(())
+    }
+    pub(crate) fn contains(&self, oid: Oid) -> bool {
+        self.state.borrow().objects.contains_key(&oid)
+    }
+    pub(crate) fn size(&self, oid: Oid) -> Result<u64> {
+        Ok(self
+            .state
+            .borrow()
+            .objects
+            .get(&oid)
+            .context("missing prepared object")?
+            .size)
+    }
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.state.borrow().failure.clone()
+    }
+    /// Startup migration starts with an empty loop cache and the same budget.
+    pub(crate) fn adopt_initial(&self, blob: crate::raw_blob::PreparedBlob) -> Result<()> {
+        anyhow::ensure!(
+            self.state.borrow().memory_bytes + blob.resident_weight() <= self.limit,
+            "prepared cache exceeds the shared payload budget"
+        );
+        let b = blob.into_parts();
+        let mut s = self.state.borrow_mut();
+        anyhow::ensure!(!s.objects.contains_key(&b.oid), "duplicate prepared object");
+        s.imported_disk_bytes += if b.file { b.size } else { 0 };
+        s.imported_disk_entries += u64::from(b.file);
+        s.objects.insert(
+            b.oid,
+            Descriptor {
+                size: b.size,
+                hashes: b.hashes,
+                file: b.file,
+                content_checked: b.content_checked,
+                used: b.used,
+            },
+        );
+        drop(s);
+        if let Some((block, bytes)) = b.resident {
+            self.admit(b.oid, block, bytes);
+        }
+        Ok(())
+    }
+    pub(crate) fn imported_disk_metrics(&self) -> (u64, u64) {
+        let s = self.state.borrow();
+        (s.imported_disk_bytes, s.imported_disk_entries)
+    }
     /// Publish an owned small source object after canonical OID verification.
     /// Source decoders can eventually pass their typed proof instead of rehashing;
     /// this entry point never accepts unverified bytes as resident data.
@@ -304,6 +375,7 @@ impl RawBlobs {
                     hashes: hashes.into_boxed_slice(),
                     file: false,
                     content_checked: false,
+                    used: true,
                 },
             );
             return Ok(());
@@ -316,6 +388,7 @@ impl RawBlobs {
                 hashes: hashes.into_boxed_slice(),
                 file: false,
                 content_checked: false,
+                used: true,
             },
         );
         self.admit(oid, 0, bytes);
@@ -411,6 +484,7 @@ impl RawBlobs {
                                 hashes: hashes.into_boxed_slice(),
                                 file: true,
                                 content_checked: false,
+                                used: true,
                             },
                         );
                         return Ok(());
@@ -466,8 +540,8 @@ impl RawBlobs {
     pub(crate) fn metrics(&self) -> crate::snapshot::SnapshotMetrics {
         let s = self.state.borrow();
         crate::snapshot::SnapshotMetrics {
-            blob_loads: s.objects.len() as u64,
-            blob_bytes: s.objects.values().map(|v| v.size).sum(),
+            blob_loads: s.objects.values().filter(|v| v.used).count() as u64,
+            blob_bytes: s.objects.values().filter(|v| v.used).map(|v| v.size).sum(),
             blob_cache_bytes: s.memory_bytes,
             blob_cache_entries: s.memory.len(),
             blob_cache_limit: self.limit,
@@ -518,17 +592,31 @@ impl RawBlobs {
         Ok(file)
     }
     pub(crate) async fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Bytes> {
-        self.read_inner(oid, offset, size).await
+        let result = self.read_inner(oid, offset, size).await;
+        self.record_result(result)
+    }
+    fn record_result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            if error
+                .downcast_ref::<crate::object::TransferStopped>()
+                .is_none()
+            {
+                self.state
+                    .borrow_mut()
+                    .failure
+                    .get_or_insert_with(|| format!("{error:#}"));
+            }
+        }
+        result
     }
     async fn read_inner(&self, oid: Oid, offset: u64, size: u32) -> Result<Bytes> {
         let length = {
-            let s = self.state.borrow();
-            s.objects
-                .get(&oid)
-                .context("missing verified object")?
-                .size
-                .saturating_sub(offset)
-                .min(u64::from(size))
+            let mut s = self.state.borrow_mut();
+            let object = s.objects.get_mut(&oid).context("missing verified object")?;
+            if size != 0 && offset < object.size {
+                object.used = true;
+            }
+            object.size.saturating_sub(offset).min(u64::from(size))
         };
         if length == 0 {
             return Ok(Bytes {
@@ -629,6 +717,135 @@ mod tests {
     use super::*;
     fn oid(b: &[u8]) -> Oid {
         Oid::hash_object(ObjectType::Blob, b).unwrap()
+    }
+    #[test]
+    fn prepared_handoff_moves_resident_allocation_without_file_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let bytes = b"verified remote payload";
+        let oid = oid(bytes);
+        source
+            .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .unwrap();
+        let prepared = source.take_blob(oid).unwrap().unwrap();
+        let pointer = prepared.resident_pointer().unwrap();
+        assert_eq!(source.memory_metrics(), (0, 0));
+        let (fd, owner) = source.directory_anchor().unwrap();
+        let (returns, returned) = std::sync::mpsc::channel();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store =
+                    RawBlobs::from_anchor(fd, owner, crate::raw_blob::MEMORY_BUDGET, io.clone());
+                store
+                    .adopt(crate::raw_blob::BlobHandoff::new(prepared, returns))
+                    .await
+                    .unwrap();
+                let actual = store.read(oid, 0, 100).await.unwrap();
+                assert_eq!(actual.as_slice(), bytes);
+                assert_eq!(
+                    actual.as_slice().as_ptr(),
+                    pointer,
+                    "handoff copied the source allocation"
+                );
+                assert_eq!(store.tested_io_operations(), 0);
+                assert!(!io.worker_started());
+                assert!(returned.try_recv().is_err());
+                drop(actual);
+                store.finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        assert_eq!(source.disk_metrics(), (0, 0));
+    }
+    #[test]
+    fn cancelled_handoff_returns_prepared_bytes_without_starting_file_worker() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let bytes = b"cancelled remote payload";
+        let oid = oid(bytes);
+        source
+            .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .unwrap();
+        let prepared = source.take_blob(oid).unwrap().unwrap();
+        let (fd, owner) = source.directory_anchor().unwrap();
+        let (returns, returned) = std::sync::mpsc::channel();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store =
+                    RawBlobs::from_anchor(fd, owner, crate::raw_blob::MEMORY_BUDGET, io.clone());
+                let admission = store.admission.lock().await;
+                let mut pending =
+                    Box::pin(store.adopt(crate::raw_blob::BlobHandoff::new(prepared, returns)));
+                poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(pending);
+                drop(admission);
+                assert!(!io.worker_started());
+                store.finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        source
+            .restore_blob(
+                returned
+                    .try_recv()
+                    .expect("cancelled handoff lost prepared bytes"),
+            )
+            .unwrap();
+        assert_eq!(source.memory_metrics(), (0, 0));
+        assert_eq!(source.get(oid).unwrap().unwrap().read_all().unwrap(), bytes);
+    }
+    #[test]
+    fn prepared_disk_handoff_authenticates_first_returned_buffer() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let bytes = vec![b'v'; BLOCK + 17];
+        let oid = oid(&bytes);
+        source
+            .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .unwrap();
+        let prepared = source.take_blob(oid).unwrap().unwrap();
+        let (fd, owner) = source.directory_anchor().unwrap();
+        StdFile::options()
+            .write(true)
+            .open(owner.path().join(oid.to_string()))
+            .unwrap()
+            .write_all_at(b"!", 0)
+            .unwrap();
+        let (returns, _) = std::sync::mpsc::channel();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store =
+                    RawBlobs::from_anchor(fd, owner, crate::raw_blob::MEMORY_BUDGET, io.clone());
+                store
+                    .adopt(crate::raw_blob::BlobHandoff::new(prepared, returns))
+                    .await
+                    .unwrap();
+                assert!(
+                    store.read(oid, 0, 1).await.is_err(),
+                    "handoff trusted modified disk bytes"
+                );
+                store.finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
     }
     #[test]
     fn fallback_ram_only_run_does_not_start_file_worker_even_during_cleanup() {
@@ -733,6 +950,69 @@ mod tests {
             assert!(store.state.borrow().authenticated_bytes > 0);
             assert!(store.state.borrow().memory_bytes <= store.limit);
         });
+    }
+    #[test]
+    fn failed_handoff_admission_returns_payload_and_preserves_storage_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let incoming = vec![b'i'; 6000];
+        let incoming_oid = oid(&incoming);
+        source
+            .insert_fetched(
+                incoming_oid,
+                incoming.len(),
+                incoming.as_slice(),
+                directory.path(),
+            )
+            .unwrap();
+        let prepared = source.take_blob(incoming_oid).unwrap().unwrap();
+        let (fd, owner) = source.directory_anchor().unwrap();
+        let anchor = owner.clone();
+        let (returns, returned) = std::sync::mpsc::channel();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let io = Io::new(false);
+                let store = RawBlobs::from_anchor(fd, owner, 8192, io.clone());
+                let victim = vec![b'v'; 6000];
+                let victim_oid = oid(&victim);
+                store.insert(victim_oid, victim.clone()).await.unwrap();
+                let collision = anchor.path().join(victim_oid.to_string());
+                std::fs::write(&collision, b"untrusted collision").unwrap();
+                assert!(store
+                    .adopt(crate::raw_blob::BlobHandoff::new(prepared, returns))
+                    .await
+                    .is_err());
+                assert!(
+                    store.failure().is_some(),
+                    "caught admission error was not preserved"
+                );
+                assert_eq!(
+                    store.read(victim_oid, 0, 6000).await.unwrap().as_slice(),
+                    victim
+                );
+                assert_eq!(std::fs::read(collision).unwrap(), b"untrusted collision");
+                store.finish().await.unwrap();
+                io.finish().await.unwrap();
+            });
+        source
+            .restore_blob(
+                returned
+                    .try_recv()
+                    .expect("failed handoff lost the incoming object"),
+            )
+            .unwrap();
+        assert_eq!(
+            source
+                .get(incoming_oid)
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            incoming
+        );
     }
     #[test]
     fn async_reload_checks_same_buffer_and_resident_reads_ignore_modified_spill() {

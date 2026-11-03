@@ -4,7 +4,7 @@
 use crate::{
     raw_blob_async::{Bytes, RawBlobs},
     snapshot::SnapshotMetrics,
-    source_async::Source,
+    source_async,
     tree::Directory,
 };
 use anyhow::{Context, Result};
@@ -18,6 +18,15 @@ use std::{
 };
 
 type MetadataGates = HashMap<(Oid, bool), Weak<tokio::sync::Mutex<()>>>;
+enum Source {
+    Local(source_async::Source),
+    Remote(crate::remote_async::Source),
+}
+pub(crate) struct Finished {
+    pub(crate) metrics: SnapshotMetrics,
+    pub(crate) remote: Option<crate::remote::Remote>,
+    pub(crate) error: Option<std::io::Error>,
+}
 pub(crate) struct Snapshot {
     root: Oid,
     source: Source,
@@ -47,11 +56,17 @@ impl Drop for Demand<'_> {
 impl Snapshot {
     #[cfg(test)]
     pub(crate) async fn tested_pause(&self) -> std::sync::mpsc::Sender<()> {
-        self.source.tested_pause().await
+        match &self.source {
+            Source::Local(source) => source.tested_pause().await,
+            Source::Remote(source) => source.tested_pause().await,
+        }
     }
     #[cfg(test)]
     pub(crate) fn tested_demands(&self) -> usize {
-        self.source.tested_demands()
+        match &self.source {
+            Source::Local(source) => source.tested_demands(),
+            Source::Remote(source) => source.tested_demands(),
+        }
     }
     pub(crate) fn new(
         repo: Repository,
@@ -62,8 +77,30 @@ impl Snapshot {
     ) -> Result<Self> {
         Ok(Self {
             root,
-            source: Source::new(repo)?,
+            source: Source::Local(source_async::Source::new(repo)?),
             raw: RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io),
+            trees: RefCell::new(HashMap::new()),
+            headers: RefCell::new(HashMap::new()),
+            pending: RefCell::new(HashMap::new()),
+        })
+    }
+    pub(crate) fn new_remote(
+        repo: Repository,
+        root: Oid,
+        remote: crate::remote::Remote,
+        directory: File,
+        owner: Arc<tempfile::TempDir>,
+        io: Rc<crate::file_async::Io>,
+    ) -> Result<Self> {
+        let raw = RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io);
+        let (source, initial) = crate::remote_async::Source::new(repo, remote)?;
+        for blob in initial {
+            raw.adopt_initial(blob)?;
+        }
+        Ok(Self {
+            root,
+            source: Source::Remote(source),
+            raw,
             trees: RefCell::new(HashMap::new()),
             headers: RefCell::new(HashMap::new()),
             pending: RefCell::new(HashMap::new()),
@@ -95,7 +132,14 @@ impl Snapshot {
         if let Some(tree) = self.trees.borrow().get(&oid) {
             return Ok(tree.clone());
         }
-        let tree = Arc::new(self.source.tree(oid).await?);
+        let tree = match &self.source {
+            Source::Local(source) => Arc::new(source.tree(oid).await?),
+            Source::Remote(source) => {
+                let (tree, batch) = source.tree(oid).await?;
+                self.adopt_remote(batch).await?;
+                tree
+            }
+        };
         self.trees.borrow_mut().insert(oid, tree.clone());
         Ok(tree)
     }
@@ -108,7 +152,15 @@ impl Snapshot {
         if let Some(size) = self.headers.borrow().get(&oid) {
             return Ok(*size);
         }
-        let (size, kind) = self.source.header(oid).await?;
+        let (size, kind) = match &self.source {
+            Source::Local(source) => source.header(oid).await?,
+            Source::Remote(source) => {
+                if !self.raw.contains(oid) {
+                    self.adopt_remote(source.blob(oid).await?).await?;
+                }
+                (usize::try_from(self.raw.size(oid)?)?, ObjectType::Blob)
+            }
+        };
         anyhow::ensure!(
             kind == ObjectType::Blob,
             "snapshot file does not reference a blob"
@@ -201,9 +253,24 @@ impl Snapshot {
         consume(&bytes)
     }
     pub(crate) async fn read(&self, oid: Oid, size: u64, offset: u64, count: u32) -> Result<Bytes> {
-        self.raw.prepare_with_size(&self.source, oid, size).await?;
+        if !self.raw.contains(oid) {
+            match &self.source {
+                Source::Local(source) => self.raw.prepare_with_size(source, oid, size).await?,
+                Source::Remote(source) => {
+                    let batch = source.blob(oid).await?;
+                    anyhow::ensure!(batch.size == size, "prepared remote size changed");
+                    self.adopt_remote(batch).await?;
+                }
+            }
+        }
         self.raw.validate_content_once(oid).await?;
         self.raw.read(oid, offset, count).await
+    }
+    async fn adopt_remote(&self, mut batch: crate::remote_async::Batch) -> Result<()> {
+        while let Some(blob) = batch.next() {
+            self.raw.adopt(blob).await?;
+        }
+        Ok(())
     }
     pub(crate) async fn read_link(&self, oid: Oid, size: u64) -> Result<Bytes> {
         let bytes = self
@@ -220,8 +287,10 @@ impl Snapshot {
         );
         Ok(bytes)
     }
-    pub(crate) async fn finish(self) -> Result<SnapshotMetrics> {
+    pub(crate) async fn finish(self) -> Result<Finished> {
         let mut metrics = self.raw.metrics();
+        let imported = self.raw.imported_disk_metrics();
+        let failure = self.raw.failure();
         let trees = self.trees.into_inner();
         metrics.tree_reads = trees.len() as u64;
         metrics.tree_cache_entries = trees.len();
@@ -231,10 +300,41 @@ impl Snapshot {
         metrics.header_cache_entries = self.headers.into_inner().len();
         metrics.spool_bytes = metrics.retained_raw_blob_bytes;
         metrics.spool_writes = metrics.retained_raw_blob_entries;
-        let source = self.source.finish().await;
+        let source = match self.source {
+            Source::Local(source) => source.finish().await.map(|_| None),
+            Source::Remote(source) => source.finish().await.map(Some),
+        };
         let raw = self.raw.finish().await;
-        source?;
-        raw?;
-        Ok(metrics)
+        let mut remote = source?;
+        if let Some(remote) = &mut remote {
+            if let Some(failure) = failure {
+                remote.record_async_failure(&anyhow::anyhow!(failure));
+            }
+            metrics.remote_fetches = remote.completed_fetches();
+            metrics.remote_fetch_operations = remote.fetch_operations();
+            metrics.remote_decode_operations = remote.decode_operations();
+            (
+                metrics.remote_session_fetch_operations,
+                metrics.remote_session_decode_operations,
+                metrics.remote_session_starts,
+            ) = remote.session_operations();
+            (
+                metrics.remote_native_pack_bytes,
+                metrics.remote_session_pack_bytes,
+            ) = remote.received_pack_bytes();
+            metrics.remote_raw_blob_imports = remote.raw_blobs.entries();
+            metrics.remote_raw_blob_bytes = remote.raw_blobs.bytes();
+            let disk = remote.raw_blobs.disk_metrics();
+            metrics.retained_raw_blob_bytes += disk.0 - imported.0;
+            metrics.retained_raw_blob_entries += disk.1 - imported.1;
+            metrics.spool_bytes = metrics.retained_raw_blob_bytes;
+            metrics.spool_writes = metrics.retained_raw_blob_entries;
+            metrics.verification_metadata_bytes += remote.raw_blobs.verification_bytes();
+        }
+        Ok(Finished {
+            metrics,
+            remote,
+            error: raw.err().map(std::io::Error::other),
+        })
     }
 }

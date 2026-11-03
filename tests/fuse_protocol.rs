@@ -21,6 +21,90 @@ fn u64s(xs: &[u64]) -> Vec<u8> {
 fn num(b: &[u8], offset: usize) -> u64 {
     u64::from_ne_bytes(b[offset..offset + 8].try_into().unwrap())
 }
+
+#[test]
+fn protocol_mount_failure_awaits_owned_shutdown_before_filesystem_drop() {
+    use std::{cell::RefCell, rc::Rc};
+    #[derive(Debug)]
+    struct OwnedSource {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        fail: bool,
+    }
+    impl fuser::AsyncFilesystem for OwnedSource {
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            self.events.borrow_mut().push("shutdown started");
+            tokio::task::yield_now().await;
+            self.events.borrow_mut().push("shutdown finished");
+            if self.fail {
+                Err(std::io::Error::other("owned shutdown failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn destroy(&mut self) {
+            self.events.borrow_mut().push("destroy");
+        }
+    }
+    impl Drop for OwnedSource {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push("drop");
+        }
+    }
+    for failure in ["mount", "device", "missing mountpoint", "missing options"] {
+        for fail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let filesystem = OwnedSource {
+                events: events.clone(),
+                fail,
+            };
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    if failure == "device" {
+                        // A regular file cannot be registered with epoll.
+                        let fd = tempfile::tempfile().unwrap().into();
+                        AsyncSession::from_fd(
+                            filesystem,
+                            fd,
+                            SessionACL::Owner,
+                            fuser::Config::default(),
+                        )
+                        .await
+                    } else {
+                        let mut builder = fuser::AsyncSessionBuilder::new().filesystem(filesystem);
+                        if failure != "missing mountpoint" {
+                            builder =
+                                builder.mountpoint(directory.path().join("missing-mountpoint"));
+                        }
+                        if failure != "missing options" {
+                            builder = builder.options(fuser::Config::default()).unwrap();
+                        }
+                        builder.build().await
+                    }
+                });
+            let error = result.unwrap_err();
+            let expected_kind = match failure {
+                "mount" => std::io::ErrorKind::NotFound,
+                "device" => std::io::ErrorKind::PermissionDenied,
+                _ => std::io::ErrorKind::InvalidInput,
+            };
+            assert_eq!(error.kind(), expected_kind, "{failure}: {error}");
+            if failure == "mount" && !fail {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+            }
+            assert_eq!(error.to_string().contains("owned shutdown failed"), fail);
+            assert_eq!(
+                *events.borrow(),
+                ["shutdown started", "shutdown finished", "drop"],
+                "{failure} failure dropped the source before its asynchronous shutdown"
+            );
+        }
+    }
+}
+
 fn names(mut b: Vec<u8>, names: &[&str]) -> Vec<u8> {
     for n in names {
         b.extend_from_slice(n.as_bytes());

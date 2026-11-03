@@ -23,7 +23,7 @@ FUSER_UPSTREAM = "c038f63e39fe2e5f87a5311b222deda4d534c735"
 ASYNC_TRAIT_SHA256 = "48f48dfb222897ff28352aa33eeab184caf48f496c83c0d64064027f88538788"
 ASYNC_DISPATCH_SHA256 = "e80c16c17566a47694391f4652320f34a68e39feb8707c19389ed9f726921eef"
 TRAIT_SHA256 = "a194e6a4dc19ae08a007a03d2eee6dc7cf9801da7584e3e13fe7bada7bd47c08"
-MOUNTED_SOURCES = ("tests/integration.py", "tests/write_policy.py")
+MOUNTED_SOURCES = ("tests/integration.py", "tests/write_policy.py", "tests/remote.py")
 
 
 def require(condition, message):

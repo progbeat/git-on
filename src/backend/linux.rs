@@ -1037,8 +1037,14 @@ impl f::AsyncFilesystem for Fuse {
                 let objects = Rc::try_unwrap(objects).map_err(|_| {
                     std::io::Error::other("object requests still owned during shutdown")
                 })?;
-                let metrics = objects.finish().await.map_err(std::io::Error::other)?;
-                state.core.snapshot().record_async_observation(metrics);
+                let finished = objects.finish().await.map_err(std::io::Error::other)?;
+                state
+                    .core
+                    .snapshot()
+                    .record_async_observation(finished.metrics, finished.remote);
+                if let Some(error) = finished.error {
+                    return Err(error);
+                }
             }
             Ok(())
         }
@@ -1772,6 +1778,126 @@ mod tests {
     use super::*;
     use f::AsyncFilesystem;
     use git2::Repository;
+
+    #[test]
+    fn remote_all_policies_serve_ram_while_transport_waits_without_file_worker() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path().join("server.git")).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowFilter", true)
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowAnySHA1InWant", true)
+            .unwrap();
+        let bytes = b"cached remote data";
+        let warm = repo.blob(bytes).unwrap();
+        let cold = repo.blob(b"another remote object").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("source", warm, 0o100644).unwrap();
+        tree.insert("other", cold, 0o100644).unwrap();
+        let root = tree.write().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &repo.find_tree(root).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let source = format!("file://{}", repo.path().display());
+        for policy in [
+            WritePolicy::None,
+            WritePolicy::Ignored,
+            WritePolicy::Untracked,
+            WritePolicy::All,
+        ] {
+            let run = temp.path().join(format!("{policy:?}"));
+            std::fs::create_dir(&run).unwrap();
+            let snapshot = crate::snapshot::Snapshot::load_source_with_pin_record(
+                temp.path(),
+                Some(OsStr::new(&source)),
+                OsStr::new("HEAD"),
+                false,
+                &run,
+                "remote-loop",
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+            let observer = snapshot.clone();
+            let overlay = Overlay::with_write_policy(snapshot, run.join("upper"), policy).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut fs = Fuse::with_fallback_source(overlay).unwrap();
+                    let objects = fs
+                        .state()
+                        .objects
+                        .clone()
+                        .expect("remote source bypassed the loop cache");
+                    let ino = fs
+                        .lookup_local(&objects, 1, OsStr::new("source"))
+                        .await
+                        .unwrap()
+                        .ino;
+                    let reader = fs.open_local(ino, libc::O_RDONLY).await.unwrap();
+                    let result = fs
+                        .read_file(ino, reader, 0, 100, libc::O_RDONLY)
+                        .await
+                        .unwrap();
+                    drop(result);
+                    let resume = objects.tested_pause().await;
+                    let mut cold_size = Box::pin(objects.size(cold));
+                    poll_fn(|cx| {
+                        assert!(cold_size.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    let demands = objects.tested_demands();
+                    let mut read = Box::pin(fs.read_file(ino, reader, 0, 100, libc::O_RDONLY));
+                    let response = poll_fn(|cx| match read.as_mut().poll(cx) {
+                        Poll::Ready(result) => Poll::Ready(result.unwrap()),
+                        Poll::Pending => panic!("RAM read waited for the remote transport"),
+                    })
+                    .await;
+                    assert_eq!(objects.tested_demands(), demands);
+                    assert!(!fs.io.io.worker_started());
+                    drop(response);
+                    drop(read);
+                    resume.send(()).unwrap();
+                    assert_eq!(cold_size.await.unwrap(), 21);
+                    let data = objects
+                        .read(warm, bytes.len() as u64, 0, 100)
+                        .await
+                        .unwrap();
+                    assert_eq!(data.as_slice(), bytes);
+                    drop(data);
+                    fs.state()
+                        .core
+                        .release_prepared_handle(ino, reader)
+                        .unwrap();
+                    fs.io.released(ino, reader);
+                    drop(objects);
+                    fs.shutdown().await.unwrap();
+                    assert!(!fs.io.io.worker_started());
+                });
+            let metrics = observer.metrics();
+            assert_eq!(metrics.blob_loads, 1);
+            assert_eq!(metrics.header_reads, 2);
+            assert_eq!(metrics.remote_raw_blob_imports, 2);
+            assert_eq!(metrics.retained_raw_blob_entries, 0);
+            assert!(observer.remote_failure().is_none());
+        }
+    }
 
     #[test]
     fn all_attribute_replies_order_copy_up_and_parent_mutations_without_blocking_readonly_open() {

@@ -110,15 +110,21 @@ impl<FS: AsyncFilesystem> AsyncSessionBuilder<FS> {
 
     /// Build the session. This will mount the filesystem and return an `AsyncSession` if successful.
     pub async fn build(self) -> io::Result<AsyncSession<FS>> {
-        let filesystem = self.filesystem.ok_or_else(|| {
+        let mut filesystem = self.filesystem.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "`filesystem` is required")
         })?;
-        let mountpoint = self.mountpoint.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "`mountpoint` is required")
-        })?;
-        let options = self
-            .options
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "`options` are required"))?;
+        let (mountpoint, options) = match (self.mountpoint, self.options) {
+            (Some(mountpoint), Some(options)) => (mountpoint, options),
+            (mountpoint, _) => {
+                let missing = if mountpoint.is_none() {
+                    "`mountpoint` is required"
+                } else {
+                    "`options` are required"
+                };
+                let error = io::Error::new(io::ErrorKind::InvalidInput, missing);
+                return Err(AsyncSession::startup_error(&mut filesystem, None, error).await);
+            }
+        };
 
         AsyncSession::init(filesystem, mountpoint, &options).await
     }
@@ -147,6 +153,22 @@ pub struct AsyncSession<FS: AsyncFilesystem> {
 }
 
 impl<FS: AsyncFilesystem> AsyncSession<FS> {
+    async fn startup_error(
+        filesystem: &mut FS,
+        mount: Option<&mut AsyncMount>,
+        mut error: io::Error,
+    ) -> io::Error {
+        if let Err(cleanup) = filesystem.shutdown().await {
+            error = io::Error::new(error.kind(), format!("{error}; shutdown: {cleanup}"));
+        }
+        if let Some(mount) = mount {
+            if let Err(cleanup) = mount.unmount().await {
+                error = io::Error::new(error.kind(), format!("{error}; unmount: {cleanup}"));
+            }
+        }
+        error
+    }
+
     /// Access the filesystem before handing the session to its event loop.
     pub fn filesystem_mut(&mut self) -> &mut FS {
         self.guard.fs.as_mut().expect("filesystem was destroyed")
@@ -159,12 +181,15 @@ impl<FS: AsyncFilesystem> AsyncSession<FS> {
     /// Wrap an already mounted FUSE descriptor and negotiate its protocol.
     /// The caller owns the mount; this session owns the descriptor and requests.
     pub async fn from_fd(
-        filesystem: FS,
+        mut filesystem: FS,
         fd: std::os::fd::OwnedFd,
         acl: SessionACL,
         config: Config,
     ) -> io::Result<Self> {
-        let device = crate::dev_fuse_async::AsyncDevFuse::from_file(std::fs::File::from(fd))?;
+        let device = match crate::dev_fuse_async::AsyncDevFuse::from_file(std::fs::File::from(fd)) {
+            Ok(device) => device,
+            Err(error) => return Err(Self::startup_error(&mut filesystem, None, error).await),
+        };
         let mut session = Self {
             guard: AsyncSessionGuard {
                 fs: Some(filesystem),
@@ -178,8 +203,7 @@ impl<FS: AsyncFilesystem> AsyncSession<FS> {
             mount: None,
         };
         if let Err(error) = session.handshake().await {
-            let _ = session.filesystem_mut().shutdown().await;
-            return Err(error);
+            return Err(Self::startup_error(session.filesystem_mut(), None, error).await);
         }
         Ok(session)
     }
@@ -189,23 +213,24 @@ impl<FS: AsyncFilesystem> AsyncSession<FS> {
     /// # Errors
     /// Returns an error if the options are incorrect, or if the fuse device can't be mounted.
     async fn init<P: AsRef<Path>>(
-        filesystem: FS,
+        mut filesystem: FS,
         mountpoint: P,
         options: &Config,
     ) -> io::Result<Self> {
         let mountpoint = mountpoint.as_ref();
 
         // mount (async)
-        let mut mount = AsyncMount::new();
-        mount = mount
+        let mut mount = match AsyncMount::new()
             .mount(mountpoint, &options.mount_options, options.acl)
-            .await?;
-        let file = mount.dev_fuse().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to get FUSE device file descriptor from mount",
-            )
-        })?;
+            .await
+        {
+            Ok(mount) => mount,
+            Err(error) => return Err(Self::startup_error(&mut filesystem, None, error).await),
+        };
+        let Some(file) = mount.dev_fuse() else {
+            let error = io::Error::other("Failed to get FUSE device file descriptor from mount");
+            return Err(Self::startup_error(&mut filesystem, Some(&mut mount), error).await);
+        };
         let ch = AsyncChannel::new(file.clone());
 
         let mut session = AsyncSession {
@@ -222,17 +247,9 @@ impl<FS: AsyncFilesystem> AsyncSession<FS> {
         };
 
         if let Err(error) = session.handshake().await {
-            let _ = session.filesystem_mut().shutdown().await;
             // Complete cleanup while the runtime still drives native/helper I/O.
-            if let Some(mut mount) = session.mount.take() {
-                if let Err(cleanup) = mount.unmount().await {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!("{error}; unmount: {cleanup}"),
-                    ));
-                }
-            }
-            return Err(error);
+            let mut mount = session.mount.take();
+            return Err(Self::startup_error(session.filesystem_mut(), mount.as_mut(), error).await);
         }
 
         Ok(session)

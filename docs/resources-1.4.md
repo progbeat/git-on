@@ -40,7 +40,7 @@ Protocol packs and native decoder stdout can still need transient bounded-part
 staging; that I/O and all native children remain inside total-cost measurements.
 No global cache, recovery fallback or corrupt-spill retry is introduced.
 
-## Local asynchronous port (work in progress)
+## Asynchronous FUSE port (work in progress)
 
 The Linux mount adapter now uses the pinned local async-fuser adaptation in
 `crates/async-fuser`. One local event loop owns namespace state through RefCell,
@@ -52,7 +52,7 @@ identity prevents cleanup from targeting a later filesystem at the same path.
 The original MIT licenses and separate diffs from both upstream sources are
 included with the local crates.
 
-Local mounts under all four write policies connect lookup/header
+Local and remote mounts under all four write policies connect lookup/header
 demands, directory
 preparation, read and readlink to `snapshot_async.rs`, `source_async.rs` and
 `raw_blob_async.rs`. Trees, sizes, verified descriptors and the payload LRU belong
@@ -123,11 +123,38 @@ Shutdown closes raw readers and directory anchors before awaiting the shared
 worker's completion. No per-request blocking pool or second payload cache is
 introduced. Native file I/O retains its existing path.
 
-This is not yet a complete asynchronous core. Remote sources still use the
-existing synchronous source core. Required remaining work includes remote
-integration, complete cancellation/cleanup
-verification, and paired performance acceptance
-with the complete mounted implementation. Component tests and protocol coverage do not establish
+Remote native Git/protocol work uses one owned source thread with a bounded
+16-demand queue in `remote_async.rs`. Its verified small allocations and block
+descriptors move into the same loop-owned cache, without copying or rehashing
+resident bytes. Source-side headers prevent repeated fetches; parsed trees are
+shared. Verified decoder output enters a handoff queue directly, including
+already-required delta bases from a multi-object pack. It does not first enter
+another payload LRU. The active output queue retains at most 16 MiB of charged
+payloads; excess payloads spill individually. Its eviction cursor advances once
+per queued object, and each handoff drains only newly prepared/returned objects
+without scanning older descriptors. A multi-object delivery or one exceeding
+the charged size of a 64 KiB object applies backpressure until the loop publishes
+or drops it. Single small deliveries send a publication marker without waking
+the worker for an acknowledgement round trip. The worker waits only for a
+repeated demand for an unpublished object or the 16-delivery bound; unrelated
+small cold demands can proceed. Active decoder allocations are separate from
+the 16 MiB retained cache. Small files remain independent objects.
+
+A cancelled handoff returns its verified ownership to the source through a
+channel, without taking a source-cache lock or performing file I/O on the loop.
+The exceptional cancellation path keeps unconsumed prepared bytes on disk for
+reuse instead of fetching them again or retaining another RAM cache. New disk
+reads authenticate their returned buffers. Admission/storage errors remain
+observable after a remote command catches EIO. Shutdown drains requests, closes
+the source intake, joins the native source and publishes its counters/failure
+before destroying the filesystem. Native transport cleanup runs on its source
+thread; the ordinary Snapshot retains final observer/recovery state.
+Session startup errors also await source shutdown before dropping the filesystem,
+including mount failure before INIT. Cleanup failures retain the startup error's
+kind and are included in its diagnostic.
+
+Complete cancellation/cleanup/resource verification and paired performance
+acceptance remain required. Component tests and protocol coverage do not establish
 issue #20 or merge readiness. No temporary profiler or benchmark harness is
 included in the source tree.
 

@@ -27,6 +27,9 @@ failed INIT. Linux mount IDs prevent cleanup of a replacement mount. Native
 mountpoint bytes are preserved. Receive buffers obey FUSE_MIN_READ_BUFFER even
 before negotiation. Release builds propagate write errors and short replies.
 These fixes have focused regressions with recorded failing predecessors.
+Failures before INIT also await filesystem shutdown, including mount errors,
+missing builder arguments and descriptor registration failures. Startup error
+kinds are preserved; cleanup errors remain visible in the diagnostic.
 
 The local `shutdown` hook awaits filesystem-owned asynchronous cleanup after
 request drain and before destroy, including INIT errors. Local Rc-backed read

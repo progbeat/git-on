@@ -927,6 +927,17 @@ impl Remote {
     pub fn failure(&self) -> Option<String> {
         self.failed.clone().or_else(|| self.raw_blobs.failure())
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_async_failure(&mut self, error: &anyhow::Error) {
+        if error
+            .downcast_ref::<crate::object::TransferStopped>()
+            .is_none()
+            && self.failure().is_none()
+        {
+            self.failed = Some(format!("{error:#}"));
+            eprintln!("git-on: remote object loading failed: {error:#}");
+        }
+    }
     pub(crate) fn completed_fetches(&self) -> u64 {
         self.completed_fetches
     }

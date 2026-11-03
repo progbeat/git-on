@@ -2689,3 +2689,61 @@ the forced file fallback. The existing mounted all-policy cache/mmap/copy-up
 regression additionally closes duplicated readonly descriptions and explicitly
 syncs the remaining description both before and after copy-up. These checks
 verify the description lifecycle separately from the paired RAM timings.
+
+## Remote handoff keeps the cache on the event loop
+
+`remote_all_policies_serve_ram_while_transport_waits_without_file_worker` requires
+all four policies to use the loop-owned snapshot. A fitting READ completes while
+the native remote source is paused with another cold demand pending; it sends no
+new source demand and starts no file worker. Restoring the old remote factory
+bypass reproduces its missing-loop-cache failure. The connected path passes.
+
+The handoff components check that the original resident allocation moves without
+copying or file I/O, that cancellation returns ownership, and that a modified
+spill is rejected on its first loop read. A failed admission must preserve both
+the incoming object and the storage failure, while the old resident remains
+readable and the colliding file stays unchanged. Removing admission-error
+recording reproduces the focused failure; the recorded path passes.
+
+The mounted controlled delta-pack fixture additionally checks all four policies.
+Two required blobs exceed one block together but fit in the payload budget;
+both move to the primary cache without spill, repeated reads return exact bytes,
+and the peer sees only the root and requested blob demands. Larger native
+handoffs apply backpressure while the loop owns their active allocations.
+Cancelled deliveries return remaining owned buffers before releasing that
+backpressure. Native source staging is drained through a new-object queue,
+without an OID-map scan on each demand. Integrity descriptors remain protected
+and each object retains its own identity and spill file.
+
+`async_output_queue_keeps_fitting_objects_out_of_the_source_lru` reproduces the
+unnecessary source-cache admission when the former source LRU is restored.
+Direct queued publication passes without a source payload LRU or spill for a
+fitting delivery. `async_output_queue_bounds_active_payloads_without_rescanning_old_deliveries`
+checks the active staging bound, individual spills and subsequent new-only
+deliveries. These correctness checks do not establish a timing improvement.
+
+`small_delivery_must_be_published_before_a_duplicate_demand_completes`
+reproduces a duplicate demand completing before the loop owns its first payload.
+An exported source header must not expose an object whose admission can still
+be waiting on asynchronous I/O. Small deliveries now report publication to the
+source; duplicate demands wait for that marker. Unrelated small cold demands
+still proceed without an acknowledgement round trip. The focused regression
+passes both successful publication and cancellation/return cases, verifies exact
+data and reuse, and requires no file worker on the fitting successful path.
+
+Real HTTPS delayed-source/policy and caught-error regressions remain separate
+from the controlled protocol fixture. Full resource, performance and lifecycle
+acceptance must still be verified on the final source.
+
+## Await filesystem shutdown when session startup fails
+
+`protocol_mount_failure_awaits_owned_shutdown_before_filesystem_drop` reproduces
+filesystem destruction without asynchronous shutdown when a nonexistent
+mountpoint fails before INIT. The fixed builder awaits shutdown before dropping
+the filesystem. The same regression covers missing builder arguments and failed
+AsyncFd registration with a regular file. Each case also injects a shutdown
+error: the startup error kind is preserved and the cleanup error is reported.
+Successful cleanup preserves the original mount errno. No destroy callback is
+issued for a filesystem that never reached INIT. Handshake errors use the same
+awaited cleanup path and additionally unmount an owned mount. This regression is
+startup ownership testing, not kernel protocol or real-mount execution evidence.

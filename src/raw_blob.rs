@@ -22,7 +22,7 @@ use std::{
 
 pub(crate) const MEMORY_BUDGET: usize = 16 * 1024 * 1024;
 // Conservatively covers the LRU node, table slack/control bytes and Vec header.
-const ENTRY_CHARGE: usize = 512;
+pub(crate) const ENTRY_CHARGE: usize = 512;
 pub(crate) const BLOCK: usize = 64 * 1024;
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
@@ -34,6 +34,8 @@ struct Descriptor {
     used: bool,
     content_checked: bool,
     directory: Option<Arc<Directory>>,
+    #[cfg(target_os = "linux")]
+    exported: bool,
 }
 impl Descriptor {
     fn kind(&self) -> ObjectType {
@@ -43,10 +45,108 @@ impl Descriptor {
             ObjectType::Blob
         }
     }
+    #[cfg(target_os = "linux")]
+    fn exported_header(&self) -> Self {
+        Self {
+            size: self.size,
+            blocks: Box::new([]),
+            file: self.file,
+            used: self.used,
+            content_checked: self.content_checked,
+            directory: None,
+            exported: true,
+        }
+    }
 }
 struct Resident {
     block: usize,
     bytes: Vec<u8>,
+}
+/// Ownership of an already verified object. Only this module can construct it;
+/// disk bytes still require authentication against its protected block hashes.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedBlob {
+    oid: Oid,
+    descriptor: Descriptor,
+    resident: Option<Resident>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ReadyBlobs {
+    blobs: Vec<PreparedBlob>,
+    bytes: usize,
+    spill: usize,
+}
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedParts {
+    pub(crate) oid: Oid,
+    pub(crate) size: u64,
+    pub(crate) hashes: Box<[[u8; 32]]>,
+    pub(crate) file: bool,
+    pub(crate) used: bool,
+    pub(crate) content_checked: bool,
+    pub(crate) resident: Option<(usize, Vec<u8>)>,
+}
+#[cfg(target_os = "linux")]
+impl PreparedBlob {
+    pub(crate) fn mark_unread(&mut self) {
+        self.descriptor.used = false;
+    }
+    pub(crate) fn oid(&self) -> Oid {
+        self.oid
+    }
+    pub(crate) fn resident_weight(&self) -> usize {
+        self.resident
+            .as_ref()
+            .map_or(0, |r| r.bytes.capacity() + ENTRY_CHARGE)
+    }
+    #[cfg(test)]
+    pub(crate) fn resident_pointer(&self) -> Option<*const u8> {
+        self.resident.as_ref().map(|r| r.bytes.as_ptr())
+    }
+    pub(crate) fn into_parts(self) -> PreparedParts {
+        let d = self.descriptor;
+        PreparedParts {
+            oid: self.oid,
+            size: d.size,
+            hashes: d.blocks,
+            file: d.file,
+            used: d.used,
+            content_checked: d.content_checked,
+            resident: self.resident.map(|r| (r.block, r.bytes)),
+        }
+    }
+}
+/// A cancelled handoff returns ownership to the source, without taking its
+/// storage lock or performing file I/O on the local event loop.
+#[cfg(target_os = "linux")]
+pub(crate) struct BlobHandoff {
+    blob: Option<PreparedBlob>,
+    returns: std::sync::mpsc::Sender<PreparedBlob>,
+}
+#[cfg(target_os = "linux")]
+impl BlobHandoff {
+    pub(crate) fn new(blob: PreparedBlob, returns: std::sync::mpsc::Sender<PreparedBlob>) -> Self {
+        Self {
+            blob: Some(blob),
+            returns,
+        }
+    }
+    pub(crate) fn blob(&self) -> &PreparedBlob {
+        self.blob.as_ref().unwrap()
+    }
+    /// No await may separate this commit from publication in the loop cache.
+    pub(crate) fn commit(mut self) -> PreparedBlob {
+        self.blob.take().unwrap()
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for BlobHandoff {
+    fn drop(&mut self) {
+        if let Some(blob) = self.blob.take() {
+            let _ = self.returns.send(blob);
+        }
+    }
 }
 #[derive(Clone)]
 pub(crate) struct RawBlob {
@@ -148,6 +248,8 @@ impl RawBlob {
                 .objects
                 .get(&self.oid)
                 .context("missing verified object descriptor")?;
+            #[cfg(target_os = "linux")]
+            anyhow::ensure!(!object.exported, "object belongs to the mounted cache");
             anyhow::ensure!(object.file, "missing prepared object block");
             let expected = object.blocks[block];
             if file.is_none() {
@@ -347,6 +449,8 @@ impl RawBlobs {
                 blob_bytes: 0,
                 disk_entries: 0,
                 disk_bytes: 0,
+                #[cfg(target_os = "linux")]
+                ready: None,
                 #[cfg(test)]
                 authenticated_bytes: 0,
             })),
@@ -367,6 +471,90 @@ impl RawBlobs {
             store.directory.fd.try_clone()?,
             store.directory._owner.clone(),
         ))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_blob(&mut self, oid: Oid) -> Result<Option<PreparedBlob>> {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(object) = store.objects.get(&oid) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(object.kind() == ObjectType::Blob, "object is not a blob");
+        anyhow::ensure!(
+            !object.exported,
+            "object already belongs to the mounted cache"
+        );
+        let descriptor = store.objects.get_mut(&oid).unwrap();
+        let header = descriptor.exported_header();
+        let descriptor = std::mem::replace(descriptor, header);
+        let resident = store.memory.pop(&oid);
+        if let Some(r) = &resident {
+            store.memory_bytes -= r.bytes.capacity() + ENTRY_CHARGE;
+        }
+        Ok(Some(PreparedBlob {
+            oid,
+            descriptor,
+            resident,
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restore_blob(&mut self, mut blob: PreparedBlob) -> Result<()> {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            store.objects.get(&blob.oid).is_some_and(|d| d.exported),
+            "unexpected returned object"
+        );
+        // Cancellation is exceptional. Retain its prepared bytes on disk rather
+        // than starting another payload cache beside the loop-owned LRU.
+        if !blob.descriptor.file && blob.descriptor.size != 0 {
+            let resident = blob
+                .resident
+                .as_ref()
+                .context("missing returned resident bytes")?;
+            anyhow::ensure!(
+                resident.block == 0 && resident.bytes.len() as u64 == blob.descriptor.size,
+                "returned object is not fully resident"
+            );
+            store.directory.spill(blob.oid, &resident.bytes)?;
+            blob.descriptor.file = true;
+            store.disk_entries += 1;
+            store.disk_bytes += blob.descriptor.size;
+        }
+        if store.ready.is_some() {
+            blob.resident = None;
+            store.stage(blob)?;
+        } else {
+            store.objects.insert(blob.oid, blob.descriptor);
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_async(&mut self) -> Result<Vec<PreparedBlob>> {
+        let oids: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objects
+            .iter()
+            .filter(|(_, d)| d.kind() == ObjectType::Blob && !d.exported)
+            .map(|(oid, _)| *oid)
+            .collect();
+        let blobs = oids
+            .into_iter()
+            .map(|oid| self.take_blob(oid).map(Option::unwrap))
+            .collect::<Result<Vec<_>>>()?;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ready = Some(ReadyBlobs::default());
+        Ok(blobs)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_ready(&mut self) -> Result<Vec<PreparedBlob>> {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = store
+            .ready
+            .as_mut()
+            .context("source handoff not initialized")?;
+        ready.bytes = 0;
+        ready.spill = 0;
+        Ok(std::mem::take(&mut ready.blobs))
     }
     pub(crate) fn get(&self, oid: Oid) -> Result<Option<RawBlob>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -463,10 +651,7 @@ impl RawBlobs {
             (digests, Vec::new())
         };
         anyhow::ensure!(digests.len() == count, "verified block count changed");
-        if resident {
-            store.make_room(weight.unwrap())?;
-        }
-        store.objects.insert(
+        store.publish_blob(
             oid,
             Descriptor {
                 size: size as u64,
@@ -475,11 +660,11 @@ impl RawBlobs {
                 used,
                 content_checked: false,
                 directory: None,
+                #[cfg(target_os = "linux")]
+                exported: false,
             },
-        );
-        for (block, bytes) in buffers.into_iter().enumerate() {
-            store.admit(oid, block, bytes)?;
-        }
+            buffers,
+        )?;
         store.blob_entries += 1;
         store.blob_bytes += size as u64;
         if !resident {
@@ -509,6 +694,8 @@ impl RawBlobs {
                 used: false,
                 content_checked: false,
                 directory: Some(directory),
+                #[cfg(target_os = "linux")]
+                exported: false,
             },
         );
         Ok(self.blob(oid, store.objects.get(&oid).unwrap()))
@@ -675,10 +862,78 @@ struct Store {
     blob_bytes: u64,
     disk_entries: u64,
     disk_bytes: u64,
+    #[cfg(target_os = "linux")]
+    ready: Option<ReadyBlobs>,
     #[cfg(test)]
     authenticated_bytes: u64,
 }
 impl Store {
+    fn publish_blob(
+        &mut self,
+        oid: Oid,
+        descriptor: Descriptor,
+        buffers: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.ready.is_some() {
+            let mut buffers = buffers;
+            anyhow::ensure!(
+                buffers.len() <= 1,
+                "large prepared object retained multiple buffers"
+            );
+            return self.stage(PreparedBlob {
+                oid,
+                descriptor,
+                resident: buffers.pop().map(|bytes| Resident { block: 0, bytes }),
+            });
+        }
+        if !buffers.is_empty() {
+            self.make_room(
+                buffers
+                    .iter()
+                    .map(|bytes| bytes.capacity() + ENTRY_CHARGE)
+                    .sum(),
+            )?;
+        }
+        self.objects.insert(oid, descriptor);
+        for (block, bytes) in buffers.into_iter().enumerate() {
+            self.admit(oid, block, bytes)?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn stage(&mut self, blob: PreparedBlob) -> Result<()> {
+        let weight = blob.resident_weight();
+        anyhow::ensure!(
+            weight <= self.memory_limit,
+            "prepared buffer exceeds the staging budget"
+        );
+        while self.ready.as_ref().unwrap().bytes > self.memory_limit - weight {
+            let ready = self.ready.as_ref().unwrap();
+            let victim = &ready.blobs[ready.spill];
+            if let Some(resident) = &victim.resident {
+                if !victim.descriptor.file {
+                    self.directory.spill(victim.oid, &resident.bytes)?;
+                    self.disk_entries += 1;
+                    self.disk_bytes += victim.descriptor.size;
+                    self.objects.get_mut(&victim.oid).unwrap().file = true;
+                }
+            }
+            let ready = self.ready.as_mut().unwrap();
+            let victim = &mut ready.blobs[ready.spill];
+            victim.descriptor.file = victim.descriptor.file || victim.resident.is_some();
+            if let Some(resident) = victim.resident.take() {
+                ready.bytes -= resident.bytes.capacity() + ENTRY_CHARGE;
+            }
+            ready.spill += 1;
+        }
+        self.objects
+            .insert(blob.oid, blob.descriptor.exported_header());
+        let ready = self.ready.as_mut().unwrap();
+        ready.bytes += weight;
+        ready.blobs.push(blob);
+        Ok(())
+    }
     fn scratch_file(&mut self, directory: &Path) -> Result<Spool> {
         if self.scratch.is_none() {
             self.scratch = Some(Files::new(directory)?);
@@ -834,6 +1089,67 @@ impl Read for StagedReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_output_queue_keeps_fitting_objects_out_of_the_source_lru() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = RawBlobs::new(directory.path()).unwrap();
+        assert!(source.begin_async().unwrap().is_empty());
+        for byte in [b'a', b'b'] {
+            let bytes = vec![byte; 40000];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            source
+                .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+                .unwrap();
+        }
+        assert_eq!(
+            source.memory_metrics(),
+            (0, 0),
+            "decoder populated a second payload LRU"
+        );
+        assert_eq!(source.disk_metrics(), (0, 0));
+        let prepared = source.take_ready().unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared
+            .iter()
+            .all(|blob| blob.resident_pointer().is_some()));
+        assert!(source.take_ready().unwrap().is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_output_queue_bounds_active_payloads_without_rescanning_old_deliveries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = RawBlobs::new(directory.path()).unwrap();
+        source.state.lock().unwrap().memory_limit = 70000;
+        source.begin_async().unwrap();
+        for byte in [b'a', b'b', b'c'] {
+            let bytes = vec![byte; 40000];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            source
+                .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+                .unwrap();
+        }
+        assert_eq!(source.memory_metrics(), (0, 0));
+        assert_eq!(source.disk_metrics(), (80000, 2));
+        let prepared = source.take_ready().unwrap();
+        assert_eq!(prepared.len(), 3);
+        assert!(
+            prepared
+                .iter()
+                .map(PreparedBlob::resident_weight)
+                .sum::<usize>()
+                <= 70000
+        );
+        assert_eq!(prepared.iter().filter(|b| b.resident.is_some()).count(), 1);
+        assert!(prepared.iter().take(2).all(|b| b.descriptor.file));
+        let bytes = b"new delivery";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        source
+            .insert_fetched(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .unwrap();
+        assert_eq!(source.take_ready().unwrap().len(), 1);
+        assert_eq!(source.disk_metrics(), (80000, 2));
+    }
     fn stored_bytes(path: &Path) -> u64 {
         std::fs::read_dir(path)
             .unwrap()
