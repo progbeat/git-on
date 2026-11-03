@@ -1095,7 +1095,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut source = RawBlobs::new(directory.path()).unwrap();
         assert!(source.begin_async().unwrap().is_empty());
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             let bytes = vec![byte; 40000];
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
             source
@@ -1122,7 +1122,7 @@ mod tests {
         let mut source = RawBlobs::new(directory.path()).unwrap();
         source.state.lock().unwrap().memory_limit = 70000;
         source.begin_async().unwrap();
-        for byte in [b'a', b'b', b'c'] {
+        for byte in *b"abc" {
             let bytes = vec![byte; 40000];
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
             source
