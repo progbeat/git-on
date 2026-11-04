@@ -48,6 +48,40 @@ class CiContractTests(unittest.TestCase):
         for check in ['cargo test --locked','tests/integration.py','tests/materialized.py','tests/test_installer.py']:
             self.assertIn(check,body)
 
+    def test_linux_dependency_setup_preserves_supported_runner_git_without_launchpad(self):
+        for name in ['rust','real-fuse','lazy-performance','repository-scale','webkit-scale']:
+            blocks=re.findall(r'^        run: \|\n((?:          [^\n]*\n)+)',job(name),re.M)
+            setup=textwrap.dedent(next(block for block in blocks if 'apt-get install' in block))
+            # Exercise dependency installation before uv/device-specific setup.
+            setup=setup.split('python3 -m pip',1)[0].split('test -c',1)[0]
+            for install_fails in [False,True]:
+                with self.subTest(job=name,install_fails=install_fails),tempfile.TemporaryDirectory() as directory:
+                    root=Path(directory);calls=root/'calls.jsonl'
+                    fake='#!'+sys.executable+'''
+import json,os,sys
+from pathlib import Path
+name=Path(sys.argv[0]).name
+with open(os.environ['CALLS'],'a') as out:out.write(json.dumps([name,*sys.argv[1:]])+'\\n')
+if name=='git':
+ print('git version 2.56.0')
+elif sys.argv[1]=='add-apt-repository':
+ print('HTTP Error 503: Service Unavailable',file=sys.stderr);sys.exit(1)
+elif sys.argv[1:3]==['apt-get','install']:
+ sys.exit(int(os.environ['INSTALL_FAILS']))
+'''
+                    for command in ['sudo','git']:
+                        path=root/command;path.write_text(fake);path.chmod(0o755)
+                    result=subprocess.run(['bash','-euo','pipefail','-c',setup],cwd=ROOT,capture_output=True,text=True,
+                        env={**os.environ,'PATH':str(root)+os.pathsep+os.environ['PATH'],
+                             'CALLS':str(calls),'INSTALL_FAILS':str(int(install_fails))})
+                    self.assertEqual(result.returncode,int(install_fails),result.stderr)
+                    recorded=[json.loads(line) for line in calls.read_text().splitlines()]
+                    self.assertIn(['git','--version'],recorded)
+                    self.assertIn(['sudo','apt-get','update'],recorded)
+                    self.assertFalse(any(call[:2]==['sudo','add-apt-repository'] for call in recorded))
+                    installation=next(call for call in recorded if call[:3]==['sudo','apt-get','install'])
+                    self.assertNotIn('git',installation[3:],'preserve the supported runner Git')
+
     def test_release_trigger_is_only_after_validated_master_checks(self):
         body=job('release')
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/master'",body)
