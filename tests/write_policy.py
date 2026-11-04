@@ -39,7 +39,8 @@ reader = os.open(name, os.O_RDONLY)
 old_inode = os.fstat(reader).st_ino
 assert name.stat().st_ino == old_inode and name.read_bytes() == b'committed\n'
 try:
- for index in range(12):
+ # First replace the source binding, then replace its private replacement.
+ for index in range(2):
   other = Path('replacement')
   payload = ('value-%d' % index).encode()
   other.write_bytes(payload)

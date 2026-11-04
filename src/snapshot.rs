@@ -248,9 +248,7 @@ pub struct SnapshotMetrics {
     pub remote_session_pack_bytes: u64,
     pub tree_reads: u64,
     pub prepared_tree_entries: u64,
-    pub retained_tree_bytes: u64,
     pub verification_metadata_bytes: usize,
-    pub tree_index_probes: u64,
     pub header_reads: u64,
     pub blob_loads: u64,
     pub blob_bytes: u64,
@@ -1770,7 +1768,10 @@ mod tests {
     fn touched_directories_stay_prepared_without_an_entry_cap() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
+        let storage = TempDir::new().unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "tree-reuse").unwrap();
+        snap.set_spool_directory(&storage.path().join("upper"))
+            .unwrap();
         let blob = repo.blob(b"x").unwrap();
         let mut ids = Vec::new();
         for i in 0..300 {
@@ -1790,10 +1791,18 @@ mod tests {
             "already prepared trees were decoded again"
         );
         assert_eq!(stats.prepared_tree_entries, 300);
-        assert_eq!(
-            stats.retained_tree_bytes, 0,
-            "raw trees were retained on disk"
-        );
+        let mut directories = vec![storage.path().to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                assert!(
+                    entry.file_type().unwrap().is_dir(),
+                    "raw trees were retained on disk: {}",
+                    entry.path().display()
+                );
+                directories.push(entry.path());
+            }
+        }
     }
     #[test]
     fn active_large_blob_reader_decodes_once_and_releases_active_accounting() {

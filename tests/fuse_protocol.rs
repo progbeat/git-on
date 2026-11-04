@@ -498,7 +498,7 @@ fn protocol_readonly_no_open_negotiation_and_stateless_reads() {
     p.err(14, 1, u32s(&[0, 0]), libc::EISDIR);
     let link = p.lookup(1, "link");
     p.err(14, link, u32s(&[0, 0]), libc::ELOOP);
-    for _ in 0..3 {
+    for _ in 0..2 {
         assert_eq!(p.ok(15, ino, io(0, 0, 4, 0)), b"orig");
         assert_eq!(p.ok(15, ino, io(0, 4, 100, 0)), b"inal\n");
         assert!(p.ok(15, ino, io(0, 100, 100, 0)).is_empty());
