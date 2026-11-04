@@ -174,7 +174,15 @@ impl Source {
                                     "small object demand exceeds stream boundary"
                                 );
                                 let mut bytes = Vec::with_capacity(size);
-                                copy_blob(&repository, oid, size, &mut bytes)?;
+                                // This reply already needs the complete bounded object.
+                                // Packed backends do not provide ODB streams.
+                                let odb = repository.odb()?;
+                                let object = odb.read(oid)?;
+                                anyhow::ensure!(
+                                    object.kind() == ObjectType::Blob && object.len() == size,
+                                    "Git blob changed during transfer"
+                                );
+                                crate::object::copy_odb_blob(&object, &mut bytes)?;
                                 Ok(SmallBlob {
                                     bytes,
                                     proof: Verified { oid, size },
@@ -347,6 +355,57 @@ mod tests {
                     demands,
                     "oversized demand reached the bounded source path"
                 );
+                source.finish().await.unwrap();
+            });
+    }
+
+    #[test]
+    fn packed_small_reply_checks_contents_kind_and_declared_length() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(dir.path()).unwrap();
+        let bytes = (0..BLOCK)
+            .map(|i| (i.wrapping_mul(37) >> 5) as u8)
+            .collect::<Vec<_>>();
+        let oid = repo.blob(&bytes).unwrap();
+        let empty = repo.blob(&[]).unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        {
+            let mut pack = repo.packbuilder().unwrap();
+            for id in [oid, empty, tree] {
+                pack.insert_object(id, None).unwrap();
+            }
+            let mut data = git2::Buf::new();
+            pack.write_buf(&mut data).unwrap();
+            let odb = repo.odb().unwrap();
+            let mut writer = odb.packwriter().unwrap();
+            writer.write_all(&data).unwrap();
+            writer.commit().unwrap();
+        }
+        for id in [oid, empty, tree] {
+            let text = id.to_string();
+            std::fs::remove_file(
+                repo.path()
+                    .join("objects")
+                    .join(&text[..2])
+                    .join(&text[2..]),
+            )
+            .unwrap();
+        }
+        let source = Source::new(repo).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let blob = source.small_blob(oid, bytes.len()).await.unwrap();
+                assert_eq!(blob.bytes, bytes);
+                assert_eq!((blob.proof.oid(), blob.proof.size()), (oid, BLOCK));
+                assert!(source.small_blob(oid, BLOCK - 1).await.is_err());
+                assert!(source.small_blob(tree, 0).await.is_err());
+                let blob = source.small_blob(empty, 0).await.unwrap();
+                assert!(blob.bytes.is_empty());
+                assert_eq!((blob.proof.oid(), blob.proof.size()), (empty, 0));
                 source.finish().await.unwrap();
             });
     }

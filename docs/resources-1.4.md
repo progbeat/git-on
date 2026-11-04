@@ -93,8 +93,9 @@ for an OID, and serves RAM hits while the decoder waits. Shared local bytes stay
 alive through FUSE reply completion without a payload copy. Session shutdown
 drains requests, awaits the source thread and then publishes final metrics.
 Objects up to 64 KiB cross the source boundary in one completely verified
-response; larger objects retain bounded streaming. Spill storage remains one
-file per OID.
+response, using the verified ODB read directly instead of first probing an
+unavailable packed-object stream. Larger objects retain bounded streaming.
+Spill storage remains one file per OID.
 
 Local sources also negotiate adaptive READDIRPLUS when the kernel supports it.
 The initial page returns file attributes only when already available, without
