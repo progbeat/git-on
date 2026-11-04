@@ -6,6 +6,7 @@ runner owns fresh execution storage. OS caches are deliberately not flushed and
 are reported as uncontrolled; 'first' means first access in this invocation.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -160,18 +161,25 @@ def process_snapshot(pid):
 
 def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
     """Include launch, native descendants and process exit; no traced timings."""
-    with tempfile.TemporaryFile() as counters:
+    with tempfile.TemporaryFile() as counters, contextlib.ExitStack() as observer_fds:
         observed_argv=[os.fspath(value) for value in argv]
+        inherited=[]
         if resource_observer:
-            rss_output=resource_observer.with_name('observed-rss')
-            argv=[str(resource_observer),str(rss_output),*argv]
-        if metrics: env = dict(env, GIT_ON_TEST_METRICS_FD=str(counters.fileno()))
+            read_fd, write_fd = os.pipe()
+            rss_output=observer_fds.enter_context(os.fdopen(read_fd,'rb'))
+            rss_sink=observer_fds.enter_context(os.fdopen(write_fd,'wb'))
+            inherited.append(rss_sink.fileno())
+            argv=[str(resource_observer),'--rss-fd',str(rss_sink.fileno()),'--',*argv]
+        if metrics:
+            env = dict(env, GIT_ON_TEST_METRICS_FD=str(counters.fileno()))
+            inherited.append(counters.fileno())
         before = resource.getrusage(resource.RUSAGE_CHILDREN); begin = time.monotonic_ns()
         # These controlled commands emit bounded JSON/quiet Git diagnostics.
         # Pipe EOF wakes communicate on exit; wait(timeout) alone busy-polls
         # and can add a 50 ms measurement floor to short commands.
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,start_new_session=True,
-            pass_fds=(counters.fileno(),) if metrics else ())
+            pass_fds=tuple(inherited))
+        if resource_observer: rss_sink.close()
         stop = threading.Event(); samples = dict(count=0, peak_rss_sum_kib=0, peak_fd_sum=0, unavailable=False,descriptors_unavailable=False)
         def sample():
             while not stop.wait(.02):
@@ -218,7 +226,7 @@ def observe(argv, cwd, env, timeout, metrics=False, resource_observer=None):
             waited_system_cpu_s=after.ru_stime-before.ru_stime, memory=samples,
             waited_input_block_bytes=(after.ru_inblock-before.ru_inblock)*512,
             waited_output_block_bytes=(after.ru_oublock-before.ru_oublock)*512,
-            waited_process_peak_rss_kib=int(rss_output.read_text()) if resource_observer else None,
+            waited_process_peak_rss_kib=int(rss_output.read()) if resource_observer else None,
             memory_limits='wait4 peak is the largest waited process, including native descendants; 20 ms process-tree RSS sums are non-atomic, shared pages double counted, fast/protected descendants may be missed',
             stderr=errors.decode(errors='replace'), command_observations=rows)
         if metrics:
@@ -384,7 +392,7 @@ def workload_plan(trials):
 
 
 def run(options):
-    from benchmark_support import stat_abi_bytes
+    from benchmark_support import build_resource_observer, stat_abi_bytes
     assert sys.platform == 'linux' and Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'), 'real Linux FUSE required'
     directory = options.fixture.resolve(); metadata = json.loads((directory/'fixture.json').read_text())
     assert metadata['pin'] == PIN, 'unrecognized fixture pin'
@@ -399,10 +407,12 @@ def run(options):
     hardware.update(kernel=os.uname().release,python=sys.version,
         binary_sha256=hashlib.sha256(options.binary.read_bytes()).hexdigest())
     with tempfile.TemporaryDirectory(prefix='git-on-real-benchmark-') as temporary, options.output.open('w') as output:
-        root = Path(temporary); stat_bytes = stat_abi_bytes(root); env = environment()
+        root = Path(temporary)
+        observer=build_resource_observer(root/'resource-observer')
+        stat_bytes = stat_abi_bytes(observer); env = environment()
         env.update(TMPDIR=str(root), GIT_LFS_SKIP_SMUDGE='1')
         def measured(argv,cwd,env,timeout,metrics=False):
-            return observe(argv,cwd,env,timeout,metrics,resource_observer=root/'resource-observer')
+            return observe(argv,cwd,env,timeout,metrics,resource_observer=observer)
         def record(row):
             row.update(head=head, working_tree_dirty=dirty, fixture=metadata, hardware=hardware,source_cache='complete immutable local ODB; OS caches uncontrolled; fresh invocation storage',
                 source_scope='local or file:// private server; not a public-network latency benchmark')

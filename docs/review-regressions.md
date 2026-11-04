@@ -2386,38 +2386,3 @@ single-object scan. Growing replacements keep the original eviction path.
 accounting, recency, equal/short/growing replacements, the actual spilled victim
 and unchanged active results. These are optimization-equivalence checks, not
 claims that the earlier revision returned incorrect bytes or measured slower.
-
-## Withdraw the experimental async backend
-
-The implementation returns to the checked-in registry-fuser backend at
-`951f4b3e245b0f361d5e4255a450fde46370a8eb`. The local async-fuser and tokio-uring
-forks, separate async payload store/source/remote layers and the optimizations
-specific to that port are removed. Their size was not justified by established
-end-to-end performance acceptance. This withdrawal is not presented as a
-measured speed improvement or completion of issue #20.
-
-Invocation-local remote storage, all four write policies, lazy metadata and
-payloads, the byte-budgeted LRU, verified raw backing, canonical OID checking,
-same-UID tamper defenses, streamed large objects and Linux/macOS platform scope
-remain. Evicted decoded contents retain raw backing; no local re-decode policy
-is reintroduced. The production version remains 1.4.0.
-
-Independent regressions remain in the suite: mounted reads after removal of an
-evicted object's original Git file, missing/unsupported objects under all four
-write policies, source-file descriptor/mmap coherence across copy-up and
-mutation, remote delta-object reuse, and selection of the exact requested
-binary for `git on` fixture commands. Remote reuse tests check observable
-contents, transport demands and temporary storage rather than requiring the
-removed implementation's thread names. Async-only library/mount tests are
-removed with their implementation. The restored callback coverage matrix and
-guard continue to cover the registry backend.
-
-Local validation of the restored implementation passed formatting, strict
-clippy, all 186 Rust tests, Rust 1.89 all-target checks, the 44-entry callback
-inventory and seven guard self-tests, 42 release-policy tests and three license
-notice tests. Real mounts passed all 10 write-policy methods and 15 selected
-remote CLI methods, plus the exact-binary fixture guard. The integration run
-passed 70 general methods; its uv method was initially disabled, then passed
-explicitly with `--uv`, covering both locked examples. Pinned uv used only
-process-local `UV_NO_CONFIG=1`; user configuration was unchanged. These are
-functional results, not performance acceptance.

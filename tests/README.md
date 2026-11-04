@@ -267,17 +267,17 @@ No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
 
-## 1.4 resource and pre-merge scale acceptance
+## Resource and pre-merge scale acceptance
 
-See [resource acceptance](../docs/resources-1.4.md), the
+See [resource acceptance](../docs/resources.md), the
 [CI cost/coverage map](../docs/ci-performance.md), and the
-[dependency audit](../docs/crate-audit-1.4.md). Resource regressions remain in
+[dependency audit](../docs/crate-audit.md). Resource regressions remain in
 `remote.py`; optional `--before-resource-probe` replays exact-master failures.
 `pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
 32/128/512 distinct-object pack metadata work, and verifies the full available
-OID set once after both read passes. The current probe's `--metrics-only` mode
-avoids repeatedly enumerating all OIDs. Historical helpers still include that
-cost; benchmark wall time is not isolated product throughput.
+OID set once after both read passes. The probe's `--metrics-only` mode omits
+full-OID enumeration from repeated measurements. Report preparation and command
+time separately.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
 defaults to `--profile matrix`: every interaction once at 1k paths. The pinned

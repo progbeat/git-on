@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from benchmark_support import stat_abi_bytes
+from benchmark_support import build_resource_observer, stat_abi_bytes
 from process_capture import capture
 from remote import Fixture
 
@@ -53,7 +53,7 @@ def run(options):
                 entries=''.join(f'100644 blob {blob}\tf{index:06d}\n' for index in range(count))
                 tree=f.git('mktree',data=entries.encode())
                 commit=f.git('commit-tree',tree,data=b'metadata reuse regression\n');f.git('update-ref','refs/heads/main',commit)
-                stat_bytes=stat_abi_bytes(f.root)
+                stat_bytes=stat_abi_bytes(build_resource_observer(f.root/'resource-observer'))
                 child=f.root/'command.py';child.write_text(CHILD)
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.operations),str(stat_bytes)]
                 source='file://'+str(f.repo) if options.source=='remote' else str(f.repo)

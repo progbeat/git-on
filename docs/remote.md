@@ -181,7 +181,7 @@ overhead without an arbitrary object-count cap. Completion removes the temporary
 SSH connection. Write required results to explicit external paths. Busy mounts
 preserve recovery state for stale-run cleanup. Explicit-all materialization
 eagerly fetches every selected tree entry; it never bypasses authentication,
-verification or object errors. See [resource acceptance](resources-1.4.md).
+verification or object errors. See [resource acceptance](resources.md).
 
 SIGKILL cannot run cleanup handlers. The runner does not request FUSE
 `auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected

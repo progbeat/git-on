@@ -14,7 +14,7 @@ from unittest import mock
 
 from benchmark import environment
 from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output,workload_plan
-from benchmark_support import stat_abi_bytes
+from benchmark_support import build_resource_observer, stat_abi_bytes
 
 
 class RealRepositoryTests(unittest.TestCase):
@@ -113,9 +113,20 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertGreater(observed['memory']['peak_rss_sum_kib'],0)
         self.assertIn('shared pages',observed['memory_limits'])
         self.assertEqual(observed['command_observations'],[{'completed':'test'}])
-        stat_abi_bytes(self.root)
+        build_resource_observer(self.root/'resource-observer')
         waited=observe([sys.executable,'-I','-S','-c',code],self.root,environment(),5,resource_observer=self.root/'resource-observer')
         self.assertGreater(waited['waited_process_peak_rss_kib'],0)
+
+    def test_waited_peak_observer_does_not_create_a_named_output_file(self):
+        observer=build_resource_observer(self.root/'resource-observer')
+        self.assertGreater(stat_abi_bytes(observer),0)
+        before=set(self.root.iterdir())
+        code='import json; print(json.dumps({"completed":"separate-channel"}))'
+        observed=observe([sys.executable,'-I','-S','-c',code],self.root,environment(),5,
+                         resource_observer=self.root/'resource-observer')
+        self.assertGreater(observed['waited_process_peak_rss_kib'],0)
+        self.assertEqual(observed['command_observations'],[{'completed':'separate-channel'}])
+        self.assertEqual(set(self.root.iterdir()),before)
 
     def test_descriptor_permission_does_not_discard_observable_rss(self):
         proc=self.root/'proc';base=proc/'123';(base/'task/123').mkdir(parents=True);(base/'fd').mkdir()
@@ -130,7 +141,7 @@ class RealRepositoryTests(unittest.TestCase):
             self.assertEqual(process_snapshot(123),(4321,0,True,False))
 
     def test_metrics_survive_the_waited_peak_wrapper(self):
-        stat_abi_bytes(self.root)
+        build_resource_observer(self.root/'resource-observer')
         metrics=dict(blob_cache_bytes=0,blob_cache_limit=16*1024*1024,tree_cache_bytes=0,tree_cache_limit=0)
         code=f"""import json,os,time
 for key,value in [('GIT_ON_TEST_METRICS_FD',{metrics!r})]:
@@ -155,7 +166,7 @@ print(json.dumps(dict(completed='channels')))
         self.assertFalse(marker.exists(),'timed-out measurement left its child running')
 
     def test_waited_peak_wrapper_preserves_owned_child_graceful_timeout_cleanup(self):
-        stat_abi_bytes(self.root)
+        build_resource_observer(self.root/'resource-observer')
         marker=self.root/'orphan-survived';pidfile=self.root/'owned-child';ready=self.root/'handler-ready'
         descendant=f'import time;from pathlib import Path;time.sleep(1);Path({str(marker)!r}).write_text("leak")'
         code=f"""import os,signal,subprocess,sys,time
