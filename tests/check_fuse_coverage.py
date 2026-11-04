@@ -18,12 +18,9 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FUSER_VERSION = "0.17.0"
-FUSER_UPSTREAM = "c038f63e39fe2e5f87a5311b222deda4d534c735"
-ASYNC_TRAIT_SHA256 = "48f48dfb222897ff28352aa33eeab184caf48f496c83c0d64064027f88538788"
-ASYNC_DISPATCH_SHA256 = "e80c16c17566a47694391f4652320f34a68e39feb8707c19389ed9f726921eef"
+FUSER_VERSION = "0.18.0"
+FUSER_CHECKSUM = "b82b6597d216503555ead6b358f341ef748869bf5c6fbae6a0cb9dd231baecfd"
 TRAIT_SHA256 = "a194e6a4dc19ae08a007a03d2eee6dc7cf9801da7584e3e13fe7bada7bd47c08"
-MOUNTED_SOURCES = ("tests/integration.py", "tests/write_policy.py", "tests/remote.py")
 
 
 def require(condition, message):
@@ -54,7 +51,7 @@ def block(source, declaration):
 
 def methods(source):
     masked = rust_mask(source)
-    found = list(re.finditer(r"^    (?:async )?fn ([a-z_][a-z_0-9]*)\s*\(", masked, re.M))
+    found = list(re.finditer(r"^    fn ([a-z_][a-z_0-9]*)\s*\(", masked, re.M))
     result = {}
     previous_end = 0
     for match in found:
@@ -116,8 +113,8 @@ def validate_rows(rows, expected, aliases):
             for identifier in ids.split(","):
                 identifier = identifier.strip()
                 require(identifier in aliases, "unknown test ID: " + identifier)
-                require(aliases[identifier][0] in (("tests/fuse_protocol.rs",) if kind == "protocol"
-                                                  else MOUNTED_SOURCES),
+                require(aliases[identifier][0] == ("tests/fuse_protocol.rs" if kind == "protocol"
+                                                   else "tests/integration.py"),
                         "wrong evidence layer for " + name + ": " + identifier)
         if classification == "macos-only":
             require(protocol == mounted == "-", "macOS callback cannot claim Linux evidence")
@@ -154,49 +151,30 @@ def host_metadata(root):
 
 def check(root=ROOT):
     lock = tomllib.loads((root / "Cargo.lock").read_text())
-    packages = [p for p in lock["package"] if p["name"] == "async-fuser"]
+    packages = [p for p in lock["package"] if p["name"] == "fuser"]
     require(len(packages) == 1, "expected exactly one locked fuser dependency")
     locked = packages[0]
-    require(locked["version"] == FUSER_VERSION and locked.get("source") is None,
+    require(locked["version"] == FUSER_VERSION and locked.get("source", "").startswith("registry+") and locked.get("checksum")==FUSER_CHECKSUM,
             "fuser dependency changed; review callback contract, matrix and fingerprint")
     metadata = host_metadata(root)
-    packages = [p for p in metadata["packages"] if p["name"] == "async-fuser"]
+    packages = [p for p in metadata["packages"] if p["name"] == "fuser"]
     require(len(packages) == 1 and packages[0]["version"] == FUSER_VERSION,
             "cargo metadata differs from reviewed fuser version")
     package = packages[0]
     library = next(t for t in package["targets"] if "lib" in t["kind"])
-    source_path = Path(library["src_path"]).resolve()
-    expected_path = (root / "crates/async-fuser/src/lib.rs").resolve()
-    require(source_path == expected_path, "async-fuser must resolve to the reviewed local crate")
-    require((root / "crates/async-fuser/UPSTREAM").read_text().strip() == FUSER_UPSTREAM,
-            "async-fuser upstream identity changed")
-    source = source_path.read_text()
+    source = Path(library["src_path"]).read_text()
     trait_source = block(source, "pub trait Filesystem")
     require(hashlib.sha256(trait_source.encode()).hexdigest() == TRAIT_SHA256,
             "fuser Filesystem trait changed; review all callback/default semantics")
     trait = methods(trait_source)
-    async_trait_source = block(source_path.with_name("lib_async.rs").read_text(), "pub trait AsyncFilesystem")
-    require(hashlib.sha256(async_trait_source.encode()).hexdigest() == ASYNC_TRAIT_SHA256,
-            "async Filesystem trait changed; review callbacks and default semantics")
-    dispatcher = source_path.parent / "ll/request_async/mod.rs"
-    require(hashlib.sha256(dispatcher.read_bytes()).hexdigest() == ASYNC_DISPATCH_SHA256,
-            "async dispatcher changed; review direct/default protocol operations")
-    overlay = methods(block((root / "src/backend/linux.rs").read_text(), "impl f::AsyncFilesystem for Fuse"))
-    require(set(overlay) <= set(methods(async_trait_source)), "adapter overrides are missing from AsyncFilesystem")
-    # shutdown is a local lifecycle hook, not a kernel opcode/callback.
-    require("shutdown" in overlay, "adapter must drain its owned source before destroy")
-    expected = classifications(trait, {name: item for name, item in overlay.items() if name != "shutdown"})
-    async_methods = methods(async_trait_source)
-    for name, classification in expected.items():
-        if classification == "unsupported" and name in async_methods:
-            require("Err(Errno::ENOSYS)" in async_methods[name]["body"],
-                    "async default differs from the reviewed ENOSYS contract: " + name)
+    overlay = methods(block((root / "src/backend/linux.rs").read_text(), "impl Filesystem for Fuse"))
+    expected = classifications(trait, overlay)
     document = (root / "docs/fuse-coverage.md").read_text()
     aliases = {}
     cached_names = {}
     for identifier, filename, function in table(document, "TEST IDS", 3):
         require(identifier not in aliases, "duplicate test ID: " + identifier)
-        require(filename in ("tests/fuse_protocol.rs",) + MOUNTED_SOURCES,
+        require(filename in ("tests/fuse_protocol.rs", "tests/integration.py"),
                 "unexpected evidence source: " + filename)
         if filename not in cached_names:
             cached_names[filename] = test_names(root / filename)
@@ -220,10 +198,6 @@ class GuardTests(unittest.TestCase):
 
     def test_complete_matrix_is_accepted(self):
         validate_rows(self.rows, self.expected, self.aliases)
-        for source in MOUNTED_SOURCES:
-            rows = [row.copy() for row in self.rows]
-            rows[0][3] = "I"
-            validate_rows(rows, self.expected, {**self.aliases, "I": (source, "test_mounted")})
 
     def test_missing_duplicate_extra_and_misclassified_rows_fail(self):
         variants = [self.rows[:-1], self.rows + [self.rows[0]],
@@ -241,9 +215,8 @@ class GuardTests(unittest.TestCase):
             rows[0][2] = identifier
             with self.subTest(identifier=identifier), self.assertRaises(ValueError):
                 validate_rows(rows, self.expected, self.aliases)
-        for source in MOUNTED_SOURCES:
-            with self.subTest(source=source), self.assertRaises(ValueError):
-                validate_rows(self.rows, self.expected, {"P": (source, "test_mounted")})
+        with self.assertRaises(ValueError):
+            validate_rows(self.rows, self.expected, {"P": ("tests/integration.py", "test_mounted")})
 
     def test_parser_preserves_defaults_and_platform_attributes(self):
         source = '''pub trait Filesystem {

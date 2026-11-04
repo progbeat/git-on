@@ -1676,7 +1676,7 @@ while True:
         self.assertEqual(list((destination/'objects/pack').iterdir()),[])
         f.finish(process)
 
-    def test_real_mount_session_delta_handoff_keeps_fitting_payloads_in_ram(self):
+    def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
         f=self.f;wanted,_,wanted_oid,tree,_,trace=self.delta_session_fixture(40000)
         code=r'''
@@ -1688,9 +1688,6 @@ for _ in range(3):
 runs=Path.cwd().parent
 raw=list(runs.glob('raw-objects-*'))
 assert len(raw)==1 and not list(raw[0].iterdir()), 'fitting delta payloads spilled to disk'
-threads=[p.joinpath('comm').read_text().strip() for p in Path('/proc/%d/task'%os.getppid()).iterdir()]
-assert 'git-on-remote' in threads,threads
-assert 'git-on-file-io' not in threads,threads
 assert not list((runs/'remote-repository/objects/pack').iterdir())
 if sys.argv[1]=='all':
  reader=os.open('file',os.O_RDONLY)

@@ -1,41 +1,22 @@
 # FUSE callback acceptance matrix
 
-This is the reviewed operation inventory for **local async-fuser and Linux ABI 7.40**.
+This is the reviewed operation inventory for **registry fuser 0.18.0 and Linux ABI 7.40**.
 It is a test contract, not an assertion that any particular CI run passed.
 The dependency has 44 trait methods: 26 implemented by the Linux adapter and shared `Overlay`, 2 inherited
 lifecycle methods, 13 inherited unsupported handlers, and 3 macOS-only methods.
 
-The local crate starts at upstream commit
-`c038f63e39fe2e5f87a5311b222deda4d534c735`; its inherited version number does
-not assert equivalence to a published crate. The complete 44-operation contract
-is retained from the matching synchronous trait. The async trait exposes 36
-methods: batch-forget dispatches to individual forget calls; unsupported Linux
-locking/bmap/poll operations return ENOSYS directly; three callbacks are excluded
-with macOS. The guard pins both traits and the async dispatcher and verifies the
-adapter overrides/default errors against this complete inventory.
-
 ## Evidence layers and limits
 
 - `tests/fuse_protocol.rs` sends encoded FUSE requests through
-  `fuser::AsyncSession::from_fd` over a private `SOCK_SEQPACKET` socket. The real fuser
+  `fuser::Session::from_fd` over a private `SOCK_SEQPACKET` socket. The real fuser
   dispatcher invokes the real `Overlay`; reply bytes, errors and subsequent
   state are asserted. This is **protocol testing, not a kernel mount**. It makes
   stale handles, caller credentials, narrow reply buffers and callbacks normally
   bypassed by Linux reproducible. It does not emulate Linux's syscall semantics.
-  `protocol_fallback_executes_the_complete_wire_suite` repeats that suite with
-  the file-worker fallback explicitly selected, without disabling host io_uring.
-  The startup-failure regression in that file tests builder/device ownership
-  without a wire peer or successful mount; it is lifecycle evidence only.
-- `tests/integration.py --require-fuse --uv` and
-  `tests/write_policy.py --require-fuse` exercise actual mounts and caller
+- `tests/integration.py --require-fuse --uv` exercises actual mounts and caller
   behavior. The existing file/directory/link matrices remain part of acceptance,
   alongside the targeted operation tests below. Missing FUSE must fail rather
   than turn a real-mount claim into a skipped test.
-- `tests/remote.py --require-fuse` additionally checks mounted remote execution,
-  delayed sources, sticky storage/transport failures and cleanup. The controlled
-  delta-pack case checks all four policies, byte equality, one fetch per demanded
-  OID and no payload spill for a fitting working set. It uses a controlled native
-  protocol peer; the other transport cases exercise real HTTPS/OpenSSH.
 - Rust helper/unit tests additionally check policy, object loading, retention,
   inode reclamation, append/mmap behavior and disposable-layer cleanup. They do not
   replace either layer above.
@@ -58,17 +39,7 @@ cargo test --locked --test fuse_protocol
 cargo test --locked --all-targets
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
 python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
-cargo test --locked --lib backend::linux::tests::fallback_real_mount_all_policies -- --ignored --exact
 ```
-
-The last test requires real FUSE and explicitly selects the asynchronous file
-fallback under all four policies. It is ignored by the ordinary Rust suite and
-run explicitly by `write_policy.py` in real-fuse CI; an ordinary-suite skip is not its execution
-evidence. It checks source/large reads, protected-write denials, generated I/O,
-copy-up, live unlinked handles, metadata, links, rename and synchronization.
-The Python suite requires Cargo for that source-level test. Its other ten
-tests continue to exercise the CLI selected by `--binary`; the forced fallback
-check compiles the current checkout, not that supplied executable.
 
 The checker resolves the dependency source with `cargo metadata --locked
 --offline --filter-platform <rustc-host>`, deriving the host from `rustc -vV`.
@@ -87,21 +58,13 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | ID | File | Test function |
 | --- | --- | --- |
 | P-life | tests/fuse_protocol.rs | protocol_lifecycle_lookup_forget_and_batch_forget |
-| I-remote-handoff | tests/remote.py | RemoteTests.test_real_mount_session_delta_handoff_keeps_fitting_payloads_in_ram |
-| I-all-attrs | tests/write_policy.py | WritePolicyTests.test_all_cached_attributes_follow_parent_edits_and_source_copy_up |
 | P-io | tests/fuse_protocol.rs | protocol_file_io_sync_and_stale_handles |
 | P-no-open | tests/fuse_protocol.rs | protocol_readonly_no_open_negotiation_and_stateless_reads |
-| P-no-opendir | tests/fuse_protocol.rs | protocol_readonly_no_opendir_pages_cookies_and_sync |
-| P-no-opendir-attrs | tests/fuse_protocol.rs | protocol_readonly_zero_directory_handle_getattr |
-| P-cache-cow | tests/fuse_protocol.rs | protocol_all_source_data_cache_stops_after_copy_up_with_owned_attributes |
+| P-cache-cow | tests/fuse_protocol.rs | protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls |
 | P-dir-cache | tests/fuse_protocol.rs | protocol_directory_kernel_cache_only_for_readonly_supported_abi |
 | P-dir-attrs | tests/fuse_protocol.rs | protocol_cached_source_directory_attrs_do_not_cache_generated_membership |
 | P-create | tests/fuse_protocol.rs | protocol_creation_links_removal_and_rename_flags |
 | P-dir | tests/fuse_protocol.rs | protocol_directory_pagination_sync_statfs_and_bad_handles |
-| P-dirplus | tests/fuse_protocol.rs | protocol_readdirplus_pages_preserve_attributes_cookies_and_lookup_lifetimes |
-| P-dirplus-view | tests/fuse_protocol.rs | protocol_readdirplus_old_view_does_not_publish_a_replacement_binding |
-| P-dirplus-attrs | tests/fuse_protocol.rs | protocol_readdirplus_keeps_mutable_attributes_live_and_names_cached |
-| P-dirplus-reuse | tests/fuse_protocol.rs | protocol_readdirplus_reuses_published_metadata_without_duplicate_lookup_refs |
 | P-dir-partial | tests/fuse_protocol.rs | protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity |
 | P-dir-version | tests/fuse_protocol.rs | protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_close |
 | P-dir-overlap | tests/fuse_protocol.rs | protocol_overlapping_merged_versions_preserve_issued_cookies |
@@ -143,13 +106,6 @@ The short IDs below keep the matrix readable. References are machine-checked.
 
 ## Callback matrix
 
-The core unit regression
-`readonly_directory_streams_compact_pins_and_preserve_forget_lifetimes` in
-`src/filesystem.rs` separately bounds source-stream membership records and
-checks metadata ownership across FORGET, replay and close. Streams use sparse
-masks; shared reference counts and merged-view ownership are preserved.
-This resource check complements the protocol and mounted evidence below.
-
 The original entries below preserve default `ignored` acceptance. Supplemental
 `P-none`, `P-untracked`, `P-cow` and `P-unlinked-cow` exercise actual protocol
 dispatch for policy denials, unignored creation, tracked copy-up, namespace
@@ -164,12 +120,12 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 <!-- CALLBACK MATRIX START -->
 | Callback | Classification | Protocol tests | Mounted behavior tests | Assertions and limitations |
 | --- | --- | --- | --- | --- |
-| init | implemented | P-life, P-no-open, P-dirplus, P-no-opendir | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Readonly `none` negotiates NO_OPEN_SUPPORT only when advertised by the peer; mutable policies and older peers retain ordinary handles. Local asynchronous sources negotiate DO_READDIRPLUS and READDIRPLUS_AUTO together when advertised on ABI 7.21+. Remote/legacy sources retain ordinary directory requests. Optional remote locks and writeback cache stay disabled. Every protocol fixture initializes a real session. Readonly cacheable directories also negotiate advertised NO_OPENDIR_SUPPORT; other policies and unadvertised peers retain handles. |
+| init | implemented | P-life, P-no-open | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Readonly `none` negotiates NO_OPEN_SUPPORT only when advertised by the peer; mutable policies and older peers retain ordinary handles. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
 | destroy | inherited | P-life | I-snapshot | DESTROY is acknowledged and the session thread joins successfully; no requests follow termination. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
-| lookup | implemented | P-life, P-namespace, P-dir-attrs | I-snapshot, I-lazy, I-all-attrs, I-remote-handoff | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_tracks_source_and_directory_attributes` checks protected source caching and async `all` caching for unchanged source and directories. Cached all-policy LOOKUP/GETATTR replies retain namespace and inode ownership through send/drop. Generated/modified regular-file attributes stay uncached; kernel namespace invalidation keeps directory attributes live. Local `all` also caches positive name bindings independently. Other generated names stay uncached. Mutable directory membership/streams remain uncached; wholly readonly `none` directory pages may be cached. |
+| lookup | implemented | P-life, P-namespace, P-dir-attrs | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_only_retains_protected_source` checks positive caching only for policy-protected source names and attributes, including directories; generated names and `all` stay uncached. Mutable directory membership/streams remain uncached; wholly readonly `none` directory pages may be cached. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
-| getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse, P-no-open, P-no-opendir-attrs | I-file, I-links, I-partial, I-all-attrs | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. `passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` and the real enabled/fallback suite cover metadata through O_PATH after unlink or replacement. Negotiated readonly zero directory handles return directory attributes, independently of zero-message regular-file opens; invalid nonzero handles remain EBADF. |
+| getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse, P-no-open | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. `passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` and the real enabled/fallback suite cover metadata through O_PATH after unlink or replacement. |
 | setattr | implemented | P-access, P-bounds, P-metadata, P-sparse | I-file, I-directory, I-partial | Owner/nonowner decisions, changed uid/gid, readonly/stale/mismatched handle and immutable rejection, size overflow, explicit/now times; sparse grow/shrink reports actual backing size/blocks; mounted chmod/chown-self/utime and path/fd truncate. Linux does not supply macOS creation/backup times or file flags. |
 | readlink | implemented | P-io | I-exec, I-links | Exact tracked target and EINVAL for regular inode; mutable, renamed and dangling links and immutable write-through boundaries on mounts. |
 | mknod | implemented | P-create, P-failures | I-mknod | Regular file, existing/disallowed name, special-node EPERM, missing backing and no namespace insertion; real umask/uid/gid and FIFO/socket refusal. Device nodes are not supported. |
@@ -179,17 +135,17 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | symlink | implemented | P-create | I-links | Real callback creates a symlink; mounted exact target, write-through, dangling link and namespace/policy denial assertions. Embedded NUL is not representable in a well-formed wire pathname. |
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
 | link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. `passthrough_link_reply_refreshes_backing_metadata_without_stat` checks size/blocks/mtime in the LINK reply after bypass writes, before GETATTR or close. |
-| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH also applies to those readonly descriptions for async all-policy source; later copy-up preserves their readonly access. Mutable handles use ordinary behavior. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. Async all-policy unchanged-source and directory attributes may cache with owned replies; modified regular-file attributes stay uncached. LOOKUP caches the name binding independently. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
-| read | implemented | P-io, P-bounds, P-partial, P-sparse, P-no-open | I-file, I-large, I-partial, I-readonly, I-remote-handoff | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
+| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Mutable handles use ordinary behavior. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
+| read | implemented | P-io, P-bounds, P-partial, P-sparse, P-no-open | I-file, I-large, I-partial, I-readonly | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
 | write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
-| flush | implemented | P-io, P-bounds, P-no-open | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. The kernel may skip close-flush for readonly protected or async all-policy source with NOFLUSH; writing descriptions and explicit fsync retain their callbacks. Negotiated readonly no-open uses fh=0 and returns ENOSYS once, allowing the kernel to omit further flush requests. Flush is not a persistence/fsync guarantee. |
+| flush | implemented | P-io, P-bounds, P-no-open | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. The kernel may skip close-flush for readonly protected source with NOFLUSH; mutable handles and explicit fsync retain their callbacks. Negotiated readonly no-open uses fh=0 and returns ENOSYS once, allowing the kernel to omit further flush requests. Flush is not a persistence/fsync guarantee. |
 | release | implemented | P-io | I-sync, I-links | Subsequent use and repeat release of closed handle fail; mounted open-unlinked lifetime. Linux does not report RELEASE errors through close; negotiated readonly no-open omits RELEASE entirely. |
 | fsync | implemented | P-io, P-no-open | I-sync, I-readonly | Data/full sync of writable and immutable handles; stale handle rejection; mounted fdatasync/fsync before and after unlink. |
-| opendir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap, P-dir-cache, P-no-opendir | I-lazy, I-readdir, I-dir-cache | Directory handle succeeds and regular inode returns ENOTDIR; separate open handles share prepared views. Merged versions share unchanged rows across edits even while older streams remain active. Untouched source views borrow verified tree entries and reserve one inode range without per-child path/node allocations. Real merged lower/upper listing includes overlapping partial streams and mutations. Only wholly readonly `none` returns FOPEN_CACHE_DIR with KEEP_CACHE, on ABI 7.28+; mutable policies and older peers keep ordinary streams. With negotiated readonly NO_OPENDIR_SUPPORT, the first request returns ENOSYS; Linux omits later OPENDIR/RELEASEDIR and supplies zero handles. Preparation moves to demanded reads. |
-| readdir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap, P-dir-cache, P-no-opendir | I-readdir, I-dir-cache | Tiny replies force pagination, exact names and EOF, negative offset and stale handle; old overlapping versions retain names/inodes and issued cookies across creation/removal/rename. Unissued interior merged cookies return EINVAL. Large flat mount listing checks telldir/seekdir/rewind, partial streams and d_ino/stat identity. Source identities remain stable across metadata eviction; they are never reassigned to another source path or generated inode. Negotiated readonly zero handles use a temporary page stream; checked source cookies and identities remain stable without retaining per-open state. |
-| readdirplus | implemented | P-dirplus, P-dirplus-view, P-dirplus-attrs, P-dirplus-reuse, P-no-opendir | I-dir-cache, I-lazy | Adaptive local directory pages preserve cookies, sizes, names, inode identity and lookup/forget lifetimes. The initial cold page omits unavailable leaf attributes; later PLUS pages batch only their required headers. Existing metadata-only source leaves in mutable namespaces omit another lookup reference and use ordinary revalidation as needed. Missing metadata or replaced old-view bindings return a listed name with nodeid zero. Replies retain namespace and cacheable all-policy inode ownership; mutable attributes stay uncached independently of name TTL. Bad handles/offsets and short/empty pages are tested. Legacy or unnegotiated sources return ENOSYS. Mounted paging and missing-object cases validate listing/lazy fallback; ordinary readdir remains supported. Negotiated readonly zero handles retain the existing page/lookup ownership rules using a temporary stream. |
-| releasedir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap, P-no-opendir | I-readdir | Release succeeds and subsequent read/release fail; open-removed directory finally reclaimed after releases and forget; mounted closedir and independent streams. Inode reclamation releases only entries returned by that handle, plus fixed dot references. Retiring a merged version also reclaims obsolete link changes, amortized over edits rather than scanning untouched rows. Unit tests cover unordered/concurrent retirement, bounded row creation, metadata reclamation, late-name membership and shared-tree path identity. Linux omits this callback after negotiating readonly no-opendir. |
-| fsyncdir | implemented | P-dir, P-failures, P-no-opendir | I-sync | Full/data sync, stale handle and missing backing error; root, tracked and writable directory descriptors on mounts. Negotiated readonly zero handles validate the directory inode and synchronize the same backing directory; invalid nonzero handles remain EBADF. |
+| opendir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap, P-dir-cache | I-lazy, I-readdir, I-dir-cache | Directory handle succeeds and regular inode returns ENOTDIR; separate open handles share prepared views. Merged versions share unchanged rows across edits even while older streams remain active. Untouched source views borrow verified tree entries and reserve one inode range without per-child path/node allocations. Real merged lower/upper listing includes overlapping partial streams and mutations. Only wholly readonly `none` returns FOPEN_CACHE_DIR with KEEP_CACHE, on ABI 7.28+; mutable policies and older peers keep ordinary streams. |
+| readdir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap, P-dir-cache | I-readdir, I-dir-cache | Tiny replies force pagination, exact names and EOF, negative offset and stale handle; old overlapping versions retain names/inodes and issued cookies across creation/removal/rename. Unissued interior merged cookies return EINVAL. Large flat mount listing checks telldir/seekdir/rewind, partial streams and d_ino/stat identity. Source identities remain stable across metadata eviction; they are never reassigned to another source path or generated inode. |
+| readdirplus | unsupported | P-optional | - | ENOSYS using a directory handle; capability is not negotiated by normal init, so the ordinary mounted stream uses readdir. |
+| releasedir | implemented | P-dir, P-metadata, P-dir-partial, P-dir-version, P-dir-overlap | I-readdir | Release succeeds and subsequent read/release fail; open-removed directory finally reclaimed after releases and forget; mounted closedir and independent streams. Inode reclamation releases only entries returned by that handle, plus fixed dot references. Retiring a merged version also reclaims obsolete link changes, amortized over edits rather than scanning untouched rows. Unit tests cover unordered/concurrent retirement, bounded row creation, metadata reclamation, late-name membership and shared-tree path identity. |
+| fsyncdir | implemented | P-dir, P-failures | I-sync | Full/data sync, stale handle and missing backing error; root, tracked and writable directory descriptors on mounts. |
 | statfs | implemented | P-dir, P-failures | I-statfs | Coherent statistics and missing backing error/recovery; mounted statvfs/fstatvfs capacity matches backing filesystem, with non-racy free-space inequalities. |
 | setxattr | unsupported | P-optional | I-xattr | ENOSYS at protocol; Linux EOPNOTSUPP and cached repeat, unchanged file/directory contents and metadata. |
 | getxattr | unsupported | P-optional | I-xattr | ENOSYS at protocol; Linux EOPNOTSUPP, including cached repeated requests. |

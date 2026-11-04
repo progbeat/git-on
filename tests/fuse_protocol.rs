@@ -3,7 +3,7 @@
 //! This is not a real mount (see integration.py). It makes kernel-short-circuited
 //! callbacks, malformed handles and caller credentials reproducibly testable.
 #![cfg(target_os = "linux")]
-use fuser::{AsyncSession, SessionACL};
+use fuser::{Session, SessionACL};
 use git2::Repository;
 use git_on::backend::linux::Fuse;
 use git_on::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
@@ -21,90 +21,6 @@ fn u64s(xs: &[u64]) -> Vec<u8> {
 fn num(b: &[u8], offset: usize) -> u64 {
     u64::from_ne_bytes(b[offset..offset + 8].try_into().unwrap())
 }
-
-#[test]
-fn protocol_mount_failure_awaits_owned_shutdown_before_filesystem_drop() {
-    use std::{cell::RefCell, rc::Rc};
-    #[derive(Debug)]
-    struct OwnedSource {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        fail: bool,
-    }
-    impl fuser::AsyncFilesystem for OwnedSource {
-        async fn shutdown(&mut self) -> std::io::Result<()> {
-            self.events.borrow_mut().push("shutdown started");
-            tokio::task::yield_now().await;
-            self.events.borrow_mut().push("shutdown finished");
-            if self.fail {
-                Err(std::io::Error::other("owned shutdown failed"))
-            } else {
-                Ok(())
-            }
-        }
-        fn destroy(&mut self) {
-            self.events.borrow_mut().push("destroy");
-        }
-    }
-    impl Drop for OwnedSource {
-        fn drop(&mut self) {
-            self.events.borrow_mut().push("drop");
-        }
-    }
-    for failure in ["mount", "device", "missing mountpoint", "missing options"] {
-        for fail in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let events = Rc::new(RefCell::new(Vec::new()));
-            let filesystem = OwnedSource {
-                events: events.clone(),
-                fail,
-            };
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    if failure == "device" {
-                        // A regular file cannot be registered with epoll.
-                        let fd = tempfile::tempfile().unwrap().into();
-                        AsyncSession::from_fd(
-                            filesystem,
-                            fd,
-                            SessionACL::Owner,
-                            fuser::Config::default(),
-                        )
-                        .await
-                    } else {
-                        let mut builder = fuser::AsyncSessionBuilder::new().filesystem(filesystem);
-                        if failure != "missing mountpoint" {
-                            builder =
-                                builder.mountpoint(directory.path().join("missing-mountpoint"));
-                        }
-                        if failure != "missing options" {
-                            builder = builder.options(fuser::Config::default()).unwrap();
-                        }
-                        builder.build().await
-                    }
-                });
-            let error = result.unwrap_err();
-            let expected_kind = match failure {
-                "mount" => std::io::ErrorKind::NotFound,
-                "device" => std::io::ErrorKind::PermissionDenied,
-                _ => std::io::ErrorKind::InvalidInput,
-            };
-            assert_eq!(error.kind(), expected_kind, "{failure}: {error}");
-            if failure == "mount" && !fail {
-                assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
-            }
-            assert_eq!(error.to_string().contains("owned shutdown failed"), fail);
-            assert_eq!(
-                *events.borrow(),
-                ["shutdown started", "shutdown finished", "drop"],
-                "{failure} failure dropped the source before its asynchronous shutdown"
-            );
-        }
-    }
-}
-
 fn names(mut b: Vec<u8>, names: &[&str]) -> Vec<u8> {
     for n in names {
         b.extend_from_slice(n.as_bytes());
@@ -137,42 +53,9 @@ fn dirents(bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
     }
     out
 }
-#[derive(Debug)]
-struct PlusEntry {
-    nodeid: u64,
-    ino: u64,
-    next: u64,
-    name: Vec<u8>,
-    size: u64,
-    entry_ttl: u64,
-    attr_ttl: u64,
-}
-fn plusents(bytes: &[u8]) -> Vec<PlusEntry> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos < bytes.len() {
-        // Linux FUSE 7.31: entry_out=128, dirent header=24, then padded name.
-        assert!(pos + 152 <= bytes.len());
-        let len = u32::from_ne_bytes(bytes[pos + 144..pos + 148].try_into().unwrap()) as usize;
-        let end = pos + ((152 + len + 7) & !7);
-        assert!(end <= bytes.len());
-        out.push(PlusEntry {
-            nodeid: num(bytes, pos),
-            ino: num(bytes, pos + 128),
-            next: num(bytes, pos + 136),
-            name: bytes[pos + 152..pos + 152 + len].to_vec(),
-            size: num(bytes, pos + 48),
-            entry_ttl: num(bytes, pos + 16),
-            attr_ttl: num(bytes, pos + 24),
-        });
-        pos = end;
-    }
-    out
-}
 struct Peer {
     fd: OwnedFd,
     task: Option<JoinHandle<()>>,
-    async_source: bool,
     unique: u64,
     uid: u32,
     gid: u32,
@@ -212,20 +95,6 @@ impl Peer {
         extra: u32,
         count: usize,
         minor: u32,
-    ) -> (Self, u32) {
-        Self::with_runtime(policy, extended, extra, count, minor, true, true)
-    }
-    fn with_legacy_policy(policy: WritePolicy) -> Self {
-        Self::with_runtime(policy, false, 0, 0, 31, false, false).0
-    }
-    fn with_runtime(
-        policy: WritePolicy,
-        extended: bool,
-        extra: u32,
-        count: usize,
-        minor: u32,
-        prefer_native: bool,
-        asynchronous: bool,
     ) -> (Self, u32) {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
@@ -283,51 +152,20 @@ impl Peer {
             },
             0
         );
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let task = std::thread::spawn(move || {
-            let runtime = if prefer_native
-                && std::env::var_os("GIT_ON_TEST_PROTOCOL_FILE_FALLBACK").is_none()
-            {
-                tokio_uring::Runtime::new(&tokio_uring::builder()).ok()
-            } else {
-                None
-            };
-            let native = runtime.is_some();
-            ready_tx.send(asynchronous).unwrap();
-            let work = async {
-                let filesystem = if !asynchronous {
-                    Fuse::new(overlay)
-                } else if native {
-                    Fuse::with_async_source(overlay).unwrap()
-                } else {
-                    Fuse::with_fallback_source(overlay).unwrap()
-                };
-                let mut session = AsyncSession::from_fd(
-                    filesystem,
-                    server,
-                    SessionACL::All,
-                    fuser::Config::default(),
-                )
-                .await
-                .unwrap();
-                let registrar = session.backing_registrar();
-                session.filesystem_mut().set_backing_registrar(registrar);
-                session.run().await.unwrap();
-            };
-            if let Some(runtime) = runtime {
-                runtime.block_on(work);
-            } else {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(work);
-            }
+            Session::from_fd(
+                Fuse::new(overlay),
+                server,
+                SessionACL::All,
+                fuser::Config::default(),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
         });
         let mut p = Self {
             fd,
             task: Some(task),
-            async_source: ready_rx.recv().unwrap(),
             unique: 0,
             // Tracked entries belong to the mounting process, including CI's
             // runner UID. Credential tests override these IDs explicitly.
@@ -355,12 +193,12 @@ impl Peer {
         // The complete operation suite below still uses the peer's7.31 layout.
         // https://man7.org/linux/man-pages/man4/fuse.4.html (FUSE_INIT)
         assert_eq!(minor.min(daemon_minor), minor);
-        // Header-only local sources support adaptive READDIRPLUS. Other
-        // optional lock/writeback capabilities remain disabled.
+        // No POSIX locks, readdirplus or writeback-cache capabilities enabled.
         let flags = u32::from_ne_bytes(init[12..16].try_into().unwrap());
-        assert_eq!(flags & ((1 << 1) | (1 << 10) | (1 << 16)), 0);
-        assert_eq!(flags & (1 << 13) != 0, asynchronous && minor >= 21);
-        assert_eq!(flags & (1 << 14) != 0, asynchronous && minor >= 21);
+        assert_eq!(
+            flags & ((1 << 1) | (1 << 10) | (1 << 13) | (1 << 14) | (1 << 16)),
+            0
+        );
         (p, flags)
     }
     fn send(&mut self, op: u32, ino: u64, body: Vec<u8>) {
@@ -466,78 +304,40 @@ fn protocol_short_and_extended_init_preserve_ordinary_fuse() {
 }
 
 #[test]
-fn protocol_kernel_cache_tracks_source_and_directory_attributes() {
-    for prefer_native in [false, true] {
-        for policy in [
-            WritePolicy::None,
-            WritePolicy::Ignored,
-            WritePolicy::Untracked,
-            WritePolicy::All,
-        ] {
-            let mut p = if prefer_native {
-                Peer::with_policy(policy)
-            } else {
-                Peer::with_legacy_policy(policy)
-            };
-            let entry = p.ok(1, 1, names(vec![], &["tracked"]));
-            let ino = num(&entry, 0);
-            let protected = policy != WritePolicy::All;
-            assert_eq!(
-                num(&entry, 16) != 0,
-                protected || p.async_source,
-                "positive entry TTL: {policy:?}"
-            );
-            assert_eq!(
-                num(&entry, 24) != 0,
-                protected || p.async_source,
-                "attribute TTL: {policy:?}"
-            );
-            let attributes = p.ok(3, ino, vec![0; 16]);
-            assert_eq!(num(&attributes, 0) != 0, protected || p.async_source);
-            // Protected source metadata stays pinned, including directory attrs.
-            assert_eq!(
-                num(&p.ok(3, 1, vec![0; 16]), 0) != 0,
-                protected || p.async_source
-            );
-            let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+fn protocol_kernel_cache_only_retains_protected_source() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let mut p = Peer::with_policy(policy);
+        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+        let ino = num(&entry, 0);
+        let protected = policy != WritePolicy::All;
+        assert_eq!(num(&entry, 16) != 0, protected, "entry TTL: {policy:?}");
+        assert_eq!(num(&entry, 24) != 0, protected, "attribute TTL: {policy:?}");
+        let attributes = p.ok(3, ino, vec![0; 16]);
+        assert_eq!(num(&attributes, 0) != 0, protected);
+        // Protected source metadata stays pinned, including directory attrs.
+        assert_eq!(num(&p.ok(3, 1, vec![0; 16]), 0) != 0, protected);
+        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+        let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
+        assert_eq!(
+            flags & ((1 << 1) | (1 << 5)),
+            (1 << 1) | if protected { 1 << 5 } else { 0 }
+        );
+        p.release(ino, num(&opened, 0));
+        if policy != WritePolicy::None {
+            let (generated, handle) = p.create("generated.tmp");
+            let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
+            assert_eq!(num(&entry, 16), 0);
+            assert_eq!(num(&entry, 24), 0);
+            let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
             let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
-            assert_eq!(
-                flags & ((1 << 1) | (1 << 5)),
-                (1 << 1)
-                    | if protected || p.async_source {
-                        1 << 5
-                    } else {
-                        0
-                    }
-            );
-            p.release(ino, num(&opened, 0));
-            if policy != WritePolicy::None {
-                let (generated, handle) = p.create("generated.tmp");
-                let entry = p.ok(1, 1, names(vec![], &["generated.tmp"]));
-                assert_eq!(
-                    num(&entry, 16) != 0,
-                    policy == WritePolicy::All && p.async_source
-                );
-                assert_eq!(num(&entry, 24), 0);
-                let opened = p.ok(14, generated, u32s(&[libc::O_RDONLY as u32, 0]));
-                let flags = u32::from_ne_bytes(opened[8..12].try_into().unwrap());
-                assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
-                p.release(generated, num(&opened, 0));
-                p.release(generated, handle);
-                let created = p.ok(9, 1, names(u32s(&[0o700, 0]), &["cache"]));
-                let directory = num(&created, 0);
-                let entry = p.ok(1, 1, names(vec![], &["cache"]));
-                let directory_cache = policy == WritePolicy::All && p.async_source;
-                assert_eq!(num(&entry, 24) != 0, directory_cache);
-                assert_eq!(
-                    num(&p.ok(3, directory, vec![0; 16]), 0) != 0,
-                    directory_cache
-                );
-                assert_eq!(
-                    num(&p.ok(3, 1, vec![0; 16]), 0) != 0,
-                    protected || p.async_source
-                );
-            }
+            assert_eq!(flags & ((1 << 1) | (1 << 5)), 0);
+            p.release(generated, num(&opened, 0));
+            p.release(generated, handle);
         }
     }
 }
@@ -566,41 +366,35 @@ fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
 }
 
 #[test]
-fn protocol_all_source_data_cache_stops_after_copy_up_with_owned_attributes() {
-    for prefer_native in [false, true] {
-        let mut p = if prefer_native {
-            Peer::with_policy(WritePolicy::All)
-        } else {
-            Peer::with_legacy_policy(WritePolicy::All)
-        };
-        let entry = p.ok(1, 1, names(vec![], &["tracked"]));
-        let ino = num(&entry, 0);
-        assert_eq!(num(&entry, 16) != 0, p.async_source);
-        assert_eq!(num(&entry, 24) != 0, p.async_source);
-        let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
-        assert_eq!(
-            u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
-            (1 << 1) | if p.async_source { 1 << 5 } else { 0 }
-        );
-        let reader = num(&opened, 0);
-        assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
-        let writer = p.open(ino, libc::O_RDWR);
-        p.ok(
-            16,
-            ino,
-            [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
-        );
-        assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
-        let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
-        assert_eq!(
-            u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
-            0
-        );
-        assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
-        p.release(ino, num(&reopened, 0));
-        p.release(ino, writer);
-        p.release(ino, reader);
-    }
+fn protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls() {
+    let mut p = Peer::with_policy(WritePolicy::All);
+    let entry = p.ok(1, 1, names(vec![], &["tracked"]));
+    let ino = num(&entry, 0);
+    assert_eq!(num(&entry, 16), 0);
+    assert_eq!(num(&entry, 24), 0);
+    let opened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(opened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        1 << 1
+    );
+    let reader = num(&opened, 0);
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
+    let writer = p.open(ino, libc::O_RDWR);
+    p.ok(
+        16,
+        ino,
+        [io(writer, 0, 9, 0), b"changed!\n".to_vec()].concat(),
+    );
+    assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"changed!\n");
+    let reopened = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(reopened[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        0
+    );
+    assert_eq!(num(&p.ok(3, ino, vec![0; 16]), 0), 0);
+    p.release(ino, num(&reopened, 0));
+    p.release(ino, writer);
+    p.release(ino, reader);
 }
 
 #[test]
@@ -990,135 +784,6 @@ fn protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity() {
 }
 
 #[test]
-fn protocol_readdirplus_pages_preserve_attributes_cookies_and_lookup_lifetimes() {
-    for policy in [
-        WritePolicy::None,
-        WritePolicy::Ignored,
-        WritePolicy::Untracked,
-        WritePolicy::All,
-    ] {
-        let (mut p, _) = Peer::with_directory_size(policy, false, 0, 64);
-        let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-        let cold = plusents(&p.ok(44, 1, io(h, 0, 512, 0)));
-        assert!(
-            cold.iter().all(|entry| entry.nodeid == 0),
-            "the initial adaptive probe loaded cold file attributes"
-        );
-        assert!(p.ok(44, 1, io(h, 0, 0, 0)).is_empty());
-        assert!(p.ok(44, 1, io(h, 0, 159, 0)).is_empty());
-        let dot = plusents(&p.ok(44, 1, io(h, 0, 160, 0)));
-        assert_eq!(dot.len(), 1);
-        assert_eq!(
-            (&dot[0].name, dot[0].nodeid, dot[0].ino, dot[0].next),
-            (&b".".to_vec(), 0, 1, 1)
-        );
-        let first = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
-        assert_eq!(first.len(), 1);
-        let first = &first[0];
-        assert_eq!(first.name, b".gitignore");
-        assert_eq!(first.nodeid, first.ino);
-        assert_eq!(first.size, b"*.tmp\n/cache/\n".len() as u64);
-        assert!(first.entry_ttl > 0 && first.attr_ttl > 0);
-        let ino = first.nodeid;
-        p.ok(29, 1, u64s(&[h, 0, 0]));
-        p.send(2, ino, u64s(&[1]));
-        p.err(3, ino, vec![0; 16], libc::ENOENT);
-        assert_eq!(p.lookup(1, ".gitignore"), ino);
-        let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-        let expected = dirents(&p.ok(28, 1, io(h, 0, 4096, 0)));
-        let mut got = Vec::new();
-        let mut offset = 0;
-        loop {
-            let page = p.ok(44, 1, io(h, offset, 512, 0));
-            assert!(page.len() <= 512);
-            let entries = plusents(&page);
-            if entries.is_empty() {
-                break;
-            }
-            for entry in entries {
-                assert!(entry.next > offset as u64);
-                offset = entry.next as i64;
-                got.push((entry.next, entry.name));
-            }
-        }
-        assert_eq!(got, expected);
-        assert!(p.ok(44, 1, io(h, 1_000_000, 512, 0)).is_empty());
-        p.err(44, 1, io(h, -1, 512, 0), libc::EINVAL);
-        p.err(44, 1, io(u64::MAX, 0, 512, 0), libc::EBADF);
-        p.err(44, ino, io(h, 0, 512, 0), libc::EBADF);
-        p.ok(29, 1, u64s(&[h, 0, 0]));
-        p.err(44, 1, io(h, 0, 512, 0), libc::EBADF);
-    }
-    let mut legacy = Peer::with_legacy_policy(WritePolicy::None);
-    let h = num(&legacy.ok(27, 1, u32s(&[0, 0])), 0);
-    legacy.err(44, 1, io(h, 0, 4096, 0), libc::ENOSYS);
-}
-
-#[test]
-fn protocol_readdirplus_old_view_does_not_publish_a_replacement_binding() {
-    let mut p = Peer::with_policy(WritePolicy::All);
-    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-    let listing = dirents(&p.ok(28, 1, io(h, 0, 4096, 0)));
-    let cookie = listing
-        .iter()
-        .find(|(_, name)| name == b"tracked")
-        .unwrap()
-        .0;
-    let old = p.lookup(1, "tracked");
-    p.ok(12, 1, names(u64s(&[1]), &["tracked", "moved"]));
-    let (new, fh) = p.create("tracked");
-    p.ok(
-        16,
-        new,
-        [io(fh, 0, 3, libc::O_RDWR), b"new".to_vec()].concat(),
-    );
-    let page = plusents(&p.ok(44, 1, io(h, cookie as i64 - 1, 160, 0)));
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].name, b"tracked");
-    assert_eq!(page[0].ino, old);
-    assert_eq!(page[0].nodeid, 0);
-    assert_eq!(p.lookup(1, "tracked"), new);
-    assert_eq!(p.lookup(1, "moved"), old);
-    assert_eq!(p.ok(15, new, io(fh, 0, 100, 0)), b"new");
-}
-
-#[test]
-fn protocol_readdirplus_reuses_published_metadata_without_duplicate_lookup_refs() {
-    let mut p = Peer::with_policy(WritePolicy::All);
-    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-    let first = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
-    assert_eq!(first.len(), 1);
-    let ino = first[0].nodeid;
-    assert_ne!(ino, 0);
-    let again = plusents(&p.ok(44, 1, io(h, 2, 168, 0)));
-    assert_eq!(again.len(), 1);
-    assert_eq!((again[0].nodeid, again[0].ino), (0, ino));
-    p.ok(29, 1, u64s(&[h, 0, 0]));
-    p.send(2, ino, u64s(&[1]));
-    p.err(3, ino, vec![0; 16], libc::ENOENT);
-}
-
-#[test]
-fn protocol_readdirplus_keeps_mutable_attributes_live_and_names_cached() {
-    let mut p = Peer::with_policy(WritePolicy::All);
-    let source = p.lookup(1, "tracked");
-    let writing = p.open(source, libc::O_RDWR);
-    p.ok(
-        16,
-        source,
-        [io(writing, 9, 1, libc::O_RDWR), b"!".to_vec()].concat(),
-    );
-    let h = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-    let entries = plusents(&p.ok(44, 1, io(h, 2, 4096, 0)));
-    let modified = entries.iter().find(|e| e.name == b"tracked").unwrap();
-    assert_eq!(modified.size, 10);
-    assert_eq!(modified.attr_ttl, 0);
-    assert!(modified.entry_ttl > 0);
-    let unchanged = entries.iter().find(|e| e.name == b"link").unwrap();
-    assert!(unchanged.attr_ttl > 0 && unchanged.entry_ttl > 0);
-}
-
-#[test]
 fn protocol_overlapping_merged_versions_preserve_issued_cookies() {
     use std::collections::BTreeSet;
     for policy in [
@@ -1409,8 +1074,7 @@ fn protocol_all_unsupported_callbacks_refuse_without_mutation() {
     for (op, body) in cases {
         p.err(op, ino, body, libc::ENOSYS);
     }
-    let plus = plusents(&p.ok(44, 1, io(directory, 0, 4096, 0)));
-    assert!(plus.iter().any(|entry| entry.name == b"optional.tmp"));
+    p.err(44, 1, io(directory, 0, 4096, 0), libc::ENOSYS);
     assert_eq!(p.ok(15, ino, io(fh, 0, 100, 0)), b"sentinel");
     assert_eq!(p.lookup(1, "optional.tmp"), ino);
     assert_eq!(p.ok(3, ino, vec![0; 16]), before);
@@ -1799,122 +1463,4 @@ fn protocol_pending_caller_signal_does_not_invent_read_error() {
     let handle = peer.open(ino, libc::O_RDONLY);
     assert_eq!(peer.ok(15, ino, io(handle, 0, 100, 0)), b"original\n");
     peer.release(ino, handle);
-}
-
-#[test]
-fn protocol_fallback_executes_the_complete_wire_suite() {
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--skip",
-            "protocol_fallback_executes_the_complete_wire_suite",
-        ])
-        .env("GIT_ON_TEST_PROTOCOL_FILE_FALLBACK", "1")
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-}
-
-#[test]
-fn protocol_readonly_no_opendir_pages_cookies_and_sync() {
-    for (native, asynchronous) in [(true, true), (false, true), (false, false)] {
-        let (mut p, flags) = Peer::with_runtime(
-            WritePolicy::None,
-            false,
-            1 << 24,
-            1024,
-            31,
-            native,
-            asynchronous,
-        );
-        assert_ne!(flags & (1 << 24), 0);
-        p.err(27, 1, u32s(&[0, 0]), libc::ENOSYS);
-        assert_eq!(dirents(&p.ok(28, 1, io(0, 0, 32, 0))), [(1, b".".to_vec())]);
-        let page = p.ok(28, 1, io(0, 100, 48, 0));
-        assert_eq!(dirents(&page).len(), 1);
-        assert_eq!(num(&page, 8), 101);
-        assert_eq!(p.ok(28, 1, io(0, 100, 48, 0)), page);
-        let ino = num(&page, 0);
-        let name = std::str::from_utf8(&dirents(&page)[0].1)
-            .unwrap()
-            .to_owned();
-        assert_eq!(p.lookup(1, &name), ino);
-        p.send(2, ino, u64s(&[1]));
-        p.err(3, ino, vec![0; 16], libc::ENOENT);
-        assert_eq!(p.lookup(1, &name), ino);
-        if asynchronous {
-            let plus = plusents(&p.ok(44, 1, io(0, 100, 512, 0)));
-            assert!(!plus.is_empty());
-            assert_eq!(plus[0].ino, ino);
-            assert_eq!(plus[0].nodeid, ino);
-            assert_eq!(plus[0].next, 101);
-            assert_eq!(plus[0].name, name.as_bytes());
-            assert_eq!(plus[0].size, b"unrequested payload".len() as u64);
-        }
-        assert!(p.ok(28, 1, io(0, 99999, 48, 0)).is_empty());
-        p.err(28, 1, io(0, -1, 48, 0), libc::EINVAL);
-        p.err(28, 1, io(777, 0, 48, 0), libc::EBADF);
-        for datasync in [0, 1] {
-            p.ok(30, 1, [u64s(&[0]), u32s(&[datasync, 0])].concat());
-        }
-        p.err(30, 1, [u64s(&[777]), u32s(&[0, 0])].concat(), libc::EBADF);
-        let tracked = p.lookup(1, "tracked");
-        p.err(27, tracked, u32s(&[0, 0]), libc::ENOTDIR);
-        p.err(28, tracked, io(0, 0, 48, 0), libc::ENOTDIR);
-        p.err(
-            30,
-            tracked,
-            [u64s(&[0]), u32s(&[0, 0])].concat(),
-            libc::ENOTDIR,
-        );
-    }
-    for policy in [
-        WritePolicy::Ignored,
-        WritePolicy::Untracked,
-        WritePolicy::All,
-    ] {
-        let (mut p, flags) = Peer::with_capabilities(policy, false, 1 << 24);
-        assert_eq!(flags & (1 << 24), 0);
-        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
-        assert_ne!(handle, 0);
-        p.err(28, 1, io(0, 0, 48, 0), libc::EBADF);
-        p.ok(29, 1, u64s(&[handle, 0, 0]));
-    }
-}
-
-#[test]
-fn protocol_readonly_zero_directory_handle_getattr() {
-    let mut failures = Vec::new();
-    for no_open in [false, true] {
-        for (native, asynchronous) in [(true, true), (false, true), (false, false)] {
-            let caps = (1 << 24) | if no_open { 1 << 17 } else { 0 };
-            let (mut p, flags) =
-                Peer::with_runtime(WritePolicy::None, false, caps, 0, 31, native, asynchronous);
-            assert_eq!(flags & caps, caps);
-            p.err(27, 1, u32s(&[0, 0]), libc::ENOSYS);
-            let request = |fh| [u32s(&[1, 0]), u64s(&[fh])].concat();
-            match p.call(3, 1, request(0)) {
-                Ok(attr) => assert_eq!(
-                    u32::from_ne_bytes(attr[76..80].try_into().unwrap()) & libc::S_IFMT,
-                    libc::S_IFDIR
-                ),
-                Err(errno) => failures.push((native, asynchronous, no_open, errno)),
-            }
-            p.err(3, 1, request(777), libc::EBADF);
-            let tracked = p.lookup(1, "tracked");
-            if no_open {
-                assert_eq!(num(&p.ok(3, tracked, request(0)), 24), 9);
-            } else {
-                p.err(3, tracked, request(0), libc::EBADF);
-            }
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "zero directory fstat failed: {failures:?}"
-    );
 }

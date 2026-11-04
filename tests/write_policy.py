@@ -17,28 +17,6 @@ from integration import BINARY, FUSE_AVAILABLE, OPTIONS, PARSER, RepositoryTest,
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE device and fusermount3 required")
 class WritePolicyTests(RepositoryTest):
-    def test_async_file_fallback_all_policies_from_this_checkout(self):
-        # This is a source-level fallback mount check, separate from the CLI
-        # binary selected below. The normal CI entry point runs it explicitly;
-        # the ordinary Rust suite does not require a FUSE-capable host.
-        root = Path(__file__).resolve().parents[1]
-        command = [
-            "cargo", "test", "--release", "--locked", "--lib",
-            "backend::linux::tests::fallback_real_mount_all_policies",
-            "--", "--ignored", "--exact", "--color=never",
-        ]
-        process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            self.fail("fallback mount check timed out: " + stderr.decode(errors="replace"))
-        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-        self.assert_success(result)
-        self.assertIn(b"test result: ok. 1 passed; 0 failed; 0 ignored;", stdout,
-                      "the explicit fallback mount test must actually run")
 
     def policy(self, policy, code):
         return self.invoke_argv([

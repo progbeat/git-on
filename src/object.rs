@@ -1,6 +1,6 @@
 //! Verified, cancellable transfers. libgit2 streams loose objects; its pack
 //! backend currently requires decoded objects (including necessary delta bases).
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
 use std::{
@@ -47,28 +47,12 @@ impl std::fmt::Display for InvalidObject {
 }
 impl std::error::Error for InvalidObject {}
 
-#[derive(Debug)]
-pub(crate) enum TransferStopped {
-    Signal(i32),
-    CommandCompleted,
-}
-impl std::fmt::Display for TransferStopped {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Signal(signal) => write!(f, "object transfer cancelled by signal {signal}"),
-            Self::CommandCompleted => {
-                f.write_str("object transfer stopped after command completion")
-            }
-        }
-    }
-}
-impl std::error::Error for TransferStopped {}
 pub(crate) fn check_transfer() -> Result<()> {
     if let Some(signal) = crate::git::cancelled_signal() {
-        return Err(TransferStopped::Signal(signal).into());
+        bail!("object transfer cancelled by signal {signal}");
     }
     if crate::git::operations_stopped() {
-        return Err(TransferStopped::CommandCompleted.into());
+        bail!("object transfer stopped after command completion");
     }
     Ok(())
 }

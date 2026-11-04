@@ -37,7 +37,7 @@ def directory_reopen_code(count):
 
 def directory_child_code(count):
     return 'expected='+repr([name.encode() for name in directory_names(count)])+'\n'+r'''
-import ctypes,json,os,stat
+import ctypes,json,os
 libc=ctypes.CDLL(None,use_errno=True)
 class Dirent64(ctypes.Structure):
     _fields_=[('ino',ctypes.c_uint64),('offset',ctypes.c_int64),
@@ -48,7 +48,6 @@ libc.telldir.argtypes=[ctypes.c_void_p];libc.telldir.restype=ctypes.c_long
 libc.seekdir.argtypes=[ctypes.c_void_p,ctypes.c_long]
 libc.rewinddir.argtypes=[ctypes.c_void_p]
 libc.closedir.argtypes=[ctypes.c_void_p];libc.closedir.restype=ctypes.c_int
-libc.dirfd.argtypes=[ctypes.c_void_p];libc.dirfd.restype=ctypes.c_int
 expected=set(expected)|{b'.',b'..'}
 def read_one(stream):
     ctypes.set_errno(0);entry=libc.readdir64(stream)
@@ -67,10 +66,6 @@ identities=None
 for phase in ('first','repeat'):
     stream=libc.opendir(b'paged');assert stream,ctypes.get_errno()
     try:
-        descriptor=libc.dirfd(stream);assert descriptor>=0,ctypes.get_errno()
-        attributes=os.fstat(descriptor)
-        assert stat.S_ISDIR(attributes.st_mode) and attributes.st_ino==os.lstat(b'paged').st_ino
-        os.fsync(descriptor)
         prefix=[read_one(stream) for _ in range(min(450,len(expected)-2))]
         assert None not in prefix
         cookie=libc.telldir(stream);assert cookie>=0
@@ -155,24 +150,6 @@ def run(options):
             for opcode in ('lookup','read'):
                 assert 0<on['fuse_requests'].get(opcode,0)<off['fuse_requests'].get(opcode,0),(opcode,on,off)
             record(dict(mode='kernel-cache-invariants',result='passed',
-                        unchanged_payload_and_namespace=True))
-            all_observations=[]
-            for uncached in (True,False):
-                env=dict(f.env)
-                if uncached:env['GIT_ON_TEST_UNCACHED_SOURCE']='1'
-                else:env.pop('GIT_ON_TEST_UNCACHED_SOURCE',None)
-                argv=[str(options.binary.resolve()),'main','--write-policy=all','--',*child]
-                sample=dict(mode='all-uncached-names' if uncached else 'all-cached-names',
-                            **capture(argv,f.repo,env,f.root,metrics=True))
-                record(sample);all_observations.append(sample)
-                assert not list(f.root.glob('git-on-*')),'private all-policy run leaked'
-                assert f.git('show-ref')==original,'all-policy source refs changed'
-            off,on=all_observations
-            assert 0<on['fuse_requests']['lookup']<off['fuse_requests']['lookup'],all_observations
-            record(dict(mode='all-name-cache-invariants',result='passed',
-                        unchanged_payload_and_namespace=True,attributes_remain_live=True))
-            assert 0<on['fuse_requests']['getattr']<off['fuse_requests']['getattr'],all_observations
-            record(dict(mode='all-attribute-cache-invariants',result='passed',
                         unchanged_payload_and_namespace=True))
             directory_cache_case(f,options.binary,record)
     finally:

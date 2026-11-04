@@ -1,5 +1,0 @@
-# Keep pinned third-party whitespace intact and focus review on the local diffs.
-crates/async-fuser/** linguist-vendored -whitespace
-crates/tokio-uring/** linguist-vendored -whitespace
-crates/*/upstream.patch linguist-vendored=false
-crates/*/LOCAL-CHANGES.md linguist-vendored=false
