@@ -64,13 +64,18 @@ class CiPlanTests(unittest.TestCase):
         self.assertEqual(documentation['required'],dict.fromkeys(KINDS,False))
         for path in ('src/cli.rs','src/backend/linux.rs','Cargo.lock','Cargo.toml','.cargo/config.toml',
                      '.github/workflows/ci.yml','tests/remote.py','tests/support/source_probe.rs','tests/test_ci_contract.py',
-                     'scripts/ci_plan.py','AGENTS.md','docs/specification.md','vendor/unknown/source.c','new.config','unknown\nfile'):
+                     'scripts/ci_plan.py','AGENTS.md','docs/specification.md','docs/resources.md','vendor/unknown/source.c','new.config','unknown\nfile'):
             with self.subTest(path=path):self.assertEqual(select([path],HEAD)['required'],dict.fromkeys(KINDS,True))
 
     def test_specific_drivers_select_their_distinct_coverage_and_union_changes(self):
-        for path,kind in (('tests/stress.py','stress'),('tests/scalability.py','scale'),('tests/test_scalability_harness.py','scale'),('tests/benchmark.py','lazy'),('tests/pack_scaling.py','resources')):
+        for path,kind in (('tests/stress.py','stress'),('tests/test_scalability_harness.py','scale'),('tests/benchmark.md','lazy'),('tests/pack_scaling.py','resources')):
             self.assertEqual(select([path],HEAD)['required'],{k:k==kind for k in KINDS})
-        self.assertEqual(select(['tests/stress.py','tests/benchmark.py'],HEAD)['required'],dict(scale=False,stress=True,lazy=True,resources=False))
+        self.assertEqual(select(['tests/stress.py','tests/pack_scaling.py'],HEAD)['required'],dict(scale=False,stress=True,lazy=False,resources=True))
+
+    def test_shared_workload_modules_require_all_consuming_suites(self):
+        for path in ('tests/benchmark.py','tests/scalability.py'):
+            with self.subTest(path=path):
+                self.assertEqual(select([path],HEAD)['required'],dict.fromkeys(KINDS,True))
 
     def test_manual_full_and_unknown_comparisons_cannot_skip(self):
         for value in (True,'true'):

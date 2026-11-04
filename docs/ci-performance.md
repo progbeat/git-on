@@ -66,9 +66,10 @@ before SHA; unavailable comparisons conservatively require all affected suites.
 | Changed input | Additional coverage required before merge |
 | --- | --- |
 | Runtime, dependencies, build settings, workflows, shared fixtures/helpers, normative contract documents, unknown paths | Scale, differential stress, lazy benchmarks and distinct-object resource controls |
-| `scalability.py` or its own harness tests | Scale, including the enabled-passthrough scale groups |
+| `benchmark.py` or `scalability.py` (shared workloads, fixtures and validators) | All heavy suites |
+| `test_scalability_harness.py` | Scale, including the enabled-passthrough scale groups |
 | `stress.py` | Differential stress |
-| `benchmark.py` / benchmark contract | Lazy benchmarks and remote million-file demand control |
+| `benchmark.md` (benchmark contract) | Lazy benchmarks and remote million-file demand control |
 | `pack_scaling.py` | Distinct-object pack resources |
 | Recognized non-contract prose/media | Base only |
 
@@ -116,9 +117,9 @@ actually runs.
 | Huge lazy startup and selected demand | Separate million-distinct-file fixture and benchmarks | Unchanged million-distinct-file true/cat and unused-subtree/large-range gates through real FUSE |
 | Large namespace, diverse real payloads and cleanup | Shared-object million-path traversal plus selective 100k reads | WebKit full namespace and payload validation; no separate million-path count checkbox. Small synthetic namespace/corruption regressions remain |
 | Eager materialization | Same preparation repeated for no-op, sparse and full children | Full child records startup, then exercises stat/repeated reads and complete bytes in one snapshot. Inert-child/fallback/interrupt semantics remain in `materialized.py` and remote integration tests |
-| Fresh remote invocations / no global cache | Repeat every workload after every source/size/signature case | Permanent two-process no-cache regression; each matrix invocation asserts its exact demanded OID set. Verified/unverified invocations also use fresh private ODBs |
+| Fresh remote invocations / no global cache | Repeat every workload after every source/size/signature case | The HTTPS regression checks exact fresh demand sets for two `HEAD` invocations and an explicit commit, including a ref movement after resolution. Each matrix invocation also checks its demanded OID set; verified/unverified invocations use fresh private ODBs |
 | Memory-cache eviction / descriptor growth | 192 and 512 distinct-object controls plus shared-object namespace tests | Same reduced-RLIMIT 192-object test, same-run reread after memory eviction, and 32/128/512 distinct pack controls |
-| Streaming large-object and import thresholds | Three 96 MiB remote objects, previously chosen to exceed a removed global 256 MiB cache | Three 16 MiB objects exceed the 64 KiB raw streaming threshold and 8 MiB native import threshold; their combined working set exceeds the 16 MiB payload budget. Local 16/64/128 MiB range controls remain |
+| Streaming large-object and import thresholds | Three 96 MiB remote objects, previously chosen to exceed a removed global 256 MiB cache | Three 16 MiB objects exceed the 64 KiB raw streaming threshold and 8 MiB native import threshold. Their three retained 64 KiB blocks total about 192 KiB; this checks streaming and reopen reuse. The separate 300-object control uses distinct 64 KiB payloads to force LRU eviction. Local 16/64/128 MiB range controls remain |
 | Whole-invocation overhead and unique-object reuse | Loader-only pack metadata trace could not establish total cost | The pinned WebKit benchmark measures complete clone/checkout + identical command + cleanup and Git-on's complete invocation. Separate behavioral CLI regressions use 160 distinct 8 KiB blobs through FUSE and 32 through materialization, check two closed-read/stat passes and one decode per unique object, and audit real native command execution. These regressions do not claim performance acceptance |
 | Long clean unmount / escaped users / cancellation | Full scale plus permanent helper and real-mount regressions | Real 4s-helper regression, WebKit teardown and busy/escaped-reader/runner-directed signal tests remain; delayed caller signals do not require prompt synthetic EINTR. Generated million opened-file pressure is not claimed for the replacement |
 | Write permissions, bytes/links/metadata, protocol errors and lifecycle | Unit/protocol, real mount, packages and seeded differential suites | All retained; differential stress parameters remain two seeds in default ignored, 400 operations, 64 nodes and 64 KiB per file |

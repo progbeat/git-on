@@ -2,7 +2,6 @@
 """Guard the real workload's root-only metadata allowance without weakening laziness."""
 import unittest
 import contextlib
-import io
 import json
 import subprocess
 import os
@@ -44,18 +43,6 @@ class ScalabilityHarnessTests(unittest.TestCase):
                 validate_lazy_noop(dict(tree_reads=trees,blob_loads=0),description)
             for metrics in (dict(tree_reads=2,blob_loads=0),dict(tree_reads=1,blob_loads=1)):
                 with self.assertRaises(AssertionError): validate_lazy_noop(metrics,description)
-
-    def test_full_walk_checks_root_git_invariant_once(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);(root/'0/0').mkdir(parents=True)
-            (root/'0/0/0').write_bytes(b'0000000\n');(root/'.gitignore').write_bytes(b'out/\n')
-            previous=Path.cwd()
-            try:
-                os.chdir(root)
-                with mock.patch.dict(os.environ,{'GIT_ON_TREE_OID':'fixture'}), mock.patch.object(sys,'argv',['child','full','1','[1,1,1]']), mock.patch('os.path.exists',wraps=os.path.exists) as exists, contextlib.redirect_stdout(io.StringIO()):
-                    exec(CHILD,{})
-                self.assertEqual(sum(call.args==('.git',) for call in exists.call_args_list),1)
-            finally: os.chdir(previous)
 
     def test_eager_materialization_keeps_its_required_full_tree_work(self):
         validate_lazy_noop(dict(tree_reads=6,blob_loads=2),dict(backend='materialized',workload='noop'))

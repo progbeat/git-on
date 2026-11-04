@@ -805,23 +805,28 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
     def test_https_fresh_runs_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        process=f.probe(url); start=f.line(process)
-        self.assertEqual(set(start['objects']), {f.commit, f.tree})
-        self.assertFalse((f.cwd/'.git').exists())
-        value, listed=f.operation(process, 'list ')
-        self.assertEqual(set(value['names']), {'.gitignore','deep','other'})
-        self.assertEqual(set(listed['objects']), {f.commit,f.tree})
-        moved_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
-        f.git('update-ref', 'refs/heads/main', f.git('commit-tree', moved_tree, data=b'moved\n'))
-        value, read=f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(set(read['objects']), {f.commit,f.tree,f.subtree,f.blob})
-        self.assertNotIn(f.other, read['objects']); f.finish(process)
-        requests=len(f.requests)
-        repeated=f.probe(url, f.commit); f.line(repeated); f.operation(repeated,'read deep/file'); f.finish(repeated)
-        # Each invocation resolves its revision and fetches its demanded objects.
-        new=f.requests[requests:]
-        self.assertEqual({oid for request in new for oid in request['wants']},{f.commit,f.tree,f.subtree,f.blob})
+        wanted={f.commit,f.tree,f.subtree,f.blob}
+        for invocation,revision in enumerate(('HEAD','HEAD',f.commit)):
+            with self.subTest(invocation=invocation,revision=revision):
+                requests=len(f.requests)
+                process=f.probe(url,revision); start=f.line(process)
+                self.assertEqual(set(start['objects']),{f.commit,f.tree})
+                if invocation==0:
+                    self.assertFalse((f.cwd/'.git').exists())
+                    value,listed=f.operation(process,'list ')
+                    self.assertEqual(set(value['names']),{'.gitignore','deep','other'})
+                    self.assertEqual(set(listed['objects']),{f.commit,f.tree})
+                if invocation==1:
+                    # Move HEAD after resolution. This invocation stays pinned;
+                    # the next explicitly requests the original commit.
+                    moved_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+                    f.git('update-ref','refs/heads/main',f.git('commit-tree',moved_tree,data=b'moved\n'))
+                value,read=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n')
+                self.assertEqual(set(read['objects']),wanted)
+                f.finish(process)
+                self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},wanted)
+        self.assertFalse((f.root/'cache').exists(),'remote run created a global cache')
         expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
         self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
@@ -1333,19 +1338,10 @@ print('caught-EIO-and-returned-success')
                     self.assertEqual((directory/'keep').read_bytes(),b'old user data')
         f.env=original
 
-    def test_separate_remote_runs_fetch_demanded_objects_again(self):
-        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
-        demands=[]
-        for _ in range(2):
-            start=len(f.requests);process=f.probe(url);f.line(process)
-            value,_=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
-            f.finish(process)
-            demands.append({oid for request in f.requests[start:] for oid in request['wants']})
-        self.assertEqual(demands,[{f.commit,f.tree,f.subtree,f.blob}]*2)
-        self.assertFalse((f.root/'cache').exists(),'remote run created a global cache')
-
     def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
-        f=self.f; ids=[];object_mib=16 # Above both the 8 MiB decoded cache and native Git streaming threshold.
+        # Exceed raw-streaming and native-import thresholds. The range reads
+        # retain one 64 KiB block per object, so this is not an eviction test.
+        f=self.f; ids=[];object_mib=16
         for byte in b'abc':
             with tempfile.TemporaryFile() as output:
                 writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)

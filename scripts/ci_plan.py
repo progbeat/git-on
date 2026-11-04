@@ -14,15 +14,15 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[1]
 KINDS=('scale','stress','lazy','resources')
-CONTRACT_DOCS={'AGENTS.md','docs/specification.md','docs/interview.md','docs/fuse-coverage.md','docs/platforms.md','docs/remote.md','docs/releases.md'}
+CONTRACT_DOCS={'AGENTS.md','docs/specification.md','docs/interview.md','docs/fuse-coverage.md','docs/platforms.md','docs/remote.md','docs/releases.md','docs/resources.md'}
 SCOPED={
-    'tests/scalability.py':('scale',),
     'tests/test_scalability_harness.py':('scale',),
     'tests/stress.py':('stress',),
-    'tests/benchmark.py':('lazy',),
     'tests/benchmark.md':('lazy',),
     'tests/pack_scaling.py':('resources',),
 }
+# benchmark.py and scalability.py also supply shared workloads, fixtures and
+# validators. Their consumers require the conservative shared-input path.
 
 
 def matrix(profile):
