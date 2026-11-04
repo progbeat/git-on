@@ -30,6 +30,7 @@ PIN = dict(repository='https://github.com/WebKit/WebKit.git',
 MODULES = 'Tools/Scripts/webkitpy/style/'
 LIGHT_TESTS = ('webkitcorepy.tests.version_unittest', 'webkitcorepy.tests.string_utils_unittest',
     'webkitcorepy.tests.filtered_call_unittest')
+LIGHT_TEST_COUNT = 32
 
 
 def environment():
@@ -260,7 +261,7 @@ def child(manifest_path, workload, stat_bytes):
             env=dict(os.environ,PYTHONPATH='Tools/Scripts/libraries/webkitcorepy',DISABLE_WEBKITCOREPY_AUTOINSTALLER='1')
             result=subprocess.run([sys.executable,'-B','-S','-m','unittest',*LIGHT_TESTS],env=env,capture_output=True,text=True)
             validate_test_output(result.returncode,result.stderr)
-            print(json.dumps(dict(completed=phase,workload=workload,test_count=32,test_modules=LIGHT_TESTS,
+            print(json.dumps(dict(completed=phase,workload=workload,test_count=LIGHT_TEST_COUNT,test_modules=LIGHT_TESTS,
                 test_output=result.stderr,elapsed_ns=time.monotonic_ns()-begin)),flush=True)
             continue
         if workload == 'syntax':
@@ -309,7 +310,7 @@ def child(manifest_path, workload, stat_bytes):
 
 
 def validate_test_output(code, output):
-    if code or not re.search(r'(?m)^Ran 32 tests in [0-9.]+s$',output) or not output.strip().endswith('\nOK'):
+    if code or not re.search(rf'(?m)^Ran {LIGHT_TEST_COUNT} tests in [0-9.]+s$',output) or not output.strip().endswith('\nOK'):
         raise ValueError(f'upstream unit tests did not all pass: {code}\n{output}')
 
 
@@ -351,7 +352,7 @@ def validate_reports(data, head, pin=PIN, trials=3):
                 raise ValueError('incomplete full namespace/payload read')
         else:
             for result in observed+direct:
-                if result['test_count']!=32 or tuple(result['test_modules'])!=LIGHT_TESTS:raise ValueError('wrong upstream test selection')
+                if result['test_count']!=LIGHT_TEST_COUNT or tuple(result['test_modules'])!=LIGHT_TESTS:raise ValueError('wrong upstream test selection')
                 validate_test_output(0,result['test_output'])
         m=runner['metrics']; validate_cache_budgets(m)
         if (full and m['blob_loads']!=counts['nonempty_unique_blob_objects']) or not 0<m['blob_loads']<=counts['nonempty_unique_blob_objects'] or m['fuse_requests'].get('read',0)<=0:
@@ -379,7 +380,7 @@ def validate_reports(data, head, pin=PIN, trials=3):
         if not any(r['memory']['count']>0 and r['memory']['peak_rss_sum_kib']>0 for r in baseline['materialize']['commands']):
             raise ValueError('preparation memory was not observed')
     partial=sum(r['runner']['memory']['unavailable'] for r in runs)
-    return dict(pin=pin['commit'],full_local_passes=2,test_invocations=2*trials,upstream_tests_per_pass=32,baseline_materializations=2,
+    return dict(pin=pin['commit'],full_local_passes=2,test_invocations=2*trials,upstream_tests_per_pass=LIGHT_TEST_COUNT,baseline_materializations=2,
         partial_process_tree_rss_samples=partial,memory_primary='wait4 largest waited process peak, not aggregate physical memory')
 
 
@@ -458,12 +459,12 @@ def run(options):
             if workload=='full':assert m['blob_loads']==metadata['counts']['nonempty_unique_blob_objects'],'verified descriptor count differs from demanded unique payloads'
             assert m['fuse_requests'].get('read', 0) > 0, 'no actual FUSE reads'
             if workload == 'tests':
-                assert all(r['test_count']==32 for r in observed)
+                assert all(r['test_count']==LIGHT_TEST_COUNT for r in observed)
                 assert m['blob_loads'] < metadata['counts']['blob_paths'], 'small workload materialized whole tree'
             else: assert all(r['files'] == PIN['blob_paths'] and r['payload_bytes'] == PIN['logical_blob_bytes'] for r in observed)
             assert not list(root.glob('git-on-*')), 'invocation cleanup incomplete'
             record(dict(type='real_repository', workload=workload, source=source, trial=trial, order=order,
-                baseline=before, runner=after, method='full two-pass real namespace/data; 32 upstream webkitcorepy unit tests through stdlib unittest without SDK/autoinstall',
+                baseline=before, runner=after, method=f'full two-pass real namespace/data; {LIGHT_TEST_COUNT} upstream webkitcorepy unit tests through stdlib unittest without SDK/autoinstall',
                 transfer_evidence=dict(remote_verified_blob_bytes=m.get('remote_raw_blob_bytes', 0),
                     remote_verified_blobs=m.get('remote_raw_blob_imports', 0),
                     session_pack_payload_bytes=m.get('remote_session_pack_bytes',0),

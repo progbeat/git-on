@@ -69,6 +69,18 @@ pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {
         .expect("SHA-1 output size"))
 }
 
+pub(crate) struct TeeRead<R, W> {
+    pub(crate) input: R,
+    pub(crate) output: W,
+}
+impl<R: Read, W: Write> Read for TeeRead<R, W> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.input.read(bytes)?;
+        self.output.write_all(&bytes[..count])?;
+        Ok(count)
+    }
+}
+
 /// The destination is staging storage: callers must not expose it until this
 /// returns successfully. The hash includes Git's canonical type/size header.
 pub(crate) fn copy_verified(

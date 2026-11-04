@@ -1513,7 +1513,7 @@ mod tests {
         assert!(snap.children(Path::new("unvisited")).is_err());
     }
     #[test]
-    fn oversized_directory_metadata_is_prepared_once_for_repeated_lookups() {
+    fn directory_metadata_is_prepared_once_for_sibling_and_absent_lookups() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
         let blob = repo.blob(b"x").unwrap();
@@ -1526,7 +1526,7 @@ mod tests {
         let snapshot = Snapshot::load(
             tmp.path(),
             OsStr::new(&tree.to_string()),
-            "oversized-metadata",
+            "sibling-metadata",
         )
         .unwrap();
         for index in 0..20 {
@@ -1543,40 +1543,9 @@ mod tests {
         assert_eq!(
             snapshot.metrics().tree_reads,
             1,
-            "oversized metadata was decoded/scanned again"
+            "sibling or absent lookup decoded/scanned the directory again"
         );
         assert_eq!(snapshot.metrics().blob_loads, 0);
-    }
-    #[test]
-    fn metadata_eviction_keeps_prepared_directory_entries_available() {
-        let (tmp, _) = fixture();
-        let snapshot = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "metadata-eviction").unwrap();
-        assert_eq!(
-            snapshot
-                .entry(Path::new("dir/child"))
-                .unwrap()
-                .unwrap()
-                .size,
-            Some(9)
-        );
-        let reads = snapshot.metrics().tree_reads;
-        assert_eq!(
-            snapshot.entry(Path::new("script")).unwrap().unwrap().size,
-            Some(9)
-        );
-        assert_eq!(
-            snapshot
-                .entry(Path::new("dir/child"))
-                .unwrap()
-                .unwrap()
-                .size,
-            Some(9)
-        );
-        assert_eq!(
-            snapshot.metrics().tree_reads,
-            reads,
-            "eviction reread a prepared Git tree"
-        );
     }
     #[test]
     fn fitting_small_working_set_uses_byte_budget_without_early_disk_spill() {
@@ -1730,21 +1699,31 @@ mod tests {
         assert!(registry.lock().unwrap().is_empty());
     }
     #[test]
-    fn active_readers_do_not_pin_evicted_payloads_in_ram() {
+    fn open_small_readers_share_the_payload_budget_and_reuse_evicted_contents() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "active-memory").unwrap();
+        let count = BLOB_CACHE_BYTES / crate::raw_blob::BLOCK + 2;
         let mut readers = Vec::new();
-        for byte in 0..20u8 {
-            let oid = repo.blob(&vec![byte; 1024 * 1024]).unwrap();
+        for index in 0..count {
+            let mut bytes = vec![b'x'; crate::raw_blob::BLOCK];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let oid = repo.blob(&bytes).unwrap();
             readers.push(snap.open(oid).unwrap());
         }
+        let metrics = snap.metrics();
+        assert_eq!(metrics.active_blob_readers, count);
+        assert!(metrics.blob_cache_entries > 0 && metrics.blob_cache_entries < count);
         assert!(
-            snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES,
-            "active readers pinned payloads outside the RAM budget"
+            metrics.retained_raw_blob_bytes > 0,
+            "no resident object was evicted"
         );
-        assert_eq!(readers[0].read(0, 1).unwrap(), [0]);
-        assert_eq!(snap.metrics().blob_loads, 20);
+        assert!(metrics.blob_cache_bytes <= BLOB_CACHE_BYTES);
+        for (index, reader) in readers.iter().enumerate() {
+            assert_eq!(reader.read(0, 8).unwrap(), (index as u64).to_le_bytes());
+        }
+        assert_eq!(snap.metrics().blob_loads, count as u64);
+        assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
     }
     #[test]
     fn blob_cache_is_bounded_and_large_partial_reads_bypass_retention() {

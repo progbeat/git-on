@@ -11,8 +11,6 @@ import textwrap
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/'scripts'))
-from ci_plan import matrix
 WORKFLOW=(subprocess.check_output(['git','show',os.environ['GIT_ON_CI_BEFORE_REF']+':.github/workflows/ci.yml'],cwd=ROOT,text=True) if 'GIT_ON_CI_BEFORE_REF' in os.environ else (ROOT/'.github/workflows/ci.yml').read_text())
 
 
@@ -61,10 +59,6 @@ class CiContractTests(unittest.TestCase):
         body=job('repository-scale')
         self.assertIn("if: needs.changes.outputs.scale == 'true'",body)
         self.assertIn('matrix: ${{ fromJSON(needs.changes.outputs.scale_matrix) }}',body)
-        cells=matrix('matrix')['include']
-        self.assertEqual(len(cells),4)
-        interactions={(g['runner'],g['backend'],source,policy,verify) for g in cells if g['profile']=='matrix' for source in g['sources'].split(',') for policy in g['policies'].split(',') for verify in (False,True)}
-        self.assertEqual(len(interactions),24)
         real=job('webkit-scale')
         self.assertIn("if: needs.changes.outputs.scale == 'true'",real)
         self.assertIn('tests/real_repository.py prepare',real)

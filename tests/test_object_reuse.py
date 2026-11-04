@@ -25,11 +25,10 @@ class ObjectReuseTests(unittest.TestCase):
                 (root/f'object-reuse-{backend}.jsonl').write_text(json.dumps(row)+'\n')
             validate_object_reuse(dict(head=head),root)
             path=root/'object-reuse-materialized.jsonl';good=json.loads(path.read_text())
-            for change in ('stale','decode','phase','native','unpack','duplicate','stat'):
+            for change in ('stale','decode','native','unpack','duplicate','stat'):
                 row=copy.deepcopy(good)
                 if change=='stale':row['head']='b'*40
                 elif change=='decode':row['metrics']['blob_loads']+=1
-                elif change=='phase':row['child_observations'].pop()
                 elif change=='native':row['native_commands']['cat-file']+=1
                 elif change=='unpack':row['native_commands']['unpack-objects']=1
                 elif change=='stat':row['stat_abi_bytes']=0

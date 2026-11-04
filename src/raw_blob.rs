@@ -1,6 +1,7 @@
 //! Invocation-local verified contents. Only payload bytes spill to disk;
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
+    object::TeeRead,
     spool::{Files, Spool},
     tree::Directory,
 };
@@ -779,17 +780,6 @@ impl<W: Write> Write for Blocks<W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
-    }
-}
-struct TeeRead<R, W> {
-    input: R,
-    output: W,
-}
-impl<R: Read, W: Write> Read for TeeRead<R, W> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let count = self.input.read(bytes)?;
-        self.output.write_all(&bytes[..count])?;
-        Ok(count)
     }
 }
 pub(crate) struct RawOutput {

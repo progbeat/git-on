@@ -1,5 +1,5 @@
 //! Explicit one-object fetches. Git's promisor auto-fetch is never the loader.
-use crate::git::Git;
+use crate::{git::Git, object::TeeRead};
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
@@ -654,7 +654,7 @@ impl Remote {
                     self.raw_blobs.insert_tree(
                         oid,
                         size,
-                        CopyTo {
+                        TeeRead {
                             input: reader,
                             output: &mut writer,
                         },
@@ -948,17 +948,6 @@ impl Remote {
             self.native_received_pack_bytes,
             self.session_received_pack_bytes,
         )
-    }
-}
-struct CopyTo<R, W> {
-    input: R,
-    output: W,
-}
-impl<R: Read, W: Write> Read for CopyTo<R, W> {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.input.read(bytes)?;
-        self.output.write_all(&bytes[..count])?;
-        Ok(count)
     }
 }
 impl Drop for Remote {

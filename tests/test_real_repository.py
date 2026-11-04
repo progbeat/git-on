@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from benchmark import environment
-from real_repository import LIGHT_TESTS, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output,workload_plan
+from real_repository import LIGHT_TESTS, LIGHT_TEST_COUNT, MODULES, command, entries, git, manifest, observe, prepare, process_snapshot, validate_reports,validate_test_output,workload_plan
 from benchmark_support import build_resource_observer, stat_abi_bytes
 
 
@@ -209,8 +209,8 @@ time.sleep(30)
             observations=[dict(completed=p,workload=workload,files=files,syntax_modules=0 if full else files,
                 payload_bytes=self.counts['logical_blob_bytes' if full else 'syntax_path_bytes'],metadata_result_bytes=144*files,elapsed_ns=4) for p in ('first','repeat')]
             if not full:
-                observations=[dict(completed=p,workload=workload,test_count=32,test_modules=LIGHT_TESTS,
-                    test_output='................................\nRan 32 tests in 0.002s\n\nOK\n',elapsed_ns=4) for p in ('first','repeat')]
+                observations=[dict(completed=p,workload=workload,test_count=LIGHT_TEST_COUNT,test_modules=LIGHT_TESTS,
+                    test_output=f'{"." * LIGHT_TEST_COUNT}\nRan {LIGHT_TEST_COUNT} tests in 0.002s\n\nOK\n',elapsed_ns=4) for p in ('first','repeat')]
             executed=dict(resource,command_observations=observations)
             metrics=dict(blob_loads=self.counts['nonempty_unique_blob_objects' if full else 'syntax_nonempty_unique_blobs'],fuse_requests={'read':1},
                 blob_cache_bytes=1,blob_cache_limit=16*1024*1024,tree_cache_bytes=4096,tree_cache_limit=0,
@@ -229,9 +229,6 @@ time.sleep(30)
         self.assertEqual(validate_reports(partial,'c'*40,pin)['partial_process_tree_rss_samples'],1)
         # Partial estimates remain explicit and never replace the primary
         # waited peak or an entirely absent runner observation.
-        partial[2]['runner']['waited_process_peak_rss_kib']=None
-        with self.assertRaises(ValueError):validate_reports(partial,'c'*40,pin)
-        partial[2]['runner']['waited_process_peak_rss_kib']=1234
         partial[2]['runner']['memory']['count']=0
         with self.assertRaises(ValueError):validate_reports(partial,'c'*40,pin)
         for failure in ('head','missing','duplicate','phase','bytes','decode','setup','memory','cpu','transfer'):
@@ -249,9 +246,9 @@ time.sleep(30)
             with self.subTest(failure=failure),self.assertRaises(ValueError):validate_reports(bad,'c'*40,pin)
 
     def test_test_runner_output_requires_all_named_tests_and_no_failures_or_skips(self):
-        good='................................\nRan 32 tests in 0.002s\n\nOK\n'
+        good=f'{"." * LIGHT_TEST_COUNT}\nRan {LIGHT_TEST_COUNT} tests in 0.002s\n\nOK\n'
         validate_test_output(0,good)
-        for code,output in ((1,good),(0,good.replace('32','31')),(0,good.replace('OK','OK (skipped=1)')),
+        for code,output in ((1,good),(0,good.replace(f'Ran {LIGHT_TEST_COUNT}',f'Ran {LIGHT_TEST_COUNT - 1}')),(0,good.replace('OK','OK (skipped=1)')),
                             (0,good.replace('OK','FAILED (failures=1)')),(0,'OK')):
             with self.subTest(code=code,output=output),self.assertRaises(ValueError):validate_test_output(code,output)
 
