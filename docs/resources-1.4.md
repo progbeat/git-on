@@ -17,21 +17,22 @@ object. Disk reads verify full intersecting 64 KiB blocks before returning bytes
 from that checked buffer. Resident rereads avoid those disk hashes. No disk
 object/name index or HMAC key remains.
 
-Local Linux FUSE objects up to 64 KiB reuse their original encoded Git storage
-after RAM eviction
-instead of creating an additional raw file. A cold miss reconstructs the object
-on the existing bounded source worker, checks its canonical OID/type/length and
-compares the returned buffer with the original trusted block hash before cache
-admission. RAM hits neither reconstruct nor rehash. Only cold misses upgrade a
-weak source reference; the source remains owned by the snapshot and is drained
-before shutdown. Large local objects still stream to raw storage. Remote objects
-keep their invocation-owned verified storage and never refetch because of a
-decoded-cache eviction.
+Local Linux FUSE objects up to 64 KiB remain whole in RAM while resident. Before
+eviction releases those verified bytes, the store saves an uncompressed private
+file using the existing asynchronous I/O path. A later miss reloads that file
+and compares the returned buffer with the original trusted block hash before
+cache admission. It does not reread or decode the original Git object. RAM hits
+neither perform file I/O nor rehash. Large local objects still stream to raw
+storage. Remote objects keep their invocation-owned verified storage and never
+refetch because of decoded-cache eviction. The eviction write must complete
+before releasing the resident entry; background spill submission is not yet
+implemented.
 
 The `blob_loads` snapshot metric counts verified demanded-object descriptors,
-not native decoder calls. A local reconstruction can repeat decoding without
-increasing that cardinality. Timings and actual source activity must be measured
-separately; this counter alone does not establish absence of repeated work.
+not native decoder calls. This counter alone does not establish absence of
+repeated work. Permanent local-source regressions additionally close the source,
+remove its original Git object and verify exact bytes after eviction; source
+demand counts stay unchanged across disk and RAM rereads.
 
 Touched unique directories are parsed once into shared immutable RAM structures;
 raw tree bytes are released. Source leaves retain their original OID, not a full

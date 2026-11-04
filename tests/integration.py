@@ -1562,6 +1562,44 @@ for _ in range(3):
         self.assertIsNone(run)
         self.assert_no_runtime_files()
 
+    def test_evicted_small_source_survives_removal_of_its_original_git_object(self):
+        # Distinct 64 KiB objects exceed the production 16 MiB payload budget.
+        # Request removal of the earlier clean kernel data pages with DONTNEED
+        # so the final reread exercises the mounted store after eviction.
+        directory = self.repo / "evicted"
+        directory.mkdir()
+        git(self.repo, "config", "gc.auto", "0")
+        git(self.repo, "config", "maintenance.auto", "false")
+        for index in range(260):
+            payload = index.to_bytes(4, "big") + bytes([index % 251]) * (65536 - 4)
+            (directory / f"{index:04d}").write_bytes(payload)
+        git(self.repo, "add", "evicted")
+        git(self.repo, "commit", "--quiet", "-m", "distinct cache-eviction objects")
+        oid = git(self.repo, "rev-parse", "HEAD:evicted/0000")
+        original = self.repo / ".git/objects" / oid[:2] / oid[2:]
+        self.assertTrue(original.is_file())
+        result, run = self.invoke_argv([
+            "HEAD", "--write-policy=none", "--", sys.executable, "-I", "-S", "-c", r'''
+import os, sys
+from pathlib import Path
+original = Path(sys.argv[1])
+assert original.is_file(), original
+for index in range(260):
+    expected = index.to_bytes(4, 'big') + bytes([index % 251]) * (65536 - 4)
+    with open('evicted/%04d' % index, 'rb', buffering=0) as source:
+        assert source.read() == expected
+        os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    if index == 0:
+        original.unlink()
+with open('evicted/0000', 'rb', buffering=0) as source:
+    assert source.read() == bytes(65536)
+''', str(original),
+        ])
+        self.assert_success(result)
+        self.assertFalse(original.exists())
+        self.assertIsNone(run)
+        self.assert_no_runtime_files()
+
     def test_large_snapshot_blob_random_and_sequential_reads_agree(self):
         import hashlib
         payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)

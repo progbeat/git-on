@@ -2896,7 +2896,12 @@ general read-speed improvement or absence of latency regressions. Full
 issue #20 acceptance remains incomplete.
 
 
-## Reuse encoded local small objects after RAM eviction
+## Historical encoded-local-object reuse (superseded)
+
+The following experiment removed raw small-object storage, but its timing
+results did not justify relaxing the requirement to retain already-decoded
+contents within one invocation. The correction below supersedes that behavior;
+these measurements remain historical evidence, not the current cache contract.
 
 At `39acc81d7d8716ebc22f94ba6c140cb366d9fcee`, evicting a small local
 object created a separate raw file even though the original Git object remained
@@ -2927,3 +2932,83 @@ claimed. Every control verified contents, native I/O selection, absence of a
 file worker, pin cleanup and empty runtime storage. These bounded controls do
 not complete issue #20 or replace full ordinary-binary acceptance. Temporary
 constructor controls, timing observers and raw evidence remain outside the PR.
+
+## Preserve decoded local objects across eviction
+
+At `f1853a42db9c4e2a3b7c53a11da48bbcbb63f47a`, small local objects lost their
+decoded bytes on eviction and needed another source request to reconstruct
+them. This contradicted the within-invocation reuse contract. The permanent
+`evicted_local_small_objects_remain_readable_without_the_git_source_native`
+and `evicted_local_small_objects_remain_readable_without_the_git_source_fallback`
+regressions prepare two distinct 6,000-byte objects under an 8,192-byte cache
+budget, close the source and remove the evicted object's original Git file.
+Both failed before the correction with `local small-object source is
+unavailable`. The red replay used a fresh build directory containing only the
+checked-in dependencies. Its old fixture uses the source-reference wiring that
+is removed by the correction; the byte/reuse assertions are preserved.
+
+Eviction now saves the verified resident allocation through the existing
+asynchronous raw-file path before releasing it. The same tests verify exact
+reloaded bytes, trusted-hash authentication, the cache budget and hash-free
+resident partial rereads after the source has gone. The source is called only
+for the initial preparation of each object. A separate regression replaces
+the original Git file and verifies that prepared snapshot bytes stay unchanged.
+Existing raw-store tests retain collision, corruption, failed/cancelled
+publication, anchored-directory and large-object streaming checks.
+
+RAM hits keep their direct path. The cold-preparation concurrency regression
+pauses the source on a different object and verifies that a resident read
+completes immediately without file I/O, another source request or hashing;
+its owned result survives the later eviction. These checks establish reuse
+and integrity, not background-write overlap or performance acceptance.
+
+The actual-mount
+`test_evicted_small_source_survives_removal_of_its_original_git_object`
+uses 260 distinct 64 KiB files to exceed the production 16 MiB budget. It
+removes the first object's loose Git file after the initial successful read,
+reads the remaining objects, requests clean kernel-page removal with DONTNEED
+and checks the first object's exact bytes again. The ordinary `f1853a4`
+binary failed that final read with EIO. Fixture-local automatic Git maintenance
+is disabled so it cannot independently repack/remove the loose test object.
+
+The corrected ordinary release binary passed 241 Rust tests (one additional
+mount-only ignored test was exercised by the write-policy suite), formatting,
+strict clippy, the Rust 1.89 all-target check, the 44-entry FUSE coverage guard
+and its seven self-tests, and 42 release-policy tests. All 71 integration methods,
+11 write-policy methods and 15 selected real-mount remote methods passed. The
+initial integration run passed 70 non-uv methods; the uv method first failed
+because the pinned uv version rejected a user-global configuration value. That
+method alone passed with process-local `UV_NO_CONFIG=1`; no user configuration
+was changed. Exact-final-head CI remains separate from these local results.
+
+Ordinary before/after performance controls used the exact same source revision,
+child algorithm, CPU 0, nice 15, idle I/O and 4 GiB address-space limit, without
+internal timing instrumentation. A fresh independent build of `f1853a4` produced
+the same executable hash as the original baseline. OS caches were uncontrolled;
+outliers and unfavorable results were retained. Prepared native data excluded
+native materialization cost, so these are command controls, not complete
+materialization-plus-command acceptance.
+
+| Workload | Before first/repeat (s) | Corrected first/repeat (s) | Evidence |
+| --- | --- | --- | --- |
+| 2,365 files, 3.48 MB, fitting RAM, `none` | 0.806 / 0.237 | 0.937 / 0.238 | Six balanced blocks; first slower in five pairs |
+| Same fitting-RAM tree, `all` | 1.000 / 0.451 | 0.994 / 0.446 | Six balanced blocks; mixed paired directions |
+| 35,019 files, 90.6 MB, ordinary reads, `none` | 12.000 / 3.484 | 16.907 / 3.435 | Two ABBA/BAAB blocks; first slower in both |
+| Same larger tree, forced reread, `none` | 12.805 / 8.079 | 17.570 / 10.614 | Two blocks; both phases slower in both |
+
+The forced-reread child requests DONTNEED for owned FUSE files between passes,
+outside the repeat timer but inside whole-invocation time. Its ordinary native
+brackets do not reproduce the same physical cache state. It establishes a
+before/after effect within that declared FUSE condition, not a native speed ratio.
+
+A separate eight-pair fitting-RAM `none` follow-up observed process/thread CPU,
+I/O and raw-directory entries only at phase boundaries, outside phase timers.
+Before/corrected first medians were 0.824/0.772 s and repeat 0.245/0.232 s;
+five pairs improved and three worsened in each phase. Both created zero raw
+files. Source-worker CPU was zero on every repeat; median first-pass source CPU
+was 0.155/0.147 s and FUSE-loop CPU 0.293/0.273 s. The earlier RAM slowdown did
+not reproduce consistently. Neither series establishes a general speedup or a
+general absence of regressions. The confirmed spill cost remains unresolved:
+this correction establishes decoded-data reuse, not an optimization, background
+write overlap or issue #20 acceptance. All temporary controls remain outside
+the PR.

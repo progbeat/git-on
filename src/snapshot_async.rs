@@ -126,8 +126,7 @@ impl Snapshot {
         io: Rc<crate::file_async::Io>,
     ) -> Result<Self> {
         let source = Rc::new(source_async::Source::new(repo)?);
-        let mut raw = RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io);
-        raw.set_local_small_source(Rc::downgrade(&source));
+        let raw = RawBlobs::from_anchor(directory, owner, crate::raw_blob::MEMORY_BUDGET, io);
         Ok(Self {
             root,
             source: Source::Local(source),
