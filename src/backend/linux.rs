@@ -34,6 +34,7 @@ struct State {
     core: Overlay,
     objects: Option<Rc<crate::snapshot_async::Snapshot>>,
     no_open: bool,
+    no_opendir: bool,
     cache_directories: bool,
     directory_plus: bool,
     enabled: bool,
@@ -57,6 +58,7 @@ impl Fuse {
                 core,
                 objects: None,
                 no_open: false,
+                no_opendir: false,
                 cache_directories: false,
                 directory_plus: false,
                 enabled: false,
@@ -646,6 +648,31 @@ impl Fuse {
                 }
             }
         }
+    }
+    async fn open_directory_local(&self, ino: u64, flags: i32) -> Result<u64, f::Errno> {
+        let objects = self.state().objects.clone();
+        let mut pin = None;
+        if let Some(objects) = &objects {
+            let demand = result(self.state().core.readonly_directory_demand(ino))?;
+            if let Some((path, oid)) = demand {
+                pin = Some(self.pin(ino));
+                if let Some(oid) = oid {
+                    let tree = objects.tree(oid).await.map_err(|_| f::Errno::EIO)?;
+                    result(self.state().core.prepare_readonly_directory(path, tree))?;
+                } else {
+                    self.prepare_directory(objects, &path).await?;
+                }
+            }
+        }
+        let mut state = self.state();
+        let h = result(if objects.is_some() && state.core.read_only() {
+            state.core.open_prepared_directory(ino, flags)
+        } else {
+            state.core.open_directory(ino, flags)
+        })?;
+        drop(state);
+        drop(pin);
+        Ok(h)
     }
     async fn directory_plus_local(
         &self,
@@ -1259,6 +1286,12 @@ impl f::AsyncFilesystem for Fuse {
         {
             state.cache_directories &= !state.test_uncached_source;
         }
+        // Entirely immutable directories need neither per-open state nor
+        // release RPCs. Unadvertised kernels keep the normal handle path.
+        state.no_opendir = state.cache_directories
+            && config
+                .add_capabilities(f::InitFlags::FUSE_NO_OPENDIR_SUPPORT)
+                .is_ok();
         let no_open = state.core.read_only();
         #[cfg(feature = "test-metrics")]
         let no_open = no_open && !state.test_uncached_source;
@@ -1322,17 +1355,29 @@ impl f::AsyncFilesystem for Fuse {
         ino: f::INodeNo,
         fh: Option<f::FileHandle>,
     ) -> Result<AttrResponse, f::Errno> {
-        let (native, no_open) = {
+        let (native, anonymous) = {
             let state = self.state();
             #[cfg(feature = "test-metrics")]
             state.core.record_fuse_request("getattr");
-            (state.objects.is_some(), state.no_open)
+            let anonymous = if fh == Some(f::FileHandle(0)) && (state.no_open || state.no_opendir) {
+                let attributes = result(state.core.prepared_attributes(ino.0, None))?;
+                match attributes.kind {
+                    FileType::Directory if state.no_opendir => Some(attributes),
+                    FileType::RegularFile if state.no_open => Some(attributes),
+                    FileType::Directory if state.no_open => return Err(f::Errno::EISDIR),
+                    _ if state.no_open => return Err(f::Errno::ELOOP),
+                    _ => return Err(f::Errno::EBADF),
+                }
+            } else {
+                None
+            };
+            (state.objects.is_some(), anonymous)
         };
         if self.native_all && self.state().all_attribute_ttl(ino.0) != TTL {
             return self.all_attributes_response(ino.0, fh.map(|h| h.0)).await;
         }
-        let a = if no_open && fh == Some(f::FileHandle(0)) {
-            result(self.state().core.readonly_file_attributes(ino.0))?
+        let a = if let Some(attributes) = anonymous {
+            attributes
         } else if native {
             self.attributes_local(ino.0, fh.map(|h| h.0)).await?
         } else {
@@ -1740,28 +1785,14 @@ impl f::AsyncFilesystem for Fuse {
         ino: f::INodeNo,
         flags: f::OpenFlags,
     ) -> Result<OpenResponse, f::Errno> {
-        let objects = self.state().objects.clone();
-        let mut pin = None;
-        if let Some(objects) = &objects {
-            let demand = result(self.state().core.readonly_directory_demand(ino.0))?;
-            if let Some((path, oid)) = demand {
-                pin = Some(self.pin(ino.0));
-                if let Some(oid) = oid {
-                    let tree = objects.tree(oid).await.map_err(|_| f::Errno::EIO)?;
-                    result(self.state().core.prepare_readonly_directory(path, tree))?;
-                } else {
-                    self.prepare_directory(objects, &path).await?;
-                }
-            }
-        }
-        let mut state = self.state();
         #[cfg(feature = "test-metrics")]
-        state.core.record_fuse_request("opendir");
-        let h = result(if objects.is_some() && state.core.read_only() {
-            state.core.open_prepared_directory(ino.0, flags.0)
-        } else {
-            state.core.open_directory(ino.0, flags.0)
-        })?;
+        self.state().core.record_fuse_request("opendir");
+        if self.state().no_opendir {
+            result(self.state().core.readonly_directory_demand(ino.0))?;
+            return Err(f::Errno::ENOSYS);
+        }
+        let h = self.open_directory_local(ino.0, flags.0).await?;
+        let state = self.state();
         let response = OpenResponse::new(
             f::FileHandle(h),
             if state.cache_directories {
@@ -1771,7 +1802,6 @@ impl f::AsyncFilesystem for Fuse {
             },
         );
         drop(state);
-        drop(pin);
         Ok(response)
     }
     async fn readdir(
@@ -1782,17 +1812,31 @@ impl f::AsyncFilesystem for Fuse {
         size: u32,
         offset: u64,
     ) -> Result<DirectoryResponse, f::Errno> {
+        // The kernel omits OPENDIR/RELEASEDIR on this immutable namespace.
+        // Keep a temporary stream for the existing page/cookie/lifetime code.
+        let temporary = self.state().no_opendir && fh.0 == 0;
+        let handle = if temporary {
+            self.open_directory_local(ino.0, libc::O_RDONLY).await?
+        } else {
+            fh.0
+        };
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("readdir");
         let mut response = DirectoryResponse::new(size as usize);
-        result(
+        let read = result(
             state
                 .core
-                .read_directory(ino.0, fh.0, offset, |i, k, n, c| {
+                .read_directory(ino.0, handle, offset, |i, k, n, c| {
                     response.add(f::INodeNo(i), c, kind(k), n)
                 }),
-        )?;
+        );
+        let close = if temporary {
+            result(state.core.release_prepared_handle(ino.0, handle))
+        } else {
+            Ok(())
+        };
+        read.and(close)?;
         Ok(response)
     }
     async fn readdirplus(
@@ -1805,7 +1849,19 @@ impl f::AsyncFilesystem for Fuse {
     ) -> Result<DirectoryPlusResponse, f::Errno> {
         #[cfg(feature = "test-metrics")]
         self.state().core.record_fuse_request("readdirplus");
-        self.directory_plus_local(ino.0, fh.0, size, offset).await
+        let temporary = self.state().no_opendir && fh.0 == 0;
+        let handle = if temporary {
+            self.open_directory_local(ino.0, libc::O_RDONLY).await?
+        } else {
+            fh.0
+        };
+        let response = self.directory_plus_local(ino.0, handle, size, offset).await;
+        let close = if temporary {
+            result(self.state().core.release_prepared_handle(ino.0, handle))
+        } else {
+            Ok(())
+        };
+        response.and_then(|response| close.map(|()| response))
     }
     async fn releasedir(
         &self,
@@ -1826,8 +1882,14 @@ impl f::AsyncFilesystem for Fuse {
         fh: f::FileHandle,
         _: bool,
     ) -> Result<(), f::Errno> {
+        let anonymous = self.state().no_opendir && fh.0 == 0;
+        if anonymous {
+            result(self.state().core.readonly_directory_demand(ino.0))?;
+        }
         if self.state().objects.is_some() {
-            result(self.state().core.validate_handle(ino.0, fh.0))?;
+            if !anonymous {
+                result(self.state().core.validate_handle(ino.0, fh.0))?;
+            }
             let _pin = self.pin(ino.0);
             let path = self.state().core.backing_directory().to_owned();
             let file = self
@@ -1841,7 +1903,14 @@ impl f::AsyncFilesystem for Fuse {
             sync.and(close).map_err(f::Errno::from)?;
             return Ok(());
         }
-        result(self.state().core.sync_directory(ino.0, fh.0))
+        if anonymous {
+            let path = self.state().core.backing_directory().to_owned();
+            std::fs::File::open(path)
+                .and_then(|f| f.sync_all())
+                .map_err(f::Errno::from)
+        } else {
+            result(self.state().core.sync_directory(ino.0, fh.0))
+        }
     }
     async fn statfs(&self, _: &f::Request, _: f::INodeNo) -> Result<StatfsResponse, f::Errno> {
         let s = if self.state().objects.is_some() {

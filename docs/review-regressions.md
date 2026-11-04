@@ -33,6 +33,29 @@ paired directions; no numerical overhead allowance is inferred. Cold metadata
 improved in all ten pairs for both tested policies. Full-read timing remains
 mixed and does not satisfy the complete performance requirement.
 
+## Zero-handle readonly directory attributes
+
+The initial no-opendir candidate based on `b30e588` reused the regular-file
+zero-handle attribute branch. A directory GETATTR with FUSE_GETATTR_FH and
+fh=0 failed with EBADF when NO_OPEN_SUPPORT was absent, or EISDIR when it was
+present. The new permanent wire regression
+`protocol_readonly_zero_directory_handle_getattr` reproduced all six failures
+across native source, fallback source and legacy adapters, with both capability
+combinations, before the fix. The pre-fix adapter SHA-256 was
+`ea27ea8850be64160d512b54dd6a9ff2dd2072a26c22647e0692a486ae69a603`;
+it was an uncommitted candidate, not a released revision.
+
+The corrected adapter validates the inode kind against the independently
+negotiated file/directory capabilities before returning its prepared attributes.
+It performs one metadata lookup and no source/file I/O. The same regression and
+all 36 wire tests pass after the fix. Nonzero invalid handles remain EBADF;
+regular-file zero handles still require NO_OPEN_SUPPORT. The existing actual
+readonly-directory integration case also checks fstat and fsync through dirfd
+alongside partial pages, seek/rewind and independent reopen. Wire execution
+forces the GETATTR request that a fresh kernel attribute cache can omit.
+Red/green logs remain outside the repository in
+`/tmp/git-on-fuse-path-20261102/evidence/no-opendir-getattr-{red,green-wire}.log`.
+
 ## Readonly directory pages on reopen
 
 Follow-up at `ff1c01a`: CACHE_DIR alone cached seek/rewind within one handle,

@@ -1818,3 +1818,103 @@ fn protocol_fallback_executes_the_complete_wire_suite() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn protocol_readonly_no_opendir_pages_cookies_and_sync() {
+    for (native, asynchronous) in [(true, true), (false, true), (false, false)] {
+        let (mut p, flags) = Peer::with_runtime(
+            WritePolicy::None,
+            false,
+            1 << 24,
+            1024,
+            31,
+            native,
+            asynchronous,
+        );
+        assert_ne!(flags & (1 << 24), 0);
+        p.err(27, 1, u32s(&[0, 0]), libc::ENOSYS);
+        assert_eq!(dirents(&p.ok(28, 1, io(0, 0, 32, 0))), [(1, b".".to_vec())]);
+        let page = p.ok(28, 1, io(0, 100, 48, 0));
+        assert_eq!(dirents(&page).len(), 1);
+        assert_eq!(num(&page, 8), 101);
+        assert_eq!(p.ok(28, 1, io(0, 100, 48, 0)), page);
+        let ino = num(&page, 0);
+        let name = std::str::from_utf8(&dirents(&page)[0].1)
+            .unwrap()
+            .to_owned();
+        assert_eq!(p.lookup(1, &name), ino);
+        p.send(2, ino, u64s(&[1]));
+        p.err(3, ino, vec![0; 16], libc::ENOENT);
+        assert_eq!(p.lookup(1, &name), ino);
+        if asynchronous {
+            let plus = plusents(&p.ok(44, 1, io(0, 100, 512, 0)));
+            assert!(!plus.is_empty());
+            assert_eq!(plus[0].ino, ino);
+            assert_eq!(plus[0].nodeid, ino);
+            assert_eq!(plus[0].next, 101);
+            assert_eq!(plus[0].name, name.as_bytes());
+            assert_eq!(plus[0].size, b"unrequested payload".len() as u64);
+        }
+        assert!(p.ok(28, 1, io(0, 99999, 48, 0)).is_empty());
+        p.err(28, 1, io(0, -1, 48, 0), libc::EINVAL);
+        p.err(28, 1, io(777, 0, 48, 0), libc::EBADF);
+        for datasync in [0, 1] {
+            p.ok(30, 1, [u64s(&[0]), u32s(&[datasync, 0])].concat());
+        }
+        p.err(30, 1, [u64s(&[777]), u32s(&[0, 0])].concat(), libc::EBADF);
+        let tracked = p.lookup(1, "tracked");
+        p.err(27, tracked, u32s(&[0, 0]), libc::ENOTDIR);
+        p.err(28, tracked, io(0, 0, 48, 0), libc::ENOTDIR);
+        p.err(
+            30,
+            tracked,
+            [u64s(&[0]), u32s(&[0, 0])].concat(),
+            libc::ENOTDIR,
+        );
+    }
+    for policy in [
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let (mut p, flags) = Peer::with_capabilities(policy, false, 1 << 24);
+        assert_eq!(flags & (1 << 24), 0);
+        let handle = num(&p.ok(27, 1, u32s(&[0, 0])), 0);
+        assert_ne!(handle, 0);
+        p.err(28, 1, io(0, 0, 48, 0), libc::EBADF);
+        p.ok(29, 1, u64s(&[handle, 0, 0]));
+    }
+}
+
+#[test]
+fn protocol_readonly_zero_directory_handle_getattr() {
+    let mut failures = Vec::new();
+    for no_open in [false, true] {
+        for (native, asynchronous) in [(true, true), (false, true), (false, false)] {
+            let caps = (1 << 24) | if no_open { 1 << 17 } else { 0 };
+            let (mut p, flags) =
+                Peer::with_runtime(WritePolicy::None, false, caps, 0, 31, native, asynchronous);
+            assert_eq!(flags & caps, caps);
+            p.err(27, 1, u32s(&[0, 0]), libc::ENOSYS);
+            let request = |fh| [u32s(&[1, 0]), u64s(&[fh])].concat();
+            match p.call(3, 1, request(0)) {
+                Ok(attr) => assert_eq!(
+                    u32::from_ne_bytes(attr[76..80].try_into().unwrap()) & libc::S_IFMT,
+                    libc::S_IFDIR
+                ),
+                Err(errno) => failures.push((native, asynchronous, no_open, errno)),
+            }
+            p.err(3, 1, request(777), libc::EBADF);
+            let tracked = p.lookup(1, "tracked");
+            if no_open {
+                assert_eq!(num(&p.ok(3, tracked, request(0)), 24), 9);
+            } else {
+                p.err(3, tracked, request(0), libc::EBADF);
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "zero directory fstat failed: {failures:?}"
+    );
+}

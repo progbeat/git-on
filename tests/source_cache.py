@@ -37,7 +37,7 @@ def directory_reopen_code(count):
 
 def directory_child_code(count):
     return 'expected='+repr([name.encode() for name in directory_names(count)])+'\n'+r'''
-import ctypes,json,os
+import ctypes,json,os,stat
 libc=ctypes.CDLL(None,use_errno=True)
 class Dirent64(ctypes.Structure):
     _fields_=[('ino',ctypes.c_uint64),('offset',ctypes.c_int64),
@@ -48,6 +48,7 @@ libc.telldir.argtypes=[ctypes.c_void_p];libc.telldir.restype=ctypes.c_long
 libc.seekdir.argtypes=[ctypes.c_void_p,ctypes.c_long]
 libc.rewinddir.argtypes=[ctypes.c_void_p]
 libc.closedir.argtypes=[ctypes.c_void_p];libc.closedir.restype=ctypes.c_int
+libc.dirfd.argtypes=[ctypes.c_void_p];libc.dirfd.restype=ctypes.c_int
 expected=set(expected)|{b'.',b'..'}
 def read_one(stream):
     ctypes.set_errno(0);entry=libc.readdir64(stream)
@@ -66,6 +67,10 @@ identities=None
 for phase in ('first','repeat'):
     stream=libc.opendir(b'paged');assert stream,ctypes.get_errno()
     try:
+        descriptor=libc.dirfd(stream);assert descriptor>=0,ctypes.get_errno()
+        attributes=os.fstat(descriptor)
+        assert stat.S_ISDIR(attributes.st_mode) and attributes.st_ino==os.lstat(b'paged').st_ino
+        os.fsync(descriptor)
         prefix=[read_one(stream) for _ in range(min(450,len(expected)-2))]
         assert None not in prefix
         cookie=libc.telldir(stream);assert cookie>=0
