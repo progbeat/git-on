@@ -1,8 +1,8 @@
 //! Invocation-only temporary files, split into bounded reopenable parts without
 //! retaining a descriptor per part or imposing an aggregate storage ceiling.
 use std::{
-    ffi::CString,
-    fs::{File, OpenOptions},
+    ffi::{CStr, CString},
+    fs::{File, Metadata, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -14,6 +14,39 @@ use std::{
         Arc, Mutex,
     },
 };
+
+pub(crate) fn private_file_metadata(file: &File) -> io::Result<Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::other("invalid private file"));
+    }
+    Ok(metadata)
+}
+
+/// Open relative to the owned directory without following links or blocking on
+/// special files. Return the checked metadata so callers can also check length
+/// without another fstat.
+pub(crate) fn open_private_file(
+    directory: &File,
+    name: &CStr,
+    flags: libc::c_int,
+) -> io::Result<(File, Metadata)> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = private_file_metadata(&file)?;
+    Ok((file, metadata))
+}
 
 pub(crate) struct Files {
     parts: Option<Arc<Directory>>,
@@ -112,48 +145,22 @@ fn open_part<'a>(
         // Drop before opening the next part, keeping the descriptor bound even
         // when an unrelated operation has filled the process descriptor table.
         state.cached = None;
-        let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let mut created = false;
-        let mut fd = unsafe {
-            libc::openat(
-                directory.fd.as_raw_fd(),
-                part_name(id, part).as_ptr(),
-                flags
-                    | if create {
-                        libc::O_CREAT | libc::O_EXCL
-                    } else {
-                        0
-                    },
-                0o600,
-            )
-        };
-        if fd >= 0 && create {
-            created = true;
-        }
-        if fd < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::AlreadyExists {
-            fd = unsafe {
-                libc::openat(
-                    directory.fd.as_raw_fd(),
-                    part_name(id, part).as_ptr(),
-                    flags,
-                )
+        let name = part_name(id, part);
+        let flags = libc::O_RDWR
+            | if create {
+                libc::O_CREAT | libc::O_EXCL
+            } else {
+                0
             };
-        }
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            if !create && error.kind() == io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(error);
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-        {
-            return Err(io::Error::other("invalid raw spool part"));
-        }
+        let (file, created) = match open_private_file(&directory.fd, &name, flags) {
+            Ok((file, _)) => (file, create),
+            Err(error) if create && error.kind() == io::ErrorKind::AlreadyExists => (
+                open_private_file(&directory.fd, &name, libc::O_RDWR)?.0,
+                false,
+            ),
+            Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if created {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }

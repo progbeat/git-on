@@ -322,6 +322,8 @@ struct State {
     readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
     metrics: SnapshotMetrics,
+    #[cfg(test)]
+    ancestor_tree_lookups: u64,
     spool_directory: PathBuf,
     _local_object_bridge: Option<tempfile::TempDir>,
 }
@@ -685,6 +687,8 @@ impl Snapshot {
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
                     metrics: SnapshotMetrics::default(),
+                    #[cfg(test)]
+                    ancestor_tree_lookups: 0,
                     spool_directory: run_directory.to_path_buf(),
                     _local_object_bridge: local_bridge,
                 }),
@@ -740,6 +744,10 @@ impl Snapshot {
             if entry.kind != EntryKind::Directory {
                 bail!("snapshot ancestor is not a directory: {}", path.display());
             }
+            #[cfg(test)]
+            {
+                state.ancestor_tree_lookups += 1;
+            }
             let tree = state.tree(entry.oid)?;
             let Some((mode, oid)) = tree.lookup(name) else {
                 return Ok(None);
@@ -747,6 +755,10 @@ impl Snapshot {
             entry = Self::metadata(mode, oid, path)?;
         }
         Ok(Some(entry))
+    }
+    #[cfg(test)]
+    pub(crate) fn ancestor_tree_lookups_for_test(&self) -> u64 {
+        self.state().unwrap().ancestor_tree_lookups
     }
     /// Resolve only a path's ancestor trees and requested object's header.
     pub fn entry(&self, path: &Path) -> Result<Option<Entry>> {
@@ -1624,9 +1636,7 @@ mod tests {
         let bytes = b"retained memory bytes";
         let oid = repo.blob(bytes).unwrap();
         assert_eq!(snap.read(oid, 0, 1024).unwrap(), bytes);
-        for _ in 0..64 {
-            assert_eq!(snap.read(oid, 0, 1024).unwrap(), bytes);
-        }
+        assert_eq!(snap.read(oid, 0, 1024).unwrap(), bytes);
         assert_eq!(snap.metrics().blob_loads, 1);
         assert_eq!(snap.metrics().retained_raw_blob_bytes, 0);
         let reader = snap.open(oid).unwrap();

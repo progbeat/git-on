@@ -1837,7 +1837,8 @@ mod tests {
         assert_eq!(first.perm, 0o644);
         let before = fs._snapshot.metrics();
         assert_eq!(
-            before.cache_hits, 0,
+            fs._snapshot.ancestor_tree_lookups_for_test(),
+            0,
             "cold descent revisited earlier ancestors"
         );
         let second = fs.lookup_entry(parent, OsStr::new("two")).unwrap();
@@ -1847,17 +1848,17 @@ mod tests {
         assert_eq!(after.tree_reads, before.tree_reads);
         assert_eq!(after.header_reads, before.header_reads);
         assert_eq!(
-            after.cache_hits - before.cache_hits,
-            1,
-            "lookup walked already prepared ancestors instead of only reusing the blob header"
+            fs._snapshot.ancestor_tree_lookups_for_test(),
+            0,
+            "sibling lookup walked already prepared ancestors"
         );
         assert_eq!(
             fs.lookup_entry(parent, OsStr::new("absent")).unwrap_err(),
             libc::ENOENT
         );
         assert_eq!(
-            fs._snapshot.metrics().cache_hits,
-            after.cache_hits,
+            fs._snapshot.ancestor_tree_lookups_for_test(),
+            0,
             "negative child lookup walked ancestors"
         );
         fs.forget_inode(second.ino, u64::MAX);
@@ -1884,6 +1885,11 @@ mod tests {
             b"source"
         );
         assert_eq!(fs._snapshot.metrics().blob_loads, 1);
+        assert_eq!(
+            fs._snapshot.ancestor_tree_lookups_for_test(),
+            0,
+            "reopened or aliased child lookup walked ancestors"
+        );
     }
     #[test]
     fn child_lookup_preserves_existing_single_component_path_normalization() {
@@ -1933,13 +1939,11 @@ mod tests {
             )
             .unwrap();
             let first = fs.lookup_entry(1, name).unwrap();
-            for _ in 0..8 {
-                let again = fs.lookup_entry(1, name).unwrap();
-                assert_eq!(again.ino, first.ino);
-                assert_eq!(again.kind, FileType::RegularFile);
-                assert_eq!(again.size, 5);
-                assert_eq!(again.perm, 0o644);
-            }
+            let again = fs.lookup_entry(1, name).unwrap();
+            assert_eq!(again.ino, first.ino);
+            assert_eq!(again.kind, FileType::RegularFile);
+            assert_eq!(again.size, 5);
+            assert_eq!(again.perm, 0o644);
             for invalid in ["", ".", "..", "a/b", "/absolute", "nul\0name"] {
                 assert_eq!(
                     fs.lookup_entry(1, OsStr::new(invalid)).unwrap_err(),

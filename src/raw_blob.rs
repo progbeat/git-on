@@ -2,7 +2,7 @@
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
     object::TeeRead,
-    spool::{Files, Spool},
+    spool::{open_private_file, private_file_metadata, Files, Spool},
     tree::Directory,
 };
 use anyhow::{Context, Result};
@@ -11,12 +11,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     ffi::CString,
-    fs::File,
+    fs::{File, Metadata},
     io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{FileExt, MetadataExt},
-    },
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -209,14 +206,7 @@ impl RawDirectory {
             open_calls: std::cell::Cell::new(0),
         })
     }
-    fn validate(file: &File, size: Option<u64>) -> Result<()> {
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && metadata.nlink() == 1
-                && metadata.uid() == unsafe { libc::geteuid() },
-            "invalid private raw object"
-        );
+    fn validate_size(metadata: &Metadata, size: Option<u64>) -> Result<()> {
         if let Some(size) = size {
             anyhow::ensure!(
                 metadata.len() == size,
@@ -228,19 +218,9 @@ impl RawDirectory {
     fn open_name(&self, name: &CString, flags: i32, size: Option<u64>) -> Result<File> {
         #[cfg(test)]
         self.open_calls.set(self.open_calls.get() + 1);
-        let fd = unsafe {
-            libc::openat(
-                self.fd.as_raw_fd(),
-                name.as_ptr(),
-                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error()).context("open private raw object");
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
-        Self::validate(&file, size)?;
+        let (file, metadata) =
+            open_private_file(&self.fd, name, flags).context("open private raw object")?;
+        Self::validate_size(&metadata, size)?;
         Ok(file)
     }
     fn open(&self, oid: Oid, write: bool, size: u64) -> Result<File> {
@@ -257,7 +237,9 @@ impl RawDirectory {
     fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<File>> {
         if let Some((cached, file)) = &self.reader {
             if *cached == oid {
-                Self::validate(file, Some(size))?;
+                let metadata =
+                    private_file_metadata(file).context("validate private raw object")?;
+                Self::validate_size(&metadata, Some(size))?;
                 return Ok(file.clone());
             }
         }
