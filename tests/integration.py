@@ -37,6 +37,14 @@ def git(repo, *args, **kwargs):
                           stderr=subprocess.PIPE, **kwargs).stdout.decode().strip()
 
 
+def file_size_limits(size=None, action=signal.SIG_DFL):
+    import resource
+    signal.signal(signal.SIGXFSZ, action)
+    if size is not None:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 class RepositoryTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="git-on-test-")
@@ -111,6 +119,28 @@ class RepositoryTest(unittest.TestCase):
 
 
 class CliTests(RepositoryTest):
+    def test_file_limit_during_run_setup_reports_error_and_cleans_up(self):
+        try:
+            result = subprocess.run([str(BINARY), 'HEAD', '--', 'true'],
+                                    cwd=self.repo, env=self.environment(), capture_output=True,
+                                    preexec_fn=lambda: file_size_limits(0), timeout=30)
+            self.assertEqual(result.returncode, 125, result.stderr.decode(errors='replace'))
+            self.assertIn(b'File too large', result.stderr)
+            self.assert_no_runtime_files()
+        finally:
+            for run in self.system_tmp.glob('git-on-*'):
+                self.cleanup_run(run)
+
+    def test_child_inherits_default_or_ignored_file_limit_signal(self):
+        for action, expected in ((signal.SIG_DFL, -signal.SIGXFSZ), (signal.SIG_IGN, 0)):
+            with self.subTest(action=action):
+                result = subprocess.run([str(BINARY), 'HEAD', '--write-policy=all', '--',
+                                         'sh', '-c', f'kill -{int(signal.SIGXFSZ)} $$; exit 0'],
+                                        cwd=self.repo, env=self.environment(), capture_output=True,
+                                        preexec_fn=lambda: file_size_limits(action=action), timeout=30)
+                self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
+                self.assert_no_runtime_files()
+
     def test_help_and_version(self):
         for arg in ("--help", "-h", "--version"):
             result = subprocess.run([str(BINARY), arg], capture_output=True, timeout=10)
@@ -837,6 +867,38 @@ os.close(fd)
 assert not Path('out/final-hard').exists()
 ''')
         self.assert_success(result)
+
+    def test_raw_file_limit_with_default_signal_cleans_mount_and_pin(self):
+        (self.repo / 'large-raw').write_bytes(b'x' * (1024 * 1024))
+        git(self.repo, 'add', 'large-raw')
+        git(self.repo, 'commit', '--quiet', '-m', 'raw file limit')
+        git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
+        git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
+        code = """
+import errno, sys
+try:
+    with open('large-raw', 'rb', buffering=0) as source:
+        source.read(1)
+except OSError as error:
+    assert error.errno in (errno.EIO, errno.EFBIG), error
+    print('handled raw file limit')
+    sys.exit(23)
+raise AssertionError('raw write unexpectedly exceeded the file limit')
+"""
+        for source, expected in (([], 23), ([self.repo.as_uri()], 125)):
+            with self.subTest(source=source):
+                try:
+                    result = subprocess.run([str(BINARY), *source, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
+                                            cwd=self.repo, env=self.environment(), capture_output=True, timeout=60,
+                                            preexec_fn=lambda: file_size_limits(128 * 1024))
+                    self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
+                    self.assertEqual(result.stdout, b'handled raw file limit\n')
+                    if source:
+                        self.assertIn(b'File too large', result.stderr)
+                    self.assert_no_runtime_files()
+                finally:
+                    for run in self.system_tmp.glob('git-on-*'):
+                        self.cleanup_run(run)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux prlimit")
     def test_checked_block_read_survives_cache_spill_limits_locally_and_remotely(self):

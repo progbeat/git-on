@@ -131,6 +131,9 @@ The same FUSE and write-policy contract below applies to local and remote runs.
 - Completion unmounts (when mounted) and deletes the private execution tree.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
+- Handle recoverable resource errors through ordinary operation or runner
+  failures and orderly cleanup whenever possible. Manual stale-run recovery
+  does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
   locking, releasing the exact Git pin and identifying the owned SSH socket;

@@ -47,6 +47,9 @@ objects. Protocol packs and native decoder output can also require transient
 bounded-part staging. Temporary files obey inherited file-size and descriptor
 limits. All invocation-owned storage is released by successful cleanup; failed
 cleanup follows the documented recovery contract.
+Git-on catches `SIGXFSZ` from its own writes so `EFBIG` follows normal error
+handling and cleanup. Executed commands retain the caller's default or ignored
+signal disposition.
 
 ## Integrity
 

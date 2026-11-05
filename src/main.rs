@@ -599,11 +599,25 @@ fn subscribe_signals() -> std::io::Result<Signals> {
         libc::SIGCONT,
     ])
 }
+fn handle_file_size_errors() -> std::io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { action.assume_init() }.sa_sigaction == libc::SIG_DFL {
+        // Catch daemon write-limit signals so EFBIG reaches normal cleanup.
+        // Exec resets caught handlers to default; an inherited SIG_IGN remains
+        // unchanged, preserving the caller's choice in Git and the command.
+        unsafe { signal_hook::low_level::register(libc::SIGXFSZ, || {}) }?;
+    }
+    Ok(())
+}
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
         // main has not created signal handlers, worker threads or Git handles.
         unsafe { git_on::object::configure_pack_descriptors() }?;
+        handle_file_size_errors()?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
                 cleanup(Path::new(&directory))?;
