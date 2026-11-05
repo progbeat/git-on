@@ -838,6 +838,59 @@ assert not Path('out/final-hard').exists()
 ''')
         self.assert_success(result)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux prlimit")
+    def test_checked_block_read_survives_cache_spill_limits_locally_and_remotely(self):
+        directory = self.repo / 'cache-spill'
+        directory.mkdir()
+        (directory / 'large').write_bytes(b'x' * (2 * 1024 * 1024))
+        # 254 complete 64 KiB payloads plus entry charges fill the 16 MiB
+        # resident budget and displace the already-backed large-file block.
+        for index in range(254):
+            (directory / f'f{index:04d}').write_bytes(index.to_bytes(4, 'little') + b's' * (65536 - 4))
+        git(self.repo, 'add', 'cache-spill')
+        git(self.repo, 'commit', '--quiet', '-m', 'cache-only spill limit')
+        git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
+        git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
+        code = """
+import errno, os, resource
+with open('cache-spill/large', 'rb', buffering=0) as large:
+    assert large.read(1) == b'x'
+    for index in range(254):
+        with open('cache-spill/f%04d' % index, 'rb', buffering=0) as small:
+            assert small.read(4) == index.to_bytes(4, 'little')
+    runner = os.getppid()
+    original = resource.prlimit(runner, resource.RLIMIT_FSIZE)
+    try:
+        resource.prlimit(runner, resource.RLIMIT_FSIZE, (3, original[1]))
+        # An untouched far block must be read and authenticated from raw disk.
+        try:
+            data = os.pread(large.fileno(), 1, 2 * 1024 * 1024 - 1)
+        except OSError as error:
+            assert error.errno in (errno.EIO, errno.EFBIG), error
+            print('handled cache-only read error', error.errno)
+        else:
+            assert data == b'x'
+            with open('cache-spill/f0000', 'rb', buffering=0) as resident:
+                assert resident.read(4) == b'\\0' * 4
+            print('checked bytes survived cache-only spill failure')
+    finally:
+        resource.prlimit(runner, resource.RLIMIT_FSIZE, original)
+"""
+        for source in ([], [self.repo.as_uri()]):
+            with self.subTest(source=source):
+                try:
+                    # Turn the write limit into EFBIG to exercise failed optional
+                    # admission independently of the inherited signal policy.
+                    result = subprocess.run([str(BINARY), *source, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
+                                            cwd=self.repo, env=self.environment(), capture_output=True, timeout=60,
+                                            preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
+                    self.assert_success(result)
+                    self.assertEqual(result.stdout, b'checked bytes survived cache-only spill failure\n')
+                    self.assert_no_runtime_files()
+                finally:
+                    for run in self.system_tmp.glob('git-on-*'):
+                        self.cleanup_run(run)
+
     def test_partial_backing_write_and_sparse_blocks_remain_visible(self):
         code = r'''
 import errno, os, resource

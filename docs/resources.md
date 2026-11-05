@@ -14,6 +14,9 @@ bytes in private raw storage before releasing them. Large objects stream to one
 raw file per original OID and retain at most their most recently read 64 KiB
 block. Prepared objects remain reusable after close/reopen and cache eviction
 without another fetch or decode. Separate invocations have separate storage.
+If caching an authenticated disk block would require a spill that fails with an
+I/O error, the read returns its checked bytes without admitting that block.
+The unbacked resident remains in RAM; the payload budget is not increased.
 
 ## Metadata and source decoding
 

@@ -163,7 +163,14 @@ impl RawBlob {
             }
             // Copy only from this checked buffer, never reopen/reread after trust.
             result.extend_from_slice(&bytes[from..to]);
-            store.admit(self.oid, block, bytes)?;
+            if let Err(error) = store.admit(self.oid, block, bytes) {
+                // Optional admission can spill a different resident object.
+                // A failed write preserves that resident; return the checked
+                // bytes without caching this block. Accounting errors still fail.
+                if error.downcast_ref::<io::Error>().is_none() {
+                    return Err(error);
+                }
+            }
         }
         Ok(result)
     }
@@ -187,6 +194,8 @@ struct RawDirectory {
     _owner: tempfile::TempDir,
     #[cfg(test)]
     open_calls: std::cell::Cell<usize>,
+    #[cfg(test)]
+    spill_error: Option<i32>,
 }
 impl RawDirectory {
     fn new(parent: &Path) -> Result<Self> {
@@ -204,6 +213,8 @@ impl RawDirectory {
             _owner: owner,
             #[cfg(test)]
             open_calls: std::cell::Cell::new(0),
+            #[cfg(test)]
+            spill_error: None,
         })
     }
     fn validate_size(metadata: &Metadata, size: Option<u64>) -> Result<()> {
@@ -266,6 +277,10 @@ impl RawDirectory {
         })
     }
     fn spill(&self, oid: Oid, bytes: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.spill_error {
+            return Err(io::Error::from_raw_os_error(error).into());
+        }
         // These bytes are already verified and fully resident. Store's lock
         // prevents readers from observing file=true until the write succeeds,
         // so this path needs no intermediate random name or rename. Exclusive
@@ -927,6 +942,46 @@ mod tests {
         assert_eq!(store.disk_metrics(), (0, 0));
         assert_eq!(store.memory_metrics().1, 1);
         assert_eq!(reader.read_all().unwrap(), bytes);
+    }
+    #[test]
+    fn optional_cache_spill_failure_preserves_checked_bytes_and_resident() {
+        for error in [libc::ENOSPC, libc::EDQUOT] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = RawBlobs::new(root.path()).unwrap();
+            store.state.lock().unwrap().memory_limit = BLOCK + ENTRY_CHARGE;
+            let mut large = vec![b'a'; BLOCK];
+            large.extend(vec![b'b'; BLOCK]);
+            let large_oid = Oid::hash_object(ObjectType::Blob, &large).unwrap();
+            let large_reader = store
+                .insert(large_oid, large.len(), large.as_slice(), root.path())
+                .unwrap();
+            assert_eq!(large_reader.read(0, 1).unwrap(), b"a");
+            let small = vec![b's'; BLOCK];
+            let small_oid = Oid::hash_object(ObjectType::Blob, &small).unwrap();
+            let small_reader = store
+                .insert(small_oid, small.len(), small.as_slice(), root.path())
+                .unwrap();
+            assert!(!small_reader.on_disk());
+            store.state.lock().unwrap().directory.spill_error = Some(error);
+
+            assert_eq!(
+                large_reader.read(BLOCK as u64, 1).unwrap(),
+                b"b",
+                "cache spill errno {error}"
+            );
+            assert_eq!(store.failure(), None);
+            assert_eq!(store.memory_metrics(), (BLOCK + ENTRY_CHARGE, 1));
+            assert_eq!(store.disk_metrics(), (2 * BLOCK as u64, 1));
+            assert!(!small_reader.on_disk());
+            assert_eq!(small_reader.read(0, 1).unwrap(), b"s");
+            assert_eq!(stored_bytes(root.path()), (2 * BLOCK) as u64);
+
+            store.state.lock().unwrap().directory.spill_error = None;
+            assert_eq!(large_reader.read(BLOCK as u64, 1).unwrap(), b"b");
+            assert!(small_reader.on_disk());
+            assert_eq!(store.failure(), None);
+            assert_eq!(small_reader.read(0, 1).unwrap(), b"s");
+        }
     }
     #[test]
     fn read_slot_releases_its_descriptor_before_replacing_it() {
