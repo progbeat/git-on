@@ -95,10 +95,16 @@ elif sys.argv[1:3]==['apt-get','install']:
         self.assertIn('matrix: ${{ fromJSON(needs.changes.outputs.scale_matrix) }}',body)
         real=job('webkit-scale')
         self.assertIn("if: needs.changes.outputs.scale == 'true'",real)
-        self.assertIn('tests/real_repository.py prepare',real)
         self.assertIn('tests/real_repository.py run',real)
         self.assertIn('webkit-results.jsonl',real)
-        self.assertEqual(real.count('tests/real_repository.py prepare'),1)
+        self.assertNotIn('tests/real_repository.py prepare',real,
+                         'the sparse WebKit gate must not acquire a full source fixture')
+        self.assertEqual(real.count('tests/real_repository.py run'),1)
+        self.assertIn('--summary "$GITHUB_STEP_SUMMARY"',real)
+        self.assertIn('needs: [changes, real-fuse]',real)
+        self.assertIn('name: linux-instrumented-runner',real)
+        self.assertIn('name: linux-instrumented-runner',job('real-fuse'))
+        self.assertNotIn('cargo build',real,'reuse the same-run binary instead of building it twice')
         for expected in ['tests/scalability.py','--features test-metrics','--profile "$PROFILE"','scale-results-$SOURCE.jsonl','matrix.profile','matrix.sources']:
             self.assertIn(expected,body)
         self.assertIn('workflow_dispatch:',WORKFLOW)

@@ -156,6 +156,13 @@ jobs:
       - name: Build private resource instrumentation
         run: |
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
+      - name: Share the exact-head instrumented runner with WebKit
+        if: needs.changes.outputs.scale == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-instrumented-runner
+          path: target/release/git-on
+          if-no-files-found: error
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
           python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on
@@ -357,10 +364,10 @@ jobs:
           if-no-files-found: ignore
 
   webkit-scale:
-    needs: [changes]
+    needs: [changes, real-fuse]
     if: needs.changes.outputs.scale == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -373,14 +380,14 @@ jobs:
           sudo apt-get install --yes fuse3
           test -c /dev/fuse
           command -v fusermount3
-      - name: Build optimized instrumented runner
-        run: |
-          rustup toolchain install stable --profile minimal
-          cargo build --release --locked --features test-metrics --bin git-on
-      - name: Acquire and verify the pinned source once
-        run: python3 tests/real_repository.py prepare --directory "$RUNNER_TEMP/webkit-fixture"
-      - name: Full real snapshot and useful tooling command with complete baselines
-        run: python3 tests/real_repository.py run --fixture "$RUNNER_TEMP/webkit-fixture" --binary target/release/git-on --output webkit-results.jsonl
+      - name: Reuse the tested runner from this workflow run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-instrumented-runner
+          path: target/release
+      - run: chmod +x target/release/git-on
+      - name: Small upstream command on pinned public WebKit
+        run: python3 tests/real_repository.py run --binary target/release/git-on --output webkit-results.jsonl --summary "$GITHUB_STEP_SUMMARY"
       - name: Retain real repository evidence, including partial failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

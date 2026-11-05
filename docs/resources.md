@@ -69,8 +69,8 @@ process memory are outside the threat model.
 - Object and metadata reuse tests check exact results, source demands, bounded
   cache accounting and preparation of touched directories without repeated scans.
 - Real FUSE tests check kernel cache behavior and identical namespace/content
-  results. The WebKit workload covers full reads, useful tooling commands,
-  complete native materialization baselines and resource accounting.
+  results. The WebKit workload runs a small upstream command on the large public
+  source and bounds its actual metadata, decoded-payload and pack demand.
 
 Performance acceptance includes startup, native children, transfers, decoding,
 verification, metadata work, temporary I/O and cleanup. Compare the same command

@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 import os
 from process_capture import capture
-from benchmark_support import build_resource_observer, stat_abi_bytes
+from benchmark_support import build_stat_observer, stat_abi_bytes
 from remote import Fixture
 
 
@@ -77,7 +77,7 @@ def run(options):
                 tree=f.git('mktree',data=''.join(entries).encode())
                 commit=f.git('commit-tree',tree,data=b'object reuse regression\n');f.git('update-ref','refs/heads/main',commit)
                 child=f.root/'command.py';child.write_text(CHILD)
-                stat_bytes=stat_abi_bytes(build_resource_observer(f.root/'resource-observer'))
+                stat_bytes=stat_abi_bytes(build_stat_observer(f.root/'stat-abi'))
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.blob_bytes),str(stat_bytes)]
                 source='file://'+str(f.repo)
                 env,log=native_command_audit(f.root,f.env,options.backend=='materialized')

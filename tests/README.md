@@ -1,40 +1,30 @@
 # Integration tests
 
-Pinned real-repository coverage runs separately from the small behavior matrix:
+A small real command on public WebKit runs separately from the behavior matrix:
 
 ```sh
-python3 tests/real_repository.py prepare --directory /path/to/webkit-fixture
-python3 tests/real_repository.py run --fixture /path/to/webkit-fixture --binary target/release/git-on --output webkit-results.jsonl
+cargo build --release --locked --features test-metrics --bin git-on
+python3 tests/real_repository.py run --binary target/release/git-on --output webkit-results.jsonl
 ```
 
-Build with `--release --locked --features test-metrics` and use real Linux FUSE.
-Preparation downloads one pinned WebKit Git repository (several GiB of logical
-contents); it does not download dependencies or hydrate LFS. The full local
-case checks every path and blob twice. The useful smaller command runs 32 real
-upstream webkitcorepy unit tests, with three fresh local and three file-transport
-invocations, each with first/repeat test processes. No browser/SDK bootstrap or
-package installation is required. The direct command is:
+This requires real Linux FUSE and public HTTPS. It starts without downloaded
+source objects and runs 32 upstream `webkitcorepy` tests twice in one mount.
+There is no full clone, source fixture, recursive scan, checkout, browser build,
+SDK or package installation. The command must see the pinned root tree, and the
+gate rejects excessive metadata, blob or received-pack demand. Complete invocation
+time includes network access, native subprocesses, command execution and cleanup.
+
+The corresponding one-pass interactive command is:
 
 ```sh
-PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+git-on https://github.com/WebKit/WebKit.git 4b125afe35a2e95bf764d7a5e2efe7dc574a0653 --write-policy=none -- env PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
 ```
 
-An actual Git-on invocation of the same useful command is:
-
-```sh
-git-on file:///absolute/path/to/webkit-fixture/repository.git 4b125afe35a2e95bf764d7a5e2efe7dc574a0653 --write-policy=none -- env PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
-```
-
-For the local mode, run from that bare repository's directory and omit the
-`file://...` operand. The reported benchmark uses its external Python wrapper
-to run this test command twice in one mount and retain separate first/repeat
-outputs; `runner.argv` records the exact measured Git-on argv, excluding the
-resource observer prefix. The one-pass command above is the interactive demo.
-Complete invocation timing includes setup, all subprocesses and cleanup.
-
-This is not a public-network latency benchmark. Source and OS-cache
-conditions, complete baseline composition and sampled-memory limitations are
-explicit in each report. See [CI coverage](../docs/ci-performance.md).
+`--summary PATH` also writes a Markdown summary of elapsed time and actual source
+demand; CI supplies its job-summary path. The fixed source has 472,895 blob paths
+and 5,522,313,781 logical bytes; this test does not scan/download it in full.
+Network latency is uncontrolled. The test does not measure a full-clone speed
+ratio or complete #20 acceptance. See [CI coverage](../docs/ci-performance.md).
 
 ```console
 cargo build --locked
@@ -296,8 +286,8 @@ million-file reads/materialization and repeated invocations; no correctness
 suite is deferred to a nightly or post-merge job.
 
 All affected source/policy/signature interactions remain pre-merge. Four physical matrix
-jobs group build/setup work; the separate WebKit job acquires its fixture once
-and checks full local reads plus the selected upstream unit tests.
+jobs group build/setup work; the separate WebKit job runs only the selected
+upstream unit tests on public HTTPS without preparing a full source fixture.
 Enabled passthrough retains actual-kernel capability/ordinary-child checks in
 `real-fuse`, plus both source scale groups. Differential stress keeps
 both seeds in default ignored and its resource bounds; dedicated write-policy
