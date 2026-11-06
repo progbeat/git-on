@@ -35,6 +35,18 @@ SNAPSHOT_METRICS = (
 )
 
 
+def validate_cache_budgets(metrics):
+    """Payload retention is bounded; zero tree limit means retained metadata."""
+    for kind in ("blob", "tree"):
+        size, limit = (metrics.get(kind + suffix) for suffix in ("_cache_bytes", "_cache_limit"))
+        if type(size) is not int or type(limit) is not int or min(size, limit) < 0:
+            raise ValueError(f"invalid {kind} cache accounting")
+        if kind == "tree" and limit == 0:
+            continue
+        if size > limit:
+            raise ValueError(f"{kind} cache exceeds its configured byte bound")
+
+
 def snapshot_metrics(metrics):
     """Require explicit test-build counters; never infer reads from timing."""
     if not isinstance(metrics, dict):
@@ -43,9 +55,7 @@ def snapshot_metrics(metrics):
         value = metrics.get(name)
         if type(value) is not int or value < 0:
             raise ValueError(f"snapshot metric {name} must be a nonnegative integer")
-    for kind in ("blob", "tree"):
-        if metrics[kind + "_cache_bytes"] > metrics[kind + "_cache_limit"]:
-            raise ValueError(f"{kind} cache exceeds its configured byte bound")
+    validate_cache_budgets(metrics)
     return {name: metrics[name] for name in SNAPSHOT_METRICS}
 
 
@@ -650,6 +660,12 @@ class SelfTests(unittest.TestCase):
             snapshot_metrics({})
         with self.assertRaises(ValueError):
             snapshot_metrics(None)
+        # Parsed metadata has no payload-LRU budget; this does not remove the
+        # independent byte limit on resident file data.
+        retained = dict(metrics, tree_cache_limit=0)
+        self.assertEqual(snapshot_metrics(retained), retained)
+        with self.assertRaises(ValueError):
+            snapshot_metrics(dict(retained, blob_cache_bytes=1025))
 
     def test_summary_excludes_warmups_and_failures(self):
         sample = dict(case={"case": "x"}, success=True, warmup=False, child_startup_ms=3,

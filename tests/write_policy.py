@@ -17,6 +17,7 @@ from integration import BINARY, FUSE_AVAILABLE, OPTIONS, PARSER, RepositoryTest,
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE device and fusermount3 required")
 class WritePolicyTests(RepositoryTest):
+
     def policy(self, policy, code):
         return self.invoke_argv([
             "HEAD", "--write-policy=" + policy,
@@ -28,6 +29,103 @@ class WritePolicyTests(RepositoryTest):
         self.assertEqual(git(self.repo, "status", "--porcelain", "--ignored"), "")
         self.assertEqual((self.repo / "tracked.txt").read_text(), "committed\n")
         self.assertEqual(os.readlink(self.repo / "tracked-link"), "tracked.txt")
+
+    def test_all_cached_name_bindings_follow_replacement_links_and_directory_moves(self):
+        result, run = self.policy("all", r'''
+import errno, os
+from pathlib import Path
+name = Path('tracked.txt')
+reader = os.open(name, os.O_RDONLY)
+old_inode = os.fstat(reader).st_ino
+assert name.stat().st_ino == old_inode and name.read_bytes() == b'committed\n'
+try:
+ # First replace the source binding, then replace its private replacement.
+ for index in range(2):
+  other = Path('replacement')
+  payload = ('value-%d' % index).encode()
+  other.write_bytes(payload)
+  assert other.stat().st_ino != old_inode
+  os.replace(other, name)
+  assert name.read_bytes() == payload
+  assert name.stat().st_ino != old_inode
+  assert os.pread(reader, 100, 0) == b'committed\n'
+  assert os.fstat(reader).st_nlink == 0
+  assert not other.exists()
+  os.rename(name, 'moved')
+  assert not name.exists()
+  os.link('moved', name)
+  assert name.stat().st_ino == Path('moved').stat().st_ino
+  assert name.stat().st_nlink == 2
+  Path('moved').unlink()
+  assert name.stat().st_nlink == 1 and name.read_bytes() == payload
+finally:
+ os.close(reader)
+# Cached descendant dentries keep their inode identity across a parent move.
+source = Path('nested/module.py')
+inode = source.stat().st_ino
+assert source.read_bytes() == b'VALUE = 42\n'
+os.rename('nested', 'renamed')
+assert not source.exists()
+source = Path('renamed/module.py')
+assert source.stat().st_ino == inode and source.read_bytes() == b'VALUE = 42\n'
+source.unlink()
+source.write_bytes(b'replacement child')
+assert source.read_bytes() == b'replacement child' and source.stat().st_ino != inode
+''')
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assert_source_unchanged()
+        self.assert_no_runtime_files()
+
+    def test_all_cached_attributes_follow_parent_edits_and_source_copy_up(self):
+        result, run = self.policy("all", r'''
+import os, stat
+from pathlib import Path
+root = Path('.')
+epoch = 111111111
+os.utime(root, (epoch, epoch))
+before = root.stat()
+assert int(before.st_mtime) == epoch
+parent = Path('generated-parent')
+parent.mkdir()
+after = root.stat()
+assert after.st_nlink == before.st_nlink + 1
+assert int(after.st_mtime) != epoch
+os.utime(parent, (epoch, epoch))
+initial = parent.stat()
+child = parent / 'child'
+child.write_bytes(b'new file')
+assert int(parent.stat().st_mtime) != epoch
+assert parent.stat().st_nlink == initial.st_nlink
+subdir = parent / 'directory'
+subdir.mkdir()
+assert parent.stat().st_nlink == initial.st_nlink + 1
+os.rename(subdir, 'moved-directory')
+assert parent.stat().st_nlink == initial.st_nlink
+assert root.stat().st_nlink == before.st_nlink + 2
+Path('moved-directory').rmdir()
+child.unlink(); parent.rmdir()
+assert root.stat().st_nlink == before.st_nlink
+source = Path('tracked.txt')
+original = source.stat()
+reader = os.open(source, os.O_RDONLY)
+try:
+ source.chmod(0o600)
+ os.utime(source, (epoch, epoch))
+ assert stat.S_IMODE(source.stat().st_mode) == 0o600
+ assert int(source.stat().st_mtime) == epoch
+ with source.open('r+b', buffering=0) as writer:
+  writer.truncate(3)
+  writer.write(b'new')
+ assert source.stat().st_size == 3 and os.fstat(reader).st_size == 3
+ assert os.pread(reader, 100, 0) == b'new'
+ assert source.stat().st_ino == original.st_ino
+finally: os.close(reader)
+''')
+        self.assert_success(result)
+        self.assertIsNone(run)
+        self.assert_source_unchanged()
+        self.assert_no_runtime_files()
 
     def test_none_reads_but_denies_mutations_even_in_ignored_paths(self):
         result, run = self.policy("none", r'''

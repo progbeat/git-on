@@ -60,7 +60,13 @@ The ordinary CI workflow keeps `rust`, `macos`, `real-fuse`, `lazy-performance`,
 `dist build` for Linux and Apple Silicon, exercises extracted binaries and the
 stock installer, and checks bundled license texts. Linux runs real FUSE against
 the packaged executable; Mac runs CLI/materialized behavior. The required
-`package` check succeeds only when both native jobs pass.
+`package` aggregate always waits for all base jobs and uses the conservative CI
+plan to require affected scale/stress/lazy/resource jobs and their actual
+evidence before merge. A required skipped or missing case fails; genuinely
+unaffected heavy jobs may skip without leaving the aggregate pending. Workflow,
+dependency, shared-helper and unknown changes require all affected suites.
+Manual `workflow_dispatch` exhaustive runs are available before release and
+never publish themselves.
 
 After all checks pass on a master push with a validated version increment, the
 small `release` job creates `vVERSION` at that exact tested SHA, or checks an

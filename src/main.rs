@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use git_on::{
     filesystem::Overlay,
+    git::set_foreground as foreground,
     platform::{ensure_unmounted, mount_is_ours},
     snapshot::Snapshot,
 };
@@ -87,26 +88,6 @@ fn release_pin(m: &Recovery) -> Result<()> {
     }
     Ok(())
 }
-// tcsetpgrp may send SIGTTOU to a background caller; temporarily block it.
-fn foreground(fd: i32, pgid: libc::pid_t) -> std::io::Result<()> {
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTTOU);
-        let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-        if error != 0 {
-            return Err(std::io::Error::from_raw_os_error(error));
-        }
-        let rc = libc::tcsetpgrp(fd, pgid);
-        let error = std::io::Error::last_os_error();
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        if rc != 0 {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
 struct Terminal {
     tty: Option<File>,
     parent: Option<libc::pid_t>,
@@ -143,32 +124,60 @@ impl Drop for Terminal {
     }
 }
 fn clean_unmount(mountpoint: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let unmount = {
+        let mut c = Command::new("fusermount3");
+        c.args(["-u", "--"]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let unmount = Command::new("/sbin/umount");
+    clean_unmount_with(unmount, mountpoint)
+}
+fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
+    git_on::git::initialize_cancellation()?;
+    // Observe signals received during cleanup, rather than a cancellation that
+    // already stopped the command. The first cancellation still gets a normal
+    // unmount attempt; a subsequent signal can stop a hung helper.
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT, libc::SIGCHLD])?;
+    unmount
+        .arg(mountpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        unmount.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let start = Instant::now();
     loop {
-        #[cfg(target_os = "linux")]
-        let mut unmount = {
-            let mut c = Command::new("fusermount3");
-            c.args(["-u", "--"]);
-            c
-        };
-        #[cfg(target_os = "macos")]
-        let mut unmount = Command::new("/sbin/umount");
-        let mut child = unmount
-            .arg(mountpoint)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("start clean unmount")?;
+        // A successful clean unmount may reclaim every visited inode. Its
+        // duration grows with the actual traversal; elapsed time alone cannot
+        // distinguish that work from a busy mount. Wait for the helper's real
+        // result, and bound only retries of completed failures below.
+        let mut child = unmount.spawn().context("start clean unmount")?;
+        let mut pending = signals.pending();
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
+            if let Some(signal) =
+                pending.find(|s| matches!(*s, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
+            {
+                git_on::git::cancel_by_signal(signal);
+                kill_group(child.id(), libc::SIGKILL);
+                child.wait().context("reap cancelled unmount helper")?;
+                bail!("clean unmount cancelled by signal {signal}; recovery state preserved for --cleanup");
             }
-            if start.elapsed() > Duration::from_secs(3) {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("clean unmount timed out; run --cleanup after stopping mount users");
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => pending = signals.wait(),
+                Err(error) => {
+                    kill_group(child.id(), libc::SIGKILL);
+                    let _ = child.wait();
+                    return Err(error).context("wait for clean unmount");
+                }
             }
-            std::thread::sleep(Duration::from_millis(10));
         };
         if status.success() {
             break;
@@ -396,6 +405,7 @@ fn execute(
             }
         }
         save(&dir, &state)?;
+
         let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
             source.as_deref(),
@@ -411,14 +421,15 @@ fn execute(
             },
         )?;
         observed = Some(snapshot.clone());
+
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
+
         let unavailable = git_on::platform::fuse_unavailable()?;
         let mut session = if let Some(reason) = unavailable {
             if write_policy != git_on::policy::WritePolicy::All {
                 bail!("FUSE unavailable: {reason}; policy {write_policy:?} requires FUSE. Only explicit --write-policy=all supports materialization");
             }
-            eprintln!("git-on: materialized backend (explicit all): {reason}; eagerly reading the complete snapshot");
             git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
             None
         } else {
@@ -475,6 +486,7 @@ fn execute(
                 Ok(())
             });
         }
+
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -494,9 +506,11 @@ fn execute(
                     .with_context(|| format!("cannot start command {:?}; {next_step}", args[0]));
             }
         };
+
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
         let outcome = supervise(&mut child, &mut signals, &terminal);
+
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
                 git_on::git::cancel_by_signal(signal);
@@ -510,7 +524,9 @@ fn execute(
             let _ = child.wait();
         }
         drop(terminal);
+
         let unmount = session.as_mut().map_or(Ok(()), Mounted::finish);
+
         match (outcome, unmount) {
             (Ok(status), Ok(())) => Ok(status),
             (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
@@ -520,6 +536,7 @@ fn execute(
     // Also cover errors before the child could start. State inspection below
     // must never wait behind an owned operation that the run no longer needs.
     git_on::git::stop_operations();
+
     let mut transport_cleanup_failure = None;
     if let Some(snapshot) = observed.take() {
         if let Some(failure) = snapshot.remote_failure() {
@@ -540,6 +557,7 @@ fn execute(
             std::mem::forget(snapshot);
         }
     }
+
     let cleanup_result = (|| -> Result<()> {
         if let Some(error) = transport_cleanup_failure {
             return Err(error).with_context(|| {
@@ -571,7 +589,11 @@ fn execute(
         fs::remove_dir_all(&dir)?;
         Ok(())
     })();
+
     if let Err(e) = cleanup_result {
+        if git_on::git::cancelled_signal().is_some() {
+            eprintln!("git-on: {e:#}");
+        }
         result = Err(match result {
             Ok(_) => e,
             Err(a) => anyhow::anyhow!("{a:#}; cleanup: {e:#}"),
@@ -590,9 +612,25 @@ fn subscribe_signals() -> std::io::Result<Signals> {
         libc::SIGCONT,
     ])
 }
+fn handle_file_size_errors() -> std::io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { action.assume_init() }.sa_sigaction == libc::SIG_DFL {
+        // Catch daemon write-limit signals so EFBIG reaches normal cleanup.
+        // Exec resets caught handlers to default; an inherited SIG_IGN remains
+        // unchanged, preserving the caller's choice in Git and the command.
+        unsafe { signal_hook::low_level::register(libc::SIGXFSZ, || {}) }?;
+    }
+    Ok(())
+}
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
+        // main has not created signal handlers, worker threads or Git handles.
+        unsafe { git_on::object::configure_pack_descriptors() }?;
+        handle_file_size_errors()?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
                 cleanup(Path::new(&directory))?;
@@ -613,7 +651,7 @@ fn main() {
     })();
     match result {
         Ok(status) => {
-            if let Some(signal) = status.signal() {
+            if let Some(signal) = git_on::git::cancelled_signal().or_else(|| status.signal()) {
                 unsafe {
                     libc::signal(signal, libc::SIG_DFL);
                     libc::raise(signal);
@@ -643,6 +681,25 @@ mod tests {
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn clean_unmount_waits_for_active_helper_but_bounds_completed_failures() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+        let mut slow_success = Command::new("/bin/sh");
+        slow_success.args(["-c", "exec /bin/sleep 4", "unmount-test"]);
+        let start = Instant::now();
+        clean_unmount_with(slow_success, Path::new("unused-test-mount")).unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(4));
+
+        let mut busy = Command::new("/bin/sh");
+        busy.args(["-c", "exit 1", "unmount-test"]);
+        let start = Instant::now();
+        let error = clean_unmount_with(busy, Path::new("unused-test-mount")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("mount is busy or unmount failed"));
+        assert!(start.elapsed() < Duration::from_secs(6));
+    }
 
     #[test]
     fn review_signal_before_first_native_git_is_not_lost() {

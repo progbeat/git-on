@@ -1,5 +1,31 @@
 # Integration tests
 
+A small real command on public WebKit runs separately from the behavior matrix:
+
+```sh
+cargo build --release --locked --features test-metrics --bin git-on
+python3 tests/real_repository.py run --binary target/release/git-on --output webkit-results.jsonl
+```
+
+This requires real Linux FUSE and public HTTPS. It starts without downloaded
+source objects and runs 32 upstream `webkitcorepy` tests twice in one mount.
+There is no full clone, source fixture, recursive scan, checkout, browser build,
+SDK or package installation. The command must see the pinned root tree, and the
+gate rejects excessive metadata, blob or received-pack demand. Complete invocation
+time includes network access, native subprocesses, command execution and cleanup.
+
+The corresponding one-pass interactive command is:
+
+```sh
+git-on https://github.com/WebKit/WebKit.git 4b125afe35a2e95bf764d7a5e2efe7dc574a0653 --write-policy=none -- env PYTHONPATH=Tools/Scripts/libraries/webkitcorepy DISABLE_WEBKITCOREPY_AUTOINSTALLER=1 python3 -B -S -m unittest webkitcorepy.tests.version_unittest webkitcorepy.tests.string_utils_unittest webkitcorepy.tests.filtered_call_unittest
+```
+
+`--summary PATH` also writes a Markdown summary of elapsed time and actual source
+demand; CI supplies its job-summary path. The fixed source has 472,895 blob paths
+and 5,522,313,781 logical bytes; this test does not scan/download it in full.
+Network latency is uncontrolled. The test does not measure a full-clone speed
+ratio or complete #20 acceptance. See [CI coverage](../docs/ci-performance.md).
+
 ```console
 cargo build --locked
 python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
@@ -40,13 +66,13 @@ python3 tests/remote.py
 python3 tests/ssh_regressions.py
 python3 tests/native_job_control.py
 python3 tests/remote.py --require-fuse
-python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_cold_and_warm_bounded_fetch
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
 ```
 
 The source probe exercises the production loader without a mount and records
 received OIDs, requested objects, request/response bytes and loader metrics.
 Tests distinguish listing from stat, repeated reads and large ranges; compare
-cold and warm caches; use distinct trees for moving-ref/replacement checks; and
+independent invocations and same-run reuse; use distinct trees for moving-ref/replacement checks; and
 cover native formats/trust, tag chains, inherited Git settings and server faults.
 OpenPGP cases use a disposable public-only keyring to compare unknown-trust
 commit/tag acceptance with native Git's default and rejection with configured
@@ -58,10 +84,12 @@ The native job-control suite runs an actual interactive Bash in a Linux PTY,
 stops encrypted-key authentication with Ctrl-Z, resumes through `fg` and `bg`,
 checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
 It fails unsigned native verification after authentication and needs no mount.
-The real-FUSE job additionally replays the authentic `e427743` executable and
-source probe for the SSH argument-boundary, ignore-acquisition errno, and native
-job-control regressions before requiring the fixed behavior.
-SSH shutdown regressions additionally replay `87a11d5`: equal-length client
+The real-FUSE job always runs the SSH argument-boundary, ignore-acquisition
+errno and native job-control regressions. Optional `--before-*` arguments replay
+authentic historical executables; their red-before evidence is recorded in
+[review regressions](../docs/review-regressions.md), without rebuilding known
+failing binaries on every push.
+SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
 retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
 changes the pathname only after file validation, demonstrating the old race;
@@ -75,7 +103,7 @@ digit paths; preparation verifies every leaf before measuring remote demand.
 The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
 mounts for remote writes, keep, cancellation, busy/stale recovery, external
 `git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
-FUSE for the remote million cold no-op/read and warm read. A loader success or
+FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
 availability is not required by these deterministic gates.
 
@@ -228,3 +256,47 @@ and native archive.
 No old archive-layout compatibility path is implemented.
 See [platform validation](../docs/platforms.md) for Linux passthrough evidence and
 the supported Mac CLI/materialization subset. Mac mounts are deferred to #12.
+
+## Resource and pre-merge scale acceptance
+
+See [resource acceptance](../docs/resources.md), the
+[CI cost/coverage map](../docs/ci-performance.md), and the
+[dependency audit](../docs/crate-audit.md). Resource regressions remain in
+`remote.py`; optional `--before-resource-probe` replays exact-master failures.
+`pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
+32/128/512 distinct-object pack metadata work, and verifies the full available
+OID set once after both read passes. The probe's `--metrics-only` mode omits
+full-OID enumeration from repeated measurements. Report preparation and command
+time separately.
+
+`scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
+defaults to `--profile matrix`: every interaction once at 1k paths. The pinned
+WebKit job supplies the principal real scale control. Use `--policies all` for materialization and
+`--policies ignored` for generated-file passthrough. Full children include stat,
+100 repeated reads, exact varied payloads, complete directory/name sets and
+fresh-output/source/cleanup checks. Instrumented snapshots remain independent
+between cases, with exact remote-demand assertions.
+
+`--profile namespace --backend fuse --source remote --policies ignored` visits
+one million leaf names and samples a payload in every leaf directory. It is
+explicitly **not** reading every million-file payload. The separate million
+**distinct**-blob lazy scenario and native true/cat benchmark remain in default
+pre-merge CI. `--profile exhaustive` is an explicit diagnostic option for full
+million-file reads/materialization and repeated invocations; no correctness
+suite is deferred to a nightly or post-merge job.
+
+All affected source/policy/signature interactions remain pre-merge. Four physical matrix
+jobs group build/setup work; the separate WebKit job runs only the selected
+upstream unit tests on public HTTPS without preparing a full source fixture.
+Enabled passthrough retains actual-kernel capability/ordinary-child checks in
+`real-fuse`, plus both source scale groups. Differential stress keeps
+both seeds in default ignored and its resource bounds; dedicated write-policy
+and protocol suites retain all four policies. Native package/installer
+and Mac checks remain. The required `package` aggregate always checks the change plan, all base jobs
+and every required heavy outcome/artifact. Unknown/shared/workflow/dependency
+changes enable all heavy suites; scoped test-driver changes enable their own
+suite. Recognized non-contract docs run the base. No workflow-level path filter
+can leave required checks pending. `workflow_dispatch` with `full_matrix=true`
+selects the complete exhaustive matrix before release; it never publishes. JSONL includes the complete planned cases, observed counts and
+phase/allocation measurements; final claims must match the actually executed
+head and workload sizes.

@@ -2,7 +2,7 @@
 use crate::snapshot::{EntryKind, Snapshot};
 use anyhow::Result;
 use std::{
-    collections::BTreeMap,
+    num::NonZeroUsize,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -102,41 +102,37 @@ impl Rule {
 const RULE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const RULE_CACHE_ENTRIES: usize = 128;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RulesCache {
-    entries: BTreeMap<PathBuf, (Arc<Vec<Rule>>, usize, u64)>,
+    entries: lru::LruCache<PathBuf, (Arc<Vec<Rule>>, usize)>,
     bytes: usize,
-    clock: u64,
+}
+impl Default for RulesCache {
+    fn default() -> Self {
+        Self {
+            entries: lru::LruCache::new(NonZeroUsize::new(RULE_CACHE_ENTRIES).unwrap()),
+            bytes: 0,
+        }
+    }
 }
 impl RulesCache {
     fn get(&mut self, path: &Path) -> Option<Arc<Vec<Rule>>> {
-        let (rules, _, used) = self.entries.get_mut(path)?;
-        self.clock = self.clock.saturating_add(1);
-        *used = self.clock;
-        Some(rules.clone())
+        self.entries.get(path).map(|(rules, _)| rules.clone())
     }
     fn insert(&mut self, path: &Path, rules: Arc<Vec<Rule>>, cost: usize) {
         if cost > RULE_CACHE_BYTES {
             return;
         }
-        if let Some((_, old_cost, _)) = self.entries.remove(path) {
+        if let Some((_, old_cost)) = self.entries.pop(path) {
             self.bytes -= old_cost;
         }
-        while self.entries.len() >= RULE_CACHE_ENTRIES
-            || self.bytes > RULE_CACHE_BYTES.saturating_sub(cost)
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, _, used))| used)
-                .map(|(path, _)| path.clone())
-                .expect("rule cache has a victim");
-            let (_, removed, _) = self.entries.remove(&oldest).unwrap();
+        while self.bytes > RULE_CACHE_BYTES - cost {
+            let (_, (_, removed)) = self.entries.pop_lru().expect("rule cache has a victim");
             self.bytes -= removed;
         }
-        self.clock = self.clock.saturating_add(1);
-        self.entries
-            .insert(path.to_path_buf(), (rules, cost, self.clock));
+        if let Some((_, (_, removed))) = self.entries.push(path.to_path_buf(), (rules, cost)) {
+            self.bytes -= removed;
+        }
         self.bytes += cost;
     }
 }
@@ -360,14 +356,25 @@ mod tests {
     #[test]
     fn rule_cache_bounds_entries_bytes_and_bypasses_oversized_rules() {
         let (_tmp, _snapshot, policy) = fixture("", "");
-        for n in 0..RULE_CACHE_ENTRIES + 10 {
+        for n in 0..RULE_CACHE_ENTRIES {
             policy.rules_at(Path::new(&format!("absent-{n}"))).unwrap();
         }
+        policy.rules_at(Path::new("absent-0")).unwrap();
+        policy.rules_at(Path::new("extra")).unwrap();
         {
             let cache = policy.rules.lock().unwrap();
             assert_eq!(cache.entries.len(), RULE_CACHE_ENTRIES);
             assert!(cache.bytes <= RULE_CACHE_BYTES);
-            assert!(!cache.entries.contains_key(Path::new("absent-0")));
+            assert_eq!(
+                cache.bytes,
+                cache
+                    .entries
+                    .iter()
+                    .map(|(_, (_, cost))| *cost)
+                    .sum::<usize>()
+            );
+            assert!(cache.entries.contains(Path::new("absent-0")));
+            assert!(!cache.entries.contains(Path::new("absent-1")));
         }
         let pattern = format!("{}\n*.log\n", "#ignored comment\n".repeat(1000));
         let (_tmp, _snapshot, policy) = fixture(&pattern, "");
@@ -375,16 +382,46 @@ mod tests {
         assert!(policy.rules.lock().unwrap().entries.is_empty());
         // Test byte-pressure eviction independently of entry pressure.
         let mut cache = RulesCache::default();
-        for n in 0..3 {
+        for n in 0..2 {
             cache.insert(
                 Path::new(&format!("dir-{n}")),
                 Arc::new(Vec::new()),
                 RULE_CACHE_BYTES / 2,
             );
         }
+        assert!(cache.get(Path::new("dir-0")).is_some());
+        cache.insert(
+            Path::new("dir-2"),
+            Arc::new(Vec::new()),
+            RULE_CACHE_BYTES / 2,
+        );
         assert_eq!(cache.bytes, RULE_CACHE_BYTES);
         assert_eq!(cache.entries.len(), 2);
-        assert!(!cache.entries.contains_key(Path::new("dir-0")));
+        assert!(!cache.entries.contains(Path::new("dir-1")));
+        assert!(cache.entries.contains(Path::new("dir-0")));
+
+        let replacement = Arc::new(Vec::new());
+        cache.insert(
+            Path::new("dir-0"),
+            replacement.clone(),
+            RULE_CACHE_BYTES / 4,
+        );
+        assert_eq!(cache.bytes, 3 * RULE_CACHE_BYTES / 4);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(Arc::ptr_eq(
+            &cache.get(Path::new("dir-0")).unwrap(),
+            &replacement
+        ));
+        cache.insert(
+            Path::new("dir-0"),
+            Arc::new(Vec::new()),
+            RULE_CACHE_BYTES + 1,
+        );
+        assert_eq!(cache.bytes, 3 * RULE_CACHE_BYTES / 4);
+        assert!(Arc::ptr_eq(
+            &cache.get(Path::new("dir-0")).unwrap(),
+            &replacement
+        ));
     }
     #[test]
     fn nested_negation_and_tracked_names() {

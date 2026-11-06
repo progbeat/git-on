@@ -90,3 +90,7 @@ deprecation practices so that users know what to expect.
 **Question:** What integrity guarantees must Git-on provide?
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
+
+**Error-handling requirement:** Allowing manual cleanup does not permit avoidable
+abrupt termination. When an error can be handled and the run can shut down and
+clean up normally, Git-on must do so without making the user remove leftover state.
