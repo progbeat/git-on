@@ -271,7 +271,14 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
-    run_captured(command, capture, capture, None)
+    run_captured(command, capture, capture, None, None)
+}
+pub(crate) fn run_with_input(
+    command: Command,
+    capture: bool,
+    mut input: impl std::io::Read,
+) -> Result<std::process::Output> {
+    run_captured(command, capture, capture, None, Some(&mut input))
 }
 /// A bounded pipe transfer is needed when inherited per-file limits require
 /// segmented staging. The caller thread retains request cancellation/TTY
@@ -279,6 +286,7 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
 pub(crate) fn run_to_writer<W: std::io::Write + Send>(
     mut command: Command,
     mut output: W,
+    input: Option<&mut dyn std::io::Read>,
 ) -> Result<std::process::Output> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
@@ -298,7 +306,7 @@ pub(crate) fn run_to_writer<W: std::io::Write + Send>(
                 failed.store(result.is_err(), Ordering::Release);
                 result
             })?;
-        let result = run_captured(command, false, true, Some(&failed));
+        let result = run_captured(command, false, true, Some(&failed), input);
         finished.store(true, Ordering::Release);
         transfer
             .join()
@@ -346,6 +354,7 @@ fn run_captured(
     capture_stdout: bool,
     capture_stderr: bool,
     failed_output: Option<&std::sync::atomic::AtomicBool>,
+    input: Option<&mut dyn std::io::Read>,
 ) -> Result<std::process::Output> {
     use std::{
         io::{Read, Seek},
@@ -359,6 +368,9 @@ fn run_captured(
     if operations_stopped() {
         bail!("Git operation stopped after command completion");
     }
+    let mut input = input
+        .map(|source| NativeInput::new(&mut command, source))
+        .transpose()?;
     let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
     let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
     if let Some(stdout) = &stdout {
@@ -425,12 +437,25 @@ fn run_captured(
                 "Git operation stopped after command completion"
             ));
         }
+        if let Some(stdin) = &mut input {
+            match stdin.advance() {
+                Ok(true) => input = None,
+                Ok(false) => {}
+                Err(error) => {
+                    break stop_request_operation(&mut child)
+                        .and(Err(error).context("write native Git input"));
+                }
+            }
+        }
         if let Some(fd) = tty_fd {
             if let Err(error) = relay_native_job_control(child.id(), fd, parent_group) {
                 break stop_request_operation(&mut child).and(Err(error));
             }
         }
-        wakeup.wait(Duration::from_millis(10));
+        wakeup.wait(
+            Duration::from_millis(10),
+            input.as_ref().map(|input| input.pipe.as_raw_fd()),
+        );
     };
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
@@ -461,6 +486,51 @@ fn run_captured(
         stderr: err,
     })
 }
+struct NativeInput<'a> {
+    source: &'a mut dyn std::io::Read,
+    pipe: std::os::unix::net::UnixStream,
+    bytes: [u8; 8192],
+    pending: std::ops::Range<usize>,
+}
+impl<'a> NativeInput<'a> {
+    fn new(command: &mut Command, source: &'a mut dyn std::io::Read) -> std::io::Result<Self> {
+        use std::os::fd::OwnedFd;
+        let (pipe, child) = std::os::unix::net::UnixStream::pair()?;
+        pipe.set_nonblocking(true)?;
+        command.stdin(Stdio::from(OwnedFd::from(child)));
+        Ok(Self {
+            source,
+            pipe,
+            bytes: [0; 8192],
+            pending: 0..0,
+        })
+    }
+    fn advance(&mut self) -> std::io::Result<bool> {
+        use std::io::{ErrorKind, Write};
+        // Bound work between cancellation checks, including for a decoder's
+        // large segmented request stream. No input worker or full copy is needed.
+        for _ in 0..8 {
+            if self.pending.is_empty() {
+                let count = match self.source.read(&mut self.bytes) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    value => value?,
+                };
+                if count == 0 {
+                    return Ok(true);
+                }
+                self.pending = 0..count;
+            }
+            match self.pipe.write(&self.bytes[self.pending.clone()]) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(count) => self.pending.start += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+}
 /// Exit notification removes the artificial polling floor for short native
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
@@ -484,16 +554,26 @@ impl ChildExitWakeup {
             Self {}
         }
     }
-    fn wait(&self, duration: std::time::Duration) {
+    fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
         #[cfg(target_os = "linux")]
-        if let Some(fd) = &self.fd {
-            use std::os::fd::AsRawFd;
-            let mut descriptor = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let result = unsafe { libc::poll(&mut descriptor, 1, duration.as_millis() as i32) };
+        let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
+        #[cfg(not(target_os = "linux"))]
+        let exit = -1;
+        if exit >= 0 || input.is_some() {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: exit,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: input.unwrap_or(-1),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                },
+            ];
+            let result =
+                unsafe { libc::poll(descriptors.as_mut_ptr(), 2, duration.as_millis() as i32) };
             if result < 0
                 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
             {
@@ -588,7 +668,8 @@ fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
         .context("reap interrupted native Git operation")?;
     Ok(())
 }
-fn set_foreground(fd: i32, group: libc::pid_t) -> std::io::Result<()> {
+/// Transfer terminal ownership while blocking SIGTTOU in the calling thread.
+pub fn set_foreground(fd: i32, group: libc::pid_t) -> std::io::Result<()> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         let mut old = std::mem::zeroed();
@@ -622,6 +703,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn native_input_and_output_progress_with_pipe_backpressure() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "dd if=/dev/zero bs=65536 count=4 2>/dev/null; cat"]);
+        let bytes = vec![b'x'; 1024 * 1024];
+        let mut input = bytes.as_slice();
+        let mut output = Vec::new();
+        let result = run_to_writer(command, &mut output, Some(&mut input)).unwrap();
+        assert!(result.status.success());
+        assert_eq!(&output[..262144], vec![0; 262144]);
+        assert_eq!(&output[262144..], bytes);
+    }
+
+    #[test]
     fn native_output_writer_error_stops_the_owned_operation() {
         struct Failed;
         impl std::io::Write for Failed {
@@ -642,7 +736,7 @@ mod tests {
                 "fixture",
             ])
             .arg(&marker);
-        let error = run_to_writer(command, Failed).unwrap_err();
+        let error = run_to_writer(command, Failed, None).unwrap_err();
         assert!(error.to_string().contains("fixture output failure"));
         assert!(
             !marker.exists(),

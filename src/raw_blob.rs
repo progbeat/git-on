@@ -1,7 +1,6 @@
 //! Invocation-local verified contents. Only payload bytes spill to disk;
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
-    object::TeeRead,
     spool::{open_private_file, private_file_metadata, Files, Spool},
     tree::Directory,
 };
@@ -192,6 +191,7 @@ struct RawDirectory {
     fd: File,
     reader: Option<(Oid, Arc<File>)>,
     _owner: tempfile::TempDir,
+    writes: std::cell::Cell<(u64, u64)>,
     #[cfg(test)]
     open_calls: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -211,6 +211,7 @@ impl RawDirectory {
             fd,
             reader: None,
             _owner: owner,
+            writes: std::cell::Cell::new((0, 0)),
             #[cfg(test)]
             open_calls: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -286,9 +287,34 @@ impl RawDirectory {
         // so this path needs no intermediate random name or rename. Exclusive
         // creation never follows or overwrites an unexpected existing entry.
         let mut pending = self.pending_name(CString::new(oid.to_string())?)?;
-        pending.file.write_all_at(bytes, 0)?;
+        self.writer(&mut pending.file).write_all(bytes)?;
         pending.committed = true;
         Ok(())
+    }
+    fn writer<'a>(&'a self, file: &'a mut File) -> RawWriter<'a> {
+        RawWriter {
+            file,
+            totals: &self.writes,
+        }
+    }
+}
+struct RawWriter<'a> {
+    file: &'a mut File,
+    totals: &'a std::cell::Cell<(u64, u64)>,
+}
+impl Write for RawWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let (calls, written) = self.totals.get();
+        self.totals.set((calls.saturating_add(1), written));
+        let count = self.file.write(bytes)?;
+        self.totals.set((
+            calls.saturating_add(1),
+            written.saturating_add(count as u64),
+        ));
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 struct Pending<'a> {
@@ -383,13 +409,7 @@ impl RawBlobs {
         object.used = true;
         Some((directory, first))
     }
-    pub(crate) fn insert(
-        &mut self,
-        oid: Oid,
-        size: usize,
-        input: impl Read,
-        _directory: &Path,
-    ) -> Result<RawBlob> {
+    pub(crate) fn insert(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
         self.insert_blob(oid, size, true, |output| {
             crate::object::copy_verified(input, output, ObjectType::Blob, size, oid)
         })
@@ -412,7 +432,6 @@ impl RawBlobs {
         oid: Oid,
         size: usize,
         input: impl Read,
-        _directory: &Path,
     ) -> Result<RawBlob> {
         self.insert_blob(oid, size, false, |output| {
             crate::object::copy_verified(input, output, ObjectType::Blob, size, oid)
@@ -446,7 +465,7 @@ impl RawBlobs {
             (digests, buffers)
         } else {
             let mut pending = store.directory.pending()?;
-            let mut output = Blocks::new(&mut pending.file);
+            let mut output = Blocks::new(store.directory.writer(&mut pending.file));
             transfer(&mut output)?;
             let (_, digests) = output.finish();
             pending.commit(oid)?;
@@ -483,7 +502,6 @@ impl RawBlobs {
         oid: Oid,
         size: usize,
         input: impl Read,
-        _directory: &Path,
     ) -> Result<RawBlob> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(object) = store.objects.get(&oid) {
@@ -503,54 +521,16 @@ impl RawBlobs {
         );
         Ok(self.blob(oid, store.objects.get(&oid).unwrap()))
     }
-    pub(crate) fn import_blob(
-        &mut self,
-        oid: Oid,
-        _offset: u64,
-        size: usize,
-        input: impl Read,
-        directory: &Path,
-    ) -> Result<()> {
-        self.insert_fetched(oid, size, input, directory)?;
-        Ok(())
-    }
-    pub(crate) fn import_tree(
-        &mut self,
-        oid: Oid,
-        _offset: u64,
-        size: usize,
-        input: impl Read,
-        metadata: impl Write,
-        directory: &Path,
-    ) -> Result<()> {
-        self.insert_tree(
-            oid,
-            size,
-            TeeRead {
-                input,
-                output: metadata,
-            },
-            directory,
-        )?;
-        Ok(())
-    }
     // Scratch files belong to transport framing/decoding, never the object map.
-    pub(crate) fn scratch_file(&self, directory: &Path) -> Result<Spool> {
+    pub(crate) fn scratch_file(&self) -> Result<Spool> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .scratch_file(directory)
+            .scratch_file()
     }
     pub(crate) fn append_output(&self) -> Result<(RawOutput, u64)> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let parent = store
-            .directory
-            ._owner
-            .path()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let file = Arc::new(store.scratch_file(&parent)?);
+        let file = Arc::new(store.scratch_file()?);
         store.output = Some(file.clone());
         Ok((RawOutput { file }, 0))
     }
@@ -613,6 +593,14 @@ impl RawBlobs {
         let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         (store.disk_bytes, store.disk_entries)
     }
+    pub(crate) fn write_metrics(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .directory
+            .writes
+            .get()
+    }
     pub(crate) fn tree_metrics(&self) -> (u64, usize, usize) {
         let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         store
@@ -669,7 +657,13 @@ struct Store {
     authenticated_bytes: u64,
 }
 impl Store {
-    fn scratch_file(&mut self, directory: &Path) -> Result<Spool> {
+    fn scratch_file(&mut self) -> Result<Spool> {
+        let directory = self
+            .directory
+            ._owner
+            .path()
+            .parent()
+            .context("raw storage parent")?;
         if self.scratch.is_none() {
             self.scratch = Some(Files::new(directory)?);
         }
@@ -834,9 +828,7 @@ mod tests {
             let mut bytes = vec![0; 8192];
             bytes[..4].copy_from_slice(&number.to_le_bytes());
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-            store
-                .insert(oid, bytes.len(), bytes.as_slice(), directory.path())
-                .unwrap();
+            store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         }
         assert_eq!(
             stored_bytes(directory.path()),
@@ -866,9 +858,7 @@ mod tests {
         let mut store = RawBlobs::new(root.path()).unwrap();
         let bytes = b"verified resident";
         let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         let path = store
             .state
             .lock()
@@ -928,9 +918,7 @@ mod tests {
         let mut store = RawBlobs::new(root.path()).unwrap();
         let bytes = b"verified resident";
         let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         assert!(store.evict_all_for_test().is_err());
         let state = store.state.lock().unwrap();
         assert!(std::fs::read_dir(state.directory._owner.path())
@@ -953,13 +941,13 @@ mod tests {
             large.extend(vec![b'b'; BLOCK]);
             let large_oid = Oid::hash_object(ObjectType::Blob, &large).unwrap();
             let large_reader = store
-                .insert(large_oid, large.len(), large.as_slice(), root.path())
+                .insert(large_oid, large.len(), large.as_slice())
                 .unwrap();
             assert_eq!(large_reader.read(0, 1).unwrap(), b"a");
             let small = vec![b's'; BLOCK];
             let small_oid = Oid::hash_object(ObjectType::Blob, &small).unwrap();
             let small_reader = store
-                .insert(small_oid, small.len(), small.as_slice(), root.path())
+                .insert(small_oid, small.len(), small.as_slice())
                 .unwrap();
             assert!(!small_reader.on_disk());
             store.state.lock().unwrap().directory.spill_error = Some(error);
@@ -1026,11 +1014,7 @@ mod tests {
         let mut readers = Vec::new();
         for bytes in [b"first".as_slice(), b"second"] {
             let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
-            readers.push(
-                store
-                    .insert(oid, bytes.len(), bytes, directory.path())
-                    .unwrap(),
-            );
+            readers.push(store.insert(oid, bytes.len(), bytes).unwrap());
         }
         assert_eq!(readers[0].read_all().unwrap(), b"first");
         let mut held = Vec::new();
@@ -1051,9 +1035,7 @@ mod tests {
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let bytes: Vec<_> = (0..4 * BLOCK).map(|n| (n % 251) as u8).collect();
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), directory.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         let before = store.state.lock().unwrap().directory.open_calls.get();
         for index in 0..64 {
             let offset = (index % 4) * BLOCK;
@@ -1095,9 +1077,7 @@ mod tests {
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let bytes: Vec<_> = (0..3 * BLOCK + 17).map(|n| (n % 251) as u8).collect();
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), directory.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         for (start, size) in [
             (BLOCK - 1, 3),
             (BLOCK, BLOCK),
@@ -1126,9 +1106,7 @@ mod tests {
         bytes.extend(vec![b'b'; BLOCK]);
         bytes.extend(b"end");
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), directory.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         let file = store
             .state
             .lock()
@@ -1170,12 +1148,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, b"good").unwrap();
-        let good = store
-            .insert(oid, 4, b"good".as_slice(), directory.path())
-            .unwrap();
+        let good = store.insert(oid, 4, b"good".as_slice()).unwrap();
         let next = Oid::hash_object(ObjectType::Blob, b"next").unwrap();
         for data in [b"evil".as_slice(), b"n", b"next-extra"] {
-            assert!(store.insert(next, 4, data, directory.path()).is_err());
+            assert!(store.insert(next, 4, data).is_err());
             assert!(store.get(next).unwrap().is_none());
             assert_eq!(good.read_all().unwrap(), b"good");
             assert_eq!(
@@ -1184,9 +1160,7 @@ mod tests {
                 "failed staging files leaked"
             );
         }
-        let reader = store
-            .insert(next, 4, b"next".as_slice(), directory.path())
-            .unwrap();
+        let reader = store.insert(next, 4, b"next".as_slice()).unwrap();
         reader.corrupt_for_test().unwrap();
         assert!(reader.read(0, 1).is_err());
         assert_eq!(store.entries(), 2);
@@ -1202,9 +1176,7 @@ mod tests {
         drop(output);
         let oid = Oid::hash_object(ObjectType::Blob, b"good").unwrap();
         let input = store.output_reader(start + 6).unwrap().take(4);
-        store
-            .import_blob(oid, start + 6, 4, input, directory.path())
-            .unwrap();
+        store.insert_fetched(oid, 4, input).unwrap();
         store.release_output();
         for first in [true, false] {
             let (blob, used) = store.for_read(oid).unwrap().unwrap();
@@ -1220,9 +1192,7 @@ mod tests {
         for number in 0..257 {
             let bytes = format!("blob-{number}");
             let oid = Oid::hash_object(ObjectType::Blob, bytes.as_bytes()).unwrap();
-            store
-                .insert(oid, bytes.len(), bytes.as_bytes(), directory.path())
-                .unwrap();
+            store.insert(oid, bytes.len(), bytes.as_bytes()).unwrap();
         }
         let mut previous: Option<std::sync::Weak<File>> = None;
         for number in (0..257).rev() {
@@ -1259,9 +1229,7 @@ mod tests {
         bytes.extend(vec![b'b'; BLOCK]);
         bytes.extend(vec![b'c'; BLOCK]);
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-        let reader = store
-            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
-            .unwrap();
+        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         let another = store.get(oid).unwrap().unwrap();
         let first = reader.read(3, 10).unwrap();
         let authenticated = store.tested_authenticated_bytes();
@@ -1304,17 +1272,11 @@ mod tests {
             let mut bytes = vec![0; 8192];
             bytes[..4].copy_from_slice(&n.to_le_bytes());
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-            hot.push(
-                store
-                    .insert(oid, bytes.len(), bytes.as_slice(), root.path())
-                    .unwrap(),
-            );
+            hot.push(store.insert(oid, bytes.len(), bytes.as_slice()).unwrap());
         }
         let bytes = vec![b'z'; MEMORY_BUDGET + 2 * BLOCK];
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-        let large = store
-            .insert(oid, bytes.len(), bytes.as_slice(), root.path())
-            .unwrap();
+        let large = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
         for offset in (0..bytes.len()).step_by(BLOCK) {
             assert_eq!(large.read(offset as u64, 1).unwrap(), b"z");
         }
@@ -1357,15 +1319,13 @@ mod tests {
         let hot_data = vec![b'h'; BLOCK];
         let hot_oid = Oid::hash_object(ObjectType::Blob, &hot_data).unwrap();
         let hot = store
-            .insert(hot_oid, hot_data.len(), hot_data.as_slice(), root.path())
+            .insert(hot_oid, hot_data.len(), hot_data.as_slice())
             .unwrap();
         let mut data = vec![b'a'; BLOCK];
         data.extend(vec![b'b'; BLOCK]);
         data.extend([b'c'; 17]);
         let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
-        let reader = store
-            .insert(oid, data.len(), data.as_slice(), root.path())
-            .unwrap();
+        let reader = store.insert(oid, data.len(), data.as_slice()).unwrap();
         let first = reader.read(0, 3).unwrap();
         check(&store, &[(oid, 0), (hot_oid, 0)]);
         assert_eq!(reader.read(BLOCK as u64, 3).unwrap(), b"bbb");
@@ -1377,12 +1337,7 @@ mod tests {
         let extra_data = vec![b'e'; BLOCK - 17 - ENTRY_CHARGE];
         let extra_oid = Oid::hash_object(ObjectType::Blob, &extra_data).unwrap();
         store
-            .insert(
-                extra_oid,
-                extra_data.len(),
-                extra_data.as_slice(),
-                root.path(),
-            )
+            .insert(extra_oid, extra_data.len(), extra_data.as_slice())
             .unwrap();
         check(&store, &[(extra_oid, 0), (oid, 2), (hot_oid, 0)]);
         // A growing replacement must still evict/spill the actual LRU victim.
@@ -1402,7 +1357,7 @@ mod tests {
         bytes.extend(blob.as_bytes());
         let oid = Oid::hash_object(ObjectType::Tree, &bytes).unwrap();
         store
-            .insert_tree(oid, bytes.len(), bytes.as_slice(), directory.path())
+            .insert_tree(oid, bytes.len(), bytes.as_slice())
             .unwrap();
         let (tree, first) = store.directory(oid).unwrap();
         assert!(first);
@@ -1421,7 +1376,7 @@ mod tests {
         duplicate.extend(&bytes);
         let oid = Oid::hash_object(ObjectType::Tree, &duplicate).unwrap();
         assert!(store
-            .insert_tree(oid, duplicate.len(), duplicate.as_slice(), directory.path())
+            .insert_tree(oid, duplicate.len(), duplicate.as_slice())
             .is_err());
         assert!(store.get(oid).unwrap().is_none());
         assert_eq!(tree.children().unwrap().len(), 1);

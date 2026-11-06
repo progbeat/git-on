@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(size, data.len());
         assert_eq!(kind, git2::ObjectType::Blob);
         let mut raw = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
-        let blob = raw.insert_fetched(oid, size, reader, root.path()).unwrap();
+        let blob = raw.insert_fetched(oid, size, reader).unwrap();
         assert_eq!(blob.read(999999, 17).unwrap(), vec![b'x'; 17]);
         assert!(raw.for_read(oid).unwrap().unwrap().1);
         assert!(!raw.for_read(oid).unwrap().unwrap().1);
@@ -644,9 +644,7 @@ mod tests {
             let (reader, size, _) = ObjectReader::single(&file).unwrap().unwrap();
             let mut raw = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
             let wanted = if mutation == 2 { Oid::zero() } else { oid };
-            assert!(raw
-                .insert_fetched(wanted, size, reader, root.path())
-                .is_err());
+            assert!(raw.insert_fetched(wanted, size, reader).is_err());
             assert!(
                 raw.get(wanted).unwrap().is_none(),
                 "invalid object was published"

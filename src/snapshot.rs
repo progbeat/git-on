@@ -263,7 +263,10 @@ pub struct SnapshotMetrics {
     pub active_spool_bytes: u64,
     pub active_blob_readers: usize,
     pub streamed_blob_loads: u64,
+    /// Raw payload File::write calls, including failed attempts.
     pub spool_writes: u64,
+    /// Bytes accepted by raw payload writes, including unpublished partial data.
+    /// These counters exclude transport/metadata staging and durability work.
     pub spool_bytes: u64,
     pub retained_raw_blob_bytes: u64,
     pub retained_raw_blob_entries: u64,
@@ -366,14 +369,14 @@ impl State {
                 kind == ObjectType::Tree,
                 "snapshot directory does not reference a tree"
             );
-            storage.insert_tree(oid, size, reader, &self.spool_directory)?;
+            storage.insert_tree(oid, size, reader)?;
         } else {
             let object = odb.read(oid).context("decode snapshot tree")?;
             anyhow::ensure!(
                 object.kind() == ObjectType::Tree,
                 "snapshot directory does not reference a tree"
             );
-            storage.insert_tree(oid, object.len(), object.data(), &self.spool_directory)?;
+            storage.insert_tree(oid, object.len(), object.data())?;
         }
         let (tree, first) = storage
             .directory(oid)
@@ -456,10 +459,6 @@ impl State {
             if first {
                 self.metrics.blob_loads += 1;
                 self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(raw.len());
-                if raw.len() > crate::raw_blob::BLOCK as u64 {
-                    self.metrics.spool_writes += 1;
-                    self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(raw.len());
-                }
             } else {
                 self.metrics.cache_hits += 1;
             }
@@ -489,7 +488,7 @@ impl State {
                     kind == ObjectType::Blob && length == size,
                     "Git blob changed during transfer"
                 );
-                (raw.insert(oid, size, reader, &self.spool_directory)?, true)
+                (raw.insert(oid, size, reader)?, true)
             } else {
                 let object = odb.read(oid).context("decode Git blob")?;
                 anyhow::ensure!(
@@ -501,8 +500,6 @@ impl State {
             self.metrics.blob_loads += 1;
             self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
             if size > crate::raw_blob::BLOCK {
-                self.metrics.spool_writes += 1;
-                self.metrics.spool_bytes = self.metrics.spool_bytes.saturating_add(size as u64);
                 self.metrics.streamed_blob_loads += u64::from(streamed);
             }
             blob
@@ -952,8 +949,15 @@ impl Snapshot {
             metrics.retained_raw_blob_bytes += bytes;
             metrics.retained_raw_blob_entries += entries;
         }
-        metrics.spool_bytes = metrics.retained_raw_blob_bytes;
-        metrics.spool_writes = metrics.retained_raw_blob_entries;
+        for raw in state
+            .raw_blobs
+            .iter()
+            .chain(state.remote.iter().map(|remote| &remote.raw_blobs))
+        {
+            let (calls, written) = raw.write_metrics();
+            metrics.spool_writes = metrics.spool_writes.saturating_add(calls);
+            metrics.spool_bytes = metrics.spool_bytes.saturating_add(written);
+        }
         // Drop the registry lock before dropping any upgraded reader: its last
         // owner removes itself from that registry, even during metrics sampling.
         let readers: Vec<_> = state
@@ -1805,6 +1809,48 @@ mod tests {
         }
     }
     #[test]
+    fn raw_write_metrics_include_unpublished_partial_writes() {
+        const CHILD: &str = "GIT_ON_TEST_PARTIAL_RAW_METRICS";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot::tests::raw_write_metrics_include_unpublished_partial_writes",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (tmp, _) = fixture();
+        let repo = Repository::open(tmp.path()).unwrap();
+        let oid = repo.blob(&vec![b'x'; crate::raw_blob::BLOCK + 1]).unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "partial-write-metrics").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        snap.set_spool_directory(&storage.path().join("backing"))
+            .unwrap();
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 3,
+                rlim_max: 3,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+        }
+        assert!(snap.open(oid).is_err());
+        let metrics = snap.metrics();
+        assert_eq!(metrics.retained_raw_blob_bytes, 0);
+        assert_eq!(metrics.spool_bytes, 3);
+        assert!(metrics.spool_writes >= 2);
+    }
+    #[test]
     fn active_large_blob_reader_decodes_once_and_releases_active_accounting() {
         let (tmp, _) = fixture();
         let repo = Repository::open(tmp.path()).unwrap();
@@ -1822,7 +1868,8 @@ mod tests {
         }
         assert_eq!(second.read(size as u64 - 2, 100).unwrap(), b"xx");
         assert_eq!(snap.metrics().blob_loads, 1);
-        assert_eq!(snap.metrics().spool_writes, 1);
+        assert!(snap.metrics().spool_writes > 0);
+        assert_eq!(snap.metrics().spool_bytes, size as u64);
         assert_eq!(snap.metrics().active_spool_bytes, size as u64);
         assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
         drop(reader);
@@ -1838,13 +1885,18 @@ mod tests {
         let size = BLOB_CACHE_BYTES + 123;
         let oid = repo.blob(&vec![b'x'; size]).unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "reopen").unwrap();
+        let mut writes = None;
         for offset in [0, size as u64 - 1, 123] {
             let reader = snap.open(oid).unwrap();
             assert_eq!(reader.read(offset, 1).unwrap(), b"x");
             drop(reader);
             assert_eq!(snap.metrics().active_blob_readers, 0);
             assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
-            assert_eq!(snap.metrics().spool_writes, 1);
+            let metrics = snap.metrics();
+            assert!(metrics.spool_writes > 0);
+            assert_eq!(metrics.spool_bytes, size as u64);
+            let first = writes.get_or_insert(metrics.spool_writes);
+            assert_eq!(metrics.spool_writes, *first);
             assert_eq!(snap.metrics().blob_loads, 1);
         }
     }

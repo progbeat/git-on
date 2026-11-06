@@ -98,6 +98,40 @@ for _ in range(2):
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.clean()
 
+    def test_oid_batch_respects_fsize_when_clone_and_command_succeed(self):
+        import resource
+        entries=[]
+        for index in range(32):
+            oid=self.git('hash-object','-w','--stdin',data=bytes([index])).decode().strip()
+            entries.append(f'100644 blob {oid}\tf{index:03d}\n')
+        empty=self.git('mktree',data=b'').decode().strip()
+        for index in range(224):
+            tree=self.git('mktree',data=f'040000 tree {empty}\te{index:03d}\n'.encode()).decode().strip()
+            entries.append(f'040000 tree {tree}\td{index:03d}\n')
+        tree=self.git('mktree',data=''.join(entries).encode()).decode().strip()
+        commit=self.git('commit-tree',tree,data=b'bounded OID input\n').decode().strip()
+        self.git('update-ref','HEAD',commit)
+        self.git('config','uploadpack.allowFilter','true')
+        self.git('config','uploadpack.allowAnySHA1InWant','true')
+        self.before=self.git('status','--porcelain')
+        def limits():
+            signal.signal(signal.SIGXFSZ,signal.SIG_DFL)
+            resource.setrlimit(resource.RLIMIT_FSIZE,(10240,10240))
+            resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+        command=[sys.executable,'-I','-S','-c',
+                 "from pathlib import Path; assert all(Path(f'f{i:03d}').read_bytes()==bytes([i]) for i in range(32)); print('small files verified')"]
+        clone=self.root/'clone'
+        result=subprocess.run(['git','clone','--quiet',str(self.repo),str(clone)],env=self.env,
+                              preexec_fn=limits,capture_output=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr)
+        direct=subprocess.run(command,cwd=clone,env=self.env,preexec_fn=limits,capture_output=True,timeout=10)
+        self.assertEqual(direct.returncode,0,direct.stderr)
+        result=subprocess.run([str(BINARY),str(self.repo),'HEAD','--write-policy=all','--',*command],
+                              cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,direct.stdout)
+        self.clean()
+
     def test_bytes_links_modes_argv_identity_freshness_and_source_isolation(self):
         for _ in range(2):
             result = self.invoke("""

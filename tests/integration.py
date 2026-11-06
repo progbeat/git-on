@@ -868,6 +868,47 @@ assert not Path('out/final-hard').exists()
 ''')
         self.assert_success(result)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux helper process inspection')
+    def test_cancel_hung_unmount_stops_helper_and_releases_run_for_cleanup(self):
+        import shlex
+        programs=self.root/'unmount-programs'; programs.mkdir()
+        marker=self.root/'unmount-helper'; release=self.root/'release-helper'
+        wrapper=programs/'fusermount3'
+        wrapper.write_text('#!/bin/sh\nif [ "$1" = "-u" ] && [ ! -e '+shlex.quote(str(release))+' ]; then\n'
+                           'printf "%s" "$$" > '+shlex.quote(str(marker))+'\nexec /bin/sleep 300\nfi\nexec '+
+                           shlex.quote(shutil.which('fusermount3'))+' "$@"\n')
+        wrapper.chmod(0o700)
+        env=dict(self.environment(),PATH=str(programs)+os.pathsep+os.environ['PATH'])
+        runner=subprocess.Popen([str(BINARY),'HEAD','--write-policy=none','--','/bin/true'],
+                                cwd=self.repo,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        helper=None
+        try:
+            deadline=time.monotonic()+10
+            while not marker.exists() or not marker.read_text().strip():
+                if runner.poll() is not None:
+                    self.fail(runner.communicate()[1].decode(errors='replace'))
+                self.assertLess(time.monotonic(),deadline,'unmount helper did not start')
+                time.sleep(.02)
+            helper=int(marker.read_text())
+            runner.send_signal(signal.SIGTERM)
+            _,stderr=runner.communicate(timeout=3)
+            self.assertEqual(runner.returncode,-signal.SIGTERM,stderr)
+            self.assertFalse(Path(f'/proc/{helper}').exists(),'owned helper was not reaped')
+            run=next(self.system_tmp.glob('git-on-*'))
+            self.assertIn(os.fsencode(run),stderr,'cleanup diagnostic must identify retained state')
+            self.assert_success(self.cleanup_run(run))
+            self.assert_no_runtime_files()
+        finally:
+            release.touch()
+            if helper is not None and Path(f'/proc/{helper}/status').exists():
+                if f'PPid:\t{runner.pid}\n' in Path(f'/proc/{helper}/status').read_text():
+                    os.kill(helper,signal.SIGKILL)
+            try: runner.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner.kill(); runner.communicate(timeout=5)
+            for run in self.system_tmp.glob('git-on-*'):
+                self.assert_success(self.cleanup_run(run))
+
     def test_raw_file_limit_with_default_signal_cleans_mount_and_pin(self):
         (self.repo / 'large-raw').write_bytes(b'x' * (1024 * 1024))
         git(self.repo, 'add', 'large-raw')

@@ -3,7 +3,7 @@
 use std::{
     ffi::{CStr, CString},
     fs::{File, Metadata, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -342,6 +342,19 @@ impl Write for &Spool {
         Ok(())
     }
 }
+impl Read for &Spool {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Spool::Single(file) => (&*file).read(bytes),
+            Spool::Parts { state, .. } => {
+                let offset = state.lock().unwrap_or_else(|e| e.into_inner()).cursor;
+                let count = self.read_at(bytes, offset)?;
+                state.lock().unwrap_or_else(|e| e.into_inner()).cursor += count as u64;
+                Ok(count)
+            }
+        }
+    }
+}
 impl Drop for Spool {
     fn drop(&mut self) {
         if let Self::Parts {
@@ -408,6 +421,10 @@ mod tests {
         let file = files.file(root.path()).unwrap();
         let bytes: Vec<_> = (0..100).collect();
         (&file).write_all(&bytes).unwrap();
+        (&file).rewind().unwrap();
+        let mut streamed = Vec::new();
+        (&file).read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, bytes);
         let mut read = [0; 43];
         file.read_exact_at(&mut read, 14).unwrap();
         assert_eq!(read, bytes[14..57]);

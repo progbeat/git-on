@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use git_on::{
     filesystem::Overlay,
+    git::set_foreground as foreground,
     platform::{ensure_unmounted, mount_is_ours},
     snapshot::Snapshot,
 };
@@ -87,26 +88,6 @@ fn release_pin(m: &Recovery) -> Result<()> {
     }
     Ok(())
 }
-// tcsetpgrp may send SIGTTOU to a background caller; temporarily block it.
-fn foreground(fd: i32, pgid: libc::pid_t) -> std::io::Result<()> {
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTTOU);
-        let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-        if error != 0 {
-            return Err(std::io::Error::from_raw_os_error(error));
-        }
-        let rc = libc::tcsetpgrp(fd, pgid);
-        let error = std::io::Error::last_os_error();
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        if rc != 0 {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
 struct Terminal {
     tty: Option<File>,
     parent: Option<libc::pid_t>,
@@ -154,21 +135,50 @@ fn clean_unmount(mountpoint: &Path) -> Result<()> {
     clean_unmount_with(unmount, mountpoint)
 }
 fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
+    git_on::git::initialize_cancellation()?;
+    // Observe signals received during cleanup, rather than a cancellation that
+    // already stopped the command. The first cancellation still gets a normal
+    // unmount attempt; a subsequent signal can stop a hung helper.
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT, libc::SIGCHLD])?;
     unmount
         .arg(mountpoint)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    unsafe {
+        unmount.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let start = Instant::now();
     loop {
         // A successful clean unmount may reclaim every visited inode. Its
         // duration grows with the actual traversal; elapsed time alone cannot
         // distinguish that work from a busy mount. Wait for the helper's real
         // result, and bound only retries of completed failures below.
-        let status = unmount
-            .spawn()
-            .context("start clean unmount")?
-            .wait()
-            .context("wait for clean unmount")?;
+        let mut child = unmount.spawn().context("start clean unmount")?;
+        let mut pending = signals.pending();
+        let status = loop {
+            if let Some(signal) =
+                pending.find(|s| matches!(*s, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
+            {
+                git_on::git::cancel_by_signal(signal);
+                kill_group(child.id(), libc::SIGKILL);
+                child.wait().context("reap cancelled unmount helper")?;
+                bail!("clean unmount cancelled by signal {signal}; recovery state preserved for --cleanup");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => pending = signals.wait(),
+                Err(error) => {
+                    kill_group(child.id(), libc::SIGKILL);
+                    let _ = child.wait();
+                    return Err(error).context("wait for clean unmount");
+                }
+            }
+        };
         if status.success() {
             break;
         }
@@ -581,6 +591,9 @@ fn execute(
     })();
 
     if let Err(e) = cleanup_result {
+        if git_on::git::cancelled_signal().is_some() {
+            eprintln!("git-on: {e:#}");
+        }
         result = Err(match result {
             Ok(_) => e,
             Err(a) => anyhow::anyhow!("{a:#}; cleanup: {e:#}"),
@@ -638,7 +651,7 @@ fn main() {
     })();
     match result {
         Ok(status) => {
-            if let Some(signal) = status.signal() {
+            if let Some(signal) = git_on::git::cancelled_signal().or_else(|| status.signal()) {
                 unsafe {
                     libc::signal(signal, libc::SIG_DFL);
                     libc::raise(signal);

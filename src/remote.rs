@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const PROMISOR_WANT_BYTES: u64 = 2 * 40 + 2;
+
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 
 fn require_native_git(cwd: &Path) -> Result<()> {
@@ -407,7 +409,18 @@ impl Remote {
             if missing.is_empty() {
                 return Ok(());
             }
-            self.fetch(repo, &missing)
+            // Native Git records each exact SHA-1 want as "OID OID\n" in
+            // its .promisor file. Keep that metadata within the inherited
+            // per-file limit as well as streaming our own stdin requests.
+            let limit = crate::spool::Files::size_limit()?.map_or(missing.len(), |limit| {
+                (limit / PROMISOR_WANT_BYTES)
+                    .max(1)
+                    .min(missing.len() as u64) as usize
+            });
+            for batch in missing.chunks(limit) {
+                self.fetch(repo, batch)?;
+            }
+            Ok(())
         })();
         self.record_result(outcome)
     }
@@ -439,6 +452,7 @@ impl Remote {
             "--depth=1",
             "--filter=tree:0",
         ]);
+        let mut requests = Vec::new();
         if oids.len() == 1 {
             command
                 .arg("--")
@@ -446,18 +460,17 @@ impl Remote {
                 .arg(oids[0].to_string())
                 .stdin(Stdio::null());
         } else {
-            let mut requests = tempfile::tempfile_in(&self.dir)?;
             for oid in oids {
                 writeln!(requests, "{oid}")?;
             }
-            requests.rewind()?;
-            command
-                .arg("--stdin")
-                .arg("--")
-                .arg(&self.source)
-                .stdin(Stdio::from(requests));
+            command.arg("--stdin").arg("--").arg(&self.source);
         }
-        let out = match crate::git::run(command, true) {
+        let output = if requests.is_empty() {
+            crate::git::run(command, true)
+        } else {
+            crate::git::run_with_input(command, true, requests.as_slice())
+        };
+        let out = match output {
             Ok(out) => out,
             Err(error) => {
                 return Err(error).context("fetch exact remote object");
@@ -628,7 +641,7 @@ impl Remote {
                 "owned SSH control connection is unavailable; reconnection is forbidden"
             );
         }
-        let pack = self.raw_blobs.scratch_file(&self.dir)?;
+        let pack = self.raw_blobs.scratch_file()?;
         if let Err(error) = session.fetch(oid, &pack) {
             let diagnostic = session.error_text();
             self.session = None;
@@ -645,8 +658,7 @@ impl Remote {
         if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
             match kind {
                 git2::ObjectType::Blob => {
-                    self.raw_blobs
-                        .insert_fetched(oid, size, reader, &self.dir)?;
+                    self.raw_blobs.insert_fetched(oid, size, reader)?;
                 }
                 git2::ObjectType::Tree => {
                     let odb = repo.odb()?;
@@ -658,7 +670,6 @@ impl Remote {
                             input: reader,
                             output: &mut writer,
                         },
-                        &self.dir,
                     )?;
                     anyhow::ensure!(writer.finalize()? == oid, "received tree OID changed");
                 }
@@ -764,7 +775,8 @@ impl Remote {
             fs::rename(path, objects.join(name))?;
         }
         let destination = Repository::open_bare(&self.dir)?;
-        let mut requests = tempfile::tempfile_in(&self.dir)?;
+        let request_storage = self.raw_blobs.scratch_file()?;
+        let mut requests = &request_storage;
         let mut failure = None;
         let received_odb = staging_repo.odb()?;
         let iteration = received_odb.foreach(|oid| {
@@ -802,9 +814,8 @@ impl Remote {
                 "cat-file",
                 "--batch",
                 "--buffer",
-            ])
-            .stdin(Stdio::from(requests));
-        let output = crate::git::run_to_writer(command, &mut output_file)
+            ]);
+        let output = crate::git::run_to_writer(command, &mut output_file, Some(&mut requests))
             .context("decode received objects into run-local raw storage")?;
         if !output.status.success() {
             bail!(
@@ -820,7 +831,6 @@ impl Remote {
     }
     fn import_raw_output(&mut self, start: u64, destination: &Repository) -> Result<()> {
         let mut input = BufReader::new(self.raw_blobs.output_reader(start)?);
-        let mut position = start;
         loop {
             crate::object::check_transfer()?;
             let mut header = Vec::new();
@@ -849,26 +859,22 @@ impl Remote {
                 _ => bail!("unknown received Git object type"),
             };
             let size: usize = fields[2].parse().context("native Git object size")?;
-            position = position
-                .checked_add(length as u64)
-                .context("native object offset")?;
             let mut payload = Read::by_ref(&mut input).take(size as u64);
             if kind == git2::ObjectType::Blob {
-                self.raw_blobs
-                    .import_blob(oid, position, size, &mut payload, &self.dir)?;
+                self.raw_blobs.insert_fetched(oid, size, &mut payload)?;
             } else {
                 // Native verification and revision resolution still use Git's
                 // metadata ODB. Blob payloads never get a second loose copy.
                 let odb = destination.odb()?;
                 let mut writer = odb.writer(size, kind)?;
                 if kind == git2::ObjectType::Tree {
-                    self.raw_blobs.import_tree(
+                    self.raw_blobs.insert_tree(
                         oid,
-                        position,
                         size,
-                        &mut payload,
-                        &mut writer,
-                        &self.dir,
+                        TeeRead {
+                            input: &mut payload,
+                            output: &mut writer,
+                        },
                     )?;
                 } else {
                     crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
@@ -878,10 +884,6 @@ impl Remote {
             let mut delimiter = [0];
             input.read_exact(&mut delimiter)?;
             anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
-            position = position
-                .checked_add(size as u64)
-                .and_then(|n| n.checked_add(1))
-                .context("native object offset")?;
         }
         Ok(())
     }
