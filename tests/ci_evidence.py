@@ -140,9 +140,58 @@ def validate_evidence(plan,root):
     if plan['required']['resources']:
         result['resources']=validate_resources(root)
         result['imports']=validate_object_reuse(plan,root)
+        result['caches']=validate_cache_reports(plan,root)
     if plan['required']['stress']:result['stress']=validate_stress(root)
     if plan['required']['lazy']:result['lazy']=validate_lazy(plan,root)
     return result
+
+
+def validate_cache_reports(plan,root):
+    from metadata_reuse import validate_runner
+    def report(name):
+        paths=list(root.rglob(name))
+        if len(paths)!=1:raise ValueError(f'missing/duplicate cache evidence: {name}')
+        data=rows(paths[0])
+        if not data or any(r.get('head')!=plan['head'] or r.get('working_tree_dirty') is not False for r in data):
+            raise ValueError(f'missing/stale/dirty cache identity: {name}')
+        return data
+    try:
+        data=report('source-cache.jsonl');by_mode={r['mode']:r for r in data}
+        expected={'uncached-source':1000,'cached-source':1000,'kernel-cache-invariants':1000,
+                  'uncached-readonly-directory':640,'cached-readonly-directory':640,'directory-cache-invariants':640}
+        if len(data)!=len(expected) or set(by_mode)!=set(expected):raise ValueError('incomplete source cache modes')
+        for mode,count in expected.items():
+            row=by_mode[mode]
+            if row['files']!=count:raise ValueError('wrong source cache workload')
+            if mode.endswith('invariants'):
+                fields=('unchanged_payload_and_namespace',) if mode=='kernel-cache-invariants' else ('unchanged_names_on_reopen','unrequested_data_unavailable')
+                if row.get('result')!='passed' or any(row.get(k) is not True for k in fields):raise ValueError('failed cache invariants')
+            else:
+                phases=[r for r in row['child_observations'] if r['completed'] in ('first','repeat')]
+                if [r['completed'] for r in phases]!=['first','repeat']:raise ValueError('incomplete source cache command')
+                if mode in ('uncached-source','cached-source'):
+                    full=[r for r in row['child_observations'] if r['completed']=='full']
+                    if len(full)!=2 or any(r['count']!=count or r['visited_leaves']!=count or r['payload_reads']!=count+101 for r in full):
+                        raise ValueError('incomplete source cache traversal')
+                if 'directory' in mode:
+                    if any(r['directory_entries']!=count for r in phases):raise ValueError('incomplete directory cache command')
+                    m=row['metrics']
+                    if m['blob_loads']!=0 or m['header_reads']!=0 or m['tree_reads']!=3:raise ValueError('nonlazy directory cache')
+        for off,on,ops in (('uncached-source','cached-source',('lookup','read')),
+                           ('uncached-readonly-directory','cached-readonly-directory',('readdir',))):
+            for op in ops:
+                if not 0<by_mode[on]['fuse_requests'][op]<by_mode[off]['fuse_requests'][op]:raise ValueError('missing kernel cache effect')
+        for source,sizes in (('local',[1000,100000]),('remote',[100000])):
+            data=report(f'metadata-reuse-{source}.jsonl')
+            if [r['files'] for r in data]!=sizes:raise ValueError('incomplete metadata reuse sizes')
+            for row in data:
+                if (row.get('type')!='runner' or row.get('backend')!='fuse' or row.get('source')!=source
+                    or row.get('operations')!=1000 or type(row.get('stat_abi_bytes')) is not int or row['stat_abi_bytes']<=0):
+                    raise ValueError('wrong metadata reuse workload')
+                validate_runner(row,row['files'],1000,row['stat_abi_bytes'],'fuse')
+    except (AssertionError,KeyError,TypeError) as error:
+        raise ValueError('invalid cache evidence') from error
+    return dict(source_cache_modes=len(expected),metadata_groups=3)
 
 
 def validate_object_reuse(plan,root):

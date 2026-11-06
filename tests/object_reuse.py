@@ -96,7 +96,7 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
     assert all(p['files']==count and p['payload_bytes']==count*size and p['metadata_result_bytes']==count*stat_bytes for p in phases),result
     assert metrics['remote_fetches']==count+2,metrics
     assert metrics['remote_raw_blob_imports']==count and metrics['remote_raw_blob_bytes']==count*size,metrics
-    assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen/eviction'
+    assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen'
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
     if backend:
         operations=2+(count+255)//256 if backend=='materialized' else count+2

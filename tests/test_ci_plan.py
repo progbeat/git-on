@@ -148,8 +148,58 @@ class CiPlanTests(unittest.TestCase):
             write();validate_resources(root)
             data.pop();write()
             with self.assertRaises(ValueError):validate_resources(root)
+
             data[0]['pack_metadata_syscalls']=0;data.append(dict(data[0],distinct_blobs=512));write()
             with self.assertRaises(ValueError):validate_resources(root)
+
+    def test_resource_gate_requires_complete_current_cache_reports(self):
+        plan=dict(head=HEAD,required=dict(scale=False,resources=True,stress=False,lazy=False))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            def write(name,data):
+                (root/name).write_text(''.join(json.dumps(r)+'\n' for r in data))
+            write('pack-scaling.jsonl',[dict(distinct_blobs=n,passes=2,baseline=False,metrics=dict(remote_fetches=n+2),pack_metadata_syscalls=n,pack_directory_bytes_enumerated=n*64) for n in (32,128,512)])
+            for backend,count in (('fuse',160),('materialized',32)):
+                operations=3 if backend=='materialized' else count+2
+                write(f'object-reuse-{backend}.jsonl',[dict(head=HEAD,working_tree_dirty=False,backend=backend,type='runner',files=count,blob_bytes=8192,stat_abi_bytes=144,
+                    child_observations=[dict(completed=p,files=count,payload_bytes=count*8192,metadata_result_bytes=count*144) for p in ('first','repeat')],
+                    metrics=dict(remote_fetches=count+2,remote_fetch_operations=operations,remote_decode_operations=operations,remote_raw_blob_imports=count,remote_raw_blob_bytes=count*8192,blob_loads=count,blob_cache_bytes=1,blob_cache_limit=16*1024*1024),
+                    fuse_requests={'read':1} if backend=='fuse' else {},native_commands={'cat-file':operations,'fetch':operations})])
+            source=[]
+            for mode,count in (('uncached-source',1000),('cached-source',1000),('uncached-readonly-directory',640),('cached-readonly-directory',640)):
+                directory_case='directory' in mode
+                phases=[]
+                for phase in ('first','repeat'):
+                    if not directory_case:phases.append(dict(completed='full',count=count,visited_leaves=count,payload_reads=count+101))
+                    phases.append(dict(completed=phase,**({'directory_entries':count} if directory_case else {})))
+                source.append(dict(head=HEAD,working_tree_dirty=False,mode=mode,files=count,
+                    metrics=dict(blob_loads=0,header_reads=0,tree_reads=3),
+                    child_observations=phases,
+                    fuse_requests={op:(4 if mode.startswith('uncached') else 2) for op in ('lookup','read','readdir')}))
+            source.extend([dict(head=HEAD,working_tree_dirty=False,mode='kernel-cache-invariants',files=1000,result='passed',unchanged_payload_and_namespace=True),
+                           dict(head=HEAD,working_tree_dirty=False,mode='directory-cache-invariants',files=640,result='passed',unchanged_names_on_reopen=True,unrequested_data_unavailable=True)])
+            reports={'source-cache.jsonl':source}
+            for source,sizes in (('local',(1000,100000)),('remote',(100000,))):
+                reports[f'metadata-reuse-{source}.jsonl']=[dict(head=HEAD,working_tree_dirty=False,type='runner',backend='fuse',source=source,files=count,operations=1000,stat_abi_bytes=144,
+                    child_observations=[dict(completed=p,operations=1000,payload_bytes=1000,metadata_result_bytes=144000) for p in ('first','repeat')],
+                    metrics=dict(tree_reads=1,prepared_tree_entries=count,blob_loads=1,tree_cache_bytes=216,tree_cache_limit=0,blob_cache_bytes=1,blob_cache_limit=16777216),fuse_requests={'read':1}) for count in sizes]
+            for name,data in reports.items():write(name,data)
+            validate_evidence(plan,root)
+            for name,good in reports.items():
+                path=root/name
+                with self.subTest(name=name,case='missing'):
+                    path.unlink()
+                    with self.assertRaises(ValueError):validate_evidence(plan,root)
+                    write(name,good)
+                for change in ('stale','dirty','duplicate','incomplete'):
+                    bad=copy.deepcopy(good)
+                    if change=='stale':bad[0]['head']='b'*40
+                    elif change=='dirty':bad[0]['working_tree_dirty']=True
+                    elif change=='duplicate':bad.append(copy.deepcopy(bad[0]))
+                    else:bad.pop()
+                    write(name,bad)
+                    with self.subTest(name=name,case=change),self.assertRaises(ValueError):validate_evidence(plan,root)
+                    write(name,good)
 
     def test_stress_header_without_completed_operations_is_not_coverage(self):
         with tempfile.TemporaryDirectory() as directory:

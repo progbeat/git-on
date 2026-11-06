@@ -37,7 +37,7 @@ def validate_runner(result,count,operations,stat_bytes,backend):
 
 def run(options):
     head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-    dirty=bool(subprocess.check_output(['git','status','--porcelain']))
+    dirty=bool(subprocess.check_output(['git','diff','--name-only','HEAD']))
     if options.backend=='fuse':
         assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
     options.output.parent.mkdir(parents=True,exist_ok=True)

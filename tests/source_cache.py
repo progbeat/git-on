@@ -121,6 +121,8 @@ def run(options):
     from scalability import fixture
     assert sys.platform=='linux','Linux required'
     assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
+    head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+    dirty=bool(subprocess.check_output(['git','diff','--name-only','HEAD']))
     f=Fixture()
     try:
         key=f.root/'cache-signing-key'
@@ -131,7 +133,7 @@ def run(options):
         observations=[]
         with options.output.open('w') as output:
             def record(value):
-                value.update(head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())
+                value.update(head=head,working_tree_dirty=dirty)
                 value.setdefault('files',options.files);value.setdefault('distinct_objects',info['distinct_objects'])
                 observations.append(value)
                 output.write(json.dumps(value)+'\n');output.flush();print(json.dumps(value),flush=True)

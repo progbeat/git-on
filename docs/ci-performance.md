@@ -28,6 +28,14 @@ pack sets, decoded-object reuse, metadata reuse, kernel-cache behavior and
 reduced descriptor limits. Wire, mounted and storage-corruption tests protect
 their distinct contracts.
 
+When resources are required, `package` requires the source-cache report, both
+metadata-reuse reports and both object-reuse reports, in addition to pack-scaling
+evidence. Cache reports identify the tested head and tracked-source cleanliness;
+generated untracked reports and binaries do not make the source dirty. The gate
+checks the complete modes, sizes and passes, and rejects missing, duplicate,
+stale or dirty reports. Object-reuse checks close/reopen with a RAM-fitting set;
+the separate 300-object raw-import regression forces payload eviction.
+
 ## Small command on public WebKit
 
 `webkit-scale` runs `tests/real_repository.py run` through real Linux FUSE against
