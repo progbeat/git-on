@@ -134,12 +134,38 @@ fn clean_unmount(mountpoint: &Path) -> Result<()> {
     let unmount = Command::new("/sbin/umount");
     clean_unmount_with(unmount, mountpoint)
 }
+struct UnblockedChildExit(libc::sigset_t);
+impl UnblockedChildExit {
+    fn new() -> std::io::Result<Self> {
+        unsafe {
+            let mut set = std::mem::zeroed();
+            let mut old = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGCHLD);
+            let error = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut old);
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+            Ok(Self(old))
+        }
+    }
+}
+impl Drop for UnblockedChildExit {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+        }
+    }
+}
 fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
     git_on::git::initialize_cancellation()?;
     // Observe signals received during cleanup, rather than a cancellation that
     // already stopped the command. The first cancellation still gets a normal
     // unmount attempt; a subsequent signal can stop a hung helper.
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT, libc::SIGCHLD])?;
+    // A launcher may block SIGCHLD across exec. Our event wait needs it
+    // deliverable on this thread; restore the caller's mask on every return.
+    let _child_exit = UnblockedChildExit::new().context("unblock unmount exit notification")?;
     unmount
         .arg(mountpoint)
         .stdout(Stdio::null())

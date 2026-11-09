@@ -2388,6 +2388,37 @@ time.sleep(300)
         self.assertFalse(run.exists())
         self.assert_no_runtime_files()
 
+    def test_cleanup_reaps_delayed_unmount_with_inherited_sigchld_blocked(self):
+        import shlex
+        process, run, child_pid = self.start_sleeping_run()
+        process.kill()
+        try: os.killpg(child_pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.communicate(timeout=10)
+        programs=self.root/'cleanup-programs'; programs.mkdir()
+        unmounted=self.root/'unmounted'
+        wrapper=programs/'fusermount3'
+        wrapper.write_text('#!/bin/sh\n'+shlex.quote(shutil.which('fusermount3'))+' "$@" || exit $?\n'
+                           'printf done > '+shlex.quote(str(unmounted))+'\nexec /bin/sleep 0.2\n')
+        wrapper.chmod(0o700)
+        env=dict(self.environment(),PATH=str(programs)+os.pathsep+os.environ['PATH'])
+        cleaner=subprocess.Popen([str(BINARY),'--cleanup',str(run)],cwd=self.repo,env=env,
+                                 preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGCHLD}),
+                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            try:
+                _,stderr=cleaner.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.assertTrue(unmounted.exists(),'helper never completed real unmount')
+                self.fail('cleanup hung after successful unmount with SIGCHLD blocked')
+            self.assertEqual(cleaner.returncode,0,stderr)
+            self.assertTrue(unmounted.exists())
+            self.assert_no_runtime_files()
+        finally:
+            if cleaner.poll() is None: cleaner.kill()
+            cleaner.communicate(timeout=5)
+            if run.exists(): self.assert_success(self.cleanup_run(run))
+
     def test_concurrent_cleanup_has_one_winner_and_removes_only_stale_run(self):
         process, run, child_pid = self.start_sleeping_run()
         process.kill()

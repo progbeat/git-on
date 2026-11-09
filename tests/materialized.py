@@ -132,6 +132,43 @@ for _ in range(2):
         self.assertEqual(result.stdout,direct.stdout)
         self.clean()
 
+    def test_incompressible_objects_respect_fsize_when_clone_and_command_succeed(self):
+        import hashlib
+        import resource
+        import zlib
+        with (self.repo/'.gitattributes').open('a') as attributes:
+            attributes.write('random-* -text\n')
+        for index in range(16):
+            payload=hashlib.shake_256(str(index).encode()).digest(8192)
+            self.assertGreater(len(zlib.compress(payload)),8192)
+            (self.repo/f'random-{index:02d}').write_bytes(payload)
+        self.git('add','.')
+        self.git('commit','-qm','incompressible file-size regression')
+        self.git('config','uploadpack.allowFilter','true')
+        self.git('config','uploadpack.allowAnySHA1InWant','true')
+        self.before=self.git('status','--porcelain')
+        def limits():
+            signal.signal(signal.SIGXFSZ,signal.SIG_DFL)
+            resource.setrlimit(resource.RLIMIT_FSIZE,(16384,16384))
+            resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+        command=[sys.executable,'-I','-S','-c',
+                 "import hashlib; from pathlib import Path; assert all(Path(f'random-{i:02d}').read_bytes()==hashlib.shake_256(str(i).encode()).digest(8192) for i in range(16)); print('incompressible files verified')"]
+        for label,policy in [('streaming',{}),('native-fsck',dict(GIT_CONFIG_COUNT='1',
+                             GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='true'))]:
+            with self.subTest(transport=label):
+                env=dict(self.env,**policy)
+                clone=self.root/f'clone-{label}'
+                result=subprocess.run(['git','clone','--quiet',str(self.repo),str(clone)],env=env,
+                                      preexec_fn=limits,capture_output=True,timeout=20)
+                self.assertEqual(result.returncode,0,result.stderr)
+                direct=subprocess.run(command,cwd=clone,env=env,preexec_fn=limits,capture_output=True,timeout=10)
+                self.assertEqual(direct.returncode,0,direct.stderr)
+                result=subprocess.run([str(BINARY),str(self.repo),'HEAD','--write-policy=all','--',*command],
+                                      cwd=self.repo,env=env,preexec_fn=limits,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,direct.stdout)
+                self.clean()
+
     def test_bytes_links_modes_argv_identity_freshness_and_source_isolation(self):
         for _ in range(2):
             result = self.invoke("""

@@ -50,9 +50,10 @@ cleanup follows the documented recovery contract.
 Git-on catches `SIGXFSZ` from its own writes so `EFBIG` follows normal error
 handling and cleanup. Executed commands retain the caller's default or ignored
 signal disposition.
-Eager remote demands are batched within the inherited file-size limit for
-native Git's per-want metadata. Request stdin is streamed through a channel;
-decoder request staging uses bounded parts.
+Eager remote demands use individual exact-object requests under a finite
+inherited file-size limit: a want count cannot bound native Git's resulting
+pack size. Unrestricted runs retain batching. Request stdin is streamed through
+a channel; decoder request staging uses bounded parts.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that

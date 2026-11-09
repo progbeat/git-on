@@ -19,8 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PROMISOR_WANT_BYTES: u64 = 2 * 40 + 2;
-
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 
 fn require_native_git(cwd: &Path) -> Result<()> {
@@ -409,14 +407,16 @@ impl Remote {
             if missing.is_empty() {
                 return Ok(());
             }
-            // Native Git records each exact SHA-1 want as "OID OID\n" in
-            // its .promisor file. Keep that metadata within the inherited
-            // per-file limit as well as streaming our own stdin requests.
-            let limit = crate::spool::Files::size_limit()?.map_or(missing.len(), |limit| {
-                (limit / PROMISOR_WANT_BYTES)
-                    .max(1)
-                    .min(missing.len() as u64) as usize
-            });
+            // The want count bounds .promisor metadata, but not the resulting
+            // pack: object sizes/compression are unknown until fetched. Under
+            // a finite per-file limit, do not aggregate individually readable
+            // objects into an oversized native pack. Unrestricted runs retain
+            // batching; exact-object requests can reuse the streaming session.
+            let limit = if crate::spool::Files::size_limit()?.is_some() {
+                1
+            } else {
+                missing.len()
+            };
             for batch in missing.chunks(limit) {
                 self.fetch(repo, batch)?;
             }
