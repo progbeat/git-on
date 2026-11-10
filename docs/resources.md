@@ -55,6 +55,14 @@ inherited file-size limit: a want count cannot bound native Git's resulting
 pack size. Unrestricted runs retain batching. Request stdin is streamed through
 a channel; decoder request staging uses bounded parts.
 
+Local explicit-all materialization verifies object bytes directly into the
+private execution tree, without a second complete raw copy. Loose objects
+stream; packed/delta objects retain libgit2's required decoding. A repeated OID
+reuses a prepared file or symlink target across directories, authenticating the
+copied bytes against that original OID. File copies remain independent. The
+command starts only after every destination has passed verification and policy
+checks. Remote materialization retains its invocation-owned verified raw store.
+
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that
 is later discarded. Transport/metadata staging and durability work are excluded.

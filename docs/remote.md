@@ -54,6 +54,9 @@ invocation-owned channel. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
 SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
 Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
+Callers with a controlling terminal retain native fetch's foreground and
+job-control supervisor, including for credential helpers that open `/dev/tty`
+despite redirected stdio or disabled built-in prompts.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
 retain the native compatibility path. No fetched object is retried merely to

@@ -127,8 +127,11 @@ impl Git {
     }
     pub(crate) fn demand_session_compatible(&self) -> bool {
         // Keep caller-defined server programs, server options and fsck policy
-        // on native fetch's complete compatibility path.
-        std::env::var_os("GIT_EXEC_PATH").is_none()
+        // on native fetch's complete compatibility path. A controlling TTY
+        // also needs that supervisor: arbitrary credential helpers can read it
+        // even with redirected stdio and GIT_TERMINAL_PROMPT=0.
+        controlling_terminal().is_none()
+            && std::env::var_os("GIT_EXEC_PATH").is_none()
             && !self.config.iter().any(|(key, value)| {
                 let key = key.as_bytes();
                 key.ends_with(b".uploadpack")
@@ -349,6 +352,14 @@ fn copy_native_output<R: std::io::Read>(
     }
 }
 
+fn controlling_terminal() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()
+}
+
 fn run_captured(
     mut command: Command,
     capture_stdout: bool,
@@ -379,11 +390,7 @@ fn run_captured(
     if let Some(stderr) = &stderr {
         command.stderr(stderr.try_clone()?);
     }
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok();
+    let tty = controlling_terminal();
     let tty_fd = tty.as_ref().map(AsRawFd::as_raw_fd);
     let parent_group = unsafe { libc::getpgrp() };
     let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == parent_group });

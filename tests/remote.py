@@ -120,7 +120,7 @@ class Fixture:
                 except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=5)
         for handle in self.handles: handle.close()
         self.temp.cleanup()
-    def https(self):
+    def https(self, authorization=None):
         key, cert = self.root/'tls.key', self.root/'tls.crt'
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert])
         backend = Path(run(['git', '--exec-path']).decode().strip()) / 'git-http-backend'
@@ -132,6 +132,11 @@ class Fixture:
             def handle_git(self):
                 path, _, query = self.path.partition('?')
                 data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                if authorization is not None and self.headers.get('Authorization') != authorization:
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate','Basic realm="git-on-fixture"')
+                    self.send_header('Content-Length','0'); self.end_headers()
+                    return
                 wants = [x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)]
                 stalled_request = bool(fixture.stalled_oids.intersection(wants))
                 if stalled_request:

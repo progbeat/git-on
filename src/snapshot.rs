@@ -860,6 +860,72 @@ impl Snapshot {
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
         self.state()?.open(oid)
     }
+    /// Eager consumers keep the destination private until the complete tree is
+    /// verified. Local objects can be checked directly into that destination,
+    /// without first creating a second full decoded copy in raw storage.
+    pub(crate) fn copy_materialized_blob(
+        &self,
+        oid: Oid,
+        output: &mut dyn std::io::Write,
+    ) -> Result<u64> {
+        let mut state = self.state()?;
+        if state.remote.is_some() {
+            let reader = state.open(oid)?;
+            drop(state);
+            let size = reader.len();
+            let mut offset = 0;
+            while offset < size {
+                let data = reader.read(offset, (size - offset).min(64 * 1024) as u32)?;
+                anyhow::ensure!(!data.is_empty(), "truncated Git blob");
+                crate::object::check_transfer()?;
+                output.write_all(&data)?;
+                offset += data.len() as u64;
+            }
+            if size == 0 {
+                reader.read(0, 1)?;
+            }
+            return Ok(size);
+        }
+        let odb = state.repo.odb()?;
+        let (size, kind) = odb.read_header(oid)?;
+        anyhow::ensure!(
+            kind == ObjectType::Blob,
+            "snapshot file does not reference a blob"
+        );
+        let mut small = Vec::new();
+        let target: &mut dyn std::io::Write = if size < 1024 {
+            &mut small
+        } else {
+            &mut *output
+        };
+        let streamed = if let Ok((input, length, kind)) = odb.reader(oid) {
+            anyhow::ensure!(
+                length == size && kind == ObjectType::Blob,
+                "Git blob changed during transfer"
+            );
+            crate::object::copy_verified(input, target, ObjectType::Blob, size, oid)?;
+            true
+        } else {
+            let object = odb.read(oid).context("decode Git blob")?;
+            anyhow::ensure!(
+                object.id() == oid && object.len() == size && object.kind() == ObjectType::Blob,
+                "Git blob changed during transfer"
+            );
+            crate::object::copy_odb_blob(&object, target)?;
+            false
+        };
+        if size < 1024 {
+            State::validate_blob(&small)?;
+            output.write_all(&small)?;
+        }
+        drop(odb);
+        state.metrics.blob_loads += 1;
+        state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
+        if size > crate::raw_blob::BLOCK {
+            state.metrics.streamed_blob_loads += u64::from(streamed);
+        }
+        Ok(size as u64)
+    }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
         // verified store without allocating/registering a temporary ActiveBlob.
