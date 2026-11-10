@@ -1385,54 +1385,40 @@ print('caught-EIO-and-returned-success')
     def test_materialization_native_git_tty_handoff_with_tostop(self):
         import native_job_control
         f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
-        # Exercise the native compatibility path; configured fsck stays native.
-        f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
-        tools=f.root/'tostop-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
-        shell=native_job_control.Shell(f);self.addCleanup(shell.close)
-        shell.send(b'stty tostop\n');shell.expect(shell.prompt)
-        f.stalled_oids={f.blob}
-        runner_file=f.root/'tostop-runner'
-        argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('child-completed')"]
-        shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
-        try:
-            self.assertTrue(f.stalled.wait(10),'native fetch did not reach controlled TTY stall')
-            self.assertTrue(runner_file.exists())
-            runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
-            shell.groups.update((runner,foreground))
-            self.assertNotEqual(foreground,runner,'native Git never received terminal foreground ownership')
-            self.assertEqual(os.getsid(runner),shell.pid)
-            deadline=time.monotonic()+1.3
-            while time.monotonic()<deadline:
-                shell.read()
-                if native_job_control.state(runner)=='T':break
-            self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
-            f.resume.set()
-            output=shell.expect(shell.prompt,timeout=15)
-            self.assertIn(b'STATUS:0',output)
-            self.assertIn(b'\r\nchild-completed\r\n',output)
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
-        finally:f.resume.set()
-
-    @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
-    def test_session_materialization_keeps_spinner_foreground_with_tostop(self):
-        import native_job_control
-        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
-        tools=f.root/'session-tostop-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
-        shell=native_job_control.Shell(f);self.addCleanup(shell.close)
-        shell.send(b'stty tostop\n');shell.expect(shell.prompt)
-        f.stalled_oids={f.blob};runner_file=f.root/'session-runner'
-        argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('session-child-completed')"]
-        shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
-        try:
-            self.assertTrue(f.stalled.wait(10),'session did not reach controlled stall')
-            runner=int(runner_file.read_text());shell.groups.add(runner)
-            self.assertEqual(os.tcgetpgrp(shell.fd),runner,'silent session stole terminal ownership')
-            output=shell.expect(b'Preparing snapshot',timeout=5)
-            self.assertNotEqual(native_job_control.state(runner),'T',output)
-            f.resume.set();output=shell.expect(shell.prompt,timeout=15)
-            self.assertIn(b'STATUS:0',output);self.assertIn(b'session-child-completed',output)
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
-        finally:f.resume.set()
+        original=f.env
+        for selection in ('automatic','explicit-fsck'):
+            with self.subTest(selection=selection):
+                f.env=dict(original)
+                if selection=='explicit-fsck':
+                    f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                tools=f.root/f'tostop-{selection}';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
+                shell=native_job_control.Shell(f);self.addCleanup(shell.close)
+                shell.send(b'stty tostop\n');shell.expect(shell.prompt)
+                f.resume.clear();f.stalled.clear();f.stalled_oids={f.blob}
+                runner_file=f.root/f'tostop-runner-{selection}'
+                argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('child-completed')"]
+                shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
+                try:
+                    self.assertTrue(f.stalled.wait(10),'native fetch did not reach controlled TTY stall')
+                    runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
+                    shell.groups.update((runner,foreground))
+                    self.assertNotEqual(foreground,runner,'native Git never received terminal foreground ownership')
+                    self.assertEqual(os.getsid(runner),shell.pid)
+                    deadline=time.monotonic()+1.3
+                    while time.monotonic()<deadline:
+                        shell.read()
+                        if native_job_control.state(runner)=='T':break
+                    self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
+                    f.resume.set()
+                    output=shell.expect(shell.prompt,timeout=15)
+                    self.assertIn(b'STATUS:0',output)
+                    visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
+                    self.assertIn(b'child-completed',visible.splitlines())
+                    self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    shell.groups.clear()
+                finally:f.resume.set()
+        f.env=original
 
     def test_materialization_progress_is_delayed_tty_only_and_cleared_before_child_or_error(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)

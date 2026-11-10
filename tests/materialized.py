@@ -249,8 +249,10 @@ subprocess.run([mount,'-t','tmpfs','-o',f'size=9m,mode=700,uid={uid},gid={gid}',
 if os.geteuid()==0 and uid!=0:
  os.setgroups([]); os.setgid(gid); os.setuid(uid)
 temporary=volume/'tmp'; temporary.mkdir()
+home=volume/'home'; home.mkdir()
 env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
-env.update(PATH=programs,TMPDIR=str(temporary),GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1')
+env.update(PATH=programs,TMPDIR=str(temporary),HOME=str(home),XDG_CONFIG_HOME=str(home/'config'),
+           GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1')
 clone=volume/'clone'
 before=os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize
 assert before<=9*1024*1024,before
