@@ -37,6 +37,7 @@ struct Node {
     bytes: Vec<u8>,
     file: Option<File>,
     external_io: bool,
+    pending_unlink: bool,
 }
 #[derive(Clone)]
 struct Handle {
@@ -191,6 +192,7 @@ impl Overlay {
                 bytes: Vec::new(),
                 file: None,
                 external_io: false,
+                pending_unlink: false,
             },
         );
         paths.insert(PathBuf::new(), 1);
@@ -333,6 +335,7 @@ impl Overlay {
                 bytes: Vec::new(),
                 file: None,
                 external_io: false,
+                pending_unlink: false,
             },
         );
         self.paths.insert(path.to_path_buf(), ino);
@@ -356,6 +359,17 @@ impl Overlay {
                 node.attr.nlink == 0 && node.lookups == 0 && node.attr.kind != FileType::Directory
             })
         {
+            if self.nodes[&ino].pending_unlink {
+                match fs::remove_file(self.backing.join(ino.to_string())) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        eprintln!("git-on: cannot release unlinked backing: {error}");
+                        return;
+                    }
+                }
+                self.nodes.get_mut(&ino).unwrap().pending_unlink = false;
+            }
             if let Some(oid) = self.nodes[&ino].oid {
                 if let Err(error) = self._snapshot.consume_source(oid) {
                     eprintln!("git-on: cannot release consumed source: {error:#}");
@@ -694,6 +708,8 @@ impl Overlay {
         };
         let unlinked = node.attr.nlink == 0;
         let disk_path = self.backing.join(ino.to_string());
+        // Complete fallible metadata preparation before transferring ownership.
+        self.copy_metadata_up(ino)?;
         // Existing readers of this inode must observe the same mutated bytes.
         let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
         while fh != 0 {
@@ -732,15 +748,19 @@ impl Overlay {
             }
             file
         };
-        if unlinked {
-            fs::remove_file(&disk_path).map_err(errno)?;
-        }
         let keep_file = unlinked || self.has_open_handle(ino);
-        self.copy_metadata_up(ino)?;
         let node = self.node_mut(ino)?;
         node.oid = None;
         if keep_file {
             node.file = Some(file);
+        }
+        // Once source ownership has moved, retain that backing even if
+        // unlinking its private name fails. Retrying must not decode again.
+        if unlinked {
+            if let Err(error) = fs::remove_file(&disk_path) {
+                self.node_mut(ino)?.pending_unlink = true;
+                return Err(errno(error));
+            }
         }
         Ok(())
     }
@@ -876,6 +896,7 @@ impl Overlay {
                 bytes,
                 file: None,
                 external_io: false,
+                pending_unlink: false,
             },
         );
         self.paths.insert(p.clone(), ino);
@@ -1221,7 +1242,9 @@ impl Overlay {
                     });
                 n.attr.ctime = SystemTime::now();
                 if n.attr.nlink == 0 && n.attr.kind == FileType::RegularFile {
-                    let _ = fs::remove_file(self.backing.join(ino.to_string()));
+                    if let Err(error) = fs::remove_file(self.backing.join(ino.to_string())) {
+                        n.pending_unlink = error.kind() != std::io::ErrorKind::NotFound;
+                    }
                 }
             }
             self.touch_parent(p);

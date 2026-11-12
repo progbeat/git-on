@@ -539,6 +539,57 @@ print('independent aliases and unlinked reader verified')
                 self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
                 self.assert_no_runtime_files()
 
+    def test_unlinked_source_survives_backing_unlink_failure_without_redecode(self):
+        # Inject an OS failure after transferring the raw inode. All later I/O
+        # must keep using that inode, even if the original Git object is gone.
+        compiler=shutil.which('cc')
+        self.assertIsNotNone(compiler,'C compiler is required for filesystem fault injection')
+        source=self.root/'unlink-fault.c';library=self.root/'unlink-fault.so'
+        source.write_text(r'''
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
+static int fail_unlink;
+int renameat(int from, const char *old, int to, const char *name) {
+ int (*real)(int,const char*,int,const char*)=dlsym(RTLD_NEXT,"renameat");
+ int result=real(from,old,to,name);
+ if(!result && strlen(old)==40 && strspn(name,"0123456789")==strlen(name))fail_unlink=1;
+ return result;
+}
+int unlink(const char *name) {
+ int (*real)(const char*)=dlsym(RTLD_NEXT,"unlink");
+ if(fail_unlink && strstr(name,"/backing/")){fail_unlink=0;errno=EACCES;return -1;}
+ return real(name);
+}
+''')
+        subprocess.run([compiler,'-shared','-fPIC','-o',str(library),str(source),'-ldl'],check=True,capture_output=True)
+        (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','source transfer failure')
+        oid=git(self.repo,'rev-parse','HEAD:large')
+        loose=self.repo/'.git/objects'/oid[:2]/oid[2:]
+        from filesystem_quota import STORAGE_OBSERVATION
+        command=[sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+import errno,sys
+from pathlib import Path
+fd=os.open('large',os.O_RDWR)
+assert os.pread(fd,1,0)==b'x'
+Path('large').unlink()
+try:os.pwrite(fd,b'y',0)
+except OSError as error:assert error.errno==errno.EACCES,error
+else:raise AssertionError('backing unlink fault was not exercised')
+Path(sys.argv[1]).unlink()
+assert os.pread(fd,2,0)==b'xx','lost prepared source after failed unlink'
+assert os.pwrite(fd,b'z',0)==1
+assert os.pread(fd,2,0)==b'zx'
+os.close(fd)
+Path('replacement').write_bytes(b'z'*(6*1024*1024))
+assert allocated()<9*1024*1024,('failed unlink retained released payload',allocated())
+print('source retained after backing unlink failure')
+''',str(loose)]
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env={'LD_PRELOAD':str(library)})
+        self.assert_success(result);self.assert_no_runtime_files()
+
     def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],self.shared_source_fixture(),size_mib=16)
