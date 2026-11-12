@@ -154,7 +154,7 @@ pub struct Remote {
     control_client: Option<ControlClient>,
     failed: Option<String>,
     materializing: bool,
-    materialized_blobs: HashMap<Oid, Arc<tempfile::TempDir>>,
+    received_blobs: HashMap<Oid, Arc<tempfile::TempDir>>,
     active_materialized_pack: Option<ReceivedPack>,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
 }
@@ -247,7 +247,7 @@ impl Remote {
             control_client,
             failed: None,
             materializing: false,
-            materialized_blobs: HashMap::new(),
+            received_blobs: HashMap::new(),
             active_materialized_pack: None,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
@@ -381,7 +381,7 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
-        self.import_received(true)?;
+        self.import_received(true, &[oid])?;
         let repo = Repository::open_bare(&self.dir)?;
         if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
             bail!("native Git fetch did not supply selected object {oid}");
@@ -394,8 +394,8 @@ impl Remote {
         self.materializing = true;
         self.session = None;
     }
-    pub(crate) fn has_materialized_blob(&self, oid: Oid) -> bool {
-        self.materialized_blobs.contains_key(&oid)
+    pub(crate) fn has_received_blob(&self, oid: Oid) -> bool {
+        self.received_blobs.contains_key(&oid)
     }
     pub(crate) fn copy_materialized_blob(
         &mut self,
@@ -405,7 +405,7 @@ impl Remote {
     ) -> Result<(u64, bool)> {
         let outcome = (|| {
             let directory = self
-                .materialized_blobs
+                .received_blobs
                 .get(&oid)
                 .context("missing materialization blob")?
                 .clone();
@@ -455,7 +455,7 @@ impl Remote {
             Ok((size as u64, streamed))
         })();
         if outcome.is_ok() {
-            self.materialized_blobs.remove(&oid);
+            self.received_blobs.remove(&oid);
             if self
                 .active_materialized_pack
                 .as_ref()
@@ -472,19 +472,22 @@ impl Remote {
     }
     pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let outcome = (|| {
-            if self.has_materialized_blob(oid)
-                || self.raw_blobs.get(oid)?.is_some()
-                || repo.odb()?.exists(oid)
-            {
+            if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
+                return Ok(());
+            }
+            if self.has_received_blob(oid) {
+                if !self.materializing {
+                    self.import_packed_blob(oid)?;
+                }
                 return Ok(());
             }
             self.fetch(repo, &[oid])
         })();
         self.record_result(outcome)
     }
-    /// Only eager materialization calls this: every supplied object is already
-    /// needed for the directory being prepared. Lazy filesystem access retains
-    /// its exact one-demand behavior.
+    /// The caller establishes that every supplied object is already needed:
+    /// eager destinations or metadata proving original source ownership.
+    /// Ordinary lazy lookup/read retains its exact one-demand behavior.
     pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         let outcome = (|| {
             let odb = repo.odb()?;
@@ -492,7 +495,7 @@ impl Remote {
             let mut missing = Vec::new();
             for oid in oids {
                 if unique.insert(*oid)
-                    && !self.has_materialized_blob(*oid)
+                    && !self.has_received_blob(*oid)
                     && self.raw_blobs.get(*oid)?.is_none()
                     && !odb.exists(*oid)
                 {
@@ -588,11 +591,11 @@ impl Remote {
         if self.materializing {
             self.stage_materialization()?;
         } else {
-            self.import_received(true)?;
+            self.import_received(true, oids)?;
         }
         let odb = repo.odb()?;
         for oid in oids {
-            if !self.has_materialized_blob(*oid)
+            if !self.has_received_blob(*oid)
                 && self.raw_blobs.get(*oid)?.is_none()
                 && !odb.exists(*oid)
             {
@@ -757,10 +760,15 @@ impl Remote {
         self.session_fetch_operations += 1;
         self.session_received_pack_bytes =
             self.session_received_pack_bytes.saturating_add(pack.len()?);
-        if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
-            self.publish_received(repo, oid, kind, size, reader)?;
-            self.session_decode_operations += 1;
-        } else {
+        let complex =
+            if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
+                self.publish_received(repo, oid, kind, size, reader)?;
+                self.session_decode_operations += 1;
+                false
+            } else {
+                true
+            };
+        if complex {
             // The generic path handles necessary deltas and multi-object packs
             // through the existing decoder; never repeat the network request.
             let target = Repository::open_bare(&self.dir)?;
@@ -795,7 +803,10 @@ impl Remote {
                 return Err(error);
             }
             indexed?;
-            self.import_received(false)?;
+            // Native storage now owns the compressed bytes. Release the wire
+            // staging before allocating any decoded payload.
+            drop(pack);
+            self.import_received(false, &[oid])?;
         }
         anyhow::ensure!(
             self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
@@ -872,7 +883,7 @@ impl Remote {
                 crate::object::check_transfer()?;
                 let (size, kind) = odb.read_header(*oid)?;
                 if kind == git2::ObjectType::Blob {
-                    self.materialized_blobs
+                    self.received_blobs
                         .entry(*oid)
                         .or_insert_with(|| received.directory.clone());
                 } else {
@@ -893,7 +904,7 @@ impl Remote {
         iteration?;
         Ok(())
     }
-    fn import_received(&mut self, count_transfer: bool) -> Result<()> {
+    fn import_received(&mut self, count_transfer: bool, wanted: &[Oid]) -> Result<()> {
         let Some(received) = self.take_received(count_transfer)? else {
             return Ok(());
         };
@@ -906,6 +917,15 @@ impl Remote {
             let outcome = (|| -> Result<()> {
                 crate::object::check_transfer()?;
                 if self.raw_blobs.get(*oid)?.is_none() && !destination.odb()?.exists(*oid) {
+                    let (_, kind) = received_odb.read_header(*oid)?;
+                    if kind == git2::ObjectType::Blob {
+                        self.received_blobs
+                            .entry(*oid)
+                            .or_insert_with(|| received.directory.clone());
+                        if !wanted.contains(oid) {
+                            return Ok(());
+                        }
+                    }
                     writeln!(requests, "{oid}")?;
                 }
                 Ok(())
@@ -927,12 +947,39 @@ impl Remote {
             return Ok(());
         }
         requests.rewind()?;
+        drop(destination);
+        self.decode_received(received.directory.path(), &mut requests)?;
+        for oid in wanted {
+            if self.raw_blobs.get(*oid)?.is_some() {
+                self.received_blobs.remove(oid);
+            }
+        }
+        Ok(())
+    }
+    fn import_packed_blob(&mut self, oid: Oid) -> Result<()> {
+        let directory = self
+            .received_blobs
+            .get(&oid)
+            .context("missing received blob")?
+            .clone();
+        let request = format!("{oid}\n");
+        self.decode_received(directory.path(), &mut request.as_bytes())?;
+        anyhow::ensure!(
+            self.raw_blobs.get(oid)?.is_some(),
+            "received pack omitted requested blob {oid}"
+        );
+        self.received_blobs.remove(&oid);
+        Ok(())
+    }
+    #[cfg(feature = "test-metrics")]
+    pub(crate) fn received_blob_oids(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.received_blobs.keys().copied()
+    }
+    fn decode_received(&mut self, directory: &Path, requests: &mut dyn Read) -> Result<()> {
+        let destination = Repository::open_bare(&self.dir)?;
         let mut command = self.git.command(Some(&self.dir));
         command
-            .env(
-                "GIT_OBJECT_DIRECTORY",
-                received.directory.path().join("objects"),
-            )
+            .env("GIT_OBJECT_DIRECTORY", directory.join("objects"))
             .args([
                 "-c",
                 "core.bigFileThreshold=8m",
@@ -941,11 +988,10 @@ impl Remote {
                 "--buffer",
             ]);
         let remote = &mut *self;
-        let (output, ()) =
-            crate::git::run_with_output(command, Some(&mut requests), move |input| {
-                remote.import_raw_output(&destination, input)
-            })
-            .context("decode received objects into run-local raw storage")?;
+        let (output, ()) = crate::git::run_with_output(command, Some(requests), move |input| {
+            remote.import_raw_output(&destination, input)
+        })
+        .context("decode received objects into run-local raw storage")?;
         if !output.status.success() {
             bail!(
                 "cannot decode received Git objects: {}",

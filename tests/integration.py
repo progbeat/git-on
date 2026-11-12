@@ -397,11 +397,15 @@ print(size)
                          source=source,write_policy='none',git_config={'fetch.fsckObjects':'false'})
         self.assert_no_runtime_files()
 
-    def writable_open_fixture(self,mutation='read'):
+    source_mutations=('read','write','truncate','read-write','read-truncate','read-rewrite','read-truncate-extend','read-replace')
+
+    def writable_open_fixture(self,mutation='read',source='local'):
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','writable open disk budget')
         from filesystem_quota import STORAGE_OBSERVATION
         return [sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+import sys
+mutation=sys.argv[-1]
 source=Path('large');before=source.stat()
 for flags in (os.O_RDWR,os.O_WRONLY|os.O_APPEND):
  fd=os.open(source,flags)
@@ -410,23 +414,29 @@ for flags in (os.O_RDWR,os.O_WRONLY|os.O_APPEND):
 after=source.stat()
 assert (after.st_size,after.st_mtime_ns,after.st_ctime_ns)==(before.st_size,before.st_mtime_ns,before.st_ctime_ns)
 fd=os.open(source,os.O_RDWR);os.ftruncate(fd,before.st_size);os.close(fd)
-if root!=Path.cwd():assert allocated()<1024*1024,('open copied payload',allocated())
-import sys
+if root!=Path.cwd():assert allocated()<(9 if sys.argv[1]=='remote' else 1)*1024*1024,('open copied payload',allocated())
 expected=b'x'*(6*1024*1024)
-if sys.argv[1]!='read':
+if mutation!='read':
  fd=os.open(source,os.O_RDWR)
- if sys.argv[1].startswith('read-'):assert os.pread(fd,1,0)==b'x'
- if sys.argv[1] in ('write','read-write'):os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
+ if mutation.startswith('read-'):assert os.pread(fd,1,0)==b'x'
+ if mutation in ('write','read-write'):os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
+ elif mutation=='read-rewrite':
+  expected=b'y'*len(expected);assert os.pwrite(fd,expected,0)==len(expected)
+ elif mutation=='read-truncate-extend':
+  os.ftruncate(fd,1024);tail=b'y'*(len(expected)-1024)
+  assert os.pwrite(fd,tail,1024)==len(tail);expected=expected[:1024]+tail
+ elif mutation=='read-replace':
+  os.close(fd);fd=None;source.unlink();expected=b'y'*len(expected);source.write_bytes(expected)
  else:os.ftruncate(fd,1024);expected=expected[:1024]
- os.close(fd)
+ if fd is not None:os.close(fd)
 assert source.read_bytes()==expected
 assert allocated()<9*1024*1024,('content mutation disk allocation',allocated())
 print('writable lifecycle verified')
-''',mutation]
+''',source,mutation]
 
     def test_writable_open_does_not_materialize_source(self):
         template=self.writable_open_fixture()
-        for mutation in ('read','write','truncate','read-write','read-truncate'):
+        for mutation in self.source_mutations:
             with self.subTest(mutation=mutation):
                 command=[*template[:-1],mutation]
                 clone=self.root/f'clone-{mutation}'
@@ -442,9 +452,96 @@ print('writable lifecycle verified')
     def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         command=self.writable_open_fixture()
-        for mutation in ('read','write','truncate','read-write','read-truncate'):
+        for mutation in self.source_mutations:
             with self.subTest(mutation=mutation):
                 compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
+        self.assert_no_runtime_files()
+
+    def test_remote_mutations_fit_checkout_disk_budget(self):
+        template=self.writable_open_fixture(source='remote')
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        source=self.repo.as_uri()
+        for native in (False,True):
+            config=(dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false') if native else {})
+            env=dict(self.environment(),**config)
+            for mutation in ('read-write','read-rewrite','read-truncate-extend','read-replace'):
+                with self.subTest(native=native,mutation=mutation):
+                    clone=self.root/f'clone-{native}-{mutation}'
+                    command=[*template[:-1],mutation]
+                    result=subprocess.run(['git','clone','--no-local','--quiet',source,str(clone)],
+                                          env=env,capture_output=True,timeout=20)
+                    self.assert_success(result)
+                    direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
+                    self.assert_success(direct)
+                    result,_=self.invoke_argv([source,'HEAD','--write-policy=all','--',*command],extra_env=config)
+                    self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+                    self.assert_no_runtime_files()
+
+    def test_remote_rewrite_and_replacement_succeed_on_nine_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        template=self.writable_open_fixture(source='remote')
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        for native in (False,True):
+            for mutation in ('read-rewrite','read-replace'):
+                with self.subTest(native=native,mutation=mutation):
+                    compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*template[:-1],mutation],
+                                     source=self.repo.as_uri(),git_config={'fetch.fsckObjects':'false'} if native else {})
+        self.assert_no_runtime_files()
+
+    def shared_source_fixture(self):
+        for directory in ('left','right'):
+            (self.repo/directory).mkdir()
+            (self.repo/directory/'large').write_bytes(b'x'*(6*1024*1024))
+        git(self.repo,'add','left','right');git(self.repo,'commit','-qm','shared source ownership')
+        self.assertEqual(git(self.repo,'rev-parse','HEAD:left'),git(self.repo,'rev-parse','HEAD:right'))
+        from filesystem_quota import STORAGE_OBSERVATION
+        return [sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+size=6*1024*1024
+first=Path('left/large');second=Path('right/large')
+assert first.read_bytes()==b'x'*size
+# The second source inode has not been looked up yet. Its equal tree is shared.
+with first.open('r+b',buffering=0) as output:
+ assert output.write(b'y'*size)==size
+assert allocated()<16*1024*1024,('first independent source copy',allocated())
+assert second.read_bytes()==b'x'*size
+os.link(second,'alias')
+reader=os.open('alias',os.O_RDONLY)
+second.unlink()
+with open('alias','r+b',buffering=0) as output:
+ assert output.write(b'z'*size)==size
+assert os.pread(reader,size,0)==b'z'*size
+assert allocated()<16*1024*1024,('last original source duplicated',allocated())
+Path('alias').unlink()
+assert os.fstat(reader).st_nlink==0
+assert os.pread(reader,size,0)==b'z'*size
+os.close(reader)
+assert first.read_bytes()==b'y'*size
+assert allocated()<9*1024*1024,('unlinked payload retained',allocated())
+print('independent aliases and unlinked reader verified')
+''']
+
+    def test_unopened_aliases_and_unlinked_readers_share_only_needed_sources(self):
+        command=self.shared_source_fixture()
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        clone=self.root/'clone'
+        result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
+                              env=self.environment(),capture_output=True,timeout=20)
+        self.assert_success(result)
+        direct=subprocess.run(command,cwd=clone,env=self.environment(),capture_output=True,timeout=20)
+        self.assert_success(direct)
+        for source in (None,self.repo.as_uri()):
+            with self.subTest(source=source):
+                operands=[source,'HEAD'] if source else ['HEAD']
+                result,_=self.invoke_argv([*operands,'--write-policy=all','--',*command])
+                self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+                self.assert_no_runtime_files()
+
+    def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],self.shared_source_fixture(),size_mib=16)
         self.assert_no_runtime_files()
 
     def source_metadata_fixture(self):

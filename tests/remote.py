@@ -1598,13 +1598,15 @@ print('caught-EIO-and-returned-success')
         self.assertNotEqual(process.wait(timeout=10),0)
         self.assertFalse((root/'unexpected-target').exists())
 
-    def delta_session_fixture(self, prefix_size=20000):
+    def delta_session_fixture(self, prefix_size=20000, include_base=False):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
         base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
         base_oid=f.git('hash-object','-w','--stdin',data=base)
         wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
-        tree=f.git('mktree',data=f'100644 blob {wanted_oid}\tfile\n'.encode())
+        entries=f'100644 blob {wanted_oid}\tfile\n'
+        if include_base:entries+=f'100644 blob {base_oid}\tbase\n'
+        tree=f.git('mktree',data=entries.encode())
         commit=f.git('commit-tree',tree,data=b'delta session\n');f.git('update-ref','refs/heads/main',commit)
         def integer(value):
             output=bytearray()
@@ -1614,7 +1616,7 @@ print('caught-EIO-and-returned-success')
         def entry(kind,size):
             first=(kind<<4)|(size&15);size>>=4
             return bytes([first|(128 if size else 0)])+(integer(size) if size else b'')
-        delta=integer(len(base))+integer(len(wanted))+bytes([0xb0,prefix_size&255,prefix_size>>8,7])+b'changed'
+        delta=integer(len(base))+integer(len(wanted))+bytes([0xf0,prefix_size&255,(prefix_size>>8)&255,(prefix_size>>16)&255,7])+b'changed'
         data=b'PACK'+(2).to_bytes(4,'big')+(2).to_bytes(4,'big')
         data+=entry(3,len(base))+zlib.compress(base)
         data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
@@ -1668,6 +1670,22 @@ while True:
         self.assertEqual(list((destination/'objects/pack').iterdir()),[])
         f.finish(process)
 
+    def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
+        f=self.f;wanted,base_oid,_,tree,_,trace=self.delta_session_fixture(include_base=True)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        _,before=f.operation(process,'range 0 1 file')
+        f.operation(process,'release')
+        value,prepared=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        self.assertEqual(before['metrics']['remote_session_fetch_operations'],prepared['metrics']['remote_session_fetch_operations'])
+        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
+        f.operation(process,'release')
+        value,reopened=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        for field in ('remote_fetch_operations','remote_decode_operations','blob_loads'):
+            self.assertEqual(prepared['metrics'][field],reopened['metrics'][field])
+        f.finish(process)
+
     def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
         f=self.f;wanted,_,wanted_oid,tree,_,trace=self.delta_session_fixture(40000)
@@ -1712,6 +1730,49 @@ if sys.argv[1]=='untracked':
                 self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
                 self.assertEqual(list(f.root.glob('git-on-*')),[])
                 self.assertEqual(f.git('cat-file','blob',wanted_oid).encode(),wanted)
+
+    def large_delta_storage_fixture(self):
+        size=7*1024*1024
+        _,_,wanted_oid,tree,_,trace=self.delta_session_fixture(size-7)
+        from filesystem_quota import STORAGE_OBSERVATION
+        command=[sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+import sys
+expected=b'a'*(7*1024*1024-7)+b'changed'
+assert Path('file').stat().st_size==len(expected)
+assert Path('file').read_bytes()==expected
+assert Path('file').read_bytes()==expected
+assert allocated()<9*1024*1024,('delta import retained an extra decoded payload',allocated())
+if sys.argv[1]=='rewrite':
+ expected=b'z'*len(expected)
+ with open('file','r+b',buffering=0) as output:assert output.write(expected)==len(expected)
+ assert Path('file').read_bytes()==expected
+ assert allocated()<9*1024*1024,('delta mutation duplicated source',allocated())
+print('delta payload verified')
+''']
+        return command,wanted_oid,tree,trace
+
+    def test_delta_base_is_not_a_second_materialized_file(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;command,wanted_oid,tree,trace=self.large_delta_storage_fixture()
+        clone=f.root/'delta-clone'
+        run(['git','clone','--no-local','--quiet','file://'+str(f.repo),str(clone)],env=f.env)
+        for mode,policy in (('read','none'),('rewrite','all')):
+            with self.subTest(mode=mode):
+                trace.unlink(missing_ok=True)
+                direct=subprocess.run([*command,mode],cwd=clone,env=f.env,capture_output=True,timeout=30)
+                self.assertEqual(direct.returncode,0,direct.stderr)
+                result=subprocess.run([str(OPTIONS.binary),'file://'+str(f.repo),'HEAD','--write-policy='+policy,'--',*command,mode],
+                                      cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,direct.stdout)
+                self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def test_delta_decode_and_rewrite_succeed_on_nine_mib_tmpfs(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        from filesystem_quota import compare_on_tmpfs
+        f=self.f;command,_,_,_=self.large_delta_storage_fixture()
+        compare_on_tmpfs(self,f.root,OPTIONS.binary,f.repo,f.env['PATH'],[*command,'rewrite'],source=f.repo.as_uri())
 
     def test_native_raw_import_verifies_oid_before_publishing_bytes(self):
         f=self.f;tools=f.root/'raw-decoder-tools';tools.mkdir()

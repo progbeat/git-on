@@ -231,6 +231,13 @@ checkout or a complete in-memory copy of the selected tree.
 7. Do not keep duplicate full source payloads merely to transfer data between
    snapshot and filesystem layers. Memory use should reflect demanded objects,
    active operations, and bounded caches, not the whole repository's contents.
+   A writable source inode must not retain an additional complete immutable
+   decoded backing merely for reuse. The last original inode transfers its
+   backing; other original same-OID inodes, including unopened paths and
+   open-unlinked references, retain their prepared bytes without repeated
+   decoding. Ownership accounting may inspect selected-tree metadata when the
+   first destructive source operation requires it; it must not preload blobs
+   or become a launch, read or policy-check prerequisite.
 8. Failures discovered in objects reached on demand must be reported through
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.

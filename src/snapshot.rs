@@ -322,6 +322,7 @@ struct State {
     headers: HashMap<Oid, u64>,
     readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
+    source_counts: Option<HashMap<Oid, u64>>,
     metrics: SnapshotMetrics,
     #[cfg(test)]
     ancestor_tree_lookups: u64,
@@ -340,6 +341,88 @@ impl State {
             .as_ref()
             .map(|remote| &remote.raw_blobs)
             .or(self.raw_blobs.as_ref())
+    }
+    /// Count source inodes, including unopened aliases, without reading file
+    /// headers or payloads. Run only when ownership changes require the counts.
+    /// Propagate tree multiplicities through the DAG; repeated subtrees need no
+    /// repeated traversal or pathname allocation.
+    fn source_count(&mut self, root: Oid, oid: Oid) -> Result<u64> {
+        if self.source_counts.is_none() {
+            // Ownership needs unopened aliases as well. Batch each level of
+            // remote tree metadata with the existing tree:0 filter; no blob
+            // payload is requested and no new server capability is required.
+            if self.remote.is_some() {
+                let mut frontier = vec![root];
+                let mut seen = std::collections::HashSet::from([root]);
+                while !frontier.is_empty() {
+                    let State { repo, remote, .. } = self;
+                    remote.as_mut().unwrap().ensure_batch_in(repo, &frontier)?;
+                    let mut next = Vec::new();
+                    for oid in frontier {
+                        let tree = self.tree(oid)?;
+                        for index in 0..tree.len() {
+                            let (mode, child) =
+                                tree.metadata_at(index).context("source tree entry")?;
+                            if mode == 0o040000 && seen.insert(child) {
+                                next.push(child);
+                            }
+                        }
+                    }
+                    frontier = next;
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut pending = vec![(root, false)];
+            let mut order = Vec::new();
+            while let Some((oid, expanded)) = pending.pop() {
+                if expanded {
+                    order.push(oid);
+                } else if seen.insert(oid) {
+                    let tree = self.tree(oid)?;
+                    pending.push((oid, true));
+                    for index in 0..tree.len() {
+                        let (mode, child) = tree.metadata_at(index).context("source tree entry")?;
+                        if mode == 0o040000 {
+                            pending.push((child, false));
+                        }
+                    }
+                }
+            }
+            let mut weights = HashMap::<Oid, u64>::from([(root, 1)]);
+            let mut counts = HashMap::<Oid, u64>::new();
+            for oid in order.into_iter().rev() {
+                let weight = weights.remove(&oid).context("source tree multiplicity")?;
+                let tree = self.tree(oid)?;
+                for index in 0..tree.len() {
+                    let (mode, child) = tree.metadata_at(index).context("source tree entry")?;
+                    let counter = match mode {
+                        0o040000 => weights.entry(child).or_default(),
+                        0o100644 | 0o100755 | 0o120000 => counts.entry(child).or_default(),
+                        _ => continue,
+                    };
+                    *counter = counter.saturating_add(weight);
+                }
+            }
+            self.source_counts = Some(counts);
+        }
+        Ok(self
+            .source_counts
+            .as_ref()
+            .unwrap()
+            .get(&oid)
+            .copied()
+            .unwrap_or(0))
+    }
+    fn consume_source(&mut self, root: Oid, oid: Oid) -> Result<()> {
+        let count = self.source_count(root, oid)?;
+        anyhow::ensure!(count > 0, "source reference accounting");
+        if count == 1 {
+            if let Some(raw) = self.raw_store() {
+                raw.discard(oid)?;
+            }
+        }
+        *self.source_counts.as_mut().unwrap().get_mut(&oid).unwrap() = count - 1;
+        Ok(())
     }
     fn tree(&mut self, oid: Oid) -> Result<Arc<Directory>> {
         if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
@@ -681,6 +764,7 @@ impl Snapshot {
                     headers: HashMap::new(),
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
+                    source_counts: None,
                     metrics: SnapshotMetrics::default(),
                     #[cfg(test)]
                     ancestor_tree_lookups: 0,
@@ -909,7 +993,7 @@ impl Snapshot {
         if let Some(remote) = state
             .remote
             .as_mut()
-            .filter(|remote| remote.has_materialized_blob(oid))
+            .filter(|remote| remote.has_received_blob(oid))
         {
             let (size, streamed) =
                 remote.copy_materialized_blob(oid, output, State::validate_blob)?;
@@ -957,6 +1041,31 @@ impl Snapshot {
             state.metrics.streamed_blob_loads += u64::from(streamed);
         }
         Ok(size as u64)
+    }
+    /// End one original inode's lifetime. An open-unlinked inode retains its
+    /// reference until the kernel releases it. Forgetting a linked cache entry
+    /// does not consume a source reference.
+    pub(crate) fn consume_source(&self, oid: Oid) -> Result<()> {
+        self.state()?.consume_source(self.tree_oid, oid)
+    }
+    pub(crate) fn prepare_source_removal(&self, oid: Oid) -> Result<()> {
+        anyhow::ensure!(
+            self.state()?.source_count(self.tree_oid, oid)? > 0,
+            "source reference accounting"
+        );
+        Ok(())
+    }
+    pub(crate) fn promote_source(&self, oid: Oid, path: &Path) -> Result<fs::File> {
+        let mut state = self.state()?;
+        let count = state.source_count(self.tree_oid, oid)?;
+        anyhow::ensure!(count > 0, "source reference accounting");
+        state.prepare_blob(oid)?;
+        let file = state
+            .raw_store()
+            .context("missing source storage")?
+            .promote(oid, path, count == 1)?;
+        state.consume_source(self.tree_oid, oid)?;
+        Ok(file)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
@@ -1087,6 +1196,7 @@ impl Snapshot {
         }
         if let Some(remote) = &state.remote {
             objects.extend(remote.raw_blobs.oids()?);
+            objects.extend(remote.received_blob_oids());
         }
         objects.sort_unstable();
         objects.dedup();

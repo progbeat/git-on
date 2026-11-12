@@ -26,63 +26,6 @@ fn snapshot_errno(_error: anyhow::Error) -> i32 {
     libc::EIO
 }
 
-// A sparse private file stores only overwritten bytes. Holes below visible
-// still come from the verified source; truncation permanently hides its tail.
-struct SourceContent {
-    oid: Oid,
-    visible: u64,
-    written: BTreeMap<u64, u64>,
-}
-impl SourceContent {
-    fn mark_written(&mut self, mut start: u64, mut end: u64) {
-        end = end.min(self.visible);
-        if start >= end {
-            return;
-        }
-        if let Some((&previous, &limit)) = self.written.range(..=start).next_back() {
-            if limit >= start {
-                start = previous;
-                end = end.max(limit);
-            }
-        }
-        while let Some((&next, &limit)) = self.written.range(start..=end).next() {
-            self.written.remove(&next);
-            end = end.max(limit);
-        }
-        self.written.insert(start, end);
-    }
-    fn truncate(&mut self, size: u64) {
-        self.visible = self.visible.min(size);
-        self.written.split_off(&self.visible);
-        if let Some((_, end)) = self.written.last_key_value() {
-            if *end > self.visible {
-                *self.written.last_entry().unwrap().get_mut() = self.visible;
-            }
-        }
-    }
-    fn gaps(&self, start: u64, end: u64) -> Vec<std::ops::Range<u64>> {
-        let end = end.min(self.visible);
-        let mut cursor = start;
-        let mut gaps = Vec::new();
-        if let Some((_, &limit)) = self.written.range(..=start).next_back() {
-            cursor = cursor.max(limit);
-        }
-        if cursor >= end {
-            return gaps;
-        }
-        for (&offset, &limit) in self.written.range(start..end) {
-            if cursor < offset {
-                gaps.push(cursor..offset);
-            }
-            cursor = cursor.max(limit);
-        }
-        if cursor < end {
-            gaps.push(cursor..end);
-        }
-        gaps
-    }
-}
-
 struct Node {
     attr: FileAttr,
     // Metadata still belongs to the pristine snapshot. Private metadata can
@@ -93,7 +36,6 @@ struct Node {
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
-    source: Option<Box<SourceContent>>,
     external_io: bool,
 }
 #[derive(Clone)]
@@ -248,7 +190,6 @@ impl Overlay {
                 snapshot_path: Some(PathBuf::new()),
                 bytes: Vec::new(),
                 file: None,
-                source: None,
                 external_io: false,
             },
         );
@@ -391,7 +332,6 @@ impl Overlay {
                 snapshot_path: Some(source),
                 bytes: Vec::new(),
                 file: None,
-                source: None,
                 external_io: false,
             },
         );
@@ -409,6 +349,23 @@ impl Overlay {
         self.inode_handles.contains_key(&ino)
     }
     fn reclaim(&mut self, ino: u64) {
+        // Directory-stream pins need metadata, not the payload of a deleted
+        // file. Kernel lookup references still cover O_PATH/open-by-fd users.
+        if !self.has_open_handle(ino)
+            && self.nodes.get(&ino).is_some_and(|node| {
+                node.attr.nlink == 0 && node.lookups == 0 && node.attr.kind != FileType::Directory
+            })
+        {
+            if let Some(oid) = self.nodes[&ino].oid {
+                if let Err(error) = self._snapshot.consume_source(oid) {
+                    eprintln!("git-on: cannot release consumed source: {error:#}");
+                    return;
+                }
+            }
+            let node = self.nodes.get_mut(&ino).unwrap();
+            node.oid = None;
+            node.file = None;
+        }
         if ino == 1
             || self.has_open_handle(ino)
             || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0
@@ -724,7 +681,8 @@ impl Overlay {
         }
         Ok(())
     }
-    /// Allocate private data only for a content mutation.
+    /// Preserve one backing per live inode. The final original source hands
+    /// over its verified backing; other source inodes retain their own version.
     fn copy_up(&mut self, ino: u64, preserve_content: bool) -> FsResult<()> {
         self.writable(ino)?;
         let node = self.node(ino)?;
@@ -736,36 +694,7 @@ impl Overlay {
         };
         let unlinked = node.attr.nlink == 0;
         let disk_path = self.backing.join(ino.to_string());
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&disk_path)
-            .map_err(errno)?;
-        if let Err(error) = file.set_len(if preserve_content { node.attr.size } else { 0 }) {
-            drop(file);
-            let _ = fs::remove_file(disk_path);
-            return Err(errno(error));
-        }
-        if unlinked {
-            fs::remove_file(&disk_path).map_err(errno)?;
-        }
-        let keep_file = unlinked || self.has_open_handle(ino);
-        self.copy_metadata_up(ino)?;
-        let node = self.node_mut(ino)?;
-        node.source = (preserve_content && node.attr.size != 0).then(|| {
-            Box::new(SourceContent {
-                oid,
-                visible: node.attr.size,
-                written: BTreeMap::new(),
-            })
-        });
-        node.oid = None;
-        if keep_file {
-            node.file = Some(file);
-        }
+        // Existing readers of this inode must observe the same mutated bytes.
         let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
         while fh != 0 {
             #[cfg(test)]
@@ -773,6 +702,45 @@ impl Overlay {
             let handle = self.handles.get_mut(&fh).expect("indexed open handle");
             handle.reader = None;
             fh = handle.next;
+        }
+        let file = if preserve_content {
+            self._snapshot
+                .promote_source(oid, &disk_path)
+                .map_err(|error| {
+                    error
+                        .downcast_ref::<crate::raw_blob::BackingError>()
+                        .map_or(libc::EIO, |error| {
+                            error.0.raw_os_error().unwrap_or(libc::EIO)
+                        })
+                })?
+        } else {
+            self._snapshot
+                .prepare_source_removal(oid)
+                .map_err(snapshot_errno)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&disk_path)
+                .map_err(errno)?;
+            if let Err(error) = self._snapshot.consume_source(oid) {
+                drop(file);
+                let _ = fs::remove_file(&disk_path);
+                return Err(snapshot_errno(error));
+            }
+            file
+        };
+        if unlinked {
+            fs::remove_file(&disk_path).map_err(errno)?;
+        }
+        let keep_file = unlinked || self.has_open_handle(ino);
+        self.copy_metadata_up(ino)?;
+        let node = self.node_mut(ino)?;
+        node.oid = None;
+        if keep_file {
+            node.file = Some(file);
         }
         Ok(())
     }
@@ -907,7 +875,6 @@ impl Overlay {
                 snapshot_path: None,
                 bytes,
                 file: None,
-                source: None,
                 external_io: false,
             },
         );
@@ -1032,9 +999,6 @@ impl Overlay {
         let file = self.disk_file(ino)?;
         file.set_len(size).map_err(errno)?;
         let n = self.node_mut(ino)?;
-        if let Some(source) = &mut n.source {
-            source.truncate(size);
-        }
         let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);
         Ok(())
@@ -1093,20 +1057,6 @@ impl Overlay {
                 }
             }
             data.truncate(done);
-            if let Some(source) = &n.source {
-                for gap in source.gaps(offset as u64, offset as u64 + done as u64) {
-                    let bytes = self
-                        ._snapshot
-                        .read(source.oid, gap.start, (gap.end - gap.start) as u32)
-                        .map_err(snapshot_errno)?;
-                    let start = (gap.start - offset as u64) as usize;
-                    let end = (gap.end - offset as u64) as usize;
-                    if bytes.len() != end - start {
-                        return Err(libc::EIO);
-                    }
-                    data[start..end].copy_from_slice(&bytes);
-                }
-            }
             Ok(data)
         } else if count == 0 {
             Ok(Vec::new())
@@ -1193,9 +1143,6 @@ impl Overlay {
                 Err(_) => break,
             }
         }
-        if let Some(source) = &mut n.source {
-            source.mark_written(offset, offset + written as u64);
-        }
         let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);
         if !cached && flags & libc::O_SYNC == libc::O_SYNC {
@@ -1226,6 +1173,16 @@ impl Overlay {
         Ok(true)
     }
     fn remove_path(&mut self, p: &Path) -> FsResult<()> {
+        if let Some(&ino) = self.paths.get(p) {
+            let node = self.node(ino)?;
+            if node.attr.kind != FileType::Directory {
+                if let Some(oid) = node.oid {
+                    self._snapshot
+                        .prepare_source_removal(oid)
+                        .map_err(snapshot_errno)?;
+                }
+            }
+        }
         if let Some(&ino) = self.paths.get(p) {
             let node = self.node(ino)?;
             if node.oid.is_none()
@@ -1271,6 +1228,7 @@ impl Overlay {
             if self.inode_paths.get(&ino).is_some_and(|path| path == p) {
                 self.inode_paths.remove(&ino);
             }
+            self.reclaim(ino);
         }
         // Keep inode objects and open descriptors for outstanding kernel inode
         // references and open-unlinked handles; all are reclaimed at unmount.
@@ -2433,7 +2391,7 @@ mod tests {
         fs.release_handle(ino, reader).unwrap();
     }
     #[test]
-    fn sparse_mutation_keeps_shared_source_intact_and_truncated_bytes_hidden() {
+    fn mutation_keeps_shared_source_intact_and_truncated_bytes_hidden() {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path().join("repo")).unwrap();
         let original = vec![b'x'; 6 * 1024 * 1024];
@@ -2460,7 +2418,6 @@ mod tests {
         assert_eq!(fs.read_data(first, reader, 0, 12).unwrap(), b"xxxabEFGdxxx");
         assert_eq!(fs.read_data(first, reader, 4, 7).unwrap(), b"bEFGdxx");
         assert_eq!(fs.read_data(first, reader, 4096, 7).unwrap(), b"xxxxxxx");
-        assert!(fs.disk_file(first).unwrap().metadata().unwrap().blocks() * 512 < 64 * 1024);
         fs.release_handle(first, writer).unwrap();
         fs.release_handle(first, reader).unwrap();
         let writer = fs.open_file(first, libc::O_RDWR).unwrap();
@@ -2490,6 +2447,64 @@ mod tests {
         fs.truncate(first, 0).unwrap();
         fs.truncate(first, 12).unwrap();
         assert_eq!(fs.read_data(first, writer, 0, 12).unwrap(), vec![0; 12]);
+        let last_writer = fs.open_file(second, libc::O_RDWR).unwrap();
+        fs.write_data(second, last_writer, 0, b"last", 0, 0)
+            .unwrap();
+        assert_eq!(fs.read_data(second, other, 0, 4).unwrap(), b"last");
+        assert_eq!(
+            fs._snapshot.metrics().blob_loads,
+            1,
+            "shared source was decoded again"
+        );
+        assert_eq!(
+            fs._snapshot.metrics().retained_raw_blob_entries,
+            0,
+            "last original source kept a second immutable backing"
+        );
+    }
+    #[test]
+    fn unopened_shared_tree_alias_and_unlinked_reader_keep_the_source_without_redecode() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let original = vec![b'x'; 128 * 1024];
+        let oid = repo.blob(&original).unwrap();
+        let mut shared = repo.treebuilder(None).unwrap();
+        shared.insert("file", oid, 0o100644).unwrap();
+        let shared = shared.write().unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        for name in ["left", "right"] {
+            root.insert(name, shared, 0o040000).unwrap();
+        }
+        let tree = root.write().unwrap();
+        let snapshot = Snapshot::load(
+            repo.path(),
+            OsStr::new(&tree.to_string()),
+            "source-ownership",
+        )
+        .unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        let left = fs.ensure(Path::new("left/file")).unwrap();
+        let writer = fs.open_file(left, libc::O_RDWR).unwrap();
+        assert_eq!(fs.read_data(left, writer, 0, 1).unwrap(), b"x");
+        // The alias has never been looked up or opened when ownership splits.
+        fs.write_data(left, writer, 0, b"y", 0, 0).unwrap();
+        let right = fs.ensure(Path::new("right/file")).unwrap();
+        let reader = fs.open_file(right, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            fs.read_data(right, reader, 0, original.len() as u32)
+                .unwrap(),
+            original
+        );
+        let parent = fs.ensure(Path::new("right")).unwrap();
+        fs.remove(parent, OsStr::new("file"), false).unwrap();
+        assert_eq!(fs.read_data(right, reader, 0, 1).unwrap(), b"x");
+        assert_eq!(fs._snapshot.metrics().blob_loads, 1);
+        fs.release_handle(right, reader).unwrap();
+        assert_eq!(fs._snapshot.metrics().retained_raw_blob_entries, 0);
+        assert_eq!(fs.read_data(left, writer, 0, 2).unwrap(), b"yx");
+        assert_eq!(fs._snapshot.metrics().blob_loads, 1);
     }
     #[test]
     fn all_truncate_to_zero_skips_source_content_and_directory_errors_are_atomic() {
@@ -2989,7 +3004,10 @@ mod tests {
                 .any(|(id, _, n)| *id == ino && n == name.as_str()));
             fs.remove(1, OsStr::new(&name), false).unwrap();
             fs.reclaim(ino);
-            assert!(fs.nodes.get(&ino).unwrap().file.is_some());
+            assert_eq!(fs.nodes[&ino].attr.nlink, 0);
+            assert!(directory_rows(&mut fs, 1, newest)
+                .iter()
+                .any(|(id, _, n)| *id == ino && n == name.as_str()));
             fs.close_handle(1, newest);
             assert!(
                 !fs.nodes.contains_key(&ino),
@@ -3036,9 +3054,7 @@ mod tests {
         assert!(directory_rows(&mut fs, 1, first)
             .iter()
             .any(|(ino, _, name)| *ino == old && name == "old"));
-        let reader = fs.open_file(old, libc::O_RDONLY).unwrap();
-        assert_eq!(fs.read_data(old, reader, 0, 100).unwrap(), b"old bytes");
-        fs.close_handle(old, reader);
+        assert_eq!(fs.open_file(old, libc::O_RDONLY), Err(libc::ENOENT));
         fs.close_handle(1, second);
         assert!(fs.nodes.contains_key(&old));
         fs.close_handle(1, first);

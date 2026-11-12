@@ -24,6 +24,18 @@ pub(crate) const BLOCK: usize = 64 * 1024;
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
+#[derive(Debug)]
+pub(crate) struct BackingError(pub io::Error);
+impl std::fmt::Display for BackingError {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(output)
+    }
+}
+impl std::error::Error for BackingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 struct Descriptor {
     size: u64,
     blocks: Box<[[u8; 32]]>,
@@ -527,6 +539,113 @@ impl RawBlobs {
             .unwrap_or_else(|e| e.into_inner())
             .scratch_file()
     }
+    /// Transfer the last source's inode, or copy for a distinct still-live
+    /// source. A writable inode never retains a second immutable payload merely
+    /// for caching. Authenticate disk bytes before making the file mutable.
+    pub(crate) fn promote(&self, oid: Oid, path: &Path, exclusive: bool) -> Result<File> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let parent = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.parent().context("backing parent")?)
+            .map_err(BackingError)?;
+        let name = CString::new(path.file_name().context("backing name")?.as_bytes())?;
+        let (mut output, _) =
+            open_private_file(&parent, &name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+                .map_err(BackingError)?;
+        let result = (|| {
+            let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let object = store.objects.get(&oid).context("missing prepared source")?;
+            anyhow::ensure!(
+                object.kind() == ObjectType::Blob,
+                "mutable source is not a blob"
+            );
+            if object.file {
+                let checked = (|| -> Result<File> {
+                    let input = store.directory.open_name(
+                        &CString::new(oid.to_string())?,
+                        libc::O_RDWR,
+                        Some(object.size),
+                    )?;
+                    let mut bytes = vec![0; BLOCK];
+                    for (block, expected) in object.blocks.iter().enumerate() {
+                        crate::object::check_transfer()?;
+                        let offset = block as u64 * BLOCK as u64;
+                        let length = (object.size - offset).min(BLOCK as u64) as usize;
+                        input.read_exact_at(&mut bytes[..length], offset)?;
+                        if Sha256::digest(&bytes[..length]).as_slice() != expected {
+                            return Err(invalid("verified raw blob bytes were modified"));
+                        }
+                        if !exclusive {
+                            // Destination errors belong to the writable file,
+                            // rather than becoming a permanent source failure.
+                            output.write_all(&bytes[..length]).map_err(BackingError)?;
+                        }
+                    }
+                    Ok(input)
+                })();
+                let input = checked?;
+                if exclusive {
+                    if unsafe {
+                        libc::renameat(
+                            store.directory.fd.as_raw_fd(),
+                            CString::new(oid.to_string())?.as_ptr(),
+                            parent.as_raw_fd(),
+                            name.as_ptr(),
+                        )
+                    } != 0
+                    {
+                        return Err(BackingError(io::Error::last_os_error()))
+                            .context("transfer prepared source");
+                    }
+                    // The name must still identify the checked source inode;
+                    // never adopt an entry swapped during the rename.
+                    let (published, metadata) = open_private_file(&parent, &name, libc::O_RDWR)?;
+                    let original = input.metadata()?;
+                    if metadata.dev() != original.dev() || metadata.ino() != original.ino() {
+                        return Err(invalid("prepared source identity changed during transfer"));
+                    }
+                    drop(published);
+                    output = input;
+                }
+            } else if object.size != 0 {
+                let resident = store.memory.peek(&oid).context("missing resident source")?;
+                anyhow::ensure!(
+                    resident.block == 0 && resident.bytes.len() as u64 == object.size,
+                    "incomplete resident source"
+                );
+                output.write_all(&resident.bytes).map_err(BackingError)?;
+            }
+            if exclusive {
+                store.forget_blob(oid, false)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if error.downcast_ref::<BackingError>().is_none()
+                && !crate::object::is_cancelled(&error)
+            {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failure
+                    .get_or_insert_with(|| format!("{error:#}"));
+            }
+            drop(output);
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        Ok(output)
+    }
+    pub(crate) fn discard(&self, oid: Oid) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_blob(oid, true)
+    }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
         Ok(self
@@ -639,6 +758,42 @@ impl Store {
             self.scratch = Some(Files::new(directory)?);
         }
         Ok(self.scratch.as_ref().unwrap().file(directory)?)
+    }
+    fn forget_blob(&mut self, oid: Oid, unlink: bool) -> Result<()> {
+        if let Some(object) = self.objects.get(&oid) {
+            anyhow::ensure!(
+                object.kind() == ObjectType::Blob,
+                "cannot discard a directory"
+            );
+            if object.file {
+                if self
+                    .directory
+                    .reader
+                    .as_ref()
+                    .is_some_and(|(key, _)| *key == oid)
+                {
+                    self.directory.reader = None;
+                }
+                if unlink
+                    && unsafe {
+                        libc::unlinkat(
+                            self.directory.fd.as_raw_fd(),
+                            CString::new(oid.to_string())?.as_ptr(),
+                            0,
+                        )
+                    } != 0
+                {
+                    return Err(io::Error::last_os_error()).context("release consumed source");
+                }
+                self.disk_entries -= 1;
+                self.disk_bytes -= object.size;
+            }
+        }
+        self.objects.remove(&oid);
+        if let Some(bytes) = self.memory.pop(&oid) {
+            self.memory_bytes -= bytes.bytes.capacity() + ENTRY_CHARGE;
+        }
+        Ok(())
     }
     fn make_room(&mut self, weight: usize) -> Result<()> {
         while self.memory_bytes > self.memory_limit.saturating_sub(weight) {
@@ -759,6 +914,69 @@ mod tests {
                 }
             })
             .sum()
+    }
+    #[test]
+    fn source_promotion_splits_aliases_then_transfers_the_last_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+        let data = vec![b'x'; BLOCK + 3];
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
+        let source_inode = store
+            .state
+            .lock()
+            .unwrap()
+            .directory
+            .open(oid, false, data.len() as u64)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino();
+        let mut first = store
+            .promote(oid, &directory.path().join("first"), false)
+            .unwrap();
+        first.write_all(b"y").unwrap();
+        assert_eq!(original.read_all().unwrap(), data);
+        let mut last = store
+            .promote(oid, &directory.path().join("last"), true)
+            .unwrap();
+        assert_eq!(
+            last.metadata().unwrap().ino(),
+            source_inode,
+            "last source was copied"
+        );
+        let mut bytes = Vec::new();
+        last.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, data);
+        assert!(store.get(oid).unwrap().is_none());
+        assert_eq!(store.disk_metrics(), (0, 0));
+    }
+    #[test]
+    fn empty_resident_source_can_become_writable_without_a_payload_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"").unwrap();
+        store.insert(oid, 0, b"".as_slice()).unwrap();
+        let mut file = store
+            .promote(oid, &directory.path().join("empty"), true)
+            .unwrap();
+        file.write_all(b"new").unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 3);
+        assert!(store.get(oid).unwrap().is_none());
+    }
+    #[test]
+    fn corrupted_source_is_not_published_as_a_mutable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+        let data = vec![b'x'; BLOCK + 3];
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
+        original.corrupt_for_test().unwrap();
+        let destination = directory.path().join("mutable");
+        assert!(store.promote(oid, &destination, true).is_err());
+        assert!(!destination.exists());
+        assert!(store.failure().is_some());
     }
     #[test]
     fn fitting_imports_do_not_write_disk_data_or_metadata() {

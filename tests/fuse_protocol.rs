@@ -891,11 +891,22 @@ fn protocol_source_directory_snapshot_survives_rename_unlink_and_newer_handle_cl
     p.ok(3, late, vec![0; 16]);
     p.ok(29, 1, u64s(&[latest, 0, 0]));
     p.err(3, late, vec![0; 16], libc::ENOENT);
+    // OPEN on an unlinked inode requires a kernel lookup reference (as with
+    // O_PATH). A plain READDIR row pins only directory-view metadata.
+    assert_eq!(p.lookup(1, "renamed"), tracked_ino);
     p.ok(10, 1, names(vec![], &["renamed"]));
     assert_eq!(p.ok(28, 1, io(old, 0, 4096, 0)), before);
     let reader = p.open(tracked_ino, libc::O_RDONLY);
     assert_eq!(p.ok(15, tracked_ino, io(reader, 0, 100, 0)), b"original\n");
     p.release(tracked_ino, reader);
+    p.send(2, tracked_ino, u64s(&[1]));
+    p.err(
+        14,
+        tracked_ino,
+        u32s(&[libc::O_RDONLY as u32, 0]),
+        libc::ENOENT,
+    );
+    assert_eq!(p.ok(28, 1, io(old, 0, 4096, 0)), before);
     p.ok(29, 1, u64s(&[old, 0, 0]));
     p.err(3, tracked_ino, vec![0; 16], libc::ENOENT);
 }

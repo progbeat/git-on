@@ -76,11 +76,26 @@ or copying its payload. Read handles, hard links and unlinked inodes retain
 access to that source. Writable opens, empty writes and unchanged-size truncation
 leave source data intact. The first nonempty write or content-changing truncation
 prepares private data; all handles then observe changes through the same inode.
-The private file is sparse: it stores overwritten ranges while untouched bytes
-come from the verified source. A read followed by a small write therefore does
-not duplicate the complete raw object. Truncation permanently hides the removed
-source tail; extending the file exposes zeros. Distinct inodes sharing a source
-OID retain independent modifications.
+Before the first destructive source operation, an ownership index counts original
+file and symlink inodes in the selected tree, including unopened paths. Shared
+trees are counted by multiplicity. This reads tree metadata, never blob contents;
+remote tree demands are batched by depth. It is not startup or readonly work.
+
+A mutation authenticates the original bytes before making them writable. If
+another original inode still needs them, its shared raw file stays intact and
+the mutated inode receives its own backing. For the last original inode, the raw
+file is renamed into the writable layer: the inode and payload are transferred,
+without copying. Resident bytes are written once. Truncation to zero releases
+that inode's original reference without loading its bytes. Unlink releases data
+after the last kernel lookup/open reference; directory-stream metadata alone
+does not retain deleted payloads. Truncation followed by extension exposes zeros.
+
+There is at most one decoded backing per live source inode, with unchanged
+same-OID inodes sharing a single backing. No extra immutable full copy is retained
+for an inode that has become writable. Prepared bytes still needed by any
+original inode survive eviction and close/reopen without refetch or repeat
+decoding. Necessary delta bases that are not requested source files remain in
+compressed Git storage rather than becoming additional decoded raw files.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that

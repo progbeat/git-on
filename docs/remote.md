@@ -44,8 +44,11 @@ Remote execution requires Git 2.45.1+. Fetch the selected object and root tree
 before mounting. Each subsequent missing tree or blob is explicitly fetched by
 OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
 Git also receives `GIT_NO_LAZY_FETCH=1`. Never request `blob:none`, perform a full
-checkout or recursively walk unvisited trees. Subtree selection reads only
-ancestor trees. Packs may contain necessary tag/commit ancestry or delta bases;
+checkout or recursively walk unvisited trees for readonly operations. Subtree
+selection reads only ancestor trees. The first destructive source operation in
+`all` indexes original inode ownership across tree metadata, including unopened
+same-OID paths, without loading their blob contents. Tree demands are batched by
+depth; ordinary reads, writable opens and metadata changes do not build that index. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
@@ -66,7 +69,8 @@ Explicit-all eager materialization already needs every entry it prepares. For
 that backend, at most 256 known object IDs from the current directory share one
 native `fetch --stdin` and decoder operation. Each object is checked for existing
 run-local availability and deduplicated before requesting it; all use `tree:0`.
-This does not add prefetch to lazy FUSE or fetch unknown descendants. The batch
+The same batching applies to metadata required by the FUSE ownership index;
+readonly FUSE demands remain exact. Neither path requests unknown descendants. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
 fetch/decode operations; full-process tracing checks those operation counts.
@@ -133,18 +137,22 @@ Received session packs are checksum-verified in bounded private parts. A
 single non-delta object then streams through zlib and canonical OID verification
 into raw storage, without a per-object fetch or decoder client. Complex packs
 use the existing Git/libgit2 import path without another network request.
-Native fetch packs likewise decode into raw storage and are discarded before
-the next demand. Blob payloads are not recompressed into loose
-copies; commit/tree/tag metadata remains in the native verification ODB. Pack
+Native fetch packs likewise decode requested blobs into raw storage. Unrequested
+blob delta bases remain compressed; a later explicit demand uses that received
+pack without refetching. A pack is released when no unpublished blob still needs
+it. Prepared blobs are not decoded again or recompressed into loose copies; commit/tree/tag metadata remains in the native verification ODB. Pack
 discovery does not enumerate earlier per-object packs. Large non-delta blobs
 stream during import; Git still performs required delta decoding. The snapshot
 reuses its Repository and available objects do not trigger unconditional ODB
 refreshes. Canonical OID verification completes before raw bytes become readable.
 Local loose objects stream in 64 KiB chunks with cancellation checks.
 
-All prepared blobs survive close/reopen and bounded-memory-cache eviction in
-private temporary storage until invocation completion. Each spilled original
-object has one raw file, opened relative to the owned directory with no symlink
+Prepared bytes needed by original source inodes survive close/reopen and
+bounded-memory-cache eviction in private temporary storage. When the last
+original inode becomes writable, its authenticated raw file is transferred into
+the writable backing; when the last original inode is deleted and released, its
+raw file is removed. Unopened same-OID paths and open-unlinked inodes keep their
+original data without repeat decoding. Each spilled original object has one raw file, opened relative to the owned directory with no symlink
 following. Trusted RAM retains its Git OID, length and packed ordered SHA-256
 hashes of 64 KiB blocks, published only after full canonical OID verification.
 Range reads hash the same owned buffer returned to the caller; neither a disk
