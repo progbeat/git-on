@@ -2433,3 +2433,21 @@ reproduced omission of `src/x.rs` when a push replaced a runtime branch with a
 divergent documentation commit. It now requires the reverted runtime and all
 affected suites, while preserving merge-base PR comparison and docs-only
 fast-forward push selection.
+
+### Read before mutation and handled termination
+
+On the frozen ordinary `5098898` release, the real-FUSE writable lifecycle
+regression failed after `pread(1)` then `pwrite(1)`: it observed 12,595,200
+allocated bytes against a 9 MiB budget, while native clone plus the same command
+passed. Both that sequence and read-then-truncate now pass. The separate tmpfs
+comparison includes both sequences; local namespace denial remains a skip and
+cannot stand in for the required CI quota execution. A focused unit regression
+also checks independent inodes sharing one OID, overlapping writes, reopen,
+unlink and truncation followed by zero-filled extension. The payload LRU budget,
+large-object streaming and verified source storage retain their existing rules.
+
+The same frozen release failed the handled-SIGTERM regression in materialized
+and real-FUSE modes, returning -15 instead of the child's 42. The corrected
+regression passes in both modes and separately retains default termination by
+SIGTERM, checking cleanup in every case. RED/GREEN logs are retained under
+`/tmp/git-on-review-20261112-readwrite/` as `before.log` and `focused-after.log`.

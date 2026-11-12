@@ -68,8 +68,11 @@ or copying its payload. Read handles, hard links and unlinked inodes retain
 access to that source. Writable opens, empty writes and unchanged-size truncation
 leave source data intact. The first nonempty write or content-changing truncation
 prepares private data; all handles then observe changes through the same inode.
-An unprepared local object is verified directly into that private file rather
-than first creating a full raw copy. Already prepared contents are reused.
+The private file is sparse: it stores overwritten ranges while untouched bytes
+come from the verified source. A read followed by a small write therefore does
+not duplicate the complete raw object. Truncation permanently hides the removed
+source tail; extending the file exposes zeros. Distinct inodes sharing a source
+OID retain independent modifications.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that

@@ -119,6 +119,31 @@ class RepositoryTest(unittest.TestCase):
 
 
 class CliTests(RepositoryTest):
+    def test_forwarded_term_preserves_the_childs_handled_exit_status(self):
+        programs=self.root/'signal-programs';programs.mkdir()
+        (programs/'git').symlink_to(shutil.which('git'))
+        for backend in (['materialized','fuse'] if FUSE_AVAILABLE else ['materialized']):
+            for handled in (True,False):
+                with self.subTest(backend=backend,handled=handled):
+                    code="import signal,sys\n"
+                    if handled:code+="signal.signal(signal.SIGTERM,lambda *args: sys.exit(42))\n"
+                    code+="print('ready',flush=True)\nsignal.pause()\n"
+                    env=self.environment()
+                    if backend=='materialized':env['PATH']=str(programs)
+                    runner=subprocess.Popen([str(BINARY),'HEAD','--write-policy=all','--',sys.executable,'-I','-S','-c',code],
+                                            cwd=self.repo,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                    try:
+                        ready,_,_=select.select([runner.stdout],[],[],10)
+                        self.assertTrue(ready,'child did not become ready')
+                        self.assertEqual(runner.stdout.readline(),b'ready\n')
+                        runner.send_signal(signal.SIGTERM)
+                        _,stderr=runner.communicate(timeout=10)
+                        self.assertEqual(runner.returncode,42 if handled else -signal.SIGTERM,stderr)
+                        self.assert_no_runtime_files()
+                    finally:
+                        if runner.poll() is None:runner.kill()
+                        runner.communicate(timeout=10)
+
     def test_file_limit_during_run_setup_reports_error_and_cleans_up(self):
         try:
             result = subprocess.run([str(BINARY), 'HEAD', '--', 'true'],
@@ -336,7 +361,8 @@ import sys
 expected=b'x'*(6*1024*1024)
 if sys.argv[1]!='read':
  fd=os.open(source,os.O_RDWR)
- if sys.argv[1]=='write':os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
+ if sys.argv[1].startswith('read-'):assert os.pread(fd,1,0)==b'x'
+ if sys.argv[1] in ('write','read-write'):os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
  else:os.ftruncate(fd,1024);expected=expected[:1024]
  os.close(fd)
 assert source.read_bytes()==expected
@@ -346,7 +372,7 @@ print('writable lifecycle verified')
 
     def test_writable_open_does_not_materialize_source(self):
         template=self.writable_open_fixture()
-        for mutation in ('read','write','truncate'):
+        for mutation in ('read','write','truncate','read-write','read-truncate'):
             with self.subTest(mutation=mutation):
                 command=[*template[:-1],mutation]
                 clone=self.root/f'clone-{mutation}'
@@ -362,7 +388,7 @@ print('writable lifecycle verified')
     def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         command=self.writable_open_fixture()
-        for mutation in ('read','write','truncate'):
+        for mutation in ('read','write','truncate','read-write','read-truncate'):
             with self.subTest(mutation=mutation):
                 compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
         self.assert_no_runtime_files()

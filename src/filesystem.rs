@@ -26,6 +26,63 @@ fn snapshot_errno(_error: anyhow::Error) -> i32 {
     libc::EIO
 }
 
+// A sparse private file stores only overwritten bytes. Holes below visible
+// still come from the verified source; truncation permanently hides its tail.
+struct SourceContent {
+    oid: Oid,
+    visible: u64,
+    written: BTreeMap<u64, u64>,
+}
+impl SourceContent {
+    fn mark_written(&mut self, mut start: u64, mut end: u64) {
+        end = end.min(self.visible);
+        if start >= end {
+            return;
+        }
+        if let Some((&previous, &limit)) = self.written.range(..=start).next_back() {
+            if limit >= start {
+                start = previous;
+                end = end.max(limit);
+            }
+        }
+        while let Some((&next, &limit)) = self.written.range(start..=end).next() {
+            self.written.remove(&next);
+            end = end.max(limit);
+        }
+        self.written.insert(start, end);
+    }
+    fn truncate(&mut self, size: u64) {
+        self.visible = self.visible.min(size);
+        self.written.split_off(&self.visible);
+        if let Some((_, end)) = self.written.last_key_value() {
+            if *end > self.visible {
+                *self.written.last_entry().unwrap().get_mut() = self.visible;
+            }
+        }
+    }
+    fn gaps(&self, start: u64, end: u64) -> Vec<std::ops::Range<u64>> {
+        let end = end.min(self.visible);
+        let mut cursor = start;
+        let mut gaps = Vec::new();
+        if let Some((_, &limit)) = self.written.range(..=start).next_back() {
+            cursor = cursor.max(limit);
+        }
+        if cursor >= end {
+            return gaps;
+        }
+        for (&offset, &limit) in self.written.range(start..end) {
+            if cursor < offset {
+                gaps.push(cursor..offset);
+            }
+            cursor = cursor.max(limit);
+        }
+        if cursor < end {
+            gaps.push(cursor..end);
+        }
+        gaps
+    }
+}
+
 struct Node {
     attr: FileAttr,
     // Metadata still belongs to the pristine snapshot. Private metadata can
@@ -36,6 +93,7 @@ struct Node {
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
+    source: Option<Box<SourceContent>>,
     external_io: bool,
 }
 #[derive(Clone)]
@@ -190,6 +248,7 @@ impl Overlay {
                 snapshot_path: Some(PathBuf::new()),
                 bytes: Vec::new(),
                 file: None,
+                source: None,
                 external_io: false,
             },
         );
@@ -332,6 +391,7 @@ impl Overlay {
                 snapshot_path: Some(source),
                 bytes: Vec::new(),
                 file: None,
+                source: None,
                 external_io: false,
             },
         );
@@ -676,7 +736,7 @@ impl Overlay {
         let mut bytes = Vec::new();
         let file = if kind == FileType::RegularFile {
             let disk_path = self.backing.join(ino.to_string());
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
@@ -684,27 +744,10 @@ impl Overlay {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&disk_path)
                 .map_err(errno)?;
-            let copied = (|| {
-                if preserve_content && node.attr.size != 0 {
-                    let copied =
-                        self._snapshot
-                            .copy_verified_blob(oid, &mut file)
-                            .map_err(|error| {
-                                error
-                                    .downcast_ref::<std::io::Error>()
-                                    .and_then(std::io::Error::raw_os_error)
-                                    .unwrap_or(libc::EIO)
-                            })?;
-                    if copied != node.attr.size {
-                        return Err(libc::EIO);
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(error) = copied {
+            if let Err(error) = file.set_len(if preserve_content { node.attr.size } else { 0 }) {
                 drop(file);
                 let _ = fs::remove_file(disk_path);
-                return Err(error);
+                return Err(errno(error));
             }
             if unlinked {
                 fs::remove_file(&disk_path).map_err(errno)?;
@@ -719,6 +762,14 @@ impl Overlay {
         let keep_file = unlinked || self.has_open_handle(ino);
         self.copy_metadata_up(ino)?;
         let node = self.node_mut(ino)?;
+        node.source = (kind == FileType::RegularFile && preserve_content && node.attr.size != 0)
+            .then(|| {
+                Box::new(SourceContent {
+                    oid,
+                    visible: node.attr.size,
+                    written: BTreeMap::new(),
+                })
+            });
         node.oid = None;
         node.bytes = bytes;
         if keep_file {
@@ -865,6 +916,7 @@ impl Overlay {
                 snapshot_path: None,
                 bytes,
                 file: None,
+                source: None,
                 external_io: false,
             },
         );
@@ -988,8 +1040,11 @@ impl Overlay {
         self.copy_up(ino, size != 0)?;
         let file = self.disk_file(ino)?;
         file.set_len(size).map_err(errno)?;
-        let metadata = file.metadata().map_err(errno)?;
         let n = self.node_mut(ino)?;
+        if let Some(source) = &mut n.source {
+            source.truncate(size);
+        }
+        let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);
         Ok(())
     }
@@ -1047,6 +1102,20 @@ impl Overlay {
                 }
             }
             data.truncate(done);
+            if let Some(source) = &n.source {
+                for gap in source.gaps(offset as u64, offset as u64 + done as u64) {
+                    let bytes = self
+                        ._snapshot
+                        .read(source.oid, gap.start, (gap.end - gap.start) as u32)
+                        .map_err(snapshot_errno)?;
+                    let start = (gap.start - offset as u64) as usize;
+                    let end = (gap.end - offset as u64) as usize;
+                    if bytes.len() != end - start {
+                        return Err(libc::EIO);
+                    }
+                    data[start..end].copy_from_slice(&bytes);
+                }
+            }
             Ok(data)
         } else if count == 0 {
             Ok(Vec::new())
@@ -1132,6 +1201,9 @@ impl Overlay {
                 // a subsequent write can report the underlying capacity error.
                 Err(_) => break,
             }
+        }
+        if let Some(source) = &mut n.source {
+            source.mark_written(offset, offset + written as u64);
         }
         let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);
@@ -2368,6 +2440,65 @@ mod tests {
         assert!(fs.nodes[&ino].oid.is_none());
         fs.release_handle(ino, writer).unwrap();
         fs.release_handle(ino, reader).unwrap();
+    }
+    #[test]
+    fn sparse_mutation_keeps_shared_source_intact_and_truncated_bytes_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let original = vec![b'x'; 6 * 1024 * 1024];
+        let oid = repo.blob(&original).unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        for name in ["first", "second"] {
+            tree.insert(name, oid, 0o100644).unwrap();
+        }
+        let tree = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&tree.to_string()), "sparse").unwrap();
+        let mut fs =
+            Overlay::with_write_policy(snapshot, temp.path().join("upper"), WritePolicy::All)
+                .unwrap();
+        let first = fs.ensure(Path::new("first")).unwrap();
+        let second = fs.ensure(Path::new("second")).unwrap();
+        let reader = fs.open_file(first, libc::O_RDONLY).unwrap();
+        let writer = fs.open_file(first, libc::O_RDWR).unwrap();
+        let other = fs.open_file(second, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_data(first, reader, 0, 1).unwrap(), b"x");
+        fs.write_data(first, writer, 3, b"abc", 0, 0).unwrap();
+        fs.write_data(first, writer, 8, b"d", 0, 0).unwrap();
+        fs.write_data(first, writer, 5, b"EFG", 0, 0).unwrap();
+        assert_eq!(fs.read_data(first, reader, 0, 12).unwrap(), b"xxxabEFGdxxx");
+        assert_eq!(fs.read_data(first, reader, 4, 7).unwrap(), b"bEFGdxx");
+        assert_eq!(fs.read_data(first, reader, 4096, 7).unwrap(), b"xxxxxxx");
+        assert!(fs.disk_file(first).unwrap().metadata().unwrap().blocks() * 512 < 64 * 1024);
+        fs.release_handle(first, writer).unwrap();
+        fs.release_handle(first, reader).unwrap();
+        let writer = fs.open_file(first, libc::O_RDWR).unwrap();
+        assert_eq!(fs.read_data(first, writer, 0, 12).unwrap(), b"xxxabEFGdxxx");
+        fs.truncate(first, 6).unwrap();
+        fs.truncate(first, 12).unwrap();
+        assert_eq!(
+            fs.read_data(first, writer, 0, 12).unwrap(),
+            b"xxxabE\0\0\0\0\0\0"
+        );
+        fs.write_data(first, writer, 10, b"z", 0, 0).unwrap();
+        assert_eq!(
+            fs.read_data(first, writer, 0, 12).unwrap(),
+            b"xxxabE\0\0\0\0z\0"
+        );
+        assert_eq!(
+            fs.read_data(second, other, 0, original.len() as u32)
+                .unwrap(),
+            original
+        );
+        fs.remove(1, OsStr::new("first"), false).unwrap();
+        fs.write_data(first, writer, 0, b"private", 0, 0).unwrap();
+        assert_eq!(
+            fs.read_data(first, writer, 0, 12).unwrap(),
+            b"private\0\0\0z\0"
+        );
+        fs.truncate(first, 0).unwrap();
+        fs.truncate(first, 12).unwrap();
+        assert_eq!(fs.read_data(first, writer, 0, 12).unwrap(), vec![0; 12]);
     }
     #[test]
     fn all_truncate_to_zero_skips_source_content_and_directory_errors_are_atomic() {

@@ -677,7 +677,7 @@ fn main() {
     })();
     match result {
         Ok(status) => {
-            if let Some(signal) = git_on::git::cancelled_signal().or_else(|| status.signal()) {
+            if let Some(signal) = status.signal() {
                 unsafe {
                     libc::signal(signal, libc::SIG_DFL);
                     libc::raise(signal);
