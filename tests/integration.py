@@ -318,12 +318,60 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def writable_open_fixture(self,mutation='read'):
+        (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','writable open disk budget')
+        from filesystem_quota import STORAGE_OBSERVATION
+        return [sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+source=Path('large');before=source.stat()
+for flags in (os.O_RDWR,os.O_WRONLY|os.O_APPEND):
+ fd=os.open(source,flags)
+ assert os.write(fd,b'')==0
+ os.fsync(fd);os.close(fd)
+after=source.stat()
+assert (after.st_size,after.st_mtime_ns,after.st_ctime_ns)==(before.st_size,before.st_mtime_ns,before.st_ctime_ns)
+fd=os.open(source,os.O_RDWR);os.ftruncate(fd,before.st_size);os.close(fd)
+if root!=Path.cwd():assert allocated()<1024*1024,('open copied payload',allocated())
+import sys
+expected=b'x'*(6*1024*1024)
+if sys.argv[1]!='read':
+ fd=os.open(source,os.O_RDWR)
+ if sys.argv[1]=='write':os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
+ else:os.ftruncate(fd,1024);expected=expected[:1024]
+ os.close(fd)
+assert source.read_bytes()==expected
+assert allocated()<9*1024*1024,('content mutation disk allocation',allocated())
+print('writable lifecycle verified')
+''',mutation]
+
+    def test_writable_open_does_not_materialize_source(self):
+        template=self.writable_open_fixture()
+        for mutation in ('read','write','truncate'):
+            with self.subTest(mutation=mutation):
+                command=[*template[:-1],mutation]
+                clone=self.root/f'clone-{mutation}'
+                result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
+                                      env=self.environment(),capture_output=True,timeout=20)
+                self.assert_success(result)
+                direct=subprocess.run(command,cwd=clone,env=self.environment(),capture_output=True,timeout=20)
+                self.assert_success(direct)
+                result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+                self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+                self.assert_no_runtime_files()
+
+    def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        command=self.writable_open_fixture()
+        for mutation in ('read','write','truncate'):
+            with self.subTest(mutation=mutation):
+                compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
+        self.assert_no_runtime_files()
+
     def source_metadata_fixture(self):
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','metadata disk budget')
-        code=r'''
-import os
-from pathlib import Path
+        from filesystem_quota import STORAGE_OBSERVATION
+        code=STORAGE_OBSERVATION+r'''
 source=Path('large')
 reader=os.open(source,os.O_RDONLY)
 os.chmod(source,0o640)
@@ -331,18 +379,6 @@ os.utime(source,ns=(1000000000,2000000000))
 os.link(source,'alias');source.rename('moved')
 assert Path('moved').stat().st_mode & 0o777==0o640
 assert Path('alias').stat().st_mtime_ns==2000000000
-root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
-if root!=Path.cwd():assert os.path.ismount('.'),'real FUSE required'
-def allocated():
- # Inspect only the host backing, not the mounted namespace's logical sizes.
- total=0;seen=set()
- for directory,dirs,files in os.walk(root):
-  if root!=Path.cwd() and Path(directory)==root:
-   dirs[:]=[name for name in dirs if root/name!=Path.cwd()]
-  for name in dirs+files:
-   st=(Path(directory)/name).lstat();key=(st.st_dev,st.st_ino)
-   if key not in seen:total+=st.st_blocks*512;seen.add(key)
- return total
 budget=(9 if root==Path.cwd() else 1)*1024*1024
 assert allocated()<budget,('metadata copied payload',allocated())
 assert Path('alias').read_bytes()==b'x'*(6*1024*1024)

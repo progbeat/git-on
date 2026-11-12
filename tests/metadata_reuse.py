@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from benchmark_support import build_stat_observer, stat_abi_bytes
+from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
 from process_capture import capture
 from remote import Fixture
 
@@ -36,8 +36,8 @@ def validate_runner(result,count,operations,stat_bytes,backend):
 
 
 def run(options):
-    head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-    dirty=bool(subprocess.check_output(['git','diff','--name-only','HEAD']))
+    identity=source_identity()
+    head,dirty=identity['head'],identity['working_tree_dirty']
     if options.backend=='fuse':
         assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
     options.output.parent.mkdir(parents=True,exist_ok=True)

@@ -7,9 +7,29 @@ import subprocess
 import sys
 
 
+# Shared child-side accounting for mounted runs and the native checkout oracle.
+STORAGE_OBSERVATION=r'''
+import os
+from pathlib import Path
+root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
+if root!=Path.cwd():assert os.path.ismount('.'),'real FUSE required'
+def allocated():
+ total=0;seen=set()
+ for directory,dirs,files in os.walk(root):
+  if root!=Path.cwd() and Path(directory)==root:
+   dirs[:]=[name for name in dirs if root/name!=Path.cwd()]
+  for name in dirs+files:
+   st=(Path(directory)/name).lstat();key=(st.st_dev,st.st_ino)
+   if key not in seen:total+=st.st_blocks*512;seen.add(key)
+ return total
+'''
+
+
 def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9):
     unshare=shutil.which('unshare')
-    if not unshare:test.skipTest('unshare is unavailable')
+    if not unshare:
+        if os.environ.get('GITHUB_ACTIONS')=='true':test.fail('unshare is required for quota coverage')
+        test.skipTest('unshare is unavailable')
     prefix=[unshare,'--user','--map-root-user','--mount','--propagation','private']
     probe=subprocess.run([*prefix,'/bin/true'],capture_output=True)
     uid,gid=0,0
@@ -23,7 +43,8 @@ def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9):
             if os.environ.get('GITHUB_ACTIONS')=='true':test.fail(reason)
             test.skipTest(reason)
         uid,gid=os.getuid(),os.getgid()
-    volume=root/'quota';volume.mkdir()
+    volume=root/'quota';volume.mkdir(exist_ok=True)
+    test.assertEqual(list(volume.iterdir()),[],'quota mountpoint must be empty')
     driver=r'''
 import json,os,shutil,subprocess,sys
 from pathlib import Path

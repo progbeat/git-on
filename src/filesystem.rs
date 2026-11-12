@@ -76,6 +76,16 @@ struct DirectoryHandle {
     cursors: HashMap<u64, DirectoryCursor>,
 }
 
+impl DirectoryHandle {
+    fn pin_entry(&mut self, child: u64, references: &mut HashMap<u64, usize>) {
+        // Called only after the reply accepts this row. Replayed cookies keep
+        // one reference; unread siblings acquire none, in either view format.
+        if self.seen.insert(child) {
+            *references.entry(child).or_default() += 1;
+        }
+    }
+}
+
 /// Snapshot ownership keeps the Git object pin alive for the entire mount.
 pub struct Overlay {
     _snapshot: Snapshot,
@@ -432,68 +442,7 @@ impl Overlay {
             cache.valid = true;
             view
         } else {
-            let source = self
-                .node(ino)?
-                .snapshot_path
-                .clone()
-                .map(|source| self.source_directory(&source))
-                .transpose()?;
-            let mut rows = None;
-            let entries =
-                if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
-                    DirectoryEntries::Source(key)
-                } else {
-                    // Namespace changes create a new enumeration snapshot. Handles
-                    // on the previous Arc keep their original names and cookies.
-                    let mut entries = DirectoryRows::default();
-                    if let Some(key) = source {
-                        let directory = &self.source_directories[key];
-                        for index in 0..directory.tree.len() {
-                            if index.is_multiple_of(256) {
-                                crate::object::check_transfer().map_err(snapshot_errno)?;
-                            }
-                            let (name, mode) = directory.tree.shared_at(index).ok_or(libc::EIO)?;
-                            let child_path = path.join(name.as_ref());
-                            if self.upper_paths.contains_key(&child_path)
-                                || self.lower_path(&child_path).is_none()
-                            {
-                                continue;
-                            }
-                            entries.insert(
-                                directory.base + index as u64,
-                                Self::listed_kind(mode),
-                                name,
-                            );
-                        }
-                    }
-                    for (index, (child_path, child)) in self
-                        .upper_paths
-                        .range(path.clone()..)
-                        .take_while(|(p, _)| p.starts_with(&path))
-                        .enumerate()
-                    {
-                        if index.is_multiple_of(256) {
-                            crate::object::check_transfer().map_err(snapshot_errno)?;
-                        }
-                        if child_path != &path
-                            && child_path.parent() == Some(path.as_path())
-                            && self.nodes.get(child).is_some_and(|node| !node.immutable)
-                        {
-                            entries.insert(
-                                *child,
-                                self.node(*child)?.attr.kind,
-                                Arc::from(child_path.file_name().ok_or(libc::EIO)?),
-                            );
-                        }
-                    }
-                    #[cfg(test)]
-                    {
-                        self.directory_prepared_rows += entries.len();
-                    }
-                    let version = entries.snapshot();
-                    rows = Some(entries);
-                    DirectoryEntries::Merged(version)
-                };
+            let (entries, rows) = self.prepare_directory_entries(ino, &path)?;
             let view = Arc::new(DirectoryView { parent, entries });
             self.directory_cache.insert(
                 ino,
@@ -518,6 +467,70 @@ impl Overlay {
             },
         );
         Ok(fh)
+    }
+    fn prepare_directory_entries(
+        &mut self,
+        ino: u64,
+        path: &Path,
+    ) -> FsResult<(DirectoryEntries, Option<DirectoryRows>)> {
+        let source = self
+            .node(ino)?
+            .snapshot_path
+            .clone()
+            .map(|source| self.source_directory(&source))
+            .transpose()?;
+        let mut rows = None;
+        let entries = if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
+            DirectoryEntries::Source(key)
+        } else {
+            // Namespace changes create a new enumeration snapshot. Handles
+            // on the previous Arc keep their original names and cookies.
+            let mut entries = DirectoryRows::default();
+            if let Some(key) = source {
+                let directory = &self.source_directories[key];
+                for index in 0..directory.tree.len() {
+                    if index.is_multiple_of(256) {
+                        crate::object::check_transfer().map_err(snapshot_errno)?;
+                    }
+                    let (name, mode) = directory.tree.shared_at(index).ok_or(libc::EIO)?;
+                    let child_path = path.join(name.as_ref());
+                    if self.upper_paths.contains_key(&child_path)
+                        || self.lower_path(&child_path).is_none()
+                    {
+                        continue;
+                    }
+                    entries.insert(directory.base + index as u64, Self::listed_kind(mode), name);
+                }
+            }
+            for (index, (child_path, child)) in self
+                .upper_paths
+                .range(path.to_path_buf()..)
+                .take_while(|(p, _)| p.starts_with(path))
+                .enumerate()
+            {
+                if index.is_multiple_of(256) {
+                    crate::object::check_transfer().map_err(snapshot_errno)?;
+                }
+                if child_path.as_path() != path
+                    && child_path.parent() == Some(path)
+                    && self.nodes.get(child).is_some_and(|node| !node.immutable)
+                {
+                    entries.insert(
+                        *child,
+                        self.node(*child)?.attr.kind,
+                        Arc::from(child_path.file_name().ok_or(libc::EIO)?),
+                    );
+                }
+            }
+            #[cfg(test)]
+            {
+                self.directory_prepared_rows += entries.len();
+            }
+            let version = entries.snapshot();
+            rows = Some(entries);
+            DirectoryEntries::Merged(version)
+        };
+        Ok((entries, rows))
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
         let _ = self.refresh_backing_attr(ino);
@@ -673,17 +686,17 @@ impl Overlay {
                 .map_err(errno)?;
             let copied = (|| {
                 if preserve_content && node.attr.size != 0 {
-                    let reader = self._snapshot.open(oid).map_err(snapshot_errno)?;
-                    let mut offset = 0;
-                    while offset < node.attr.size {
-                        let data = reader
-                            .read(offset, (node.attr.size - offset).min(64 * 1024) as u32)
-                            .map_err(snapshot_errno)?;
-                        if data.is_empty() {
-                            return Err(libc::EIO);
-                        }
-                        std::io::Write::write_all(&mut file, &data).map_err(errno)?;
-                        offset += data.len() as u64;
+                    let copied =
+                        self._snapshot
+                            .copy_verified_blob(oid, &mut file)
+                            .map_err(|error| {
+                                error
+                                    .downcast_ref::<std::io::Error>()
+                                    .and_then(std::io::Error::raw_os_error)
+                                    .unwrap_or(libc::EIO)
+                            })?;
+                    if copied != node.attr.size {
+                        return Err(libc::EIO);
                     }
                 }
                 Ok(())
@@ -929,8 +942,6 @@ impl Overlay {
         }
         if flags & libc::O_TRUNC != 0 {
             self.truncate(ino, 0)?;
-        } else if flags & libc::O_ACCMODE != libc::O_RDONLY {
-            self.copy_up(ino, true)?;
         }
         if self.node(ino)?.oid.is_none() && self.node(ino)?.file.is_none() {
             let file = self.disk_file(ino)?;
@@ -966,6 +977,13 @@ impl Overlay {
         }
         if size > i64::MAX as u64 {
             return Err(libc::EFBIG);
+        }
+        if self.node(ino)?.oid.is_some() && self.node(ino)?.attr.size == size {
+            self.copy_metadata_up(ino)?;
+            let n = self.node_mut(ino)?;
+            n.attr.mtime = SystemTime::now();
+            n.attr.ctime = n.attr.mtime;
+            return Ok(());
         }
         self.copy_up(ino, size != 0)?;
         let file = self.disk_file(ino)?;
@@ -1077,7 +1095,7 @@ impl Overlay {
         if self.node(ino)?.snapshot_path.is_none() {
             self._snapshot.record_generated_io(true);
         }
-        let n = self.node_mut(ino)?;
+        let n = self.node(ino)?;
         // FUSE_WRITE_CACHE identifies dirty mmap pages. Their kernel-selected
         // offsets must never acquire append semantics from the original fd.
         // For ordinary writes use current request flags (fcntl F_SETFL can
@@ -1092,10 +1110,15 @@ impl Overlay {
             .checked_add(data.len() as u64)
             .filter(|end| *end <= i64::MAX as u64)
             .ok_or(libc::EFBIG)?;
-        let file = n.file.as_ref().ok_or(libc::EINVAL)?;
+        if n.attr.kind != FileType::RegularFile {
+            return Err(libc::EINVAL);
+        }
         if data.is_empty() {
             return Ok(0);
         }
+        self.copy_up(ino, true)?;
+        let n = self.node_mut(ino)?;
+        let file = n.file.as_ref().ok_or(libc::EINVAL)?;
         let mut written = 0;
         while written < data.len() {
             match file.write_at(&data[written..], offset + written as u64) {
@@ -1548,15 +1571,11 @@ impl Overlay {
             if emit(child, kind, name, index as u64 + 1) {
                 break;
             }
-            if index >= 2
-                && self
-                    .directories
+            if index >= 2 {
+                self.directories
                     .get_mut(&fh)
                     .ok_or(libc::EBADF)?
-                    .seen
-                    .insert(child)
-            {
-                *self.directory_refs.entry(child).or_default() += 1;
+                    .pin_entry(child, &mut self.directory_refs);
             }
         }
         Ok(())
@@ -1614,9 +1633,7 @@ impl Overlay {
                 .cursors
                 .entry(cookie)
                 .or_insert_with(|| cursor.clone());
-            if handle.seen.insert(child) {
-                *self.directory_refs.entry(child).or_default() += 1;
-            }
+            handle.pin_entry(child, &mut self.directory_refs);
             offset = cookie;
         }
         Ok(())
@@ -2255,6 +2272,66 @@ mod tests {
         assert!(!overlay.backing.join(file.to_string()).exists());
         assert!(!overlay.upper_paths.contains_key(Path::new("tracked.tmp")));
         assert_eq!(overlay.nodes[&file].attr.nlink, 0);
+    }
+    #[test]
+    fn writable_open_and_empty_write_preserve_source_data() {
+        for flags in [libc::O_WRONLY, libc::O_RDWR | libc::O_APPEND] {
+            let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+            let ino = fs.lookup_entry(1, OsStr::new("tracked.tmp")).unwrap().ino;
+            let before = fs._snapshot.metrics();
+            let original = fs.nodes[&ino].attr;
+            let writer = fs.open_file(ino, flags).unwrap();
+            fs.write_data(ino, writer, 0, b"", 0, flags).unwrap();
+            fs.sync_file(ino, writer, false).unwrap();
+            fs.release_handle(ino, writer).unwrap();
+            assert_eq!(fs._snapshot.metrics().blob_loads, before.blob_loads);
+            assert_eq!(fs::read_dir(&fs.backing).unwrap().count(), 0);
+            assert_eq!(fs.nodes[&ino].attr.mtime, original.mtime);
+            assert_eq!(fs.nodes[&ino].attr.ctime, original.ctime);
+            assert!(fs.unchanged_source_data(ino));
+        }
+    }
+    #[test]
+    fn failed_first_write_keeps_source_and_existing_handles_usable() {
+        let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+        let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let reader = fs.open_file(ino, libc::O_RDONLY).unwrap();
+        let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
+        let blocker = fs.backing.join(ino.to_string());
+        fs::write(&blocker, b"foreign file").unwrap();
+        assert_eq!(
+            fs.write_data(ino, writer, 0, b"edited", 0, 0),
+            Err(libc::EEXIST)
+        );
+        assert_eq!(fs::read(&blocker).unwrap(), b"foreign file");
+        assert_eq!(
+            fs.read_data(ino, reader, 0, 100).unwrap(),
+            b"pinned content\n"
+        );
+        assert!(fs.unchanged_source_data(ino));
+        fs::remove_file(blocker).unwrap();
+        fs.write_data(ino, writer, 0, b"edited", 0, 0).unwrap();
+        assert_eq!(
+            fs.read_data(ino, reader, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+    }
+    #[test]
+    fn unchanged_size_truncate_retains_source_and_later_write_works_after_unlink() {
+        let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+        let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let reader = fs.open_file(ino, libc::O_RDONLY).unwrap();
+        let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
+        let size = fs.nodes[&ino].attr.size;
+        fs.truncate(ino, size).unwrap();
+        assert_eq!(fs._snapshot.metrics().blob_loads, 0);
+        fs.remove(1, OsStr::new("tracked.tmp"), false).unwrap();
+        fs.write_data(ino, writer, 0, b"edited", 0, 0).unwrap();
+        assert_eq!(
+            fs.read_data(ino, reader, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+        assert!(!fs.backing.join(ino.to_string()).exists());
     }
     #[test]
     fn metadata_changes_preserve_source_until_content_changes() {

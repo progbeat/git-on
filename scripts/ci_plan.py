@@ -77,10 +77,11 @@ def validate_jobs(plan,needs):
         raise ValueError(f'passthrough scale coverage missing/failed: {outcome}')
 
 
-def changed_paths(base,head):
+def changed_paths(base,head,*,merge_base=True):
     if not base or not re.fullmatch(r'[0-9a-f]{40,64}',base) or set(base)=={'0'}:raise ValueError('no usable comparison base')
     # No renames: both the old and new path participate in conservative rules.
-    output=subprocess.check_output(['git','diff','--no-renames','--name-only','-z',f'{base}...{head}','--'],stderr=subprocess.PIPE)
+    comparison=[f'{base}...{head}'] if merge_base else [base,head]
+    output=subprocess.check_output(['git','diff','--no-renames','--name-only','-z',*comparison,'--'],stderr=subprocess.PIPE)
     return [os.fsdecode(value) for value in output.split(b'\0') if value]
 
 
@@ -92,7 +93,9 @@ def build(event,event_name,head):
     if event_name=='pull_request':base=event.get('pull_request',{}).get('base',{}).get('sha')
     elif event_name=='push':base=event.get('before')
     else:return select([],head,force_all=True,reason='unknown event; conservative full affected coverage')
-    try:paths=changed_paths(base,head)
+    # PRs cover the branch since its merge base. Pushes cover the actual tree
+    # transition, including runtime removed by a non-fast-forward replacement.
+    try:paths=changed_paths(base,head,merge_base=event_name=='pull_request')
     except (ValueError,subprocess.CalledProcessError):
         return select([],head,force_all=True,reason='comparison unavailable; conservative full affected coverage')
     return select(paths,head)

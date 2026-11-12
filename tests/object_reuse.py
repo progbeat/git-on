@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 import os
 from process_capture import capture
-from benchmark_support import build_stat_observer, stat_abi_bytes
+from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
 from remote import Fixture
 
 
@@ -57,8 +57,8 @@ def native_commands(log):
 
 
 def run(options):
-    head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-    dirty=bool(subprocess.check_output(['git','diff','--name-only','HEAD']))
+    identity=source_identity()
+    head,dirty=identity['head'],identity['working_tree_dirty']
     if options.backend=='fuse':
         assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
     options.output.parent.mkdir(parents=True,exist_ok=True)

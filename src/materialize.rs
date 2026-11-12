@@ -248,7 +248,7 @@ fn directory(
                         // files are mutable disk and cannot be trusted on reopen.
                         source.copy_to(root, entry.oid, &mut output)?;
                     } else {
-                        let size = snapshot.copy_materialized_blob(entry.oid, &mut output)?;
+                        let size = snapshot.copy_verified_blob(entry.oid, &mut output)?;
                         prepared.insert(
                             entry.oid,
                             PreparedBlob {

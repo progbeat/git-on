@@ -8,6 +8,7 @@ import unittest
 from object_reuse import CHILD,validate_runner,native_command_audit,native_commands
 from benchmark import environment
 from ci_evidence import validate_object_reuse
+from evidence_fixtures import object_reuse_row
 
 
 class ObjectReuseTests(unittest.TestCase):
@@ -15,14 +16,8 @@ class ObjectReuseTests(unittest.TestCase):
         head='a'*40
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
-            for backend,count in [('fuse',160),('materialized',32)]:
-                operations=3 if backend=='materialized' else count+2
-                row=dict(head=head,working_tree_dirty=False,backend=backend,type='runner',files=count,blob_bytes=8192,stat_abi_bytes=144,
-                    child_observations=[dict(completed=p,files=count,payload_bytes=count*8192,metadata_result_bytes=count*144) for p in ('first','repeat')],
-                    metrics=dict(remote_fetches=count+2,remote_fetch_operations=operations,remote_decode_operations=operations,
-                        remote_raw_blob_imports=count,remote_raw_blob_bytes=count*8192,blob_loads=count,blob_cache_bytes=1,blob_cache_limit=16*1024*1024),
-                    fuse_requests={'read':1} if backend=='fuse' else {},native_commands={'cat-file':operations,'fetch':operations})
-                (root/f'object-reuse-{backend}.jsonl').write_text(json.dumps(row)+'\n')
+            for backend in ('fuse','materialized'):
+                (root/f'object-reuse-{backend}.jsonl').write_text(json.dumps(object_reuse_row(head,backend))+'\n')
             validate_object_reuse(dict(head=head),root)
             path=root/'object-reuse-materialized.jsonl';good=json.loads(path.read_text())
             for change in ('stale','decode','native','unpack','duplicate','stat'):

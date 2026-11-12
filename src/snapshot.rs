@@ -860,16 +860,23 @@ impl Snapshot {
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
         self.state()?.open(oid)
     }
-    /// Eager consumers keep the destination private until the complete tree is
-    /// verified. Local objects can be checked directly into that destination,
-    /// without first creating a second full decoded copy in raw storage.
-    pub(crate) fn copy_materialized_blob(
+    /// Check into a private destination before publishing it to consumers.
+    /// Reuse prepared contents; new local objects need no second raw copy.
+    pub(crate) fn copy_verified_blob(
         &self,
         oid: Oid,
         output: &mut dyn std::io::Write,
     ) -> Result<u64> {
         let mut state = self.state()?;
-        if state.remote.is_some() {
+        if state.remote.is_some()
+            || state
+                .raw_blobs
+                .as_ref()
+                .map(|raw| raw.get(oid))
+                .transpose()?
+                .flatten()
+                .is_some()
+        {
             let reader = state.open(oid)?;
             drop(state);
             let size = reader.len();

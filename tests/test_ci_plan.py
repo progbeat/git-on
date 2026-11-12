@@ -14,6 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
 from ci_plan import KINDS, build, changed_paths, matrix, select, validate_jobs, validate_plan
 from ci_evidence import validate_evidence, validate_lazy, validate_resources, validate_scale, validate_stress
+from evidence_fixtures import object_reuse_row, pack_scaling_rows
 HEAD='a'*40
 
 
@@ -59,6 +60,69 @@ def write_synthetic_scale_reports(root,plan):
 
 
 class CiPlanTests(unittest.TestCase):
+    def test_pack_generator_records_actual_revision_and_tracked_source_state(self):
+        import contextlib
+        from pack_scaling import main
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            def git(*args):return subprocess.check_output(['git',*args],text=True).strip()
+            git('init','-q');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
+            Path('source').write_text('committed');git('add','source');git('commit','-qm','fixture')
+            head=git('rev-parse','HEAD');output=Path('pack-scaling.jsonl')
+            def observe(binary,count,before):
+                return next(r for r in pack_scaling_rows(head) if r['distinct_blobs']==count)
+            with mock.patch('pack_scaling.exercise',side_effect=observe), \
+                 mock.patch('pack_scaling.sys.platform','linux'), \
+                 mock.patch('pack_scaling.shutil.which',return_value='/usr/bin/strace'), \
+                 mock.patch('builtins.print'):
+                for state in ('clean','untracked-report','unstaged','staged'):
+                    if state=='unstaged':Path('source').write_text('modified')
+                    elif state=='staged':git('add','source')
+                    main(['--probe','probe','--output',str(output)])
+                    records=[json.loads(line) for line in output.read_text().splitlines()]
+                    self.assertEqual([r['distinct_blobs'] for r in records],[32,128,512])
+                    self.assertTrue(all(r['head']==head for r in records))
+                    self.assertTrue(all(r['working_tree_dirty']==(state in ('unstaged','staged')) for r in records))
+
+    def test_divergent_push_covers_reverted_runtime_while_pr_uses_merge_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'src').mkdir();(root/'src/x.rs').write_text('original')
+            env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
+            env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1')
+            def git(*args):return subprocess.check_output(['git',*args],cwd=root,env=env,text=True).strip()
+            git('init','-q');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
+            git('add','.');git('commit','-qm','common');base=git('rev-parse','HEAD')
+            (root/'src/x.rs').write_text('runtime update');git('add','.');git('commit','-qm','runtime')
+            before=git('rev-parse','HEAD')
+            git('checkout','-q','--detach',base)
+            (root/'README.md').write_text('documentation');git('add','.');git('commit','-qm','docs')
+            head=git('rev-parse','HEAD')
+            old=Path.cwd()
+            try:
+                os.chdir(root)
+                push=build({'before':before},'push',head)
+                self.assertEqual(set(push['paths']),{'src/x.rs','README.md'})
+                self.assertTrue(all(push['required'].values()))
+                pr=build({'pull_request':{'base':{'sha':before}}},'pull_request',head)
+                self.assertEqual(pr['paths'],['README.md'])
+                self.assertFalse(any(pr['required'].values()))
+                fast_forward=build({'before':base},'push',head)
+                self.assertEqual(fast_forward['paths'],['README.md'])
+                self.assertFalse(any(fast_forward['required'].values()))
+            finally:os.chdir(old)
+
+    def test_pack_report_rejects_stale_dirty_or_missing_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);path=root/'pack-scaling.jsonl'
+            good=pack_scaling_rows(HEAD)
+            for change in ('stale','dirty','missing-head','missing-dirty'):
+                data=copy.deepcopy(good)
+                if change=='stale':data[1]['head']='b'*40
+                elif change=='dirty':data[1]['working_tree_dirty']=True
+                elif change=='missing-head':del data[1]['head']
+                else:del data[1]['working_tree_dirty']
+                path.write_text(''.join(json.dumps(r)+'\n' for r in data))
+                with self.subTest(change=change),self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
+
     def test_docs_keep_fast_base_and_unknown_shared_dependency_workflow_inputs_require_all(self):
         documentation=select(['README.md','docs/ci-performance.md','docs/new-guide.md'],HEAD)
         self.assertEqual(documentation['required'],dict.fromkeys(KINDS,False))
@@ -137,20 +201,20 @@ class CiPlanTests(unittest.TestCase):
     def test_successful_job_without_required_files_does_not_satisfy_coverage(self):
         plan=select(['src/main.rs'],HEAD);validate_jobs(plan,outcomes(plan))
         with tempfile.TemporaryDirectory() as directory:
-            for validator in (lambda:validate_scale(plan,Path(directory)),lambda:validate_resources(Path(directory)),lambda:validate_stress(Path(directory))):
+            for validator in (lambda:validate_scale(plan,Path(directory)),lambda:validate_resources(plan,Path(directory)),lambda:validate_stress(Path(directory))):
                 with self.assertRaises(ValueError):validator()
 
     def test_pack_report_requires_all_sizes_and_nonzero_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);path=root/'pack-scaling.jsonl'
-            data=[dict(distinct_blobs=n,passes=2,baseline=False,metrics=dict(remote_fetches=n+2),pack_metadata_syscalls=n,pack_directory_bytes_enumerated=n*64) for n in (32,128,512)]
+            data=pack_scaling_rows(HEAD)
             def write():path.write_text(''.join(json.dumps(r)+'\n' for r in data))
-            write();validate_resources(root)
+            write();validate_resources(dict(head=HEAD),root)
             data.pop();write()
-            with self.assertRaises(ValueError):validate_resources(root)
+            with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
             data[0]['pack_metadata_syscalls']=0;data.append(dict(data[0],distinct_blobs=512));write()
-            with self.assertRaises(ValueError):validate_resources(root)
+            with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
     def test_resource_gate_requires_complete_current_cache_reports(self):
         plan=dict(head=HEAD,required=dict(scale=False,resources=True,stress=False,lazy=False))
@@ -158,13 +222,9 @@ class CiPlanTests(unittest.TestCase):
             root=Path(directory)
             def write(name,data):
                 (root/name).write_text(''.join(json.dumps(r)+'\n' for r in data))
-            write('pack-scaling.jsonl',[dict(distinct_blobs=n,passes=2,baseline=False,metrics=dict(remote_fetches=n+2),pack_metadata_syscalls=n,pack_directory_bytes_enumerated=n*64) for n in (32,128,512)])
-            for backend,count in (('fuse',160),('materialized',32)):
-                operations=3 if backend=='materialized' else count+2
-                write(f'object-reuse-{backend}.jsonl',[dict(head=HEAD,working_tree_dirty=False,backend=backend,type='runner',files=count,blob_bytes=8192,stat_abi_bytes=144,
-                    child_observations=[dict(completed=p,files=count,payload_bytes=count*8192,metadata_result_bytes=count*144) for p in ('first','repeat')],
-                    metrics=dict(remote_fetches=count+2,remote_fetch_operations=operations,remote_decode_operations=operations,remote_raw_blob_imports=count,remote_raw_blob_bytes=count*8192,blob_loads=count,blob_cache_bytes=1,blob_cache_limit=16*1024*1024),
-                    fuse_requests={'read':1} if backend=='fuse' else {},native_commands={'cat-file':operations,'fetch':operations})])
+            write('pack-scaling.jsonl',pack_scaling_rows(HEAD))
+            for backend in ('fuse','materialized'):
+                write(f'object-reuse-{backend}.jsonl',[object_reuse_row(HEAD,backend)])
             source=[]
             for mode,count in (('uncached-source',1000),('cached-source',1000),('uncached-readonly-directory',640),('cached-readonly-directory',640)):
                 directory_case='directory' in mode

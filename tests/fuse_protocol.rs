@@ -379,7 +379,19 @@ fn protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls() {
     );
     let reader = num(&opened, 0);
     assert_eq!(p.ok(15, ino, io(reader, 0, 100, 0)), b"original\n");
-    let writer = p.open(ino, libc::O_RDWR);
+    let writable = p.ok(14, ino, u32s(&[libc::O_RDWR as u32, 0]));
+    let writer = num(&writable, 0);
+    assert_eq!(
+        u32::from_ne_bytes(writable[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        1 << 1
+    );
+    p.ok(16, ino, io(writer, 0, 0, 0));
+    let unchanged = p.ok(14, ino, u32s(&[libc::O_RDONLY as u32, 0]));
+    assert_eq!(
+        u32::from_ne_bytes(unchanged[8..12].try_into().unwrap()) & ((1 << 1) | (1 << 5)),
+        1 << 1
+    );
+    p.release(ino, num(&unchanged, 0));
     p.ok(
         16,
         ino,

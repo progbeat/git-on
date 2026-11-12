@@ -75,12 +75,14 @@ def validate_scale(plan,root):
     return dict(groups=len(observed),**total)
 
 
-def validate_resources(root):
+def validate_resources(plan,root):
     paths=list(root.rglob('pack-scaling.jsonl'))
     if len(paths)!=1:raise ValueError('missing/duplicate pack-scaling evidence')
     data=rows(paths[0])
     if [r['distinct_blobs'] for r in data]!=[32,128,512]:raise ValueError('missing distinct-demand sizes')
     for r in data:
+        if r.get('head')!=plan['head'] or r.get('working_tree_dirty') is not False:
+            raise ValueError('stale, dirty or unidentified pack-scaling evidence')
         n=r['distinct_blobs']
         if r['baseline'] or r['passes']!=2 or r['metrics']['remote_fetches']!=n+2:raise ValueError('wrong pack demand control')
         if not 0<r['pack_directory_bytes_enumerated']<=2048*(n+2) or not 0<r['pack_metadata_syscalls']<=64*(n+2):raise ValueError('pack metadata work exceeds linear gate')
@@ -138,7 +140,7 @@ def validate_evidence(plan,root):
         if len(paths)!=1:raise ValueError('missing/duplicate WebKit scale evidence')
         result['webkit']=validate_reports(rows(paths[0]),plan['head'])
     if plan['required']['resources']:
-        result['resources']=validate_resources(root)
+        result['resources']=validate_resources(plan,root)
         result['imports']=validate_object_reuse(plan,root)
         result['caches']=validate_cache_reports(plan,root)
     if plan['required']['stress']:result['stress']=validate_stress(root)

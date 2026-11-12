@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+from benchmark_support import source_identity
 import shutil
 import subprocess
 import sys
@@ -121,8 +122,8 @@ def run(options):
     from scalability import fixture
     assert sys.platform=='linux','Linux required'
     assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
-    head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-    dirty=bool(subprocess.check_output(['git','diff','--name-only','HEAD']))
+    identity=source_identity()
+    head,dirty=identity['head'],identity['working_tree_dirty']
     f=Fixture()
     try:
         key=f.root/'cache-signing-key'

@@ -13,12 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-parser=argparse.ArgumentParser()
-parser.add_argument('--probe',type=Path,required=True)
-parser.add_argument('--before-probe',type=Path)
-parser.add_argument('--sizes',default='32,128,512')
-parser.add_argument('--output',type=Path,default=Path('pack-scaling.jsonl'))
-options=parser.parse_args()
+from benchmark_support import source_identity
 from remote import Fixture
 
 
@@ -65,12 +60,24 @@ def exercise(binary,count,before=False):
         if not before:
             assert 0<pack_bytes<=2048*(count+2),observation
             assert 0<pack_metadata<=64*(count+2),observation
-        print(json.dumps(observation),flush=True)
-        with options.output.open('a') as output:output.write(json.dumps(observation)+'\n')
+        return observation
     finally:f.close()
 
-if __name__=='__main__':
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--probe',type=Path,required=True)
+    parser.add_argument('--before-probe',type=Path)
+    parser.add_argument('--sizes',default='32,128,512')
+    parser.add_argument('--output',type=Path,default=Path('pack-scaling.jsonl'))
+    options=parser.parse_args(argv)
     assert sys.platform=='linux' and shutil.which('strace'),'Linux strace required'
-    for count in map(int,options.sizes.split(',')):
-        if options.before_probe:exercise(options.before_probe,count,True)
-        exercise(options.probe,count)
+    identity=source_identity()
+    with options.output.open('w') as output:
+        for count in map(int,options.sizes.split(',')):
+            for binary,before in ([(options.before_probe,True)] if options.before_probe else [])+[(options.probe,False)]:
+                row=dict(exercise(binary,count,before),**identity)
+                output.write(json.dumps(row)+'\n');output.flush()
+                print(json.dumps(row),flush=True)
+
+
+if __name__=='__main__':main()

@@ -65,8 +65,11 @@ checks. Remote materialization retains its invocation-owned verified raw store.
 
 In FUSE, metadata and namespace changes preserve the source OID without loading
 or copying its payload. Read handles, hard links and unlinked inodes retain
-access to that source. A writable open or truncation prepares private data;
-all handles then observe subsequent content changes through the same inode.
+access to that source. Writable opens, empty writes and unchanged-size truncation
+leave source data intact. The first nonempty write or content-changing truncation
+prepares private data; all handles then observe changes through the same inode.
+An unprepared local object is verified directly into that private file rather
+than first creating a full raw copy. Already prepared contents are reused.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that

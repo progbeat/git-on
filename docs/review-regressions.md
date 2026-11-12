@@ -2406,3 +2406,30 @@ reproduced the second-run dirty-report rejection on `68d0e4d`. It now accepts
 the generated untracked report and still rejects both staged and unstaged
 source edits. The harness fixture uses a real Git repository and replaces the
 public-network observation; it does not claim a WebKit execution.
+
+### Writable opens and CI evidence identity
+
+On frozen `9cce624`,
+`FuseTests.test_writable_open_does_not_materialize_source` reproduced
+12,595,200 allocated bytes after opening a 6 MiB file for writing without
+changing data; its native clone-plus-command control succeeded. The corrected
+case also checks empty writes, fsync, unchanged-size truncation, first-byte
+mutation and truncation to a smaller size. The Linux quota case runs read,
+write and truncate separately against clone-plus-command on private 9 MiB
+tmpfs volumes. Local mount-namespace denial is a skip, not quota evidence.
+Unit and protocol checks retain source identity/cache flags until actual
+mutation, preserve existing readers and verify usable handles after a rejected
+first copy-up. mmap and all write policies remain real-FUSE checks.
+
+`CiPlanTests.test_pack_report_rejects_stale_dirty_or_missing_identity`
+reproduced acceptance of all four invalid identity cases on `9cce624`.
+The gate now requires current head and an explicit clean tracked state on
+each pack row. The producer regression uses real commits and staged/unstaged
+edits, accepting its own untracked output across repeated runs. Synthetic
+validator fixtures are shared and never represent backend execution.
+
+`CiPlanTests.test_divergent_push_covers_reverted_runtime_while_pr_uses_merge_base`
+reproduced omission of `src/x.rs` when a push replaced a runtime branch with a
+divergent documentation commit. It now requires the reverted runtime and all
+affected suites, while preserving merge-base PR comparison and docs-only
+fast-forward push selection.

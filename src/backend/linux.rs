@@ -408,9 +408,7 @@ impl Filesystem for Fuse {
         }
         match state.core.open_file(ino.0, flags.0) {
             Ok(fh) => {
-                let cache = if state.retain_source_data(ino.0)
-                    && flags.0 & libc::O_ACCMODE == libc::O_RDONLY
-                {
+                let cache = if state.retain_source_data(ino.0) {
                     // Copy-up/mutation still uses this FUSE inode's coherent
                     // page cache. All-policy names and metadata keep zero TTL.
                     // NOFLUSH remains limited to source that cannot be mutated.

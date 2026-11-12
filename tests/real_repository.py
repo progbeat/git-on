@@ -111,12 +111,13 @@ def validate_reports(data, head):
 
 
 def run(options):
+    from benchmark_support import source_identity
     from benchmark import environment
     from process_capture import capture
     if not (sys.platform == 'linux' and Path('/dev/fuse').is_char_device() and shutil.which('fusermount3')):
         raise RuntimeError('real Linux FUSE required')
-    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-    dirty = bool(subprocess.check_output(['git', 'diff', '--name-only', 'HEAD']))
+    identity=source_identity()
+    head,dirty=identity['head'],identity['working_tree_dirty']
     binary = options.binary.resolve()
     with tempfile.TemporaryDirectory(prefix='git-on-webkit-') as temporary:
         root = Path(temporary)
