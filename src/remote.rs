@@ -656,30 +656,7 @@ impl Remote {
         self.session_received_pack_bytes =
             self.session_received_pack_bytes.saturating_add(pack.len()?);
         if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
-            match kind {
-                git2::ObjectType::Blob => {
-                    self.raw_blobs.insert_fetched(oid, size, reader)?;
-                }
-                git2::ObjectType::Tree => {
-                    let odb = repo.odb()?;
-                    let mut writer = odb.writer(size, kind)?;
-                    self.raw_blobs.insert_tree(
-                        oid,
-                        size,
-                        TeeRead {
-                            input: reader,
-                            output: &mut writer,
-                        },
-                    )?;
-                    anyhow::ensure!(writer.finalize()? == oid, "received tree OID changed");
-                }
-                _ => {
-                    let odb = repo.odb()?;
-                    let mut writer = odb.writer(size, kind)?;
-                    crate::object::copy_verified(reader, &mut writer, kind, size, oid)?;
-                    anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
-                }
-            }
+            self.publish_received(repo, oid, kind, size, reader)?;
             self.session_decode_operations += 1;
         } else {
             // The generic path handles necessary deltas and multi-object packs
@@ -804,7 +781,7 @@ impl Remote {
             return Ok(());
         }
         requests.rewind()?;
-        let (mut output_file, start) = self.raw_blobs.append_output()?;
+        let mut output_file = self.raw_blobs.create_output()?;
         let mut command = self.git.command(Some(&self.dir));
         command
             .env("GIT_OBJECT_DIRECTORY", staging.path().join("objects"))
@@ -823,14 +800,45 @@ impl Remote {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let imported = self.import_raw_output(start, &destination);
+        let imported = self.import_raw_output(&destination);
         self.raw_blobs.release_output();
         imported?;
         self.decode_operations += 1;
         Ok(())
     }
-    fn import_raw_output(&mut self, start: u64, destination: &Repository) -> Result<()> {
-        let mut input = BufReader::new(self.raw_blobs.output_reader(start)?);
+    fn publish_received(
+        &mut self,
+        destination: &Repository,
+        oid: Oid,
+        kind: git2::ObjectType,
+        size: usize,
+        mut input: impl Read,
+    ) -> Result<()> {
+        if kind == git2::ObjectType::Blob {
+            self.raw_blobs.insert_fetched(oid, size, input)?;
+        } else {
+            // Revision resolution and native signature verification need Git's
+            // metadata ODB; blob payloads have no second loose copy.
+            let odb = destination.odb()?;
+            let mut writer = odb.writer(size, kind)?;
+            if kind == git2::ObjectType::Tree {
+                self.raw_blobs.insert_tree(
+                    oid,
+                    size,
+                    TeeRead {
+                        input: &mut input,
+                        output: &mut writer,
+                    },
+                )?;
+            } else {
+                crate::object::copy_verified(input, &mut writer, kind, size, oid)?;
+            }
+            anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
+        }
+        Ok(())
+    }
+    fn import_raw_output(&mut self, destination: &Repository) -> Result<()> {
+        let mut input = BufReader::new(self.raw_blobs.output_reader()?);
         loop {
             crate::object::check_transfer()?;
             let mut header = Vec::new();
@@ -859,28 +867,8 @@ impl Remote {
                 _ => bail!("unknown received Git object type"),
             };
             let size: usize = fields[2].parse().context("native Git object size")?;
-            let mut payload = Read::by_ref(&mut input).take(size as u64);
-            if kind == git2::ObjectType::Blob {
-                self.raw_blobs.insert_fetched(oid, size, &mut payload)?;
-            } else {
-                // Native verification and revision resolution still use Git's
-                // metadata ODB. Blob payloads never get a second loose copy.
-                let odb = destination.odb()?;
-                let mut writer = odb.writer(size, kind)?;
-                if kind == git2::ObjectType::Tree {
-                    self.raw_blobs.insert_tree(
-                        oid,
-                        size,
-                        TeeRead {
-                            input: &mut payload,
-                            output: &mut writer,
-                        },
-                    )?;
-                } else {
-                    crate::object::copy_verified(&mut payload, &mut writer, kind, size, oid)?;
-                }
-                anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
-            }
+            let payload = Read::by_ref(&mut input).take(size as u64);
+            self.publish_received(destination, oid, kind, size, payload)?;
             let mut delimiter = [0];
             input.read_exact(&mut delimiter)?;
             anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");

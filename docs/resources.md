@@ -63,6 +63,11 @@ copied bytes against that original OID. File copies remain independent. The
 command starts only after every destination has passed verification and policy
 checks. Remote materialization retains its invocation-owned verified raw store.
 
+In FUSE, metadata and namespace changes preserve the source OID without loading
+or copying its payload. Read handles, hard links and unlinked inodes retain
+access to that source. A writable open or truncation prepares private data;
+all handles then observe subsequent content changes through the same inode.
+
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that
 is later discarded. Transport/metadata staging and durability work are excluded.

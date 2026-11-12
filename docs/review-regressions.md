@@ -2386,3 +2386,23 @@ single-object scan. Growing replacements keep the original eviction path.
 accounting, recency, equal/short/growing replacements, the actual spilled victim
 and unchanged active results. These are optimization-equivalence checks, not
 claims that the earlier revision returned incorrect bytes or measured slower.
+
+### Source metadata changes and repeatable WebKit reports
+
+On frozen `68d0e4d`,
+`FuseTests.test_source_metadata_changes_fit_checkout_disk_budget` observed
+12,595,200 allocated bytes after chmod, utime, link and rename of a 6 MiB
+source file. The same command in a native checkout fit the 9 MiB budget.
+The corrected real-FUSE case passes without copying payload for metadata
+changes and preserves a readable, chmod-able descriptor after unlink. The
+unit regression `metadata_changes_preserve_source_until_content_changes`
+failed with one blob load instead of zero; it now also checks that later
+content writes reach an existing reader. A separate Linux regression compares
+both paths on a fresh private 9 MiB tmpfs; unavailable mount namespaces cause
+a local skip and a CI failure, never an assumed quota pass.
+
+`RealRepositoryTests.test_report_can_be_repeated_with_untracked_output_but_rejects_changed_sources`
+reproduced the second-run dirty-report rejection on `68d0e4d`. It now accepts
+the generated untracked report and still rejects both staged and unstaged
+source edits. The harness fixture uses a real Git repository and replaces the
+public-network observation; it does not claim a WebKit execution.

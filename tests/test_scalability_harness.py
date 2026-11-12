@@ -87,10 +87,13 @@ class ScalabilityHarnessTests(unittest.TestCase):
     def test_plan_preserves_interactions_and_selects_larger_scale_without_cartesian_repetition(self):
         for source in ('local','remote'):
             cases=scenario_plan('fuse',source,'matrix',['none','ignored','untracked','all'],'both')
-            self.assertEqual(len(cases),24)
+            self.assertEqual(len(cases),12)
             for count in (1000,):
                 full={(c['policy'],c['verify']) for c in cases if c['files']==count and c['workload']=='full'}
                 self.assertEqual(full,{(p,v) for p in ('none','ignored','untracked','all') for v in (False,True)})
+            for workload in ('noop','sparse'):
+                self.assertEqual({(c['policy'],c['verify']) for c in cases if c['workload']==workload},
+                                 {('none',True),('ignored',True)})
             self.assertFalse(any(c['files']>1000 for c in cases))
             for backend,policy in (('materialized','all'),('passthrough','ignored')):
                 compact=scenario_plan(backend,source,'matrix',[policy],'both')

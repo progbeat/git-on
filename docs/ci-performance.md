@@ -19,7 +19,9 @@ uses `macos-15`; other macOS behavior uses `macos-26`.
 The ordinary synthetic scale matrix exercises all source/backend/write-policy/
 signature interactions at 1,000 paths. Full children check complete directory
 membership, varied payloads, stat, repeated reads, source isolation, generated
-writes and cleanup. Passthrough uses actual kernel capability checks and remains
+writes and cleanup. Each FUSE source has eight full-read cases (four policies
+and two signature modes), plus signed no-op and sparse reads under readonly and
+one mutable policy: twelve invocations. Passthrough uses actual kernel capability checks and remains
 in `real-fuse`. `--profile exhaustive` is an explicit diagnostic option.
 
 Separate lazy-access checks cover million-object demand, untouched subtrees,

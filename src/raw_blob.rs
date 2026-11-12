@@ -528,26 +528,22 @@ impl RawBlobs {
             .unwrap_or_else(|e| e.into_inner())
             .scratch_file()
     }
-    pub(crate) fn append_output(&self) -> Result<(RawOutput, u64)> {
+    pub(crate) fn create_output(&self) -> Result<RawOutput> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let file = Arc::new(store.scratch_file()?);
         store.output = Some(file.clone());
-        Ok((RawOutput { file }, 0))
+        Ok(RawOutput { file })
     }
-    pub(crate) fn output_reader(&self, start: u64) -> Result<impl Read> {
+    pub(crate) fn output_reader(&self) -> Result<impl Read> {
         let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let file = store
             .output
             .as_ref()
             .context("no staged native output")?
             .clone();
-        let size = file
-            .len()?
-            .checked_sub(start)
-            .context("invalid native output offset")?;
+        let size = file.len()?;
         Ok(StagedReader {
             file,
-            start,
             size,
             position: 0,
         })
@@ -786,7 +782,6 @@ impl Write for RawOutput {
 }
 struct StagedReader {
     file: Arc<Spool>,
-    start: u64,
     size: u64,
     position: u64,
 }
@@ -796,9 +791,7 @@ impl Read for StagedReader {
             .size
             .saturating_sub(self.position)
             .min(bytes.len() as u64) as usize;
-        let count = self
-            .file
-            .read_at(&mut bytes[..length], self.start + self.position)?;
+        let count = self.file.read_at(&mut bytes[..length], self.position)?;
         self.position += count as u64;
         Ok(count)
     }
@@ -1171,11 +1164,15 @@ mod tests {
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         store.state.lock().unwrap().scratch =
             Some(Files::with_limit(directory.path(), Some(3)).unwrap());
-        let (mut output, start) = store.append_output().unwrap();
+        let mut output = store.create_output().unwrap();
         output.write_all(b"headergood\n").unwrap();
         drop(output);
         let oid = Oid::hash_object(ObjectType::Blob, b"good").unwrap();
-        let input = store.output_reader(start + 6).unwrap().take(4);
+        let mut input = store.output_reader().unwrap();
+        let mut header = [0; 6];
+        input.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"header");
+        let input = input.take(4);
         store.insert_fetched(oid, 4, input).unwrap();
         store.release_output();
         for first in [true, false] {

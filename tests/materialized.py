@@ -223,57 +223,8 @@ print('large file verified')
 
     @unittest.skipUnless(sys.platform=='linux','private tmpfs quota requires Linux mount namespaces')
     def test_large_local_materialization_succeeds_on_nine_mib_tmpfs(self):
-        unshare=shutil.which('unshare')
-        if not unshare: self.skipTest('unshare is unavailable')
-        prefix=[unshare,'--user','--map-root-user','--mount','--propagation','private']
-        probe=subprocess.run([*prefix,'/bin/true'],capture_output=True)
-        uid,gid=0,0
-        if probe.returncode:
-            sudo=shutil.which('sudo')
-            prefix=([sudo,'-n'] if os.geteuid()!=0 and sudo else [])+[
-                unshare,'--mount','--propagation','private']
-            probe=subprocess.run([*prefix,'/bin/true'],capture_output=True)
-            if probe.returncode:
-                reason='mount namespaces unavailable: '+probe.stderr.decode().strip()
-                if os.environ.get('GITHUB_ACTIONS')=='true': self.fail(reason)
-                self.skipTest(reason)
-            uid,gid=os.getuid(),os.getgid()
-        command=self.large_local_fixture()
-        volume=self.root/'quota'; volume.mkdir()
-        driver=r'''
-import json,os,shutil,subprocess,sys
-from pathlib import Path
-volume,binary,repo,mount,programs,uid,gid,command=sys.argv[1:]
-uid,gid=int(uid),int(gid); volume=Path(volume); command=json.loads(command)
-subprocess.run([mount,'-t','tmpfs','-o',f'size=9m,mode=700,uid={uid},gid={gid}','tmpfs',str(volume)],check=True)
-if os.geteuid()==0 and uid!=0:
- os.setgroups([]); os.setgid(gid); os.setuid(uid)
-temporary=volume/'tmp'; temporary.mkdir()
-home=volume/'home'; home.mkdir()
-env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
-env.update(PATH=programs,TMPDIR=str(temporary),HOME=str(home),XDG_CONFIG_HOME=str(home/'config'),
-           GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1')
-clone=volume/'clone'
-before=os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize
-assert before<=9*1024*1024,before
-result=subprocess.run(['git','clone','--no-local','--quiet',repo,str(clone)],env=env,capture_output=True)
-assert result.returncode==0,result.stderr
-direct=subprocess.run(command,cwd=clone,env=env,capture_output=True)
-assert direct.returncode==0,direct.stderr
-print('native clone + command passed on 9 MiB tmpfs',flush=True)
-shutil.rmtree(clone)
-assert os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize==before, 'baseline did not restore initial free space'
-result=subprocess.run([binary,'HEAD','--write-policy=all','--',*command],cwd=repo,env=env,capture_output=True)
-assert result.returncode==0,(result.returncode,result.stderr)
-assert result.stdout==direct.stdout
-assert list(temporary.iterdir())==[]
-print('git-on + command passed on 9 MiB tmpfs',flush=True)
-'''
-        result=subprocess.run([*prefix,sys.executable,'-I','-S','-c',driver,str(volume),str(BINARY),
-                               str(self.repo),shutil.which('mount'),self.env['PATH'],str(uid),str(gid),
-                               json.dumps(command)],capture_output=True,timeout=30)
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn(b'git-on + command passed on 9 MiB tmpfs',result.stdout)
+        from filesystem_quota import compare_on_tmpfs
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,self.env['PATH'],self.large_local_fixture())
         self.clean()
 
     def test_command_status_and_signal_cleanup(self):

@@ -28,6 +28,8 @@ fn snapshot_errno(_error: anyhow::Error) -> i32 {
 
 struct Node {
     attr: FileAttr,
+    // Metadata still belongs to the pristine snapshot. Private metadata can
+    // coexist with source data: oid stays present until content copy-up.
     immutable: bool,
     oid: Option<Oid>,
     lookups: u64,
@@ -127,7 +129,7 @@ impl Overlay {
     }
     pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
         self.nodes.get(&ino).is_some_and(|node| {
-            node.immutable
+            node.oid.is_some()
                 && node.snapshot_path.is_some()
                 && node.attr.kind == FileType::RegularFile
         })
@@ -630,22 +632,34 @@ impl Overlay {
             Ok(())
         }
     }
-    /// Copy only this inode on its first mutation. A directory retains its
-    /// source origin so its untouched descendants continue to load on demand.
-    fn copy_up(&mut self, ino: u64, preserve_content: bool) -> FsResult<()> {
+    /// Retain source data independently of mutable metadata and namespace.
+    /// Directories also keep their origin for demand-loaded descendants.
+    fn copy_metadata_up(&mut self, ino: u64) -> FsResult<()> {
         self.writable(ino)?;
         let node = self.node(ino)?;
         if !node.immutable {
             return Ok(());
         }
-        let kind = node.attr.kind;
-        let oid = node.oid.ok_or(libc::EIO)?;
-        let unlinked = node.attr.nlink == 0;
         let path = match self.path(ino) {
             Ok(path) => Some(path),
-            Err(libc::ENOENT) if unlinked => None,
+            Err(libc::ENOENT) if node.attr.nlink == 0 => None,
             Err(error) => return Err(error),
         };
+        self.node_mut(ino)?.immutable = false;
+        if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+            self.upper_paths.insert(path, ino);
+        }
+        Ok(())
+    }
+    /// Allocate private data only for a content mutation.
+    fn copy_up(&mut self, ino: u64, preserve_content: bool) -> FsResult<()> {
+        self.writable(ino)?;
+        let node = self.node(ino)?;
+        let Some(oid) = node.oid else {
+            return Ok(());
+        };
+        let kind = node.attr.kind;
+        let unlinked = node.attr.nlink == 0;
         let mut bytes = Vec::new();
         let file = if kind == FileType::RegularFile {
             let disk_path = self.backing.join(ino.to_string());
@@ -690,15 +704,12 @@ impl Overlay {
             None
         };
         let keep_file = unlinked || self.has_open_handle(ino);
+        self.copy_metadata_up(ino)?;
         let node = self.node_mut(ino)?;
-        node.immutable = false;
         node.oid = None;
         node.bytes = bytes;
         if keep_file {
             node.file = file;
-        }
-        if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
-            self.upper_paths.insert(path, ino);
         }
         let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
         while fh != 0 {
@@ -921,7 +932,7 @@ impl Overlay {
         } else if flags & libc::O_ACCMODE != libc::O_RDONLY {
             self.copy_up(ino, true)?;
         }
-        if !self.node(ino)?.immutable && self.node(ino)?.file.is_none() {
+        if self.node(ino)?.oid.is_none() && self.node(ino)?.file.is_none() {
             let file = self.disk_file(ino)?;
             self.node_mut(ino)?.file = Some(file);
         }
@@ -1131,7 +1142,7 @@ impl Overlay {
     fn remove_path(&mut self, p: &Path) -> FsResult<()> {
         if let Some(&ino) = self.paths.get(p) {
             let node = self.node(ino)?;
-            if !node.immutable
+            if node.oid.is_none()
                 && node.attr.kind == FileType::RegularFile
                 && node.attr.nlink == 1
                 && node.file.is_none()
@@ -1281,7 +1292,7 @@ impl Overlay {
             None
         };
         // Every namespace validation precedes copy-up or a visible mutation.
-        self.copy_up(ino, true)?;
+        self.copy_metadata_up(ino)?;
         if destination.is_some() {
             self.remove_path(&to)?;
         }
@@ -1349,7 +1360,7 @@ impl Overlay {
             return Err(libc::ENOENT);
         }
         self.refresh_backing_attr(ino)?;
-        self.copy_up(ino, true)?;
+        self.copy_metadata_up(ino)?;
         let n = self.node_mut(ino)?;
         if n.attr.nlink == 0 {
             return Err(libc::ENOENT);
@@ -1422,7 +1433,7 @@ impl Overlay {
         if let Some(size) = size {
             self.truncate(ino, size)?;
         } else {
-            self.copy_up(ino, true)?;
+            self.copy_metadata_up(ino)?;
         }
         let n = self.node_mut(ino)?;
         if let Some(mode) = mode {
@@ -1442,7 +1453,10 @@ impl Overlay {
             n.attr.crtime = t;
         }
         n.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-        if n.attr.kind == FileType::RegularFile && (atime.is_some() || mtime.is_some()) {
+        if n.attr.kind == FileType::RegularFile
+            && n.oid.is_none()
+            && (atime.is_some() || mtime.is_some())
+        {
             // Unspecified timestamps stay untouched even when a bypass write
             // has made the cached attributes stale since the last callback.
             let mut times = std::fs::FileTimes::new();
@@ -2241,6 +2255,42 @@ mod tests {
         assert!(!overlay.backing.join(file.to_string()).exists());
         assert!(!overlay.upper_paths.contains_key(Path::new("tracked.tmp")));
         assert_eq!(overlay.nodes[&file].attr.nlink, 0);
+    }
+    #[test]
+    fn metadata_changes_preserve_source_until_content_changes() {
+        let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+        let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
+        let oid = fs.nodes[&ino].oid;
+        let reader = fs.open_file(ino, libc::O_RDONLY).unwrap();
+        let before = fs._snapshot.metrics();
+        fs.set_attributes(
+            ino,
+            0,
+            SetAttributes {
+                mode: Some(0o640),
+                mtime: Some(TimeOrNow::SpecificTime(SystemTime::UNIX_EPOCH)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.hardlink(ino, 1, OsStr::new("alias")).unwrap();
+        fs.rename_path(1, OsStr::new("tracked.tmp"), 1, OsStr::new("moved"), 0)
+            .unwrap();
+        assert_eq!(fs._snapshot.metrics().blob_loads, before.blob_loads);
+        assert_eq!(fs.nodes[&ino].oid, oid);
+        assert_eq!(fs::read_dir(&fs.backing).unwrap().count(), 0);
+        fs.forget_inode(ino, u64::MAX);
+        assert_eq!(fs.ensure(Path::new("alias")).unwrap(), ino);
+        let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
+        fs.write_data(ino, writer, 0, b"edited", 0, 0).unwrap();
+        assert_eq!(
+            fs.read_data(ino, reader, 0, 100).unwrap(),
+            b"edited content\n"
+        );
+        assert_eq!(fs.nodes[&ino].attr.perm, 0o640);
+        assert!(fs.nodes[&ino].oid.is_none());
+        fs.release_handle(ino, writer).unwrap();
+        fs.release_handle(ino, reader).unwrap();
     }
     #[test]
     fn all_truncate_to_zero_skips_source_content_and_directory_errors_are_atomic() {

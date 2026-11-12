@@ -116,7 +116,7 @@ def run(options):
     if not (sys.platform == 'linux' and Path('/dev/fuse').is_char_device() and shutil.which('fusermount3')):
         raise RuntimeError('real Linux FUSE required')
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-    dirty = bool(subprocess.check_output(['git', 'status', '--porcelain']))
+    dirty = bool(subprocess.check_output(['git', 'diff', '--name-only', 'HEAD']))
     binary = options.binary.resolve()
     with tempfile.TemporaryDirectory(prefix='git-on-webkit-') as temporary:
         root = Path(temporary)

@@ -318,6 +318,63 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def source_metadata_fixture(self):
+        (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','metadata disk budget')
+        code=r'''
+import os
+from pathlib import Path
+source=Path('large')
+reader=os.open(source,os.O_RDONLY)
+os.chmod(source,0o640)
+os.utime(source,ns=(1000000000,2000000000))
+os.link(source,'alias');source.rename('moved')
+assert Path('moved').stat().st_mode & 0o777==0o640
+assert Path('alias').stat().st_mtime_ns==2000000000
+root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
+if root!=Path.cwd():assert os.path.ismount('.'),'real FUSE required'
+def allocated():
+ # Inspect only the host backing, not the mounted namespace's logical sizes.
+ total=0;seen=set()
+ for directory,dirs,files in os.walk(root):
+  if root!=Path.cwd() and Path(directory)==root:
+   dirs[:]=[name for name in dirs if root/name!=Path.cwd()]
+  for name in dirs+files:
+   st=(Path(directory)/name).lstat();key=(st.st_dev,st.st_ino)
+   if key not in seen:total+=st.st_blocks*512;seen.add(key)
+ return total
+budget=(9 if root==Path.cwd() else 1)*1024*1024
+assert allocated()<budget,('metadata copied payload',allocated())
+assert Path('alias').read_bytes()==b'x'*(6*1024*1024)
+Path('alias').unlink();Path('moved').unlink()
+assert os.fstat(reader).st_nlink==0
+os.fchmod(reader,0o600)
+assert os.pread(reader,1,6*1024*1024-1)==b'x'
+os.close(reader)
+assert allocated()<9*1024*1024,('metadata disk allocation',allocated())
+print('metadata and unlinked reader verified')
+'''
+        return [sys.executable,'-I','-S','-c',code]
+
+    def test_source_metadata_changes_fit_checkout_disk_budget(self):
+        command=self.source_metadata_fixture()
+        clone=self.root/'clone'
+        result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
+                              env=self.environment(),capture_output=True,timeout=20)
+        self.assert_success(result)
+        # A checkout already owns its one payload copy before chmod.
+        direct=subprocess.run(command,
+                              cwd=clone,env=self.environment(),capture_output=True,timeout=20)
+        self.assert_success(direct)
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+        self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+        self.assert_no_runtime_files()
+
+    def test_source_metadata_changes_succeed_on_nine_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],self.source_metadata_fixture())
+        self.assert_no_runtime_files()
+
     def test_readonly_directory_pages_preserve_partial_seek_reopen_and_empty(self):
         from source_cache import directory_child_code,directory_names
         count=640

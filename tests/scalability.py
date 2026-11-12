@@ -112,9 +112,18 @@ def scenario_plan(backend,source,profile,policies,verification,sizes=None):
             assert selected_policies[0] in policies
             selected_modes=(True,) if True in modes else (False,)
         workloads=('enumerate',) if profile=='namespace' else ('noop','sparse','full') if profile=='exhaustive' or (backend=='fuse' and count<=1000) else ('full',)
+        lazy_policies={'none'} & set(selected_policies)
+        mutable=next((p for p in selected_policies if p!='none'),None)
+        if mutable:lazy_policies.add(mutable)
         for policy in selected_policies:
             for verify in selected_modes:
                 for workload in workloads:
+                    # Full reads retain every policy/signature interaction.
+                    # Read-only commands need one protected and one mutable
+                    # case; signing is independently exercised by full reads.
+                    if profile=='matrix' and workload in ('noop','sparse') and (
+                            policy not in lazy_policies or verify!=selected_modes[-1]):
+                        continue
                     invocations=('first','repeat') if source=='remote' and profile=='exhaustive' else ('first',) if source=='remote' else ('local',)
                     for invocation in invocations:
                         cases.append(dict(files=count,policy=policy,verify=verify,workload=workload,invocation=invocation))

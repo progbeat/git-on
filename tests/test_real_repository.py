@@ -1,5 +1,6 @@
 """Synthetic harness regressions; these fixtures are not WebKit executions."""
 import copy
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,28 @@ def report():
 
 
 class RealRepositoryTests(unittest.TestCase):
+    def test_report_can_be_repeated_with_untracked_output_but_rejects_changed_sources(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.chdir(temporary):
+            def git(*args):
+                subprocess.run(['git',*args],check=True,capture_output=True)
+            git('init','-q')
+            Path('source').write_text('committed')
+            git('add','source')
+            git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture')
+            options=SimpleNamespace(binary=Path(__file__).resolve(),output=Path('webkit-results.jsonl'),summary=None)
+            with mock.patch('process_capture.capture',return_value=report()['runner']), \
+                 mock.patch('real_repository.Path.is_char_device',return_value=True), \
+                 mock.patch('real_repository.shutil.which',return_value='/usr/bin/fusermount3'), \
+                 mock.patch('builtins.print'):
+                run(options)
+                self.assertTrue(options.output.exists())
+                run(options)
+                self.assertFalse(json.loads(options.output.read_text())['working_tree_dirty'])
+                Path('source').write_text('edited')
+                with self.assertRaises(ValueError):run(options)
+                git('add','source')
+                with self.assertRaises(ValueError):run(options)
+
     def test_small_command_runs_twice_without_scanning_unrelated_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
@@ -66,7 +89,7 @@ class RealRepositoryTests(unittest.TestCase):
                         summary=Path(temporary)/f'{eager}.md')
                     def git_metadata(argv,**kwargs):
                         if argv==['git','rev-parse','HEAD']:return 'c'*40+'\n'
-                        if argv==['git','status','--porcelain']:return b''
+                        if argv==['git','diff','--name-only','HEAD']:return b''
                         self.fail(f'unexpected preparation command: {argv}')
                     with mock.patch('process_capture.capture',return_value=result) as captured, \
                          mock.patch('real_repository.subprocess.check_output',side_effect=git_metadata), \
