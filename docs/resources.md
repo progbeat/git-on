@@ -43,8 +43,10 @@ cover enumerated directories and do not preload leaf contents or subtrees.
 Raw backing uses one file per prepared original object. Readers share a retained
 raw descriptor rather than keeping an open file for each object. Disk usage
 grows with prepared data, including evicted small objects and streamed large
-objects. Protocol packs and native decoder output can also require transient
-bounded-part staging. Temporary files obey inherited file-size and descriptor
+objects. Compressed protocol packs and decoder requests can also require transient
+bounded-part staging. Native decoder output streams through OID verification
+into the raw object; it has no complete decoded staging file.
+Temporary files obey inherited file-size and descriptor
 limits. All invocation-owned storage is released by successful cleanup; failed
 cleanup follows the documented recovery contract.
 Git-on catches `SIGXFSZ` from its own writes so `EFBIG` follows normal error

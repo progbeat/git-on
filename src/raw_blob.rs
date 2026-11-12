@@ -365,7 +365,6 @@ impl RawBlobs {
                 memory_limit: MEMORY_BUDGET,
                 memory_high_water: 0,
                 scratch: None,
-                output: None,
                 failure: None,
                 blob_entries: 0,
                 blob_bytes: 0,
@@ -528,29 +527,6 @@ impl RawBlobs {
             .unwrap_or_else(|e| e.into_inner())
             .scratch_file()
     }
-    pub(crate) fn create_output(&self) -> Result<RawOutput> {
-        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let file = Arc::new(store.scratch_file()?);
-        store.output = Some(file.clone());
-        Ok(RawOutput { file })
-    }
-    pub(crate) fn output_reader(&self) -> Result<impl Read> {
-        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let file = store
-            .output
-            .as_ref()
-            .context("no staged native output")?
-            .clone();
-        let size = file.len()?;
-        Ok(StagedReader {
-            file,
-            size,
-            position: 0,
-        })
-    }
-    pub(crate) fn release_output(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).output = None;
-    }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
         Ok(self
@@ -643,7 +619,6 @@ struct Store {
     memory_limit: usize,
     memory_high_water: usize,
     scratch: Option<Files>,
-    output: Option<Arc<Spool>>,
     failure: Option<String>,
     blob_entries: u64,
     blob_bytes: u64,
@@ -769,34 +744,6 @@ impl<W: Write> Write for Blocks<W> {
         self.output.flush()
     }
 }
-pub(crate) struct RawOutput {
-    file: Arc<Spool>,
-}
-impl Write for RawOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        (&*self.file).write(bytes)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-struct StagedReader {
-    file: Arc<Spool>,
-    size: u64,
-    position: u64,
-}
-impl Read for StagedReader {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let length = self
-            .size
-            .saturating_sub(self.position)
-            .min(bytes.len() as u64) as usize;
-        let count = self.file.read_at(&mut bytes[..length], self.position)?;
-        self.position += count as u64;
-        Ok(count)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,22 +1106,11 @@ mod tests {
         assert_eq!(store.entries(), 2);
     }
     #[test]
-    fn native_staging_is_bounded_and_read_marking_survives_reopen() {
+    fn fetched_read_marking_survives_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
-        store.state.lock().unwrap().scratch =
-            Some(Files::with_limit(directory.path(), Some(3)).unwrap());
-        let mut output = store.create_output().unwrap();
-        output.write_all(b"headergood\n").unwrap();
-        drop(output);
         let oid = Oid::hash_object(ObjectType::Blob, b"good").unwrap();
-        let mut input = store.output_reader().unwrap();
-        let mut header = [0; 6];
-        input.read_exact(&mut header).unwrap();
-        assert_eq!(&header, b"header");
-        let input = input.take(4);
-        store.insert_fetched(oid, 4, input).unwrap();
-        store.release_output();
+        store.insert_fetched(oid, 4, b"good".as_slice()).unwrap();
         for first in [true, false] {
             let (blob, used) = store.for_read(oid).unwrap().unwrap();
             assert_eq!(used, first);

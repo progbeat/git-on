@@ -343,6 +343,60 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
 class FuseTests(RepositoryTest):
+    def lazy_native_stat_fixture(self):
+        size=7*1024*1024
+        (self.repo/'large').write_bytes(b'x'*size)
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','lazy native decode disk budget')
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        # An explicit fsck policy retains native fetch/cat-file rather than the
+        # reusable protocol session. The oracle inherits the same Git setting.
+        config=dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+        return self.repo.as_uri(),['stat','-c','%s','large'],config,size
+
+    def test_lazy_native_stat_writes_one_decoded_payload(self):
+        source,_,config,_=self.lazy_native_stat_fixture()
+        def write_bytes():
+            return int(dict(line.split(': ',1) for line in Path('/proc/self/io').read_text().splitlines())['write_bytes'])
+        before=write_bytes()
+        probe=self.system_tmp/'accounting-probe';probe.write_bytes(b'x'*65536);probe.unlink()
+        if write_bytes()-before<65536:
+            self.skipTest('temporary filesystem does not account block writes; tmpfs quota is checked separately')
+        # /proc accounts disk writes by every runner thread and reaped child.
+        # Socket writes are excluded. A complete decoder
+        # staging copy followed by raw publication exceeds this one-copy budget
+        # even if both files disappear before stat returns to the command.
+        command=[sys.executable,'-I','-S','-c',r'''
+import os
+from pathlib import Path
+def written():
+ return int(dict(line.split(': ',1) for line in Path(f'/proc/{os.getppid()}/io').read_text().splitlines())['write_bytes'])
+before=written()
+size=Path('large').stat().st_size
+assert size==7*1024*1024,size
+count=written()-before
+assert count<size+1024*1024,('stat wrote duplicate decoded payloads',count,size)
+print(size)
+''']
+        env=dict(self.environment(),**config)
+        clone=self.root/'clone'
+        result=subprocess.run(['git','clone','--no-local','--quiet',source,str(clone)],
+                              env=env,capture_output=True,timeout=20)
+        self.assert_success(result)
+        direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
+        self.assert_success(direct)
+        result=subprocess.run([str(BINARY),source,'HEAD','--write-policy=none','--',*command],
+                              cwd=self.repo,env=env,capture_output=True,timeout=30)
+        self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+        self.assert_no_runtime_files()
+
+    def test_lazy_native_stat_succeeds_on_nine_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        source,command,_,_=self.lazy_native_stat_fixture()
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],command,
+                         source=source,write_policy='none',git_config={'fetch.fsckObjects':'false'})
+        self.assert_no_runtime_files()
+
     def writable_open_fixture(self,mutation='read'):
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','writable open disk budget')

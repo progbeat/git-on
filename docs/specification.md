@@ -236,7 +236,7 @@ checkout or a complete in-memory copy of the selected tree.
    validation must not be introduced as an implicit startup prerequisite.
 
 The explicit [interview acceptance contract](interview.md#interview) is mandatory
-for [1.4.0 issue #20](https://github.com/progbeat/git-on/issues/20):
+for [issue #20](https://github.com/progbeat/git-on/issues/20):
 
 T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
 

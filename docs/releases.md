@@ -36,6 +36,8 @@ cannot identify one edge, validation fails explicitly instead of guessing its ki
 Use patch for backwards-compatible binary bug fixes. Use minor for new
 backwards-compatible capabilities, such as an optional write policy. Use major for
 breaking the documented CLI, filesystem, environment or platform contract.
+Changing whether a signal interrupts an individual filesystem operation is a
+filesystem contract change, including removal of documented EINTR behavior.
 Correcting git-on's custom argument handling to restore the intended native Git
 semantics is a bug fix; a release that also adds write policies uses a minor bump.
 This classification includes using native Git for local resolution: direct

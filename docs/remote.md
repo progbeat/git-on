@@ -160,8 +160,12 @@ range rechecks file type, owner, link count and trusted length, even on descript
 reuse, then authenticates its blocks. A different object replaces the single
 read slot. Active import/spill writes need an additional temporary descriptor.
 Blob readers hold object descriptors rather than cached payloads or open files.
-Native transport/decoder staging still uses bounded logical parts capped by
-inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
+Compressed transport packs and decoder requests use bounded logical parts capped
+by inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
+Native decoder stdout is consumed directly: each object's canonical OID is
+verified while its bytes enter RAM or its sole raw file. No complete decoded
+output file is retained between decoding and publication. A failed consumer
+stops and reaps the decoder; unsuccessful native exit still fails the import.
 The private files stay outside the execution view and are removed with their
 owning store/readers during invocation cleanup. Retained-raw disk metrics are
 separate from active-reader and bounded payload-memory metrics. No cross-run

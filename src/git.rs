@@ -283,16 +283,16 @@ pub(crate) fn run_with_input(
 ) -> Result<std::process::Output> {
     run_captured(command, capture, capture, None, Some(&mut input))
 }
-/// A bounded pipe transfer is needed when inherited per-file limits require
-/// segmented staging. The caller thread retains request cancellation/TTY
-/// ownership; a writer failure stops the owned native operation as well.
-pub(crate) fn run_to_writer<W: std::io::Write + Send>(
+/// Stream native stdout to its consumer while the caller retains process,
+/// cancellation and terminal supervision. The consumer must read to EOF or fail;
+/// its errors stop and reap the owned operation before they are returned.
+pub(crate) fn run_with_output<T: Send>(
     mut command: Command,
-    mut output: W,
     input: Option<&mut dyn std::io::Read>,
-) -> Result<std::process::Output> {
+    consume: impl FnOnce(&mut dyn std::io::Read) -> Result<T> + Send,
+) -> Result<(std::process::Output, T)> {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
     command.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
         writer,
     )));
@@ -303,51 +303,76 @@ pub(crate) fn run_to_writer<W: std::io::Write + Send>(
         let transfer = std::thread::Builder::new()
             .name("git-output".into())
             .spawn_scoped(scope, || {
-                let result = copy_native_output(&mut reader, &mut output, &finished, |input| {
-                    input.set_nonblocking(true)
-                });
+                let mut output = NativeOutput {
+                    reader,
+                    finished: &finished,
+                    start_drain: Some(|input: &mut std::os::unix::net::UnixStream| {
+                        input.set_nonblocking(true)
+                    }),
+                };
+                let result = consume(&mut output);
                 failed.store(result.is_err(), Ordering::Release);
                 result
             })?;
         let result = run_captured(command, false, true, Some(&failed), input);
         finished.store(true, Ordering::Release);
-        transfer
+        let value = transfer
             .join()
-            .map_err(|_| anyhow::anyhow!("native output writer panicked"))??;
-        result
+            .map_err(|_| anyhow::anyhow!("native output consumer panicked"))??;
+        Ok((result?, value))
     })
 }
 
-fn copy_native_output<R: std::io::Read>(
-    reader: &mut R,
-    output: &mut impl std::io::Write,
-    finished: &std::sync::atomic::AtomicBool,
-    start_drain: impl FnOnce(&mut R) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut bytes = [0; 64 * 1024];
-    let mut start_drain = Some(start_drain);
-    loop {
-        match reader.read(&mut bytes) {
-            Ok(0) => return Ok(()),
-            Ok(count) => output.write_all(&bytes[..count])?,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if finished.load(std::sync::atomic::Ordering::Acquire) {
-                    // The read may have timed out before the final native
-                    // write/exit became visible. Retry after observing exit,
-                    // draining queued bytes without another timeout delay.
-                    match start_drain.take() {
-                        Some(prepare) => prepare(reader)?,
-                        None => return Ok(()),
+pub(crate) fn run_to_writer<W: std::io::Write + Send>(
+    command: Command,
+    mut output: W,
+    input: Option<&mut dyn std::io::Read>,
+) -> Result<std::process::Output> {
+    run_with_output(command, input, |reader| {
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            let count = reader.read(&mut bytes)?;
+            if count == 0 {
+                return Ok(());
+            }
+            output.write_all(&bytes[..count])?;
+        }
+    })
+    .map(|(result, ())| result)
+}
+
+struct NativeOutput<'a, R, F> {
+    reader: R,
+    finished: &'a std::sync::atomic::AtomicBool,
+    start_drain: Option<F>,
+}
+impl<R: std::io::Read, F: FnOnce(&mut R) -> std::io::Result<()>> std::io::Read
+    for NativeOutput<'_, R, F>
+{
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Preserve typed cancellation rather than reporting truncated Git
+            // data after the supervisor closes an interrupted decoder's pipe.
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            match self.reader.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+                        // A timeout can precede the final write/exit. Observe
+                        // completion before freshly draining queued bytes.
+                        match self.start_drain.take() {
+                            Some(prepare) => prepare(&mut self.reader)?,
+                            None => return Ok(0),
+                        }
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
         }
     }
 }
@@ -426,7 +451,7 @@ fn run_captured(
         }
         if failed_output.is_some_and(|failed| failed.load(std::sync::atomic::Ordering::Acquire)) {
             break stop_request_operation(&mut child)
-                .and(Err(anyhow::anyhow!("native Git output staging failed")));
+                .and(Err(anyhow::anyhow!("native Git output consumer failed")));
         }
         if let Some(signal) = cancelled_signal() {
             unsafe {
@@ -751,6 +776,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streamed_output_retains_the_native_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf payload; exit 42"]);
+        let (result, bytes) = run_with_output(command, None, |reader| {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(result.status.code(), Some(42));
+    }
+
     fn wait_for_pid(path: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -857,10 +896,14 @@ mod output_race_tests {
         let finished = AtomicBool::new(false);
         let mut input = input(&finished);
         let mut output = Vec::new();
-        copy_native_output(&mut input, &mut output, &finished, |input| {
-            input.input.set_nonblocking(true)
-        })
-        .unwrap();
+        let mut reader = NativeOutput {
+            reader: &mut input,
+            finished: &finished,
+            start_drain: Some(|input: &mut &mut StaleTimeout<'_>| {
+                input.input.set_nonblocking(true)
+            }),
+        };
+        io::copy(&mut reader, &mut output).unwrap();
         assert_eq!(output, b"verified output queued before exit");
     }
     #[test]
@@ -876,11 +919,13 @@ mod output_race_tests {
         }
         let finished = AtomicBool::new(false);
         let mut input = input(&finished);
-        assert!(
-            copy_native_output(&mut input, &mut Failed, &finished, |input| input
-                .input
-                .set_nonblocking(true))
-            .is_err()
-        );
+        let mut reader = NativeOutput {
+            reader: &mut input,
+            finished: &finished,
+            start_drain: Some(|input: &mut &mut StaleTimeout<'_>| {
+                input.input.set_nonblocking(true)
+            }),
+        };
+        assert!(io::copy(&mut reader, &mut Failed).is_err());
     }
 }

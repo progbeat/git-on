@@ -927,7 +927,6 @@ impl Remote {
             return Ok(());
         }
         requests.rewind()?;
-        let mut output_file = self.raw_blobs.create_output()?;
         let mut command = self.git.command(Some(&self.dir));
         command
             .env(
@@ -941,7 +940,11 @@ impl Remote {
                 "--batch",
                 "--buffer",
             ]);
-        let output = crate::git::run_to_writer(command, &mut output_file, Some(&mut requests))
+        let remote = &mut *self;
+        let (output, ()) =
+            crate::git::run_with_output(command, Some(&mut requests), move |input| {
+                remote.import_raw_output(&destination, input)
+            })
             .context("decode received objects into run-local raw storage")?;
         if !output.status.success() {
             bail!(
@@ -949,9 +952,6 @@ impl Remote {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let imported = self.import_raw_output(&destination);
-        self.raw_blobs.release_output();
-        imported?;
         self.decode_operations += 1;
         Ok(())
     }
@@ -986,8 +986,8 @@ impl Remote {
         }
         Ok(())
     }
-    fn import_raw_output(&mut self, destination: &Repository) -> Result<()> {
-        let mut input = BufReader::new(self.raw_blobs.output_reader()?);
+    fn import_raw_output(&mut self, destination: &Repository, input: impl Read) -> Result<()> {
+        let mut input = BufReader::new(input);
         loop {
             crate::object::check_transfer()?;
             let mut header = Vec::new();
