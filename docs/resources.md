@@ -55,13 +55,19 @@ inherited file-size limit: a want count cannot bound native Git's resulting
 pack size. Unrestricted runs retain batching. Request stdin is streamed through
 a channel; decoder request staging uses bounded parts.
 
-Local explicit-all materialization verifies object bytes directly into the
+Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects
 stream; packed/delta objects retain libgit2's required decoding. A repeated OID
 reuses a prepared file or symlink target across directories, authenticating the
 copied bytes against that original OID. File copies remain independent. The
 command starts only after every destination has passed verification and policy
-checks. Remote materialization retains its invocation-owned verified raw store.
+checks. Remote materialization isolates each received compressed pack. Only the
+pack currently being decoded has an open ODB; it is released with its indexes
+after its last needed blob reaches the execution tree. Blobs up to 64 KiB use
+the ODB transfer; larger blobs stream from
+native Git through the same OID verifier into their destination, without a
+decoded raw spool. Repeated OIDs reuse verified files or symlink targets in the
+execution tree. Lazy FUSE reads retain the invocation-owned verified raw store.
 
 In FUSE, metadata and namespace changes preserve the source OID without loading
 or copying its payload. Read handles, hard links and unlinked inodes retain

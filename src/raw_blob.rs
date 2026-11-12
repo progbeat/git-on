@@ -109,7 +109,7 @@ impl RawBlob {
             // Preserve storage failures for the remote runner's final status,
             // including after a caller catches EIO or all handles close.
             let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if store.failure.is_none() {
+            if !crate::object::is_cancelled(error) && store.failure.is_none() {
                 store.failure = Some(format!("{error:#}"));
             }
         }

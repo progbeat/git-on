@@ -95,7 +95,8 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
     assert [p['completed'] for p in phases]==['first','repeat'],result
     assert all(p['files']==count and p['payload_bytes']==count*size and p['metadata_result_bytes']==count*stat_bytes for p in phases),result
     assert metrics['remote_fetches']==count+2,metrics
-    assert metrics['remote_raw_blob_imports']==count and metrics['remote_raw_blob_bytes']==count*size,metrics
+    raw_count=0 if backend=='materialized' else count
+    assert metrics['remote_raw_blob_imports']==raw_count and metrics['remote_raw_blob_bytes']==raw_count*size,metrics
     assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen'
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
     if backend:
@@ -103,7 +104,10 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
         session_fetches=metrics.get('remote_session_fetch_operations',0)
         session_decodes=metrics.get('remote_session_decode_operations',0)
         assert metrics['remote_fetch_operations']+session_fetches==operations,metrics
-        assert metrics['remote_decode_operations']+session_decodes==operations,metrics
+        streamed=metrics.get('streamed_blob_loads',0)
+        assert 0<=streamed<=count,metrics
+        decodes=2+streamed if backend=='materialized' else operations
+        assert metrics['remote_decode_operations']+session_decodes==decodes,metrics
         if session_fetches:assert metrics['remote_session_starts']==1,metrics
     if backend:
         native=result['native_commands']

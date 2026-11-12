@@ -12,7 +12,7 @@ from evidence_fixtures import object_reuse_row
 
 
 class ObjectReuseTests(unittest.TestCase):
-    def test_gate_requires_current_head_complete_two_passes_and_native_commands(self):
+    def test_gate_requires_current_head_clean_sources_and_unique_complete_backends(self):
         head='a'*40
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
@@ -20,13 +20,10 @@ class ObjectReuseTests(unittest.TestCase):
                 (root/f'object-reuse-{backend}.jsonl').write_text(json.dumps(object_reuse_row(head,backend))+'\n')
             validate_object_reuse(dict(head=head),root)
             path=root/'object-reuse-materialized.jsonl';good=json.loads(path.read_text())
-            for change in ('stale','decode','native','unpack','duplicate','stat'):
+            for change in ('stale','dirty','duplicate'):
                 row=copy.deepcopy(good)
                 if change=='stale':row['head']='b'*40
-                elif change=='decode':row['metrics']['blob_loads']+=1
-                elif change=='native':row['native_commands']['cat-file']+=1
-                elif change=='unpack':row['native_commands']['unpack-objects']=1
-                elif change=='stat':row['stat_abi_bytes']=0
+                elif change=='dirty':row['working_tree_dirty']=True
                 content=json.dumps(row)+'\n'
                 if change=='duplicate':content+=content
                 path.write_text(content)
@@ -58,14 +55,20 @@ class ObjectReuseTests(unittest.TestCase):
             self.assertNotEqual(subprocess.run([sys.executable,'-I','-S','-c',CHILD,'3','32','144'],cwd=root,capture_output=True).returncode,0)
 
     def test_validator_rejects_repeated_decode_missing_phase_and_wrong_import_bytes(self):
-        good=dict(child_observations=[dict(completed=p,files=160,payload_bytes=1310720,metadata_result_bytes=23040) for p in ('first','repeat')],
-            metrics=dict(remote_fetches=162,remote_raw_blob_imports=160,remote_raw_blob_bytes=1310720,blob_loads=160,blob_cache_bytes=100,blob_cache_limit=8388608))
-        validate_runner(good,160,8192,144)
-        for key in ('remote_fetches','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads'):
-            broken=copy.deepcopy(good);broken['metrics'][key]+=1
-            with self.assertRaises(AssertionError):validate_runner(broken,160,8192,144)
-        broken=copy.deepcopy(good);broken['child_observations'].pop()
-        with self.assertRaises(AssertionError):validate_runner(broken,160,8192,144)
+        for backend in ('fuse','materialized'):
+            good=object_reuse_row('a'*40,backend);count=good['files']
+            validate_runner(good,count,8192,144,backend)
+            for change in ('remote_fetches','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads',
+                           'remote_decode_operations','native','unpack','phase','payload','stat'):
+                broken=copy.deepcopy(good)
+                if change in broken['metrics']:broken['metrics'][change]+=1
+                elif change=='native':broken['native_commands']['cat-file']+=1
+                elif change=='unpack':broken['native_commands']['unpack-objects']=1
+                elif change=='phase':broken['child_observations'].pop()
+                elif change=='payload':broken['child_observations'][0]['payload_bytes']+=1
+                elif change=='stat':broken['child_observations'][0]['metadata_result_bytes']=0
+                with self.subTest(backend=backend,change=change),self.assertRaises(AssertionError):
+                    validate_runner(broken,count,8192,144,backend)
 
     def test_session_counts_replace_native_demands_without_hiding_repeat_work(self):
         good=dict(child_observations=[dict(completed=p,files=160,payload_bytes=1310720,metadata_result_bytes=23040) for p in ('first','repeat')],

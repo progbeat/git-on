@@ -25,7 +25,7 @@ def allocated():
 '''
 
 
-def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9):
+def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, source=None):
     unshare=shutil.which('unshare')
     if not unshare:
         if os.environ.get('GITHUB_ACTIONS')=='true':test.fail('unshare is required for quota coverage')
@@ -48,7 +48,7 @@ def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9):
     driver=r'''
 import json,os,shutil,subprocess,sys
 from pathlib import Path
-volume,binary,repo,mount,programs,uid,gid,command,size=sys.argv[1:]
+volume,binary,repo,mount,programs,uid,gid,command,size,source=sys.argv[1:]
 uid,gid,size=int(uid),int(gid),int(size);volume=Path(volume);command=json.loads(command)
 subprocess.run([mount,'-t','tmpfs','-o',f'size={size}m,mode=700,uid={uid},gid={gid}','tmpfs',str(volume)],check=True)
 if os.geteuid()==0 and uid!=0:
@@ -61,14 +61,15 @@ env.update(PATH=programs,TMPDIR=str(temporary),HOME=str(home),XDG_CONFIG_HOME=st
 clone=volume/'clone'
 before=os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize
 assert before<=size*1024*1024,before
-result=subprocess.run(['git','clone','--no-local','--quiet',repo,str(clone)],env=env,capture_output=True)
+result=subprocess.run(['git','clone','--no-local','--quiet',source or repo,str(clone)],env=env,capture_output=True)
 assert result.returncode==0,result.stderr
 direct=subprocess.run(command,cwd=clone,env=env,capture_output=True)
 assert direct.returncode==0,direct.stderr
 print('native clone + command passed on tmpfs',flush=True)
 shutil.rmtree(clone)
 assert os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize==before,'baseline did not restore initial free space'
-result=subprocess.run([binary,'HEAD','--write-policy=all','--',*command],cwd=repo,env=env,capture_output=True)
+operands=[source,'HEAD'] if source else ['HEAD']
+result=subprocess.run([binary,*operands,'--write-policy=all','--',*command],cwd=repo,env=env,capture_output=True)
 assert result.returncode==0,(result.returncode,result.stderr)
 assert result.stdout==direct.stdout
 assert list(temporary.iterdir())==[]
@@ -76,6 +77,6 @@ print('git-on + command passed on tmpfs',flush=True)
 '''
     result=subprocess.run([*prefix,sys.executable,'-I','-S','-c',driver,str(volume),str(binary),
                            str(repo),shutil.which('mount'),programs,str(uid),str(gid),
-                           json.dumps(command),str(size_mib)],capture_output=True,timeout=30)
+                           json.dumps(command),str(size_mib),source or ''],capture_output=True,timeout=30)
     test.assertEqual(result.returncode,0,result.stderr)
     test.assertIn(b'git-on + command passed on tmpfs',result.stdout)

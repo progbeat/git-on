@@ -822,22 +822,28 @@ impl Snapshot {
             })
             .collect()
     }
-    pub(crate) fn prepare_materialization(&self, children: &[(OsString, Entry)]) -> Result<()> {
+    pub(crate) fn begin_materialization(&self) -> Result<()> {
+        if let Some(remote) = &mut self.state()?.remote {
+            remote.begin_materialization();
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_materialization(
+        &self,
+        children: &[(OsString, Entry)],
+        prepared: impl Fn(Oid) -> bool,
+    ) -> Result<()> {
         let mut state = self.state()?;
         let State { repo, remote, .. } = &mut *state;
         let Some(remote) = remote else { return Ok(()) };
-        // Bounded requests avoid argv limits and O(repository-size) request RAM.
-        // Repeated OIDs in a directory are deduplicated within each batch and
-        // later batches reuse already prepared objects.
-        for children in children.chunks(256) {
-            let oids: Vec<_> = children
-                .iter()
-                .filter(|(_, entry)| entry.mode != 0o160000)
-                .map(|(_, entry)| entry.oid)
-                .collect();
-            remote.ensure_batch_in(repo, &oids)?;
-        }
-        Ok(())
+        // The materializer supplies bounded batches and reuses completed
+        // destinations across batches/directories instead of fetching again.
+        let oids: Vec<_> = children
+            .iter()
+            .filter(|(_, entry)| entry.mode != 0o160000 && !prepared(entry.oid))
+            .map(|(_, entry)| entry.oid)
+            .collect();
+        remote.ensure_batch_in(repo, &oids)
     }
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
@@ -865,10 +871,16 @@ impl Snapshot {
     pub(crate) fn copy_verified_blob(
         &self,
         oid: Oid,
-        output: &mut dyn std::io::Write,
+        output: &mut (dyn std::io::Write + Send),
     ) -> Result<u64> {
         let mut state = self.state()?;
-        if state.remote.is_some()
+        if state
+            .remote
+            .as_ref()
+            .map(|remote| remote.raw_blobs.get(oid))
+            .transpose()?
+            .flatten()
+            .is_some()
             || state
                 .raw_blobs
                 .as_ref()
@@ -891,6 +903,19 @@ impl Snapshot {
             if size == 0 {
                 reader.read(0, 1)?;
             }
+            return Ok(size);
+        }
+        state.ensure(oid)?;
+        if let Some(remote) = state
+            .remote
+            .as_mut()
+            .filter(|remote| remote.has_materialized_blob(oid))
+        {
+            let (size, streamed) =
+                remote.copy_materialized_blob(oid, output, State::validate_blob)?;
+            state.metrics.blob_loads += 1;
+            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size);
+            state.metrics.streamed_blob_loads += u64::from(streamed);
             return Ok(size);
         }
         let odb = state.repo.odb()?;

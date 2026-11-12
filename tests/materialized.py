@@ -191,13 +191,13 @@ print(os.environ['GIT_ON_TREE_OID'])
             self.assertEqual(result.stdout.strip(), self.oid)
             self.clean()
 
-    def large_local_fixture(self):
-        (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
+    def large_local_fixture(self,size=6*1024*1024):
+        (self.repo/'large').write_bytes(b'x'*size)
         self.git('add','.'); self.git('commit','-qm','materialization disk budget')
         self.before=self.git('status','--porcelain')
-        return [sys.executable,'-I','-S','-c',"""
+        return [sys.executable,'-I','-S','-c',f"""
 from pathlib import Path
-assert Path('large').read_bytes()==b'x'*(6*1024*1024)
+assert Path('large').read_bytes()==b'x'*{size}
 root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
 allocated=sum(p.lstat().st_blocks*512 for p in root.rglob('*'))
 assert allocated < 9*1024*1024, ('materialization disk allocation',allocated)
@@ -225,6 +225,32 @@ print('large file verified')
     def test_large_local_materialization_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         compare_on_tmpfs(self,self.root,BINARY,self.repo,self.env['PATH'],self.large_local_fixture())
+        self.clean()
+
+    def remote_materialization_fixture(self):
+        command=self.large_local_fixture(7*1024*1024)
+        self.git('config','uploadpack.allowFilter','true')
+        self.git('config','uploadpack.allowAnySHA1InWant','true')
+        return self.repo.as_uri(),command
+
+    def test_large_remote_materialization_fits_checkout_disk_budget(self):
+        source,command=self.remote_materialization_fixture()
+        clone=self.root/'clone'
+        result=subprocess.run(['git','clone','--quiet',source,str(clone)],env=self.env,capture_output=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr)
+        direct=subprocess.run(command,cwd=clone,env=self.env,capture_output=True,timeout=20)
+        self.assertEqual(direct.returncode,0,direct.stderr)
+        result=subprocess.run([str(BINARY),source,'HEAD','--write-policy=all','--',*command],
+                              cwd=self.repo,env=self.env,capture_output=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,direct.stdout)
+        self.clean()
+
+    @unittest.skipUnless(sys.platform=='linux','private tmpfs quota requires Linux mount namespaces')
+    def test_large_remote_materialization_succeeds_on_nine_mib_tmpfs(self):
+        from filesystem_quota import compare_on_tmpfs
+        source,command=self.remote_materialization_fixture()
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,self.env['PATH'],command,source=source)
         self.clean()
 
     def test_command_status_and_signal_cleanup(self):

@@ -1,6 +1,6 @@
 //! Verified, cancellable transfers. libgit2 streams loose objects; its pack
 //! backend currently requires decoded objects (including necessary delta bases).
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
 use std::{
@@ -47,12 +47,24 @@ impl std::fmt::Display for InvalidObject {
 }
 impl std::error::Error for InvalidObject {}
 
+#[derive(Debug)]
+pub(crate) struct OperationCancelled;
+impl std::fmt::Display for OperationCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("owned operation cancelled")
+    }
+}
+impl std::error::Error for OperationCancelled {}
+pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<OperationCancelled>())
+}
 pub(crate) fn check_transfer() -> Result<()> {
     if let Some(signal) = crate::git::cancelled_signal() {
-        bail!("object transfer cancelled by signal {signal}");
+        return Err(OperationCancelled)
+            .context(format!("object transfer cancelled by signal {signal}"));
     }
     if crate::git::operations_stopped() {
-        bail!("object transfer stopped after command completion");
+        return Err(OperationCancelled).context("object transfer stopped after command completion");
     }
     Ok(())
 }
@@ -90,9 +102,7 @@ pub(crate) fn copy_verified(
     size: usize,
     oid: Oid,
 ) -> Result<()> {
-    let kind = kind.str();
-    let mut hash = Sha1::new();
-    hash.update(format!("{kind} {size}\0").as_bytes());
+    let mut output = VerifiedWriter::new(&mut output, kind, size, oid);
     let mut buffer = [0; 64 * 1024];
     let mut remaining = size;
     while remaining != 0 {
@@ -104,7 +114,6 @@ pub(crate) fn copy_verified(
         if count == 0 {
             return Err(InvalidObject(format!("truncated Git object {oid}")).into());
         }
-        hash.update(&buffer[..count]);
         #[cfg(test)]
         HASH_PROBE.with(|probe| {
             if let Some((tracked, bytes)) = probe.get() {
@@ -122,10 +131,55 @@ pub(crate) fn copy_verified(
     if input.read(&mut buffer[..1])? != 0 {
         return Err(InvalidObject(format!("oversized Git object {oid}")).into());
     }
-    if finish_sha1(hash)?.as_slice() != oid.as_bytes() {
-        return Err(InvalidObject(format!("Git object hash mismatch for {oid}")).into());
+    output.finish()
+}
+
+/// Authenticate the same buffers written to an unpublished destination. Native
+/// decoders can stream through this writer without a second decoded spool.
+pub(crate) struct VerifiedWriter<W> {
+    output: W,
+    hash: Sha1,
+    remaining: usize,
+    oid: Oid,
+}
+impl<W: Write> VerifiedWriter<W> {
+    pub(crate) fn new(output: W, kind: ObjectType, size: usize, oid: Oid) -> Self {
+        let mut hash = Sha1::new();
+        hash.update(format!("{} {size}\0", kind.str()).as_bytes());
+        Self {
+            output,
+            hash,
+            remaining: size,
+            oid,
+        }
     }
-    Ok(())
+    pub(crate) fn finish(self) -> Result<()> {
+        anyhow::ensure!(
+            self.remaining == 0,
+            InvalidObject(format!("truncated Git object {}", self.oid))
+        );
+        if finish_sha1(self.hash)?.as_slice() != self.oid.as_bytes() {
+            return Err(InvalidObject(format!("Git object hash mismatch for {}", self.oid)).into());
+        }
+        Ok(())
+    }
+}
+impl<W: Write> Write for VerifiedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other(InvalidObject(format!(
+                "oversized Git object {}",
+                self.oid
+            ))));
+        }
+        let count = self.output.write(bytes)?;
+        self.hash.update(&bytes[..count]);
+        self.remaining -= count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
 }
 
 /// The owned ODB buffer was verified before libgit2 returned it. Only the
@@ -197,6 +251,50 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_identity_survives_io_wrapping_without_hiding_real_faults() {
+        let cancelled = anyhow::Error::new(std::io::Error::other(
+            anyhow::Error::new(OperationCancelled).context("socket read"),
+        ))
+        .context("fetch remote object");
+        assert!(is_cancelled(&cancelled));
+        for error in [
+            anyhow::Error::new(InvalidObject("hash mismatch during cancellation".into())),
+            std::io::Error::from_raw_os_error(libc::EIO).into(),
+            anyhow::anyhow!("remote peer cancelled its request"),
+        ] {
+            assert!(!is_cancelled(&error));
+        }
+    }
+    #[test]
+    fn verified_writer_authenticates_partial_writes_and_rejects_invalid_lengths() {
+        struct Short(Vec<u8>);
+        impl Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = bytes.len().min(2);
+                self.0.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = b"verified";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        let mut destination = Short(Vec::new());
+        let mut writer = VerifiedWriter::new(&mut destination, ObjectType::Blob, bytes.len(), oid);
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(destination.0, bytes);
+        for invalid in [&b"short"[..], &b"modified"[..]] {
+            let mut writer =
+                VerifiedWriter::new(std::io::sink(), ObjectType::Blob, bytes.len(), oid);
+            writer.write_all(invalid).unwrap();
+            assert!(writer.finish().unwrap_err().is::<InvalidObject>());
+        }
+        let mut writer = VerifiedWriter::new(std::io::sink(), ObjectType::Blob, bytes.len(), oid);
+        assert!(writer.write_all(b"oversized").is_err());
+    }
     #[test]
     fn streaming_stops_after_command_completion_without_a_signal() {
         if std::env::var_os("GIT_ON_TRANSFER_STOP_CHILD").is_none() {

@@ -374,10 +374,12 @@ fn run_captured(
     };
     initialize_cancellation()?;
     if let Some(signal) = cancelled_signal() {
-        bail!("Git operation cancelled by signal {signal}");
+        return Err(crate::object::OperationCancelled)
+            .context(format!("Git operation cancelled by signal {signal}"));
     }
     if operations_stopped() {
-        bail!("Git operation stopped after command completion");
+        return Err(crate::object::OperationCancelled)
+            .context("Git operation stopped after command completion");
     }
     let mut input = input
         .map(|source| NativeInput::new(&mut command, source))
@@ -431,18 +433,16 @@ fn run_captured(
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
-            break Err(anyhow::anyhow!(
-                "Git operation cancelled by signal {signal}"
-            ));
+            break Err(crate::object::OperationCancelled)
+                .context(format!("Git operation cancelled by signal {signal}"));
         }
         if operations_stopped() {
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
-            break Err(anyhow::anyhow!(
-                "Git operation stopped after command completion"
-            ));
+            break Err(crate::object::OperationCancelled)
+                .context("Git operation stopped after command completion");
         }
         if let Some(stdin) = &mut input {
             match stdin.advance() {

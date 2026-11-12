@@ -2451,3 +2451,23 @@ and real-FUSE modes, returning -15 instead of the child's 42. The corrected
 regression passes in both modes and separately retains default termination by
 SIGTERM, checking cleanup in every case. RED/GREEN logs are retained under
 `/tmp/git-on-review-20261112-readwrite/` as `before.log` and `focused-after.log`.
+
+### Remote eager destination and cancellation identity
+
+The frozen ordinary `78ac642` release failed the 7 MiB `file://` materialization
+regression with 14,864,384 allocated bytes against 9 MiB; native clone plus the
+same command passed. Remote eager blobs now decode into their final files with
+OID verification, without decoded raw staging. Received packs are isolated and
+released after their last needed blob; only the active pack has an open ODB.
+Existing finite-FSIZE and 64-descriptor cases pass, as does the native-checkout
+disk comparison. A separate regression requires a real private 9 MiB tmpfs in
+Linux CI; local namespace denial is explicitly a skip. The 32/160-object and
+large streamed-object workloads verify single preparation and zero raw imports.
+
+The same frozen release returned -15 instead of 42 when a child handled forwarded
+SIGTERM during an active HTTPS read, through both a reusable session and native
+fetch. Both corrected cases pass; caught real ODB/raw faults still fail the run.
+Typed cancellation survives socket I/O context and is excluded from sticky
+transport/storage failures, without discarding actual integrity or I/O errors.
+Logs are under `/tmp/git-on-review-20261112-eager-cancel/`: `materialized-before.log`,
+`materialized.log`, `cancel-before.log` and `cancel-after.log`.

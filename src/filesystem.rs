@@ -728,52 +728,43 @@ impl Overlay {
     fn copy_up(&mut self, ino: u64, preserve_content: bool) -> FsResult<()> {
         self.writable(ino)?;
         let node = self.node(ino)?;
+        if node.attr.kind != FileType::RegularFile {
+            return Err(libc::EINVAL);
+        }
         let Some(oid) = node.oid else {
             return Ok(());
         };
-        let kind = node.attr.kind;
         let unlinked = node.attr.nlink == 0;
-        let mut bytes = Vec::new();
-        let file = if kind == FileType::RegularFile {
-            let disk_path = self.backing.join(ino.to_string());
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&disk_path)
-                .map_err(errno)?;
-            if let Err(error) = file.set_len(if preserve_content { node.attr.size } else { 0 }) {
-                drop(file);
-                let _ = fs::remove_file(disk_path);
-                return Err(errno(error));
-            }
-            if unlinked {
-                fs::remove_file(&disk_path).map_err(errno)?;
-            }
-            Some(file)
-        } else {
-            if kind == FileType::Symlink {
-                bytes = self._snapshot.read_link(oid).map_err(snapshot_errno)?;
-            }
-            None
-        };
+        let disk_path = self.backing.join(ino.to_string());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&disk_path)
+            .map_err(errno)?;
+        if let Err(error) = file.set_len(if preserve_content { node.attr.size } else { 0 }) {
+            drop(file);
+            let _ = fs::remove_file(disk_path);
+            return Err(errno(error));
+        }
+        if unlinked {
+            fs::remove_file(&disk_path).map_err(errno)?;
+        }
         let keep_file = unlinked || self.has_open_handle(ino);
         self.copy_metadata_up(ino)?;
         let node = self.node_mut(ino)?;
-        node.source = (kind == FileType::RegularFile && preserve_content && node.attr.size != 0)
-            .then(|| {
-                Box::new(SourceContent {
-                    oid,
-                    visible: node.attr.size,
-                    written: BTreeMap::new(),
-                })
-            });
+        node.source = (preserve_content && node.attr.size != 0).then(|| {
+            Box::new(SourceContent {
+                oid,
+                visible: node.attr.size,
+                written: BTreeMap::new(),
+            })
+        });
         node.oid = None;
-        node.bytes = bytes;
         if keep_file {
-            node.file = file;
+            node.file = Some(file);
         }
         let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
         while fh != 0 {

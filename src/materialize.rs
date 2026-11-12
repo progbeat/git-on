@@ -164,11 +164,18 @@ impl PreparedBlob {
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
     let _progress = crate::progress::MaterializationProgress::start();
     snapshot.set_spool_directory(root)?;
+    snapshot.begin_materialization()?;
+    let batch_size = if crate::spool::Files::size_limit()?.is_some() {
+        1
+    } else {
+        256
+    };
     directory(
         snapshot,
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
+        batch_size,
     )
 }
 fn directory(
@@ -176,111 +183,125 @@ fn directory(
     relative: &Path,
     root: &Path,
     prepared: &mut std::collections::HashMap<git2::Oid, PreparedBlob>,
+    batch_size: usize,
 ) -> Result<()> {
-    let children = snapshot.children(relative)?;
-    snapshot.prepare_materialization(&children)?;
+    let mut children = snapshot.children(relative)?.into_iter();
     let mut expected = std::collections::HashSet::new();
-    for (name, entry) in children {
-        if let Some(signal) = crate::git::cancelled_signal() {
-            bail!("materialization cancelled by signal {signal}");
+    loop {
+        let batch: Vec<_> = children.by_ref().take(batch_size).collect();
+        if batch.is_empty() {
+            break;
         }
-        let bytes = name.as_bytes();
-        ensure!(
-            !bytes.is_empty()
-                && bytes != b"."
-                && bytes != b".."
-                && !bytes.contains(&b'/')
-                && !bytes.contains(&0),
-            "unsupported snapshot name {:?}",
-            name
-        );
-        let relative = relative.join(&name);
-        let path = root.join(&relative);
-        ensure!(
-            entry.mode != 0o160000,
-            "submodules are unsupported: {}",
-            relative.display()
-        );
-        let result = (|| -> Result<()> {
-            match entry.kind {
-                EntryKind::Directory => {
-                    fs::create_dir(&path)?;
-                    directory(snapshot, &relative, root, prepared)?;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-                    ensure!(
-                        fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
-                        "host cannot preserve directory permissions"
-                    );
-                }
-                EntryKind::Symlink => {
-                    let target = if let Some(source) = prepared.get(&entry.oid) {
-                        let mut target = Vec::new();
-                        source.copy_to(root, entry.oid, &mut target)?;
+        snapshot.prepare_materialization(&batch, |oid| prepared.contains_key(&oid))?;
+        for (name, entry) in batch {
+            if let Some(signal) = crate::git::cancelled_signal() {
+                bail!("materialization cancelled by signal {signal}");
+            }
+            let bytes = name.as_bytes();
+            ensure!(
+                !bytes.is_empty()
+                    && bytes != b"."
+                    && bytes != b".."
+                    && !bytes.contains(&b'/')
+                    && !bytes.contains(&0),
+                "unsupported snapshot name {:?}",
+                name
+            );
+            let relative = relative.join(&name);
+            let path = root.join(&relative);
+            ensure!(
+                entry.mode != 0o160000,
+                "submodules are unsupported: {}",
+                relative.display()
+            );
+            let result = (|| -> Result<()> {
+                match entry.kind {
+                    EntryKind::Directory => {
+                        fs::create_dir(&path)?;
+                        directory(snapshot, &relative, root, prepared, batch_size)?;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
                         ensure!(
-                            !target.is_empty() && !target.contains(&0),
-                            "unusable symlink target"
-                        );
-                        target
-                    } else {
-                        snapshot.read_link(entry.oid)?
-                    };
-                    symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
-                    ensure!(
-                        fs::read_link(&path)?.as_os_str().as_bytes() == target,
-                        "host cannot preserve symlink target"
-                    );
-                    prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
-                        path: relative.clone(),
-                        size: target.len() as u64,
-                        kind: entry.kind,
-                    });
-                }
-                EntryKind::File => {
-                    let mut output = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .custom_flags(libc::O_NOFOLLOW)
-                        .open(&path)?;
-                    if let Some(source) = prepared.get(&entry.oid) {
-                        // Reuse decoded bytes across directories, while checking
-                        // the copied buffers against the original OID. Prepared
-                        // files are mutable disk and cannot be trusted on reopen.
-                        source.copy_to(root, entry.oid, &mut output)?;
-                    } else {
-                        let size = snapshot.copy_verified_blob(entry.oid, &mut output)?;
-                        prepared.insert(
-                            entry.oid,
-                            PreparedBlob {
-                                path: relative.clone(),
-                                size,
-                                kind: entry.kind,
-                            },
+                            fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
+                            "host cannot preserve directory permissions"
                         );
                     }
-                    let mode = entry.mode & 0o777;
-                    output.set_permissions(fs::Permissions::from_mode(mode))?;
-                    ensure!(
-                        output.metadata()?.permissions().mode() & 0o777 == mode,
-                        "host cannot preserve executable/permission bits"
-                    );
+                    EntryKind::Symlink => {
+                        let target = if let Some(source) = prepared.get(&entry.oid) {
+                            let mut target = Vec::new();
+                            source.copy_to(root, entry.oid, &mut target)?;
+                            ensure!(
+                                !target.is_empty() && !target.contains(&0),
+                                "unusable symlink target"
+                            );
+                            target
+                        } else {
+                            let mut target = Vec::new();
+                            snapshot.copy_verified_blob(entry.oid, &mut target)?;
+                            ensure!(
+                                !target.is_empty() && !target.contains(&0),
+                                "unusable symlink target"
+                            );
+                            target
+                        };
+                        symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
+                        ensure!(
+                            fs::read_link(&path)?.as_os_str().as_bytes() == target,
+                            "host cannot preserve symlink target"
+                        );
+                        prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
+                            path: relative.clone(),
+                            size: target.len() as u64,
+                            kind: entry.kind,
+                        });
+                    }
+                    EntryKind::File => {
+                        let mut output = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&path)?;
+                        if let Some(source) = prepared.get(&entry.oid) {
+                            // Reuse decoded bytes across directories, while checking
+                            // the copied buffers against the original OID. Prepared
+                            // files are mutable disk and cannot be trusted on reopen.
+                            source.copy_to(root, entry.oid, &mut output)?;
+                        } else {
+                            let size = snapshot.copy_verified_blob(entry.oid, &mut output)?;
+                            prepared.insert(
+                                entry.oid,
+                                PreparedBlob {
+                                    path: relative.clone(),
+                                    size,
+                                    kind: entry.kind,
+                                },
+                            );
+                        }
+                        let mode = entry.mode & 0o777;
+                        output.set_permissions(fs::Permissions::from_mode(mode))?;
+                        ensure!(
+                            output.metadata()?.permissions().mode() & 0o777 == mode,
+                            "host cannot preserve executable/permission bits"
+                        );
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+                {
+                    let existing =
+                        fs::read_dir(path.parent().context("missing materialized parent")?)?
+                            .map(|entry| entry.map(|entry| entry.file_name()))
+                            .collect::<std::io::Result<Vec<_>>>()?;
+                    bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
+                }
+                return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-            {
-                let existing = fs::read_dir(path.parent().context("missing materialized parent")?)?
-                    .map(|entry| entry.map(|entry| entry.file_name()))
-                    .collect::<std::io::Result<Vec<_>>>()?;
-                bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
-            }
-            return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
+            expected.insert(name);
         }
-        expected.insert(name);
     }
     let actual = fs::read_dir(root.join(relative))?
         .map(|e| e.map(|e| e.file_name()))

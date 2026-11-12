@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, Write},
@@ -16,6 +16,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -126,6 +127,11 @@ struct ControlClient {
     content_sha256: Option<[u8; 32]>,
 }
 
+struct ReceivedPack {
+    // Release ODB/index descriptors before deleting the owned directory.
+    repo: Repository,
+    directory: Arc<tempfile::TempDir>,
+}
 pub struct Remote {
     pub git: Git,
     pub dir: PathBuf,
@@ -147,6 +153,9 @@ pub struct Remote {
     ssh: Option<OsString>,
     control_client: Option<ControlClient>,
     failed: Option<String>,
+    materializing: bool,
+    materialized_blobs: HashMap<Oid, Arc<tempfile::TempDir>>,
+    active_materialized_pack: Option<ReceivedPack>,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
 }
 impl Remote {
@@ -237,6 +246,9 @@ impl Remote {
             ssh,
             control_client,
             failed: None,
+            materializing: false,
+            materialized_blobs: HashMap::new(),
+            active_materialized_pack: None,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
         // Authentication and host-key interaction happen here, before mounting.
@@ -378,13 +390,92 @@ impl Remote {
         self.fetch_operations += 1;
         Ok(oid)
     }
+    pub(crate) fn begin_materialization(&mut self) {
+        self.materializing = true;
+        self.session = None;
+    }
+    pub(crate) fn has_materialized_blob(&self, oid: Oid) -> bool {
+        self.materialized_blobs.contains_key(&oid)
+    }
+    pub(crate) fn copy_materialized_blob(
+        &mut self,
+        oid: Oid,
+        output: &mut (dyn Write + Send),
+        validate: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<(u64, bool)> {
+        let outcome = (|| {
+            let directory = self
+                .materialized_blobs
+                .get(&oid)
+                .context("missing materialization blob")?
+                .clone();
+            if self
+                .active_materialized_pack
+                .as_ref()
+                .is_none_or(|pack| !Arc::ptr_eq(&pack.directory, &directory))
+            {
+                self.active_materialized_pack = None;
+                self.active_materialized_pack = Some(ReceivedPack {
+                    repo: Repository::open_bare(directory.path())?,
+                    directory: directory.clone(),
+                });
+            }
+            drop(directory);
+            let pack = self.active_materialized_pack.as_ref().unwrap();
+            let odb = pack.repo.odb()?;
+            let (size, kind) = odb.read_header(oid)?;
+            anyhow::ensure!(
+                kind == git2::ObjectType::Blob,
+                "materialized file is not a blob"
+            );
+            let streamed = size > crate::raw_blob::BLOCK;
+            if streamed {
+                let mut checked = crate::object::VerifiedWriter::new(output, kind, size, oid);
+                let mut command = self.git.command(Some(pack.directory.path()));
+                command
+                    .args(["-c", "core.bigFileThreshold=8m", "cat-file", "blob"])
+                    .arg(oid.to_string());
+                let result = crate::git::run_to_writer(command, &mut checked, None)?;
+                self.decode_operations += 1;
+                anyhow::ensure!(
+                    result.status.success(),
+                    "cannot decode received Git blob: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                checked.finish()?;
+            } else {
+                let object = odb.read(oid)?;
+                anyhow::ensure!(
+                    object.id() == oid && object.len() == size && object.kind() == kind,
+                    "Git blob changed during transfer"
+                );
+                validate(object.data())?;
+                crate::object::copy_odb_blob(&object, output)?;
+            }
+            Ok((size as u64, streamed))
+        })();
+        if outcome.is_ok() {
+            self.materialized_blobs.remove(&oid);
+            if self
+                .active_materialized_pack
+                .as_ref()
+                .is_some_and(|pack| Arc::strong_count(&pack.directory) == 1)
+            {
+                self.active_materialized_pack = None;
+            }
+        }
+        self.record_result(outcome)
+    }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
         let repo = Repository::open_bare(&self.dir)?;
         self.ensure_in(&repo, oid)
     }
     pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let outcome = (|| {
-            if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
+            if self.has_materialized_blob(oid)
+                || self.raw_blobs.get(oid)?.is_some()
+                || repo.odb()?.exists(oid)
+            {
                 return Ok(());
             }
             self.fetch(repo, &[oid])
@@ -400,7 +491,11 @@ impl Remote {
             let mut unique = HashSet::new();
             let mut missing = Vec::new();
             for oid in oids {
-                if unique.insert(*oid) && self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+                if unique.insert(*oid)
+                    && !self.has_materialized_blob(*oid)
+                    && self.raw_blobs.get(*oid)?.is_none()
+                    && !odb.exists(*oid)
+                {
                     missing.push(*oid);
                 }
             }
@@ -424,11 +519,11 @@ impl Remote {
         })();
         self.record_result(outcome)
     }
-    fn record_result(&mut self, outcome: Result<()>) -> Result<()> {
+    fn record_result<T>(&mut self, outcome: Result<T>) -> Result<T> {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if self.failure().is_none() {
+            if !crate::object::is_cancelled(error) && self.failure().is_none() {
                 self.failed = Some(format!("{error:#}"));
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
@@ -441,7 +536,7 @@ impl Remote {
         if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
         }
-        if oids.len() == 1 && self.fetch_in_session(repo, oids[0])? {
+        if !self.materializing && oids.len() == 1 && self.fetch_in_session(repo, oids[0])? {
             return Ok(());
         }
         let mut command = self.command(false)?;
@@ -490,10 +585,17 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        self.import_received(true)?;
+        if self.materializing {
+            self.stage_materialization()?;
+        } else {
+            self.import_received(true)?;
+        }
         let odb = repo.odb()?;
         for oid in oids {
-            if self.raw_blobs.get(*oid)?.is_none() && !odb.exists(*oid) {
+            if !self.has_materialized_blob(*oid)
+                && self.raw_blobs.get(*oid)?.is_none()
+                && !odb.exists(*oid)
+            {
                 bail!("filtered remote fetch did not supply requested object {oid}");
             }
         }
@@ -707,7 +809,7 @@ impl Remote {
     /// demands. Decode only new received objects directly into raw run storage,
     /// then release their files/indexes before the next operation. The private
     /// repository has one serialized writer and no auto-maintenance.
-    fn import_received(&mut self, count_transfer: bool) -> Result<()> {
+    fn take_received(&mut self, count_transfer: bool) -> Result<Option<ReceivedPack>> {
         let pack_directory = self.dir.join("objects/pack");
         let mut received = Vec::new();
         for entry in fs::read_dir(&pack_directory)? {
@@ -727,11 +829,13 @@ impl Remote {
             }
         }
         if received.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let staging = tempfile::Builder::new()
-            .prefix("received-pack-")
-            .tempdir_in(&self.dir)?;
+        let staging = Arc::new(
+            tempfile::Builder::new()
+                .prefix("received-pack-")
+                .tempdir_in(&self.dir)?,
+        );
         let mut options = git2::RepositoryInitOptions::new();
         options.bare(true).external_template(false);
         let staging_repo = Repository::init_opts(staging.path(), &options)?;
@@ -751,11 +855,53 @@ impl Remote {
             }
             fs::rename(path, objects.join(name))?;
         }
+        Ok(Some(ReceivedPack {
+            repo: staging_repo,
+            directory: staging,
+        }))
+    }
+    fn stage_materialization(&mut self) -> Result<()> {
+        let Some(received) = self.take_received(true)? else {
+            return Ok(());
+        };
+        let destination = Repository::open_bare(&self.dir)?;
+        let odb = received.repo.odb()?;
+        let mut failure = None;
+        let iteration = odb.foreach(|oid| {
+            let outcome = (|| {
+                crate::object::check_transfer()?;
+                let (size, kind) = odb.read_header(*oid)?;
+                if kind == git2::ObjectType::Blob {
+                    self.materialized_blobs
+                        .entry(*oid)
+                        .or_insert_with(|| received.directory.clone());
+                } else {
+                    let object = odb.read(*oid)?;
+                    self.publish_received(&destination, *oid, kind, size, object.data())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                failure = Some(error);
+                return false;
+            }
+            true
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        iteration?;
+        Ok(())
+    }
+    fn import_received(&mut self, count_transfer: bool) -> Result<()> {
+        let Some(received) = self.take_received(count_transfer)? else {
+            return Ok(());
+        };
         let destination = Repository::open_bare(&self.dir)?;
         let request_storage = self.raw_blobs.scratch_file()?;
         let mut requests = &request_storage;
         let mut failure = None;
-        let received_odb = staging_repo.odb()?;
+        let received_odb = received.repo.odb()?;
         let iteration = received_odb.foreach(|oid| {
             let outcome = (|| -> Result<()> {
                 crate::object::check_transfer()?;
@@ -776,7 +922,7 @@ impl Remote {
         iteration?;
         // Release ODB/pack descriptors before launching the native decoder.
         drop(received_odb);
-        drop(staging_repo);
+        drop(received.repo);
         if requests.stream_position()? == 0 {
             return Ok(());
         }
@@ -784,7 +930,10 @@ impl Remote {
         let mut output_file = self.raw_blobs.create_output()?;
         let mut command = self.git.command(Some(&self.dir));
         command
-            .env("GIT_OBJECT_DIRECTORY", staging.path().join("objects"))
+            .env(
+                "GIT_OBJECT_DIRECTORY",
+                received.directory.path().join("objects"),
+            )
             .args([
                 "-c",
                 "core.bigFileThreshold=8m",

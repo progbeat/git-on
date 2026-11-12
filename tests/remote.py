@@ -2238,6 +2238,47 @@ os.execv(native,[native,*args])
                 cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
+    def handled_term_during_active_remote_read(self,native):
+        f=self.f;url=f.https();self.addCleanup(f.server.server_close);self.addCleanup(f.server.shutdown)
+        f.stalled.clear();f.resume.clear();f.stalled_oids={f.blob}
+        ready=f.root/'handled-read-ready'
+        code="""
+import json,os,signal,sys,threading
+from pathlib import Path
+signal.signal(signal.SIGTERM,lambda *args:sys.exit(42))
+Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))
+def read():
+ try:Path('deep/file').read_bytes()
+ except OSError:pass
+threading.Thread(target=read,daemon=True).start()
+signal.pause()
+"""
+        env=dict(f.env,READY=str(ready))
+        if native:env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='true')
+        process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-I','-S','-c',code],
+                                 cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process);directory=None
+        try:
+            self.assertTrue(f.stalled.wait(timeout=20),'remote read never reached the controlled stall')
+            state=json.loads(ready.read_text());directory=Path(state['run'])
+            process.send_signal(signal.SIGTERM)
+            _,errors=process.communicate(timeout=10)
+            self.assertEqual(process.returncode,42,errors)
+            self.assertFalse(directory.exists(),'handled termination must clean its run')
+        finally:
+            f.resume.set();f.stalled_oids.clear()
+            if process.poll() is None:process.kill();process.communicate(timeout=10)
+            if ready.exists():
+                with contextlib.suppress(ProcessLookupError):os.killpg(json.loads(ready.read_text())['pid'],signal.SIGKILL)
+            if directory is not None and directory.exists():
+                cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(directory)],capture_output=True,timeout=20)
+                self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+
+    def test_handled_term_during_active_remote_read_preserves_child_exit(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        for native in (False,True):
+            with self.subTest(native_fetch=native):self.handled_term_during_active_remote_read(native)
+
     def test_review_real_mount_stalled_lazy_fetch_shutdown(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; self.stall_url=f.https(); self.addCleanup(f.server.shutdown)

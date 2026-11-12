@@ -320,8 +320,10 @@ fn eager_remote_batches_are_bounded_and_reuse_objects_across_batch_boundaries() 
     );
     assert_eq!(
         metrics.remote_decode_operations + metrics.remote_session_decode_operations,
-        4
+        2
     );
+    assert_eq!(metrics.remote_raw_blob_imports, 0);
+    assert_eq!(metrics.remote_raw_blob_bytes, 0);
     assert_eq!(metrics.blob_loads, 301);
     assert_eq!(
         std::fs::read(destination.join("a-shared")).unwrap(),
