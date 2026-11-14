@@ -131,6 +131,9 @@ impl Session {
         let child = command
             .spawn()
             .context("start invocation demand transport")?;
+        // Command retains its Stdio descriptors after spawn. Close the
+        // parent's copies so an exited helper produces EOF during handshake.
+        drop(command);
         let mut session = Self {
             owner: Owner(Mutex::new(Some(child))),
             input: Output(input),
@@ -674,6 +677,25 @@ mod tests {
             let file = spool(root.path(), &[]);
             assert!(session.fetch(Oid::zero(), &file).is_err());
             assert_eq!(file.len().unwrap(), 0);
+        }
+    }
+    #[test]
+    fn helper_exit_before_first_reply_reports_eof() {
+        for helper in [false, true] {
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "echo early-helper-exit >&2; exit 7"]);
+                let error = Session::connect(command, helper)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                let _ = send.send(error);
+            });
+            let error = receive
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("exited helper did not close the handshake stream")
+                .expect("early helper exit was accepted");
+            assert!(error.contains("early-helper-exit"), "{error}");
         }
     }
     #[test]

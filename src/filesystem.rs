@@ -36,6 +36,7 @@ struct Node {
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
     file: Option<File>,
+    source_integrity: Option<Box<crate::raw_blob::SourceIntegrity>>,
     external_io: bool,
     pending_unlink: bool,
 }
@@ -191,6 +192,7 @@ impl Overlay {
                 snapshot_path: Some(PathBuf::new()),
                 bytes: Vec::new(),
                 file: None,
+                source_integrity: None,
                 external_io: false,
                 pending_unlink: false,
             },
@@ -334,6 +336,7 @@ impl Overlay {
                 snapshot_path: Some(source),
                 bytes: Vec::new(),
                 file: None,
+                source_integrity: None,
                 external_io: false,
                 pending_unlink: false,
             },
@@ -379,6 +382,7 @@ impl Overlay {
             let node = self.nodes.get_mut(&ino).unwrap();
             node.oid = None;
             node.file = None;
+            node.source_integrity = None;
         }
         if ino == 1
             || self.has_open_handle(ino)
@@ -719,8 +723,9 @@ impl Overlay {
             handle.reader = None;
             fh = handle.next;
         }
-        let file = if preserve_content {
-            self._snapshot
+        let (file, source_integrity) = if preserve_content {
+            let promoted = self
+                ._snapshot
                 .promote_source(oid, &disk_path)
                 .map_err(|error| {
                     error
@@ -728,7 +733,14 @@ impl Overlay {
                         .map_or(libc::EIO, |error| {
                             error.0.raw_os_error().unwrap_or(libc::EIO)
                         })
-                })?
+                })?;
+            (
+                promoted.file,
+                promoted
+                    .integrity
+                    .has_source()
+                    .then_some(promoted.integrity),
+            )
         } else {
             self._snapshot
                 .prepare_source_removal(oid)
@@ -746,11 +758,12 @@ impl Overlay {
                 let _ = fs::remove_file(&disk_path);
                 return Err(snapshot_errno(error));
             }
-            file
+            (file, None)
         };
         let keep_file = unlinked || self.has_open_handle(ino);
         let node = self.node_mut(ino)?;
         node.oid = None;
+        node.source_integrity = source_integrity;
         if keep_file {
             node.file = Some(file);
         }
@@ -895,6 +908,7 @@ impl Overlay {
                 snapshot_path: None,
                 bytes,
                 file: None,
+                source_integrity: None,
                 external_io: false,
                 pending_unlink: false,
             },
@@ -991,7 +1005,7 @@ impl Overlay {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(self.backing.join(ino.to_string()))
             .map_err(errno)
     }
@@ -1018,8 +1032,15 @@ impl Overlay {
         }
         self.copy_up(ino, size != 0)?;
         let file = self.disk_file(ino)?;
-        file.set_len(size).map_err(errno)?;
         let n = self.node_mut(ino)?;
+        if let Some(integrity) = &mut n.source_integrity {
+            integrity.set_len(&file, size).map_err(errno)?;
+            if !integrity.has_source() {
+                n.source_integrity = None;
+            }
+        } else {
+            file.set_len(size).map_err(errno)?;
+        }
         let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);
         Ok(())
@@ -1067,6 +1088,9 @@ impl Overlay {
         }
         let count = (n.attr.size.saturating_sub(offset as u64)).min(size as u64) as usize;
         if let Some(file) = &n.file {
+            if let Some(integrity) = &n.source_integrity {
+                return integrity.read(file, offset as u64, count).map_err(errno);
+            }
             let mut data = vec![0; count];
             let mut done = 0;
             while done < count {
@@ -1152,7 +1176,12 @@ impl Overlay {
         let file = n.file.as_ref().ok_or(libc::EINVAL)?;
         let mut written = 0;
         while written < data.len() {
-            match file.write_at(&data[written..], offset + written as u64) {
+            let result = if let Some(integrity) = &mut n.source_integrity {
+                integrity.write_chunk(file, offset + written as u64, &data[written..])
+            } else {
+                file.write_at(&data[written..], offset + written as u64)
+            };
+            match result {
                 Ok(0) if written == 0 => return Err(libc::EIO),
                 Ok(0) => break,
                 Ok(n) => written += n,
@@ -1163,6 +1192,12 @@ impl Overlay {
                 // a subsequent write can report the underlying capacity error.
                 Err(_) => break,
             }
+        }
+        if n.source_integrity
+            .as_ref()
+            .is_some_and(|integrity| !integrity.has_source())
+        {
+            n.source_integrity = None;
         }
         let metadata = file.metadata().map_err(errno)?;
         Self::record_data_change(&mut n.attr, &metadata);

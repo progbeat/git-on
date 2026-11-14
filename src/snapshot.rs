@@ -1055,7 +1055,11 @@ impl Snapshot {
         );
         Ok(())
     }
-    pub(crate) fn promote_source(&self, oid: Oid, path: &Path) -> Result<fs::File> {
+    pub(crate) fn promote_source(
+        &self,
+        oid: Oid,
+        path: &Path,
+    ) -> Result<crate::raw_blob::PromotedSource> {
         let mut state = self.state()?;
         let count = state.source_count(self.tree_oid, oid)?;
         anyhow::ensure!(count > 0, "source reference accounting");
@@ -1064,7 +1068,9 @@ impl Snapshot {
             .raw_store()
             .context("missing source storage")?
             .promote(oid, path, count == 1)?;
-        state.consume_source(self.tree_oid, oid)?;
+        // Preparation established this entry; ownership commitment performs
+        // no fallible I/O after the last raw inode has moved.
+        *state.source_counts.as_mut().unwrap().get_mut(&oid).unwrap() = count - 1;
         Ok(file)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {

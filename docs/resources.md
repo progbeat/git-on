@@ -23,8 +23,8 @@ The unbacked resident remains in RAM; the payload budget is not increased.
 Original OIDs, exact lengths and ordered SHA-256 block hashes remain in trusted
 process memory. Touched unique directories are parsed once into shared immutable
 structures; raw tree bytes are released. Parsed directories, object descriptors,
-header sizes and filesystem namespace state grow with demand outside the
-payload LRU. The 16 MiB payload budget is not a total-RSS limit.
+header sizes, proofs for partially modified source files and filesystem namespace
+state grow with demand outside the payload LRU. The 16 MiB payload budget is not a total-RSS limit.
 
 Libgit2 uses 8 MiB source-pack mapping windows and a 16 MiB soft mapped-byte
 budget. Retained pack descriptors are limited to
@@ -81,14 +81,25 @@ file and symlink inodes in the selected tree, including unopened paths. Shared
 trees are counted by multiplicity. This reads tree metadata, never blob contents;
 remote tree demands are batched by depth. It is not startup or readonly work.
 
-A mutation authenticates the original bytes before making them writable. If
-another original inode still needs them, its shared raw file stays intact and
+A mutation retains authentication of source bytes not overwritten by the command.
+If another original inode still needs them, its shared raw file stays intact and
 the mutated inode receives its own backing. For the last original inode, the raw
-file is renamed into the writable layer: the inode and payload are transferred,
-without copying. Resident bytes are written once. Truncation to zero releases
+file is renamed into the writable layer with its existing descriptor and trusted
+block hashes. Ownership commitment performs no additional opening or fallible
+I/O after the rename. There is no payload copy or full-file verification pass
+for this transfer. Resident bytes are written once. Truncation to zero releases
 that inode's original reference without loading its bytes. Unlink releases data
 after the last kernel lookup/open reference; directory-stream metadata alone
 does not retain deleted payloads. Truncation followed by extension exposes zeros.
+
+Reads of remaining source blocks return bytes from authenticated buffers, also
+after close/reopen. Before modifying a protected block, preserve its checked
+bytes in a bounded buffer and update its digest using only bytes actually
+accepted by the write. Short writes retain the proof of their untouched suffix.
+Shrinking a partial block updates the proof from the checked prefix before
+truncation; extension does not restore discarded source bytes. Fully overwritten
+or truncated blocks release their proofs. Source inodes remain ineligible for
+kernel passthrough, which would bypass these checks.
 
 There is at most one decoded backing per live source inode, with unchanged
 same-OID inodes sharing a single backing. No extra immutable full copy is retained

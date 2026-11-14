@@ -138,6 +138,12 @@ protection, file/directory renames and deletion, symlinks/hardlinks, metadata,
 open-handle coherence, disposable overlay cleanup, command errors and SIGINT cleanup.
 Its dirty-index/working-copy fixture verifies that `untracked` means absent from
 the selected commit. Source checks include ignored host files to catch leaks.
+Source-transfer regressions inject same-UID changes at rename, partial-write and
+truncate boundaries through `support/transfer_fault.c`; every case must return
+checked bytes or EIO. Actual inherited file-size and descriptor limits exercise
+short writes, recovery and retained source proofs separately. The tmpfs subset
+checks capacity for partial preservation and full replacement; the ordinary
+allocation matrix covers all writable-open lifecycles.
 
 | Path / operation | `none` | `ignored` | `untracked` | `all` |
 | --- | --- | --- | --- | --- |

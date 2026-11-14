@@ -452,7 +452,9 @@ print('writable lifecycle verified')
     def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         command=self.writable_open_fixture()
-        for mutation in self.source_mutations:
+        # The allocation matrix covers every lifecycle; actual quota adds
+        # capacity failures for partial preservation and complete replacement.
+        for mutation in ('read-write','read-rewrite'):
             with self.subTest(mutation=mutation):
                 compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
         self.assert_no_runtime_files()
@@ -539,31 +541,51 @@ print('independent aliases and unlinked reader verified')
                 self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
                 self.assert_no_runtime_files()
 
+    def transfer_fault(self, mode):
+        compiler=shutil.which('cc')
+        self.assertIsNotNone(compiler,'C compiler is required for filesystem fault injection')
+        library=self.root/'transfer-fault.so'
+        if not library.is_file():
+            subprocess.run([compiler,'-shared','-fPIC','-o',str(library),
+                            str(ROOT/'tests/support/transfer_fault.c'),'-ldl'],check=True,capture_output=True)
+        return {'LD_PRELOAD':str(library),'GIT_ON_TEST_TRANSFER_FAULT':mode}
+
+    def test_copy_up_authenticates_source_after_transfer_race(self):
+        (self.repo/'large').write_bytes(b'x'*(3*65536+17))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','transfer integrity')
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        command=[sys.executable,'-I','-S','-c',r'''
+import errno,os,sys
+from pathlib import Path
+fd=os.open('large',os.O_RDWR)
+try:
+ if sys.argv[2]=='truncate':os.ftruncate(fd,4096)
+ else:os.pwrite(fd,b'y',0)
+except OSError as error:assert error.errno==errno.EIO,error
+assert Path(sys.argv[1]).exists(),'transfer race was not exercised'
+try:
+ data=os.pread(fd,1,(2*65536+7) if sys.argv[2]=='rename' else 7)
+ assert data==b'x',('unverified source bytes escaped copy-up',data)
+except OSError as error:assert error.errno==errno.EIO,error
+os.close(fd)
+print('checked bytes or EIO')
+''']
+        for mode,remote in [('rename',False),('write',False),('truncate',False),('rename',True)]:
+            with self.subTest(mode=mode,remote=remote):
+                marker=self.root/f'tampered-{mode}-{remote}'
+                env=dict(self.transfer_fault(mode),GIT_ON_TEST_TRANSFER_MARKER=str(marker))
+                source=[self.repo.as_uri()] if remote else []
+                result,_=self.invoke_argv([*source,'HEAD','--write-policy=all','--',*command,str(marker),mode],extra_env=env)
+                self.assertEqual(result.returncode,125 if remote else 0,result.stderr.decode(errors='replace'))
+                if remote:self.assertIn(b'verified source bytes were modified',result.stderr)
+                self.assertEqual(result.stdout,b'checked bytes or EIO\n')
+                self.assert_no_runtime_files()
+
     def test_unlinked_source_survives_backing_unlink_failure_without_redecode(self):
         # Inject an OS failure after transferring the raw inode. All later I/O
         # must keep using that inode, even if the original Git object is gone.
-        compiler=shutil.which('cc')
-        self.assertIsNotNone(compiler,'C compiler is required for filesystem fault injection')
-        source=self.root/'unlink-fault.c';library=self.root/'unlink-fault.so'
-        source.write_text(r'''
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <string.h>
-static int fail_unlink;
-int renameat(int from, const char *old, int to, const char *name) {
- int (*real)(int,const char*,int,const char*)=dlsym(RTLD_NEXT,"renameat");
- int result=real(from,old,to,name);
- if(!result && strlen(old)==40 && strspn(name,"0123456789")==strlen(name))fail_unlink=1;
- return result;
-}
-int unlink(const char *name) {
- int (*real)(const char*)=dlsym(RTLD_NEXT,"unlink");
- if(fail_unlink && strstr(name,"/backing/")){fail_unlink=0;errno=EACCES;return -1;}
- return real(name);
-}
-''')
-        subprocess.run([compiler,'-shared','-fPIC','-o',str(library),str(source),'-ldl'],check=True,capture_output=True)
+        env=self.transfer_fault('unlink')
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','source transfer failure')
         oid=git(self.repo,'rev-parse','HEAD:large')
@@ -587,7 +609,7 @@ Path('replacement').write_bytes(b'z'*(6*1024*1024))
 assert allocated()<9*1024*1024,('failed unlink retained released payload',allocated())
 print('source retained after backing unlink failure')
 ''',str(loose)]
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env={'LD_PRELOAD':str(library)})
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
         self.assert_success(result);self.assert_no_runtime_files()
 
     def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
@@ -1357,6 +1379,43 @@ os.close(fd)
                                 preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
         self.assert_success(result)
         self.assert_no_runtime_files()
+
+    def test_short_source_write_preserves_unwritten_bytes_after_reopen(self):
+        (self.repo/'large').write_bytes(b'x'*(2*65536+17))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','short source write')
+        command=[sys.executable,'-I','-S','-c',r'''
+import errno,os,resource
+from pathlib import Path
+fd=os.open('large',os.O_RDWR)
+# Prepare/adopt before lowering the runner's write limit.
+assert os.pwrite(fd,b'y',65536)==1
+runner=os.getppid()
+original=resource.prlimit(runner,resource.RLIMIT_FSIZE)
+try:
+ resource.prlimit(runner,resource.RLIMIT_FSIZE,(3,original[1]))
+ assert os.pwrite(fd,b'z'*65536,0)==3
+finally:resource.prlimit(runner,resource.RLIMIT_FSIZE,original)
+os.close(fd)
+expected=b'z'*3+b'x'*(65536-3)+b'y'+b'x'*(65536+16)
+assert Path('large').read_bytes()==expected
+fd=os.open('large',os.O_RDWR)
+assert os.pwrite(fd,b'abcd',65534)==4
+os.ftruncate(fd,65537);os.ftruncate(fd,65570)
+assert os.pread(fd,40,65532)==b'xxabc'+b'\0'*33
+os.close(fd)
+# A reopened, partially overwritten/truncated source still authenticates the
+# untouched prefix; the overwritten/truncated suffix does not retain payload.
+backing=Path.cwd().parent/'backing'/str(Path('large').stat().st_ino)
+with backing.open('r+b',buffering=0) as out:out.seek(10);out.write(b'!')
+fd=os.open('large',os.O_RDONLY)
+try:
+ data=os.pread(fd,1,10)
+ assert data==b'x',('unchecked prefix after reopen',data)
+except OSError as error:assert error.errno==errno.EIO,error
+os.close(fd)
+''']
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+        self.assert_success(result);self.assert_no_runtime_files()
 
     def test_mknod_regular_files_follow_policy_and_special_nodes_are_refused(self):
         result, _ = self.python(r'''

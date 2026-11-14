@@ -57,6 +57,135 @@ struct Resident {
     block: usize,
     bytes: Vec<u8>,
 }
+pub(crate) struct PromotedSource {
+    pub(crate) file: File,
+    pub(crate) integrity: Box<SourceIntegrity>,
+}
+
+/// Authentication follows the remaining source bytes into writable storage.
+/// Partial mutations update a block's proof from a checked buffer and the
+/// accepted command bytes. Fully overwritten/truncated blocks need no proof.
+pub(crate) struct SourceIntegrity {
+    state: Arc<Mutex<Store>>,
+    size: u64,
+    blocks: Vec<Option<[u8; 32]>>,
+    remaining: usize,
+}
+impl SourceIntegrity {
+    pub(crate) fn has_source(&self) -> bool {
+        self.remaining != 0
+    }
+    fn checked_block(&self, file: &File, block: usize) -> io::Result<Vec<u8>> {
+        let offset = block as u64 * BLOCK as u64;
+        let mut bytes = vec![0; (self.size - offset).min(BLOCK as u64) as usize];
+        let result = (|| {
+            file.read_exact_at(&mut bytes, offset)?;
+            if Sha256::digest(&bytes).as_slice() != self.blocks[block].unwrap() {
+                return Err(io::Error::other("verified source bytes were modified"));
+            }
+            Ok(bytes)
+        })();
+        if let Err(error) = &result {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .failure
+                .get_or_insert_with(|| format!("read promoted source: {error}"));
+        }
+        result
+    }
+    pub(crate) fn read(&self, file: &File, offset: u64, size: usize) -> io::Result<Vec<u8>> {
+        let mut data = vec![0; size];
+        let mut done = 0;
+        while done < size {
+            let position = offset + done as u64;
+            let block = (position / BLOCK as u64) as usize;
+            let within = (position % BLOCK as u64) as usize;
+            if position < self.size && self.blocks[block].is_some() {
+                let checked = self.checked_block(file, block)?;
+                let count = (size - done).min(checked.len() - within);
+                data[done..done + count].copy_from_slice(&checked[within..within + count]);
+                done += count;
+            } else {
+                let count = if position < self.size {
+                    (size - done).min(BLOCK - within)
+                } else {
+                    size - done
+                };
+                match file.read_at(&mut data[done..done + count], position) {
+                    Ok(0) => break,
+                    Ok(count) => done += count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        data.truncate(done);
+        Ok(data)
+    }
+    pub(crate) fn write_chunk(
+        &mut self,
+        file: &File,
+        offset: u64,
+        data: &[u8],
+    ) -> io::Result<usize> {
+        let block = (offset / BLOCK as u64) as usize;
+        if offset >= self.size || self.blocks[block].is_none() {
+            // Stop at the next protected block, if any.
+            let count = if offset < self.size {
+                data.len().min(BLOCK - (offset % BLOCK as u64) as usize)
+            } else {
+                data.len()
+            };
+            return file.write_at(&data[..count], offset);
+        }
+        let mut checked = self.checked_block(file, block)?;
+        let within = (offset % BLOCK as u64) as usize;
+        let count = data.len().min(BLOCK - within);
+        // Keep the checked old bytes until the kernel reports how much was
+        // accepted: a short write must preserve proof of its untouched suffix.
+        let written = file.write_at(&data[..count], offset)?;
+        let changed = written.min(checked.len() - within);
+        checked[within..within + changed].copy_from_slice(&data[..changed]);
+        if within == 0 && changed == checked.len() {
+            self.blocks[block] = None;
+            self.remaining -= 1;
+        } else if changed != 0 {
+            self.blocks[block] = Some(Sha256::digest(&checked).into());
+        }
+        Ok(written)
+    }
+    pub(crate) fn set_len(&mut self, file: &File, size: u64) -> io::Result<()> {
+        let partial = if size < self.size && !size.is_multiple_of(BLOCK as u64) {
+            let block = (size / BLOCK as u64) as usize;
+            if self.blocks[block].is_some() {
+                let checked = self.checked_block(file, block)?;
+                Some((
+                    block,
+                    Sha256::digest(&checked[..(size % BLOCK as u64) as usize]).into(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        file.set_len(size)?;
+        if size < self.size {
+            let keep = size.div_ceil(BLOCK as u64) as usize;
+            self.remaining -= self.blocks[keep..]
+                .iter()
+                .filter(|hash| hash.is_some())
+                .count();
+            self.blocks.truncate(keep);
+            self.size = size;
+            if let Some((block, hash)) = partial {
+                self.blocks[block] = Some(hash);
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Clone)]
 pub(crate) struct RawBlob {
     state: Arc<Mutex<Store>>,
@@ -541,10 +670,10 @@ impl RawBlobs {
     }
     /// Transfer the last source's inode, or copy for a distinct still-live
     /// source. A writable inode never retains a second immutable payload merely
-    /// for caching. Authenticate disk bytes before making the file mutable.
-    pub(crate) fn promote(&self, oid: Oid, path: &Path, exclusive: bool) -> Result<File> {
+    /// for caching. The source proof follows the file into the writable layer.
+    pub(crate) fn promote(&self, oid: Oid, path: &Path, exclusive: bool) -> Result<PromotedSource> {
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         let parent = File::options()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -561,13 +690,32 @@ impl RawBlobs {
                 object.kind() == ObjectType::Blob,
                 "mutable source is not a blob"
             );
+            let integrity = Box::new(SourceIntegrity {
+                state: self.state.clone(),
+                size: object.size,
+                blocks: object.blocks.iter().copied().map(Some).collect(),
+                remaining: object.blocks.len(),
+            });
             if object.file {
-                let checked = (|| -> Result<File> {
-                    let input = store.directory.open_name(
+                let input = store
+                    .directory
+                    .open_name(
                         &CString::new(oid.to_string())?,
                         libc::O_RDWR,
                         Some(object.size),
-                    )?;
+                    )
+                    .map_err(|error| {
+                        if let Some(code) = error
+                            .downcast_ref::<io::Error>()
+                            .and_then(io::Error::raw_os_error)
+                        {
+                            if matches!(code, libc::EMFILE | libc::ENFILE) {
+                                return BackingError(io::Error::from_raw_os_error(code)).into();
+                            }
+                        }
+                        error
+                    })?;
+                if !exclusive {
                     let mut bytes = vec![0; BLOCK];
                     for (block, expected) in object.blocks.iter().enumerate() {
                         crate::object::check_transfer()?;
@@ -577,15 +725,9 @@ impl RawBlobs {
                         if Sha256::digest(&bytes[..length]).as_slice() != expected {
                             return Err(invalid("verified raw blob bytes were modified"));
                         }
-                        if !exclusive {
-                            // Destination errors belong to the writable file,
-                            // rather than becoming a permanent source failure.
-                            output.write_all(&bytes[..length]).map_err(BackingError)?;
-                        }
+                        output.write_all(&bytes[..length]).map_err(BackingError)?;
                     }
-                    Ok(input)
-                })();
-                let input = checked?;
+                }
                 if exclusive {
                     if unsafe {
                         libc::renameat(
@@ -599,14 +741,10 @@ impl RawBlobs {
                         return Err(BackingError(io::Error::last_os_error()))
                             .context("transfer prepared source");
                     }
-                    // The name must still identify the checked source inode;
-                    // never adopt an entry swapped during the rename.
-                    let (published, metadata) = open_private_file(&parent, &name, libc::O_RDWR)?;
-                    let original = input.metadata()?;
-                    if metadata.dev() != original.dev() || metadata.ino() != original.ino() {
-                        return Err(invalid("prepared source identity changed during transfer"));
-                    }
-                    drop(published);
+                    // Commit ownership using the existing descriptor. No open
+                    // or other fallible I/O may lose the source after rename.
+                    // Reopened names and concurrently changed inodes are still
+                    // untrusted: SourceIntegrity checks the returned bytes.
                     output = input;
                 }
             } else if object.size != 0 {
@@ -618,33 +756,39 @@ impl RawBlobs {
                 output.write_all(&resident.bytes).map_err(BackingError)?;
             }
             if exclusive {
-                store.forget_blob(oid, false)?;
+                store.release_blob(oid);
             }
-            Ok(())
+            Ok(integrity)
         })();
-        if let Err(error) = result {
-            if error.downcast_ref::<BackingError>().is_none()
-                && !crate::object::is_cancelled(&error)
-            {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .failure
-                    .get_or_insert_with(|| format!("{error:#}"));
+        let integrity = match result {
+            Ok(integrity) => integrity,
+            Err(error) => {
+                if error.downcast_ref::<BackingError>().is_none()
+                    && !crate::object::is_cancelled(&error)
+                {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failure
+                        .get_or_insert_with(|| format!("{error:#}"));
+                }
+                drop(output);
+                unsafe {
+                    libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+                }
+                return Err(error);
             }
-            drop(output);
-            unsafe {
-                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
-            }
-            return Err(error);
-        }
-        Ok(output)
+        };
+        Ok(PromotedSource {
+            file: output,
+            integrity,
+        })
     }
     pub(crate) fn discard(&self, oid: Oid) -> Result<()> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .forget_blob(oid, true)
+            .forget_blob(oid)
     }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
@@ -759,12 +903,29 @@ impl Store {
         }
         Ok(self.scratch.as_ref().unwrap().file(directory)?)
     }
-    fn forget_blob(&mut self, oid: Oid, unlink: bool) -> Result<()> {
+    fn forget_blob(&mut self, oid: Oid) -> Result<()> {
         if let Some(object) = self.objects.get(&oid) {
             anyhow::ensure!(
                 object.kind() == ObjectType::Blob,
                 "cannot discard a directory"
             );
+            if object.file
+                && unsafe {
+                    libc::unlinkat(
+                        self.directory.fd.as_raw_fd(),
+                        CString::new(oid.to_string())?.as_ptr(),
+                        0,
+                    )
+                } != 0
+            {
+                return Err(io::Error::last_os_error()).context("release consumed source");
+            }
+        }
+        self.release_blob(oid);
+        Ok(())
+    }
+    fn release_blob(&mut self, oid: Oid) {
+        if let Some(object) = self.objects.remove(&oid) {
             if object.file {
                 if self
                     .directory
@@ -774,26 +935,13 @@ impl Store {
                 {
                     self.directory.reader = None;
                 }
-                if unlink
-                    && unsafe {
-                        libc::unlinkat(
-                            self.directory.fd.as_raw_fd(),
-                            CString::new(oid.to_string())?.as_ptr(),
-                            0,
-                        )
-                    } != 0
-                {
-                    return Err(io::Error::last_os_error()).context("release consumed source");
-                }
                 self.disk_entries -= 1;
                 self.disk_bytes -= object.size;
             }
         }
-        self.objects.remove(&oid);
         if let Some(bytes) = self.memory.pop(&oid) {
             self.memory_bytes -= bytes.bytes.capacity() + ENTRY_CHARGE;
         }
-        Ok(())
     }
     fn make_room(&mut self, weight: usize) -> Result<()> {
         while self.memory_bytes > self.memory_limit.saturating_sub(weight) {
@@ -902,6 +1050,32 @@ impl<W: Write> Write for Blocks<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn under_descriptor_limit(name: &str) -> bool {
+        const CHILD: &str = "GIT_ON_TEST_RAW_NOFILE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            let mut limit = unsafe { limit.assume_init() };
+            limit.rlim_cur = limit.rlim_cur.min(64);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
     fn stored_bytes(path: &Path) -> u64 {
         std::fs::read_dir(path)
             .unwrap()
@@ -914,6 +1088,70 @@ mod tests {
                 }
             })
             .sum()
+    }
+    #[test]
+    fn source_promotion_survives_descriptor_pressure() {
+        if !under_descriptor_limit("raw_blob::tests::source_promotion_survives_descriptor_pressure")
+        {
+            return;
+        }
+        for available in [2, 3] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+            let data = vec![b'x'; BLOCK + 3];
+            let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+            let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
+            let mut held = Vec::new();
+            loop {
+                match File::open("/dev/null") {
+                    Ok(file) => held.push(file),
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                        break;
+                    }
+                }
+            }
+            for _ in 0..available {
+                held.pop();
+            }
+            let result = store.promote(oid, &directory.path().join("mutable"), true);
+            drop(held);
+            match result {
+                Ok(file) => {
+                    let mut bytes = vec![0; data.len()];
+                    file.file.read_exact_at(&mut bytes, 0).unwrap();
+                    assert_eq!(bytes, data);
+                }
+                Err(error) => {
+                    assert!(
+                        error.chain().any(|cause| cause
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|e| e.raw_os_error() == Some(libc::EMFILE))),
+                        "{error:#}"
+                    );
+                    assert_eq!(
+                        original
+                            .read_all()
+                            .expect("EMFILE lost the prepared source"),
+                        data
+                    );
+                    assert!(
+                        store.failure().is_none(),
+                        "descriptor pressure poisoned the source"
+                    );
+                    let promoted = store
+                        .promote(oid, &directory.path().join("retry"), true)
+                        .unwrap();
+                    assert_eq!(
+                        promoted
+                            .integrity
+                            .read(&promoted.file, 0, data.len())
+                            .unwrap(),
+                        data
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn source_promotion_splits_aliases_then_transfers_the_last_inode() {
@@ -935,12 +1173,14 @@ mod tests {
             .ino();
         let mut first = store
             .promote(oid, &directory.path().join("first"), false)
-            .unwrap();
+            .unwrap()
+            .file;
         first.write_all(b"y").unwrap();
         assert_eq!(original.read_all().unwrap(), data);
         let mut last = store
             .promote(oid, &directory.path().join("last"), true)
-            .unwrap();
+            .unwrap()
+            .file;
         assert_eq!(
             last.metadata().unwrap().ino(),
             source_inode,
@@ -960,13 +1200,14 @@ mod tests {
         store.insert(oid, 0, b"".as_slice()).unwrap();
         let mut file = store
             .promote(oid, &directory.path().join("empty"), true)
-            .unwrap();
+            .unwrap()
+            .file;
         file.write_all(b"new").unwrap();
         assert_eq!(file.metadata().unwrap().len(), 3);
         assert!(store.get(oid).unwrap().is_none());
     }
     #[test]
-    fn corrupted_source_is_not_published_as_a_mutable_file() {
+    fn promoted_source_never_returns_corrupted_original_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let data = vec![b'x'; BLOCK + 3];
@@ -974,8 +1215,10 @@ mod tests {
         let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
         original.corrupt_for_test().unwrap();
         let destination = directory.path().join("mutable");
-        assert!(store.promote(oid, &destination, true).is_err());
+        assert!(store.promote(oid, &destination, false).is_err());
         assert!(!destination.exists());
+        let promoted = store.promote(oid, &destination, true).unwrap();
+        assert!(promoted.integrity.read(&promoted.file, 0, 1).is_err());
         assert!(store.failure().is_some());
     }
     #[test]
@@ -1131,40 +1374,9 @@ mod tests {
     }
     #[test]
     fn read_slot_releases_its_descriptor_before_replacing_it() {
-        const CHILD: &str = "GIT_ON_TEST_RAW_SLOT_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            use std::os::unix::process::CommandExt;
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "raw_blob::tests::read_slot_releases_its_descriptor_before_replacing_it",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1");
-            unsafe {
-                command.pre_exec(|| {
-                    let mut limit = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    limit.rlim_cur = limit.rlim_cur.min(64);
-                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if !under_descriptor_limit(
+            "raw_blob::tests::read_slot_releases_its_descriptor_before_replacing_it",
+        ) {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
