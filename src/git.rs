@@ -2,15 +2,11 @@
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
-    cell::RefCell,
     ffi::{OsStr, OsString},
-    fs::File,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-#[cfg(target_os = "linux")]
-use std::{marker::PhantomData, rc::Rc};
 
 #[derive(Debug)]
 pub struct Git {
@@ -96,6 +92,11 @@ impl Git {
                     // reject its intentionally missing tree objects.
                     if key == "core.repositoryformatversion"
                         || key.as_bytes().starts_with(b"extensions.")
+                        // The deprecated loose-object durability switch can
+                        // override core.fsync=none. Private objects are never
+                        // resumed after a crash; preserve the caller's setting
+                        // only for operations in its own repository.
+                        || key == "core.fsyncobjectfiles"
                     {
                         continue;
                     }
@@ -123,6 +124,24 @@ impl Git {
                 .args(["-c", "core.bare=true"]);
         }
         command
+    }
+    pub(crate) fn demand_session_compatible(&self) -> bool {
+        // Keep caller-defined server programs, server options and fsck policy
+        // on native fetch's complete compatibility path. A controlling TTY
+        // also needs that supervisor: arbitrary credential helpers can read it
+        // even with redirected stdio and GIT_TERMINAL_PROMPT=0.
+        controlling_terminal().is_none()
+            && std::env::var_os("GIT_EXEC_PATH").is_none()
+            && !self.config.iter().any(|(key, value)| {
+                let key = key.as_bytes();
+                key.ends_with(b".uploadpack")
+                    || key.ends_with(b".vcs")
+                    || key.ends_with(b".serveroption")
+                    || key.starts_with(b"fsck.")
+                    || key == b"fetch.fsckobjects"
+                    || key == b"transfer.fsckobjects"
+                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+            })
     }
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
@@ -254,7 +273,125 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 }
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
-pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> {
+pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
+    run_captured(command, capture, capture, None, None)
+}
+pub(crate) fn run_with_input(
+    command: Command,
+    capture: bool,
+    mut input: impl std::io::Read,
+) -> Result<std::process::Output> {
+    run_captured(command, capture, capture, None, Some(&mut input))
+}
+/// Stream native stdout to its consumer while the caller retains process,
+/// cancellation and terminal supervision. The consumer must read to EOF or fail;
+/// its errors stop and reap the owned operation before they are returned.
+pub(crate) fn run_with_output<T: Send>(
+    mut command: Command,
+    input: Option<&mut dyn std::io::Read>,
+    consume: impl FnOnce(&mut dyn std::io::Read) -> Result<T> + Send,
+) -> Result<(std::process::Output, T)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    command.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+        writer,
+    )));
+    let failed = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    reader.set_read_timeout(Some(std::time::Duration::from_millis(10)))?;
+    std::thread::scope(|scope| {
+        let transfer = std::thread::Builder::new()
+            .name("git-output".into())
+            .spawn_scoped(scope, || {
+                let mut output = NativeOutput {
+                    reader,
+                    finished: &finished,
+                    start_drain: Some(|input: &mut std::os::unix::net::UnixStream| {
+                        input.set_nonblocking(true)
+                    }),
+                };
+                let result = consume(&mut output);
+                failed.store(result.is_err(), Ordering::Release);
+                result
+            })?;
+        let result = run_captured(command, false, true, Some(&failed), input);
+        finished.store(true, Ordering::Release);
+        let value = transfer
+            .join()
+            .map_err(|_| anyhow::anyhow!("native output consumer panicked"))??;
+        Ok((result?, value))
+    })
+}
+
+pub(crate) fn run_to_writer<W: std::io::Write + Send>(
+    command: Command,
+    mut output: W,
+    input: Option<&mut dyn std::io::Read>,
+) -> Result<std::process::Output> {
+    run_with_output(command, input, |reader| {
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            let count = reader.read(&mut bytes)?;
+            if count == 0 {
+                return Ok(());
+            }
+            output.write_all(&bytes[..count])?;
+        }
+    })
+    .map(|(result, ())| result)
+}
+
+struct NativeOutput<'a, R, F> {
+    reader: R,
+    finished: &'a std::sync::atomic::AtomicBool,
+    start_drain: Option<F>,
+}
+impl<R: std::io::Read, F: FnOnce(&mut R) -> std::io::Result<()>> std::io::Read
+    for NativeOutput<'_, R, F>
+{
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Preserve typed cancellation rather than reporting truncated Git
+            // data after the supervisor closes an interrupted decoder's pipe.
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            match self.reader.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+                        // A timeout can precede the final write/exit. Observe
+                        // completion before freshly draining queued bytes.
+                        match self.start_drain.take() {
+                            Some(prepare) => prepare(&mut self.reader)?,
+                            None => return Ok(0),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+fn controlling_terminal() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()
+}
+
+fn run_captured(
+    mut command: Command,
+    capture_stdout: bool,
+    capture_stderr: bool,
+    failed_output: Option<&std::sync::atomic::AtomicBool>,
+    input: Option<&mut dyn std::io::Read>,
+) -> Result<std::process::Output> {
     use std::{
         io::{Read, Seek},
         os::unix::{io::AsRawFd, process::CommandExt},
@@ -262,27 +399,29 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     };
     initialize_cancellation()?;
     if let Some(signal) = cancelled_signal() {
-        bail!("Git operation cancelled by signal {signal}");
+        return Err(crate::object::OperationCancelled)
+            .context(format!("Git operation cancelled by signal {signal}"));
     }
     if operations_stopped() {
-        bail!("Git operation stopped after command completion");
+        return Err(crate::object::OperationCancelled)
+            .context("Git operation stopped after command completion");
     }
-    check_request_interruption()?;
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
-    if capture {
-        command
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?);
+    let mut input = input
+        .map(|source| NativeInput::new(&mut command, source))
+        .transpose()?;
+    let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
+    let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
+    if let Some(stdout) = &stdout {
+        command.stdout(stdout.try_clone()?);
     }
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok();
+    if let Some(stderr) = &stderr {
+        command.stderr(stderr.try_clone()?);
+    }
+    let tty = controlling_terminal();
     let tty_fd = tty.as_ref().map(AsRawFd::as_raw_fd);
     let parent_group = unsafe { libc::getpgrp() };
     let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == parent_group });
+    let _progress_lease = crate::progress::native_terminal_lease(transfer);
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -303,39 +442,52 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
             return Err(error).context("start native Git operation");
         }
     };
+    let wakeup = ChildExitWakeup::new(child.id());
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.into()),
             Ok(None) => {}
         }
+        if failed_output.is_some_and(|failed| failed.load(std::sync::atomic::Ordering::Acquire)) {
+            break stop_request_operation(&mut child)
+                .and(Err(anyhow::anyhow!("native Git output consumer failed")));
+        }
         if let Some(signal) = cancelled_signal() {
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
-            break Err(anyhow::anyhow!(
-                "Git operation cancelled by signal {signal}"
-            ));
+            break Err(crate::object::OperationCancelled)
+                .context(format!("Git operation cancelled by signal {signal}"));
         }
         if operations_stopped() {
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
-            break Err(anyhow::anyhow!(
-                "Git operation stopped after command completion"
-            ));
+            break Err(crate::object::OperationCancelled)
+                .context("Git operation stopped after command completion");
         }
-        if let Err(error) = check_request_interruption() {
-            break stop_request_operation(&mut child).and(Err(error));
+        if let Some(stdin) = &mut input {
+            match stdin.advance() {
+                Ok(true) => input = None,
+                Ok(false) => {}
+                Err(error) => {
+                    break stop_request_operation(&mut child)
+                        .and(Err(error).context("write native Git input"));
+                }
+            }
         }
         if let Some(fd) = tty_fd {
             if let Err(error) = relay_native_job_control(child.id(), fd, parent_group) {
                 break stop_request_operation(&mut child).and(Err(error));
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wakeup.wait(
+            Duration::from_millis(10),
+            input.as_ref().map(|input| input.pipe.as_raw_fd()),
+        );
     };
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
@@ -352,10 +504,12 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
     }
     let mut out = Vec::new();
     let mut err = Vec::new();
-    if capture {
+    if let Some(stdout) = &mut stdout {
         stdout.rewind()?;
-        stderr.rewind()?;
         stdout.read_to_end(&mut out)?;
+    }
+    if let Some(stderr) = &mut stderr {
+        stderr.rewind()?;
         stderr.read_to_end(&mut err)?;
     }
     Ok(std::process::Output {
@@ -363,6 +517,104 @@ pub fn run(mut command: Command, capture: bool) -> Result<std::process::Output> 
         stdout: out,
         stderr: err,
     })
+}
+struct NativeInput<'a> {
+    source: &'a mut dyn std::io::Read,
+    pipe: std::os::unix::net::UnixStream,
+    bytes: [u8; 8192],
+    pending: std::ops::Range<usize>,
+}
+impl<'a> NativeInput<'a> {
+    fn new(command: &mut Command, source: &'a mut dyn std::io::Read) -> std::io::Result<Self> {
+        use std::os::fd::OwnedFd;
+        let (pipe, child) = std::os::unix::net::UnixStream::pair()?;
+        pipe.set_nonblocking(true)?;
+        command.stdin(Stdio::from(OwnedFd::from(child)));
+        Ok(Self {
+            source,
+            pipe,
+            bytes: [0; 8192],
+            pending: 0..0,
+        })
+    }
+    fn advance(&mut self) -> std::io::Result<bool> {
+        use std::io::{ErrorKind, Write};
+        // Bound work between cancellation checks, including for a decoder's
+        // large segmented request stream. No input worker or full copy is needed.
+        for _ in 0..8 {
+            if self.pending.is_empty() {
+                let count = match self.source.read(&mut self.bytes) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    value => value?,
+                };
+                if count == 0 {
+                    return Ok(true);
+                }
+                self.pending = 0..count;
+            }
+            match self.pipe.write(&self.bytes[self.pending.clone()]) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(count) => self.pending.start += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+}
+/// Exit notification removes the artificial polling floor for short native
+/// operations. Cancellation/TTY checks keep the same maximum polling interval.
+/// Unsupported kernels or descriptor pressure retain the existing fallback.
+struct ChildExitWakeup {
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+impl ChildExitWakeup {
+    fn new(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) } as i32;
+            Self {
+                fd: (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+    fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
+        #[cfg(target_os = "linux")]
+        let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
+        #[cfg(not(target_os = "linux"))]
+        let exit = -1;
+        if exit >= 0 || input.is_some() {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: exit,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: input.unwrap_or(-1),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                },
+            ];
+            let result =
+                unsafe { libc::poll(descriptors.as_mut_ptr(), 2, duration.as_millis() as i32) };
+            if result < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                std::thread::sleep(duration);
+            }
+            return;
+        }
+        std::thread::sleep(duration);
+    }
 }
 /// Native Git owns a separate group while authenticating/verifying. Observe
 /// stops without consuming its exit status, then suspend the caller's job so
@@ -448,7 +700,8 @@ fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
         .context("reap interrupted native Git operation")?;
     Ok(())
 }
-fn set_foreground(fd: i32, group: libc::pid_t) -> std::io::Result<()> {
+/// Transfer terminal ownership while blocking SIGTTOU in the calling thread.
+pub fn set_foreground(fd: i32, group: libc::pid_t) -> std::io::Result<()> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         let mut old = std::mem::zeroed();
@@ -476,140 +729,67 @@ impl SplitByte for [u8] {
     }
 }
 
-#[derive(Debug)]
-struct RequestInterrupted(i32);
-impl std::fmt::Display for RequestInterrupted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "filesystem requester interrupted by signal {}", self.0)
-    }
-}
-impl std::error::Error for RequestInterrupted {}
-
-thread_local! {
-    static REQUEST_STATUS: RefCell<Option<File>> = const { RefCell::new(None) };
-}
-
-/// Bind a synchronous FUSE callback to the actual requesting task. Keeping the
-/// proc descriptor open prevents a reused task ID from changing this identity.
-#[cfg(target_os = "linux")]
-pub(crate) struct RequestGuard {
-    previous: Option<File>,
-    _same_thread: PhantomData<Rc<()>>,
-}
-#[cfg(target_os = "linux")]
-impl RequestGuard {
-    pub(crate) fn enter(pid: u32) -> Self {
-        let status = File::open(format!("/proc/{pid}/status")).ok();
-        Self {
-            previous: REQUEST_STATUS.with(|slot| slot.replace(status)),
-            _same_thread: PhantomData,
-        }
-    }
-}
-#[cfg(target_os = "linux")]
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        REQUEST_STATUS.with(|slot| slot.replace(self.previous.take()));
-    }
-}
-
-fn pending_request_signal(status: &[u8]) -> Option<i32> {
-    let mut pending = None;
-    let mut shared = None;
-    let mut blocked = None;
-    let mut ignored = None;
-    for line in status.split(|byte| *byte == b'\n') {
-        let (key, value) = line.split_once_byte(b':');
-        let Some(value) = value else {
-            continue;
-        };
-        let destination = match key {
-            b"SigPnd" => &mut pending,
-            b"ShdPnd" => &mut shared,
-            b"SigBlk" => &mut blocked,
-            b"SigIgn" => &mut ignored,
-            _ => continue,
-        };
-        *destination = std::str::from_utf8(value)
-            .ok()
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok());
-    }
-    let actionable = (pending? | shared?) & !blocked? & !ignored?;
-    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
-        .into_iter()
-        .find(|signal| actionable & (1_u64 << (signal - 1)) != 0)
-}
-
-/// fuser dispatches synchronously and cannot process INTERRUPT while a native
-/// operation is blocked. Reply EINTR when this requester has a pending signal,
-/// then let its actual disposition/handler determine the command's outcome.
-/// This is per-request interruption, never global command cancellation.
-pub(crate) fn check_request_interruption() -> Result<()> {
-    use std::io::{Read, Seek};
-    let signal = REQUEST_STATUS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let status = slot.as_mut()?;
-        status.rewind().ok()?;
-        let mut bytes = Vec::new();
-        status.read_to_end(&mut bytes).ok()?;
-        pending_request_signal(&bytes)
-    });
-    if let Some(signal) = signal {
-        return Err(RequestInterrupted(signal).into());
-    }
-    Ok(())
-}
-pub(crate) fn is_request_interruption(error: &anyhow::Error) -> bool {
-    error.is::<RequestInterrupted>()
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::process::Child;
     use std::time::{Duration, Instant};
 
-    struct Requester(Child);
-    impl Requester {
-        fn stopped(mode: &str) -> Self {
-            let script = "import ctypes,os,signal,sys,time\nmode=sys.argv[1]\nif mode=='caught': signal.signal(signal.SIGTERM,lambda *_:None)\nif mode=='ignored': signal.signal(signal.SIGTERM,signal.SIG_IGN)\nif mode=='blocked': signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGTERM})\nctypes.CDLL(None).prctl(15,b'\\xffrequester',0,0,0)\nprint('ready',flush=True)\nos.kill(os.getpid(),signal.SIGSTOP)\ntime.sleep(300)";
-            let mut child = Command::new("python3")
-                .args(["-c", script, mode])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap();
-            let mut ready = String::new();
-            BufReader::new(child.stdout.take().unwrap())
-                .read_line(&mut ready)
-                .unwrap();
-            assert_eq!(ready.trim(), "ready");
-            let requester = Self(child);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
-                if status
-                    .split(|byte| *byte == b'\n')
-                    .any(|line| line.starts_with(b"State:\tT"))
-                {
-                    return requester;
-                }
-                assert!(Instant::now() < deadline, "requester never stopped");
-                std::thread::sleep(Duration::from_millis(1));
+    #[test]
+    fn native_input_and_output_progress_with_pipe_backpressure() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "dd if=/dev/zero bs=65536 count=4 2>/dev/null; cat"]);
+        let bytes = vec![b'x'; 1024 * 1024];
+        let mut input = bytes.as_slice();
+        let mut output = Vec::new();
+        let result = run_to_writer(command, &mut output, Some(&mut input)).unwrap();
+        assert!(result.status.success());
+        assert_eq!(&output[..262144], vec![0; 262144]);
+        assert_eq!(&output[262144..], bytes);
+    }
+
+    #[test]
+    fn native_output_writer_error_stops_the_owned_operation() {
+        struct Failed;
+        impl std::io::Write for Failed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture output failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
-        fn signal(&self, signal: i32) {
-            assert_eq!(unsafe { libc::kill(self.0.id() as i32, signal) }, 0);
-        }
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("not-stopped");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf payload; sleep 3; printf late > \"$1\"",
+                "fixture",
+            ])
+            .arg(&marker);
+        let error = run_to_writer(command, Failed, None).unwrap_err();
+        assert!(error.to_string().contains("fixture output failure"));
+        assert!(
+            !marker.exists(),
+            "native operation continued after output failed"
+        );
     }
-    impl Drop for Requester {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
+
+    #[test]
+    fn streamed_output_retains_the_native_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf payload; exit 42"]);
+        let (result, bytes) = run_with_output(command, None, |reader| {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(result.status.code(), Some(42));
     }
+
     fn wait_for_pid(path: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -622,104 +802,6 @@ mod tests {
             assert!(Instant::now() < deadline, "owned operation never started");
             std::thread::sleep(Duration::from_millis(1));
         }
-    }
-
-    #[test]
-    fn request_masks_preserve_blocked_ignored_and_caught_dispositions() {
-        let status = |pending, shared, blocked, ignored| {
-            format!("SigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\nSigCgt:\tffffffffffffffff\n")
-        };
-        let term = 1_u64 << (libc::SIGTERM - 1);
-        for (pending, shared) in [(term, 0), (0, term)] {
-            assert_eq!(
-                pending_request_signal(status(pending, shared, 0, 0).as_bytes()),
-                Some(libc::SIGTERM)
-            );
-            for (blocked, ignored) in [(term, 0), (0, term)] {
-                assert_eq!(
-                    pending_request_signal(status(pending, shared, blocked, ignored).as_bytes()),
-                    None
-                );
-            }
-        }
-        assert_eq!(pending_request_signal(b"SigPnd:\t4000\n"), None);
-        let mut long_status = b"Name:\t\xffrequester\nGroups:\t".to_vec();
-        long_status.extend(b"10000 ".repeat(4096));
-        long_status.extend_from_slice(b"\n");
-        long_status.extend_from_slice(status(0, term, 0, 0).as_bytes());
-        assert_eq!(pending_request_signal(&long_status), Some(libc::SIGTERM));
-        {
-            use std::io::Write;
-            let _request = RequestGuard::enter(0);
-            let mut held = tempfile::tempfile().unwrap();
-            held.write_all(&long_status).unwrap();
-            REQUEST_STATUS.with(|slot| slot.replace(Some(held)));
-            assert!(is_request_interruption(
-                &check_request_interruption().unwrap_err()
-            ));
-        }
-        let user = 1_u64 << (libc::SIGUSR1 - 1);
-        assert_eq!(
-            pending_request_signal(status(0, user, 0, 0).as_bytes()),
-            None
-        );
-    }
-
-    #[test]
-    fn request_scope_reads_real_dispositions_and_keeps_original_task_identity() {
-        for (mode, signal, interrupts) in [
-            ("default", libc::SIGTERM, true),
-            ("caught", libc::SIGTERM, true),
-            ("python-int", libc::SIGINT, true),
-            ("ignored", libc::SIGTERM, false),
-            ("blocked", libc::SIGTERM, false),
-        ] {
-            let requester = Requester::stopped(mode);
-            let _request = RequestGuard::enter(requester.0.id());
-            requester.signal(signal);
-            match check_request_interruption() {
-                Err(error) => assert!(interrupts && is_request_interruption(&error)),
-                Ok(()) => assert!(!interrupts, "missed pending {signal} in {mode}"),
-            }
-            {
-                let _nested = RequestGuard::enter(0);
-                check_request_interruption().unwrap();
-            }
-            assert_eq!(check_request_interruption().is_err(), interrupts);
-            // The held proc descriptor belongs to this task even after exit;
-            // later checks never reopen its numeric ID or cancel another task.
-            drop(requester);
-            check_request_interruption().unwrap();
-        }
-        check_request_interruption().unwrap();
-    }
-
-    #[test]
-    fn pending_request_signal_stops_only_its_owned_operation() {
-        let requester = Requester::stopped("caught");
-        let _request = RequestGuard::enter(requester.0.id());
-        let temporary = tempfile::tempdir().unwrap();
-        let started = temporary.path().join("native-pid");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "echo $$ > \"$1\"; exec sleep 300", "request-test"])
-            .arg(&started);
-        let error = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                wait_for_pid(&started);
-                requester.signal(libc::SIGTERM);
-            });
-            run(command, true).unwrap_err()
-        });
-        assert!(is_request_interruption(&error));
-        let pid = std::fs::read_to_string(&started).unwrap();
-        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
-        assert_eq!(cancelled_signal(), None);
-        assert!(!operations_stopped());
-        let status = std::fs::read(format!("/proc/{}/status", requester.0.id())).unwrap();
-        assert!(status
-            .split(|byte| *byte == b'\n')
-            .any(|line| line.starts_with(b"State:\tT")));
     }
 
     #[test]
@@ -762,5 +844,88 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod output_race_tests {
+    use super::*;
+    use std::{
+        io::{self, Read, Write},
+        os::unix::net::UnixStream,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    struct StaleTimeout<'a> {
+        input: UnixStream,
+        writer: UnixStream,
+        finished: &'a AtomicBool,
+        raced: bool,
+    }
+    impl Read for StaleTimeout<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.raced {
+                self.raced = true;
+                let stale = self.input.read(output);
+                assert!(
+                    matches!(&stale, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+                );
+                // A native write and completed-child notification race a read
+                // that has already returned a timeout to the transfer thread.
+                self.writer
+                    .write_all(b"verified output queued before exit")?;
+                self.finished.store(true, Ordering::Release);
+                return stale;
+            }
+            self.input.read(output)
+        }
+    }
+    fn input(finished: &AtomicBool) -> StaleTimeout<'_> {
+        let (input, writer) = UnixStream::pair().unwrap();
+        input
+            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+            .unwrap();
+        StaleTimeout {
+            input,
+            writer,
+            finished,
+            raced: false,
+        }
+    }
+    #[test]
+    fn finished_output_is_drained_after_a_stale_timeout() {
+        let finished = AtomicBool::new(false);
+        let mut input = input(&finished);
+        let mut output = Vec::new();
+        let mut reader = NativeOutput {
+            reader: &mut input,
+            finished: &finished,
+            start_drain: Some(|input: &mut &mut StaleTimeout<'_>| {
+                input.input.set_nonblocking(true)
+            }),
+        };
+        io::copy(&mut reader, &mut output).unwrap();
+        assert_eq!(output, b"verified output queued before exit");
+    }
+    #[test]
+    fn final_output_drain_keeps_staging_failures_visible() {
+        struct Failed;
+        impl Write for Failed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("staging failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let finished = AtomicBool::new(false);
+        let mut input = input(&finished);
+        let mut reader = NativeOutput {
+            reader: &mut input,
+            finished: &finished,
+            start_drain: Some(|input: &mut &mut StaleTimeout<'_>| {
+                input.input.set_nonblocking(true)
+            }),
+        };
+        assert!(io::copy(&mut reader, &mut Failed).is_err());
     }
 }

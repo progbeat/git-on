@@ -23,6 +23,12 @@ class NoticeTests(unittest.TestCase):
         self.add('example','dev','GPL example not linked')
         result=module.collect(self.metadata)
         self.assertIn('Copyright runtime',result);self.assertIn('BSD license text',result);self.assertNotIn('GPL example',result)
+    def test_vendored_runtime_crate_preserves_its_license_text(self):
+        self.add('vendored',None,'Original upstream copyright and MIT license')
+        self.metadata['packages'][-1]['source']=None
+        result=module.collect(self.metadata)
+        self.assertIn('Original upstream copyright and MIT license',result)
+
     def test_missing_text_or_outside_package_path_fails_closed(self):
         self.add('runtime',None,'License text');(self.root/'runtime/LICENSE').unlink()
         with self.assertRaisesRegex(ValueError,'missing license text'):module.collect(self.metadata)

@@ -35,13 +35,15 @@ PARSER.add_argument('--probe', type=Path, default=ROOT / 'target/debug/examples/
 PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
 PARSER.add_argument('--million', action='store_true')
+PARSER.add_argument('--evidence-output',type=Path,help='Machine-readable completed remote-million evidence')
+PARSER.add_argument('--before-resource-probe', type=Path, help='Master source probe for resource red-before evidence')
 PARSER.add_argument('--before-binary', type=Path, help='Authentic pre-shutdown-fix binary for focused red-before replay')
 PARSER.add_argument('--before-lifecycle-binary', type=Path, help='Authentic pre-review-lifecycle-fix binary for mounted SSH shutdown replay')
 PARSER.add_argument('--before-policy-binary', type=Path, help='Authentic e427743 binary for ignore-acquisition errno red-before replay')
 OPTIONS, ARGS = PARSER.parse_known_args()
 # Artifact arguments are relative to the invoking harness, not a forked
 # fixture's cwd. Resolve them before any child changes directories.
-for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary'):
+for artifact in ('probe','binary','before_binary','before_lifecycle_binary','before_policy_binary','before_resource_probe','evidence_output'):
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
@@ -49,6 +51,20 @@ def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
+
+def git_on_environment(binary, environment, tools):
+    # Git dispatches by the git-on basename even when --binary names an artifact.
+    tools.mkdir()
+    (tools / 'git-on').symlink_to(binary.resolve())
+    return dict(environment, PATH=str(tools)+os.pathsep+environment['PATH'])
+
+def private_storage_fault(fault, root="Path.cwd().parent"):
+    """Corrupt the storage used by the selected import path, before a demand."""
+    if fault=='odb':
+        return f"packs={root}/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
+    assert fault=='raw'
+    return (f"parts=next(({root}).glob('raw-parts-*')); target={root}/'unexpected-target'\n"
+            "for index in range(256):\n path=parts/f'{index:x}-0'\n if not os.path.lexists(path): path.symlink_to(target)\n")
 
 def exec_fixture_child(argv, cwd, env):
     try:
@@ -104,7 +120,7 @@ class Fixture:
                 except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=5)
         for handle in self.handles: handle.close()
         self.temp.cleanup()
-    def https(self):
+    def https(self, authorization=None):
         key, cert = self.root/'tls.key', self.root/'tls.crt'
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert])
         backend = Path(run(['git', '--exec-path']).decode().strip()) / 'git-http-backend'
@@ -116,6 +132,11 @@ class Fixture:
             def handle_git(self):
                 path, _, query = self.path.partition('?')
                 data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                if authorization is not None and self.headers.get('Authorization') != authorization:
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate','Basic realm="git-on-fixture"')
+                    self.send_header('Content-Length','0'); self.end_headers()
+                    return
                 wants = [x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)]
                 stalled_request = bool(fixture.stalled_oids.intersection(wants))
                 if stalled_request:
@@ -157,7 +178,7 @@ class Fixture:
         self.server = server
         self.env['GIT_SSL_CAINFO'] = str(cert)
         return f'https://127.0.0.1:{server.server_port}/server.git'
-    def ssh(self, encrypted=False):
+    def ssh(self, encrypted=False, protocol_v2=False):
         sshd = shutil.which('sshd') or '/usr/sbin/sshd'
         if not Path(sshd).exists(): raise RuntimeError('OpenSSH server missing; install openssh-server')
         host, identity = self.root/'host', self.root/'identity'
@@ -167,6 +188,8 @@ class Fixture:
         with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port = sock.getsockname()[1]
         config = self.root/'sshd_config'
         config.write_text(f'Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nPidFile {self.root}/sshd.pid\nAuthorizedKeysFile {authorized}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nLogLevel VERBOSE\n')
+        if protocol_v2:
+            with config.open('a') as output:output.write('AcceptEnv GIT_PROTOCOL\n')
         errors = (self.root/'sshd.log').open('w+b'); self.handles.append(errors)
         server = subprocess.Popen([sshd, '-D', '-e', '-f', str(config)], stderr=errors)
         self.children.append(server); self.ssh_server = server
@@ -221,6 +244,20 @@ class RemoteDiagnosticsTests(unittest.TestCase):
         self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                         XDG_CACHE_HOME=str(self.root / 'cache'), TMPDIR=str(self.root),
                         LC_ALL='C')
+
+    def test_git_on_uses_selected_nonstandard_binary_over_path_fallback(self):
+        selected = self.root / 'chosen-runner'
+        selected.write_text('#!/bin/sh\nprintf selected\n')
+        selected.chmod(0o755)
+        fallback = self.tools / 'git-on'
+        fallback.write_text('#!/bin/sh\nprintf wrong-runner\nexit 77\n')
+        fallback.chmod(0o755)
+        environment = dict(self.env, PATH=str(self.tools)+os.pathsep+self.env['PATH'])
+        environment = git_on_environment(selected, environment, self.root / 'selected-tools')
+        result = subprocess.run([self.native_git, 'on'], cwd=self.root,
+                                env=environment, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'selected')
 
     def native_version(self, version, ssh_failure=False):
         wrapper = self.tools / 'git'
@@ -771,27 +808,30 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         self.assertEqual(result.stdout,b'bare relative alternate\n')
                 finally: f.cwd,f.env=previous_cwd,previous_env
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
-    def test_https_cold_warm_lazy_objects_ref_race_and_local_equivalence(self):
+    def test_https_fresh_runs_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        process=f.probe(url); start=f.line(process)
-        self.assertEqual(set(start['objects']), {f.commit, f.tree})
-        self.assertFalse((f.cwd/'.git').exists())
-        value, listed=f.operation(process, 'list ')
-        self.assertEqual(set(value['names']), {'.gitignore','deep','other'})
-        self.assertEqual(set(listed['objects']), {f.commit,f.tree})
-        moved_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
-        f.git('update-ref', 'refs/heads/main', f.git('commit-tree', moved_tree, data=b'moved\n'))
-        value, read=f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(set(read['objects']), {f.commit,f.tree,f.subtree,f.blob})
-        self.assertNotIn(f.other, read['objects']); f.finish(process)
-        requests=len(f.requests)
-        warm=f.probe(url, f.commit); f.line(warm); f.operation(warm,'read deep/file'); f.finish(warm)
-        # Native Git still resolves the exact user fetch operand. Cached trees
-        # and payloads need no requests beyond advertisement and that fetch.
-        new=f.requests[requests:]
-        self.assertEqual(len([x for x in new if x['path'].endswith('git-upload-pack')]), 2)
-        self.assertEqual({oid for request in new for oid in request['wants']},{f.commit})
+        wanted={f.commit,f.tree,f.subtree,f.blob}
+        for invocation,revision in enumerate(('HEAD','HEAD',f.commit)):
+            with self.subTest(invocation=invocation,revision=revision):
+                requests=len(f.requests)
+                process=f.probe(url,revision); start=f.line(process)
+                self.assertEqual(set(start['objects']),{f.commit,f.tree})
+                if invocation==0:
+                    self.assertFalse((f.cwd/'.git').exists())
+                    value,listed=f.operation(process,'list ')
+                    self.assertEqual(set(value['names']),{'.gitignore','deep','other'})
+                    self.assertEqual(set(listed['objects']),{f.commit,f.tree})
+                if invocation==1:
+                    # Move HEAD after resolution. This invocation stays pinned;
+                    # the next explicitly requests the original commit.
+                    moved_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+                    f.git('update-ref','refs/heads/main',f.git('commit-tree',moved_tree,data=b'moved\n'))
+                value,read=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n')
+                self.assertEqual(set(read['objects']),wanted)
+                f.finish(process)
+                self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},wanted)
+        self.assertFalse((f.root/'cache').exists(),'remote run created a global cache')
         expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
         self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
@@ -951,15 +991,21 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 while not pid.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
                 self.assertTrue(pid.exists(),'owned startup transport never began')
                 owned=int(pid.read_text())
+                descriptor=os.pidfd_open(owned)
                 try:
                     process.send_signal(sig); _,errors=process.communicate(timeout=5)
                     self.assertEqual(process.returncode,-sig,errors)
-                    proc=Path(f'/proc/{owned}/stat')
-                    self.assertTrue(not proc.exists() or proc.read_text().split()[2]=='Z')
+                    # Reaping Git can precede its transport processing the same
+                    # group's SIGKILL. Wait for this exact process's bounded
+                    # death, including on loaded runners and unreaped zombies.
+                    self.assertTrue(select.select([descriptor],[],[],2)[0],
+                                    'owned startup transport survived cancellation')
                     self.assertEqual(list(f.root.glob('git-on-*')),[])
                 finally:
+                    if not select.select([descriptor],[],[],0)[0]:
+                        with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+                    os.close(descriptor)
                     if process.poll() is None:
-                        with contextlib.suppress(ProcessLookupError): os.kill(owned,signal.SIGKILL)
                         process.kill(); process.communicate(timeout=5)
     def test_sigkill_during_native_config_startup_requires_external_process_cleanup(self):
         f=self.f; native=str(Path(shutil.which('git')).resolve())
@@ -1044,7 +1090,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_real_mount_remote_disposable_cleanup_and_cancellation(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        result=subprocess.run(['git','-c','http.sslCAInfo='+f.env['GIT_SSL_CAINFO'],'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH']),capture_output=True,timeout=30)
+        result=subprocess.run(['git','-c','http.sslCAInfo='+f.env['GIT_SSL_CAINFO'],'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools'),capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
         self.assertEqual(list(f.root.glob('git-on-*')),[])
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sleep','30'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -1078,11 +1124,15 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         size,stat=f.operation(process,'stat large')
         self.assertEqual(size['size'],len(payload)); self.assertEqual(stat['metrics']['blob_loads'],0)
         request_count=len(f.requests)
+        writes=None
         for offset in (0,len(payload)-4096,512,512):
             value,report=f.operation(process,f'range {offset} 4096 large')
             self.assertEqual(bytes(value['bytes']),payload[offset:offset+4096])
             self.assertEqual(report['metrics']['blob_loads'],1)
-            self.assertEqual(report['metrics']['spool_writes'],1)
+            self.assertGreater(report['metrics']['spool_writes'],0)
+            self.assertEqual(report['metrics']['spool_bytes'],len(payload))
+            if writes is None:writes=report['metrics']['spool_writes']
+            self.assertEqual(report['metrics']['spool_writes'],writes)
             self.assertNotIn(f.other,report['objects'])
         self.assertEqual(len(f.requests),request_count)
         _,report=f.operation(process,'release'); self.assertEqual(report['metrics']['active_spool_bytes'],0)
@@ -1234,13 +1284,12 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
-        env=dict(f.env,PATH=str(OPTIONS.binary.resolve().parent)+':'+f.env['PATH'])
+        env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools')
         for key in list(env):
             if key.startswith('GIT_CONFIG_KEY_') or key.startswith('GIT_CONFIG_VALUE_') or key=='GIT_CONFIG_COUNT': del env[key]
         for cwd,operands in ((f.cwd,[url,signed]),(f.repo,[signed])):
             result=subprocess.run(['git','-c','gpg.format=ssh','-c','gpg.ssh.allowedSignersFile='+str(allowed),'on','--verify',*operands,'--','cat','deep/file'],cwd=cwd,env=env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
-        shutil.rmtree(f.root/'cache')
         # The command catches EIO and returns 0. The runner must still report 125.
         f.denied_oids.add(f.blob)
         code="import errno\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('transport fault not observed')\n"
@@ -1249,7 +1298,638 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
-    def test_million_distinct_file_remote_cold_and_warm_bounded_fetch(self):
+    def test_real_mount_caught_verified_raw_storage_failure_is_sticky(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;blob=f.git('hash-object','-w','--stdin',data=b'v'*(128*1024))
+        tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        commit=f.git('commit-tree',tree,data=b'raw integrity failure\n');f.git('update-ref','refs/heads/main',commit)
+        code=f"""import errno,os
+from pathlib import Path
+os.stat('file')
+raw=next(Path.cwd().parent.glob('raw-objects-*/{blob}'))
+with raw.open('r+b') as output:output.write(b'!')
+try:
+ with open('file','rb') as source:source.read(1)
+except OSError as error:
+ assert error.errno==errno.EIO,error
+else:raise AssertionError('raw corruption was not rejected')
+print('caught-EIO-and-returned-success')
+"""
+        result=subprocess.run([str(OPTIONS.binary),'file://'+str(f.repo),'HEAD','--write-policy=none','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+        self.assertIn(b'caught-EIO-and-returned-success',result.stdout)
+        self.assertEqual(result.returncode,125,result.stderr)
+        self.assertIn(b'bytes were modified',result.stderr);self.assertIn(b'execution incomplete',result.stderr)
+        self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def test_remote_never_requires_or_modifies_global_cache(self):
+        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        original=dict(f.env)
+        blocked=f.root/'cache-path-is-a-file';blocked.write_bytes(b'unchanged cache path')
+        historical=f.root/'historical-cache'
+        for version in ('objects-v1','objects-v2'):
+            directory=historical/'git-on'/version;directory.mkdir(parents=True)
+            (directory/'keep').write_bytes(b'old user data')
+        for mode in ('unset','blocked','existing'):
+            with self.subTest(mode=mode):
+                f.env=dict(original)
+                if mode=='unset':
+                    f.env.pop('HOME',None);f.env.pop('XDG_CACHE_HOME',None)
+                else:f.env['XDG_CACHE_HOME']=str(blocked if mode=='blocked' else historical)
+                process=f.probe(url);f.line(process)
+                value,report=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n')
+                self.assertEqual(set(report['objects']),{f.commit,f.tree,f.subtree,f.blob})
+                f.finish(process)
+                self.assertEqual(blocked.read_bytes(),b'unchanged cache path')
+                for version in ('objects-v1','objects-v2'):
+                    directory=historical/'git-on'/version
+                    self.assertEqual(list(directory.iterdir()),[directory/'keep'])
+                    self.assertEqual((directory/'keep').read_bytes(),b'old user data')
+        f.env=original
+
+    def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
+        # Exceed raw-streaming and native-import thresholds. The range reads
+        # retain one 64 KiB block per object, so this is not an eviction test.
+        f=self.f; ids=[];object_mib=16
+        for byte in b'abc':
+            with tempfile.TemporaryFile() as output:
+                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
+                for _ in range(object_mib): writer.stdin.write(bytes([byte])*(1024*1024))
+                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); ids.append(output.read().decode().strip())
+        tree=f.git('mktree',data=''.join(f'100644 blob {oid}\t{name}\n' for name,oid in zip('abc',ids)).encode())
+        commit=f.git('commit-tree',tree,data=b'large run-local reuse fixture\n');f.git('update-ref','refs/heads/main',commit)
+        url=f.https();self.addCleanup(f.server.shutdown)
+        process=f.probe(url);f.line(process)
+        for name in 'abc':
+            value,last=f.operation(process,f'range 13 16 {name}')
+            self.assertEqual(bytes(value['bytes']),name.encode()*16)
+        self.assertEqual(last['metrics']['remote_fetches'],5)
+        self.assertEqual(last['metrics']['spool_bytes'],3*object_mib*1024*1024)
+        writes=last['metrics']['spool_writes'];self.assertGreater(writes,0)
+        requests=len(f.requests)
+        value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
+        self.assertEqual(len(f.requests),requests,'available run object fetched again')
+        self.assertEqual(last['metrics']['spool_writes'],writes,'closed blob was written again')
+        f.finish(process)
+        # A separate invocation streams a newly fetched loose object again.
+        requests=len(f.requests);process=f.probe(url);f.line(process)
+        value,last=f.operation(process,'range 13 16 c');self.assertEqual(bytes(value['bytes']),b'c'*16)
+        self.assertEqual(last['metrics']['remote_raw_blob_imports'],1)
+        self.assertEqual(last['metrics']['blob_loads'],1)
+        self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
+        f.finish(process)
+        self.assertFalse((f.root/'cache').exists())
+        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*object_mib*1024*1024,metrics=last['metrics'])),flush=True)
+
+    @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
+    def test_materialization_native_git_tty_handoff_with_tostop(self):
+        import native_job_control
+        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        original=f.env
+        for selection in ('automatic','explicit-fsck'):
+            with self.subTest(selection=selection):
+                f.env=dict(original)
+                if selection=='explicit-fsck':
+                    f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                tools=f.root/f'tostop-{selection}';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
+                shell=native_job_control.Shell(f);self.addCleanup(shell.close)
+                shell.send(b'stty tostop\n');shell.expect(shell.prompt)
+                f.resume.clear();f.stalled.clear();f.stalled_oids={f.blob}
+                runner_file=f.root/f'tostop-runner-{selection}'
+                argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('child-completed')"]
+                shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
+                try:
+                    self.assertTrue(f.stalled.wait(10),'native fetch did not reach controlled TTY stall')
+                    runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
+                    shell.groups.update((runner,foreground))
+                    self.assertNotEqual(foreground,runner,'native Git never received terminal foreground ownership')
+                    self.assertEqual(os.getsid(runner),shell.pid)
+                    deadline=time.monotonic()+1.3
+                    while time.monotonic()<deadline:
+                        shell.read()
+                        if native_job_control.state(runner)=='T':break
+                    self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
+                    f.resume.set()
+                    output=shell.expect(shell.prompt,timeout=15)
+                    self.assertIn(b'STATUS:0',output)
+                    visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
+                    self.assertIn(b'child-completed',visible.splitlines())
+                    self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    shell.groups.clear()
+                finally:f.resume.set()
+        f.env=original
+
+    def test_materialization_progress_is_delayed_tty_only_and_cleared_before_child_or_error(self):
+        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        programs=f.root/'progress-tools'; programs.mkdir(); (programs/'git').symlink_to(shutil.which('git'))
+        env=dict(f.env,PATH=str(programs),TERM='xterm')
+        f.stalled_oids={f.blob}
+        for outcome in ('success','error','cancel'):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(f.root/'cache',ignore_errors=True)
+                f.resume.clear(); f.stalled.clear(); f.denied_oids=set()
+                master,slave=pty.openpty()
+                self.addCleanup(os.close,master)
+                child="import sys; sys.stderr.write('CHILD-START\\n'); print('child output')"
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=slave)
+                os.close(slave); f.children.append(process)
+                self.assertTrue(f.stalled.wait(10),'materialization never reached controlled object stall')
+                transcript=bytearray(); deadline=time.monotonic()+5
+                while b'Preparing snapshot' not in transcript and time.monotonic()<deadline:
+                    if select.select([master],[],[],.1)[0]: transcript.extend(os.read(master,65536))
+                self.assertIn(b'Preparing snapshot',transcript)
+                self.assertNotIn(b'CHILD-START',transcript)
+                if outcome=='error': f.denied_oids={f.blob}
+                if outcome=='cancel': process.send_signal(signal.SIGTERM)
+                f.resume.set()
+                output,_=process.communicate(timeout=20)
+                while select.select([master],[],[],.05)[0]:
+                    try: chunk=os.read(master,65536)
+                    except OSError as error:
+                        if error.errno==errno.EIO: break
+                        raise
+                    if not chunk: break
+                    transcript.extend(chunk)
+                self.assertIn(b'\x1b[2K',transcript)
+                if outcome=='success':
+                    self.assertEqual(process.returncode,0,transcript)
+                    self.assertEqual(output,b'child output\n')
+                    self.assertGreater(transcript.index(b'CHILD-START'),transcript.rfind(b'\x1b[2K'))
+                else:
+                    self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
+                    self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
+                    if outcome=='error': self.assertIn(b'fetch of exact object',transcript)
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')
+    def test_private_remote_objects_do_not_sync_disposable_payloads(self):
+        f=self.f;trace=f.root/'private-object-io.trace'
+        # The caller can request durability for its real repository. Only the
+        # disposable private destination overrides that policy, not signatures
+        # or object-integrity checks, and no source configuration is rewritten.
+        env=dict(f.env,GIT_CONFIG_COUNT='2',GIT_CONFIG_KEY_0='core.fsync',GIT_CONFIG_VALUE_0='all',
+            GIT_CONFIG_KEY_1='core.fsyncObjectFiles',GIT_CONFIG_VALUE_1='true')
+        before=f.git('config','--list')
+        result=subprocess.run(['strace','--kill-on-exit','-f','-yy','-e','trace=process,read,write,fsync,fdatasync',
+            '-o',str(trace),str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],
+            cwd=f.cwd,env=env,input=b'read deep/file\nread deep/file\nreport\nexit\n',capture_output=True,timeout=40)
+        if result.returncode:
+            self.fail(f'private import failed ({result.returncode}): {result.stderr!r}\n'+trace.read_text()[-65536:])
+        rows=[json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row['data'] for row in rows if 'data' in row],['expected\n']*2)
+        reports=[row['metrics'] for row in rows if 'metrics' in row]
+        self.assertEqual(reports[-1]['remote_fetches'],4)
+        self.assertEqual(reports[-1]['remote_fetches'],reports[-2]['remote_fetches'])
+        lines=[line for line in trace.read_text().splitlines() if '/remote-repository/objects/' in line]
+        self.assertTrue(any(re.search(r'\bwrite\(',line) for line in lines),'object writes were not traced')
+        self.assertEqual([line for line in lines if re.search(r'\b(fsync|fdatasync)\(',line)],[])
+        self.assertEqual(f.git('config','--list'),before)
+
+    def test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies(self):
+        f=self.f;entries=[];oids=[];count=300
+        for index in range(count):
+            prefix=f'raw-{index:03d}:'.encode();data=prefix+b'x'*(65536-len(prefix))
+            oid=f.git('hash-object','-w','--stdin',data=data);oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'raw eviction fixture\n');f.git('update-ref','refs/heads/main',commit)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'range 0 32 f{index:03d}')
+            self.assertEqual(bytes(value['bytes']),f'raw-{index:03d}:'.encode()+b'x'*24)
+        value,again=f.operation(process,'range 0 32 f000');self.assertEqual(bytes(value['bytes']),b'raw-000:'+b'x'*24)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
+        self.assertEqual(again['metrics']['blob_loads'],last['metrics']['blob_loads'],'evicted raw blob was unpacked again')
+        destination=next(f.root.glob('*/remote-repository'))
+        self.assertEqual(list((destination/'objects/pack').iterdir()),[])
+        self.assertFalse(any((destination/'objects'/oid[:2]/oid[2:]).exists() for oid in oids),'received blobs were recompressed into loose files')
+        self.assertGreater(again['metrics']['retained_raw_blob_entries'],0,'working set did not actually evict payloads')
+        self.assertLessEqual(again['metrics']['blob_cache_bytes'],again['metrics']['blob_cache_limit'])
+        f.finish(process)
+
+    def test_protocol_v2_reuses_native_clients_across_many_blob_demands(self):
+        f=self.f;count=140;entries=[];oids=[]
+        for index in range(count):
+            oid=f.git('hash-object','-w','--stdin',data=f'unique-{index}\n'.encode());oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:04d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode());commit=f.git('commit-tree',tree,data=b'session reuse\n');f.git('update-ref','refs/heads/main',commit)
+        trace=f.root/'native-processes.jsonl';f.env['GIT_TRACE2_EVENT']=str(trace)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'read f{index:04d}')
+            self.assertEqual(value['data'],f'unique-{index}\n')
+        value,again=f.operation(process,'read f0000');self.assertEqual(value['data'],'unique-0\n')
+        self.assertEqual(again['metrics']['blob_loads'],count)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
+        f.finish(process)
+        starts=[r['argv'] for line in trace.read_text().splitlines() if (r:=json.loads(line))['event']=='start']
+        fetches=[args for args in starts if 'fetch' in args]
+        decoders=[args for args in starts if 'cat-file' in args]
+        self.assertEqual(len(fetches),1,'one native fetch process per lazy object returned')
+        self.assertEqual(len(decoders),1,'one native decoder process per lazy object returned')
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_starts'],1)
+        self.assertEqual(set(again['objects']),{commit,tree,*oids})
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux process resource limits')
+    def test_session_pack_and_raw_storage_respect_fsize_and_descriptor_limits(self):
+        import hashlib,resource
+        f=self.f;count=140;limit=8192;entries=[]
+        for index in range(count):
+            data=hashlib.shake_256(f'session-parts:{index}'.encode()).digest(limit)
+            oid=f.git('hash-object','-w','--stdin',data=data)
+            entries.append(f'100644 blob {oid}\tf{index:04d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'bounded session parts\n');f.git('update-ref','refs/heads/main',commit)
+        def reduced_limits():
+            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+            resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
+        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,preexec_fn=reduced_limits,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        f.children.append(process);f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'range 0 32 f{index:04d}')
+            self.assertEqual(value['bytes'],list(hashlib.shake_256(f'session-parts:{index}'.encode()).digest(32)))
+            f.operation(process,'release')
+        value,again=f.operation(process,'range 0 32 f0000')
+        self.assertEqual(value['bytes'],list(hashlib.shake_256(b'session-parts:0').digest(32)))
+        self.assertEqual(again['metrics']['blob_loads'],count)
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
+        self.assertEqual(again['metrics']['remote_session_starts'],1)
+        self.assertEqual(again['metrics']['remote_raw_blob_bytes'],count*limit)
+        self.assertGreater(again['metrics']['remote_raw_blob_bytes'],limit)
+        parts=[p for directory in f.root.rglob('raw-parts-*') for p in directory.iterdir()]
+        # Transport scratch may already be reclaimed and this working set fits
+        # RAM. Successful verified demands exceed FSIZE in aggregate; retained
+        # scratch bytes are not a requirement of the storage contract.
+        self.assertTrue(all(p.stat().st_size<=limit for p in parts),'a logical raw or pack file exceeded inherited FSIZE')
+        self.assertLessEqual(len(list(Path(f'/proc/{process.pid}/fd').iterdir())),48)
+        f.finish(process)
+
+    def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
+        f=self.f;url=f.ssh(protocol_v2=True)
+        process=f.probe(url);f.line(process)
+        value,report=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
+        self.assertEqual(report['metrics']['remote_session_fetch_operations'],3)
+        self.assertEqual(report['metrics']['remote_session_starts'],1)
+        socket=next(f.root.rglob('ssh-control'))
+        run(['ssh','-F','/dev/null','-S',socket,'-O','exit','fixture-host'],env=f.env)
+        with self.assertRaises(AssertionError):f.operation(process,'read other')
+        self.assertNotEqual(process.wait(timeout=10),0)
+        self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
+
+    def test_session_storage_fault_targets_the_active_parts_instead_of_unused_packs(self):
+        f=self.f
+        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        f.children.append(process);f.line(process)
+        root=next(f.root.glob('*/remote-repository')).parent
+        selected=f"Path({str(root)!r})"
+        exec(private_storage_fault('odb',selected),{'Path':Path})
+        value,report=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n')
+        self.assertEqual(report['metrics']['remote_session_starts'],1)
+        exec(private_storage_fault('raw',selected),{'Path':Path,'os':os})
+        with self.assertRaisesRegex(AssertionError,'Too many levels of symbolic links'):
+            f.operation(process,'read other')
+        self.assertNotEqual(process.wait(timeout=10),0)
+        self.assertFalse((root/'unexpected-target').exists())
+
+    def delta_session_fixture(self, prefix_size=20000, include_base=False):
+        import hashlib,zlib
+        f=self.f;native=shutil.which('git')
+        base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
+        base_oid=f.git('hash-object','-w','--stdin',data=base)
+        wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
+        entries=f'100644 blob {wanted_oid}\tfile\n'
+        if include_base:entries+=f'100644 blob {base_oid}\tbase\n'
+        tree=f.git('mktree',data=entries.encode())
+        commit=f.git('commit-tree',tree,data=b'delta session\n');f.git('update-ref','refs/heads/main',commit)
+        def integer(value):
+            output=bytearray()
+            while True:
+                byte=value&127;value>>=7;output.append(byte|(128 if value else 0))
+                if not value:return bytes(output)
+        def entry(kind,size):
+            first=(kind<<4)|(size&15);size>>=4
+            return bytes([first|(128 if size else 0)])+(integer(size) if size else b'')
+        delta=integer(len(base))+integer(len(wanted))+bytes([0xf0,prefix_size&255,(prefix_size>>8)&255,(prefix_size>>16)&255,7])+b'changed'
+        data=b'PACK'+(2).to_bytes(4,'big')+(2).to_bytes(4,'big')
+        data+=entry(3,len(base))+zlib.compress(base)
+        data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
+        data+=hashlib.sha1(data).digest()
+        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],input=(tree+'\n').encode(),env=f.env)
+        trace=f.root/'delta-demands'
+        tools=f.root/'delta-tools';tools.mkdir();wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,sys
+native={native!r}
+args=sys.argv[1:]
+if 'upload-pack' not in args:os.execv(native,[native,*args])
+packs={dict([(tree,tree_pack),(wanted_oid,data)])!r}
+def send(data):
+ sys.stdout.buffer.write(f'{{len(data)+4:04x}}'.encode()+data)
+def packet():
+ header=sys.stdin.buffer.read(4)
+ if not header:raise SystemExit(0)
+ length=int(header,16)
+ return length if length<4 else sys.stdin.buffer.read(length-4)
+send(b'version 2\\n');send(b'fetch=shallow filter\\n');sys.stdout.buffer.write(b'0000');sys.stdout.buffer.flush()
+while True:
+ wanted=None
+ while True:
+  value=packet()
+  if value==0:break
+  if isinstance(value,bytes) and value.startswith(b'want '):wanted=value[5:].strip().decode()
+ with open({str(trace)!r},'a') as output:output.write(wanted+'\\n')
+ send(b'packfile\\n')
+ for offset in range(0,len(packs[wanted]),60000):send(b'\\x01'+packs[wanted][offset:offset+60000])
+ sys.stdout.buffer.write(b'0000');sys.stdout.buffer.flush()
+''')
+        wrapper.chmod(0o700);f.env['PATH']=str(tools)+os.pathsep+f.env['PATH']
+        return wanted,base_oid,wanted_oid,tree,commit,trace
+
+    def test_session_imports_required_delta_pack_without_a_second_fetch(self):
+        f=self.f;wanted,base_oid,wanted_oid,tree,commit,_=self.delta_session_fixture()
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        value,first=f.operation(process,'range 19990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        f.operation(process,'release')
+        value,again=f.operation(process,'range 19990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        for field in ('remote_fetches','remote_fetch_operations','remote_decode_operations','remote_session_fetch_operations','blob_loads'):
+            self.assertEqual(first['metrics'][field],again['metrics'][field])
+        self.assertEqual(again['metrics']['remote_fetch_operations'],1)
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'],2)
+        self.assertEqual(again['metrics']['remote_decode_operations'],2,'generic decoder did not run')
+        self.assertEqual(set(again['objects']),{commit,tree,base_oid,wanted_oid})
+        destination=next(f.root.rglob('remote-repository'))
+        self.assertEqual(list((destination/'objects/pack').iterdir()),[])
+        f.finish(process)
+
+    def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
+        f=self.f;wanted,base_oid,_,tree,_,trace=self.delta_session_fixture(include_base=True)
+        process=f.probe('file://'+str(f.repo));f.line(process)
+        _,before=f.operation(process,'range 0 1 file')
+        f.operation(process,'release')
+        value,prepared=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        self.assertEqual(before['metrics']['remote_session_fetch_operations'],prepared['metrics']['remote_session_fetch_operations'])
+        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
+        f.operation(process,'release')
+        value,reopened=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        for field in ('remote_fetch_operations','remote_decode_operations','blob_loads'):
+            self.assertEqual(prepared['metrics'][field],reopened['metrics'][field])
+        f.finish(process)
+
+    def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;wanted,_,wanted_oid,tree,_,trace=self.delta_session_fixture(40000)
+        code=r'''
+import errno,os,sys
+from pathlib import Path
+expected=b'a'*40000+b'changed'
+for _ in range(2):
+ assert Path('file').read_bytes()==expected
+runs=Path.cwd().parent
+raw=list(runs.glob('raw-objects-*'))
+assert len(raw)==1 and not list(raw[0].iterdir()), 'fitting delta payloads spilled to disk'
+assert not list((runs/'remote-repository/objects/pack').iterdir())
+if sys.argv[1]=='all':
+ reader=os.open('file',os.O_RDONLY)
+ try:
+  with open('file','r+b',buffering=0) as writer:
+   writer.write(b'changed in mount')
+  assert os.pread(reader,16,0)==b'changed in mount'
+  os.fsync(reader);os.fdatasync(reader)
+  os.rename('file','moved')
+  os.link('moved','alias')
+  assert Path('alias').read_bytes().startswith(b'changed in mount')
+  os.unlink('moved');os.unlink('alias')
+  assert os.fstat(reader).st_nlink==0 and os.pread(reader,16,0)==b'changed in mount'
+ finally:os.close(reader)
+else:
+ try:open('file','wb')
+ except OSError as error:assert error.errno==errno.EROFS,error
+ else:raise AssertionError('protected source was writable')
+if sys.argv[1]=='untracked':
+ Path('generated').write_bytes(b'generated bytes')
+ assert Path('generated').read_bytes()==b'generated bytes'
+'''
+        for policy in ('none','untracked','all'):
+            with self.subTest(policy=policy):
+                trace.unlink(missing_ok=True)
+                result=subprocess.run([str(OPTIONS.binary),'file://'+str(f.repo),'HEAD',
+                    '--write-policy='+policy,'--',sys.executable,'-I','-S','-c',code,policy],
+                    cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(f.git('cat-file','blob',wanted_oid).encode(),wanted)
+
+    def large_delta_storage_fixture(self):
+        size=7*1024*1024
+        _,_,wanted_oid,tree,_,trace=self.delta_session_fixture(size-7)
+        from filesystem_quota import STORAGE_OBSERVATION
+        command=[sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
+import sys
+expected=b'a'*(7*1024*1024-7)+b'changed'
+assert Path('file').stat().st_size==len(expected)
+assert Path('file').read_bytes()==expected
+assert Path('file').read_bytes()==expected
+assert allocated()<9*1024*1024,('delta import retained an extra decoded payload',allocated())
+if sys.argv[1]=='rewrite':
+ expected=b'z'*len(expected)
+ with open('file','r+b',buffering=0) as output:assert output.write(expected)==len(expected)
+ assert Path('file').read_bytes()==expected
+ assert allocated()<9*1024*1024,('delta mutation duplicated source',allocated())
+print('delta payload verified')
+''']
+        return command,wanted_oid,tree,trace
+
+    def test_delta_base_is_not_a_second_materialized_file(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;command,wanted_oid,tree,trace=self.large_delta_storage_fixture()
+        clone=f.root/'delta-clone'
+        run(['git','clone','--no-local','--quiet','file://'+str(f.repo),str(clone)],env=f.env)
+        for mode,policy in (('read','none'),('rewrite','all')):
+            with self.subTest(mode=mode):
+                trace.unlink(missing_ok=True)
+                direct=subprocess.run([*command,mode],cwd=clone,env=f.env,capture_output=True,timeout=30)
+                self.assertEqual(direct.returncode,0,direct.stderr)
+                result=subprocess.run([str(OPTIONS.binary),'file://'+str(f.repo),'HEAD','--write-policy='+policy,'--',*command,mode],
+                                      cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,direct.stdout)
+                self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    def test_delta_decode_and_rewrite_succeed_on_nine_mib_tmpfs(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        from filesystem_quota import compare_on_tmpfs
+        f=self.f;command,_,_,_=self.large_delta_storage_fixture()
+        compare_on_tmpfs(self,f.root,OPTIONS.binary,f.repo,f.env['PATH'],[*command,'rewrite'],source=f.repo.as_uri())
+
+    def test_native_raw_import_verifies_oid_before_publishing_bytes(self):
+        f=self.f;tools=f.root/'raw-decoder-tools';tools.mkdir()
+        f.env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+        real_git=shutil.which('git')
+        wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,subprocess,sys
+native={real_git!r}
+args=sys.argv[1:]
+if 'cat-file' in args and '--batch' in args:
+ result=subprocess.run([native,*args],input=sys.stdin.buffer.read(),stdout=subprocess.PIPE)
+ data=result.stdout
+ if b' blob ' in data.split(b'\\n',1)[0]:
+  fault=os.environ['NATIVE_DECODER_FAULT']
+  if fault=='corrupt':data=data.replace(b'expected\\n',b'changed!\\n',1)
+  elif fault=='truncated':data=data[:-3]
+  elif fault=='exit':result.returncode=42
+ sys.stdout.buffer.write(data)
+ raise SystemExit(result.returncode)
+os.execv(native,[native,*args])
+''')
+        wrapper.chmod(0o700);f.env['PATH']=str(tools)+os.pathsep+f.env['PATH']
+        for fault,message in [('corrupt','Git object hash mismatch'),
+                              ('truncated','truncated Git object'),
+                              ('exit','cannot decode received Git objects')]:
+            with self.subTest(fault=fault):
+                f.env['NATIVE_DECODER_FAULT']=fault
+                process=f.probe('file://'+str(f.repo));f.line(process)
+                with self.assertRaisesRegex(AssertionError,message):
+                    f.operation(process,'read deep/file')
+                self.assertNotEqual(process.wait(timeout=10),0)
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
+    def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):
+        import resource
+        f=self.f
+        entries=[]
+        for index in range(192):
+            blob=f.git('hash-object','-w','--stdin',data=f'object-{index}\n'.encode())
+            entries.append(f'100644 blob {blob}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'descriptor fixture\n')
+        f.git('update-ref','refs/heads/main',commit)
+        limit=64
+        def reduced_limit(): resource.setrlimit(resource.RLIMIT_NOFILE,(limit,limit))
+        def exercise(binary,cache,expect_failure=False):
+            process=subprocess.Popen([str(binary),'file://'+str(f.repo),'HEAD'],cwd=f.cwd,
+                env=dict(f.env,XDG_CACHE_HOME=str(cache)),preexec_fn=reduced_limit,
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+            f.children.append(process)
+            samples=[]; failure=None; last=None
+            try:
+                f.line(process)
+                for index in range(192):
+                    value,last=f.operation(process,f'read f{index:03d}')
+                    self.assertEqual(value['data'],f'object-{index}\n')
+                    if index in (15,63,127,191):
+                        samples.append(dict(objects=index+1,descriptors=len(list(Path(f'/proc/{process.pid}/fd').iterdir()))))
+                        if not expect_failure:
+                            pack_dirs=list(f.root.glob('*/remote-repository/objects/pack'))
+                            self.assertEqual(len(pack_dirs),1)
+                            self.assertEqual(list(pack_dirs[0].iterdir()),[],'per-demand packs accumulated in the run ODB')
+            except (AssertionError,BrokenPipeError) as error:
+                failure=str(error)
+                process.wait(timeout=10)
+            if expect_failure:
+                self.assertIsNotNone(failure,'old binary unexpectedly completed; red result unavailable')
+                self.assertIn('Too many open files',failure)
+            else:
+                if failure: self.fail(failure)
+                fetches=last['metrics']['remote_fetches']
+                value,again=f.operation(process,'read f000')
+                self.assertEqual(value['data'],'object-0\n')
+                self.assertEqual(again['metrics']['remote_fetches'],fetches)
+                f.finish(process)
+                self.assertLessEqual(max(x['descriptors'] for x in samples),48)
+            print('descriptor evidence:',json.dumps(dict(binary=str(binary),cache=str(cache),rlimit_nofile=limit,samples=samples,failure=failure,metrics=last['metrics'] if last else None)),flush=True)
+            return last
+        if OPTIONS.before_resource_probe:
+            exercise(OPTIONS.before_resource_probe,f.root/'before-cache',True)
+        cache=f.root/'resource-cache'
+        for _ in range(2):
+            report=exercise(OPTIONS.probe,cache)
+            self.assertEqual(report['metrics']['blob_loads'],192)
+            self.assertEqual(report['metrics']['remote_fetches'],194)
+        self.assertFalse(cache.exists())
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux source-pack mapping observation')
+    def test_idle_local_pack_mappings_do_not_retain_the_complete_source_pack(self):
+        f=self.f; f.cwd=f.repo; entries=[]; expected=[]; generator=random.Random(140019)
+        for index in range(24):
+            data=generator.randbytes(2*1024*1024)
+            blob=f.git('hash-object','-w','--stdin',data=data)
+            entries.append(f'100644 blob {blob}\tf{index:03d}\n');expected.append((data[0],data[-1]))
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'packed mapping retention fixture\n')
+        f.git('update-ref','refs/heads/main',commit)
+        f.git('-c','core.compression=0','repack','-adf','--window=0','--depth=0')
+        packs=list((f.repo/'objects/pack').glob('*.pack'))
+        self.assertEqual(len(packs),1)
+        self.assertGreater(packs[0].stat().st_size,48*1024*1024)
+        index=packs[0].with_suffix('.idx')
+        packed=f.git('verify-pack','-v',str(index)).splitlines()
+        self.assertEqual(sum(' blob ' in line for line in packed),24)
+        self.assertTrue(all(len(line.split())==5 for line in packed if ' blob ' in line),'fixture acquired delta chains')
+        process=f.probe('local');f.line(process)
+        for number,(first,_) in enumerate(expected):
+            value,report=f.operation(process,f'range 0 1 f{number:03d}')
+            self.assertEqual(value['bytes'],[first])
+        _,report=f.operation(process,'release')
+        self.assertEqual(report['metrics']['active_blob_readers'],0)
+        # smaps Size measures retained mappings, independently of whether clean
+        # file-backed pages have been reclaimed under host memory pressure.
+        text=Path(f'/proc/{process.pid}/smaps').read_text()
+        mapped_kib=0
+        for section in re.split(r'(?=^[0-9a-f]+-[0-9a-f]+ )',text,flags=re.M):
+            if section and str(packs[0]) in section.splitlines()[0]:
+                mapped_kib+=int(re.search(r'^Size:\s+(\d+) kB$',section,re.M)[1])
+        status=Path(f'/proc/{process.pid}/status').read_text()
+        rss_kib=int(re.search(r'^VmRSS:\s+(\d+) kB$',status,re.M)[1])
+        self.assertGreater(mapped_kib,0)
+        self.assertLessEqual(mapped_kib,24*1024,'idle source pack exceeded the 16 MiB soft budget plus an active-window allowance')
+        for number,(_,last) in enumerate(expected):
+            value,again=f.operation(process,f'range {2*1024*1024-1} 1 f{number:03d}')
+            self.assertEqual(value['bytes'],[last])
+        self.assertEqual(again['metrics']['blob_loads'],24,'window eviction triggered object decoding')
+        self.assertEqual(again['metrics']['blob_cache_limit'],16*1024*1024)
+        f.finish(process)
+        print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
+    def test_first_large_loose_range_streams_without_retaining_full_payload(self):
+        f=self.f
+        for mib in (16,64,128):
+            with tempfile.TemporaryFile() as output:
+                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
+                for _ in range(mib): writer.stdin.write(b'x'*(1024*1024))
+                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); blob=output.read().decode().strip()
+            tree=f.git('mktree',data=f'100644 blob {blob}\tlarge\n'.encode())
+            for binary in ([OPTIONS.before_resource_probe] if OPTIONS.before_resource_probe else [])+[OPTIONS.probe]:
+                process=subprocess.Popen([str(binary),'local',tree],cwd=f.repo,env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+                f.children.append(process); f.line(process)
+                value,report=f.operation(process,'range 1234 16 large')
+                self.assertEqual(bytes(value['bytes']),b'x'*16)
+                repeated,again=f.operation(process,'range 4321 16 large')
+                self.assertEqual(repeated,value)
+                self.assertEqual(report['metrics']['spool_bytes'],mib*1024*1024)
+                self.assertGreater(report['metrics']['spool_writes'],0)
+                self.assertEqual(again['metrics']['spool_writes'],report['metrics']['spool_writes'])
+                status=Path(f'/proc/{process.pid}/status').read_text()
+                peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
+                if binary==OPTIONS.probe: self.assertEqual(report['metrics']['streamed_blob_loads'],1)
+                print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
+                f.finish(process)
+
+    def test_million_distinct_file_remote_fresh_runs_bounded_fetch(self):
         if not OPTIONS.million: self.skipTest('million-file acceptance explicitly selected in CI')
         import benchmark
         f=self.f; fixture=benchmark.digit_fixture(f.repo,1_000_000)
@@ -1259,7 +1939,6 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         selected=f'{random.Random(0x5eed).randrange(1_000_000):06d}'; path='/'.join(selected)
         process=f.probe(url); initial=f.line(process)
         self.assertEqual(set(initial['objects']),{commit,tree}); f.finish(process)
-        shutil.rmtree(f.root/'cache')
         process=f.probe(url); f.line(process)
         value,read=f.operation(process,'read '+path); self.assertEqual(value['data'],selected+'\n')
         self.assertEqual(len(read['objects']),8)
@@ -1271,7 +1950,8 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         start=len(f.requests)
         process=f.probe(url); f.line(process); value,_=f.operation(process,'read '+path); f.finish(process)
         self.assertEqual(value['data'],selected+'\n')
-        self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},{commit})
+        self.assertEqual({oid for request in f.requests[start:] for oid in request['wants']},set(read['objects']))
+        fuse_runs=[]
         if OPTIONS.require_fuse:
             for index,command in enumerate((['true'],['cat',path],['cat',path])):
                 if index<2: shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -1280,7 +1960,12 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'' if command[0]=='true' else (selected+'\n').encode())
                 demands={oid for x in f.requests[begin:] for oid in x['wants']}
-                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']) if index==1 else {commit})
+                self.assertEqual(demands, {commit,tree} if index==0 else set(read['objects']))
+                fuse_runs.append(dict(command=command,returncode=result.returncode,stdout=result.stdout.decode(),objects=sorted(demands)))
+        if OPTIONS.evidence_output:
+            head=subprocess.check_output(['git','-C',str(Path(__file__).resolve().parents[1]),'rev-parse','HEAD'],text=True).strip()
+            OPTIONS.evidence_output.parent.mkdir(parents=True,exist_ok=True)
+            OPTIONS.evidence_output.write_text(json.dumps(dict(head=head,files=1000000,selected=selected,objects=read['objects'],fuse_runs=fuse_runs))+'\n')
         print('remote million evidence:',json.dumps(dict(fixture=fixture,selected=selected,objects=read['objects'],requests=f.requests)),flush=True)
 
     def test_ssh_denied_authentication_stops_before_mount(self):
@@ -1386,9 +2071,9 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                             for path in (directory/'backing').iterdir()),'raw writable payload was lost')
         self.assertTrue((directory/'ssh-control-owner').is_file())
         self.assertEqual(f.git('rev-parse',pin,at=directory/'remote-repository'),recovery['tree_oid'])
-        # Kernel flock ownership ends with the killed process. Cached objects
-        # remain reusable; active-run objects and pin remain in private storage.
-        for lockfile in (directory/'.lock',f.root/'cache/git-on/objects-v1/lock'):
+        # Kernel flock ownership ends with the killed process. Active-run
+        # objects and the recovery pin remain in private storage.
+        for lockfile in (directory/'.lock',):
             with lockfile.open('rb') as held:
                 fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 fcntl.flock(held,fcntl.LOCK_UN)
@@ -1596,7 +2281,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             self.assertTrue(f.stalled.wait(timeout=20),'lazy fetch never reached controlled server stall')
             self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
             if escaped: exit_file.write_text('exit successfully')
-            else: os.killpg(state['pid'],signal.SIGTERM)
+            else: process.send_signal(signal.SIGTERM)
             try:
                 _,errors=process.communicate(timeout=8)
                 stayed_blocked=False
@@ -1623,28 +2308,71 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
+    def handled_term_during_active_remote_read(self,native):
+        f=self.f;url=f.https();self.addCleanup(f.server.server_close);self.addCleanup(f.server.shutdown)
+        f.stalled.clear();f.resume.clear();f.stalled_oids={f.blob}
+        ready=f.root/'handled-read-ready'
+        code="""
+import json,os,signal,sys,threading
+from pathlib import Path
+signal.signal(signal.SIGTERM,lambda *args:sys.exit(42))
+Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))
+def read():
+ try:Path('deep/file').read_bytes()
+ except OSError:pass
+threading.Thread(target=read,daemon=True).start()
+signal.pause()
+"""
+        env=dict(f.env,READY=str(ready))
+        if native:env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='true')
+        process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-I','-S','-c',code],
+                                 cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process);directory=None
+        try:
+            self.assertTrue(f.stalled.wait(timeout=20),'remote read never reached the controlled stall')
+            state=json.loads(ready.read_text());directory=Path(state['run'])
+            process.send_signal(signal.SIGTERM)
+            _,errors=process.communicate(timeout=10)
+            self.assertEqual(process.returncode,42,errors)
+            self.assertFalse(directory.exists(),'handled termination must clean its run')
+        finally:
+            f.resume.set();f.stalled_oids.clear()
+            if process.poll() is None:process.kill();process.communicate(timeout=10)
+            if ready.exists():
+                with contextlib.suppress(ProcessLookupError):os.killpg(json.loads(ready.read_text())['pid'],signal.SIGKILL)
+            if directory is not None and directory.exists():
+                cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(directory)],capture_output=True,timeout=20)
+                self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+
+    def test_handled_term_during_active_remote_read_preserves_child_exit(self):
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
+        for native in (False,True):
+            with self.subTest(native_fetch=native):self.handled_term_during_active_remote_read(native)
+
     def test_review_real_mount_stalled_lazy_fetch_shutdown(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; self.stall_url=f.https(); self.addCleanup(f.server.shutdown)
         for escaped in (False,True):
             with self.subTest(escaped=escaped):
-                if OPTIONS.before_binary: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
+                if OPTIONS.before_binary and escaped: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
                 self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
 
-    def test_review_real_mount_caught_cache_fault_forces_runner_failure(self):
+    def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        code="import errno,os; from pathlib import Path; (Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('cache fault not observed')\n"
-        cases=([(OPTIONS.before_binary,0)] if OPTIONS.before_binary else [])+[(OPTIONS.binary,125)]
-        for binary,expected in cases:
-            shutil.rmtree(f.root/'cache',ignore_errors=True)
-            result=subprocess.run([str(binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
-            self.assertEqual(result.returncode,expected,result.stderr)
-            if expected==125:
-                self.assertIn(b'not-an-object',result.stderr)
+        for fault in ('odb','raw'):
+            with self.subTest(fault=fault):
+                env=dict(f.env)
+                if fault=='odb':
+                    env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                code="import errno,os; from pathlib import Path\n"+private_storage_fault(fault)
+                code+="try:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
+                if fault=='raw':code+="assert not target.exists()\n"
+                result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=env,capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,125,result.stderr)
+                self.assertIn(b'remote object loading failed',result.stderr)
                 self.assertIn(b'execution incomplete',result.stderr)
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
-            print('cache fault regression evidence:',json.dumps(dict(binary=str(binary),expected=expected,actual=result.returncode)),flush=True)
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     def ignore_policy_fixture(self):
         f=self.f
@@ -1660,25 +2388,28 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         f=self.f; url=self.ignore_policy_fixture()
         cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
         for binary,expected in cases:
-            for fault in ('transport','cache'):
+            faults=('transport','odb') if binary==OPTIONS.before_policy_binary else ('transport','odb','raw')
+            for fault in faults:
                 for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
                     with self.subTest(binary=str(binary),fault=fault,operation=operation):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)
                         f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
                         code="import json,os,sys; from pathlib import Path\n"
-                        if fault=='cache':
-                            code+="(Path(os.environ['XDG_CACHE_HOME'])/'git-on/objects-v1/not-an-object').write_text('invalid cache entry')\n"
+                        if fault!='transport':code+=private_storage_fault(fault)
                         code+="try:\n"
                         code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
                         code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
-                        result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
+                        if fault=='raw':code+="assert not target.exists()\n"
+                        env=dict(f.env)
+                        if fault=='odb':env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+                        result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,capture_output=True,timeout=30)
                         self.assertEqual(result.returncode,125,result.stderr)
                         self.assertEqual(json.loads(result.stdout),{'errno':expected,'exists':False},result.stderr)
                         self.assertIn(b'execution incomplete',result.stderr)
                         if fault=='transport':
                             self.assertTrue(any(f.ignore in request['wants'] and request.get('status')==403 for request in f.requests),f.requests)
                             self.assertIn(f.ignore.encode(),result.stderr)
-                        else: self.assertIn(b'not-an-object',result.stderr)
+                        else: self.assertIn(b'remote object loading failed',result.stderr)
                         self.assertEqual(list(f.root.glob('git-on-*')),[])
                         print('ignore acquisition errno regression evidence:',json.dumps(dict(binary=str(binary),before=expected==errno.EROFS,fault=fault,operation=operation,errno=expected)),flush=True)
         # With healthy rules, policy denial retains its distinct EROFS meaning.
@@ -1688,111 +2419,99 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(list(f.root.glob('git-on-*')),[])
 
-    def test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr(self):
+    def test_real_mount_delayed_ignore_acquisition_preserves_policy(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=self.ignore_policy_fixture()
-        cases=([OPTIONS.before_policy_binary] if OPTIONS.before_policy_binary else [])+[OPTIONS.binary]
-        for binary in cases:
-            for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
-                with self.subTest(binary=str(binary),operation=operation):
-                    shutil.rmtree(f.root/'cache',ignore_errors=True)
-                    f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.ignore}
-                    ready=f.root/'ignore-request-ready'; handled=f.root/'ignore-request-handled'
-                    observed=f.root/'ignore-request-errno'; release=f.root/'ignore-request-release'
-                    for marker in (ready,handled,observed,release): marker.unlink(missing_ok=True)
-                    # ctypes observes the original syscall errno; Python's open
-                    # and mkdir wrappers otherwise retry EINTR automatically.
-                    code="import ctypes,errno,json,os,signal,sys,time; from pathlib import Path\nlibc=ctypes.CDLL(None,use_errno=True)\ndef handler(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handler)\nPath(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
-                    code+=("result=libc.open(os.fsencode(sys.argv[1]),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n" if operation=='create' else "result=libc.mkdir(os.fsencode(sys.argv[1]),0o700)\n")
-                    code+="error=ctypes.get_errno()\nassert result==-1,(result,error)\nassert error==errno.EINTR,error\nassert not os.path.lexists(sys.argv[1])\nPath(os.environ['OBSERVED']).write_text(str(error))\nwhile not Path(os.environ['RELEASE']).exists(): time.sleep(.01)\n"
-                    code+=("fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else "os.mkdir(sys.argv[1])\n")
-                    env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed),RELEASE=str(release))
-                    process=subprocess.Popen([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                    f.children.append(process); state=None
-                    try:
-                        self.assertTrue(f.stalled.wait(timeout=20),'ignore request did not reach controlled acquisition stall')
-                        self.assertTrue(ready.exists()); state=json.loads(ready.read_text())
-                        os.kill(state['pid'],signal.SIGTERM)
-                        deadline=time.monotonic()+5
-                        while not observed.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
-                        self.assertTrue(observed.exists(),'ignore request failed to reply EINTR before server release')
-                        self.assertEqual(int(observed.read_text()),errno.EINTR)
-                        self.assertTrue(handled.exists(),'requester signal handler did not run')
-                        f.resume.set(); release.touch()
-                        _,errors=process.communicate(timeout=20)
-                        self.assertEqual(process.returncode,0,errors)
-                        self.assertNotIn(b'execution incomplete',errors)
-                        self.assertEqual(list(f.root.glob('git-on-*')),[])
-                        print('ignore interruption regression evidence:',json.dumps(dict(binary=str(binary),operation=operation,errno=errno.EINTR,retry_succeeded=True)),flush=True)
-                    finally:
-                        f.resume.set(); f.stalled_oids.clear(); release.touch()
-                        if process.poll() is None:
-                            if state is not None:
-                                with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
-                            process.kill()
-                        process.communicate(timeout=20)
-                        if state is not None and Path(state['run']).exists():
-                            cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',state['run']],capture_output=True,timeout=20)
-                            self.assertEqual(cleanup.returncode,0,cleanup.stderr)
+        for operation,path,allowed in (('create','created.tmp',True),('mkdir','created-dir',True),('create','denied',False),('mkdir','denied-dir',False)):
+            with self.subTest(operation=operation,allowed=allowed):
+                f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.ignore}
+                ready=f.root/'ignore-request-ready'; handled=f.root/'ignore-request-handled';observed=f.root/'ignore-result'
+                for marker in (ready,handled,observed):marker.unlink(missing_ok=True)
+                code="import errno,json,os,signal,sys; from pathlib import Path\ndef handler(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handler)\nPath(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+                code+=f"allowed={allowed!r}\ntry:\n"
+                code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
+                code+="except OSError as error:\n assert not allowed and error.errno==errno.EROFS,error\n assert not os.path.lexists(sys.argv[1])\nelse:\n assert allowed,'forbidden mutation succeeded'\n assert os.path.exists(sys.argv[1])\nassert Path(os.environ['HANDLED']).exists(),'handler not delivered after source completed'\nPath(os.environ['OBSERVED']).write_text(str(allowed))\n"
+                env=dict(f.env,READY=str(ready),HANDLED=str(handled),OBSERVED=str(observed))
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                f.children.append(process); state=None
+                try:
+                    self.assertTrue(f.stalled.wait(timeout=20),'ignore request did not reach controlled source delay')
+                    self.assertTrue(ready.exists());state=json.loads(ready.read_text())
+                    os.kill(state['pid'],signal.SIGTERM)
+                    # Observe completion outside FUSE: probing the mount here
+                    # could itself block behind the controlled callback.
+                    time.sleep(.05)
+                    self.assertFalse(observed.exists(),'write completed before ignore rules were obtained')
+                    self.assertIsNone(process.poll(),'write failed while policy source was merely delayed')
+                    f.resume.set()
+                    _,errors=process.communicate(timeout=20)
+                    self.assertEqual(process.returncode,0,errors)
+                    self.assertTrue(handled.exists())
+                    self.assertEqual(observed.read_text(),str(allowed))
+                    self.assertNotIn(b'execution incomplete',errors)
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                finally:
+                    f.resume.set();f.stalled_oids.clear()
+                    if process.poll() is None:
+                        if state is not None:
+                            with contextlib.suppress(ProcessLookupError):os.killpg(state['pid'],signal.SIGKILL)
+                        process.kill()
+                    process.communicate(timeout=20)
+                    if state is not None and Path(state['run']).exists():
+                        cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',state['run']],capture_output=True,timeout=20)
+                        self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def request_signal_behavior(self, binary, mode, expect_old):
+    def delayed_mount_read(self,mode):
         f=self.f
-        shutil.rmtree(f.root/'cache',ignore_errors=True)
-        f.stalled.clear(); f.resume.clear(); f.stalled_oids={f.blob}
-        ready=f.root/'request-ready'; handled=f.root/'request-handled'
-        ready.unlink(missing_ok=True); handled.unlink(missing_ok=True)
-        code="import json,os,signal,sys; from pathlib import Path\n"
+        f.stalled.clear();f.resume.clear();f.stalled_oids={f.blob}
+        ready=f.root/'request-ready';handled=f.root/'request-handled'
+        for marker in (ready,handled):marker.unlink(missing_ok=True)
+        code="import ctypes,json,os,signal,sys; from pathlib import Path\n"
         if mode=='handled-exit':
             code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\n raise SystemExit(0)\nsignal.signal(signal.SIGTERM,handle)\n"
-        elif mode=='handled-retry':
-            code+="def handle(*args):\n Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handle)\n"
-        code+="Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\nassert open('deep/file').read()=='expected\\n'\nprint('read completed')\n"
-        process=subprocess.Popen([str(binary.resolve()),self.signal_url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready),HANDLED=str(handled)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        f.children.append(process); directory=None; state=None
+        elif mode=='caught-return':
+            code+="def handle(*args): Path(os.environ['HANDLED']).touch()\nsignal.signal(signal.SIGTERM,handle)\n"
+        code+="Path(os.environ['READY']).write_text(json.dumps({'pid':os.getpid(),'run':str(Path.cwd().parent)}))\n"
+        if mode in ('plain','caught-return'):
+            # Observe the actual result: Python's file wrappers could hide a
+            # synthetic EINTR by retrying the open/read automatically.
+            code+="libc=ctypes.CDLL(None,use_errno=True)\nlibc.open.argtypes=[ctypes.c_char_p,ctypes.c_int];libc.open.restype=ctypes.c_int\nlibc.read.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_size_t];libc.read.restype=ctypes.c_ssize_t\nfd=libc.open(b'deep/file',os.O_RDONLY);assert fd>=0,('open',ctypes.get_errno())\nbuffer=ctypes.create_string_buffer(64)\ncount=libc.read(fd,buffer,64);assert count==9,('read',count,ctypes.get_errno())\nassert buffer.raw[:count]==b'expected\\n'\nassert libc.read(fd,buffer,64)==0\nlibc.close(fd)\nos.write(1,b'expected\\n')\n"
+            if mode=='caught-return':code+="assert Path(os.environ['HANDLED']).exists()\n"
+        else:code+="assert open('deep/file').read()=='expected\\n'\n"
+        process=subprocess.Popen([str(OPTIONS.binary.resolve()),self.signal_url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=dict(f.env,READY=str(ready),HANDLED=str(handled)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        f.children.append(process);state=None;directory=None
         try:
-            self.assertTrue(f.stalled.wait(timeout=20),'request did not reach controlled transport stall')
-            self.assertTrue(ready.exists()); state=json.loads(ready.read_text()); directory=Path(state['run'])
-            os.killpg(state['pid'],signal.SIGINT if mode=='python-int' else signal.SIGTERM)
-            if mode=='handled-retry':
-                deadline=time.monotonic()+5
-                while not handled.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.01)
-                stayed_blocked=not handled.exists()
-                if not stayed_blocked: f.resume.set()
-            else:
-                try:
-                    output,errors=process.communicate(timeout=5)
-                    stayed_blocked=False
-                except subprocess.TimeoutExpired:
-                    stayed_blocked=True
-            if expect_old:
-                self.assertTrue(stayed_blocked,'old binary did not reproduce pending requester signal')
-            else:
-                self.assertFalse(stayed_blocked,'pending requester signal did not interrupt native demand')
-                if mode=='handled-retry': output,errors=process.communicate(timeout=15)
-                self.assertEqual(process.returncode,-signal.SIGINT if mode=='python-int' else 0,errors)
-                if mode=='handled-retry': self.assertEqual(output,b'read completed\n')
-                if mode!='python-int': self.assertTrue(handled.exists(),'custom signal handler did not run')
-                self.assertNotIn(b'execution incomplete',errors)
-                self.assertFalse(directory.exists(),'completed command did not clean its run')
-            print('request signal regression evidence:',json.dumps(dict(binary=str(binary),mode=mode,before=expect_old,observed_stall=stayed_blocked)),flush=True)
+            self.assertTrue(f.stalled.wait(timeout=20),'read did not reach controlled source delay')
+            self.assertTrue(ready.exists());state=json.loads(ready.read_text());directory=Path(state['run'])
+            if mode!='plain':os.killpg(state['pid'],signal.SIGINT if mode=='python-int' else signal.SIGTERM)
+            if mode in ('plain','caught-return'):
+                # Harness-only observation window; no product read deadline.
+                # Availability has not changed and no I/O error was injected.
+                time.sleep(.05)
+                self.assertIsNone(process.poll(),'read failed while the valid source was merely delayed')
+            f.resume.set()
+            output,errors=process.communicate(timeout=20)
+            self.assertEqual(process.returncode,-signal.SIGINT if mode=='python-int' else 0,errors)
+            if mode in ('plain','caught-return'):self.assertEqual(output,b'expected\n')
+            if mode in ('caught-return','handled-exit'):self.assertTrue(handled.exists(),'handler did not run')
+            self.assertNotIn(b'execution incomplete',errors)
+            self.assertFalse(directory.exists(),'completed command did not clean its run')
         finally:
+            f.resume.set();f.stalled_oids.clear()
             if process.poll() is None:
                 if state is not None:
-                    with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
+                    with contextlib.suppress(ProcessLookupError):os.killpg(state['pid'],signal.SIGKILL)
                 process.kill()
-            f.resume.set(); f.stalled_oids.clear()
-            process.communicate(timeout=15)
+            process.communicate(timeout=20)
             if directory is not None and directory.exists():
                 cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def test_review_real_mount_pending_request_signals_preserve_handlers(self):
-        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
-        f=self.f; self.signal_url=f.https(); self.addCleanup(f.server.shutdown)
-        for mode in ('python-int','handled-exit','handled-retry'):
-            with self.subTest(mode=mode):
-                if OPTIONS.before_binary: self.request_signal_behavior(OPTIONS.before_binary,mode,True)
-                self.request_signal_behavior(OPTIONS.binary,mode,False)
+    def test_real_mount_delayed_source_returns_data_without_invented_error(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        f=self.f;self.signal_url=f.https();self.addCleanup(f.server.shutdown)
+        for mode in ('plain','caught-return','handled-exit','python-int'):
+            with self.subTest(mode=mode):self.delayed_mount_read(mode)
 
     def test_native_failed_verification_never_executes_command(self):
         f=self.f; signed,allowed=self.signing(); sentinel=f.root/'command-executed'
