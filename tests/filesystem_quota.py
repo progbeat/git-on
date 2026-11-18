@@ -14,6 +14,13 @@ from pathlib import Path
 root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
 if root!=Path.cwd():assert os.path.ismount('.'),'real FUSE required'
 def allocated():
+ while True:
+  try:return _allocated()
+  except FileNotFoundError:
+   # FUSE may reclaim source files after close. Rescan instead of dropping
+   # the entry: a renamed payload must still count at its new location.
+   pass
+def _allocated():
  total=0;seen=set()
  for directory,dirs,files in os.walk(root):
   if root!=Path.cwd() and Path(directory)==root:
