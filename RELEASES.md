@@ -7,7 +7,9 @@
   Clear it before starting the command and on preparation failure or cancellation.
   Redirected output contains no indicator or terminal control sequences.
 - Git-on owns the terminal during preparation and presents standard Git/SSH
-  authentication prompts, pausing the animation for interaction.
+  authentication prompts, pausing the animation for interaction. Git and its
+  helpers have no controlling terminal. Helpers that directly open
+  `/dev/tty` must use `GIT_ASKPASS` or `SSH_ASKPASS` for interaction instead.
   Configured askpass programs retain their original environment and selection
   policy. The requested command receives the original terminal and inherits
   standard streams directly.
