@@ -1,5 +1,6 @@
-# 2.0.0
-<!-- Bump: major -->
+# 1.4.1
+<!-- Bump: patch -->
+<!-- Release-base: v1.4.0 -->
 
 - Show temporary terminal progress after 0.5 seconds from invocation, including
   local resolution, remote network waits, verification, and snapshot preparation.
@@ -7,7 +8,7 @@
   Redirected output contains no indicator or terminal control sequences.
 - Git-on owns the terminal during preparation and presents standard Git/SSH
   authentication prompts, pausing the animation for interaction. Git and its
-  helpers no longer receive a controlling terminal. Helpers that directly open
+  helpers have no controlling terminal. Helpers that directly open
   `/dev/tty` must use `GIT_ASKPASS` or `SSH_ASKPASS` for interaction instead.
   Configured askpass programs retain their original environment and selection
   policy. The requested command receives the original terminal and inherits
