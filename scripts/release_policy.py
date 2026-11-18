@@ -242,6 +242,33 @@ def push_base(event_path):
     return before
 
 
+def correction_base(base, current, previous, notes):
+    """An explicit correction may replace an untagged, unpublished version."""
+    match = re.search(r"^<!-- Release-base: (v[0-9]+\.[0-9]+\.[0-9]+) -->$", notes, re.M)
+    if not match:
+        raise ValueError("correcting an unreleased version requires an explicit Release-base tag")
+    tags = subprocess.check_output(["git", "tag", "--list"], text=True).splitlines()
+    released = {tag: version(tag[1:]) for tag in tags
+                if re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag)}
+    tag = match[1]
+    if f"v{previous}" in tags:
+        raise ValueError("cannot correct a version with an existing release tag")
+    if tag not in released or released[tag] != max(
+            value for name, value in released.items() if name != f"v{current}"):
+        raise ValueError("Release-base must be the latest existing release tag")
+    if f"v{current}" in tags:
+        tagged = subprocess.check_output(["git", "rev-parse", f"refs/tags/v{current}^{{commit}}"], text=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True)
+        if tagged != head or subprocess.check_output(["git", "status", "--porcelain"]):
+            raise ValueError("cannot reuse a version tag for different source")
+    ref = f"refs/tags/{tag}"
+    subprocess.run(["git", "merge-base", "--is-ancestor", ref, base], check=True)
+    manifest = tomllib.loads(subprocess.check_output(["git", "show", f"{ref}:Cargo.toml"], text=True))
+    if manifest["package"]["version"] != tag[1:]:
+        raise ValueError("Release-base tag differs from its Cargo version")
+    return ref
+
+
 def check(base):
     manifest = tomllib.loads(Path("Cargo.toml").read_text())
     package = manifest["package"]
@@ -253,6 +280,9 @@ def check(base):
     # A missing file is the bootstrap case; an invalid ref must never become one.
     subprocess.run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], check=True, stdout=subprocess.DEVNULL)
     old, reasons = release_reasons(base, manifest, lock)
+    if old is not None and version(package["version"]) < version(old):
+        release_base = correction_base(base, package["version"], old, Path("RELEASES.md").read_text())
+        old, reasons = release_reasons(release_base, manifest, lock)
     required = bool(reasons)
     if required:
         validate(package["version"], old, own["version"], Path("RELEASES.md").read_text())

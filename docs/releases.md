@@ -38,6 +38,9 @@ backwards-compatible capabilities, such as an optional write policy. Use major f
 breaking the documented CLI, filesystem, environment or platform contract.
 Changing whether a signal interrupts an individual filesystem operation is a
 filesystem contract change, including removal of documented EINTR behavior.
+The maintainer explicitly keeps the current milestone at **1.4.0**, including
+that documented interruption change. Treat it as an accepted minor-release
+exception, not a reason to raise this milestone to 2.0.0.
 Correcting git-on's custom argument handling to restore the intended native Git
 semantics is a bug fix; a release that also adds write policies uses a minor bump.
 This classification includes using native Git for local resolution: direct
@@ -52,8 +55,16 @@ for breaking changes instead of silently treating every 0.x release as breaking.
 CI can validate the numeric increment and notes; semantic classification requires
 review of the change. Agents are responsible for proposing the correct kind.
 
-Bootstrap is the only exception: a base with no Cargo package introduces `0.1.0`
+For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.
+
+An incorrect version that has not been published or tagged may be corrected.
+In that case, put `<!-- Release-base: vVERSION -->` in the current release notes
+to explicitly select the latest existing release tag. The validator compares
+the complete binary changes against that release and requires exactly one
+increment from it. Fetch all tags before validation. A tagged previous version
+cannot be corrected; an existing target tag is accepted only for a clean retry
+of its exact commit. Never delete or move a published tag to enable correction.
 
 ## CI and automatic publication
 

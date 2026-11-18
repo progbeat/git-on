@@ -87,6 +87,10 @@ working take priority?
 **Answer:** Changes to Git-on should follow standard semantic versioning and
 deprecation practices so that users know what to expect.
 
+**Current release direction:** The author explicitly requires the 1.4.0 milestone
+to remain 1.4.0 and rejects a major-version increase for this work, including
+the documented change to requester-only signal interruption.
+
 **Question:** What integrity guarantees must Git-on provide?
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.

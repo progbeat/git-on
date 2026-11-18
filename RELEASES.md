@@ -1,7 +1,8 @@
-# 2.0.0
-<!-- Bump: major -->
+# 1.4.0
+<!-- Bump: minor -->
+<!-- Release-base: v1.3.0 -->
 
-Breaking change: signals sent only to a command blocked in remote FUSE I/O no longer synthesize EINTR. The signal handler may wait for the current I/O to finish, with no runner-imposed deadline. To cancel the whole invocation, signal Git-on itself or the foreground process group. Whole-invocation cancellation stops owned operations and performs normal cleanup. Native FUSE_INTERRUPT support remains deferred until the backend supports it.
+Compatibility note (accepted for the 1.4.0 milestone): signals sent only to a command blocked in remote FUSE I/O no longer synthesize EINTR. The signal handler may wait for the current I/O to finish, with no runner-imposed deadline. To cancel the whole invocation, signal Git-on itself or the foreground process group. Whole-invocation cancellation stops owned operations and performs normal cleanup. Native FUSE_INTERRUPT support remains deferred until the backend supports it.
 
 - Handle transport-helper exit before its first reply without hanging. Preserve prepared source data across descriptor exhaustion during copy-up. Transferred source files keep authenticating untouched bytes after partial writes, truncation and reopen, including concurrent temporary-file tampering, without a second decoded backing or repeated decoding.
 - Stream loose Git objects into verified large source spools without an avoidable full decoded RAM buffer. Local packed objects still use libgit2's required object/delta decoding.
