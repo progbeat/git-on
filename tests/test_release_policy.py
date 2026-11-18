@@ -452,7 +452,7 @@ class ChangeClassificationTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, 'a tagged retry must use its exact clean source')
 
-    def test_correction_refuses_missing_consent_and_published_or_stale_baselines(self):
+    def test_correction_refuses_missing_release_base_and_published_or_stale_baselines(self):
         self.prepare_unreleased_correction()
         original = (self.root / 'RELEASES.md').read_text()
         for tag, release_base in [(None, None), ('v2.0.0', 'v1.1.0'),

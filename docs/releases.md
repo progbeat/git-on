@@ -36,20 +36,10 @@ cannot identify one edge, validation fails explicitly instead of guessing its ki
 Use patch for backwards-compatible binary bug fixes. Use minor for new
 backwards-compatible capabilities, such as an optional write policy. Use major for
 breaking the documented CLI, filesystem, environment or platform contract.
-Changing whether a signal interrupts an individual filesystem operation is a
-filesystem contract change, including removal of documented EINTR behavior.
-The maintainer explicitly keeps the current milestone at **1.4.0**, including
-that documented interruption change. Treat it as an accepted minor-release
-exception, not a reason to raise this milestone to 2.0.0.
-Correcting git-on's custom argument handling to restore the intended native Git
-semantics is a bug fix; a release that also adds write policies uses a minor bump.
-This classification includes using native Git for local resolution: direct
-`git-on` invocations now require Git on `PATH`, including unverified local runs
-that version 1.1 could resolve without it. Maintaining a separate Git-free
-resolver would contradict the original requirement that Git itself interpret
-the operands. This restoration is explicitly classified as a bug fix, rather
-than a breaking platform change; unrelated platform requirements still follow
-the major-release rule above.
+Assess compatibility against the requirements in the specification and interview.
+Restoring required behavior after an implementation defect is a bug fix, even
+when it changes observable behavior. Changing the required contract itself is a
+breaking change. Describe the user-visible effects in the release notes.
 These rules also apply before 1.0: this project deliberately reserves major bumps
 for breaking changes instead of silently treating every 0.x release as breaking.
 CI can validate the numeric increment and notes; semantic classification requires
