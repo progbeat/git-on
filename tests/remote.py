@@ -1392,8 +1392,9 @@ print('caught-EIO-and-returned-success')
                            f'os.execv({shutil.which("git")!r},["git",*sys.argv[1:]])\n')
         wrapper.chmod(0o700)
         env=dict(f.env,PATH=str(tools),TERM='xterm')
-        for phase,terminal in (('local-resolution',True),('initial-fetch',True),('initial-fetch',False)):
-            with self.subTest(phase=phase,terminal=terminal):
+        for variable in ('NO_COLOR','CLICOLOR','CLICOLOR_FORCE'):env.pop(variable,None)
+        for phase,terminal,color in (('local-resolution',True,{}),('initial-fetch',True,{'NO_COLOR':'1'}),('initial-fetch',False,{'CLICOLOR_FORCE':'1'})):
+            with self.subTest(phase=phase,terminal=terminal,color=color):
                 if phase=='initial-fetch':release.touch()
                 f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
                 master,slave=pty.openpty();self.addCleanup(os.close,master)
@@ -1401,7 +1402,7 @@ print('caught-EIO-and-returned-success')
                 started=time.monotonic()
                 process=subprocess.Popen([str(OPTIONS.binary),*operands,'--write-policy=all','--',
                                           sys.executable,'-c',"import sys;sys.stderr.write('COMMAND-START\\n');print('command-output')"],
-                                         cwd=f.repo,env=env,stdout=subprocess.PIPE,stderr=slave if terminal else subprocess.PIPE)
+                                         cwd=f.repo,env=env|color,stdout=subprocess.PIPE,stderr=slave if terminal else subprocess.PIPE)
                 os.close(slave);f.children.append(process)
                 transcript=bytearray()
                 try:
@@ -1430,6 +1431,10 @@ print('caught-EIO-and-returned-success')
                 self.assertEqual(process.returncode,0,transcript)
                 self.assertEqual(output,b'command-output\n')
                 if terminal:
+                    frames=re.findall('[\u2800-\u28ff]',transcript.decode('utf-8'))
+                    self.assertGreaterEqual(len(set(frames)),2,'indicator did not animate Unicode dots')
+                    if color.get('NO_COLOR'):self.assertNotRegex(transcript,rb'\x1b\[[0-9;]*m')
+                    else:self.assertIn(b'\x1b[36m',transcript,'TTY indicator has no color accent')
                     self.assertLess(transcript.rfind(b'\x1b[2K'),transcript.index(b'COMMAND-START'))
                     self.assertNotIn(b'Preparing snapshot',transcript[transcript.index(b'COMMAND-START'):])
                 else:self.assertEqual(errors,b'COMMAND-START\n')

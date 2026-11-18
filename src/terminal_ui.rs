@@ -202,10 +202,11 @@ impl StartupProgress {
                                 let _ = std::io::stderr().write_all(b"\r");
                                 let bar = ProgressBar::new_spinner();
                                 bar.set_style(
-                                    ProgressStyle::with_template("{spinner} Preparing snapshot")
+                                    ProgressStyle::with_template("{spinner:.cyan} {msg:.bold}")
                                         .expect("static progress template")
-                                        .tick_strings(&["|", "/", "-", "\\"]),
+                                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
                                 );
+                                bar.set_message("Preparing snapshot");
                                 bar
                             });
                             bar.tick();
