@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Real OpenSSH authentication and interactive-shell job-control regressions.
+"""Real SSH/HTTPS authentication and interactive-shell job-control regressions.
 
-Run with --binary /path/to/git-on; no FUSE is needed because the disposable
-unsigned commit fails native verification after authentication.
+Run with --binary /path/to/git-on; no FUSE is needed. SSH cases use an unsigned
+commit that fails verification; HTTPS exercises explicit-all materialization.
 """
 import contextlib
 import importlib.util
@@ -13,6 +13,7 @@ import select
 import shlex
 import shutil
 import signal
+import sys
 import time
 import unittest
 
@@ -177,14 +178,17 @@ class NativeJobControlTests(unittest.TestCase):
     def assert_finished(self, expected):
         shell = self.shell
         output = shell.expect(shell.prompt)
+        # After Ctrl-C, OpenSSH can still be restoring its passphrase reader.
+        # Check the existing transport-lifetime contract before sending another
+        # command, whose first byte that reader could otherwise consume.
+        shell.wait_for(lambda: all(state(pid) in (None,'Z') for pid in self.transport_pids),
+                       'owned authentication transport survived completion')
         shell.send(b'printf "native-job-status=%s\\n" "$?"\n')
         shell.expect(f'native-job-status={expected}\r\n'.encode())
         shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
         self.assertEqual(list(self.f.root.glob('git-on-*')), [], 'runner leaked recovery state')
         self.assertEqual(list(self.f.root.glob('*/ssh-control')), [], 'runner leaked SSH socket')
-        self.assertTrue(all(state(pid) in (None, 'Z') for pid in self.transport_pids),
-                        'owned authentication transport survived completion')
         if expected == 125:
             self.assertIn(b'native Git verify-commit failed', output)
             self.assertEqual((self.f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
@@ -219,6 +223,65 @@ class NativeJobControlTests(unittest.TestCase):
         self.foreground()
         self.shell.send(b'\x03')
         self.assert_finished(130)
+
+
+class HttpsCredentialTerminalTests(unittest.TestCase):
+    def test_repeated_tty_credentials_keep_foreground_and_finish_materialization(self):
+        import base64
+        f=remote.Fixture(); self.addCleanup(f.close)
+        # Fork the shell before starting the fixture's HTTPS server thread.
+        shell=Shell(f)
+        def close_shell():
+            try: shell.close()
+            finally:
+                if hasattr(f,'server'): f.server.shutdown()
+        self.addCleanup(close_shell)
+        url=f.https(authorization='Basic '+base64.b64encode(b'fixture:fixture-token').decode())
+        helper=f.root/'credential-helper'
+        pidfile=f.root/'credential-pid'
+        helper.write_text('#!'+sys.executable+'\n'+
+                          'import os,sys\nfrom pathlib import Path\n'
+                          'sys.stdin.read()\nif sys.argv[1]=="get":\n'
+                          ' Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\n'
+                          ' fd=os.open("/dev/tty",os.O_RDWR)\n'
+                          ' os.write(fd,b"https-helper-token: ")\n'
+                          ' token=bytearray()\n'
+                          ' while not token.endswith(b"\\n"): token.extend(os.read(fd,1))\n'
+                          ' os.close(fd)\n'
+                          ' sys.stdout.write("username=fixture\\npassword="+token.decode().strip()+"\\n")\n')
+        helper.chmod(0o700)
+        # Hide the FUSE helper, retaining actual HTTPS and an actual terminal.
+        programs=f.root/'programs'; programs.mkdir()
+        (programs/'git').symlink_to(shutil.which('git'))
+        environment=dict(PATH=str(programs),GIT_CONFIG_COUNT='1',GIT_SSL_CAINFO=f.env['GIT_SSL_CAINFO'],
+                         GIT_CONFIG_KEY_0='credential.helper',GIT_CONFIG_VALUE_0=str(helper))
+        command=[shutil.which('env'),*[key+'='+value for key,value in environment.items()],
+                 str(remote.OPTIONS.binary),url,'HEAD','--write-policy=all','--',
+                 sys.executable,'-I','-S','-c',
+                 "from pathlib import Path; assert Path('deep/file').read_bytes()==b'expected\\n'; print('https-helper-command-ok')"]
+        shell.send((shlex.join(command)+'\n').encode())
+        prompts=0; deadline=time.monotonic()+20
+        while b'\r\nhttps-helper-command-ok\r\n' not in shell.pending:
+            self.assertLess(time.monotonic(),deadline,'HTTPS credential flow did not finish: '+repr(bytes(shell.transcript)))
+            if b'https-helper-token: ' in shell.pending:
+                shell.expect(b'https-helper-token: ')
+                runner,=children(shell.pid)
+                helper_pid=int(pidfile.read_text())
+                group=os.getpgid(helper_pid)
+                shell.groups={runner,group}
+                if os.tcgetpgrp(shell.fd)!=group:
+                    shell.wait_for(lambda: state(helper_pid)=='T','background helper did not stop on tty input')
+                self.assertEqual(os.tcgetpgrp(shell.fd),group,
+                                 'credential helper is in a background group; tty input would stop it')
+                shell.send(b'fixture-token\n'); prompts+=1
+            else: shell.read()
+        self.assertGreaterEqual(prompts,2,'fixture did not exercise authentication after initial fetch')
+        shell.expect(shell.prompt)
+        shell.groups.clear()
+        shell.send(b'printf "https-helper-status=%s\\n" "$?"\n')
+        shell.expect(b'https-helper-status=0\r\n'); shell.expect(shell.prompt)
+        self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
+        self.assertEqual(list(f.root.glob('git-on-*')),[],'HTTPS run leaked temporary storage')
 
 
 def replay_baseline():

@@ -1,5 +1,244 @@
 # Review regression evidence
 
+## Readonly directory pages on reopen
+
+Follow-up at `ff1c01a`: CACHE_DIR alone cached seek/rewind within one handle,
+but Linux's common open path invalidated the pages on reopen without KEEP_CACHE.
+The original mixed counter case could pass using only within-handle reuse.
+The protocol regression now fails for observed flags 8 versus required 10 before
+the fix; the runtime returns both flags only under the existing readonly/ABI gate.
+The mounted counter workload now performs two independent full listings, with
+no intra-handle seek or rewind, so it specifically requires reuse across opens.
+The separate ordinary-mount test retains partial/seek/rewind/inode checks.
+See [Linux fuse_open_common](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/file.c#L243).
+This follow-up still needs candidate-head actual-FUSE and CI validation.
+
+The initial stage at `f538e30` returned no cache flag even for fully immutable
+`none`. The first version of the protocol regression failed at ABI 7.28
+(expected FOPEN_CACHE_DIR=8, observed 0); its successor above checks the complete
+flag combination. Negative cases retain ordinary streams for ABI 7.27 and all
+three mutable policies. CACHE_DIR is part of upstream FUSE ABI 7.28; no new
+capability, thread or payload cache is required.
+
+The ordinary real-FUSE test exercises a 640-long-name directory, multiple pages,
+partial reads, telldir/seekdir/rewind, independent opens and an empty directory.
+The counter control separately requires fewer readdir callbacks across independent
+opens, without relying on intra-handle replay. A missing blob
+and unvisited missing tree make accidental payload/subtree loading fail; the
+case requires zero blob/header reads and exactly three prepared trees. These
+are behavioral/resource assertions, not temporary profiling or a latency SLA.
+The child payload's normal-disk self-test is not a mounted result. Actual FUSE
+execution and any performance improvement require candidate-head validation.
+
+## Delayed reads without requester signal emulation
+
+Version 1.4 removes the /proc-based requester-signal workaround. A temporarily
+slow source remains pending and returns its verified bytes when available;
+Git-on adds no arbitrary read deadline or synthetic EINTR for caller signals.
+Actual transport/storage/integrity failures remain errors. Signals directed at
+Git-on and observed child completion still stop owned operations before unmount.
+Caller-only signals may wait for current I/O; future native FUSE_INTERRUPT
+support is explicitly deferred.
+
+The permanent wire regression
+`protocol_pending_caller_signal_does_not_invent_read_error` sends real fuser
+requests with a stopped caller's pending caught SIGTERM. The original 416e2277
+runtime returns EINTR (errno 4) from LOOKUP; the changed runtime returns the exact
+source data. The same test fails before and passes after removal. Red/green logs
+are retained outside the repository under
+`/workspace/git-on-evidence/remove-requester-416/`.
+
+The mounted delayed-source regression uses real HTTPS and ordinary libc
+open/read calls so Python cannot hide synthetic EINTR by retrying. It releases
+the valid source after a controlled delay and checks exact data/EOF, handlers,
+exit status and cleanup. Delayed ignore acquisition still forbids mutation
+before the pinned rules are obtained. These require actual FUSE CI; the wire
+regression is not labelled as a mount. Earlier requester-emulation records below
+are historical evidence, not current behavior requirements.
+
+## Optional LF on protocol text packets
+
+A fresh whole-PR review reproduced a native-compatible upload-pack proxy that
+omits the optional LF from the packfile text label. Native Git fetched through
+it, while the session parser rejected it. Git's pkt-line contract requires
+nonbinary text to be accepted with or without that LF. Permanent tests fail
+before the fix for capability/section text and pass after normalization. The
+binary pack fixture deliberately ends in LF and must remain byte-identical;
+unsupported SHA-256 repository advertisements still fail. Requests now assemble
+their bounded exact-demand framing before one socket write, reducing repeated
+poll/status work without changing the requested OID set or cancellation checks
+around blocking I/O. No fetch retry or future-object prefetch is introduced.
+
+## WebKit memory observation
+
+The first exact-head WebKit workload at e1edf15 completed every full read and
+small command, but the required aggregate failed because process-tree samples
+were marked partial. The run remains failed. Process observation now separates
+descriptor denial from RSS, adds kernel wait4 peak accounting for waited
+descendants, and retains partial/non-atomic tree-sample flags. Missing primary
+peak data still fails validation. This corrects the measurement method; it does
+not grant process access, turn missing samples into zero memory, or claim a
+complete simultaneous physical-memory peak.
+
+## Real-repository harness and protected directory attributes
+
+The real-repository harness initially required one payload decode per unique
+blob, including empty files. An independent reviewer reproduced successful
+empty OPEN/READ/RELEASE through actual fuser dispatch with zero blob loads.
+The old gate therefore rejected correct empty-file behavior. Permanent fixtures
+now include an empty source and empty Python module; namespace/path/byte counts
+still include both, while decode expectations count nonempty unique objects.
+The old-expectation replay fails, and the corrected gate and dispatch pass.
+Evidence is under `review-webkit-empty` in the recorded workspace evidence.
+
+A timeout regression also exposed an observer leaving a descendant alive;
+even sending TERM to the group was insufficient when the child ignored it.
+The observer now grants graceful cleanup, observes root exit without reaping,
+then stops the owned group before final reap. Both failing variants and the
+passing permanent descendant-marker test were retained.
+
+Protected source directory attributes were unchanged by generated-child
+mutations, yet Linux returned zero attribute TTL and forced repeated metadata
+callbacks. A protocol red/green regression checks positive source TTL while
+generated entries keep zero TTL. Directory streams remain uncached, and fresh
+opens observe generated membership creation/removal. All-policy metadata keeps
+zero TTL. These protocol checks do not replace required real-kernel validation.
+
+## Invocation-owned demand sessions
+
+The startup experiment's first CI stopped in the existing sync regression:
+native fetch succeeded but the selected object was absent after import.
+Investigation identified a real output-transfer race consistent with that
+symptom: a socket read can return a timeout, then native Git writes its final
+bytes and exits before the worker observes the completed flag. Returning on
+that stale timeout discards queued output and can hide staging failures. Two
+permanent tests use a real socket, a controlled stale timeout and final write;
+both fail before and pass after a fresh nonblocking drain. The drain adds no
+extra timeout floor or fetch retry. The original CI discarded its temporary
+trace, so the specific CI occurrence is not retrospectively proven to be this
+interleaving. Twenty focused original sync replays passed before the fix; that
+alone was not treated as evidence that the failure could be ignored.
+
+The first mounted run at `d8a41d2` exposed three stale fault-injection assertions:
+replacing `objects/pack` cannot break a direct session import that does not use
+that directory. The tests now select the native compatibility path for pack
+faults and additionally corrupt the active raw-parts destination for session
+faults. Both mounted read and ignore-rule mutation controls still require EIO,
+runner status 125, failure latching and cleanup. A no-mount production-loader
+control demonstrates that the unused pack fault permits a session read, while
+the same raw-parts fault rejects the next demand without following a symlink.
+Historical pre-raw-store policy replays retain their original transport/ODB
+faults; they do not claim to test a storage path absent from that binary.
+
+The permanent `test_protocol_v2_reuses_native_clients_across_many_blob_demands`
+checks actual Native Git Trace2 process starts, 140 unique blobs, eviction and
+a closed reread. Replaying it with the authentic pre-session production loader
+fails because a new fetch/cat-file pair is started for each missing object.
+The session path retains one of each for initial selection and uses a single
+owned server/helper for subsequent exact requests. SHA1 pack trailers, zlib end/
+extent and canonical OIDs are checked independently; altered/truncated/tail
+fixtures never publish raw bytes. A synthetic valid REF_DELTA pack exercises
+the generic decoder without a second network fetch. SSH v2 ownership/loss and
+both native-compatibility and session materialization under `stty tostop` remain
+separate permanent cases.
+
+During implementation review, a diagnostic-tail regression reproduced whole
+stderr-file RAM retention. It fails before and passes after a 64 KiB diagnostic
+tail bound; completed-request diagnostics are discarded between transactions.
+This bounds diagnostic retention without imposing an object or repository cap.
+Evidence is retained under `/workspace/git-on-evidence/transport-5dd38f9/`.
+
+Historical requester-emulation review of `d8a1015` reproduced a P1: putting RequestInterrupted into
+an opaque anyhow-backed io::Error lost its type, returned EIO instead of EINTR
+and permanently latched the remote failure. The authentic base allowed a later
+demand; the candidate rejected it. Permanent typed-I/O and complete Remote caller
+regressions failed before the fix. Transfer I/O now carries a typed marker and
+classification examines its io payload, without matching remote error text.
+
+The direct path also requires native Git's collision-detection class of defense
+when it bypasses index-pack. Plain SHA-1 accepted a public SHA-mbles vector in
+the digest regression; checked incremental finalization rejects it. Pack and
+canonical object hashes both use the checked implementation before publication.
+This retains the Git format; it does not claim SHA-1 is collision resistant.
+
+## Prepared tree mode parsing
+
+Independent review of `029872d` found that the new streaming tree parser accepted
+out-of-range octal modes before normalizing them. A raw tree containing
+`200644 file` is rejected by libgit2 and the previous CLI but was materialized
+successfully by the candidate. The permanent `tree_metadata` integration suite
+reproduced that error both through Snapshot lookup and child launch. It also
+reproduced rejection of long leading-zero modes accepted by libgit2 and native
+Git. All three cases failed before the fix and pass with incremental octal
+parsing bounded to `u16`, without an unbounded mode buffer. Red/green logs are
+retained outside temporary storage in
+`/workspace/git-on-evidence/metadata-029872d/parser-{red,green}.log`.
+
+The first published metadata CI at `15b9e4b` then failed all macOS builds because
+Darwin's libc crate does not export `NAME_MAX`. Removing that parser-level host
+limit also preserves Git tree names independently of the current host's path
+limits. The permanent `tree_parser_does_not_apply_a_host_filename_limit` reads
+a 1024-byte tree name through Snapshot. The prior production source probe fails
+on that exact raw tree; the fixed integration suite passes all four cases.
+The parser retains one active name, whose size is part of the active operation;
+the materializer/kernel remains responsible for an actual host path error.
+Red evidence is `long-name-red.json`, green is `long-name-green.log` in the same
+retained workspace evidence directory. Actual macOS compilation needs final CI.
+
+A fresh full-stage review at `5821425` found no additional runtime defect and
+one P3: the new metadata reuse regression suite was omitted from CI's
+explicit Python commands. `test_python_regression_suites_are_registered` fails
+on that workflow and passes after registering `test_metadata_reuse.py`.
+It guards all standalone Python regression suites so a new one cannot remain
+local-only unnoticed. The red/green registration logs are retained alongside
+the other metadata-stage evidence.
+
+## Shared raw spooling under inherited per-file limits
+
+Fresh review of fca7786 found one introduced P2. With RLIMIT_FSIZE=65536 and
+SIGXFSZ ignored, 80 distinct 8192-byte local files fail at the ninth file;
+native clone and exact parent 33548b3 both succeed. Evidence is retained in
+`/tmp/review-raw-fsize-evidence.jsonl`. The permanent
+`MaterializedTests.test_small_files_respect_individual_fsize_limits_without_aggregate_ceiling`
+also fails on fca7786 for local and native file:// sources (two failed subcases)
+and passes after bounded raw parts, with FSIZE=64 KiB and NOFILE=64. Both native
+clones succeed; the child checks every byte twice and private storage cleanup.
+The original native/current/parent reproducer and permanent red/green outputs
+are `/tmp/review-raw-fsize.py` and `/tmp/git-on-140-fsize-{red,permanent-green}.log`.
+
+Raw-store tests cross 97-byte physical boundaries while authenticating 4 KiB
+logical blocks and keep a reader usable after its store drops. Sparse extension,
+truncation, part cleanup, prior integrity regressions and geometric index growth
+remain checked. A native-output writer failure must stop the owned command before
+its delayed completion marker; it preserves the staging error and adds no
+system-limit or security-setting changes.
+
+## Invocation-local raw reuse and bounded reader retention (1.4.0)
+
+At authentic `325be51`, `blob_cache_is_bounded_and_large_partial_reads_bypass_retention`
+decoded the evicted first blob again (13 loads instead of 12), and
+`test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies` counted
+141 loads for 140 distinct blobs. Both now require unchanged unique-load counts
+on closed rereads. The remote regression also asserts no loose blob payloads or
+retained per-demand packs. `test_native_raw_import_verifies_oid_before_publishing_bytes`
+substitutes same-length native decoder output and requires canonical OID failure.
+
+Two additional focused tests failed at `325be51` and pass with the new reader
+lifetime: `reader_registry_releases_closed_entries_without_another_open` found
+one stale registry entry instead of zero; `active_readers_do_not_pin_evicted_payloads_in_ram`
+found active readers strongly retaining payloads outside the bounded cache.
+These are meaningful retention assertions, not counts inferred from process RSS.
+
+An initial unauthenticated raw-storage candidate failed the permanent
+`modified_prepared_bytes_are_rejected_before_a_range_is_returned` regression after
+the prepared payload was overwritten. The corrected store verifies per-block
+HMACs before returning the exact checked bytes. Other permanent raw-store cases
+modify tags/index records and attempt to reuse tags from a failed preparation;
+all must fail without exposing modified bytes. They supplement initial canonical
+OID checking, which remains mandatory before publication. Reduced-RLIMIT remote
+tests still run at 64 and observe constant retained descriptors; no OS limit or
+process-security setting was changed.
+
 This is a historical review record. The owner subsequently selected stock
 cargo-dist release/installer behavior. Earlier custom publisher, hash-hardening
 and assembly sections below are superseded; their replaced code/tests were
@@ -276,7 +515,7 @@ operation shutdown before unmount/state locking through a separate flag; this
 does not invent a termination signal. Its real-mounted stalled-read and busy
 recovery evidence is tracked separately and requires exact-head FUSE CI.
 
-## Pending requester signals during a stalled mounted fetch
+## Historical requester signals during a stalled mounted fetch
 
 Actual real-FUSE CI run
 [38164674316](https://github.com/progbeat/git-on/actions/runs/38164674316)
@@ -290,7 +529,7 @@ foreground signal case required an additional fix because the child could not
 exit until its blocked FUSE request received a reply. fuser 0.16 dispatches on
 one synchronous session thread and does not implement FUSE_INTERRUPT.
 
-Demand-capable callbacks now bind cancellation to their actual requesting task
+At that revision demand-capable callbacks bound cancellation to their actual requesting task
 with a held `/proc/TID/status` descriptor. Existing native-operation and cache
 lock polls detect pending unblocked, nonignored INT/TERM/HUP/QUIT signals and
 abort only that request. The typed interruption propagates as EINTR and does
@@ -810,14 +1049,15 @@ removes a real loose `.gitignore` object before policy demand. Inserting only
 this regression into the unchanged before-fix source produces
 `[Err(30), Err(30)]` instead of `[Err(5), Err(5)]`; the corrected source passes
 both file and directory creation checks without inserting namespace or backing
-entries. Policy loader errors now use `snapshot_errno`, retaining EINTR for
-request interruption and EROFS for an ordinary healthy-policy denial.
+entries. Policy loader errors use `snapshot_errno` for EIO and preserve EROFS for an
+ordinary healthy-policy denial. The former requester-specific EINTR mapping was
+part of the historical emulation and is removed in 1.4.
 `RemoteTests.test_review_real_mount_ignore_acquisition_faults_report_eio`
 requires actual FUSE and repeats create/mkdir with an exact remote ignore-object
 403 response and a real invalid cache entry. `--before-policy-binary` checks
 the original EROFS result and the corrected EIO result, failure diagnostics,
 runner status 125 and absence of a created path.
-`test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
+The historical `test_review_real_mount_interrupted_ignore_acquisition_preserves_eintr` stalls
 the ignore request, signals its requesting task, observes exact libc syscall
 EINTR before releasing the server, and verifies its handler and successful
 retry. EINTR preservation is expected on both revisions. These mount-dependent
@@ -1775,3 +2015,459 @@ stock workflow. `test_trigger_pins_the_tested_commit_and_never_moves_existing_ta
 uses an inert gh fixture for absent/reused/mismatched tags and creation failure;
 no live tag or workflow dispatch is performed. Regeneration is checked with the
 pinned upstream `dist generate --mode=ci --check` command.
+
+## 1.4 full-scale harness: Python startup may inspect cwd
+
+At `d0edf505bfbf5b2280d63fa60a68791b24911996`, exact-head CI run
+[40840201554](https://github.com/progbeat/git-on/actions/runs/40840201554) failed
+both ordinary-FUSE scale cells on the first 1,000-file Python no-op control:
+`tree_reads=1`, `header_reads=0`, `blob_loads=0`. The harness incorrectly treated
+Python startup name lookups in cwd as forbidden recursive work. This was a test
+assumption defect; no runtime source change is required.
+
+`tests/test_scalability_harness.py` now permits zero or one root tree for that
+specific Python no-op workload, rejects a second tree or any payload, and keeps
+eager materialization's full-tree work distinct. The native true/cat million
+lazy gates are unchanged. The final PR CI must rerun the complete matrix; this
+old failure is not counted as platform acceptance.
+
+## 1.4 resource review: buffered metadata, missing payloads and shutdown
+
+Copilot's [review of d0edf50](https://github.com/progbeat/git-on/pull/23#discussion_r4410058171)
+identified four concrete defects. These red-before results were observed before
+changing the affected code. The global-cache findings below are historical:
+the owner later removed that entire feature, including its index and tests.
+The streaming/shutdown regression remains permanent:
+
+- The former `tests/cache_scaling.py` counted actual cache read/write syscalls as well
+  as metadata enumeration. Running the d0edf50 source probe with K=64, N=8
+  failed the bounded-I/O gate with 9,638 calls. Both JSON reads and writes were
+  unbuffered. The corrected path uses bounded byte buffers and produced 171
+  calls for that case, while preserving atomic/fsync ordering.
+- `deleted_payload_restore_repairs_accounting_before_replacement` failed with
+  count two where one was required after a missing retained payload. The direct
+  store/eviction regression failed with ENOENT at capacity. Restore and direct
+  store now unlink stale metadata before refilling; eviction tolerates an
+  already absent payload. Permanent tests check replacement at and below
+  capacity, exact bytes, accounting and link topology.
+- `streaming_stops_after_command_completion_without_a_signal` failed because
+  copying returned success after `stop_operations()`. Its isolated reader sets
+  the real process flag during the first chunk, without a cancellation signal.
+  The fixed helper returns the stopped error before the second read; the test
+  observes exactly one active chunk. Isolation preserves other tests' global
+  lifecycle state. Existing real-FUSE escaped-reader/native-operation shutdown
+  checks remain separate acceptance evidence.
+
+## 1.4 independent review: cumulative per-demand pack scans
+
+At d0edf50, `tests/pack_scaling.py --probe <d0edf50-source-probe> --sizes 32`
+failed its linear pack-enumeration gate: 2,559,376 directory bytes for 32 distinct
+blob demands and a repeat pass. The expanded old runs measured 37,495,312 bytes
+at 128 and 742,274,064 at 512. Descriptor bounds and the shared-object full-million
+fixture did not expose this work.
+
+The fix imports only each newly received filtered pack into loose run storage
+using native Git, releases its pack/index files, reuses the snapshot Repository,
+and removes unconditional ODB refreshes. Corrected samples were 22,784/88,064/
+349,184 bytes. The permanent interactive reduced-RLIMIT test checks that live
+pack directories are empty between operations, and the scaling test verifies
+that the second pass neither fetches nor re-stores run-available objects. The
+helper's own OID enumeration and necessary Git unpack/decoding costs are
+explicitly separated from this structural pack-maintenance evidence.
+
+## 1.4 terminal ownership and durable CI replay
+
+The second Copilot review of df900c4 identified three additional defects; the review workflow was later changed to independent clean-context tasks
+followed by final Copilot review.
+
+- The permanent real interactive-Bash PTY regression
+  `test_materialization_native_git_tty_handoff_with_tostop` enables `stty tostop`
+  and stalls an actual HTTPS object fetch. Before the fix the runner became
+  stopped (`/proc` state `T`, shell status 150) while native Git owned the
+  foreground terminal. The delayed progress worker now clears before terminal
+  handoff, pauses while Git owns it, and draws only in the foreground. The same
+  test is green, together with the existing success/error/SIGTERM PTY test.
+  A session-leader-only PTY does not reproduce this non-orphan job-control bug.
+- The actual workflow replay block failed with `fatal: invalid reference` in a
+  fresh repository without intermediate PR commit d0edf50. Its permanent test
+  now observes that the current pack-scaling gate still executes when this
+  optional historical baseline is unavailable after a squash merge. Existing
+  history continues to run the old/new comparison; master baseline replay is
+  unchanged.
+- The actual full-walk child checked the root `.git` invariant three times in
+  the permanent tiny three-directory fixture. It now checks once, before the
+  walk, on both clone and git-on paths. Every leaf, byte and path-depth check
+  remains. The focused test failed with `3 != 1` before the change and passes
+  afterward.
+
+Local red/green logs are `/tmp/git-on-tostop-shell-red.log`,
+`/tmp/git-on-tostop-green.log`, `/tmp/git-on-ci-replay-{red,green}.log` and
+`/tmp/git-on-walk-{red,green}.log`.
+
+## 1.4 complete traversal: wait for actual unmount result
+
+In [Actions run 40843614561](https://github.com/progbeat/git-on/actions/runs/40843614561),
+both ordinary FUSE and enabled passthrough read all one million leaves, verified
+their bytes and exited the child successfully. The runner nevertheless failed
+with `clean unmount timed out`: it killed an active unmount helper after three
+seconds. A fixed deadline on an in-flight unmount imposes an artificial failure
+as visited inode reclamation grows.
+
+`clean_unmount_waits_for_active_helper_but_bounds_completed_failures` is a
+permanent helper-supervision regression. With a real four-second helper, the
+old code failed at three seconds; the corrected code waits for success. It
+also verifies that immediately completed failure helpers still produce the
+busy-mount error within the existing retry budget. The helper test is not a
+substitute for an actual mount: the exact-head full traversal matrix and the
+escaped-descendant busy-mount integration test remain required. No forced or
+lazy unmount is introduced, and failed unmounts retain recovery state. Local
+logs are `/tmp/git-on-unmount-{red,green}.log`.
+
+## 1.4 acceptance review: independent resource observations
+
+The scale sampler put Linux `/proc` and host `statvfs` reads in one try block.
+When a capability-bearing test daemon denied `/proc` access, the otherwise
+available filesystem sample was skipped and its field stayed zero. This is a
+measurement failure, not evidence of zero temporary storage use.
+
+The permanent
+`test_denied_proc_observation_does_not_skip_available_filesystem_sample` calls
+the real sampling helper with a denied descriptor observation and an available
+filesystem observation. Before the fix it failed with `0 != 7168`. Separate
+observation blocks now preserve the denied runner fields while recording the
+filesystem delta; the same test passes. Logs are
+`/tmp/git-on-sampler-{red,green}.log`. Actual enabled-passthrough CI remains
+required, and a denied filesystem observation has its own explicit flag.
+
+Mac verification modes run in separate CI jobs to reduce the elapsed time of
+the required rerun. Their combined sizes, workloads and cold/warm cases are
+unchanged; the matrix guard verifies all fourteen source/policy/verification
+cells. The test harness defaults to both verification modes for existing callers.
+
+## 1.4 confirmed removal of the global persistent cache
+
+The owner explicitly retained temporary storage for one invocation and removed
+cross-run persistence. `test_remote_never_requires_or_modifies_global_cache`
+failed against 19f0cbd when HOME/XDG_CACHE_HOME were unset, when the cache path
+was a regular file, and when historical cache directories contained markers.
+`test_separate_remote_runs_fetch_demanded_objects_again` also failed because
+that binary reused globally retained trees/blobs. Both pass after removing the
+global index, cache transfers and directory initialization. Local evidence is
+`/tmp/git-on-no-global-cache-{red,green}.log`.
+
+The run-local ODB, streaming, integrity checks, native error latch, pack import,
+FD limit, progress and cleanup remain. Global-lock/payload-fault tests were
+replaced with private-ODB fault tests; native cancellation and recovery tests
+remain. First/repeat remote scale invocations each fetch their own demands,
+while within-run repeats must reuse available OIDs after memory-cache eviction.
+Old global-cache complexity measurements and earlier CI successes are historical,
+not acceptance evidence for this new head. The full exact-head matrix must run
+again before independent review and final Copilot.
+
+## CI test-cost consolidation
+
+The author authorized removing repeated executions of practically identical
+checks and using representative stress sizes, while retaining important
+pre-merge validation. [CI cost and coverage](ci-performance.md) records the old
+76m38s wall / 586.7 runner-minute baseline, the distinct invariants and the new
+plans. Historical full-million passes remain historical; the new namespace
+profile is never labeled as a full-million payload read.
+
+The source probe previously enumerated every available OID after each read,
+adding quadratic observer work to increasing distinct-demand tests. Metrics-only
+reporting plus one final explicit OID-set verification reduced the local
+512-object control from 126.6s to 23.1s; exact bytes, same-run fetch counts and
+pack-metadata gates remain. The permanent gate rejects per-read object lists in
+that mode. Historical `--before-*` options still reproduce old failures; current
+regressions run in CI without rebuilding already-known failing binaries.
+
+The scale child now rejects wrong bytes, missing names and stale generated
+output in focused real-filesystem harness cases. The default execution plan and
+workflow guards cover every prior source/policy/signature interaction, selected
+100k full reads and a separate million-name traversal. Native fixture/clone/
+cleanup phases and actual sample allocation are reported explicitly. The
+existing required package aggregate waits for the scale and Mac jobs, so these
+checks cannot first finish after merge.
+
+The two-level CI plan is conservative for runtime, dependency, workflow, shared
+helper and unknown changes. Positive/negative gate tests cover permitted skips,
+failed base jobs, omitted required jobs/steps, absent artifacts, dropped matrix
+cases and incomplete operation/sample reports. The always-running required
+aggregate validates the exact head and actual execution data, not only the
+classifier's promised plan. No branch settings or publication behavior change.
+
+The new metrics-only probe gate was replayed against an independently built
+immutable `2062eb8` helper: the 32-object case fails specifically with
+`per-read ODB enumeration returned`. The current helper passes the same case
+and still verifies all final OIDs. Local evidence is
+`/tmp/git-on-ci-opt-probe-{red2,green2}.log`.
+
+## CI evidence review: eager materialization and cancellation observations
+
+The exhaustive manual plan includes no-op and sparse children after eager
+materialization. Its evidence validator incorrectly required those preparations
+to have the same object-load counts as a lazy FUSE mount. The permanent
+`test_exhaustive_materialized_evidence_allows_eager_object_preparation` fails on
+2525918 with `non-lazy no-op`, then passes after restricting lazy counters to
+FUSE/passthrough. Its exhaustive parser fixture includes 378 scenarios; these
+synthetic records are parser coverage, not backend execution. Negative cases
+still reject wrong child read counts on all three backends and excess blob/tree
+loads for lazy no-op/sparse cases. Logs are
+`/tmp/git-on-ci-eager-evidence-{red,green}.log`.
+
+Actual 1,000-file exhaustive materialization passed six local and twelve remote
+invocations: no-op/sparse/full, both verification modes and fresh repeated
+remote runs. Each preparation loaded 17 blobs and three trees; child payload
+read counts were respectively 0, 100 and 1101. No full-million exhaustive matrix
+was run to validate this small evidence correction.
+
+The startup cancellation test also assumed that reaping native Git meant every
+transport in its killed process group was already dead. A review saw a SIGQUIT
+failure followed by a passing rerun. A local diagnostic passed 120 ordinary
+cancellations; with controlled CPU contention, the same immediate `/proc`
+predicate failed for all 80 observations, including 20 SIGQUIT cases, while
+every exact transport's pidfd became readable within 0.503 seconds. The test now
+uses a two-second pidfd death assertion, as the existing stalled-transport test
+already does. It still fails if the owned process survives, avoids PID reuse,
+and disposes of the exact process if an assertion fails. Product cancellation
+behavior is unchanged. Diagnostic records are
+`/tmp/git-on-signal-review-{diagnostic,loaded}.jsonl`; focused tests pass in
+`/tmp/git-on-signal-review-green.log`.
+
+## Final Copilot review: hidden nested namespace entries
+
+[Copilot review 5702538999](https://github.com/progbeat/git-on/pull/23#pullrequestreview-5702538999)
+found one real incremental defect after the independent review of 74fc52a
+reported no findings. The scale child's directory filter hid `.git` and `out`
+at every depth, so full-read and namespace-only checks accepted unexpected
+subtrees. All four reported combinations reproduced as false passes. The
+permanent `test_walk_rejects_nested_git_and_out_subtrees` expands them to both
+direct-disk and snapshot contexts; all eight cases failed before the fix and
+pass afterward.
+
+Only a direct clone's root `.git` directory is now exempted. The existing real
+clone full/enumerate controls still pass; snapshot root `.git` remains forbidden.
+No `out` directory is filtered. Six cases reject stale root output as a directory,
+regular file or dangling symlink in both traversal modes, including before a
+generated-write command. A positive case still creates and verifies `out/generated`
+after the full namespace walk. Runtime code and stress sizes are unchanged.
+Focused evidence is `/tmp/git-on-namespace-copilot-{red,green}.log`.
+
+## Required 1.4.0 performance work: first kernel-cache increment
+
+The owner rejected the measured 22–27x full-read overhead and kept #20 within
+1.4.0. Resource-limit passes do not satisfy this acceptance requirement. The
+author clarified that metadata results (including stat) contribute fixed
+interface bytes to N, and all metadata/internal work contributes to total cost.
+The full-revision-materialization-plus-direct-command baseline resolves
+the initial short-read accounting question. Already prepared data must not be
+fetched or unpacked repeatedly; no numerical overhead allowance was invented.
+
+`protocol_kernel_cache_only_retains_protected_source` failed against c42ebf1
+because the protected entry TTL was zero. It now passes for none/ignored/untracked
+and confirms that generated entries and all-mode entries remain uncached.
+Directory attributes remain uncached; readonly protected source uses KEEP_CACHE
+and NOFLUSH. All 20 protocol tests pass. Logs are
+`/tmp/git-on-140-kernel-cache-{red,green}.log`. This is a wire-contract result,
+not proof of a real-kernel speedup or completion of #20.
+
+The permanent real-FUSE source-cache regression compares the previous
+uncached-source policy and the protected-source policy in the same test build.
+Both walks check complete names and bytes; test-only callback counters assert
+fewer delivered lookup/read requests without tracing or privilege changes.
+The inherited-metrics descriptor and child namespace checks remain negative
+regressions. Temporary profiling scripts and old traced timing evidence are
+kept outside the mergeable tree.
+
+## Disposable object syncs and large-blob close/reopen
+
+`test_private_remote_objects_do_not_sync_disposable_payloads` follows native
+Git descendants under strace and forces caller core.fsync=all. The old probe
+performed 16 private object syncs; the corrected probe performs none, including
+when the deprecated fsyncObjectFiles switch is inherited. Exact bytes, same-run
+fetch reuse and unchanged source configuration are asserted. Evidence:
+`/tmp/git-on-140-sync-{red,green}.log`. The sync reduction is not a latency SLA.
+
+`large_blob_preparation_survives_close_and_reopen_with_bounded_memory` failed
+before the raw store: spool_writes became two after the second open. It now
+passes three separate one-byte reads with a single transfer/verification and no
+retained payload RAM. Raw-store tests cover multiple index growths and reverse
+lookups, absent named files, boundary ranges, invalid hashes, truncated/oversized
+input, rollback and preservation of prior verified data. The real-HTTPS large
+object test also asserts that revisiting a closed blob adds no spool write.
+Evidence: `/tmp/git-on-140-reopen-{red,green}.log`,
+`/tmp/git-on-140-raw-{unit,rust,integrations}.log`. Raw bytes/index are unlinked
+like the prior active-reader spool, and remain invocation-local.
+
+### Retained source-pack mappings
+
+A 48 MiB non-delta packed fixture failed before the window policy: after closing
+all readers it retained 49,160 KiB of source-pack mappings, despite bounded data
+LRU retention. `RemoteTests.test_idle_local_pack_mappings_do_not_retain_the_complete_source_pack`
+checks the production startup policy, source mappings after reader release and
+exact opposite-end rereads without another blob decode. Source mappings are
+clean/reclaimable and separate from anonymous decoder buffers.
+
+### Waited-RSS observer and graceful timeout cleanup
+
+The new real-repository wait4 wrapper initially exited on group SIGTERM before
+the measured command completed its own child-group cleanup. The timeout path
+then killed that command, leaving its separate owned child group alive. A
+focused test reproduced the escaped-child marker with the wrapper and no marker
+without it. The observer now ignores SIGTERM while waiting; its forked child
+restores the normal disposition before exec. The timeout retains its bounded
+final SIGKILL and the earlier same-group TERM-ignoring descendant regression.
+
+### Caught raw-storage EIO must fail a remote invocation
+
+An already fetched remote blob rejected tampered raw bytes on read, but the
+error bypassed the sticky transport status. A child catching EIO could therefore
+make an incomplete remote invocation appear successful. The new retained-reader
+and close/reopen regression reproduced an absent `remote_failure()` after EIO.
+Raw read failures now remain in the invocation store and feed the existing
+remote final-status path. The historical requester-specific EINTR exception is
+removed together with requester emulation in 1.4. A real-mount
+regression catches the raw-storage EIO and requires runner status 125, the
+original diagnostic and complete cleanup.
+
+### Reopened small objects avoid repeated format validation
+
+After a 512-byte ordinary blob was verified/read and then evicted, opening a
+new reader reloaded and authenticated all 512 bytes solely to repeat the LFS
+pointer check. The permanent snapshot regression reproduced that extra I/O.
+Successful content-policy validation is now retained with the immutable object's
+trusted descriptor. The regression requires zero spill hydration on reopen and
+512 authenticated bytes when the requested one-byte data range is actually
+read. Failed policy validation is not cached as success; existing repeated LFS
+rejection cases remain in the suite. Block verification is unchanged.
+
+### Transient reads and readonly child metadata reuse
+
+On `2a41951`, `transient_read_does_not_wait_for_the_active_reader_registry`
+blocked behind the active-reader registry until the test released it, despite
+not retaining a reader. The test always releases the lock and joins its worker
+before reporting failure. Transient reads now share the same verified raw
+preparation/range path without constructing a temporary registered reader;
+retained `BlobReader` ownership and cleanup remain unchanged. Existing spill
+corruption coverage checks both retained-reader and transient reads.
+
+`readonly_child_lookups_reuse_prepared_parent_metadata` reproduced five cache
+lookups for one new leaf below prepared ancestors instead of just the shared
+blob header. Readonly child lookup now uses the known parent's OID and prepared
+name index, including during the initial descent. The regression also checks
+negative lookup, modes, identity after forget/relookup, and distinct pathname
+inodes for shared Git trees. Mutable policies keep their redirect/whiteout path.
+These structural regressions do not establish a measured WebKit speedup or
+satisfy the outstanding full-workload performance acceptance.
+
+The follow-up `child_lookup_preserves_existing_single_component_path_normalization`
+reproduced ENOENT on the initial fast path for a cold `tracked.tmp/` lookup.
+It preserves the helper's existing normalized-path behavior across all four
+policies, including trailing separators and `/.`. The readonly index lookup
+uses the resolved path's filename, as the original source-inode path did.
+Kernel LOOKUP names do not include these separators; this is helper-level
+equivalence coverage, not a claim about kernel pathname traversal.
+
+### Readonly live-inode lookup and non-growing block replacement
+
+Readonly child lookup now borrows the parent's immutable source path, validates
+the component and resolves its arithmetic source inode before allocating a
+full pathname. A live inode avoids the parent reverse-path check and child
+ordered-index lookup. New inode insertion and mutable-policy namespace handling
+retain their existing indexes. Byte-exact names, error precedence, repeated
+lookups and forget/relookup identity are checked for all four policies; existing
+normalization and shared-tree identity regressions remain.
+
+Replacing a retained block with one of equal or smaller allocation weight now
+updates/promotes the existing LRU node. It cannot need another eviction, so it
+avoids pop/free/reinsert and the temporary-empty-table shrink during a
+single-object scan. Growing replacements keep the original eviction path.
+`block_replacement_preserves_byte_budget_recency_and_spill_victims` checks exact
+accounting, recency, equal/short/growing replacements, the actual spilled victim
+and unchanged active results. These are optimization-equivalence checks, not
+claims that the earlier revision returned incorrect bytes or measured slower.
+
+### Source metadata changes and repeatable WebKit reports
+
+On frozen `68d0e4d`,
+`FuseTests.test_source_metadata_changes_fit_checkout_disk_budget` observed
+12,595,200 allocated bytes after chmod, utime, link and rename of a 6 MiB
+source file. The same command in a native checkout fit the 9 MiB budget.
+The corrected real-FUSE case passes without copying payload for metadata
+changes and preserves a readable, chmod-able descriptor after unlink. The
+unit regression `metadata_changes_preserve_source_until_content_changes`
+failed with one blob load instead of zero; it now also checks that later
+content writes reach an existing reader. A separate Linux regression compares
+both paths on a fresh private 9 MiB tmpfs; unavailable mount namespaces cause
+a local skip and a CI failure, never an assumed quota pass.
+
+`RealRepositoryTests.test_report_can_be_repeated_with_untracked_output_but_rejects_changed_sources`
+reproduced the second-run dirty-report rejection on `68d0e4d`. It now accepts
+the generated untracked report and still rejects both staged and unstaged
+source edits. The harness fixture uses a real Git repository and replaces the
+public-network observation; it does not claim a WebKit execution.
+
+### Writable opens and CI evidence identity
+
+On frozen `9cce624`,
+`FuseTests.test_writable_open_does_not_materialize_source` reproduced
+12,595,200 allocated bytes after opening a 6 MiB file for writing without
+changing data; its native clone-plus-command control succeeded. The corrected
+case also checks empty writes, fsync, unchanged-size truncation, first-byte
+mutation and truncation to a smaller size. The Linux quota case runs read,
+write and truncate separately against clone-plus-command on private 9 MiB
+tmpfs volumes. Local mount-namespace denial is a skip, not quota evidence.
+Unit and protocol checks retain source identity/cache flags until actual
+mutation, preserve existing readers and verify usable handles after a rejected
+first copy-up. mmap and all write policies remain real-FUSE checks.
+
+`CiPlanTests.test_pack_report_rejects_stale_dirty_or_missing_identity`
+reproduced acceptance of all four invalid identity cases on `9cce624`.
+The gate now requires current head and an explicit clean tracked state on
+each pack row. The producer regression uses real commits and staged/unstaged
+edits, accepting its own untracked output across repeated runs. Synthetic
+validator fixtures are shared and never represent backend execution.
+
+`CiPlanTests.test_divergent_push_covers_reverted_runtime_while_pr_uses_merge_base`
+reproduced omission of `src/x.rs` when a push replaced a runtime branch with a
+divergent documentation commit. It now requires the reverted runtime and all
+affected suites, while preserving merge-base PR comparison and docs-only
+fast-forward push selection.
+
+### Read before mutation and handled termination
+
+On the frozen ordinary `5098898` release, the real-FUSE writable lifecycle
+regression failed after `pread(1)` then `pwrite(1)`: it observed 12,595,200
+allocated bytes against a 9 MiB budget, while native clone plus the same command
+passed. Both that sequence and read-then-truncate now pass. The separate tmpfs
+comparison includes both sequences; local namespace denial remains a skip and
+cannot stand in for the required CI quota execution. A focused unit regression
+also checks independent inodes sharing one OID, overlapping writes, reopen,
+unlink and truncation followed by zero-filled extension. The payload LRU budget,
+large-object streaming and verified source storage retain their existing rules.
+
+The same frozen release failed the handled-SIGTERM regression in materialized
+and real-FUSE modes, returning -15 instead of the child's 42. The corrected
+regression passes in both modes and separately retains default termination by
+SIGTERM, checking cleanup in every case. RED/GREEN logs are retained under
+`/tmp/git-on-review-20261112-readwrite/` as `before.log` and `focused-after.log`.
+
+### Remote eager destination and cancellation identity
+
+The frozen ordinary `78ac642` release failed the 7 MiB `file://` materialization
+regression with 14,864,384 allocated bytes against 9 MiB; native clone plus the
+same command passed. Remote eager blobs now decode into their final files with
+OID verification, without decoded raw staging. Received packs are isolated and
+released after their last needed blob; only the active pack has an open ODB.
+Existing finite-FSIZE and 64-descriptor cases pass, as does the native-checkout
+disk comparison. A separate regression requires a real private 9 MiB tmpfs in
+Linux CI; local namespace denial is explicitly a skip. The 32/160-object and
+large streamed-object workloads verify single preparation and zero raw imports.
+
+The same frozen release returned -15 instead of 42 when a child handled forwarded
+SIGTERM during an active HTTPS read, through both a reusable session and native
+fetch. Both corrected cases pass; caught real ODB/raw faults still fail the run.
+Typed cancellation survives socket I/O context and is excluded from sticky
+transport/storage failures, without discarding actual integrity or I/O errors.
+Logs are under `/tmp/git-on-review-20261112-eager-cancel/`: `materialized-before.log`,
+`materialized.log`, `cancel-before.log` and `cancel-after.log`.

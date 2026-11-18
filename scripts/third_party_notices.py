@@ -20,7 +20,7 @@ def collect(metadata):
         selected.add(identifier)
         todo.extend(d['pkg'] for d in nodes[identifier]['deps'] if any(k['kind']!='dev' for k in d['dep_kinds']))
     sections=[]
-    for p in sorted((packages[i] for i in selected if packages[i]['source'] is not None),key=lambda p:(p['name'],p['version'])):
+    for p in sorted((packages[i] for i in selected if i != metadata['resolve']['root']),key=lambda p:(p['name'],p['version'])):
         root=Path(p['manifest_path']).parent.resolve()
         paths={f for f in root.iterdir() if f.is_file() and f.name.lower().startswith(('license','copying','copyright','notice'))}
         if p['license_file']:paths.add(root/p['license_file'])
