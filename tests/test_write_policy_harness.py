@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""The four-policy launcher must build argv before real mounts can test policy."""
+"""Helpers used by the real-mount write-policy tests."""
 import ast
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
+
+from filesystem_quota import STORAGE_OBSERVATION
 
 
 class PolicyHarnessTests(unittest.TestCase):
@@ -15,6 +20,29 @@ class PolicyHarnessTests(unittest.TestCase):
         exec(compile(ast.Module(body=[method],type_ignores=[]),'<policy regression>','exec'),namespace)
         result=namespace['policy'](Probe(),'all','print(1)')
         self.assertEqual(result,['HEAD','--write-policy=all','--','python','-c','print(1)'])
+
+    def test_storage_accounting_restarts_when_a_listed_path_moves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            (root/'.git').mkdir()
+            (root/'payload').write_bytes(b'x'*8192)
+            code=STORAGE_OBSERVATION+r'''
+expected=allocated()
+walk=os.walk
+moved=False
+def relocating_walk(*args,**kwargs):
+ global moved
+ for row in walk(*args,**kwargs):
+  if not moved:
+   (root/'payload').rename(root/'moved')
+   moved=True
+  yield row
+os.walk=relocating_walk
+assert allocated()==expected,'a moved payload must still count toward the budget'
+'''
+            result=subprocess.run([sys.executable,'-I','-S','-c',code],cwd=root,
+                                  capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

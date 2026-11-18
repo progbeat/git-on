@@ -36,24 +36,25 @@ cannot identify one edge, validation fails explicitly instead of guessing its ki
 Use patch for backwards-compatible binary bug fixes. Use minor for new
 backwards-compatible capabilities, such as an optional write policy. Use major for
 breaking the documented CLI, filesystem, environment or platform contract.
-Changing whether a signal interrupts an individual filesystem operation is a
-filesystem contract change, including removal of documented EINTR behavior.
-Correcting git-on's custom argument handling to restore the intended native Git
-semantics is a bug fix; a release that also adds write policies uses a minor bump.
-This classification includes using native Git for local resolution: direct
-`git-on` invocations now require Git on `PATH`, including unverified local runs
-that version 1.1 could resolve without it. Maintaining a separate Git-free
-resolver would contradict the original requirement that Git itself interpret
-the operands. This restoration is explicitly classified as a bug fix, rather
-than a breaking platform change; unrelated platform requirements still follow
-the major-release rule above.
+Assess compatibility against the requirements in the specification and interview.
+Restoring required behavior after an implementation defect is a bug fix, even
+when it changes observable behavior. Changing the required contract itself is a
+breaking change. Describe the user-visible effects in the release notes.
 These rules also apply before 1.0: this project deliberately reserves major bumps
 for breaking changes instead of silently treating every 0.x release as breaking.
 CI can validate the numeric increment and notes; semantic classification requires
 review of the change. Agents are responsible for proposing the correct kind.
 
-Bootstrap is the only exception: a base with no Cargo package introduces `0.1.0`
+For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.
+
+An incorrect version that has not been published or tagged may be corrected.
+In that case, put `<!-- Release-base: vVERSION -->` in the current release notes
+to explicitly select the latest existing release tag. The validator compares
+the complete binary changes against that release and requires exactly one
+increment from it. Fetch all tags before validation. A tagged previous version
+cannot be corrected; an existing target tag is accepted only for a clean retry
+of its exact commit. Never delete or move a published tag to enable correction.
 
 ## CI and automatic publication
 

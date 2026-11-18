@@ -426,6 +426,50 @@ class ChangeClassificationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('release_required=false\n', output.read_text())
 
+    def prepare_unreleased_correction(self):
+        self.git('tag', 'v1.1.0')
+        self.replace('Cargo.toml', 'version = "1.1.0"', 'version = "2.0.0"')
+        self.replace('Cargo.lock', 'version = "1.1.0"', 'version = "2.0.0"')
+        self.write('src/main.rs', 'fn main() { println!("new feature"); }\n')
+        self.write('RELEASES.md', notes('2.0.0', 'major'))
+        self.git('add', '.')
+        self.git('commit', '-qm', 'unreleased master')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.replace('Cargo.toml', 'version = "2.0.0"', 'version = "1.2.0"')
+        self.replace('Cargo.lock', 'version = "2.0.0"', 'version = "1.2.0"')
+        self.write('RELEASES.md', notes('1.2.0', 'minor') + '<!-- Release-base: v1.1.0 -->\n')
+
+    def test_correct_unreleased_version_and_retry_same_tagged_commit(self):
+        self.prepare_unreleased_correction()
+        self.run_policy(True)
+        (self.root / 'policy-output').unlink()
+        self.git('tag', 'v1.2.0')
+        result = subprocess.run([sys.executable, self.script, '--base', self.base], cwd=self.root,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write('src/bin/extra.rs', 'fn main() {}\n')
+        result = subprocess.run([sys.executable, self.script, '--base', self.base], cwd=self.root,
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, 'a tagged retry must use its exact clean source')
+
+    def test_correction_refuses_missing_release_base_and_published_or_stale_baselines(self):
+        self.prepare_unreleased_correction()
+        original = (self.root / 'RELEASES.md').read_text()
+        for tag, release_base in [(None, None), ('v2.0.0', 'v1.1.0'),
+                                  ('v1.2.0', 'v1.1.0'), ('v1.1.1', 'v1.1.0'),
+                                  (None, 'v0.9.0')]:
+            with self.subTest(tag=tag, release_base=release_base):
+                if tag:
+                    self.git('tag', tag, self.base)
+                self.write('RELEASES.md', notes('1.2.0', 'minor') +
+                           (f'<!-- Release-base: {release_base} -->\n' if release_base else ''))
+                result = subprocess.run([sys.executable, self.script, '--base', self.base],
+                                        cwd=self.root, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                if tag:
+                    self.git('tag', '-d', tag)
+        self.write('RELEASES.md', original)
+
     def test_required_checks_have_no_path_filters_or_release_condition(self):
         workflow = (Path(SPEC.origin).parents[1] / '.github/workflows/ci.yml').read_text()
         self.assertNotIn('paths:', workflow)

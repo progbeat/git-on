@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -42,6 +43,14 @@ class CiContractTests(unittest.TestCase):
         self.assertIn('VERSION=$(cargo metadata',body)
         self.assertIn('= "git-on $VERSION"',body)
         self.assertNotRegex(body,r"= ['\"]git-on [0-9]+\.[0-9]+\.[0-9]+['\"]")
+
+    def test_release_runners_match_native_package_validation(self):
+        tested={target:runner for runner,target in re.findall(
+            r'- runner: (\S+)\n\s+target: (\S+)',job('package-build'))}
+        self.assertTrue(tested)
+        configured=tomllib.loads((ROOT/'dist-workspace.toml').read_text())['dist'].get('github-custom-runners',{})
+        self.assertEqual({target:configured.get(target) for target in tested},tested,
+                         'release builds must use the runners exercised before merge')
 
     def test_macos_runs_behavior_and_installer_tests(self):
         body=job('macos')

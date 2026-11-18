@@ -26,3 +26,8 @@ hosting = "github"
 
 # Generated from the exact target's locked runtime/build sources before packing.
 include = ["THIRD_PARTY_NOTICES"]
+
+# Match the runners exercised by the native package CI job.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
