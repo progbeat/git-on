@@ -59,10 +59,8 @@ SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
 Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
 Callers with a controlling terminal use native fetch with job-control supervision.
 During preparation, Git-on owns that terminal and presents standard Git/OpenSSH
-askpass requests. Git and its helpers have no controlling terminal; helpers that
-need terminal interaction must use `GIT_ASKPASS` or `SSH_ASKPASS` instead of opening
-`/dev/tty` directly. Configured askpass programs retain their selection policy
-and original environment.
+askpass requests, pausing the animation for interaction. Configured askpass
+programs retain their selection policy and original environment.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
 retain the native compatibility path. No fetched object is retried merely to
