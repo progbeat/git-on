@@ -123,6 +123,13 @@ impl Git {
                 .arg(dir)
                 .args(["-c", "core.bare=true"]);
         }
+        if let Some(program) = self.config.iter().rev().find_map(|(key, value)| {
+            (key == "core.askpass")
+                .then_some(value.as_deref())
+                .flatten()
+        }) {
+            crate::terminal_ui::core_askpass(&mut command, program);
+        }
         command
     }
     pub(crate) fn demand_session_compatible(&self) -> bool {
@@ -274,7 +281,17 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 /// Wait for owned transport/verifier groups without trapping cancellation in
 /// blocking pipe reads. Temporary capture files have no application quota.
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
-    run_captured(command, capture, capture, None, None)
+    let managed = crate::terminal_ui::owns_terminal();
+    let mut output = run_captured(command, capture || managed, capture || managed, None, None)?;
+    if managed && !capture {
+        use std::io::Write;
+        let _drawing = crate::terminal_ui::native_terminal_lease(true);
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+        output.stdout.clear();
+        output.stderr.clear();
+    }
+    Ok(output)
 }
 pub(crate) fn run_with_input(
     command: Command,
@@ -417,14 +434,24 @@ fn run_captured(
     if let Some(stderr) = &stderr {
         command.stderr(stderr.try_clone()?);
     }
-    let tty = controlling_terminal();
+    let managed = crate::terminal_ui::owns_terminal();
+    crate::terminal_ui::configure(&mut command);
+    if managed && input.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        command.stdin(Stdio::null());
+    }
+    let tty = (!managed).then(controlling_terminal).flatten();
     let tty_fd = tty.as_ref().map(AsRawFd::as_raw_fd);
     let parent_group = unsafe { libc::getpgrp() };
     let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == parent_group });
-    let _progress_lease = crate::progress::native_terminal_lease(transfer);
+    let _progress_lease = crate::terminal_ui::native_terminal_lease(transfer);
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) != 0 {
+            if if managed {
+                libc::setsid()
+            } else {
+                libc::setpgid(0, 0)
+            } < 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             if transfer {
@@ -442,9 +469,10 @@ fn run_captured(
             return Err(error).context("start native Git operation");
         }
     };
+    let _operation = crate::terminal_ui::NativeOperation::new(child.id());
     let wakeup = ChildExitWakeup::new(child.id());
     let outcome = loop {
-        match child.try_wait() {
+        match crate::terminal_ui::try_wait(&mut child) {
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.into()),
             Ok(None) => {}
@@ -457,7 +485,7 @@ fn run_captured(
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            let _ = child.wait();
+            let _ = crate::terminal_ui::reap(&mut child);
             break Err(crate::object::OperationCancelled)
                 .context(format!("Git operation cancelled by signal {signal}"));
         }
@@ -465,7 +493,7 @@ fn run_captured(
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            let _ = child.wait();
+            let _ = crate::terminal_ui::reap(&mut child);
             break Err(crate::object::OperationCancelled)
                 .context("Git operation stopped after command completion");
         }
@@ -695,9 +723,7 @@ fn stop_request_operation(child: &mut std::process::Child) -> Result<()> {
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    child
-        .wait()
-        .context("reap interrupted native Git operation")?;
+    crate::terminal_ui::reap(child).context("reap interrupted native Git operation")?;
     Ok(())
 }
 /// Transfer terminal ownership while blocking SIGTTOU in the calling thread.

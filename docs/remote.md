@@ -57,9 +57,12 @@ invocation-owned channel. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
 SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
 Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
-Callers with a controlling terminal retain native fetch's foreground and
-job-control supervisor, including for credential helpers that open `/dev/tty`
-despite redirected stdio or disabled built-in prompts.
+Callers with a controlling terminal use native fetch with job-control supervision.
+During preparation, Git-on owns that terminal and presents standard Git/OpenSSH
+askpass requests. Git and its helpers have no controlling terminal; helpers that
+need terminal interaction must use `GIT_ASKPASS` or `SSH_ASKPASS` instead of opening
+`/dev/tty` directly. Configured askpass programs retain their selection policy
+and original environment.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
 retain the native compatibility path. No fetched object is retried merely to
@@ -213,7 +216,7 @@ mount setup can leave the same disconnected mount even before the command starts
 Use the caller's effective system/global/repository configuration, expanded
 includes, inherited `git -c`, transport and credentials. Replay each value once
 for the private repository in its effective order; expand include conditions in
-the original caller's context. Do not capture or store passphrases, modify an
+the original caller's context. Do not log or persist passphrases, modify an
 agent, or create/change real trust keys. Captured configuration stays in process
 memory/environment rather than a runner-owned durable credential file.
 
@@ -223,7 +226,7 @@ ordinary selected encrypted identity authenticates once. Lazy fetches reuse the
 master, enable BatchMode and forbid replacement TCP connections. Connection loss
 fails clearly. Existing OpenSSH host-key policy controls first-contact prompts.
 During native Git authentication, Ctrl-Z stops the invoking job and returns
-control to its shell. `fg` resumes Git with the terminal; `bg` leaves the shell
+control to its shell. `fg` resumes preparation with the terminal; `bg` leaves the shell
 foregrounded, so another authentication read can stop the job until `fg`.
 
 Select the identity using SSH configuration, `GIT_SSH_COMMAND`,
@@ -263,8 +266,10 @@ retrying cleanup. Legacy records without any selected-client entry can still
 close their identity-checked master through the same direct mux protocol.
 Multiple encrypted identities, separately authenticated jump hosts and
 interactive credential helpers can need extra initial interaction. The one-prompt guarantee covers a directly reachable
-host and one selected identity. Lazy fetches disable Git/OpenSSH terminal/askpass
-prompts; a helper opening an independent UI is outside that guarantee. Unix
+host and one selected identity. Object loading during preparation can request
+credentials through Git-on. After command startup, lazy fetches disable
+Git/OpenSSH terminal/askpass prompts; a helper opening an independent graphical
+UI is outside that guarantee. Unix
 control-socket paths must fit Linux's length limit. Cancellation terminates owned
 transport subprocesses and follows the normal unmount/cleanup path.
 

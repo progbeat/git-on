@@ -1096,9 +1096,7 @@ run. Other green jobs in the failed run do not replace that acceptance.
 
 ## Native Git trust policy is the verification acceptance policy
 
-The owner reconciled issue #4 with native Git policy delegation after review
-discussion `r4245809531`. This is acceptance clarification and test hardening,
-not a discovered runtime trust-policy defect. git-on intentionally adds no
+Git-on delegates verification acceptance to native Git. It adds no
 signer allowlist or trust threshold to native Git's result under the caller's
 effective configuration. A source comment beside that decision records why.
 
@@ -1845,10 +1843,10 @@ The subsequent b07e786 head changes only the real-kernel timestamp assertions.
 
 ## Deferred macOS mounts
 
-The owner moved issue #12 outside1.3.0. All unfinished native FSKit/app/transport
-code and mount-only tests were removed from the final PR; historical commits
-remain available. The native idle-timeout, cold-enumeration and prerequisite
-review findings apply to that removed implementation. Mac CLI/materialization,
+Native macOS mounts are deferred beyond 1.3.0. The native FSKit/app/transport
+implementation and mount-only tests are absent. The native idle-timeout,
+cold-enumeration and prerequisite review findings describe that removed
+implementation. Mac CLI/materialization,
 archive metadata and installer tests remain; no actual Mac mount is claimed.
 
 ## 1.3 Copilot: passthrough metadata merges and readiness publication
@@ -2033,7 +2031,7 @@ old failure is not counted as platform acceptance.
 
 ## 1.4 resource review: buffered metadata, missing payloads and shutdown
 
-Copilot's [review of d0edf50](https://github.com/progbeat/git-on/pull/23#discussion_r4410058171)
+Review of d0edf50
 identified four concrete defects. These red-before results were observed before
 changing the affected code. The global-cache findings below are historical:
 the owner later removed that entire feature, including its index and tests.
@@ -2236,7 +2234,7 @@ behavior is unchanged. Diagnostic records are
 
 ## Final Copilot review: hidden nested namespace entries
 
-[Copilot review 5702538999](https://github.com/progbeat/git-on/pull/23#pullrequestreview-5702538999)
+Independent review
 found one real incremental defect after the independent review of 74fc52a
 reported no findings. The scale child's directory filter hid `.git` and `out`
 at every depth, so full-read and namespace-only checks accepted unexpected
@@ -2471,3 +2469,39 @@ Typed cancellation survives socket I/O context and is excluded from sticky
 transport/storage failures, without discarding actual integrity or I/O errors.
 Logs are under `/tmp/git-on-review-20261112-eager-cancel/`: `materialized-before.log`,
 `materialized.log`, `cancel-before.log` and `cancel-after.log`.
+
+## Startup progress, askpass paths and queued terminal input
+
+At a5e362d, `test_startup_progress_covers_local_resolution_and_initial_remote_fetch`
+failed in both TTY cases: neither a blocked first local Git call nor a stalled
+initial HTTPS fetch displayed progress. The invocation-wide renderer passes
+both cases, keeps the first 0.25 seconds silent, and emits no indicator into a
+redirected stream.
+
+The first replacement renderer split a configured askpass executable path at
+spaces by invoking a shell. The permanent
+`test_configured_askpass_path_with_spaces_matches_native_git` first authenticates
+with native Git, then uses the same helper through Git-on in a controlling
+terminal. Before the correction native Git succeeded and Git-on returned 125
+with `ask: not found`; direct executable invocation passes both paths.
+
+The existing TOSTOP preparation test now queues a line of command input while
+progress is visible. Before the correction kernel echo moved the indicator onto
+a completed screen line; the new artifact assertion failed in both native
+selection cases, although the command received its input. Suppressing echo only
+while rendering progress leaves the queued bytes untouched and restores terminal
+settings before a prompt, suspension, or command startup. Both cases pass with
+no completed indicator line and the exact queued command input.
+
+Native-process SIGSTOP delivery can follow the shell's stopped-job notification
+by several milliseconds. The job-control test waits for that observable stop
+instead of racing delivery. Its historical replay uses the earlier native
+terminal ownership assertions; current runs assert Git-on's terminal ownership.
+
+With `SSH_ASKPASS_REQUIRE=force`, an empty configured askpass executable must fail
+instead of falling back to the terminal. An unset executable retains OpenSSH's
+compiled default, including failure when that default is unavailable. The
+permanent `test_forced_askpass_failure_does_not_fall_back_to_terminal` compares
+both cases with native Git. Both replacement-renderer cases previously hung at
+a terminal passphrase prompt; both now fail authentication without prompting.
+Permission-only askpass requests also retain OpenSSH's display/require policy.

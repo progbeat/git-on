@@ -162,7 +162,6 @@ impl PreparedBlob {
 }
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
-    let _progress = crate::progress::MaterializationProgress::start();
     snapshot.set_spool_directory(root)?;
     snapshot.begin_materialization()?;
     let batch_size = if crate::spool::Files::size_limit()?.is_some() {

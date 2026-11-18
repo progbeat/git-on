@@ -77,4 +77,4 @@ empty; network and OS caches are uncontrolled. The report is checked again by
 
 This check demonstrates a small real command on a large public source. It does
 not measure full-tree throughput, a clone speed ratio, a fixed total-RSS bound
-or the complete performance contract in #20. That issue remains open.
+or the complete performance contract in the [specification](specification.md).

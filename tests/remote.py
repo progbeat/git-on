@@ -1381,8 +1381,62 @@ print('caught-EIO-and-returned-success')
         self.assertFalse((f.root/'cache').exists())
         print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*object_mib*1024*1024,metrics=last['metrics'])),flush=True)
 
+    def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
+        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        tools=f.root/'startup-tools';tools.mkdir()
+        entered=f.root/'git-entered';release=f.root/'git-release'
+        wrapper=tools/'git'
+        wrapper.write_text('#!'+sys.executable+'\nimport os,sys,time\nfrom pathlib import Path\n'
+                           f'entered=Path({str(entered)!r});release=Path({str(release)!r})\n'
+                           'entered.touch()\nwhile not release.exists(): time.sleep(.01)\n'
+                           f'os.execv({shutil.which("git")!r},["git",*sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env=dict(f.env,PATH=str(tools),TERM='xterm')
+        for phase,terminal in (('local-resolution',True),('initial-fetch',True),('initial-fetch',False)):
+            with self.subTest(phase=phase,terminal=terminal):
+                if phase=='initial-fetch':release.touch()
+                f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
+                master,slave=pty.openpty();self.addCleanup(os.close,master)
+                operands=['HEAD'] if phase=='local-resolution' else [url,'HEAD']
+                started=time.monotonic()
+                process=subprocess.Popen([str(OPTIONS.binary),*operands,'--write-policy=all','--',
+                                          sys.executable,'-c',"import sys;sys.stderr.write('COMMAND-START\\n');print('command-output')"],
+                                         cwd=f.repo,env=env,stdout=subprocess.PIPE,stderr=slave if terminal else subprocess.PIPE)
+                os.close(slave);f.children.append(process)
+                transcript=bytearray()
+                try:
+                    while time.monotonic()-started<.25:
+                        if terminal and select.select([master],[],[],.01)[0]:transcript.extend(os.read(master,65536))
+                        elif not terminal:time.sleep(.01)
+                    self.assertNotIn(b'Preparing snapshot',transcript,'indicator appeared before its delay')
+                    if phase=='local-resolution':self.assertTrue(entered.exists(),'first Git invocation did not start')
+                    else:self.assertTrue(f.stalled.wait(10),'initial fetch did not reach its controlled stall')
+                    if terminal:
+                        deadline=started+4
+                        while transcript.count(b'Preparing snapshot')<2 and time.monotonic()<deadline:
+                            if select.select([master],[],[],.05)[0]:transcript.extend(os.read(master,65536))
+                        self.assertGreaterEqual(transcript.count(b'Preparing snapshot'),2,'preparation wait hid the animation')
+                    else:time.sleep(.6)
+                finally:
+                    release.touch();f.resume.set()
+                output,errors=process.communicate(timeout=20)
+                while select.select([master],[],[],.05)[0]:
+                    try:chunk=os.read(master,65536)
+                    except OSError as error:
+                        if error.errno==errno.EIO:break
+                        raise
+                    if not chunk:break
+                    transcript.extend(chunk)
+                self.assertEqual(process.returncode,0,transcript)
+                self.assertEqual(output,b'command-output\n')
+                if terminal:
+                    self.assertLess(transcript.rfind(b'\x1b[2K'),transcript.index(b'COMMAND-START'))
+                    self.assertNotIn(b'Preparing snapshot',transcript[transcript.index(b'COMMAND-START'):])
+                else:self.assertEqual(errors,b'COMMAND-START\n')
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
+
     @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
-    def test_materialization_native_git_tty_handoff_with_tostop(self):
+    def test_preparation_progress_during_native_git_with_tostop(self):
         import native_job_control
         f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
         original=f.env
@@ -1396,24 +1450,31 @@ print('caught-EIO-and-returned-success')
                 shell.send(b'stty tostop\n');shell.expect(shell.prompt)
                 f.resume.clear();f.stalled.clear();f.stalled_oids={f.blob}
                 runner_file=f.root/f'tostop-runner-{selection}'
-                argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"print('child-completed')"]
+                argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"import sys,termios;assert termios.tcgetattr(0)[3]&termios.ECHO;assert sys.stdin.readline()=='typed-ahead\\n';print('child-completed')"]
                 shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
                 try:
                     self.assertTrue(f.stalled.wait(10),'native fetch did not reach controlled TTY stall')
                     runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
                     shell.groups.update((runner,foreground))
-                    self.assertNotEqual(foreground,runner,'native Git never received terminal foreground ownership')
+                    self.assertEqual(foreground,runner,'native Git took the terminal from git-on')
                     self.assertEqual(os.getsid(runner),shell.pid)
+                    shell.send(b'typed-')
                     deadline=time.monotonic()+1.3
                     while time.monotonic()<deadline:
                         shell.read()
                         if native_job_control.state(runner)=='T':break
                     self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
+                    self.assertGreaterEqual(shell.transcript.count(b'Preparing snapshot'),2,'native Git wait hid the animation')
+                    shell.send(b'ahead\n')
+                    deadline=time.monotonic()+.2
+                    while time.monotonic()<deadline:shell.read()
                     f.resume.set()
                     output=shell.expect(shell.prompt,timeout=15)
                     self.assertIn(b'STATUS:0',output)
                     visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
                     self.assertIn(b'child-completed',visible.splitlines())
+                    self.assertNotIn(b'Preparing snapshot',output[output.rindex(b'child-completed'):])
+                    self.assertNotRegex(output,rb'Preparing snapshot[^\x1b]*\n','typeahead left an indicator line on screen')
                     self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
                     self.assertEqual(list(f.root.glob('git-on-*')),[])
                     shell.groups.clear()

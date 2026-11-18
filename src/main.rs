@@ -392,6 +392,7 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 fn execute(
+    invoked: Instant,
     tree: OsString,
     args: Vec<OsString>,
     source: Option<OsString>,
@@ -399,6 +400,7 @@ fn execute(
     write_policy: git_on::policy::WritePolicy,
 ) -> Result<ExitStatus> {
     let mut signals = subscribe_signals()?;
+    let mut progress = git_on::terminal_ui::StartupProgress::start(invoked)?;
     if let Some(signal) = git_on::git::cancelled_signal() {
         return Ok(ExitStatus::from_raw(signal));
     }
@@ -513,6 +515,7 @@ fn execute(
             });
         }
 
+        progress.finish();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -559,6 +562,7 @@ fn execute(
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })();
+    progress.finish();
     // Also cover errors before the child could start. State inspection below
     // must never wait behind an owned operation that the run no longer needs.
     git_on::git::stop_operations();
@@ -652,6 +656,10 @@ fn handle_file_size_errors() -> std::io::Result<()> {
     Ok(())
 }
 fn main() {
+    let invoked = Instant::now();
+    if let Some(status) = git_on::terminal_ui::invoke_askpass() {
+        std::process::exit(status);
+    }
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = (|| -> Result<ExitStatus> {
         // main has not created signal handlers, worker threads or Git handles.
@@ -663,6 +671,7 @@ fn main() {
                 Ok(ExitStatus::from_raw(0))
             }
             Ok(cli::Invocation::Run(run)) => execute(
+                invoked,
                 run.tree,
                 run.command.to_vec(),
                 run.repository,

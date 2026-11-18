@@ -332,7 +332,7 @@ impl Remote {
                 .env("GIT_SSH_COMMAND", text)
                 .env("GIT_SSH_VARIANT", "ssh");
         }
-        if !initial {
+        if !(initial || crate::terminal_ui::preparing() && crate::terminal_ui::owns_terminal()) {
             command
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env("GIT_ASKPASS", "/bin/false")
@@ -528,6 +528,7 @@ impl Remote {
             // the original failure even when later demands retry that operation.
             if !crate::object::is_cancelled(error) && self.failure().is_none() {
                 self.failed = Some(format!("{error:#}"));
+                let _drawing = crate::terminal_ui::native_terminal_lease(true);
                 eprintln!("git-on: remote object loading failed: {error:#}");
             }
         }
@@ -1138,6 +1139,7 @@ impl Remote {
 impl Drop for Remote {
     fn drop(&mut self) {
         if let Err(error) = self.stop_transport() {
+            let _drawing = crate::terminal_ui::native_terminal_lease(true);
             eprintln!("git-on: owned SSH shutdown failed: {error:#}");
         }
     }
