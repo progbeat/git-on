@@ -5,6 +5,20 @@ implementation generic: application-specific Python/uv/Numba examples are not
 filesystem exceptions. Preserve the complete FUSE-operation coverage matrix and
 its guard whenever callbacks or tests change.
 
+Keep documentation self-contained: specifications define behavior and decision
+records explain decisions. Do not refer to external issues or conversation
+context to define requirements or behavior.
+
+Limit behavioral changes to those required by the task. Keep unrelated behavior
+unchanged. Minimize tests: use focused cases and small shared fixtures instead of
+redundant or unnecessarily expensive scenarios.
+
+Before committing, obtain a cold preliminary review with standard instructions,
+without implementation hints. Fix findings and repeat until it passes. After
+publishing the commit, obtain a separate cold review of the actual PR, emphasizing
+regressions and test minimality. Findings restart this cycle. Deliver a
+ready-to-merge PR; do not merge it without an explicit request.
+
 docs/interview.md records the author's intent; keep the implementation consistent
 with it. Read the project documentation and interview before asking questions.
 If the documentation leaves a material ambiguity about the author's intent or

@@ -203,7 +203,7 @@ The published registry fuser 0.18.0 owns Linux protocol handling and backing
 registration. Its locked checksum and unchanged reviewed Filesystem trait are
 checked above; no local fork or FUSE protocol implementation is shipped.
 `src/backend/linux.rs` converts typed callbacks into the shared Overlay engine.
-macOS mounts are deferred to issue #12. Mac CLI/materialization tests do not
+macOS mounts are not supported. Mac CLI/materialization tests do not
 establish FUSE mount behavior.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and

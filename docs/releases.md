@@ -166,5 +166,5 @@ cargo install --path . --locked
 ```
 
 Mac builds require no FUSE framework or extension: they support startup and
-explicit-all materialization. Native mounts remain deferred to issue #12.
+explicit-all materialization. Native mounts are not supported on macOS.
 Linux uses registry fuser 0.18 with no vendored fork.

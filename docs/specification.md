@@ -145,11 +145,13 @@ The same FUSE and write-policy contract below applies to local and remote runs.
 
 ## Backend selection and materialization
 
+[Startup indication](startup-indication.md) defines progress display, terminal
+ownership, and clearing before command execution.
+
 Linux FUSE is preferred whenever available and capable of the requested behavior.
 Missing kernel passthrough is only an optimization limitation and retains
 ordinary FUSE I/O. Before launching the child, discovery identifies absent or
-inaccessible `/dev/fuse` or `fusermount3`. macOS mounts are outside 1.3.0 and are
-tracked by [issue #12](https://github.com/progbeat/git-on/issues/12); the Mac CLI
+inaccessible `/dev/fuse` or `fusermount3`. macOS mounts are outside 1.3.0; the Mac CLI
 reports this concrete capability limitation without probing or activating an
 extension. Only explicit `--write-policy=all` permits an ordinary private-directory
 backend in these cases. Other mount failures remain errors. Never rerun a command
@@ -242,8 +244,7 @@ checkout or a complete in-memory copy of the selected tree.
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
 
-The explicit [interview acceptance contract](interview.md#interview) is mandatory
-for [issue #20](https://github.com/progbeat/git-on/issues/20):
+The explicit [interview acceptance contract](interview.md#interview) is mandatory:
 
 T_git_on <= T_materialize_same_revision + T_same_command_direct + O(N).
 

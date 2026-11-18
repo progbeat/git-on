@@ -8,8 +8,7 @@ registry fuser0.18.0, without a fork or vendored source. A usable `/dev/fuse` an
 
 macOS13+ supports CLI startup and explicitly selected `--write-policy=all`
 materialization. Default `ignored`, `untracked` and `none` policies fail clearly:
-1.3.0 provides no supporting Mac mount backend. macOS mounts are deferred to
-[issue #12](https://github.com/progbeat/git-on/issues/12), which remains open outside
+1.3.0 provides no supporting Mac mount backend. macOS mounts are deferred beyond
 this milestone. No FSKit/macFUSE adapter, app bundle, activation or security change
 is part of this release. The same console installer installs the CLI binary.
 
