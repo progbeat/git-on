@@ -86,9 +86,8 @@ checks foreground/process groups, and verifies completion and Ctrl-C cleanup.
 It fails unsigned native verification after authentication and needs no mount.
 The real-FUSE job always runs the SSH argument-boundary, ignore-acquisition
 errno and native job-control regressions. Optional `--before-*` arguments replay
-authentic historical executables; their red-before evidence is recorded in
-[review regressions](../docs/review-regressions.md), without rebuilding known
-failing binaries on every push.
+authentic historical executables without rebuilding known failing binaries on
+every push.
 SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
 retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
