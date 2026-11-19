@@ -148,3 +148,15 @@ should be retained for startup indication?
 
 **Answer:** I meant not to change behavior if the change does not follow from
 the task specification.
+
+**Question:** Should the indication contain only color and animation without
+text, or should it have one short caption? The choices are a colored animation
+without text, or an animation with a short `Loading…` caption. Neither variant
+lists internal stages, and both disappear completely before the command.
+
+**Answer:** Look at how `uv run` works. Does `uv run` show a stupid and useless
+`Loading…`? Or `git clone`? Make it show information like `git clone`, but in a
+more modern style.
+
+**Performance clarification:** A remaining preparation-time difference of about
+30% compared with a full `git clone` is not critical.

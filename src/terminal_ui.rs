@@ -1,6 +1,8 @@
 //! Preparation owns terminal rendering and standard Git/SSH prompt requests.
 use anyhow::Result;
+mod progress;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+pub(crate) use progress::{diagnostics as progress_diagnostics, NativeProgress};
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
@@ -34,6 +36,7 @@ const ENVIRONMENT: [&str; 5] = [
 ];
 static DIRECTORY_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PREPARING: AtomicBool = AtomicBool::new(false);
+static VISIBLE: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DRAW: Mutex<Option<ProgressBar>> = Mutex::new(None);
 static NATIVE: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
@@ -86,6 +89,14 @@ type Environment = Vec<Option<Vec<u8>>>;
 pub(crate) fn preparing() -> bool {
     PREPARING.load(Ordering::Acquire)
 }
+pub(crate) fn progress_enabled() -> bool {
+    preparing() && VISIBLE.load(Ordering::Relaxed)
+}
+pub(crate) fn configure_fetch(command: &mut Command) {
+    if progress_enabled() {
+        command.arg("--progress");
+    }
+}
 pub(crate) fn owns_terminal() -> bool {
     DIRECTORY_PATH.get().is_some()
 }
@@ -118,7 +129,7 @@ pub struct StartupProgress {
     _directory: Option<tempfile::TempDir>,
 }
 impl StartupProgress {
-    pub fn start(invoked: Instant) -> Result<Self> {
+    pub fn start(invoked: Instant, revision: &OsStr) -> Result<Self> {
         PREPARING.store(true, Ordering::Release);
         let tty = OpenOptions::new()
             .read(true)
@@ -160,6 +171,8 @@ impl StartupProgress {
         let stopping = stop.clone();
         let visible = std::io::stderr().is_terminal()
             && std::env::var_os("TERM").is_none_or(|term| term != "dumb");
+        VISIBLE.store(visible, Ordering::Relaxed);
+        let revision = progress::display(&revision.to_string_lossy());
         if !visible && listener.is_none() {
             return Ok(Self {
                 stop,
@@ -202,13 +215,38 @@ impl StartupProgress {
                                 let _ = std::io::stderr().write_all(b"\r");
                                 let bar = ProgressBar::new_spinner();
                                 bar.set_style(
-                                    ProgressStyle::with_template("{spinner:.cyan} {msg:.bold}")
+                                    ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}")
                                         .expect("static progress template")
                                         .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
                                 );
-                                bar.set_message("Preparing snapshot");
                                 bar
                             });
+                            let report = progress::current();
+                            let counts = report.as_ref().and_then(|report| report.counts);
+                            if bar.length().is_some() != counts.is_some() {
+                                let template = if counts.is_some() {
+                                    "{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}\n  {wide_bar:.green/dim} {percent}% {pos}/{len}"
+                                } else {
+                                    "{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}"
+                                };
+                                bar.set_style(ProgressStyle::with_template(template).expect("static progress template").tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ").progress_chars("━╸─"));
+                            }
+                            if let Some((position, total)) = counts {
+                                bar.set_length(total);
+                                bar.set_position(position);
+                            } else {
+                                bar.unset_length();
+                            }
+                            let (label, detail) = report.map_or_else(
+                                || ("git on".into(), revision.clone()),
+                                |report| (report.label, report.detail),
+                            );
+                            if bar.prefix() != label {
+                                bar.set_prefix(label);
+                            }
+                            if bar.message() != detail {
+                                bar.set_message(detail);
+                            }
                             bar.tick();
                         } else {
                             clear(&mut drawing);

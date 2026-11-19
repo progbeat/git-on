@@ -1,6 +1,9 @@
 # 1.4.2
 <!-- Bump: patch -->
 
-- Show preparation activity with a smooth Unicode dot spinner, a cyan accent
-  and a bold status label. Respect disabled terminal colors, including
-  `NO_COLOR` and `CLICOLOR=0`.
+- Show live Git object counts, received bytes, transfer speed and pack progress
+  in a highlighted terminal display that clears before the command starts.
+  Respect disabled colors and keep redirected output free of progress text.
+- Fetch remote materialized snapshots in one shallow transfer instead of
+  repeated directory and object fetches. Keep lazy execution demand driven
+  and preserve bounded transfers under finite per-file resource limits.

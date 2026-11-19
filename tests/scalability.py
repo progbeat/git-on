@@ -173,7 +173,8 @@ def fixture(f,count,key):
 
 
 def expected_demands(info,backend,workload):
-    if backend=='materialized' or workload=='full':return set(info['git_objects'])
+    if backend=='materialized':return {info['commit']}
+    if workload=='full':return set(info['git_objects'])
     if workload=='enumerate':return set(info['namespace_objects'])
     if workload=='sparse':return set(info['sparse_objects'])
     return {info['commit'],info['tree']}

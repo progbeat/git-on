@@ -11,9 +11,15 @@ Git-on displays temporary progress while preparing the requested command.
   remote operations and network waits, verification, and snapshot preparation.
 - Display it in the terminal's text area beside the command text, not in the
   terminal title.
-- Use a smooth Unicode dot spinner with a cyan accent and a bold status label.
-  When terminal colors are disabled, display the spinner and label without
-  highlighting.
+- Show useful Git transfer information as it becomes available: object counts,
+  received bytes, transfer speed and pack processing. Use actual reported
+  counts and a progress bar when the total is known. Do not invent percentages
+  or replace these details with a generic loading message.
+- While no transfer measurements are available, animate beside the requested
+  revision. Do not create a sequence of status labels for brief internal calls.
+- Use Unicode animation, highlighted labels and a colored progress bar. Respect
+  disabled terminal colors. Fit revision details to the terminal's column
+  width and escape embedded terminal controls.
 - Display progress only on a TTY. Do not write indicator text or terminal
   control sequences to a redirected or non-TTY output stream.
 - Keep startup shorter than 0.5 seconds silent. Successful preparation produces

@@ -115,6 +115,7 @@ class ScalabilityHarnessTests(unittest.TestCase):
             self.assertEqual(len(info['payload_objects']),16)
             self.assertEqual(len(expected_demands(info,'fuse','noop')),2)
             self.assertEqual(len(expected_demands(info,'fuse','sparse')),4)
+            self.assertEqual(expected_demands(info,'materialized','full'),{info['commit']})
             clone=f.root/'clone'
             subprocess.run(['git','clone','--quiet',str(f.repo),str(clone)],env=f.env,check=True)
             def child(mode):return subprocess.run([sys.executable,'-c',CHILD,mode,'1000',json.dumps(info['fanouts'])],cwd=clone,env=f.env,capture_output=True)

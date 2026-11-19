@@ -160,6 +160,15 @@ pub struct Remote {
 }
 impl Remote {
     pub fn open(cwd: &Path, source: &OsStr, revision: &OsStr, run: &Path) -> Result<(Self, Oid)> {
+        Self::open_for_execution(cwd, source, revision, run, false)
+    }
+    pub(crate) fn open_for_execution(
+        cwd: &Path,
+        source: &OsStr,
+        revision: &OsStr,
+        run: &Path,
+        materialized: bool,
+    ) -> Result<(Self, Oid)> {
         // Capture effective configuration first: even `git --version` can read
         // it. Preserve the first native operation's cancellation/TTY lifecycle.
         let git = Git::capture(cwd).map_err(|error| {
@@ -246,11 +255,20 @@ impl Remote {
             ssh,
             control_client,
             failed: None,
-            materializing: false,
+            // Eager execution needs the whole selected tree. Keep its blobs
+            // compressed until decoding directly into their final paths.
+            // Finite per-file limits retain individual-object transfers.
+            materializing: materialized && crate::spool::Files::size_limit()?.is_none(),
             received_blobs: HashMap::new(),
             active_materialized_pack: None,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
+        if remote.materializing {
+            // The explicit eager backend needs all payloads, so it does not
+            // depend on server-side filtering or a separate capability probe.
+            let oid = remote.fetch_selected(revision, true)?;
+            return Ok((remote, oid));
+        }
         // Authentication and host-key interaction happen here, before mounting.
         let capabilities = tempfile::NamedTempFile::new_in(run)?;
         let mut command = remote.command(true)?;
@@ -287,7 +305,7 @@ impl Remote {
             bail!("remote server does not advertise object filtering; full-clone fallback is forbidden");
         }
         remote.failed = None;
-        let oid = remote.fetch_selected(revision)?;
+        let oid = remote.fetch_selected(revision, false)?;
         Ok((remote, oid))
     }
     fn command(&self, initial: bool) -> Result<Command> {
@@ -340,18 +358,34 @@ impl Remote {
         }
         Ok(command)
     }
-    fn fetch_selected(&mut self, revision: &OsStr) -> Result<Oid> {
+    fn fetch_selected(&mut self, revision: &OsStr, initial: bool) -> Result<Oid> {
         // A fetch refspec belongs to native Git, including its leading '+',
         // namespace abbreviation and destination. All resulting refs and
         // FETCH_HEAD live in this owned bare repository, never in the caller.
-        let mut command = self.command(false)?;
+        let mut command = self.command(initial)?;
+        command.args(["fetch", "--no-tags", "--depth=1"]);
+        if self.materializing {
+            // Prevent small eager transfers from becoming a second decoded
+            // loose-object copy before final-path materialization.
+            command.arg("--keep");
+        }
+        command.arg(if self.materializing {
+            "--no-filter"
+        } else {
+            "--filter=tree:0"
+        });
+        crate::terminal_ui::configure_fetch(&mut command);
         command
-            .args(["fetch", "--no-tags", "--depth=1", "--filter=tree:0"])
             .arg("--")
             .arg(&self.source)
             .arg(revision)
             .stdin(Stdio::null());
-        let out = crate::git::run(command, true).context("fetch selected remote revision")?;
+        let outcome =
+            crate::git::run_fetch(command, None).context("fetch selected remote revision");
+        if initial {
+            self.record_socket_owner()?;
+        }
+        let out = outcome?;
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
             bail!(
@@ -359,6 +393,9 @@ impl Remote {
                 error.trim(),
                 authentication_advice(&error, self.https_alternative.as_deref())
             );
+        }
+        if initial && self.socket.is_some() && self.socket_owner.is_none() {
+            bail!("OpenSSH did not create the owned control socket");
         }
         if error.contains("filtering not recognized") || error.contains("filter capability") {
             bail!(
@@ -381,7 +418,11 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
-        self.import_received(true, &[oid])?;
+        if self.materializing {
+            self.stage_materialization()?;
+        } else {
+            self.import_received(true, &[oid])?;
+        }
         let repo = Repository::open_bare(&self.dir)?;
         if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
             bail!("native Git fetch did not supply selected object {oid}");
@@ -551,6 +592,7 @@ impl Remote {
             "--depth=1",
             "--filter=tree:0",
         ]);
+        crate::terminal_ui::configure_fetch(&mut command);
         let mut requests = Vec::new();
         if oids.len() == 1 {
             command
@@ -565,9 +607,9 @@ impl Remote {
             command.arg("--stdin").arg("--").arg(&self.source);
         }
         let output = if requests.is_empty() {
-            crate::git::run(command, true)
+            crate::git::run_fetch(command, None)
         } else {
-            crate::git::run_with_input(command, true, requests.as_slice())
+            crate::git::run_fetch(command, Some(&mut requests.as_slice()))
         };
         let out = match output {
             Ok(out) => out,

@@ -25,9 +25,11 @@ import ssl
 import sys
 import subprocess
 import tempfile
+import termios
 import threading
 import time
 import unittest
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser()
@@ -51,6 +53,30 @@ def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
+
+def terminal_lines(transcript,columns=80):
+    """Replay the cursor movement and line erasure used by the terminal UI."""
+    rows=[[]];row=column=0
+    for token in re.finditer(r'\x1b\[([0-?]*)[ -/]*([@-~])|([^\x1b])',transcript.decode('utf-8',errors='replace')):
+        parameters,control,character=token.groups()
+        if control:
+            number=int(parameters or '0') if (parameters or '0').isdigit() else 0
+            if control=='A':row=max(0,row-(number or 1))
+            elif control=='B':row+=number or 1
+            elif control=='K':
+                if number==2:rows[row]=[]
+                elif number==0:rows[row]=rows[row][:column]
+            while row>=len(rows):rows.append([])
+        elif character=='\r':column=0
+        elif character=='\n':row+=1
+        elif character=='\b':column=max(0,column-1)
+        elif ord(character)>=32:
+            if column>=columns:row+=1;column=0
+            while row>=len(rows):rows.append([])
+            while len(rows[row])<=column:rows[row].append(' ')
+            rows[row][column]=character;column+=1
+        while row>=len(rows):rows.append([])
+    return '\n'.join(''.join(line).rstrip() for line in rows)
 
 def git_on_environment(binary, environment, tools):
     # Git dispatches by the git-on basename even when --binary names an artifact.
@@ -88,6 +114,7 @@ class Fixture:
         self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', XDG_CACHE_HOME=str(self.root / 'cache'), TMPDIR=str(self.root), LC_ALL='C')
         self.git('init', '--bare', '--quiet', str(self.repo), at=self.root)
         self.git('config', 'uploadpack.allowFilter', 'true')
+        self.git('config', 'uploadpackfilter.tree.maxDepth', '0')
         self.git('config', 'uploadpack.allowAnySHA1InWant', 'true')
         self.git('config', 'http.uploadpack', 'true')
         self.git('config', 'user.name', 'Disposable Fixture')
@@ -120,7 +147,7 @@ class Fixture:
                 except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=5)
         for handle in self.handles: handle.close()
         self.temp.cleanup()
-    def https(self, authorization=None):
+    def https(self, authorization=None, transfer_delay=0):
         key, cert = self.root/'tls.key', self.root/'tls.crt'
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert])
         backend = Path(run(['git', '--exec-path']).decode().strip()) / 'git-http-backend'
@@ -164,7 +191,11 @@ class Fixture:
                 try:
                     self.send_response(status)
                     for name, value in fields: self.send_header(name, value)
-                    self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                    self.send_header('Content-Length', str(len(body))); self.end_headers()
+                    if transfer_delay and wants:
+                        for offset in range(0,len(body),8192):
+                            self.wfile.write(body[offset:offset+8192]);self.wfile.flush();time.sleep(transfer_delay)
+                    else:self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
                     # A cancellation regression deliberately closes the client
                     # before the held server request can send its response.
@@ -1381,8 +1412,39 @@ print('caught-EIO-and-returned-success')
         self.assertFalse((f.root/'cache').exists())
         print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*object_mib*1024*1024,metrics=last['metrics'])),flush=True)
 
+    def test_materialized_remote_fetches_the_selected_tree_once(self):
+        f=self.f;entries=[]
+        for index in range(12):
+            blob=f.git('hash-object','-w','--stdin',data=f'file {index}\n'.encode())
+            tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+            entries.append(f'040000 tree {tree}\td{index}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        ancestor=f.commit
+        commit=f.git('commit-tree',tree,'-p',ancestor,data=b'materialization transfer regression\n')
+        f.git('update-ref','refs/heads/main',commit)
+        url=f.https();self.addCleanup(f.server.shutdown)
+        tools=f.root/'single-transfer-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
+        code=("import os,subprocess; from pathlib import Path; "
+              "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(12)); "
+              f"assert subprocess.run(['git','--git-dir',str(Path.cwd().parent/'remote-repository'),'cat-file','-e',{ancestor!r}],"
+              "env=dict(os.environ,GIT_NO_LAZY_FETCH='1'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0; "
+              "print('verified')")
+        result=subprocess.run([str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',code],
+                              cwd=f.cwd,env=dict(f.env,PATH=str(tools)),capture_output=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,b'verified\n')
+        self.assertEqual([request['wants'] for request in f.requests if request['wants']],[[commit]],
+                         'eager preparation performs separate directory/object fetches')
+        self.assertEqual(list(f.root.glob('git-on-*')),[])
+
     def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
-        f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
+        f=self.f
+        revision=':/progress-\x1b'+'界'*60
+        blob=f.git('hash-object','-w','--stdin',data=random.Random(16).randbytes(512*1024))
+        tree=f.git('mktree',data=f'100644 blob {blob}\tpayload\n'.encode())
+        f.commit=f.git('commit-tree',tree,data=(revision[2:]+'\n').encode())
+        f.git('update-ref','refs/heads/main',f.commit)
+        url=f.https(transfer_delay=.04);self.addCleanup(f.server.shutdown)
         tools=f.root/'startup-tools';tools.mkdir()
         entered=f.root/'git-entered';release=f.root/'git-release'
         wrapper=tools/'git'
@@ -1398,7 +1460,8 @@ print('caught-EIO-and-returned-success')
                 if phase=='initial-fetch':release.touch()
                 f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
                 master,slave=pty.openpty();self.addCleanup(os.close,master)
-                operands=['HEAD'] if phase=='local-resolution' else [url,'HEAD']
+                termios.tcsetwinsize(slave,(24,48))
+                operands=[revision] if phase=='local-resolution' else [url,'HEAD']
                 started=time.monotonic()
                 process=subprocess.Popen([str(OPTIONS.binary),*operands,'--write-policy=all','--',
                                           sys.executable,'-c',"import sys;sys.stderr.write('COMMAND-START\\n');print('command-output')"],
@@ -1409,17 +1472,25 @@ print('caught-EIO-and-returned-success')
                     while time.monotonic()-started<.25:
                         if terminal and select.select([master],[],[],.01)[0]:transcript.extend(os.read(master,65536))
                         elif not terminal:time.sleep(.01)
-                    self.assertNotIn(b'Preparing snapshot',transcript,'indicator appeared before its delay')
+                    self.assertNotIn(b'git on',transcript,'indicator appeared before its delay')
                     if phase=='local-resolution':self.assertTrue(entered.exists(),'first Git invocation did not start')
                     else:self.assertTrue(f.stalled.wait(10),'initial fetch did not reach its controlled stall')
                     if terminal:
                         deadline=started+4
-                        while transcript.count(b'Preparing snapshot')<2 and time.monotonic()<deadline:
+                        while transcript.count(b'git on')<2 and time.monotonic()<deadline:
                             if select.select([master],[],[],.05)[0]:transcript.extend(os.read(master,65536))
-                        self.assertGreaterEqual(transcript.count(b'Preparing snapshot'),2,'preparation wait hid the animation')
+                        self.assertGreaterEqual(transcript.count(b'git on'),2,'preparation wait hid the animation')
                     else:time.sleep(.6)
                 finally:
                     release.touch();f.resume.set()
+                if terminal:
+                    deadline=time.monotonic()+20
+                    while process.poll() is None and time.monotonic()<deadline:
+                        if select.select([master],[],[],.05)[0]:
+                            try:transcript.extend(os.read(master,65536))
+                            except OSError as error:
+                                if error.errno==errno.EIO:break
+                                raise
                 output,errors=process.communicate(timeout=20)
                 while select.select([master],[],[],.05)[0]:
                     try:chunk=os.read(master,65536)
@@ -1435,8 +1506,18 @@ print('caught-EIO-and-returned-success')
                     self.assertGreaterEqual(len(set(frames)),2,'indicator did not animate Unicode dots')
                     if color.get('NO_COLOR'):self.assertNotRegex(transcript,rb'\x1b\[[0-9;]*m')
                     else:self.assertIn(b'\x1b[36m',transcript,'TTY indicator has no color accent')
+                    visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',transcript)
+                    if phase=='initial-fetch':
+                        self.assertIn(b'Receiving objects',visible)
+                        self.assertRegex(visible,rb'\d+/\d+','status omits Git object counts')
+                        self.assertRegex(visible,rb'[KM]iB/s','status omits actual transfer speed')
+                        self.assertIn('━'.encode(),transcript,'status has no progress bar')
+                    else:
+                        self.assertIn(b':/progress-\\u{1b}',visible,'revision is missing or its controls are not escaped')
+                        frames=visible.split(b'COMMAND-START')[0].decode('utf-8').split('\r')
+                        self.assertLessEqual(max(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in frame) for frame in frames),48)
                     self.assertLess(transcript.rfind(b'\x1b[2K'),transcript.index(b'COMMAND-START'))
-                    self.assertNotIn(b'Preparing snapshot',transcript[transcript.index(b'COMMAND-START'):])
+                    self.assertNotIn(b'git on',transcript[transcript.index(b'COMMAND-START'):])
                 else:self.assertEqual(errors,b'COMMAND-START\n')
                 self.assertEqual(list(f.root.glob('git-on-*')),[])
 
@@ -1453,7 +1534,7 @@ print('caught-EIO-and-returned-success')
                 tools=f.root/f'tostop-{selection}';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
                 shell=native_job_control.Shell(f);self.addCleanup(shell.close)
                 shell.send(b'stty tostop\n');shell.expect(shell.prompt)
-                f.resume.clear();f.stalled.clear();f.stalled_oids={f.blob}
+                f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
                 runner_file=f.root/f'tostop-runner-{selection}'
                 argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"import sys,termios;assert termios.tcgetattr(0)[3]&termios.ECHO;assert sys.stdin.readline()=='typed-ahead\\n';print('child-completed')"]
                 shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
@@ -1469,7 +1550,7 @@ print('caught-EIO-and-returned-success')
                         shell.read()
                         if native_job_control.state(runner)=='T':break
                     self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
-                    self.assertGreaterEqual(shell.transcript.count(b'Preparing snapshot'),2,'native Git wait hid the animation')
+                    self.assertGreaterEqual(shell.transcript.count(b'git on'),2,'native Git wait hid the animation')
                     shell.send(b'ahead\n')
                     deadline=time.monotonic()+.2
                     while time.monotonic()<deadline:shell.read()
@@ -1478,8 +1559,10 @@ print('caught-EIO-and-returned-success')
                     self.assertIn(b'STATUS:0',output)
                     visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
                     self.assertIn(b'child-completed',visible.splitlines())
-                    self.assertNotIn(b'Preparing snapshot',output[output.rindex(b'child-completed'):])
-                    self.assertNotRegex(output,rb'Preparing snapshot[^\x1b]*\n','typeahead left an indicator line on screen')
+                    self.assertNotIn(b'git on',output[output.rindex(b'child-completed'):])
+                    screen=terminal_lines(output)
+                    for artifact in ('git on HEAD','Receiving objects','Compressing objects','━'):
+                        self.assertNotIn(artifact,screen,'preparation left an indicator on screen')
                     self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
                     self.assertEqual(list(f.root.glob('git-on-*')),[])
                     shell.groups.clear()
@@ -1490,7 +1573,7 @@ print('caught-EIO-and-returned-success')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         programs=f.root/'progress-tools'; programs.mkdir(); (programs/'git').symlink_to(shutil.which('git'))
         env=dict(f.env,PATH=str(programs),TERM='xterm')
-        f.stalled_oids={f.blob}
+        f.stalled_oids={f.commit}
         for outcome in ('success','error','cancel'):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(f.root/'cache',ignore_errors=True)
@@ -1502,11 +1585,11 @@ print('caught-EIO-and-returned-success')
                 os.close(slave); f.children.append(process)
                 self.assertTrue(f.stalled.wait(10),'materialization never reached controlled object stall')
                 transcript=bytearray(); deadline=time.monotonic()+5
-                while b'Preparing snapshot' not in transcript and time.monotonic()<deadline:
+                while b'git on' not in transcript and time.monotonic()<deadline:
                     if select.select([master],[],[],.1)[0]: transcript.extend(os.read(master,65536))
-                self.assertIn(b'Preparing snapshot',transcript)
+                self.assertIn(b'git on',transcript)
                 self.assertNotIn(b'CHILD-START',transcript)
-                if outcome=='error': f.denied_oids={f.blob}
+                if outcome=='error': f.denied_oids={f.commit}
                 if outcome=='cancel': process.send_signal(signal.SIGTERM)
                 f.resume.set()
                 output,_=process.communicate(timeout=20)
@@ -1525,7 +1608,7 @@ print('caught-EIO-and-returned-success')
                 else:
                     self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
                     self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
-                    if outcome=='error': self.assertIn(b'fetch of exact object',transcript)
+                    if outcome=='error': self.assertIn(b'native Git fetch failed',transcript)
                 self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')

@@ -2505,3 +2505,41 @@ permanent `test_forced_askpass_failure_does_not_fall_back_to_terminal` compares
 both cases with native Git. Both replacement-renderer cases previously hung at
 a terminal passphrase prompt; both now fail authentication without prompting.
 Permission-only askpass requests also retain OpenSSH's display/require policy.
+
+## Remote materialization transfers and terminal progress
+
+`RemoteTests.test_materialized_remote_fetches_the_selected_tree_once` prepares
+twelve distinct directories and verifies their complete contents. The previous
+materializer issued fifteen object-transfer requests; the regression fails on
+that request list. The optimized eager backend requests the selected revision
+once, retains its compressed pack and passes the same content and cleanup
+checks. Existing finite-file-size tests cover the bounded-transfer path.
+
+The existing startup PTY test now slows a real Git pack transfer rather than
+accepting animation alone. It requires object counts, transfer speed and a
+progress bar, plus non-TTY silence, disabled colors and clearing before the
+command. Its local-resolution case includes an escaped terminal control and a
+long wide-character revision in a 48-column terminal. Disabling Unicode-width
+support caused contextual status to exceed that width; the retained width
+assertion uses terminal columns rather than character count.
+
+The TOSTOP/typeahead test replays cursor movement and line erasure to check the
+final screen after both single-line and multiline statuses. The native-progress
+unit test additionally checks bounded partial lines and proves that reading
+progress does not move the native process's shared capture-file write offset.
+
+The existing forced-askpass rejection test also exercises eager SSH startup.
+An early control-socket check masked the native authentication failure with
+`OpenSSH did not create the owned control socket`. The retained materialized
+case fails against that implementation and passes after native Git's failure
+is reported first, preserving its `Permission denied` diagnostic.
+
+Single-transfer materialization initially failed the existing object-reuse,
+repository-scale and repeated-credential acceptance checks: their expectations
+still described separate transfers. The object-reuse validator now requires one
+fetch and only actual streamed blob decoder processes; it still checks exact
+bytes, two application passes, one decode per blob and native command counts.
+Scale evidence requires only the selected commit in eager request wants while
+the child still validates the complete namespace and contents. The existing
+repeated-credential case uses a finite per-file limit to retain its multiple
+authentication requests and foreground-terminal assertions.

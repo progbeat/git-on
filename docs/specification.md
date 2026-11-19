@@ -168,6 +168,12 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset, not protected FUSE policies.
 The lazy startup/performance requirements below apply to the FUSE backend.
 
+Remote materialization obtains the selected revision in one shallow transfer
+when host per-file limits permit it. It must not pay a separate network round
+trip for each directory. Compressed objects are decoded into their final paths;
+already prepared contents are reused for repeated OIDs. Finite per-file limits
+retain bounded transfers rather than creating a pack that exceeds that limit.
+
 ## FUSE operation coverage requirement
 
 Every callback in the locked `fuser::Filesystem` trait must have an explicit,
