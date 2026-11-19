@@ -313,6 +313,7 @@ pub(crate) struct Metrics {
     pub(crate) bytes: u64,
     pub(crate) streamed_packs: u64,
     pub(crate) prefetches: u64,
+    pub(crate) prefetched_blobs: u64,
 }
 
 #[derive(Default)]
@@ -328,6 +329,7 @@ struct Shared {
     bytes: AtomicU64,
     streamed_packs: AtomicU64,
     prefetches: AtomicU64,
+    prefetched_blobs: AtomicU64,
 }
 
 struct Http2Batch {
@@ -527,6 +529,7 @@ impl Pool {
             bytes: s.bytes.load(Ordering::Relaxed),
             streamed_packs: s.streamed_packs.load(Ordering::Relaxed),
             prefetches: s.prefetches.load(Ordering::Relaxed),
+            prefetched_blobs: s.prefetched_blobs.load(Ordering::Relaxed),
         }
     }
 
@@ -598,6 +601,9 @@ impl Shared {
                     .1;
                 let acquired = if object.kind() == git2::ObjectType::Blob {
                     cache.insert_verified_blob(&object)?;
+                    if speculative {
+                        shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+                    }
                     Acquired::Stored
                 } else {
                     anyhow::ensure!(!speculative, "prefetched object is not a blob");
@@ -666,6 +672,9 @@ impl Shared {
             } else {
                 let object = odb.read(item.oid)?;
                 cache.insert_prefetched_odb_blob(item.oid, &object)?;
+            }
+            if work.speculative {
+                self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
             }
             self.oids.fetch_add(1, Ordering::Relaxed);
             item.demand

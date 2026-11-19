@@ -1453,9 +1453,9 @@ impl Remote {
     pub(crate) fn completed_fetches(&self) -> u64 {
         self.completed_fetches + self.pool_metrics().oids
     }
-    pub(crate) fn response_metrics(&self) -> (u64, u64) {
+    pub(crate) fn response_metrics(&self) -> (u64, u64, u64) {
         let pool = self.pool_metrics();
-        (pool.streamed_packs, pool.prefetches)
+        (pool.streamed_packs, pool.prefetches, pool.prefetched_blobs)
     }
     pub(crate) fn fetch_operations(&self) -> u64 {
         self.fetch_operations

@@ -33,7 +33,6 @@ DEMAND_LIMITS = dict(tree_reads=32, prepared_tree_entries=4096, header_reads=128
     blob_loads=128, blob_bytes=1024*1024, remote_raw_blob_imports=128,
     remote_raw_blob_bytes=1024*1024)
 PACK_LIMIT = 1024*1024
-PREFETCH_WANTS = 4
 
 
 def command():
@@ -103,9 +102,13 @@ def validate_reports(data, head):
     if not 0 < received <= PACK_LIMIT:
         raise ValueError('public command transferred too much source data')
     prefetches = metrics.get('remote_prefetch_packs')
+    prefetched_blobs = metrics.get('remote_prefetched_blobs')
     surplus = metrics['remote_raw_blob_imports'] - metrics['blob_loads']
+    # Adaptive packs carry different counts. Verified blobs can also become
+    # available before a speculative pack finishes.
     if (type(prefetches) is not int or prefetches < 0
-            or not 0 <= surplus <= PREFETCH_WANTS * prefetches
+            or type(prefetched_blobs) is not int
+            or not 0 <= surplus <= prefetched_blobs <= metrics['remote_raw_blob_imports']
             or not 0 < metrics['blob_loads']
             or not 0 < metrics['blob_bytes'] <= metrics['remote_raw_blob_bytes']
             or (not surplus and metrics['blob_bytes'] != metrics['remote_raw_blob_bytes'])):

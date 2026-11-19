@@ -24,7 +24,7 @@ def report():
         blob_cache_limit=16*1024*1024, tree_cache_bytes=74773, tree_cache_entries=10, tree_cache_limit=0,
         remote_raw_blob_imports=35, remote_raw_blob_bytes=293353,
         remote_native_pack_bytes=1234, remote_session_pack_bytes=103382,
-        remote_prefetch_packs=0, fuse_requests={'read':35})
+        remote_prefetch_packs=0, remote_prefetched_blobs=0, fuse_requests={'read':35})
     runner=dict(argv=['git-on', PIN['repository'], PIN['commit'], '--write-policy=none', '--', *command()],
         elapsed_ns=10, waited_user_cpu_s=.01, waited_system_cpu_s=.01,
         child_observations=observations, metrics=metrics)
@@ -144,13 +144,13 @@ class RealRepositoryTests(unittest.TestCase):
 
     def test_gate_accepts_only_accounted_unused_prefetch(self):
         row=report();metrics=row['runner']['metrics']
-        metrics.update(remote_prefetch_packs=16, remote_raw_blob_imports=67,
-            remote_raw_blob_bytes=612052)
+        metrics.update(remote_prefetch_packs=11, remote_prefetched_blobs=86,
+            remote_raw_blob_imports=108, remote_raw_blob_bytes=856188)
         self.assertEqual(validate_reports([row],'c'*40)['blob_loads'],35)
-        for invalid in (None, True, -1, 0, 7):
+        for invalid in (None, True, -1, 0, 72, 109):
             bad=copy.deepcopy(row)
-            bad['runner']['metrics']['remote_prefetch_packs']=invalid
-            with self.subTest(prefetch_packs=invalid),self.assertRaises(ValueError):
+            bad['runner']['metrics']['remote_prefetched_blobs']=invalid
+            with self.subTest(prefetched_blobs=invalid),self.assertRaises(ValueError):
                 validate_reports([bad],'c'*40)
 
     def test_test_runner_output_requires_all_named_tests_and_no_failures_or_skips(self):
