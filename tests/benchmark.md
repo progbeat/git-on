@@ -223,3 +223,23 @@ and large-file assertions must be established by successful real-FUSE runs on
 the exact tested binary. Retain external stdout/stderr, metrics, JSONL and the
 executable hash rather than treating fixture-generation timings or self-tests
 as runtime evidence.
+
+## Comparing NFS and materialization on macOS
+
+Build with `cargo build --release --locked --features test-metrics` and prepare
+the same packed million-file digit tree used by the Linux benchmark. Pass
+`--backend nfs` to the run command. Each round reads the same seeded digit
+path once with `--backend=nfs` and once with `--backend=copy`.
+The harness randomizes order and uses the same child on both backends.
+
+The mounted child records its first monotonic timestamp before accessing the
+tree. The elapsed total includes command completion and cleanup. The harness
+verifies the actual backend using the metrics pipe, and requires the NFS trial
+to touch at most six tree objects and load exactly the selected blob. Use a
+fresh fixture and document cache state when comparing separate measurements.
+
+```sh
+python3 tests/benchmark.py prepare --directory /tmp/git-on-nfs-million --digit-files 1000000
+python3 tests/benchmark.py run --backend nfs --fixtures /tmp/git-on-nfs-million \
+  --output /tmp/git-on-nfs-results --binary target/release/git-on --repeats 3 --timeout 900
+```

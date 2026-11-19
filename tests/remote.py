@@ -36,6 +36,7 @@ PARSER = argparse.ArgumentParser()
 PARSER.add_argument('--probe', type=Path, default=ROOT / 'target/debug/examples/source-probe')
 PARSER.add_argument('--binary', type=Path, default=ROOT / 'target/debug/git-on')
 PARSER.add_argument('--require-fuse', action='store_true')
+PARSER.add_argument('--require-nfs', action='store_true')
 PARSER.add_argument('--million', action='store_true')
 PARSER.add_argument('--evidence-output',type=Path,help='Machine-readable completed remote-million evidence')
 PARSER.add_argument('--before-resource-probe', type=Path, help='Master source probe for resource red-before evidence')
@@ -1423,19 +1424,29 @@ print('caught-EIO-and-returned-success')
         commit=f.git('commit-tree',tree,'-p',ancestor,data=b'materialization transfer regression\n')
         f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
-        tools=f.root/'single-transfer-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
         code=("import os,subprocess; from pathlib import Path; "
+              f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}; "
               "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(12)); "
               f"assert subprocess.run(['git','--git-dir',str(Path.cwd().parent/'remote-repository'),'cat-file','-e',{ancestor!r}],"
               "env=dict(os.environ,GIT_NO_LAZY_FETCH='1'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0; "
               "print('verified')")
-        result=subprocess.run([str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',code],
-                              cwd=f.cwd,env=dict(f.env,PATH=str(tools)),capture_output=True,timeout=30)
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(result.stdout,b'verified\n')
-        self.assertEqual([request['wants'] for request in f.requests if request['wants']],[[commit]],
-                         'eager preparation performs separate directory/object fetches')
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        backends = ('copy', 'auto') if OPTIONS.require_nfs else ('copy',)
+        for backend in backends:
+            with self.subTest(backend=backend):
+                f.requests.clear()
+                env = dict(f.env)
+                if backend == 'auto':
+                    env['GIT_ON_TEST_NFS_MOUNT_ERROR'] = '1'
+                result = subprocess.run([str(OPTIONS.binary), url, 'HEAD', '--write-policy=all',
+                                         '--backend='+backend, '--', sys.executable, '-c', code],
+                                        cwd=f.cwd, env=env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,b'verified\n')
+                wants = [request['wants'] for request in f.requests if request['wants']]
+                expected = [[commit], [tree], [commit]] if backend == 'auto' else [[commit]]
+                self.assertEqual(wants, expected,
+                                 'eager preparation performs separate directory/object fetches')
+                self.assertEqual(list(f.root.glob('git-on-*')),[])
 
     def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
         f=self.f

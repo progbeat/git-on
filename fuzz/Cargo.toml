@@ -1,0 +1,21 @@
+[package]
+name = "git-on-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "nfs_rpc"
+path = "fuzz_targets/nfs_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

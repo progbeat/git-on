@@ -1,4 +1,4 @@
-//! Host-specific FUSE discovery and checked mount ownership. No configuration,
+//! Host-specific backend discovery and checked mount ownership. No configuration,
 //! extension loading, privilege changes, or lazy unmounts are performed here.
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "linux")]
@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
 use std::path::Path;
 
-pub fn fuse_unavailable() -> Result<Option<String>> {
+pub fn mount_unavailable() -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
         match fs::metadata("/dev/fuse") {
@@ -44,9 +44,40 @@ pub fn fuse_unavailable() -> Result<Option<String>> {
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Some(
-            "macOS mounts are not supported in git-on 1.3.0 (future support: issue #12)".into(),
-        ))
+        use std::ffi::CStr;
+        let mut raw = [0u8; 64];
+        let mut len = raw.len();
+        // Darwin 25 corresponds to macOS 26. uname/sysctl is available
+        // on the full macOS deployment range and needs no subprocess.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.osrelease".as_ptr(),
+                raw.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("read Darwin version");
+        }
+        let version = CStr::from_bytes_with_nul(&raw[..len])
+            .context("decode Darwin version")?
+            .to_str()?;
+        let major = version
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .parse::<u32>()?;
+        if major < 25 {
+            return Ok(Some(
+                "the NFSv4.1 backend requires macOS 26 or later".into(),
+            ));
+        }
+        if !Path::new("/sbin/mount_nfs").is_file() {
+            return Ok(Some("/sbin/mount_nfs is unavailable".into()));
+        }
+        Ok(None)
     }
     #[cfg(target_os = "linux")]
     Ok(None)
@@ -55,29 +86,61 @@ pub fn fuse_unavailable() -> Result<Option<String>> {
 pub fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
     let point = dir.join("mount");
     #[cfg(target_os = "macos")]
-    {
-        let _ = id;
-        if mounts()?.iter().any(|(path, _)| path == &point) {
-            bail!(
-                "mountpoint is occupied by an unverified filesystem; macOS mounting is unsupported"
-            );
-        }
-        Ok(false)
-    }
+    let expected = nfs_mount_source(id);
     #[cfg(target_os = "linux")]
-    {
-        let expected = format!("git-on:{id}");
-        let mut found = false;
-        for (path, source) in mounts()? {
-            if path == point {
-                if source != expected || found {
-                    bail!("mountpoint is occupied by a different or stacked filesystem");
-                }
-                found = true;
+    let expected = Some(format!("git-on:{id}"));
+    let mut found = false;
+    for (path, source) in mounts()? {
+        if path == point {
+            if expected.as_deref() != Some(source.as_str()) || found {
+                bail!("mountpoint is occupied by a different or stacked filesystem");
             }
+            found = true;
         }
-        Ok(found)
     }
+    Ok(found)
+}
+
+#[cfg(target_os = "macos")]
+pub fn nfs_socket(id: &str) -> Option<std::path::PathBuf> {
+    let uuid = uuid::Uuid::parse_str(id).ok()?;
+    (uuid.to_string() == id).then(|| format!("/private/tmp/git-on-nfs-{id}/s").into())
+}
+
+#[cfg(target_os = "macos")]
+pub fn nfs_mount_source(id: &str) -> Option<String> {
+    Some(format!("<{}>:/", nfs_socket(id)?.display()))
+}
+
+#[cfg(target_os = "macos")]
+pub fn cleanup_nfs_socket(id: &str) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(socket) = nfs_socket(id) else {
+        return Ok(());
+    };
+    let directory = socket.parent().context("missing NFS socket directory")?;
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect NFS socket directory"),
+    };
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!("NFS socket directory has unexpected type or ownership");
+    }
+    let source = nfs_mount_source(id).context("invalid NFS mount identity")?;
+    if mounts()?.iter().any(|(_, current)| *current == source) {
+        bail!("NFS socket still belongs to a system mount");
+    }
+    match std::fs::symlink_metadata(&socket) {
+        Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == uid => {
+            std::fs::remove_file(&socket).context("remove private NFS socket")?;
+        }
+        Ok(_) => bail!("NFS socket has unexpected type or ownership"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("inspect private NFS socket"),
+    }
+    std::fs::remove_dir(directory).context("remove private NFS socket directory")
 }
 
 pub fn ensure_unmounted(dir: &Path) -> Result<()> {
@@ -130,10 +193,16 @@ fn mounts() -> Result<Vec<(std::path::PathBuf, String)>> {
             .iter()
             .map(|entry| {
                 let path = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
-                let source = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) };
+                let kind = unsafe { CStr::from_ptr(entry.f_fstypename.as_ptr()) };
+                let source = if kind.to_bytes() == b"nfs" {
+                    let from = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) };
+                    from.to_string_lossy().into_owned()
+                } else {
+                    String::new()
+                };
                 (
                     Path::new(OsStr::from_bytes(path.to_bytes())).to_path_buf(),
-                    source.to_string_lossy().into_owned(),
+                    source,
                 )
             })
             .collect(),

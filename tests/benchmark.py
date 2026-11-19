@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-FUSE git-on benchmarks. See tests/benchmark.md for measurement limits."""
+"""Real-mount git-on benchmarks. See tests/benchmark.md for measurement limits."""
 from __future__ import annotations
 
 import argparse
@@ -252,7 +252,14 @@ if mode == "large":
         expected.append(block[offset % 65536:offset % 65536 + 4096])
 read_bytes = 0
 workload_ns = time.monotonic_ns()
-if mode in ("scale", "repeat"):
+if mode == "digits":
+    digits = sys.argv[4]
+    with open("/".join(digits), "rb", buffering=0) as source:
+        actual = source.read()
+    if actual != (digits + "\n").encode():
+        raise RuntimeError("incorrect digit fixture bytes")
+    read_bytes = len(actual)
+elif mode in ("scale", "repeat"):
     for _ in range(count):
         for path, expected in small:
             with open(path, "rb", buffering=0) as source:
@@ -293,6 +300,21 @@ def require_fuse():
 def signal_session(session, signum):
     # Popen creates a private session. The workload's process group may differ
     # from the runner's, so address only processes still in that same session.
+    if sys.platform == "darwin":
+        if signum != signal.SIGKILL:
+            # The runner forwards ordinary termination to its workload group.
+            try:
+                os.killpg(session, signum)
+            except ProcessLookupError:
+                pass
+            return
+        for pid in map(int, subprocess.check_output(["/bin/ps", "-A", "-o", "pid="]).split()):
+            try:
+                if os.getsid(pid) == session:
+                    os.kill(pid, signum)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -374,11 +396,12 @@ def measured_process(argv, cwd, env, stdout, stderr, timeout, expected_stdout=No
                 signal_session(process.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 5
         process.returncode = os.waitstatus_to_exitcode(status)
+        rss_divisor = 1024 if sys.platform == "darwin" else 1
         return dict(started_ns=start, observed_exit_ns=time.monotonic_ns(),
                     returncode=process.returncode, timed_out=timed_out, interrupted=interrupted,
                     capture_incomplete=capture_incomplete, stdout_match_ns=stdout_match_ns,
-                    wait4_peak_rss_kib=usage.ru_maxrss, user_cpu_s=usage.ru_utime,
-                    system_cpu_s=usage.ru_stime, harness_peak_rss_kib_before_spawn=harness_rss)
+                    wait4_peak_rss_kib=usage.ru_maxrss // rss_divisor, user_cpu_s=usage.ru_utime,
+                    system_cpu_s=usage.ru_stime, harness_peak_rss_kib_before_spawn=harness_rss // rss_divisor)
 
 
 def make_cases(fixtures, suites, repeat_count):
@@ -413,12 +436,22 @@ def machine_metadata(repo, output=None):
     cpuinfo = read_optional("/proc/cpuinfo") or ""
     cpu_model = next((line.split(":", 1)[1].strip() for line in cpuinfo.splitlines()
                       if line.startswith("model name")), None)
-    filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(repo)],
-                                capture_output=True, text=True, check=False).stdout.strip()
-    evidence_filesystem = None
-    if output is not None:
-        evidence_filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(output)],
-                                            capture_output=True, text=True, check=False).stdout.strip() or None
+    def filesystem_type(path):
+        if path is None:
+            return None
+        if sys.platform == "darwin":
+            mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
+            for line in sorted(mounts, key=len, reverse=True):
+                point, _, options = line.partition(" on ")[2].rpartition(" (")
+                if point and path.is_relative_to(point):
+                    return options.split(",", 1)[0].strip(")")
+            return None
+        return subprocess.check_output(["stat", "-f", "-c", "%T", str(path)], text=True).strip()
+
+    if sys.platform == "darwin":
+        cpu_model = subprocess.check_output(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+    filesystem = filesystem_type(repo)
+    evidence_filesystem = filesystem_type(output)
     try:
         revision = git(ROOT, "rev-parse", "HEAD").decode()
         dirty = bool(git(ROOT, "status", "--porcelain"))
@@ -434,7 +467,11 @@ def machine_metadata(repo, output=None):
 
 
 def benchmark(args):
-    require_fuse()  # A real mount failure later is also a hard failure, never a skip.
+    if args.backend == "fuse":
+        require_fuse()
+    elif sys.platform != "darwin":
+        raise RuntimeError("NFS samples require the real macOS client")
+    backends = ("fuse",) if args.backend == "fuse" else ("nfs", "copy")
     binary = args.binary.resolve(strict=True)
     source = args.fixtures.resolve(strict=True)
     fixture_manifest = json.loads((source / "fixtures.json").read_text())
@@ -460,6 +497,7 @@ def benchmark(args):
             binary_hash = hashlib.file_digest(binary_file, "sha256").hexdigest()
         record(dict(event="metadata", format=FORMAT, timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     platform=platform.platform(), hardware_and_source=machine_metadata(repo, output), python=sys.version,
+                    backends=backends,
                     binary=str(binary), binary_sha256=binary_hash, cat=cat,
                     binary_version=subprocess.check_output([str(binary), "--version"]).decode().strip(),
                     fixture_manifest=fixture_manifest, repeats=args.repeats, warmups=args.warmups,
@@ -468,18 +506,23 @@ def benchmark(args):
                     object_metrics_semantics="Application-level Git tree/header/blob fetches and decoded blob bytes, not physical disk I/O; revision resolution is outside these counters.",
                     lazy_access_gates="Digits: at most six ancestor trees and one header, exactly one seven-byte blob; caches stay within their byte limits.",
                     cat_child_startup_unavailable_reason="Unmodified cat has no child-start marker.",
-                    rss_semantics="Linux wait4 ru_maxrss in KiB; maximum process high-water including waited descendants, not concurrent sum.",
+                    rss_semantics="wait4 ru_maxrss in KiB (converted from bytes on Darwin); maximum process high-water including waited descendants.",
                     command_line=sys.argv))
         rng = random.Random(args.seed)
         for iteration in range(-args.warmups, args.repeats):
-            ordered = cases.copy()
+            ordered = [(case, backend) for case in cases for backend in backends]
             rng.shuffle(ordered)
-            for case in ordered:
+            for case, backend in ordered:
                 tag = f"{len(samples):04d}-{case['case']}"
+                if backend != "fuse":
+                    tag += "-" + backend
                 env = environment()
                 stdout, stderr = output / f"{tag}.stdout", output / f"{tag}.stderr"
                 metrics_path = output / f"{tag}.metrics"
-                argv = [str(binary), case["tree_oid"], "--", sys.executable, "-I", "-S", "-c", CHILD,
+                prefix = [str(binary), case["tree_oid"], "--backend=" + backend]
+                if backend != "fuse":
+                    prefix.append("--write-policy=all")
+                argv = [*prefix, "--", sys.executable, "-I", "-S", "-c", CHILD,
                         case["suite"], str(case["count"]), str(case.get("large_bytes", 0))]
                 expected_stdout = None
                 selection = {}
@@ -487,11 +530,14 @@ def benchmark(args):
                     number = random.Random(f"{args.seed}:{case['case']}:{iteration}").randrange(case["digit_files"])
                     digits = f"{number:06d}"
                     path = "/".join(digits)
-                    expected_stdout = (digits + "\n").encode()
                     selection = dict(selected_number=digits, selected_path=path, selection_seed=args.seed)
-                    argv = [str(binary), case["tree_oid"], "--", cat, path]
+                    if backend == "fuse":
+                        expected_stdout = (digits + "\n").encode()
+                        argv = [*prefix, "--", cat, path]
+                    else:
+                        argv.append(digits)
                 measured = measured_process(argv, repo, env, stdout, stderr, args.timeout, expected_stdout, metrics_path)
-                sample = dict(event="sample", case=case, iteration=iteration, warmup=iteration < 0,
+                sample = dict(event="sample", case=case, backend=backend, iteration=iteration, warmup=iteration < 0,
                               stdout=str(stdout), stderr=str(stderr), metrics_file=str(metrics_path), argv=argv,
                               **selection, **measured)
                 try:
@@ -503,11 +549,14 @@ def benchmark(args):
                     except ValueError as error:
                         raise ValueError("missing or malformed test metrics; build with --features test-metrics") from error
                     sample["snapshot_metrics"] = snapshot_metrics(metrics)
-                    assert_lazy_reads(case, sample["snapshot_metrics"])
+                    if metrics.get("backend") != backend:
+                        raise ValueError(f"expected {backend}, observed {metrics.get('backend')}")
+                    if backend != "copy":
+                        assert_lazy_reads(case, sample["snapshot_metrics"])
                     sample.update(observed_total_ms=(measured["observed_exit_ns"] - measured["started_ns"]) / 1e6,
                                   success=True, child_startup_ms=None, workload_ms=None,
                                   child_ready_to_finish_ms=None, verified_stdout_ms=None)
-                    if case["suite"] == "digits":
+                    if case["suite"] == "digits" and backend == "fuse":
                         if stdout.read_bytes() != expected_stdout or measured["stdout_match_ns"] is None:
                             raise RuntimeError("cat stdout does not exactly match the selected six-digit number plus LF")
                         sample.update(verified_stdout_ms=(measured["stdout_match_ns"] - measured["started_ns"]) / 1e6,
@@ -526,7 +575,7 @@ def benchmark(args):
                     sample.update(success=False, error=str(error), child_startup_ms=None, workload_ms=None)
                 record(sample)
                 samples.append(sample)
-                metric = "verified_stdout_ms" if case["suite"] == "digits" else "child_startup_ms"
+                metric = "verified_stdout_ms" if case["suite"] == "digits" and backend == "fuse" else "child_startup_ms"
                 print(f"{tag}: " + (f"{metric}={sample[metric]:.3f}, "
                       f"wait4 RSS={sample['wait4_peak_rss_kib']} KiB, "
                       f"trees={sample['snapshot_metrics']['tree_reads']}, "
@@ -544,8 +593,8 @@ def summarize(samples):
     groups = defaultdict(list)
     for sample in samples:
         if sample["success"] and not sample["warmup"]:
-            groups[sample["case"]["case"]].append(sample)
-    for case, group in sorted(groups.items()):
+            groups[sample["case"]["case"], sample.get("backend", "fuse")].append(sample)
+    for (case, backend), group in sorted(groups.items()):
         metrics = {}
         for name in ("verified_stdout_ms", "child_startup_ms", "workload_ms", "child_ready_to_finish_ms",
                      "observed_total_ms", "wait4_peak_rss_kib"):
@@ -557,7 +606,7 @@ def summarize(samples):
             values = [sample["snapshot_metrics"][name] for sample in group if "snapshot_metrics" in sample]
             if values:
                 metrics["snapshot_metrics." + name] = dict(min=min(values), median=statistics.median(values), max=max(values))
-        yield dict(event="summary", case=case, samples=len(group), metrics=metrics)
+        yield dict(event="summary", case=case, backend=backend, samples=len(group), metrics=metrics)
 
 
 class SelfTests(unittest.TestCase):
@@ -698,7 +747,8 @@ def main():
     prepare.add_argument("--sizes", type=integers, default=[0, 1000, 10000], help="unused logical file counts")
     prepare.add_argument("--large-mib", type=integers, default=[1, 16], help="positive large-blob sizes in MiB")
     prepare.add_argument("--storage", choices=["loose", "packed"], default="loose")
-    run = sub.add_parser("run", help="measure the binary with real FUSE; no emulation or skips")
+    run = sub.add_parser("run", help="measure the native mount without emulation or skips")
+    run.add_argument("--backend", choices=["fuse", "nfs"], default="fuse", help="nfs also measures an explicit-all materialized control")
     run.add_argument("--fixtures", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True, help="new directory for raw evidence and JSONL")
     run.add_argument("--binary", type=Path, default=ROOT / "target/release/git-on")

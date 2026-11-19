@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Actual no-FUSE executions; run only on a host where FUSE is unavailable.
-These do not count as real FUSE/macFUSE verification.
-"""
+"""Test the copy backend, including automatic fallback without a native mount."""
 import os
 import json
 from pathlib import Path
@@ -14,6 +12,9 @@ import time
 import unittest
 
 BINARY = Path(sys.argv.pop(1)).resolve()
+# On Linux the fixture hides fusermount3. Darwin 25+ supplies NFS independently
+# of PATH, so exercise the same copy backend explicitly there.
+COPY_ARGS = ['--backend=copy'] if sys.platform == 'darwin' and int(os.uname().release.split('.')[0]) >= 25 else []
 
 
 class MaterializedTests(unittest.TestCase):
@@ -48,7 +49,7 @@ class MaterializedTests(unittest.TestCase):
         return subprocess.check_output(['git', *args], cwd=self.repo, env=self.env, input=data)
 
     def invoke(self, code, *options):
-        result = subprocess.run([str(BINARY), 'HEAD', *options, '--', sys.executable, '-c', code, '--keep', '-k', '', 'a b'], cwd=self.repo, env=self.env, capture_output=True, timeout=20)
+        result = subprocess.run([str(BINARY), *COPY_ARGS, 'HEAD', *options, '--', sys.executable, '-c', code, '--keep', '-k', '', 'a b'], cwd=self.repo, env=self.env, capture_output=True, timeout=20)
         return result
 
     def clean(self):
@@ -59,8 +60,13 @@ class MaterializedTests(unittest.TestCase):
     def test_default_and_protected_policies_are_never_relaxed(self):
         for options in [[], ['--write-policy=none'], ['--write-policy=ignored'], ['--write-policy=untracked']]:
             result = self.invoke('raise Exception("child must not start")', *options)
-            self.assertEqual(result.returncode, 125, result.stderr)
-            self.assertIn(b'FUSE unavailable', result.stderr)
+            if COPY_ARGS:
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b'requires explicit --write-policy=all', result.stderr)
+            else:
+                self.assertEqual(result.returncode, 125, result.stderr)
+                backend = b'NFS' if sys.platform == 'darwin' else b'FUSE'
+                self.assertIn(backend + b' unavailable', result.stderr)
             self.clean()
 
     def test_small_files_respect_individual_fsize_limits_without_aggregate_ceiling(self):
@@ -94,7 +100,7 @@ for _ in range(2):
                 result=subprocess.run(['git','clone','--quiet',source,str(clone)],env=self.env,preexec_fn=limits,capture_output=True,timeout=20)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(len(list(clone.glob('f*'))),80)
-                result=subprocess.run([str(BINARY),*operands,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
+                result=subprocess.run([str(BINARY),*COPY_ARGS,*operands,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.clean()
 
@@ -126,7 +132,7 @@ for _ in range(2):
         self.assertEqual(result.returncode,0,result.stderr)
         direct=subprocess.run(command,cwd=clone,env=self.env,preexec_fn=limits,capture_output=True,timeout=10)
         self.assertEqual(direct.returncode,0,direct.stderr)
-        result=subprocess.run([str(BINARY),str(self.repo),'HEAD','--write-policy=all','--',*command],
+        result=subprocess.run([str(BINARY),*COPY_ARGS,str(self.repo),'HEAD','--write-policy=all','--',*command],
                               cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(result.stdout,direct.stdout)
@@ -163,7 +169,7 @@ for _ in range(2):
                 self.assertEqual(result.returncode,0,result.stderr)
                 direct=subprocess.run(command,cwd=clone,env=env,preexec_fn=limits,capture_output=True,timeout=10)
                 self.assertEqual(direct.returncode,0,direct.stderr)
-                result=subprocess.run([str(BINARY),str(self.repo),'HEAD','--write-policy=all','--',*command],
+                result=subprocess.run([str(BINARY),*COPY_ARGS,str(self.repo),'HEAD','--write-policy=all','--',*command],
                                       cwd=self.repo,env=env,preexec_fn=limits,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,direct.stdout)
@@ -215,7 +221,7 @@ print('large file verified')
                 self.assertEqual(result.returncode,0,result.stderr)
                 direct=subprocess.run(command,cwd=clone,env=self.env,capture_output=True,timeout=10)
                 self.assertEqual(direct.returncode,0,direct.stderr)
-                result=subprocess.run([str(BINARY),'HEAD','--write-policy=all','--',*command],
+                result=subprocess.run([str(BINARY),*COPY_ARGS,'HEAD','--write-policy=all','--',*command],
                                       cwd=self.repo,env=self.env,capture_output=True,timeout=20)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,direct.stdout)
@@ -240,7 +246,7 @@ print('large file verified')
         self.assertEqual(result.returncode,0,result.stderr)
         direct=subprocess.run(command,cwd=clone,env=self.env,capture_output=True,timeout=20)
         self.assertEqual(direct.returncode,0,direct.stderr)
-        result=subprocess.run([str(BINARY),source,'HEAD','--write-policy=all','--',*command],
+        result=subprocess.run([str(BINARY),*COPY_ARGS,source,'HEAD','--write-policy=all','--',*command],
                               cwd=self.repo,env=self.env,capture_output=True,timeout=20)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(result.stdout,direct.stdout)
@@ -318,7 +324,7 @@ os.chmod('.',0)
     def test_case_collision_fails_before_child(self):
         blob = self.git('hash-object', '-w', '--stdin', data=b'case').strip().decode()
         tree = self.git('mktree', data=f'100644 blob {blob}\tFoo\n100644 blob {blob}\tfoo\n'.encode()).strip().decode()
-        result = subprocess.run([str(BINARY), tree, '--write-policy=all', '--', sys.executable, '-c', 'print("launched")'], cwd=self.repo, env=self.env, capture_output=True, timeout=20)
+        result = subprocess.run([str(BINARY), *COPY_ARGS, tree, '--write-policy=all', '--', sys.executable, '-c', 'print("launched")'], cwd=self.repo, env=self.env, capture_output=True, timeout=20)
         # Explicitly establish that this host volume is case insensitive.
         probe = self.root / 'CaseProbe'
         probe.touch()

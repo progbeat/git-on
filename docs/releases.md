@@ -62,7 +62,8 @@ The ordinary CI workflow keeps `rust`, `macos`, `real-fuse`, `lazy-performance`,
 `release-policy` and real native packaging checks. `package-build` runs stock
 `dist build` for Linux and Apple Silicon, exercises extracted binaries and the
 stock installer, and checks bundled license texts. Linux runs real FUSE against
-the packaged executable; Mac runs CLI/materialized behavior. The required
+the packaged executable. Mac package checks run CLI and materialized behavior
+on macOS 15. The macOS 26 CI job requires real NFSv4.1 mounts. The required
 `package` aggregate always waits for all base jobs and uses the conservative CI
 plan to require affected scale/stress/lazy/resource jobs and their actual
 evidence before merge. A required skipped or missing case fails; genuinely
@@ -130,7 +131,7 @@ Cargo-dist generates the Linux x86_64 and Apple Silicon `.tar.gz` archives,
 `git-on-installer.sh`, checksum files and its standard manifests/source artifact.
 The installed executable is `git-on`; native archives include README, LICENSE
 and target-specific THIRD_PARTY_NOTICES. See [platforms](platforms.md) for runtime
-requirements and the Mac materialization-only scope.
+requirements and the native mount capabilities on macOS.
 
 The installer is unmodified cargo-dist output. It checks archive hashes when
 its supported checksum utility is available, but can skip verification when
@@ -165,6 +166,6 @@ Use Rust 1.89+, native Git, and a C compiler:
 cargo install --path . --locked
 ```
 
-Mac builds require no FUSE framework or extension: they support startup and
-explicit-all materialization. Native mounts are not supported on macOS.
-Linux uses registry fuser 0.18 with no vendored fork.
+Mac builds use the operating system's NFS client for native mounts on macOS 26
+and later. They also support explicit-all materialization on macOS 13 and later.
+Linux uses registry fuser 0.18.

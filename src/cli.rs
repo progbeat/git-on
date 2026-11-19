@@ -1,5 +1,5 @@
 use clap::{builder::OsStringValueParser, error::ErrorKind, Arg, ArgAction, Command};
-use git_on::policy::WritePolicy;
+use git_on::{backend::Backend, policy::WritePolicy};
 use std::{ffi::OsString, os::unix::ffi::OsStrExt};
 
 pub const RUN_USAGE: &str = "git on [REPOSITORY] REV [OPTIONS] -- COMMAND [ARGS...]";
@@ -11,6 +11,7 @@ pub struct RunArgs<'a> {
     pub command: &'a [OsString],
     pub verify: bool,
     pub write_policy: WritePolicy,
+    pub backend: Backend,
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,7 +39,7 @@ fn command(mode: Mode) -> Command {
         .disable_version_flag(true)
         .args_override_self(true)
         .override_usage(RUN_USAGE)
-        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand is resolved by native git rev-parse; two operands are passed unchanged to native git fetch. Git owns repository and revision syntax.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nPrefer Linux FUSE. macOS mounts are not supported in 1.3.0. Without a supported mount backend, only explicit --write-policy=all supports eager materialization. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
+        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand is resolved by native git rev-parse; two operands are passed unchanged to native git fetch. Git owns repository and revision syntax.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nBackend auto uses FUSE on Linux and NFSv4.1 on macOS 26 and later. Explicit fuse and nfs require a mount. Backend copy creates a regular temporary directory and requires explicit --write-policy=all. Auto can use copy when a mount is unavailable and all was selected explicitly. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
     if mode != Mode::Cleanup {
         command = command
             .arg(
@@ -55,6 +56,15 @@ fn command(mode: Mode) -> Command {
                     .value_parser(["none", "ignored", "untracked", "all"])
                     .default_value("ignored")
                     .help("Temporary writes: none, ignored, untracked, or all"),
+            )
+            .arg(
+                Arg::new("backend")
+                    .long("backend")
+                    .require_equals(true)
+                    .value_name("BACKEND")
+                    .value_parser(["auto", "fuse", "nfs", "copy"])
+                    .default_value("auto")
+                    .help("Snapshot backend: auto, fuse, nfs, or copy"),
             )
             .arg(
                 Arg::new("operands")
@@ -191,16 +201,31 @@ pub fn parse_run_args(args: &[OsString]) -> Result<RunArgs<'_>, clap::Error> {
             "expected a non-empty command after --",
         ));
     }
+    let write_policy = matches
+        .get_one::<String>("write-policy")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let backend = match matches.get_one::<String>("backend").unwrap().as_str() {
+        "auto" => Backend::Auto,
+        "fuse" => Backend::Fuse,
+        "nfs" => Backend::Nfs,
+        "copy" => Backend::Copy,
+        _ => unreachable!("validated backend"),
+    };
+    if backend == Backend::Copy && write_policy != WritePolicy::All {
+        return Err(command.error(
+            ErrorKind::ArgumentConflict,
+            "--backend=copy requires explicit --write-policy=all",
+        ));
+    }
     Ok(RunArgs {
         tree,
         repository,
         command: command_tail,
         verify: matches.get_flag("verify"),
-        write_policy: matches
-            .get_one::<String>("write-policy")
-            .unwrap()
-            .parse()
-            .unwrap(),
+        write_policy,
+        backend,
     })
 }
 
@@ -308,6 +333,36 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn backend_selection_preserves_arg_boundaries_and_requires_all_for_copy() {
+        for backend in [Backend::Auto, Backend::Fuse, Backend::Nfs, Backend::Copy] {
+            let option = format!("--backend={}", backend.as_str());
+            let args = arguments(&[
+                "origin",
+                &option,
+                "HEAD",
+                "--write-policy=all",
+                "--",
+                "cmd",
+                "--backend=copy",
+            ]);
+            let run = parse_run_args(&args).unwrap();
+            assert_eq!(run.backend, backend);
+            assert_eq!(run.command, arguments(&["cmd", "--backend=copy"]));
+        }
+        let args = arguments(&["HEAD", "--", "cmd"]);
+        assert_eq!(parse_run_args(&args).unwrap().backend, Backend::Auto);
+        for option in [
+            "--backend",
+            "--backend=",
+            "--backend=unknown",
+            "--backend=copy",
+        ] {
+            let args = arguments(&["HEAD", option, "--", "cmd"]);
+            assert_eq!(parse_run_args(&args).unwrap_err().exit_code(), 2);
+        }
+    }
+
     #[test]
     fn remote_operands_verify_and_literal_command_tail() {
         for source in [

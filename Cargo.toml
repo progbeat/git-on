@@ -1,6 +1,6 @@
 [package]
 name = "git-on"
-version = "1.4.2"
+version = "1.5.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
@@ -48,3 +48,6 @@ lto = "thin"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "=0.18.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

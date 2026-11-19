@@ -274,8 +274,9 @@ def main():
         f.env.update(GIT_CONFIG_COUNT='2',GIT_CONFIG_KEY_0='gpg.format',GIT_CONFIG_VALUE_0='ssh',
             GIT_CONFIG_KEY_1='gpg.ssh.allowedSignersFile',GIT_CONFIG_VALUE_1=str(allowed))
         env=dict(f.env)
+        backend_args = []
         if OPTIONS.backend=='materialized':
-            tools=f.root/'git-only';tools.mkdir();(tools/'git').symlink_to(native_git);(tools/'ssh-keygen').symlink_to(shutil.which('ssh-keygen'));env['PATH']=str(tools)
+            backend_args = ['--backend=copy']
         else:assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3')
         source=f.https() if OPTIONS.source=='remote' else None
         env.update({k:v for k,v in f.env.items() if k!='PATH'})
@@ -302,8 +303,10 @@ def main():
             for case in selected:
                 first_request=len(f.requests)
                 child=[sys.executable,'-c',CHILD,case['workload'],str(count),json.dumps(info['fanouts']),*(['write'] if OPTIONS.backend=='passthrough' and case['workload']=='full' else [])]
-                command=[str(OPTIONS.binary),*([source] if source else []),'main',f"--write-policy={case['policy']}",*(['--verify'] if case['verify'] else []),'--',*child]
+                command=[str(OPTIONS.binary),*backend_args,*([source] if source else []),'main',f"--write-policy={case['policy']}",*(['--verify'] if case['verify'] else []),'--',*child]
                 result=execute(f,command,env,dict(type='runner',backend=OPTIONS.backend,source=OPTIONS.source,profile=OPTIONS.profile,**case),True)
+                expected_backend = 'copy' if OPTIONS.backend == 'materialized' else 'fuse'
+                assert result['metrics']['backend'] == expected_backend, result
                 requests=f.requests[first_request:];wants={oid for request in requests for oid in request.get('wants',[])}
                 assert wants==(expected_demands(info,OPTIONS.backend,case['workload']) if source else set()),(case,wants,info)
                 assert result['metrics']['remote_fetches']==len(wants),result

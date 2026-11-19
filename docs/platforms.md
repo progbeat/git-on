@@ -1,27 +1,26 @@
 # Platform requirements and verification
 
-Git-on 1.3.0 builds Linux x86_64 and Apple Silicon CLI binaries. Linux mounts use
-registry fuser0.18.0, without a fork or vendored source. A usable `/dev/fuse` and
-`fusermount3` are required; optional passthrough does not change that requirement.
+Git-on builds Linux x86_64 and Apple Silicon CLI binaries. Linux mounts use
+registry fuser 0.18.0. A usable `/dev/fuse` and `fusermount3` are required;
+optional passthrough does not change that requirement.
 
 ## Apple Silicon
 
-macOS13+ supports CLI startup and explicitly selected `--write-policy=all`
-materialization. Default `ignored`, `untracked` and `none` policies fail clearly:
-1.3.0 provides no supporting Mac mount backend. macOS mounts are deferred beyond
-this milestone. No FSKit/macFUSE adapter, app bundle, activation or security change
-is part of this release. The same console installer installs the CLI binary.
+The CLI runs on macOS 13 or later. macOS 26 and later can mount a lazy snapshot
+with any write policy using the built-in NFSv4.1 client and a private local
+socket. This needs an ordinary user account and a writable temporary directory.
+The same console installer installs the single executable.
 
-The Mac CI job runs strict clippy, Rust tests, eleven CLI cases, materialized
-execution and installer tests. Native packaging also executes the extracted
-binary and unmodified generated installer. The standard installer can skip
-checksum verification when its utility is absent; build-only success is not
-substituted for behavior tests. Actual Mac mounts are not claimed.
+On earlier versions, `--backend=auto` uses a temporary copy when
+`--write-policy=all` is explicit. The same fallback is available when the NFS
+mount is unavailable and any partial mount has been cleaned up.
+`--backend=nfs` requires a real mount. See the
+[NFS profile and lifecycle](nfs.md).
 
-On the owner's Mac27.0.1 (26A434), SDK26.5, the reduced implementation passed
-58 core, 12 binary and 10 remote-source Rust tests, strict metrics clippy,
-seven materialized-execution and eleven CLI cases. Local tests use disposable
-fixtures; no extension is installed or activated.
+The macOS 26 CI job requires real NFS mounts for the filesystem and write-policy
+fixtures shared with FUSE. It also runs selected upstream pynfs tests
+over the Unix socket. macOS 15 CI runs fallback cases with the extracted native
+binary. Both jobs test the revision under review.
 
 ## Linux passthrough
 
@@ -62,6 +61,6 @@ policy cases plus fallback, preserving existing mounts/checkout. Brick's older
 kernel does not establish enabled passthrough. A missing /dev/fuse in the saved
 Linux container is a failed prerequisite, never a passed real-mount test.
 
-CI exercises Linux real mounts/performance/MSRV and Mac CLI/materialized behavior,
-both native archives and corrected generated installers. Exact final-head CI and
-Copilot review remain readiness gates; COMMENTED/no findings is not APPROVED.
+CI exercises Linux FUSE, Rust 1.89, macOS NFS and materialized behavior,
+both native archives and the generated installers. Exact final-head CI and
+a cold PR review are readiness gates.

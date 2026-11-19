@@ -21,7 +21,7 @@ git on --version
 
 Every executed command requires `--`. Before the first separator, supply exactly
 one local revision, or a repository followed by a revision. Recognized
-`--verify` and `--write-policy=none|ignored|untracked|all` options may
+`--verify`, `--backend=auto|fuse|nfs|copy` and `--write-policy=none|ignored|untracked|all` options may
 appear anywhere before that separator, interspersed with the operands.
 `--keep` and `-k` before the separator return usage 2 with migration guidance. With one
 operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`. With two,
@@ -65,6 +65,13 @@ For a rare executable named `--keep`, use `git on REV -- --keep -- args`: the
 second `--` belongs to that executable.
 
 ## Filesystem behavior
+
+| Backend | Behavior |
+| --- | --- |
+| `auto` (default) | Uses FUSE on Linux and NFSv4.1 on macOS 26 or later. Can use a temporary copy if the native backend is unavailable and `--write-policy=all` is explicit. |
+| `fuse` | Requires a Linux FUSE mount. |
+| `nfs` | Requires a macOS NFSv4.1 mount. |
+| `copy` | Eagerly creates a regular temporary directory. Requires explicit `--write-policy=all`. |
 
 For repository operands, native fetch semantics, cache bounds and signature verification,
 see [the remote guide](remote.md).

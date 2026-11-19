@@ -81,7 +81,8 @@ def run(options):
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.blob_bytes),str(stat_bytes)]
                 source='file://'+str(f.repo)
                 env,log=native_command_audit(f.root,f.env,options.backend=='materialized')
-                argv=[str(options.binary.resolve()),source,'HEAD','--write-policy=all','--',*command]
+                backend_args = ['--backend=copy'] if options.backend=='materialized' else []
+                argv=[str(options.binary.resolve()),*backend_args,source,'HEAD','--write-policy=all','--',*command]
                 result=capture(argv,f.cwd,env,f.root,metrics=True)
                 result['native_commands']=native_commands(log)
                 validate_runner(result,count,options.blob_bytes,stat_bytes,options.backend)

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Black-box tests against real Git repositories and a real FUSE mount.
+"""Black-box tests against real Git repositories and native FUSE or NFS mounts.
 
-Run: python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
-No mount or filesystem operation is mocked. Omit --require-fuse only for local
-non-FUSE development; skipped tests are explicitly reported by unittest.
+On Linux, pass --require-fuse. On macOS, pass --require-nfs MountTests.
+Native tests exercise the real filesystem through the same fixtures.
 """
 from __future__ import annotations
 
@@ -26,10 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser(description=__doc__)
 PARSER.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-on")
 PARSER.add_argument("--require-fuse", action="store_true")
+PARSER.add_argument("--require-nfs", action="store_true", help="Require a real Darwin NFSv4.1 mount in mount tests")
 PARSER.add_argument("--uv", action="store_true", help="Also run network-backed uv examples")
 OPTIONS, UNITTEST_ARGS = PARSER.parse_known_args()
 BINARY = OPTIONS.binary.resolve()
 FUSE_AVAILABLE = Path("/dev/fuse").exists() and bool(shutil.which("fusermount3") or shutil.which("fusermount"))
+MOUNT_AVAILABLE = FUSE_AVAILABLE or OPTIONS.require_nfs
+MOUNT_ARGS = ["--backend=nfs"] if OPTIONS.require_nfs else ["--backend=fuse"]
+fuse_only = unittest.skipUnless(FUSE_AVAILABLE and not OPTIONS.require_nfs, "requires the Linux FUSE interface")
 
 
 def git(repo, *args, **kwargs):
@@ -47,9 +50,8 @@ def file_size_limits(size=None, action=signal.SIG_DFL):
 
 class RepositoryTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="git-on-test-")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(tempfile.mkdtemp(prefix="git-on-test-")).resolve()
+        self.addCleanup(self.remove_fixture)
         self.repo = self.root / "repository"
         self.repo.mkdir()
         git(self.repo, "init", "--quiet")
@@ -70,6 +72,14 @@ class RepositoryTest(unittest.TestCase):
         self.tree = git(self.repo, "rev-parse", "HEAD^{tree}")
         self.system_tmp = self.root / "system-tmp"
         self.system_tmp.mkdir()
+
+    def remove_fixture(self):
+        if OPTIONS.require_nfs:
+            prefix = b" on " + os.fsencode(self.root) + b"/"
+            mounts = subprocess.check_output(["/sbin/mount"]).splitlines()
+            self.assertFalse(any(prefix in line for line in mounts),
+                             f"preserving fixture containing a mount at {self.root}")
+        shutil.rmtree(self.root)
 
     def put(self, name, content):
         path = self.repo / name
@@ -92,10 +102,26 @@ class RepositoryTest(unittest.TestCase):
 
     def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
         before = set(self.system_tmp.glob("git-on-*"))
-        result = subprocess.run([str(BINARY), *args], cwd=self.repo,
-                                env=dict(self.environment(), **(extra_env or {})),
-                                input=input, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=timeout)
+        argv = [str(BINARY), *args]
+        env = dict(self.environment(), **(extra_env or {}))
+        if OPTIONS.require_nfs:
+            # Give an interrupted native test time to unmount its own share.
+            # subprocess.run's timeout sends SIGKILL and can leave a hard mount.
+            with subprocess.Popen(argv, cwd=self.repo, env=env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                try:
+                    stdout, stderr = process.communicate(input, timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise
+            result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+        else:
+            result = subprocess.run(argv, cwd=self.repo, env=env, input=input,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         created = set(self.system_tmp.glob("git-on-*")) - before
         self.assertLessEqual(len(created), 1, created)
         return result, next(iter(created), None)
@@ -118,19 +144,35 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
 
+class MountedRepositoryTest(RepositoryTest):
+    def invoke_argv(self, args, **kwargs):
+        return super().invoke_argv([*MOUNT_ARGS, *args], **kwargs)
+
+
 class CliTests(RepositoryTest):
+    def test_explicit_backend_selects_copy_and_unavailable_mount_does_not_fall_back(self):
+        unavailable = "fuse" if sys.platform == "darwin" else "nfs"
+        result, _ = self.invoke_argv([
+            "HEAD", "--backend=" + unavailable, "--write-policy=all", "--", "/bin/echo", "must not run",
+        ])
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        result, _ = self.invoke_argv([
+            "--backend=copy", "HEAD", "--write-policy=all", "--", "/bin/cat", "tracked.txt",
+        ])
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b"committed\n")
+        self.assert_no_runtime_files()
+
     def test_forwarded_term_preserves_the_childs_handled_exit_status(self):
-        programs=self.root/'signal-programs';programs.mkdir()
-        (programs/'git').symlink_to(shutil.which('git'))
-        for backend in (['materialized','fuse'] if FUSE_AVAILABLE else ['materialized']):
+        for backend in ['--backend=copy', *(MOUNT_ARGS if MOUNT_AVAILABLE else [])]:
             for handled in (True,False):
                 with self.subTest(backend=backend,handled=handled):
                     code="import signal,sys\n"
                     if handled:code+="signal.signal(signal.SIGTERM,lambda *args: sys.exit(42))\n"
                     code+="print('ready',flush=True)\nsignal.pause()\n"
                     env=self.environment()
-                    if backend=='materialized':env['PATH']=str(programs)
-                    runner=subprocess.Popen([str(BINARY),'HEAD','--write-policy=all','--',sys.executable,'-I','-S','-c',code],
+                    runner=subprocess.Popen([str(BINARY),'HEAD',backend,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],
                                             cwd=self.repo,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                     try:
                         ready,_,_=select.select([runner.stdout],[],[],10)
@@ -341,8 +383,8 @@ class CliTests(RepositoryTest):
         self.assertEqual(sentinel.read_text(), "preserve")
 
 
-@unittest.skipUnless(FUSE_AVAILABLE, "real FUSE is unavailable (use --require-fuse in CI)")
-class FuseTests(RepositoryTest):
+@unittest.skipUnless(MOUNT_AVAILABLE, "real FUSE or NFS mount required")
+class MountTests(MountedRepositoryTest):
     def lazy_native_stat_fixture(self):
         size=7*1024*1024
         (self.repo/'large').write_bytes(b'x'*size)
@@ -354,6 +396,7 @@ class FuseTests(RepositoryTest):
         config=dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
         return self.repo.as_uri(),['stat','-c','%s','large'],config,size
 
+    @fuse_only
     def test_lazy_native_stat_writes_one_decoded_payload(self):
         source,_,config,_=self.lazy_native_stat_fixture()
         def write_bytes():
@@ -390,6 +433,7 @@ print(size)
         self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_lazy_native_stat_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         source,command,_,_=self.lazy_native_stat_fixture()
@@ -412,7 +456,9 @@ for flags in (os.O_RDWR,os.O_WRONLY|os.O_APPEND):
  assert os.write(fd,b'')==0
  os.fsync(fd);os.close(fd)
 after=source.stat()
-assert (after.st_size,after.st_mtime_ns,after.st_ctime_ns)==(before.st_size,before.st_mtime_ns,before.st_ctime_ns)
+assert (after.st_size,after.st_mtime_ns)==(before.st_size,before.st_mtime_ns)
+# Darwin can write AppleDouble metadata when opening the file.
+if sys.platform!='darwin':assert after.st_ctime_ns==before.st_ctime_ns
 fd=os.open(source,os.O_RDWR);os.ftruncate(fd,before.st_size);os.close(fd)
 if root!=Path.cwd():assert allocated()<(9 if sys.argv[1]=='remote' else 1)*1024*1024,('open copied payload',allocated())
 expected=b'x'*(6*1024*1024)
@@ -449,6 +495,7 @@ print('writable lifecycle verified')
                 self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
                 self.assert_no_runtime_files()
 
+    @fuse_only
     def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         command=self.writable_open_fixture()
@@ -480,6 +527,7 @@ print('writable lifecycle verified')
                     self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
                     self.assert_no_runtime_files()
 
+    @fuse_only
     def test_remote_rewrite_and_replacement_succeed_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         template=self.writable_open_fixture(source='remote')
@@ -550,6 +598,7 @@ print('independent aliases and unlinked reader verified')
                             str(ROOT/'tests/support/transfer_fault.c'),'-ldl'],check=True,capture_output=True)
         return {'LD_PRELOAD':str(library),'GIT_ON_TEST_TRANSFER_FAULT':mode}
 
+    @fuse_only
     def test_copy_up_authenticates_source_after_transfer_race(self):
         (self.repo/'large').write_bytes(b'x'*(3*65536+17))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','transfer integrity')
@@ -582,6 +631,7 @@ print('checked bytes or EIO')
                 self.assertEqual(result.stdout,b'checked bytes or EIO\n')
                 self.assert_no_runtime_files()
 
+    @fuse_only
     def test_unlinked_source_survives_backing_unlink_failure_without_redecode(self):
         # Inject an OS failure after transferring the raw inode. All later I/O
         # must keep using that inode, even if the original Git object is gone.
@@ -612,6 +662,7 @@ print('source retained after backing unlink failure')
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
         self.assert_success(result);self.assert_no_runtime_files()
 
+    @fuse_only
     def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],self.shared_source_fixture(),size_mib=16)
@@ -656,6 +707,7 @@ print('metadata and unlinked reader verified')
         self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_source_metadata_changes_succeed_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],self.source_metadata_fixture())
@@ -689,7 +741,7 @@ try:
  for fd in fds:
   assert os.fstat(fd).st_size==size
   for offset in (size-4096,0,65536,0):assert os.pread(fd,4096,offset)==pattern
-  os.fsync(fd);os.fdatasync(fd)
+  os.fsync(fd);getattr(os, "fdatasync", os.fsync)(fd)
  with mmap.mmap(fds[0],0,access=mmap.ACCESS_READ) as view:
   assert view[:4096]==pattern and view[-4096:]==pattern
  os.close(fds.pop())
@@ -715,7 +767,7 @@ from pathlib import Path
 p=Path('cached-source')
 reader=os.open(p,os.O_RDONLY)
 duplicate=os.dup(reader);os.close(duplicate)
-os.fsync(reader);os.fdatasync(reader)
+os.fsync(reader);getattr(os, "fdatasync", os.fsync)(reader)
 mapping=mmap.mmap(reader,8192,access=mmap.ACCESS_READ)
 assert mapping[:]==b'a'*8192
 assert p.read_bytes()==b'a'*8192  # warm pages, close and reopen
@@ -723,7 +775,7 @@ writer=os.open(p,os.O_RDWR)
 try:
  os.pwrite(writer,b'b'*8192,0)
  duplicate=os.dup(reader);os.close(duplicate)
- os.fsync(reader);os.fdatasync(reader)
+ os.fsync(reader);getattr(os, "fdatasync", os.fsync)(reader)
  assert os.pread(reader,8192,0)==b'b'*8192 and mapping[:]==b'b'*8192
  assert p.read_bytes()==b'b'*8192
  os.pwrite(writer,b'tail',8192)
@@ -799,10 +851,9 @@ assert p.read_bytes()==b'new'
                 self.assertIsNone(run)
                 self.assert_no_runtime_files()
         raw_name = b"tree-\xff"
-        directory = self.repo / os.fsdecode(raw_name)
-        directory.mkdir()
-        (directory / "value").write_text("non-UTF8 directory\n")
-        git(self.repo, "add", "--all")
+        blob = git(self.repo, "hash-object", "-w", "--stdin", input=b"non-UTF8 directory\n")
+        git(self.repo, "update-index", "-z", "--index-info",
+            input=b"100644 " + blob.encode() + b"\t" + raw_name + b"/value\0")
         git(self.repo, "commit", "--quiet", "-m", "non-UTF8 tree path")
         result, run = self.invoke_argv([
             b"HEAD:" + raw_name, "--", sys.executable, "-c",
@@ -817,7 +868,8 @@ assert p.read_bytes()==b'new'
         git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
         branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
         before = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)")
-        raw_alias = self.root / os.fsdecode(b"repository-\xff")
+        alias_name = b"repository space" if sys.platform == "darwin" else b"repository-\xff"
+        raw_alias = self.root / os.fsdecode(alias_name)
         raw_alias.symlink_to(self.repo, target_is_directory=True)
         cases = [(source, branch + ":refs/heads/private-copy")
                  for source in (str(self.repo), ".", str(raw_alias))]
@@ -853,7 +905,7 @@ assert p.read_bytes()==b'new'
         git(self.repo, "add", "executable.sh")
         git(self.repo, "commit", "--quiet", "-m", "executable fixture")
         code = "from pathlib import Path; import os,subprocess; assert os.access('executable.sh',os.X_OK); assert Path('tracked-link').is_symlink(); assert Path('tracked-link').read_text() == 'committed\\n'; subprocess.run(['./executable.sh'],check=True)"
-        result = subprocess.run([str(BINARY), "HEAD", "--", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(), capture_output=True, timeout=30)
+        result = subprocess.run([str(BINARY), *MOUNT_ARGS, "HEAD", "--", sys.executable, "-c", code], cwd=self.repo / "nested", env=self.environment(), capture_output=True, timeout=30)
         self.assert_success(result)
         self.assertEqual(result.stdout, b"executable\n")
 
@@ -1005,7 +1057,7 @@ assert Path('out/new/result').read_text() == 'first second'
         git(self.repo, "add", "--force", "protected.cache", "nested/protected.tmp")
         git(self.repo, "commit", "--quiet", "-m", "tracked ignore precedence")
         result, _ = self.python(r'''
-import errno, os, stat
+import errno, os, stat, sys
 from pathlib import Path
 
 def denied(label, action, codes=(errno.EROFS, errno.EACCES, errno.EPERM)):
@@ -1030,7 +1082,8 @@ for path in ['tracked.txt', 'out/protected.txt', 'protected.cache',
         ('read-only-truncate', lambda: opened(path, os.O_RDONLY | os.O_TRUNC)),
         ('truncate', lambda: os.truncate(path, 1)),
         ('chmod', lambda: os.chmod(path, 0o600)),
-        ('chown-self', lambda: os.chown(path, os.getuid(), os.getgid())),
+        # Darwin can satisfy chown-to-self without contacting the filesystem.
+        ('chown', lambda: os.chown(path, os.getuid() + (sys.platform == 'darwin'), os.getgid())),
         ('utime', lambda: os.utime(path, ns=(123000000000, 456000000000))),
         ('unlink', lambda: os.unlink(path)),
         ('rename', lambda: os.rename(path, 'out/stolen')),
@@ -1337,6 +1390,7 @@ with open('cache-spill/large', 'rb', buffering=0) as large:
                     for run in self.system_tmp.glob('git-on-*'):
                         self.cleanup_run(run)
 
+    @fuse_only
     def test_partial_backing_write_and_sparse_blocks_remain_visible(self):
         code = r'''
 import errno, os, resource
@@ -1380,6 +1434,7 @@ os.close(fd)
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_short_source_write_preserves_unwritten_bytes_after_reopen(self):
         (self.repo/'large').write_bytes(b'x'*(2*65536+17))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','short source write')
@@ -1417,6 +1472,7 @@ os.close(fd)
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
         self.assert_success(result);self.assert_no_runtime_files()
 
+    @fuse_only
     def test_mknod_regular_files_follow_policy_and_special_nodes_are_refused(self):
         result, _ = self.python(r'''
 import errno, os, socket, stat
@@ -1478,13 +1534,13 @@ for path in ['tracked.txt', 'out/protected.txt']:
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
-        os.fdatasync(fd)
+        getattr(os, "fdatasync", os.fsync)(fd)
         assert os.pread(fd, 100, 0) == expected
     finally: os.close(fd)
 fd = os.open('out/syncdir/value', os.O_RDWR | os.O_CREAT, 0o600)
 try:
     assert os.write(fd, b'before') == 6
-    os.fdatasync(fd)
+    getattr(os, "fdatasync", os.fsync)(fd)
     assert Path('out/syncdir/value').read_bytes() == b'before'
     duplicate = os.dup(fd)
     os.close(duplicate)  # FLUSH must not invalidate the remaining description.
@@ -1494,7 +1550,7 @@ try:
     os.unlink('out/syncdir/value')
     assert os.pwrite(fd, b'open', 0) == 4
     os.fsync(fd)
-    os.fdatasync(fd)
+    getattr(os, "fdatasync", os.fsync)(fd)
     assert os.pread(fd, 20, 0) == b'openr!'
     assert os.fstat(fd).st_nlink == 0
 finally: os.close(fd)
@@ -1502,7 +1558,7 @@ for path in ['.', 'nested', 'out', 'out/syncdir']:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
-        os.fdatasync(fd)
+        getattr(os, "fdatasync", os.fsync)(fd)
     finally: os.close(fd)
 assert not Path('out/syncdir/value').exists()
 assert Path('tracked.txt').read_bytes() == b'committed\n'
@@ -1512,15 +1568,18 @@ assert Path('tracked.txt').read_bytes() == b'committed\n'
 
     def test_statvfs_reports_coherent_backing_filesystem_capacity(self):
         result, _ = self.python(r'''
-import os
+import os, sys
 from pathlib import Path
 
 Path('out/capacity').write_bytes(b'x' * 8192)
 backing = os.statvfs(Path.cwd().parent / 'backing')
 for path in ['.', 'nested', 'tracked.txt', 'out/capacity']:
     stats = os.statvfs(path)
-    for field in ['f_bsize', 'f_frsize', 'f_blocks', 'f_files']:
-        assert getattr(stats, field) == getattr(backing, field), (path, field, stats, backing)
+    # The Darwin client reports NFS capacity in its own fragment units.
+    assert stats.f_blocks * stats.f_frsize == backing.f_blocks * backing.f_frsize, (path, stats, backing)
+    if sys.platform != 'darwin':
+        for field in ['f_bsize', 'f_frsize', 'f_blocks', 'f_files']:
+            assert getattr(stats, field) == getattr(backing, field), (path, field, stats, backing)
     assert stats.f_bsize > 0 and stats.f_frsize > 0 and stats.f_blocks > 0
     assert 0 <= stats.f_bavail <= stats.f_bfree <= stats.f_blocks, stats
     assert 0 <= stats.f_favail <= stats.f_ffree <= stats.f_files, stats
@@ -1537,6 +1596,7 @@ for path in ['.', 'nested', 'tracked.txt', 'out/capacity']:
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_renameat2_noreplace_and_rejected_flags_are_atomic(self):
         result, _ = self.python(r'''
 import ctypes, errno, os
@@ -1597,6 +1657,7 @@ assert Path('out/moved-dir/value').read_bytes() == b'directory payload'
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_readdir_pagination_and_seekdir_preserve_merged_entries(self):
         for index in range(640):
             self.put(f"out/paged/tracked-{index:04d}-" + "x" * 96, "tracked entry\n")
@@ -1729,6 +1790,7 @@ assert set(os.listdir(b'out/paged'))==expected-{b'.',b'..'}
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_xattrs_are_unsupported_without_changing_files_or_directories(self):
         result, _ = self.python(r'''
 import errno, os
@@ -1756,6 +1818,7 @@ for path in ['out/xattr', 'tracked.txt', 'out/protected.txt', 'out/xattrdir', 'n
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_fallocate_and_unknown_ioctl_fail_without_changing_bytes(self):
         result, _ = self.python(r'''
 import ctypes, errno, fcntl, os
@@ -1794,6 +1857,7 @@ for path in ['out/allocate', 'tracked.txt']:
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_posix_and_flock_locks_use_local_kernel_fallback(self):
         result, _ = self.python(r'''
 import errno, fcntl, json, os, subprocess, sys
@@ -1854,6 +1918,7 @@ finally: os.close(fd)
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_poll_and_lseek_use_regular_file_kernel_fallbacks(self):
         result, _ = self.python(r'''
 import errno, os, select
@@ -1891,6 +1956,7 @@ for path, flags in [('tracked.txt', os.O_RDONLY), ('out/seek', os.O_RDWR)]:
         self.assert_success(result)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_copy_file_range_kernel_fallback_preserves_offsets_and_snapshot(self):
         result, _ = self.python(r'''
 import errno, os
@@ -1978,7 +2044,7 @@ assert Path('out/protected.txt').read_text() == 'tracked despite ignore\n'
     def test_concurrent_readers_and_writers_do_not_share_artifacts_or_corrupt_appends(self):
         result, run = self.python(r'''
 from concurrent.futures import ThreadPoolExecutor
-import os
+import os, sys
 from pathlib import Path
 Path('out/appends').write_bytes(b'')
 def worker(index):
@@ -1999,7 +2065,10 @@ with ThreadPoolExecutor(max_workers=8) as pool:
 rows = Path('out/appends').read_bytes().splitlines()
 assert len(rows) == 160, len(rows)
 for index in range(8): assert rows.count(('%04d' % index).encode()) == 20
-assert set(Path('out').iterdir()) == {Path('out/protected.txt'), Path('out/appends')}
+entries = {path.name for path in Path('out').iterdir()}
+if sys.platform == 'darwin':
+    entries.discard('._appends')  # Native AppleDouble metadata for the live file.
+assert entries == {'protected.txt', 'appends'}, entries
 print(len(rows))
 ''')
         self.assert_success(result)
@@ -2098,6 +2167,7 @@ for _ in range(3):
         self.assertIsNone(run)
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_evicted_small_source_survives_removal_of_its_original_git_object(self):
         # Distinct 64 KiB objects exceed the production 16 MiB payload budget.
         # Request removal of the earlier clean kernel data pages with DONTNEED
@@ -2265,7 +2335,7 @@ assert Path(release).exists(), 'parent did not release concurrent runs'
 assert Path('out/shared').read_text() == index
 print(index)
 """
-                processes.append(subprocess.Popen([str(BINARY), "HEAD", "--", sys.executable,
+                processes.append(subprocess.Popen([str(BINARY), "HEAD", *MOUNT_ARGS, "--", sys.executable,
                                                     "-c", code, str(index), str(ready), str(release)],
                                                    cwd=self.repo, env=self.environment(),
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE))
@@ -2330,6 +2400,39 @@ os.close(fd)
 assert path.read_bytes() == b'abcX', path.read_bytes()
 ''')
         self.assert_success(result)
+
+    def test_shared_mmap_and_record_locks(self):
+        result, left = self.invoke_argv([
+            "HEAD", "--write-policy=all", "--", sys.executable, "-c", r"""
+import errno, fcntl, mmap, os, subprocess, sys
+with open('tracked.txt', 'r+b', buffering=0) as stream:
+    fd = stream.fileno()
+    os.ftruncate(fd, 4096)
+    with mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE) as view:
+        view[:4] = b'MMAP'
+        view.flush()
+    os.fsync(fd)
+    assert os.pread(fd, 4, 0) == b'MMAP'
+    fcntl.lockf(fd, fcntl.LOCK_EX, 8)
+    contender = '''
+import errno, fcntl, sys
+with open('tracked.txt', 'r+b', buffering=0) as file:
+    try:
+        fcntl.lockf(file, fcntl.LOCK_EX | fcntl.LOCK_NB, 8)
+    except OSError as error:
+        assert sys.argv[1] == 'held' and error.errno in (errno.EACCES, errno.EAGAIN), error
+    else:
+        assert sys.argv[1] == 'released'
+'''
+    subprocess.run([sys.executable, '-c', contender, 'held'], check=True)
+    fcntl.lockf(fd, fcntl.LOCK_UN, 8)
+    subprocess.run([sys.executable, '-c', contender, 'released'], check=True)
+""",
+        ])
+        self.assert_success(result)
+        self.assertIsNone(left)
+        self.assert_no_runtime_files()
+
 
     def test_interactive_pty_stdin_has_foreground_process_group(self):
         code = "import os,sys; assert all(os.isatty(fd) for fd in (0,1,2)); assert os.tcgetpgrp(0) == os.getpgrp(); print('input-ready',flush=True); assert sys.stdin.readline() == 'terminal-input\\n'; print('terminal-ok',flush=True)"
@@ -2656,14 +2759,21 @@ assert p.exists()
             self.assertIn(os.fsencode(run), result.stderr)
             # A disconnected FUSE mount returns ENOTCONN to stat(), so
             # os.path.ismount misleadingly reports false. Inspect mountinfo.
-            mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
+            if sys.platform == "darwin":
+                mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
+                mountpoints = [line.partition(" on ")[2].rpartition(" (")[0] for line in mounts]
+            else:
+                mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
             self.assertTrue((run / ".state").is_file())
             self.assertTrue(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
             cleanup = self.cleanup_run(run)
-            self.assertNotEqual(cleanup.returncode, 0, "live escaped cwd must remain busy")
-            self.assertTrue((run / "backing").is_dir())
+            if sys.platform == "darwin":
+                self.assert_success(cleanup)  # The checked recovery detaches a dead server.
+            else:
+                self.assertNotEqual(cleanup.returncode, 0, "live escaped cwd must remain busy")
+                self.assertTrue((run / "backing").is_dir())
         finally:
             if pidfile.exists():
                 try: os.killpg(int(pidfile.read_text()), signal.SIGKILL)
@@ -2720,7 +2830,7 @@ pending.write_text(json.dumps({'pid': os.getpid(), 'run': str(Path.cwd().parent)
 pending.replace(ready)
 time.sleep(300)
 """
-        process = subprocess.Popen([str(BINARY), "HEAD", "--",
+        process = subprocess.Popen([str(BINARY), "HEAD", *MOUNT_ARGS, "--",
                                     sys.executable, "-c", code, str(ready)], cwd=self.repo,
                                    env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 20
@@ -2768,6 +2878,7 @@ time.sleep(300)
         self.assertFalse(run.exists())
         self.assert_no_runtime_files()
 
+    @fuse_only
     def test_cleanup_reaps_delayed_unmount_with_inherited_sigchld_blocked(self):
         import shlex
         process, run, child_pid = self.start_sleeping_run()
@@ -2865,8 +2976,8 @@ print(run)
         self.assert_no_runtime_files()
 
 
-@unittest.skipUnless(FUSE_AVAILABLE and OPTIONS.uv, "pass --uv with real FUSE for dependency integration")
-class UvTests(RepositoryTest):
+@unittest.skipUnless(MOUNT_AVAILABLE and OPTIONS.uv, "pass --uv with a real mount for dependency integration")
+class UvTests(MountedRepositoryTest):
     def test_locked_pep723_and_project_with_numba_cache_reuse(self):
         self.assertIsNotNone(shutil.which("uv"), "uv is required for --uv")
         for example in ("pep723", "uv-project"):
@@ -2890,6 +3001,8 @@ class UvTests(RepositoryTest):
 if __name__ == "__main__":
     if not BINARY.is_file():
         PARSER.error(f"binary not found: {BINARY}; run cargo build first")
+    if OPTIONS.require_nfs and (OPTIONS.require_fuse or sys.platform != "darwin"):
+        PARSER.error("select the Darwin NFS client on macOS or the Linux FUSE client")
     if OPTIONS.require_fuse and not FUSE_AVAILABLE:
         PARSER.error("real FUSE required: /dev/fuse and fusermount3/fusermount must be available")
     unittest.main(argv=[sys.argv[0], *UNITTEST_ARGS], verbosity=2)

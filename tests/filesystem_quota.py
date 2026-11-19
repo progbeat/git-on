@@ -12,7 +12,7 @@ STORAGE_OBSERVATION=r'''
 import os
 from pathlib import Path
 root=Path.cwd() if Path('.git').exists() else Path.cwd().parent
-if root!=Path.cwd():assert os.path.ismount('.'),'real FUSE required'
+if root!=Path.cwd():assert os.path.ismount('.'),'real mount required'
 def allocated():
  while True:
   try:return _allocated()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write-policy acceptance against actual FUSE, sharing the integration fixture.
+"""Write-policy acceptance against a native mount, sharing the integration fixture.
 
 python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
 """
@@ -12,11 +12,11 @@ import sys
 import time
 import unittest
 
-from integration import BINARY, FUSE_AVAILABLE, OPTIONS, PARSER, RepositoryTest, git
+from integration import BINARY, FUSE_AVAILABLE, MOUNT_ARGS, MOUNT_AVAILABLE, OPTIONS, PARSER, MountedRepositoryTest, git
 
 
-@unittest.skipUnless(FUSE_AVAILABLE, "real FUSE device and fusermount3 required")
-class WritePolicyTests(RepositoryTest):
+@unittest.skipUnless(MOUNT_AVAILABLE, "a real FUSE or NFS mount is required")
+class WritePolicyTests(MountedRepositoryTest):
 
     def policy(self, policy, code):
         return self.invoke_argv([
@@ -29,6 +29,58 @@ class WritePolicyTests(RepositoryTest):
         self.assertEqual(git(self.repo, "status", "--porcelain", "--ignored"), "")
         self.assertEqual((self.repo / "tracked.txt").read_text(), "committed\n")
         self.assertEqual(os.readlink(self.repo / "tracked-link"), "tracked.txt")
+
+    def test_local_and_remote_sources_preserve_bytes_and_enforce_each_policy(self):
+        script = b"#!/bin/sh\nprintf 'mounted executable\\n'\n"
+        index = bytearray()
+        for mode, name, data in [
+            (b"100755", b"run", script),
+            (b"100755", b"raw-\xff", script),
+            (b"120000", b"byte-link", b"raw-\xff"),
+        ]:
+            oid = subprocess.check_output(["git", "hash-object", "-w", "--stdin"], cwd=self.repo, input=data)
+            index.extend(mode + b" " + oid.strip() + b"\t" + name + b"\0")
+        # The names are created in the Git index so this test is independent of
+        # the representation accepted by the APFS worktree.
+        git(self.repo, "update-index", "-z", "--index-info", input=index)
+        git(self.repo, "commit", "-qm", "byte-only index entries")
+        git(self.repo, "config", "uploadpack.allowFilter", "true")
+        git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+        for source in ([], [self.repo.as_uri()]):
+            for policy in ("none", "ignored", "untracked", "all"):
+                with self.subTest(remote=bool(source), policy=policy):
+                    result, left = self.invoke_argv([
+                        *source, "HEAD", "--write-policy=" + policy, "--", sys.executable, "-c", r"""
+import errno, os, pathlib, subprocess, sys
+policy = sys.argv[1]
+byte_name = b'raw-\xff'
+assert byte_name in os.listdir(b'.')
+assert os.readlink(b'byte-link') == byte_name
+assert os.stat(byte_name).st_size == len(open(byte_name, 'rb').read())
+assert os.access(byte_name, os.X_OK)
+assert subprocess.check_output([b'./run']) == b'mounted executable\n'
+assert subprocess.check_output([b'/bin/sh', b'./byte-link']) == b'mounted executable\n'
+assert pathlib.Path('tracked.txt').read_bytes() == b'committed\n'
+for path, allowed in [
+    ('out/new', policy != 'none'),
+    ('new', policy in ('untracked', 'all')),
+    ('tracked.txt', policy == 'all'),
+]:
+    if path != 'tracked.txt':
+        assert not pathlib.Path(path).exists()
+    try:
+        pathlib.Path(path).write_bytes(b'temporary')
+    except OSError as exc:
+        assert not allowed and exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM), exc
+    else:
+        assert allowed
+        assert pathlib.Path(path).read_bytes() == b'temporary'
+""", policy,
+                    ])
+                    self.assert_success(result)
+                    self.assertIsNone(left)
+                    self.assert_no_runtime_files()
+        self.assertEqual((self.repo / "tracked.txt").read_bytes(), b"committed\n")
 
     def test_all_cached_name_bindings_follow_replacement_links_and_directory_moves(self):
         result, run = self.policy("all", r'''
@@ -79,18 +131,22 @@ assert source.read_bytes() == b'replacement child' and source.stat().st_ino != i
 
     def test_all_cached_attributes_follow_parent_edits_and_source_copy_up(self):
         result, run = self.policy("all", r'''
-import os, stat
+import os, stat, sys
 from pathlib import Path
 root = Path('.')
 epoch = 111111111
-os.utime(root, (epoch, epoch))
+# Darwin's own AppleDouble write during root utime changes the directory.
+# The generated parent and source file below still exercise explicit utime.
+if sys.platform != 'darwin':
+    os.utime(root, (epoch, epoch))
 before = root.stat()
-assert int(before.st_mtime) == epoch
+if sys.platform != 'darwin':
+    assert int(before.st_mtime) == epoch
 parent = Path('generated-parent')
 parent.mkdir()
 after = root.stat()
 assert after.st_nlink == before.st_nlink + 1
-assert int(after.st_mtime) != epoch
+assert after.st_mtime_ns != before.st_mtime_ns
 os.utime(parent, (epoch, epoch))
 initial = parent.stat()
 child = parent / 'child'
@@ -367,7 +423,7 @@ reader.close()
                     code += "Path('tracked.txt').write_text('temporary'); "
                 code += f"Path({str(ready)!r}).touch(); time.sleep(60)"
                 child = subprocess.Popen([
-                    str(BINARY), "HEAD", "--write-policy=" + policy,
+                    str(BINARY), *MOUNT_ARGS, "HEAD", "--write-policy=" + policy,
                     "--", sys.executable, "-c", code,
                 ], cwd=self.repo, env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
@@ -391,6 +447,8 @@ if __name__ == "__main__":
         PARSER.error(f"binary not found: {BINARY}; run cargo build first")
     if OPTIONS.require_fuse and not FUSE_AVAILABLE:
         PARSER.error("real FUSE is required")
+    if OPTIONS.require_nfs and sys.platform != "darwin":
+        PARSER.error("real Darwin NFS is required")
     # integration.py parsed runner arguments before unittest sees test selectors.
     from integration import UNITTEST_ARGS
     unittest.main(argv=[sys.argv[0], *UNITTEST_ARGS], verbosity=2)
