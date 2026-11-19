@@ -73,10 +73,15 @@ On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. The two backends share an
-HTTP(S) loader with up to four invocation-owned connections.
+HTTP(S) loader that initially allows four invocation-owned connections.
+If each of the first eight successful pack transfers takes at least
+64 milliseconds, the loader allows eight connections for the rest of the
+invocation.
 One entry represents each pending OID and a fetch can group up to eight OIDs
-already requested. Single requests reuse the first connection immediately.
-The other helpers start when demands overlap. Cached objects bypass the queue.
+already requested. After expansion, a single pending OID may wait up to
+two milliseconds while another transfer is in flight so overlapping demands
+can share a fetch. A request arriving at an idle pool starts immediately.
+Additional helpers start when demands overlap. Cached objects bypass the queue.
 The queue bounds outstanding objects, and transfer workers release its mutex
 before receiving and checking a pack. The snapshot then verifies and publishes
 the objects through its normal store. This path requires a reusable HTTP(S)

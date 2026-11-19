@@ -1613,10 +1613,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
         while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertTrue(ready.exists(), 'cached blob waited behind the transfers')
-        next_stalled('third connection did not receive an exact demand')
-        next_stalled('fourth connection did not receive an exact demand')
-        # Hold all connections until the other concurrent callbacks reach the
-        # mount. The next free connection can batch already pending requests.
+        more_wants = next_stalled('concurrent sibling lookups did not reach HTTPS')
+        if len(more_wants) == 1:
+            next_stalled('a fourth exact demand did not reach HTTPS')
+        # Give concurrent callbacks time to reach the mount while the initial
+        # transfers are held. A free connection can batch those pending OIDs.
         time.sleep(.2)
         f.resume.set()
         _, errors = process.communicate(timeout=30)

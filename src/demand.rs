@@ -11,11 +11,16 @@ use std::{
         Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
-pub(crate) const CONNECTIONS: usize = 4;
+pub(crate) const CONNECTIONS: usize = 8;
+const INITIAL_CONNECTIONS: usize = 4;
 const MAX_OUTSTANDING: usize = 32;
 const MAX_WANTS: usize = 8;
+const REPLY_SAMPLES: u8 = 8;
+const SLOW_REPLY: Duration = Duration::from_millis(64);
+const BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 pub(crate) struct Batch {
     pub(crate) oids: Vec<Oid>,
@@ -88,19 +93,73 @@ impl Demand {
     }
 }
 
+struct QueuedDemand {
+    oid: Oid,
+    demand: Demand,
+    queued_at: Instant,
+}
+
+enum ConnectionMode {
+    Probing(u8),
+    Standard,
+    Wide,
+}
+
+impl Default for ConnectionMode {
+    fn default() -> Self {
+        Self::Probing(0)
+    }
+}
+
+impl ConnectionMode {
+    fn record_reply(&mut self, elapsed: Duration) -> bool {
+        let Self::Probing(samples) = self else {
+            return false;
+        };
+        // A fast reply rules out consistently high startup latency. Later
+        // bursts of slow replies can reflect server load or larger packs.
+        if elapsed < SLOW_REPLY {
+            *self = Self::Standard;
+        } else {
+            *samples += 1;
+            if *samples == REPLY_SAMPLES {
+                *self = Self::Wide;
+            }
+        }
+        !matches!(self, Self::Probing(_))
+    }
+}
+
 #[derive(Default)]
 struct Queue {
-    waiting: VecDeque<(Oid, Demand)>,
+    waiting: VecDeque<QueuedDemand>,
     pending: HashMap<Oid, Demand>,
     outstanding: usize,
     busy: [bool; CONNECTIONS],
     failure: Option<String>,
+    mode: ConnectionMode,
+}
+
+impl Queue {
+    fn batch_wait(&self, now: Instant) -> Option<Duration> {
+        if matches!(self.mode, ConnectionMode::Wide)
+            && self.waiting.len() == 1
+            && self.busy.contains(&true)
+        {
+            BATCH_WINDOW
+                .checked_sub(now.duration_since(self.waiting.front()?.queued_at))
+                .filter(|remaining| !remaining.is_zero())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
 struct Shared {
     queue: Mutex<Queue>,
     work: Condvar,
+    mode_ready: Condvar,
     stop: Arc<AtomicBool>,
     additional_starts: AtomicU64,
 }
@@ -160,7 +219,11 @@ impl Pool {
             if queue.outstanding < MAX_OUTSTANDING {
                 let demand = Demand::default();
                 queue.pending.insert(oid, demand.clone());
-                queue.waiting.push_back((oid, demand.clone()));
+                queue.waiting.push_back(QueuedDemand {
+                    oid,
+                    demand: demand.clone(),
+                    queued_at: Instant::now(),
+                });
                 queue.outstanding += 1;
                 self.shared.work.notify_all();
                 return Ok(demand);
@@ -192,7 +255,8 @@ impl Pool {
             std::mem::take(&mut queue.waiting)
         };
         self.shared.work.notify_all();
-        for (oid, demand) in waiting {
+        self.shared.mode_ready.notify_all();
+        for QueuedDemand { oid, demand, .. } in waiting {
             demand.complete(Batch::new(
                 vec![oid],
                 Err(object::OperationCancelled.into()),
@@ -225,28 +289,51 @@ impl Shared {
         mut command: Option<Command>,
         scratch: &RawBlobs,
     ) -> Result<()> {
+        if index >= INITIAL_CONNECTIONS {
+            // Spare workers do not compete for the work queue during probing.
+            let queue = self.queue.lock().unwrap();
+            let queue = self
+                .mode_ready
+                .wait_while(queue, |queue| {
+                    !self.stop.load(Ordering::Relaxed)
+                        && matches!(queue.mode, ConnectionMode::Probing(_))
+                })
+                .unwrap();
+            if !matches!(queue.mode, ConnectionMode::Wide) {
+                return Ok(());
+            }
+        }
         loop {
-            let (work, failure) = {
-                let queue = self.queue.lock().unwrap();
-                let mut queue = self
-                    .work
-                    .wait_while(queue, |queue| {
-                        !self.stop.load(Ordering::Relaxed)
-                            && (queue.waiting.is_empty() || queue.busy[..index].contains(&false))
-                    })
-                    .unwrap();
-                if self.stop.load(Ordering::Relaxed) {
-                    break;
+            let next = {
+                let mut queue = self.queue.lock().unwrap();
+                loop {
+                    queue = self
+                        .work
+                        .wait_while(queue, |queue| {
+                            !self.stop.load(Ordering::Relaxed)
+                                && (queue.waiting.is_empty()
+                                    || queue.busy[..index].contains(&false))
+                        })
+                        .unwrap();
+                    if self.stop.load(Ordering::Relaxed) {
+                        break None;
+                    }
+                    if let Some(remaining) = queue.batch_wait(Instant::now()) {
+                        queue = self.work.wait_timeout(queue, remaining).unwrap().0;
+                        continue;
+                    }
+                    // Use an established lower-numbered connection first.
+                    let count = queue.waiting.len().min(MAX_WANTS);
+                    let work: Vec<_> = queue.waiting.drain(..count).collect();
+                    queue.busy[index] = true;
+                    break Some((work, queue.failure.clone()));
                 }
-                // Use an established lower-numbered connection first. Extra
-                // helpers start only when real demands overlap.
-                let count = queue.waiting.len().min(MAX_WANTS);
-                let work: Vec<_> = queue.waiting.drain(..count).collect();
-                queue.busy[index] = true;
-                (work, queue.failure.clone())
+            };
+            let Some((work, failure)) = next else {
+                break;
             };
             self.work.notify_all();
-            let oids = work.iter().map(|(oid, _)| *oid).collect::<Vec<_>>();
+            let oids = work.iter().map(|item| item.oid).collect::<Vec<_>>();
             let result = (|| {
                 if let Some(failure) = failure {
                     bail!("remote object transport previously failed: {failure}");
@@ -261,11 +348,18 @@ impl Shared {
                     .as_mut()
                     .context("HTTPS helper cannot reuse its connection")?;
                 let pack = scratch.scratch_file()?;
+                let started = Instant::now();
                 session.fetch_exact(&oids, &pack)?;
-                Ok(pack)
+                Ok((pack, started.elapsed()))
             })();
-            {
+            let result = {
                 let mut queue = self.queue.lock().unwrap();
+                let result = result.map(|(pack, elapsed)| {
+                    if queue.mode.record_reply(elapsed) {
+                        self.mode_ready.notify_all();
+                    }
+                    pack
+                });
                 if let Err(error) = &result {
                     if queue.failure.is_none() && !object::is_cancelled(error) {
                         queue.failure = Some(format!("{error:#}"));
@@ -273,13 +367,62 @@ impl Shared {
                 }
                 queue.outstanding -= work.len();
                 queue.busy[index] = false;
-            }
+                result
+            };
             let batch = Batch::new(oids, result);
-            for (_, demand) in work {
-                demand.complete(batch.clone());
+            for item in work {
+                item.demand.complete(batch.clone());
             }
             self.work.notify_all();
         }
         session.as_ref().map_or(Ok(()), Session::stop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_only_when_every_startup_reply_is_slow() {
+        let mut variable = ConnectionMode::default();
+        let mut slow = ConnectionMode::default();
+        for _ in 1..REPLY_SAMPLES {
+            assert!(!slow.record_reply(SLOW_REPLY));
+            assert!(!variable.record_reply(SLOW_REPLY));
+        }
+        assert!(variable.record_reply(SLOW_REPLY / 2));
+        for _ in 0..REPLY_SAMPLES {
+            assert!(!variable.record_reply(SLOW_REPLY));
+        }
+        assert!(matches!(variable, ConnectionMode::Standard));
+        assert!(slow.record_reply(SLOW_REPLY));
+        assert!(!slow.record_reply(SLOW_REPLY / 2));
+        assert!(matches!(slow, ConnectionMode::Wide));
+    }
+
+    #[test]
+    fn wait_briefly_only_when_one_wide_mode_demand_can_join_others() {
+        let now = Instant::now();
+        let mut queue = Queue::default();
+        queue.waiting.push_back(QueuedDemand {
+            oid: Oid::zero(),
+            demand: Demand::default(),
+            queued_at: now,
+        });
+        queue.busy[0] = true;
+        assert_eq!(queue.batch_wait(now), None);
+        queue.mode = ConnectionMode::Wide;
+        assert_eq!(queue.batch_wait(now), Some(BATCH_WINDOW));
+        assert_eq!(queue.batch_wait(now + BATCH_WINDOW), None);
+        queue.busy[0] = false;
+        assert_eq!(queue.batch_wait(now), None);
+        queue.busy[0] = true;
+        queue.waiting.push_back(QueuedDemand {
+            oid: Oid::from_bytes(&[1; 20]).unwrap(),
+            demand: Demand::default(),
+            queued_at: now,
+        });
+        assert_eq!(queue.batch_wait(now), None);
     }
 }
