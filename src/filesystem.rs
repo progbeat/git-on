@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-const PREFETCH_SCAN_LIMIT: usize = 32;
+const PREFETCH_SCAN_LIMIT: usize = 256;
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
@@ -62,6 +62,27 @@ struct SourceDirectory {
     tree: Arc<crate::tree::Directory>,
     base: u64,
     opened: bool,
+    considered: BTreeMap<usize, usize>,
+}
+
+impl SourceDirectory {
+    fn next_candidate(&self, index: usize) -> usize {
+        self.considered
+            .range(..=index)
+            .next_back()
+            .map_or(index, |(_, end)| index.max(*end))
+    }
+
+    fn consider(&mut self, index: usize) {
+        let end = self.considered.remove(&(index + 1)).unwrap_or(index + 1);
+        if let Some((_, previous)) = self.considered.range_mut(..index).next_back() {
+            if *previous == index {
+                *previous = end;
+                return;
+            }
+        }
+        self.considered.insert(index, end);
+    }
 }
 
 struct DfsFrame {
@@ -73,7 +94,8 @@ struct DfsFrame {
 /// Walk the already-open source view in Git tree order. Each frame borrows
 /// the parsed tree rather than building a second index of the directory's files.
 struct OpenedFiles<'a> {
-    overlay: &'a Overlay,
+    directories: &'a mut [SourceDirectory],
+    keys: &'a HashMap<PathBuf, usize>,
     stack: Vec<DfsFrame>,
     remaining: usize,
 }
@@ -84,22 +106,26 @@ impl Iterator for OpenedFiles<'_> {
     fn next(&mut self) -> Option<Oid> {
         while self.remaining != 0 {
             let frame = self.stack.last_mut()?;
-            let directory = &self.overlay.source_directories[frame.key];
-            let index = frame.next;
+            let directory = &mut self.directories[frame.key];
+            let index = directory.next_candidate(frame.next);
             let Some((mode, oid)) = directory.tree.metadata_at(index) else {
                 self.stack.pop();
                 continue;
             };
-            frame.next += 1;
-            // Count skipped entries as well, including cached OIDs that the
-            // caller rejects. Reverse or sparse access stays bounded.
+            frame.next = index + 1;
             self.remaining -= 1;
             match mode {
-                0o100644 | 0o100755 if directory.opened => return Some(oid),
+                0o100644 | 0o100755 if directory.opened => {
+                    // The queue considers each yielded OID before asking for
+                    // the next. Coalesce visited indices into runs so warm or
+                    // reverse reads can skip them without rescanning names.
+                    directory.consider(index);
+                    return Some(oid);
+                }
                 0o040000 => {
                     let (name, _) = directory.tree.at(index)?;
                     let path = frame.path.join(name);
-                    if let Some(&key) = self.overlay.source_directory_keys.get(&path) {
+                    if let Some(&key) = self.keys.get(&path) {
                         self.stack.push(DfsFrame { path, key, next: 0 });
                     }
                 }
@@ -520,6 +546,7 @@ impl Overlay {
             tree,
             base,
             opened: false,
+            considered: BTreeMap::new(),
         });
         self.source_directory_keys.insert(source, key);
         Ok(key)
@@ -1615,15 +1642,16 @@ impl Overlay {
     }
 
     pub(crate) fn start_remote_demand(
-        &self,
+        &mut self,
         oid: Oid,
         inode: Option<u64>,
     ) -> Option<crate::snapshot::PendingObject> {
+        let snapshot = self._snapshot.clone();
         let files = inode.and_then(|ino| self.opened_files_after(ino));
-        self._snapshot.start_remote_demand(oid, files)
+        snapshot.start_remote_demand(oid, files)
     }
 
-    fn opened_files_after(&self, ino: u64) -> Option<OpenedFiles<'_>> {
+    fn opened_files_after(&mut self, ino: u64) -> Option<OpenedFiles<'_>> {
         let node = self.nodes.get(&ino)?;
         if node.attr.kind != FileType::RegularFile {
             return None;
@@ -1648,7 +1676,8 @@ impl Overlay {
         }
         stack.reverse();
         Some(OpenedFiles {
-            overlay: self,
+            directories: &mut self.source_directories,
+            keys: &self.source_directory_keys,
             stack,
             remaining: PREFETCH_SCAN_LIMIT,
         })
@@ -2240,7 +2269,7 @@ mod tests {
         let blob = repo.blob(b"anchor").unwrap();
         let mut tree = repo.treebuilder(None).unwrap();
         tree.insert("a", blob, 0o100644).unwrap();
-        for index in 0..64 {
+        for index in 0..PREFETCH_SCAN_LIMIT {
             tree.insert(format!("b-{index:02}"), blob, 0o120000)
                 .unwrap();
         }

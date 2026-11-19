@@ -104,15 +104,17 @@ class StreamingTests(unittest.TestCase):
             with self.subTest(transport=transport), ExitStack() as stack:
                 fixture = fixture_in_short_tmp()
                 stack.callback(fixture.close)
-                names = ['a', 'b/first', 'b/second', 'd', 'e', 'f', 'hidden/no']
+                names = ['a', 'b/first', 'b/second', 'd', 'e', 'f', 'g', 'h', 'i',
+                         'j', 'k', 'hidden/no']
                 data = [f'payload-{index}\n'.encode() for index, _ in enumerate(names)]
                 oids = [fixture.git('hash-object', '-w', '--stdin', data=payload) for payload in data]
                 b = fixture.git('mktree', data=f'100644 blob {oids[1]}\tfirst\n100644 blob {oids[2]}\tsecond\n'.encode())
                 hidden = fixture.git('mktree', data=f'100644 blob {oids[-1]}\tno\n'.encode())
+                files = ''.join(f'100644 blob {oid}\t{name}\n'
+                                for name, oid in zip(names[3:-1], oids[3:-1]))
                 root = fixture.git('mktree', data=(
                     f'100644 blob {oids[0]}\ta\n040000 tree {b}\tb\n'
-                    f'100644 blob {oids[3]}\td\n100644 blob {oids[4]}\te\n'
-                    f'100644 blob {oids[5]}\tf\n040000 tree {hidden}\thidden\n'
+                    f'{files}040000 tree {hidden}\thidden\n'
                 ).encode())
                 commit = fixture.git('commit-tree', root, data=b'separate prefetch\n')
                 fixture.git('update-ref', 'refs/heads/main', commit)
@@ -154,7 +156,11 @@ while not Path({str(split.started)!r}).exists():
     assert time.monotonic() < deadline, 'prefetch did not start'
     time.sleep(.01)
 assert Path('b/first').read_bytes() == {data[1]!r}
+assert Path('b/first').read_bytes() == {data[1]!r}
 Path({str(ready)!r}).touch()
+while not Path({str(split.release)!r}).exists():
+    assert time.monotonic() < deadline, 'the test did not release the pack'
+    time.sleep(.01)
 assert Path('b/second').read_bytes() == {data[2]!r}
 assert Path('hidden/no').read_bytes() == {data[-1]!r}
 """
@@ -172,7 +178,14 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
                 try:
                     started = await_file(split.started, 12, process)
                     early = started and await_file(ready, 5, process)
-                    self.assertNotIn(hidden.encode(), set().union(*requests()))
+                    refill = {oid.encode() for oid in oids[5:9]}
+                    deadline = time.monotonic() + 5
+                    while early and refill not in requests() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertIn(refill, requests())
+                    fetched = set().union(*requests())
+                    self.assertNotIn(hidden.encode(), fetched)
+                    self.assertFalse(fetched & {oid.encode() for oid in oids[9:-1]})
                 finally:
                     split.release.touch()
                 _, errors = process.communicate(timeout=15)

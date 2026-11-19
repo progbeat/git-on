@@ -56,8 +56,11 @@ Where protocol v2 and the caller's policy permit, exact demands reuse
 invocation-owned channels. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
 SSH path and port bytes; unknown formats retain native fetch. Native Git
-resolves and fetches the initial HTTPS selection with the caller's credentials,
-proxies and TLS policy.
+resolves symbolic revisions and refspecs with the caller's credentials,
+proxies and TLS policy. A full SHA-1 object ID can use the reusable HTTPS
+channel for the initial fetch after validating filtering and authentication.
+SSH can fetch that same exact object over a channel on the authenticated master
+and reuse the channel for the root tree and later demands.
 Interactive preparation uses native fetch with job-control supervision. Git-on
 owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
 request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
@@ -90,15 +93,17 @@ same owned master and uses fewer when the server refuses an additional channel.
 An idle pool starts an ordinary request immediately. On a slow source the queue
 can wait up to two milliseconds to combine overlapping demands.
 
-A first access to a regular file in a directory opened for enumeration can
-find up to four uncached and previously unscheduled blob OIDs in the next 32
-entries of Git's depth-first order through already opened directories. The
-same planner serves FUSE and NFS. Each speculative pack contains up to four
-OIDs. Ordinary demands
-take precedence and can join an active speculative request without duplicating
-its fetch. If that speculation fails, only waiting ordinary demands reenter
-the request queue. These paths require a reusable transport and an unrestricted
-per-file size limit.
+A first access to a regular file in a directory opened for enumeration finds
+uncached and previously unscheduled blob OIDs in Git's depth-first order
+through already opened directories. It skips previously considered ranges
+and examines at most 256 remaining entries. The same planner serves FUSE and
+NFS. Speculative packs start with up to four OIDs. Confirmed first accesses to
+predicted objects can expand this to 16, 32 or 64, with a bound on the number
+of predictions awaiting an actual access. Ordinary demands take precedence and
+can join an active speculative request without duplicating its fetch. If that
+speculation fails, only waiting ordinary demands reenter the request queue.
+These paths require a reusable transport and an unrestricted per-file size
+limit.
 
 The HTTPS and SSH receivers share the same incremental Git framing and pack
 decoder. It inflates ordinary entries in memory and verifies the canonical Git

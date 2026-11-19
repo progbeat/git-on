@@ -24,6 +24,8 @@ const CONNECTIONS: usize = 8;
 const INITIAL_CONNECTIONS: usize = 4;
 const MAX_WANTS: usize = 8;
 const READ_AHEAD: usize = 4;
+const MAX_READ_AHEAD: usize = 64;
+const MAX_FORECAST_SCORE: u8 = 24;
 const NATIVE_BLOB_STREAM_THRESHOLD: usize = 8 * 1024 * 1024;
 const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
@@ -120,6 +122,7 @@ struct QueuedDemand {
     oid: Oid,
     demand: Demand,
     queued_at: Instant,
+    prefetch_width: usize,
 }
 
 struct Work {
@@ -129,7 +132,11 @@ struct Work {
 
 impl Work {
     fn take(queue: &mut VecDeque<QueuedDemand>, speculative: bool) -> Option<Self> {
-        let limit = if speculative { READ_AHEAD } else { MAX_WANTS };
+        let limit = if speculative {
+            queue.front()?.prefetch_width
+        } else {
+            MAX_WANTS
+        };
         let count = queue.len().min(limit);
         (count != 0).then(|| Self {
             items: queue.drain(..count).collect(),
@@ -182,6 +189,7 @@ struct Queue {
     ahead: VecDeque<QueuedDemand>,
     pending: HashMap<Oid, Demand>,
     predicted: HashSet<Oid>,
+    forecast_score: u8,
     busy: [bool; CONNECTIONS],
     native_ceiling: Option<usize>,
     failure: Option<String>,
@@ -196,6 +204,21 @@ impl Queue {
             oid,
             demand,
             queued_at: Instant::now(),
+            prefetch_width: READ_AHEAD,
+        }
+    }
+
+    fn forecast_width(&mut self, anchor: Oid) -> usize {
+        if self.predicted.remove(&anchor) {
+            self.forecast_score = (self.forecast_score + 1).min(MAX_FORECAST_SCORE);
+        } else {
+            self.forecast_score = self.forecast_score.saturating_sub(2);
+        }
+        match self.forecast_score {
+            0..=2 => READ_AHEAD,
+            3..=5 => 16,
+            6..=8 => 32,
+            _ => MAX_READ_AHEAD,
         }
     }
 
@@ -408,12 +431,19 @@ impl Pool {
         Ok(demand)
     }
 
-    pub(crate) fn prefetch(&self, candidates: impl IntoIterator<Item = Oid>) {
+    pub(crate) fn prefetch(&self, anchor: Oid, candidates: impl IntoIterator<Item = Oid>) {
         let mut queue = self.shared.queue.lock().unwrap();
         if self.shared.stop.load(Ordering::Relaxed)
             || queue.failure.is_some()
             || queue.native_ceiling == Some(1)
         {
+            return;
+        }
+        // Only the first real access to a predicted OID earns credit.
+        // Keep a bounded distance ahead of those observed accesses.
+        let width = queue.forecast_width(anchor);
+        let limit = width.min((4 * width).saturating_sub(queue.predicted.len()));
+        if limit == 0 {
             return;
         }
         let mut accepted = 0;
@@ -425,10 +455,11 @@ impl Pool {
                 continue;
             }
             queue.predicted.insert(oid);
-            let entry = queue.insert(oid);
+            let mut entry = queue.insert(oid);
+            entry.prefetch_width = width;
             queue.ahead.push_back(entry);
             accepted += 1;
-            if accepted == READ_AHEAD {
+            if accepted == limit {
                 break;
             }
         }
@@ -925,6 +956,25 @@ mod tests {
     }
 
     #[test]
+    fn forecast_grows_with_distinct_hits_and_shrinks_on_misses() {
+        let mut queue = Queue::default();
+        for index in 0..9 {
+            let oid = Oid::from_bytes(&[index; 20]).unwrap();
+            queue.predicted.insert(oid);
+            let expected = match index {
+                0..=1 => 4,
+                2..=4 => 16,
+                5..=7 => 32,
+                _ => 64,
+            };
+            assert_eq!(queue.forecast_width(oid), expected);
+        }
+        for width in [32, 16, 16, 4] {
+            assert_eq!(queue.forecast_width(Oid::zero()), width);
+        }
+    }
+
+    #[test]
     fn failed_speculation_requeues_the_live_waiter() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
@@ -966,6 +1016,7 @@ mod tests {
             oid: Oid::zero(),
             demand: Demand::default(),
             queued_at: now,
+            prefetch_width: READ_AHEAD,
         });
         assert_eq!(queue.batch_wait(now, true), None);
         queue.mode = ConnectionMode::Wide;
@@ -978,6 +1029,7 @@ mod tests {
                 oid: Oid::from_bytes(&[index as u8; 20]).unwrap(),
                 demand: Demand::default(),
                 queued_at: now,
+                prefetch_width: READ_AHEAD,
             });
         }
         assert_eq!(queue.batch_wait(now, true), None);

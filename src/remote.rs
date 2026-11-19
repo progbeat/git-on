@@ -275,6 +275,27 @@ impl Remote {
             let oid = remote.fetch_selected(revision, true, false)?;
             return Ok((remote, oid));
         }
+        // An unabbreviated object ID needs no ref advertisement to select its
+        // value. Reuse the capability-checked channel for mounting and later
+        // demands. Named revisions still go through native Git selection.
+        let exact = (crate::spool::Files::size_limit()?.is_none()
+            && revision.as_bytes().len() == 40
+            && revision.as_bytes().iter().all(u8::is_ascii_hexdigit))
+        .then(|| {
+            revision
+                .to_str()
+                .and_then(|value| Oid::from_str(value).ok())
+        })
+        .flatten();
+        if let Some(oid) = exact {
+            if remote.open_http2_pool()? {
+                remote.http2_checked = true;
+                remote.pool_checked = true;
+                let repo = Repository::open_bare(&remote.dir)?;
+                remote.fetch(&repo, &[oid])?;
+                return Ok((remote, oid));
+            }
+        }
         // Authentication and host-key interaction happen here, before mounting.
         let capabilities = tempfile::NamedTempFile::new_in(run)?;
         let mut command = remote.command(true)?;
@@ -311,6 +332,16 @@ impl Remote {
             bail!("remote server does not advertise object filtering; full-clone fallback is forbidden");
         }
         remote.failed = None;
+        if let Some(oid) = exact.filter(|_| remote.socket_owner.is_some()) {
+            remote.session = remote.start_session(false)?;
+            if remote.session.is_some() {
+                remote.session_checked = true;
+                let repo = Repository::open_bare(&remote.dir)?;
+                if remote.fetch_in_session(&repo, &[oid])? {
+                    return Ok((remote, oid));
+                }
+            }
+        }
         let oid = remote.fetch_selected(revision, false, false)?;
         Ok((remote, oid))
     }
@@ -617,7 +648,7 @@ impl Remote {
             };
             let demand = wanted.then(|| pool.request(oid)).transpose()?;
             if let Some(candidates) = candidates.filter(|_| self.forecast_seen.insert(oid)) {
-                pool.prefetch(candidates.filter(|oid| !odb.exists(*oid)));
+                pool.prefetch(oid, candidates.filter(|oid| !odb.exists(*oid)));
             }
             Ok(demand)
         })();
@@ -666,16 +697,21 @@ impl Remote {
             return Ok(());
         }
         self.http2_checked = true;
+        self.open_http2_pool()?;
+        Ok(())
+    }
+
+    fn open_http2_pool(&mut self) -> Result<bool> {
         if !self.demand_url.as_bytes().starts_with(b"https://")
             || !self.git.http2_compatible()
             || !self.git.demand_session_compatible()?
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(configuration) =
             crate::http2::Configuration::new(&self.demand_url, self.command(false)?)
         else {
-            return Ok(());
+            return Ok(false);
         };
         self.demand_pool = crate::demand::Pool::http2(configuration, &self.raw_blobs, &self.git)?;
         if self.demand_pool.is_some() {
@@ -684,7 +720,7 @@ impl Remote {
             }
             self.session_starts += 1;
         }
-        Ok(())
+        Ok(self.demand_pool.is_some())
     }
     pub(crate) fn finish_demand(
         &mut self,

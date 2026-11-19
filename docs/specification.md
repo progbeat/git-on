@@ -231,9 +231,11 @@ and complete in-memory copies of the selected tree.
    tree object, but must not recursively enumerate its children. Resolving a
    deep path may read its ancestor trees.
 3. File contents are loaded on demand. Directory listings alone do not load
-   file payloads. On reusable remote transports, a regular-file request in an
-   opened directory can also schedule up to four subsequent regular-file OIDs
-   in depth-first order through already opened directories. A lookup in an
+   file payloads. On reusable remote transports, the first actual request for
+   a regular-file OID in an opened directory can schedule subsequent OIDs in
+   depth-first order through already opened directories. The window starts at
+   four objects and expands only as first accesses confirm earlier forecasts.
+   A lookup in an
    unopened directory may load only the necessary blob headers, applicable
    ignore files, and required Git object decoding.
 4. Git storage encoding may require decoding a whole object or its delta bases,

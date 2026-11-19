@@ -194,7 +194,7 @@ with ThreadPoolExecutor(1) as pool:
             try:
                 process = subprocess.Popen(
                     [OPTIONS.binary, f'https://127.0.0.1:{proxy.server_address[1]}/server.git',
-                     'HEAD', backend_flag, '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', code],
+                     fixture.commit, backend_flag, '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', code],
                     cwd=fixture.cwd, env=env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 fixture.children.append(process)
@@ -221,11 +221,14 @@ with ThreadPoolExecutor(1) as pool:
             _, errors = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 0, errors)
             report = json.load(metrics)
-        self.assertEqual(report['remote_http2_fetch_operations'], 3, report)
+        self.assertEqual(report['remote_native_pack_bytes'], 0, report)
+        self.assertEqual(report['remote_http2_fetch_operations'], 5, report)
         self.assertGreaterEqual(report['remote_http2_peak_requests'], 2, report)
         connections = {
             connection for connection, wants in proxy.records
-            if fixture.other.encode() in wants or fixture.blob.encode() in wants
+            if set(wants) & {oid.encode() for oid in (
+                fixture.commit, fixture.tree, fixture.other, fixture.blob
+            )}
         }
         self.assertEqual(len(connections), 1, proxy.records)
         self.assertEqual(

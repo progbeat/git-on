@@ -138,7 +138,7 @@ impl Server {
     }
 
     fn start_demand(
-        &self,
+        &mut self,
         demand: ObjectDemand,
         wake: &Arc<Notify>,
     ) -> Option<(PendingObject, bool)> {
