@@ -91,8 +91,13 @@ successful transfers takes at least 64 milliseconds, the pool can use up to
 16 channels. It can expand earlier if a scan confirms its forecasts while the
 connection is still being measured. SSH opens its channels through the same
 owned master and uses fewer when the server refuses an additional channel.
-After a slow SSH handshake, spare channels can negotiate protocol v2 in
-parallel with preparing the snapshot on that master.
+On a slow SSH startup, up to two spare channels can begin negotiating protocol
+v2 as soon as the authenticated, owned socket exists. The first channel to
+advertise filtered protocol v2 selects the revision and prepares the snapshot.
+When another channel opens during execution, pending requests stay eligible
+on the existing channels until one is available to send them.
+Beyond the initial SSH pool, actual demands open additional channels.
+Prefetch can use those channels after they connect.
 An idle pool starts an ordinary request immediately. While a transfer is active,
 the queue can wait up to two milliseconds on a slow source. A dense scan can
 wait up to twelve milliseconds to combine overlapping requests.

@@ -163,25 +163,38 @@ impl Connection {
         self.open(Some(stop), true)
     }
 
+    pub(crate) fn start_additional(&self) -> Result<StartingSession> {
+        StartingSession::spawn(self.command(true)?, self.helper, None)
+    }
+
     fn open(&self, stop: Stop, additional: bool) -> Result<Option<Session>> {
+        Session::connect_with_stop(self.command(additional)?, self.helper, stop)
+    }
+
+    fn command(&self, additional: bool) -> Result<Command> {
         self.check()?;
-        let mut command = Command::new(self.command.get_program());
-        command.args(self.command.get_args());
-        if let Some(directory) = self.command.get_current_dir() {
-            command.current_dir(directory);
-        }
-        for (key, value) in self.command.get_envs() {
-            if let Some(value) = value {
-                command.env(key, value);
-            } else {
-                command.env_remove(key);
-            }
-        }
+        let mut command = copy_command(&self.command);
         if additional && self.is_ssh() {
             command.env("GIT_ON_SSH_ADDITIONAL", "1");
         }
-        Session::connect_with_stop(command, self.helper, stop)
+        Ok(command)
     }
+}
+
+pub(crate) fn copy_command(template: &Command) -> Command {
+    let mut command = Command::new(template.get_program());
+    command.args(template.get_args());
+    if let Some(directory) = template.get_current_dir() {
+        command.current_dir(directory);
+    }
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command
 }
 
 pub(crate) struct Session {
@@ -191,30 +204,11 @@ pub(crate) struct Session {
     errors: File,
     stateless: bool,
 }
-#[derive(Debug, PartialEq)]
-enum Packet {
-    Flush,
-    Delimiter,
-    End,
-    Data(Vec<u8>),
-}
-// Git text pkt-lines accept an optional terminal LF. Never apply this to
-// sideband pack payloads, which remain byte-exact binary data.
-pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
-}
-impl Session {
-    /// A missing protocol/helper capability is an optional optimization miss,
-    /// before any fetch. Errors after a fetch request must never retry it.
-    #[cfg(test)]
-    pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
-        Self::connect_with_stop(command, helper, None)
-    }
-    pub(crate) fn connect_with_stop(
-        mut command: Command,
-        helper: bool,
-        stop: Stop,
-    ) -> Result<Option<Self>> {
+
+pub(crate) struct StartingSession(Session);
+
+impl StartingSession {
+    pub(crate) fn spawn(mut command: Command, helper: bool, stop: Stop) -> Result<Self> {
         check_transfer(&stop)?;
         let (input, to_child) = UnixStream::pair()?;
         input.set_nonblocking(true)?;
@@ -241,15 +235,39 @@ impl Session {
         // Command retains its Stdio descriptors after spawn. Close the
         // parent's copies so an exited helper produces EOF during handshake.
         drop(command);
-        let mut session = Self {
+        Ok(Self(Session {
             owner: Owner(Mutex::new(Some(child))),
             input: Output(input, stop.clone()),
             output: BufReader::with_capacity(64 * 1024, Input(output, stop)),
             errors,
             stateless: helper,
-        };
-        match session.handshake(helper) {
-            Ok(true) => Ok(Some(session)),
+        }))
+    }
+
+    pub(crate) fn wait_for_advertisement(sessions: &[Self]) -> io::Result<Option<usize>> {
+        check_transfer(&None)?;
+        let mut sockets: Vec<_> = sessions
+            .iter()
+            .map(|session| libc::pollfd {
+                fd: session.0.output.get_ref().0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        if unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, 10) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        Ok(sockets.iter().position(|socket| socket.revents != 0))
+    }
+
+    pub(crate) fn negotiate(mut self) -> Result<Option<Session>> {
+        let session = &mut self.0;
+        match session.handshake(session.stateless) {
+            Ok(true) => Ok(Some(self.0)),
             Ok(false) => Ok(None),
             Err(error) => {
                 let diagnostic = session.error_text();
@@ -257,6 +275,38 @@ impl Session {
                     .with_context(|| format!("open native demand channel: {}", diagnostic.trim()))
             }
         }
+    }
+
+    pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.0.set_stop(stop);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Packet {
+    Flush,
+    Delimiter,
+    End,
+    Data(Vec<u8>),
+}
+// Git text pkt-lines accept an optional terminal LF. Never apply this to
+// sideband pack payloads, which remain byte-exact binary data.
+pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+impl Session {
+    /// A missing protocol/helper capability is an optional optimization miss,
+    /// before any fetch. Errors after a fetch request must never retry it.
+    #[cfg(test)]
+    pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
+        Self::connect_with_stop(command, helper, None)
+    }
+    pub(crate) fn connect_with_stop(
+        command: Command,
+        helper: bool,
+        stop: Stop,
+    ) -> Result<Option<Self>> {
+        StartingSession::spawn(command, helper, stop)?.negotiate()
     }
     pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         self.input.1 = Some(stop.clone());

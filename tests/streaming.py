@@ -213,6 +213,11 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
         commit = fixture.git('commit-tree', tree, data=b'one SSH channel\n')
         fixture.git('update-ref', 'refs/heads/main', commit)
         url = fixture.ssh(protocol_v2=True, max_sessions=1)
+        shim = fixture.root / 'slow-upload-pack'
+        shim.write_text(f'#!/bin/sh\nsleep 0.4\nexec git-upload-pack {shlex.quote(str(fixture.repo))}\n')
+        shim.chmod(0o700)
+        authorized = fixture.root / 'authorized'
+        authorized.write_text(f'command="{shlex.quote(str(shim))}" ' + authorized.read_text())
         script = f"""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -222,7 +227,7 @@ with ThreadPoolExecutor(12) as pool:
     assert list(pool.map(lambda name: Path(name).read_bytes(), contents)) == list(contents.values())
 """
         result = subprocess.run(
-            [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
+            [OPTIONS.binary, url, 'main', mount_flag(), '--write-policy=none', '--',
              sys.executable, '-I', '-S', '-c', script],
             cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=25,
         )

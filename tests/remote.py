@@ -2027,6 +2027,32 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         f.finish(process)
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
+    def test_ssh_spare_can_prepare_while_first_advertisement_waits(self):
+        f = self.f
+        url = f.ssh(protocol_v2=True, max_sessions=2)
+        release = f.root / 'release-primary'
+        self.addCleanup(release.touch)
+        shim = f.root / 'hold-first-upload-pack'
+        shim.write_text(
+            '#!/bin/sh\n'
+            f'if mkdir {shlex.quote(str(f.root / "first-channel"))} 2>/dev/null; then\n'
+            f'    while test ! -f {shlex.quote(str(release))}; do sleep 0.02; done\n'
+            'fi\n'
+            f'exec git-upload-pack {shlex.quote(str(f.repo))}\n'
+        )
+        shim.chmod(0o700)
+        authorized = f.root / 'authorized'
+        authorized.write_text(f'command="{shlex.quote(str(shim))}" ' + authorized.read_text())
+        process = f.probe(url, 'main')
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 5)
+            self.assertTrue(ready, 'the spare did not complete preparation before the first advertisement')
+            self.assertEqual(f.line(process)['tree'], f.tree)
+        finally:
+            release.touch()
+        f.finish(process)
+        self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
     def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
         f=self.f;url=f.ssh(protocol_v2=True)
         process=f.probe(url);f.line(process)

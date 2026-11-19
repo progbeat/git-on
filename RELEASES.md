@@ -13,6 +13,8 @@
   source and caller configuration support it.
 - Reuse authenticated channels during startup for exact object IDs and
   unambiguous remote branches.
+- Open spare SSH channels while the initial one negotiates Git, and let
+  existing channels serve queued reads while another channel is opening.
 - Prefetch upcoming blobs from already opened directories on both transports.
   Grow the fetch batch during scans that consistently use the prefetched blobs.
 - Decode Git packs as they arrive and make verified objects readable before

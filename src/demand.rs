@@ -4,7 +4,7 @@ use crate::{
     object, pack_stream,
     raw_blob::RawBlobs,
     spool::Spool,
-    transport::{BranchQuery, Connection, Session},
+    transport::{BranchQuery, Connection, Session, StartingSession},
 };
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -22,7 +22,6 @@ use std::{
 
 const CONNECTIONS: usize = 16;
 const INITIAL_CONNECTIONS: usize = 4;
-const STANDBY_SSH_CHANNELS: usize = 5;
 const MAX_WANTS: usize = 64;
 const READ_AHEAD: usize = 4;
 const MAX_READ_AHEAD: usize = 256;
@@ -204,6 +203,7 @@ struct Queue {
     forecast_score: u8,
     forecast_misses: u8,
     busy: [bool; CONNECTIONS],
+    connecting: bool,
     native_ceiling: Option<usize>,
     failure: Option<String>,
     mode: ConnectionMode,
@@ -304,7 +304,7 @@ impl Queue {
             .filter(|remaining| !remaining.is_zero())
     }
 
-    fn native_work(&mut self, index: usize) -> Option<Work> {
+    fn native_work(&mut self, index: usize, needs_ssh_channel: bool) -> Option<NativeWork> {
         let channels = if self.dense() {
             CONNECTIONS
         } else {
@@ -314,12 +314,30 @@ impl Queue {
         if index >= channels || self.busy[..index].contains(&false) {
             return None;
         }
-        let active = self.busy.iter().filter(|busy| **busy).count();
-        Work::take(&mut self.waiting, false).or_else(|| {
-            (active + 1 < channels)
-                .then(|| Work::take(&mut self.ahead, true))
-                .flatten()
-        })
+        let speculative = self.waiting.is_empty();
+        let pending = if speculative {
+            let active = self.busy.iter().filter(|busy| **busy).count();
+            if active + 1 >= channels {
+                return None;
+            }
+            &mut self.ahead
+        } else {
+            &mut self.waiting
+        };
+        let work = if needs_ssh_channel && self.failure.is_none() {
+            if pending.is_empty() || self.connecting || speculative && index >= INITIAL_CONNECTIONS
+            {
+                return None;
+            }
+            // A new channel can take several round trips. Keep the queued
+            // objects available while an already open channel might free up.
+            self.connecting = true;
+            NativeWork::Connect
+        } else {
+            NativeWork::Fetch(Work::take(pending, speculative)?, self.failure.clone())
+        };
+        self.busy[index] = true;
+        Some(work)
     }
 
     fn retry(&mut self, mut item: QueuedDemand, speculative: bool) {
@@ -373,6 +391,11 @@ struct Http2Batch {
 
 type FallbackPack = (Http2Batch, pack_stream::Received);
 
+enum NativeWork {
+    Connect,
+    Fetch(Work, Option<String>),
+}
+
 pub(crate) struct Pool {
     shared: Arc<Shared>,
     scratch: RawBlobs,
@@ -383,11 +406,21 @@ pub(crate) struct Pool {
 
 impl Pool {
     pub(crate) fn new(
-        mut first: Session,
+        first: Session,
         connection: Connection,
         scratch: &RawBlobs,
         git: &Git,
-        standby: bool,
+    ) -> Result<Self> {
+        let mut pool = Self::prepare_native(&connection, scratch, git, Vec::new())?;
+        pool.attach_primary(first, connection)?;
+        Ok(pool)
+    }
+
+    pub(crate) fn prepare_native(
+        connection: &Connection,
+        scratch: &RawBlobs,
+        git: &Git,
+        standby: Vec<StartingSession>,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
@@ -396,17 +429,20 @@ impl Pool {
             workers: Mutex::default(),
             wake: None,
         };
-        first.set_stop(pool.shared.stop.clone());
-        pool.start(0, Some(first), connection.clone(), false)?;
+        let mut standby = standby.into_iter();
         for index in 1..CONNECTIONS {
-            pool.start(
-                index,
-                None,
-                connection.clone(),
-                standby && index <= STANDBY_SSH_CHANNELS,
-            )?;
+            pool.start(index, None, connection.clone(), standby.next())?;
         }
         Ok(pool)
+    }
+
+    pub(crate) fn attach_primary(
+        &mut self,
+        mut first: Session,
+        connection: Connection,
+    ) -> Result<()> {
+        first.set_stop(self.shared.stop.clone());
+        self.start(0, Some(first), connection, None)
     }
 
     pub(crate) fn http2(
@@ -476,7 +512,7 @@ impl Pool {
         index: usize,
         session: Option<Session>,
         connection: Connection,
-        standby: bool,
+        standby: Option<StartingSession>,
     ) -> Result<()> {
         let shared = self.shared.clone();
         let scratch = self.scratch.clone();
@@ -947,17 +983,19 @@ impl Shared {
         connection: Connection,
         scratch: &RawBlobs,
         git: &Git,
-        standby: bool,
+        standby: Option<StartingSession>,
     ) -> Result<()> {
-        if standby {
-            if let Ok(Some(connected)) = connection.connect_additional(self.stop.clone()) {
+        if let Some(mut standby) = standby {
+            standby.set_stop(self.stop.clone());
+            if let Ok(Some(connected)) = standby.negotiate() {
                 session = Some(connected);
                 self.additional_starts.fetch_add(1, Ordering::Relaxed);
             }
         }
         loop {
-            let (work, failure) = {
+            let next = {
                 let mut queue = self.queue.lock().unwrap();
+                let needs_ssh_channel = index != 0 && session.is_none() && connection.is_ssh();
                 loop {
                     if self.stop.load(Ordering::Relaxed)
                         || queue.native_ceiling.is_some_and(|ceiling| index >= ceiling)
@@ -970,14 +1008,34 @@ impl Shared {
                         queue = self.work.wait_timeout(queue, delay).unwrap().0;
                         continue;
                     }
-                    if let Some(work) = queue.native_work(index) {
-                        queue.busy[index] = true;
-                        break (work, queue.failure.clone());
+                    if let Some(work) = queue.native_work(index, needs_ssh_channel) {
+                        break work;
                     }
                     queue = self.work.wait(queue).unwrap();
                 }
             };
             self.work.notify_all();
+            let (work, failure) = match next {
+                NativeWork::Fetch(work, failure) => (work, failure),
+                NativeWork::Connect => {
+                    let connected = connection.connect_additional(self.stop.clone());
+                    let mut queue = self.queue.lock().unwrap();
+                    queue.busy[index] = false;
+                    queue.connecting = false;
+                    if let Ok(Some(connected)) = connected {
+                        session = Some(connected);
+                        self.additional_starts.fetch_add(1, Ordering::Relaxed);
+                    } else if !self.stop.load(Ordering::Relaxed) {
+                        // An additional session can exceed the master's
+                        // MaxSessions. The queue still owns all the demands.
+                        queue.native_ceiling =
+                            Some(queue.native_ceiling.unwrap_or(CONNECTIONS).min(index));
+                        queue.prune_prefetch();
+                    }
+                    self.work.notify_all();
+                    continue;
+                }
+            };
             let started = Instant::now();
             if session.is_none() && failure.is_none() {
                 let connected =
@@ -992,24 +1050,6 @@ impl Shared {
                             self.additional_starts.fetch_add(1, Ordering::Relaxed);
                         }
                         session = Some(new);
-                    }
-                    Err(_)
-                        if index != 0
-                            && connection.is_ssh()
-                            && !self.stop.load(Ordering::Relaxed) =>
-                    {
-                        // The master may have a lower MaxSessions. Nothing has
-                        // been sent over this channel, so narrower reuse is safe.
-                        let mut queue = self.queue.lock().unwrap();
-                        queue.busy[index] = false;
-                        queue.native_ceiling =
-                            Some(queue.native_ceiling.unwrap_or(CONNECTIONS).min(index));
-                        for item in work.items {
-                            queue.retry(item, work.speculative);
-                        }
-                        queue.prune_prefetch();
-                        self.work.notify_all();
-                        return Ok(());
                     }
                     Err(error) => {
                         self.finish(work, Err(error), started, Some(index), scratch, git);
@@ -1172,6 +1212,42 @@ mod tests {
         assert_eq!(queue.waiting[0].oid, used);
         assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
         assert!(!demand.ready());
+    }
+
+    #[test]
+    fn a_ready_channel_can_take_demand_while_another_channel_opens() {
+        let mut queue = Queue::default();
+        let oid = Oid::from_bytes(&[1; 20]).unwrap();
+        queue.foreground(oid);
+        queue.busy[0] = true;
+        assert!(matches!(
+            queue.native_work(1, true),
+            Some(NativeWork::Connect)
+        ));
+        assert!(queue.native_work(2, true).is_none());
+        queue.busy[0] = false;
+        let Some(NativeWork::Fetch(work, None)) = queue.native_work(0, false) else {
+            panic!("the ready channel did not receive the pending demand");
+        };
+        assert_eq!(work.wants(), [oid]);
+        assert!(queue.waiting.is_empty());
+    }
+
+    #[test]
+    fn exact_demand_opens_additional_channels_beyond_the_initial_pool() {
+        let mut queue = Queue {
+            mode: ConnectionMode::Wide,
+            ..Queue::default()
+        };
+        queue.busy[..INITIAL_CONNECTIONS].fill(true);
+        let next = queue.insert(Oid::from_bytes(&[1; 20]).unwrap());
+        queue.ahead.push_back(next);
+        assert!(queue.native_work(INITIAL_CONNECTIONS, true).is_none());
+        queue.foreground(Oid::from_bytes(&[2; 20]).unwrap());
+        assert!(matches!(
+            queue.native_work(INITIAL_CONNECTIONS, true),
+            Some(NativeWork::Connect)
+        ));
     }
 
     #[test]

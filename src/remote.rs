@@ -1,5 +1,5 @@
 //! Explicit exact-object fetches. Git's promisor auto-fetch is never the loader.
-use crate::{git::Git, object::TeeRead};
+use crate::{git::Git, object::TeeRead, transport};
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,8 @@ use std::{
 };
 
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
+const SSH_STANDBY_DELAY: Duration = Duration::from_millis(250);
+const SSH_STANDBY_CHANNELS: usize = 2;
 
 fn require_native_git(cwd: &Path) -> Result<()> {
     let mut command = Command::new("git");
@@ -666,10 +668,10 @@ impl Remote {
         if self.demand_pool.is_some() || self.pool_checked || crate::terminal_ui::preparing() {
             return Ok(());
         }
-        self.open_demand_pool(false)
+        self.open_demand_pool()
     }
 
-    fn open_demand_pool(&mut self, standby: bool) -> Result<()> {
+    fn open_demand_pool(&mut self) -> Result<()> {
         let http = self.uses_http();
         if http {
             self.try_http2_pool()?;
@@ -697,7 +699,6 @@ impl Remote {
             connection,
             &self.raw_blobs,
             &self.git,
-            standby,
         )?);
         Ok(())
     }
@@ -931,11 +932,46 @@ impl Remote {
         // interactive authentication to native Git's normal preparation path.
         command.env("SSH_ASKPASS_REQUIRE", "never");
         let started = Instant::now();
-        let session = crate::transport::Session::connect_with_stop(command, false, None);
-        let slow_start = started.elapsed() >= Duration::from_millis(250);
+        let mut additional = transport::copy_command(&command);
+        additional
+            .env("GIT_ON_SSH_INITIAL", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false");
+        let mut candidates: Vec<_> = transport::StartingSession::spawn(command, false, None)
+            .into_iter()
+            .collect();
+        let mut connection = None;
+        let session = (|| -> Result<_> {
+            while !candidates.is_empty() {
+                if let Some(index) =
+                    transport::StartingSession::wait_for_advertisement(&candidates)?
+                {
+                    if let Ok(Some(session)) = candidates.swap_remove(index).negotiate() {
+                        return Ok(Some(session));
+                    }
+                } else if connection.is_none() && started.elapsed() >= SSH_STANDBY_DELAY {
+                    self.record_socket_owner()?;
+                    if let Some(socket) = self.ssh_socket() {
+                        let owned = transport::Connection::new(
+                            transport::copy_command(&additional),
+                            false,
+                            Some(socket),
+                        );
+                        for _ in 0..SSH_STANDBY_CHANNELS {
+                            if let Ok(candidate) = owned.start_additional() {
+                                candidates.push(candidate);
+                            }
+                        }
+                        connection = Some(owned);
+                    }
+                }
+            }
+            Ok(None)
+        })();
         self.record_socket_owner()?;
         crate::object::check_transfer()?;
-        let Ok(Some(mut session)) = session else {
+        let Some(mut session) = session? else {
             return Ok(None);
         };
         anyhow::ensure!(
@@ -960,10 +996,20 @@ impl Remote {
         if !self.fetch_in_session(&repo, &[oid])? {
             return Ok(None);
         }
-        if slow_start {
-            // Authenticate once. Extra channels negotiate protocol v2 with
-            // the same master in parallel with preparing the snapshot.
-            self.open_demand_pool(true)?;
+        if let Some(connection) = connection {
+            let mut pool = crate::demand::Pool::prepare_native(
+                &connection,
+                &self.raw_blobs,
+                &self.git,
+                candidates,
+            )?;
+            let primary = self
+                .session
+                .take()
+                .context("missing selected SSH channel")?;
+            pool.attach_primary(primary, connection)?;
+            self.pool_checked = true;
+            self.demand_pool = Some(pool);
         }
         Ok(Some(oid))
     }
