@@ -55,8 +55,9 @@ name alone proves nothing about demand.
 Where protocol v2 and the caller's policy permit, exact demands reuse
 invocation-owned channels. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
-SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
-Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
+SSH path and port bytes; unknown formats retain native fetch. Native Git
+resolves and fetches the initial HTTPS selection with the caller's credentials,
+proxies and TLS policy.
 Interactive preparation uses native fetch with job-control supervision. Git-on
 owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
 request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
@@ -72,8 +73,17 @@ decoders, and no unrelated future OID is requested.
 On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
-Directory enumeration can wait for its tree as well. The two backends share an
-HTTP(S) loader that initially allows four invocation-owned connections.
+Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
+an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
+It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
+the peer govern the active streams. After eight consistently slow replies,
+the loader can briefly wait for overlapping demands to share a fetch.
+Each fetch can group up to eight already pending OIDs.
+Explicit Git HTTP configuration, authentication outside the supported exchange,
+and servers without HTTP/2 or filtered protocol v2 use the native helper.
+Transport selection completes before any object demand is sent.
+
+The native HTTP(S) loader initially allows four invocation-owned connections.
 If each of the first eight successful pack transfers takes at least
 64 milliseconds, the loader allows eight connections for the rest of the
 invocation.
@@ -82,10 +92,10 @@ already requested. After expansion, the loader can wait up to two milliseconds
 from its oldest pending OID to collect four requests while another transfer is
 in flight. An idle pool starts a request immediately.
 Additional helpers start when demands overlap. Cached objects bypass the queue.
-The queue bounds outstanding objects, and transfer workers release its mutex
-before receiving and checking a pack. The snapshot then verifies and publishes
-the objects through its normal store. This path requires a reusable HTTP(S)
-session and an unrestricted per-file size limit.
+The native-loader queue bounds outstanding objects. Both transports receive
+and check packs outside the queue lock. The snapshot verifies and publishes
+the objects through its normal store. Parallel demand requires a reusable
+HTTP(S) transport and an unrestricted per-file size limit.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with

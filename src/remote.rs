@@ -147,6 +147,7 @@ pub struct Remote {
     session_received_pack_bytes: u64,
     session: Option<crate::transport::Session>,
     session_checked: bool,
+    http2_checked: bool,
     demand_pool: Option<crate::demand::Pool>,
     demand_url: OsString,
     socket: Option<PathBuf>,
@@ -250,6 +251,7 @@ impl Remote {
             session_received_pack_bytes: 0,
             session: None,
             session_checked: false,
+            http2_checked: false,
             demand_pool: None,
             demand_url: OsString::from_vec(url.to_vec()),
             socket,
@@ -601,6 +603,9 @@ impl Remote {
                 return Ok(None);
             }
             if self.demand_pool.is_none() {
+                self.try_http2_pool()?;
+            }
+            if self.demand_pool.is_none() {
                 self.prepare_session()?;
                 if self.session.is_none() {
                     return Ok(None);
@@ -617,6 +622,34 @@ impl Remote {
             self.demand_pool.as_ref().unwrap().request(oid).map(Some)
         })();
         self.record_result(outcome)
+    }
+
+    fn try_http2_pool(&mut self) -> Result<()> {
+        if self.http2_checked
+            || crate::git::controlling_terminal().is_some() && crate::terminal_ui::preparing()
+        {
+            return Ok(());
+        }
+        self.http2_checked = true;
+        if !self.demand_url.as_bytes().starts_with(b"https://")
+            || !self.git.http2_compatible()
+            || !self.git.demand_session_compatible()?
+        {
+            return Ok(());
+        }
+        let Some(configuration) =
+            crate::http2::Configuration::new(&self.demand_url, self.command(false)?)
+        else {
+            return Ok(());
+        };
+        self.demand_pool = crate::demand::Pool::http2(configuration, &self.raw_blobs)?;
+        if self.demand_pool.is_some() {
+            if let Some(session) = self.session.take() {
+                session.stop()?;
+            }
+            self.session_starts += 1;
+        }
+        Ok(())
     }
     pub(crate) fn finish_demand(
         &mut self,
@@ -1296,6 +1329,11 @@ impl Remote {
             self.native_received_pack_bytes,
             self.session_received_pack_bytes,
         )
+    }
+    pub(crate) fn http2_metrics(&self) -> (u64, u64) {
+        self.demand_pool
+            .as_ref()
+            .map_or((0, 0), crate::demand::Pool::http2_metrics)
     }
 }
 impl Drop for Remote {

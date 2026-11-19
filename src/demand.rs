@@ -5,6 +5,8 @@ use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
     collections::{HashMap, VecDeque},
+    io::{self, Read, Write},
+    os::unix::net::UnixStream,
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -60,6 +62,9 @@ struct FlightState {
 impl Demand {
     fn complete(&self, batch: Arc<Batch>) {
         let mut state = self.0.state.lock().unwrap();
+        if state.batch.is_some() {
+            return;
+        }
         state.batch = Some(batch);
         self.0.ready.notify_all();
         #[cfg(target_os = "macos")]
@@ -142,10 +147,10 @@ struct Queue {
 }
 
 impl Queue {
-    fn batch_wait(&self, now: Instant) -> Option<Duration> {
+    fn batch_wait(&self, now: Instant, transfer_active: bool) -> Option<Duration> {
         if matches!(self.mode, ConnectionMode::Wide)
             && self.waiting.len() < BATCH_TARGET
-            && self.busy.contains(&true)
+            && transfer_active
         {
             BATCH_WINDOW
                 .checked_sub(now.duration_since(self.waiting.front()?.queued_at))
@@ -163,11 +168,20 @@ struct Shared {
     mode_ready: Condvar,
     stop: Arc<AtomicBool>,
     additional_starts: AtomicU64,
+    http2_fetches: AtomicU64,
+    http2_peak: AtomicU64,
+}
+
+struct Http2Batch {
+    oids: Vec<Oid>,
+    work: Vec<QueuedDemand>,
+    started: Instant,
 }
 
 pub(crate) struct Pool {
     shared: Arc<Shared>,
     workers: Mutex<Vec<JoinHandle<Result<()>>>>,
+    wake: Option<UnixStream>,
 }
 
 impl Pool {
@@ -179,6 +193,7 @@ impl Pool {
         let mut pool = Self {
             shared: Arc::default(),
             workers: Mutex::default(),
+            wake: None,
         };
         first.set_stop(pool.shared.stop.clone());
         pool.start(0, Some(first), None, scratch)?;
@@ -186,6 +201,52 @@ impl Pool {
             pool.start(index + 1, None, Some(command), scratch)?;
         }
         Ok(pool)
+    }
+
+    pub(crate) fn http2(
+        configuration: crate::http2::Configuration,
+        scratch: &RawBlobs,
+    ) -> Result<Option<Self>> {
+        let (read, write) = UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        write.set_nonblocking(true)?;
+        let shared = Arc::<Shared>::default();
+        let worker_state = shared.clone();
+        let worker_scratch = scratch.clone();
+        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("git-on-http2".into())
+            .spawn(move || {
+                let client =
+                    crate::http2::Client::negotiate(configuration, worker_state.stop.clone());
+                // No exact want has been sent during discovery. A different
+                // protocol or an unsupported authentication exchange can use Git.
+                let Ok(Some(client)) = client else {
+                    let _ = ready.send(false);
+                    return Ok(());
+                };
+                if ready.send(true).is_ok() {
+                    worker_state.run_http2(client, read, &worker_scratch);
+                }
+                Ok(())
+            })?;
+        let pool = Self {
+            shared,
+            workers: Mutex::new(vec![worker]),
+            wake: Some(write),
+        };
+        let ready = result
+            .recv()
+            .context("Git HTTP/2 dispatcher stopped during discovery")?;
+        object::check_transfer()?;
+        Ok(ready.then_some(pool))
+    }
+
+    fn wake_dispatcher(&self) {
+        if let Some(mut wake) = self.wake.as_ref() {
+            // A full signal socket is already readable.
+            let _ = wake.write(&[1]);
+        }
     }
 
     fn start(
@@ -217,7 +278,7 @@ impl Pool {
             if let Some(error) = &queue.failure {
                 bail!("remote object transport previously failed: {error}");
             }
-            if queue.outstanding < MAX_OUTSTANDING {
+            if self.wake.is_some() || queue.outstanding < MAX_OUTSTANDING {
                 let demand = Demand::default();
                 queue.pending.insert(oid, demand.clone());
                 queue.waiting.push_back(QueuedDemand {
@@ -227,6 +288,7 @@ impl Pool {
                 });
                 queue.outstanding += 1;
                 self.shared.work.notify_all();
+                self.wake_dispatcher();
                 return Ok(demand);
             }
             queue = self.shared.work.wait(queue).unwrap();
@@ -249,6 +311,13 @@ impl Pool {
         self.shared.additional_starts.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn http2_metrics(&self) -> (u64, u64) {
+        (
+            self.shared.http2_fetches.load(Ordering::Relaxed),
+            self.shared.http2_peak.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn stop(&self) -> Result<()> {
         let waiting = {
             let mut queue = self.shared.queue.lock().unwrap();
@@ -257,6 +326,7 @@ impl Pool {
         };
         self.shared.work.notify_all();
         self.shared.mode_ready.notify_all();
+        self.wake_dispatcher();
         for QueuedDemand { oid, demand, .. } in waiting {
             demand.complete(Batch::new(
                 vec![oid],
@@ -283,6 +353,129 @@ impl Drop for Pool {
 }
 
 impl Shared {
+    fn run_http2(
+        &self,
+        mut client: crate::http2::Client,
+        mut wake: UnixStream,
+        scratch: &RawBlobs,
+    ) {
+        let result = self.drive_http2(&mut client, &mut wake, scratch);
+        let failure = result.err().filter(|error| !object::is_cancelled(error));
+        let pending = {
+            let mut queue = self.queue.lock().unwrap();
+            if let Some(error) = &failure {
+                queue.failure.get_or_insert_with(|| format!("{error:#}"));
+            }
+            queue.waiting.clear();
+            queue.outstanding = 0;
+            queue.pending.clone()
+        };
+        for (oid, demand) in pending {
+            let error = failure.as_ref().map_or_else(
+                || object::OperationCancelled.into(),
+                |error| anyhow::anyhow!("Git HTTP/2 dispatcher failed: {error:#}"),
+            );
+            demand.complete(Batch::new(vec![oid], Err(error)));
+        }
+        self.work.notify_all();
+    }
+
+    fn drive_http2(
+        &self,
+        client: &mut crate::http2::Client,
+        wake: &mut UnixStream,
+        scratch: &RawBlobs,
+    ) -> Result<()> {
+        let mut active = HashMap::<usize, Http2Batch>::new();
+        let mut token = 0_usize;
+        while !self.stop.load(Ordering::Relaxed) {
+            object::check_transfer()?;
+            drain_wake(wake)?;
+            let (mut waiting, failure, delay) = {
+                let mut queue = self.queue.lock().unwrap();
+                let delay = if queue.failure.is_none() {
+                    queue.batch_wait(Instant::now(), !active.is_empty())
+                } else {
+                    None
+                };
+                let waiting = if delay.is_some() {
+                    VecDeque::new()
+                } else {
+                    std::mem::take(&mut queue.waiting)
+                };
+                (waiting, queue.failure.clone(), delay)
+            };
+            while !waiting.is_empty() {
+                let count = waiting.len().min(MAX_WANTS);
+                let work: Vec<_> = waiting.drain(..count).collect();
+                let oids: Vec<_> = work.iter().map(|item| item.oid).collect();
+                if let Some(error) = &failure {
+                    self.finish_http2(oids, work, Err(anyhow::anyhow!("{error}")), None);
+                    continue;
+                }
+                token = token
+                    .checked_add(1)
+                    .context("Git HTTP/2 request ID overflow")?;
+                client.start(token, &oids, scratch)?;
+                active.insert(
+                    token,
+                    Http2Batch {
+                        oids,
+                        work,
+                        started: Instant::now(),
+                    },
+                );
+                self.http2_peak
+                    .fetch_max(active.len() as u64, Ordering::Relaxed);
+            }
+            for (token, pack) in client.progress(scratch)? {
+                let Http2Batch {
+                    oids,
+                    work,
+                    started,
+                } = active
+                    .remove(&token)
+                    .context("unknown completed Git demand")?;
+                if pack.is_ok() {
+                    self.http2_fetches.fetch_add(1, Ordering::Relaxed);
+                }
+                self.finish_http2(oids, work, pack, Some(started.elapsed()));
+            }
+            // The wake socket makes new demands and shutdown visible while
+            // libcurl waits on the connection. The interval checks signals
+            // even before the runner reaches transport cleanup.
+            let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
+                remaining.max(Duration::from_millis(1))
+            });
+            client.wait(wake, timeout)?;
+        }
+        Ok(())
+    }
+
+    fn finish_http2(
+        &self,
+        oids: Vec<Oid>,
+        work: Vec<QueuedDemand>,
+        pack: Result<Spool>,
+        elapsed: Option<Duration>,
+    ) {
+        {
+            let mut queue = self.queue.lock().unwrap();
+            if let Err(error) = &pack {
+                if queue.failure.is_none() && !object::is_cancelled(error) {
+                    queue.failure = Some(format!("{error:#}"));
+                }
+            } else if let Some(elapsed) = elapsed {
+                queue.mode.record_reply(elapsed);
+            }
+            queue.outstanding -= work.len();
+        }
+        let batch = Batch::new(oids, pack);
+        for item in work {
+            item.demand.complete(batch.clone());
+        }
+    }
+
     fn worker(
         &self,
         index: usize,
@@ -319,7 +512,9 @@ impl Shared {
                     if self.stop.load(Ordering::Relaxed) {
                         break None;
                     }
-                    if let Some(remaining) = queue.batch_wait(Instant::now()) {
+                    if let Some(remaining) =
+                        queue.batch_wait(Instant::now(), queue.busy.contains(&true))
+                    {
                         queue = self.work.wait_timeout(queue, remaining).unwrap().0;
                         continue;
                     }
@@ -380,6 +575,19 @@ impl Shared {
     }
 }
 
+fn drain_wake(wake: &mut UnixStream) -> io::Result<()> {
+    let mut buffer = [0; 256];
+    loop {
+        match wake.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,22 +619,19 @@ mod tests {
             demand: Demand::default(),
             queued_at: now,
         });
-        queue.busy[0] = true;
-        assert_eq!(queue.batch_wait(now), None);
+        assert_eq!(queue.batch_wait(now, true), None);
         queue.mode = ConnectionMode::Wide;
-        assert_eq!(queue.batch_wait(now), Some(BATCH_WINDOW));
-        assert_eq!(queue.batch_wait(now + BATCH_WINDOW), None);
-        queue.busy[0] = false;
-        assert_eq!(queue.batch_wait(now), None);
-        queue.busy[0] = true;
+        assert_eq!(queue.batch_wait(now, true), Some(BATCH_WINDOW));
+        assert_eq!(queue.batch_wait(now + BATCH_WINDOW, true), None);
+        assert_eq!(queue.batch_wait(now, false), None);
         for index in 1..BATCH_TARGET {
-            assert_eq!(queue.batch_wait(now), Some(BATCH_WINDOW));
+            assert_eq!(queue.batch_wait(now, true), Some(BATCH_WINDOW));
             queue.waiting.push_back(QueuedDemand {
                 oid: Oid::from_bytes(&[index as u8; 20]).unwrap(),
                 demand: Demand::default(),
                 queued_at: now,
             });
         }
-        assert_eq!(queue.batch_wait(now), None);
+        assert_eq!(queue.batch_wait(now, true), None);
     }
 }

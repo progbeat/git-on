@@ -162,6 +162,24 @@ impl Git {
         Ok(result.status.success()
             && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
+    pub(crate) fn http2_compatible(&self) -> bool {
+        // The HTTPS helper remains responsible for explicit Git HTTP
+        // configuration, including URL-scoped settings and remote proxies.
+        !self.config.iter().any(|(key, _)| {
+            let key = key.as_bytes();
+            key.starts_with(b"http.")
+                || key.starts_with(b"remote.")
+                    && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
+        }) && !std::env::vars_os().any(|(key, _)| {
+            let key = key.as_bytes();
+            key.starts_with(b"GIT_HTTP_")
+                || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
+                || matches!(
+                    key,
+                    b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
+                )
+        })
+    }
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());

@@ -208,34 +208,7 @@ impl Session {
                 "native helper rejected protocol connection"
             );
         }
-        if !matches!(self.packet()?, Packet::Data(version) if packet_text(&version) == b"version 2")
-        {
-            return Ok(false);
-        }
-        let mut fetch = false;
-        let mut filter = false;
-        loop {
-            match self.packet()? {
-                Packet::Flush => break,
-                Packet::Data(capability) => {
-                    if let Some(values) = capability.strip_prefix(b"fetch=") {
-                        fetch = true;
-                        filter |= values
-                            .split(u8::is_ascii_whitespace)
-                            .any(|value| value == b"filter");
-                    }
-                    if let Some(format) = capability.strip_prefix(b"object-format=") {
-                        ensure!(
-                            packet_text(format) == b"sha1",
-                            "SHA-256 repositories unsupported"
-                        );
-                    }
-                }
-                _ => bail!("invalid demand capability advertisement"),
-            }
-        }
-        ensure!(fetch && filter, "demand transport lacks object filtering");
-        Ok(true)
+        read_v2_capabilities(&mut self.output)
     }
     fn line(&mut self) -> Result<Vec<u8>> {
         let mut line = Vec::new();
@@ -250,39 +223,6 @@ impl Session {
         );
         line.pop();
         Ok(line)
-    }
-    fn packet(&mut self) -> Result<Packet> {
-        let mut header = [0; 4];
-        self.output
-            .read_exact(&mut header)
-            .context("read demand packet header")?;
-        ensure!(
-            header.iter().all(u8::is_ascii_hexdigit),
-            "invalid demand packet length"
-        );
-        let length = u16::from_str_radix(std::str::from_utf8(&header)?, 16)?;
-        Ok(match length {
-            0 => Packet::Flush,
-            1 => Packet::Delimiter,
-            2 => Packet::End,
-            4..=65520 => {
-                let mut bytes = vec![0; usize::from(length) - 4];
-                self.output.read_exact(&mut bytes)?;
-                if let Some(error) = bytes.strip_prefix(b"ERR ") {
-                    bail!(
-                        "remote exact-object request rejected: {}",
-                        String::from_utf8_lossy(error)
-                    );
-                }
-                Packet::Data(bytes)
-            }
-            _ => return Err(invalid("invalid demand packet length")),
-        })
-    }
-    fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-        write!(output, "{:04x}", bytes.len() + 4)?;
-        output.extend_from_slice(bytes);
-        Ok(())
     }
     pub(crate) fn fetch_exact(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
         self.fetch(oids, pack).with_context(|| {
@@ -303,58 +243,14 @@ impl Session {
         // shared regular-file offset is reset only between transactions.
         self.errors.set_len(0)?;
         self.errors.rewind()?;
-        // One small exact-demand request, not one syscall/signal-status read
-        // for every pkt-line header and body. No future objects are prefetched.
-        let mut request = Vec::with_capacity(256);
-        Self::request_packet(&mut request, b"command=fetch\n")?;
-        request.extend_from_slice(b"0001");
-        for oid in oids {
-            Self::request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
-        }
-        for value in [
-            b"deepen 1\n".as_slice(),
-            b"filter tree:0\n",
-            b"no-progress\n",
-            b"done\n",
-        ] {
-            Self::request_packet(&mut request, value)?;
-        }
-        request.extend_from_slice(b"0000");
-        self.input.write_all(&request)?;
-        loop {
-            match self.packet()? {
-                Packet::Data(section) if packet_text(&section) == b"packfile" => break,
-                Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
-                    match self.packet()? {
-                        Packet::Delimiter => break,
-                        Packet::Data(value)
-                            if value.starts_with(b"shallow ")
-                                || value.starts_with(b"unshallow ") => {}
-                        _ => return Err(invalid("invalid demand shallow section")),
-                    }
-                },
-                _ => return Err(invalid("invalid demand response section")),
-            }
-        }
-        let mut output = PackWriter::new(pack);
-        loop {
-            match self.packet()? {
-                Packet::Flush => break,
-                Packet::Data(data) => match data.split_first() {
-                    Some((1, payload)) => output.write_all(payload)?,
-                    Some((2, _)) => {} // optional progress is not application data
-                    Some((3, error)) => {
-                        bail!("remote pack failed: {}", String::from_utf8_lossy(error))
-                    }
-                    _ => return Err(invalid("invalid demand pack sideband")),
-                },
-                _ => return Err(invalid("invalid demand pack termination")),
-            }
-        }
+        self.input.write_all(&exact_request(oids)?)?;
+        read_pack(&mut self.output, pack)?;
         if self.stateless {
-            ensure!(self.packet()? == Packet::End, "missing helper response end");
+            ensure!(
+                read_packet(&mut self.output)? == Packet::End,
+                "missing helper response end"
+            );
         }
-        output.finish()?;
         Ok(())
     }
     pub(crate) fn stop(&self) -> Result<()> {
@@ -373,6 +269,176 @@ impl Session {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+fn read_packet(input: &mut impl Read) -> Result<Packet> {
+    let mut header = [0; 4];
+    input
+        .read_exact(&mut header)
+        .context("read demand packet header")?;
+    ensure!(
+        header.iter().all(u8::is_ascii_hexdigit),
+        "invalid demand packet length"
+    );
+    let length = u16::from_str_radix(std::str::from_utf8(&header)?, 16)?;
+    Ok(match length {
+        0 => Packet::Flush,
+        1 => Packet::Delimiter,
+        2 => Packet::End,
+        4..=65520 => {
+            let mut bytes = vec![0; usize::from(length) - 4];
+            input.read_exact(&mut bytes)?;
+            if let Some(error) = bytes.strip_prefix(b"ERR ") {
+                bail!(
+                    "remote exact-object request rejected: {}",
+                    String::from_utf8_lossy(error)
+                );
+            }
+            Packet::Data(bytes)
+        }
+        _ => return Err(invalid("invalid demand packet length")),
+    })
+}
+fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    write!(output, "{:04x}", bytes.len() + 4)?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn read_v2_capabilities(input: &mut impl Read) -> Result<bool> {
+    if !matches!(read_packet(input)?, Packet::Data(version) if packet_text(&version) == b"version 2")
+    {
+        return Ok(false);
+    }
+    let mut fetch = false;
+    let mut filter = false;
+    loop {
+        match read_packet(input)? {
+            Packet::Flush => break,
+            Packet::Data(capability) => {
+                if let Some(values) = capability.strip_prefix(b"fetch=") {
+                    fetch = true;
+                    filter |= values
+                        .split(u8::is_ascii_whitespace)
+                        .any(|value| value == b"filter");
+                }
+                if let Some(format) = capability.strip_prefix(b"object-format=") {
+                    ensure!(
+                        packet_text(format) == b"sha1",
+                        "SHA-256 repositories unsupported"
+                    );
+                }
+            }
+            _ => bail!("invalid demand capability advertisement"),
+        }
+    }
+    ensure!(fetch && filter, "demand transport lacks object filtering");
+    Ok(true)
+}
+
+pub(crate) fn http_post_probe() -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    request_packet(&mut request, b"command=ls-refs\n")?;
+    request.extend_from_slice(b"0001");
+    request_packet(&mut request, b"ref-prefix refs/git-on/probe/\n")?;
+    request.extend_from_slice(b"0000");
+    Ok(request)
+}
+
+pub(crate) fn check_http_post_probe(mut input: &[u8]) -> Result<()> {
+    loop {
+        match read_packet(&mut input)? {
+            Packet::Data(_) => (),
+            Packet::Flush => return check_http_end(input),
+            _ => return Err(invalid("invalid Git HTTP reference response")),
+        }
+    }
+}
+
+pub(crate) fn read_http_capabilities(mut input: &[u8]) -> Result<bool> {
+    let mut body = input;
+    if matches!(
+        read_packet(&mut body)?,
+        Packet::Data(service) if packet_text(&service) == b"# service=git-upload-pack"
+    ) {
+        ensure!(
+            read_packet(&mut body)? == Packet::Flush,
+            "invalid Git HTTP service announcement"
+        );
+        input = body;
+    }
+    read_v2_capabilities(&mut input)
+}
+
+pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
+    // One small exact-demand request, not one syscall/signal-status read
+    // for every pkt-line header and body. No future objects are prefetched.
+    let mut request = Vec::with_capacity(256);
+    request_packet(&mut request, b"command=fetch\n")?;
+    request.extend_from_slice(b"0001");
+    for oid in oids {
+        request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
+    }
+    for value in [
+        b"deepen 1\n".as_slice(),
+        b"filter tree:0\n",
+        b"no-progress\n",
+        b"done\n",
+    ] {
+        request_packet(&mut request, value)?;
+    }
+    request.extend_from_slice(b"0000");
+    Ok(request)
+}
+
+fn read_pack(input: &mut impl Read, pack: &Spool) -> Result<()> {
+    loop {
+        crate::object::check_transfer()?;
+        match read_packet(input)? {
+            Packet::Data(section) if packet_text(&section) == b"packfile" => break,
+            Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
+                match read_packet(input)? {
+                    Packet::Delimiter => break,
+                    Packet::Data(value)
+                        if value.starts_with(b"shallow ") || value.starts_with(b"unshallow ") => {}
+                    _ => return Err(invalid("invalid demand shallow section")),
+                }
+            },
+            _ => return Err(invalid("invalid demand response section")),
+        }
+    }
+    let mut output = PackWriter::new(pack);
+    loop {
+        crate::object::check_transfer()?;
+        match read_packet(input)? {
+            Packet::Flush => break,
+            Packet::Data(data) => match data.split_first() {
+                Some((1, payload)) => output.write_all(payload)?,
+                Some((2, _)) => {} // optional progress is not application data
+                Some((3, error)) => {
+                    bail!("remote pack failed: {}", String::from_utf8_lossy(error))
+                }
+                _ => return Err(invalid("invalid demand pack sideband")),
+            },
+            _ => return Err(invalid("invalid demand pack termination")),
+        }
+    }
+    output.finish()
+}
+
+fn check_http_end(input: impl Read) -> Result<()> {
+    let mut trailer = Vec::new();
+    input.take(5).read_to_end(&mut trailer)?;
+    ensure!(
+        trailer.is_empty() || trailer == b"0002",
+        "unexpected data after the Git HTTP response"
+    );
+    Ok(())
+}
+
+pub(crate) fn read_http_pack(mut input: impl Read, pack: &Spool) -> Result<()> {
+    read_pack(&mut input, pack)?;
+    check_http_end(input)
+}
+
 // Keep the trailer out of the checksum without retaining the pack in RAM.
 struct PackWriter<'a> {
     output: BufWriter<&'a Spool>,
@@ -808,4 +874,18 @@ mod tests {
             assert!(ObjectReader::single(&file).unwrap().is_none());
         }
     }
+}
+#[test]
+fn http_advertisement_accepts_the_version_two_service_preamble() {
+    let mut capabilities = Vec::new();
+    request_packet(&mut capabilities, b"version 2\n").unwrap();
+    request_packet(&mut capabilities, b"fetch=shallow filter\n").unwrap();
+    capabilities.extend_from_slice(b"0000");
+    assert!(read_http_capabilities(&capabilities).unwrap());
+
+    let mut announced = Vec::new();
+    request_packet(&mut announced, b"# service=git-upload-pack\n").unwrap();
+    announced.extend_from_slice(b"0000");
+    announced.extend_from_slice(&capabilities);
+    assert!(read_http_capabilities(&announced).unwrap());
 }

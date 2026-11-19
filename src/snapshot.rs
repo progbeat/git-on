@@ -241,6 +241,8 @@ pub struct SnapshotMetrics {
     pub remote_session_fetch_operations: u64,
     pub remote_session_decode_operations: u64,
     pub remote_session_starts: u64,
+    pub remote_http2_fetch_operations: u64,
+    pub remote_http2_peak_requests: u64,
     /// Native Git's retained received packs, possibly normalized by index-pack.
     pub remote_native_pack_bytes: u64,
     /// Exact received Git pack payloads on invocation-owned demand sessions.
@@ -1223,6 +1225,10 @@ impl Snapshot {
                 metrics.remote_session_decode_operations,
                 metrics.remote_session_starts,
             ) = remote.session_operations();
+            (
+                metrics.remote_http2_fetch_operations,
+                metrics.remote_http2_peak_requests,
+            ) = remote.http2_metrics();
             (
                 metrics.remote_native_pack_bytes,
                 metrics.remote_session_pack_bytes,

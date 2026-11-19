@@ -3,6 +3,7 @@ mod demand;
 mod directory_view;
 pub mod filesystem;
 pub mod git;
+mod http2;
 pub mod materialize;
 pub mod object;
 pub mod platform;
