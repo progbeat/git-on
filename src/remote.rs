@@ -353,7 +353,8 @@ impl Remote {
             text.push(" \"$@\"; }; git_on_ssh");
             command
                 .env("GIT_ON_SSH_CONTROL_PATH", socket)
-                .env("GIT_ON_SSH_INITIAL", if initial { "1" } else { "0" });
+                .env("GIT_ON_SSH_INITIAL", if initial { "1" } else { "0" })
+                .env("GIT_ON_SSH_ADDITIONAL", "0");
             command
                 .env("GIT_SSH_COMMAND", text)
                 .env("GIT_SSH_VARIANT", "ssh");
@@ -660,6 +661,7 @@ impl Remote {
             first,
             connection,
             &self.raw_blobs,
+            &self.git,
         )?);
         Ok(())
     }
@@ -682,7 +684,7 @@ impl Remote {
         else {
             return Ok(());
         };
-        self.demand_pool = crate::demand::Pool::http2(configuration, &self.raw_blobs)?;
+        self.demand_pool = crate::demand::Pool::http2(configuration, &self.raw_blobs, &self.git)?;
         if self.demand_pool.is_some() {
             if let Some(session) = self.session.take() {
                 session.stop()?;
@@ -1829,7 +1831,7 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
         exit 125
     fi
     set -- "$@" -S "$GIT_ON_SSH_CONTROL_PATH"
-    if [ "$GIT_ON_SSH_INITIAL" != 1 ]; then
+    if [ "$GIT_ON_SSH_INITIAL" != 1 ] && [ "$GIT_ON_SSH_ADDITIONAL" != 1 ]; then
         # Mux proxy mode requires the existing socket, including with -J.
         set -- "$@" -O proxy
     fi
@@ -1840,6 +1842,11 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     done
     if [ "$GIT_ON_SSH_INITIAL" = 1 ]; then
         exec "$executable" -o "ControlPath=$GIT_ON_SSH_CONTROL_PATH" -o ControlMaster=auto -o ControlPersist=yes "$@"
+    elif [ "$GIT_ON_SSH_ADDITIONAL" = 1 ]; then
+        # Ask the master to open the session. A rejected channel in raw mux
+        # proxy mode can disconnect the master. The false proxy forbids
+        # a replacement connection if ordinary session multiplexing fails.
+        exec "$executable" -o "ControlPath=$GIT_ON_SSH_CONTROL_PATH" -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=/usr/bin/false "$@"
     else
         exec "$executable" -o "ControlPath=$GIT_ON_SSH_CONTROL_PATH" -o ControlMaster=no -o BatchMode=yes "$@"
     fi

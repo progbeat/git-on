@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Git {
     pub cwd: PathBuf,
     config: Vec<(OsString, Option<OsString>)>,

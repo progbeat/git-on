@@ -1,5 +1,6 @@
 //! One request queue for HTTP/2, native HTTPS helpers and owned SSH channels.
 use crate::{
+    git::Git,
     object, pack_stream,
     raw_blob::RawBlobs,
     spool::Spool,
@@ -23,6 +24,7 @@ const CONNECTIONS: usize = 8;
 const INITIAL_CONNECTIONS: usize = 4;
 const MAX_WANTS: usize = 8;
 const READ_AHEAD: usize = 4;
+const NATIVE_BLOB_STREAM_THRESHOLD: usize = 8 * 1024 * 1024;
 const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
 const BATCH_TARGET: usize = 4;
@@ -290,6 +292,7 @@ struct Http2Batch {
 pub(crate) struct Pool {
     shared: Arc<Shared>,
     scratch: RawBlobs,
+    git: Arc<Git>,
     workers: Mutex<Vec<JoinHandle<Result<()>>>>,
     wake: Option<UnixStream>,
 }
@@ -299,10 +302,12 @@ impl Pool {
         mut first: Session,
         connection: Connection,
         scratch: &RawBlobs,
+        git: &Git,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
             scratch: scratch.clone(),
+            git: Arc::new(git.clone()),
             workers: Mutex::default(),
             wake: None,
         };
@@ -317,6 +322,7 @@ impl Pool {
     pub(crate) fn http2(
         configuration: crate::http2::Configuration,
         scratch: &RawBlobs,
+        git: &Git,
     ) -> Result<Option<Self>> {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
@@ -324,6 +330,8 @@ impl Pool {
         let shared = Arc::<Shared>::default();
         let worker_state = shared.clone();
         let worker_scratch = scratch.clone();
+        let git = Arc::new(git.clone());
+        let worker_git = git.clone();
         let (ready, result) = std::sync::mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("git-on-http2".into())
@@ -336,13 +344,14 @@ impl Pool {
                     return Ok(());
                 };
                 if ready.send(true).is_ok() {
-                    worker_state.run_http2(client, read, &worker_scratch);
+                    worker_state.run_http2(client, read, &worker_scratch, &worker_git);
                 }
                 Ok(())
             })?;
         let pool = Self {
             shared,
             scratch: scratch.clone(),
+            git,
             workers: Mutex::new(vec![worker]),
             wake: Some(write),
         };
@@ -369,9 +378,10 @@ impl Pool {
     ) -> Result<()> {
         let shared = self.shared.clone();
         let scratch = self.scratch.clone();
+        let git = self.git.clone();
         let worker = thread::Builder::new()
             .name(format!("git-on-native-{index}"))
-            .spawn(move || shared.worker(index, session, connection, &scratch))?;
+            .spawn(move || shared.worker(index, session, connection, &scratch, &git))?;
         self.workers.get_mut().unwrap().push(worker);
         Ok(())
     }
@@ -532,7 +542,13 @@ impl Shared {
         )
     }
 
-    fn resolve_speculative_pack(&self, work: &Work, scratch: &RawBlobs, pack: Spool) -> Result<()> {
+    fn resolve_speculative_pack(
+        &self,
+        work: &Work,
+        scratch: &RawBlobs,
+        git: &Git,
+        pack: Spool,
+    ) -> Result<()> {
         let directory = scratch.index_directory()?;
         let mut options = git2::RepositoryInitOptions::new();
         options.bare(true).external_template(false);
@@ -541,8 +557,31 @@ impl Shared {
         pack_stream::index(&odb, &pack)?;
         let mut cache = scratch.clone();
         for item in work.items.iter().filter(|item| !item.demand.ready()) {
-            let object = odb.read(item.oid)?;
-            cache.insert_prefetched_odb_blob(item.oid, &object)?;
+            let (size, kind) = odb.read_header(item.oid)?;
+            anyhow::ensure!(
+                kind == git2::ObjectType::Blob,
+                "prefetched object is not a blob"
+            );
+            if size > NATIVE_BLOB_STREAM_THRESHOLD {
+                let mut command = git.command(Some(repository.path()));
+                command
+                    .args(["-c", "core.bigFileThreshold=8m", "cat-file", "blob"])
+                    .arg(item.oid.to_string())
+                    .stdin(std::process::Stdio::null());
+                let (output, ()) = crate::git::run_with_output(command, None, |input| {
+                    cache.insert_fetched(item.oid, size, input)?;
+                    Ok(())
+                })
+                .context("stream large prefetched Git blob")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "cannot decode prefetched Git blob: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            } else {
+                let object = odb.read(item.oid)?;
+                cache.insert_prefetched_odb_blob(item.oid, &object)?;
+            }
             self.oids.fetch_add(1, Ordering::Relaxed);
             item.demand
                 .complete(Batch::new(vec![item.oid], Ok(Acquired::Stored)));
@@ -557,6 +596,7 @@ impl Shared {
         started: Instant,
         lane: Option<usize>,
         scratch: &RawBlobs,
+        git: &Git,
     ) {
         let result = result.and_then(|pack| {
             self.packs.fetch_add(1, Ordering::Relaxed);
@@ -569,7 +609,7 @@ impl Shared {
             }
             match pack.fallback {
                 Some(file) if work.speculative => {
-                    self.resolve_speculative_pack(&work, scratch, file)?;
+                    self.resolve_speculative_pack(&work, scratch, git, file)?;
                     Ok(None)
                 }
                 Some(file) => Ok(Some(Acquired::Pack(file))),
@@ -633,9 +673,10 @@ impl Shared {
         mut client: crate::http2::Client,
         mut wake: UnixStream,
         scratch: &RawBlobs,
+        git: &Git,
     ) {
         let failure = self
-            .drive_http2(&mut client, &mut wake, scratch)
+            .drive_http2(&mut client, &mut wake, scratch, git)
             .err()
             .filter(|error| !object::is_cancelled(error));
         let pending = {
@@ -662,6 +703,7 @@ impl Shared {
         client: &mut crate::http2::Client,
         wake: &mut UnixStream,
         scratch: &RawBlobs,
+        git: &Git,
     ) -> Result<()> {
         let mut active = HashMap::<usize, Http2Batch>::new();
         let mut token = 0_usize;
@@ -702,7 +744,7 @@ impl Shared {
                         Ok(()) => {
                             active.insert(token, Http2Batch { work, started });
                         }
-                        Err(error) => self.finish(work, Err(error), started, None, scratch),
+                        Err(error) => self.finish(work, Err(error), started, None, scratch, git),
                     }
                     self.http2_peak
                         .fetch_max(active.len() as u64, Ordering::Relaxed);
@@ -712,7 +754,7 @@ impl Shared {
                 let Http2Batch { work, started } = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
-                self.finish(work, pack, started, None, scratch);
+                self.finish(work, pack, started, None, scratch, git);
             }
             let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
                 remaining.max(Duration::from_millis(1))
@@ -731,6 +773,7 @@ impl Shared {
         mut session: Option<Session>,
         connection: Connection,
         scratch: &RawBlobs,
+        git: &Git,
     ) -> Result<()> {
         loop {
             let (work, failure) = {
@@ -757,11 +800,12 @@ impl Shared {
             self.work.notify_all();
             let started = Instant::now();
             if session.is_none() && failure.is_none() {
-                let connected = connection
-                    .connect(Some(self.stop.clone()))
-                    .and_then(|session| {
-                        session.context("native Git cannot open a reusable demand channel")
-                    });
+                let connected =
+                    connection
+                        .connect_additional(self.stop.clone())
+                        .and_then(|session| {
+                            session.context("native Git cannot open a reusable demand channel")
+                        });
                 match connected {
                     Ok(new) => {
                         if index != 0 {
@@ -788,7 +832,7 @@ impl Shared {
                         return Ok(());
                     }
                     Err(error) => {
-                        self.finish(work, Err(error), started, Some(index), scratch);
+                        self.finish(work, Err(error), started, Some(index), scratch, git);
                         continue;
                     }
                 }
@@ -808,7 +852,7 @@ impl Shared {
                 // fetch_stream reaps a channel with an incomplete response.
                 session = None;
             }
-            self.finish(work, result, started, Some(index), scratch);
+            self.finish(work, result, started, Some(index), scratch, git);
         }
     }
 }
@@ -870,6 +914,7 @@ mod tests {
             Instant::now(),
             None,
             &scratch,
+            &Git::capture(directory.path()).unwrap(),
         );
         let queue = shared.queue.lock().unwrap();
         assert!(queue.failure.is_none());

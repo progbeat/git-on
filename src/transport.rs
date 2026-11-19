@@ -156,6 +156,14 @@ impl Connection {
     }
 
     pub(crate) fn connect(&self, stop: Stop) -> Result<Option<Session>> {
+        self.open(stop, false)
+    }
+
+    pub(crate) fn connect_additional(&self, stop: Arc<AtomicBool>) -> Result<Option<Session>> {
+        self.open(Some(stop), true)
+    }
+
+    fn open(&self, stop: Stop, additional: bool) -> Result<Option<Session>> {
         self.check()?;
         let mut command = Command::new(self.command.get_program());
         command.args(self.command.get_args());
@@ -168,6 +176,9 @@ impl Connection {
             } else {
                 command.env_remove(key);
             }
+        }
+        if additional && self.is_ssh() {
+            command.env("GIT_ON_SSH_ADDITIONAL", "1");
         }
         Session::connect_with_stop(command, self.helper, stop)
     }

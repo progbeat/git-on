@@ -81,14 +81,23 @@ class SplitPack:
         self.tail = b''.join(entries[1:]) + hashlib.sha1(pack).digest() + b'0000'
 
 
+def fixture_in_short_tmp():
+    # OpenSSH's Unix socket can outgrow macOS's default TMPDIR.
+    with patch.object(tempfile, 'tempdir', '/tmp'):
+        return Fixture()
+
+
+def mount_flag():
+    assert OPTIONS.require_fuse or OPTIONS.require_nfs
+    return '--backend=' + ('nfs' if OPTIONS.require_nfs else 'fuse')
+
+
 class StreamingTests(unittest.TestCase):
     def test_directory_dfs_prefetch_is_separate_and_publishes_early(self):
         self.assertTrue(OPTIONS.require_fuse or OPTIONS.require_nfs)
         for transport in ('https', 'ssh'):
             with self.subTest(transport=transport), ExitStack() as stack:
-                # OpenSSH's Unix socket can outgrow macOS's default TMPDIR.
-                with patch.object(tempfile, 'tempdir', '/tmp'):
-                    fixture = Fixture()
+                fixture = fixture_in_short_tmp()
                 stack.callback(fixture.close)
                 names = ['a', 'b/first', 'b/second', 'd', 'e', 'f', 'hidden/no']
                 data = [f'payload-{index}\n'.encode() for index, _ in enumerate(names)]
@@ -143,9 +152,8 @@ assert Path('b/first').read_bytes() == {data[1]!r}
 Path({str(ready)!r}).touch()
 assert Path('b/second').read_bytes() == {data[2]!r}
 """
-                backend = '--backend=' + ('nfs' if OPTIONS.require_nfs else 'fuse')
                 process = subprocess.Popen(
-                    [OPTIONS.binary, url, 'HEAD', backend, '--write-policy=none', '--',
+                    [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
                      sys.executable, '-I', '-S', '-c', script],
                     cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
@@ -166,6 +174,78 @@ assert Path('b/second').read_bytes() == {data[2]!r}
                 self.assertIn({oids[0].encode()}, wants)
                 self.assertEqual(wants.count(split.wants), 1)
                 self.assertNotIn(hidden.encode(), set().union(*wants))
+
+    def test_ssh_channel_rejection_preserves_the_owned_master(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        contents = {f'file-{index:02}': f'payload {index}\n'.encode() for index in range(12)}
+        rows = [
+            f"100644 blob {fixture.git('hash-object', '-w', '--stdin', data=body)}\t{name}\n"
+            for name, body in contents.items()
+        ]
+        tree = fixture.git('mktree', data=''.join(rows).encode())
+        commit = fixture.git('commit-tree', tree, data=b'one SSH channel\n')
+        fixture.git('update-ref', 'refs/heads/main', commit)
+        url = fixture.ssh(protocol_v2=True, max_sessions=1)
+        script = f"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+contents = {contents!r}
+assert sorted(path.name for path in Path('.').iterdir()) == list(contents)
+with ThreadPoolExecutor(12) as pool:
+    assert list(pool.map(lambda name: Path(name).read_bytes(), contents)) == list(contents.values())
+"""
+        result = subprocess.run(
+            [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
+             sys.executable, '-I', '-S', '-c', script],
+            cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=25,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
+    def test_large_speculative_blob_uses_the_native_streaming_decoder(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        large = fixture.git('hash-object', '-w', '--stdin', data=b'x' * (9 * 1024 * 1024))
+        tree = fixture.git('mktree', data=(
+            f'100644 blob {fixture.blob}\ta\n100644 blob {large}\tb\n'
+        ).encode())
+        commit = fixture.git('commit-tree', tree, data=b'large speculative blob\n')
+        fixture.git('update-ref', 'refs/heads/main', commit)
+        url = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        trace = fixture.root / 'native.jsonl'
+        fixture.env['GIT_TRACE2_EVENT'] = str(trace)
+        script = f"""
+import json, os, time
+from pathlib import Path
+assert sorted(os.listdir('.')) == ['a', 'b']
+assert Path('a').read_bytes() == b'expected\\n'
+trace = Path({str(trace)!r})
+deadline = time.monotonic() + 8
+while time.monotonic() < deadline:
+    lines = trace.read_text().splitlines()
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    starts = {{e['sid'] for e in events if e['event'] == 'start'
+               and e['argv'][-3:] == ['cat-file', 'blob', {large!r}]}}
+    if any(e['event'] == 'exit' and e['sid'] in starts and e['code'] == 0 for e in events):
+        break
+    time.sleep(.02)
+else:
+    raise AssertionError('the unused large blob did not use the native streaming decoder')
+"""
+        result = subprocess.run(
+            [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
+             sys.executable, '-I', '-S', '-c', script],
+            cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(large in request['wants'] for request in fixture.requests), 1)
 
 
 if __name__ == '__main__':

@@ -213,7 +213,7 @@ class Fixture:
         self.server = server
         self.env['GIT_SSL_CAINFO'] = str(cert)
         return f'https://127.0.0.1:{server.server_port}/server.git'
-    def ssh(self, encrypted=False, protocol_v2=False):
+    def ssh(self, encrypted=False, protocol_v2=False, max_sessions=None):
         sshd = shutil.which('sshd') or '/usr/sbin/sshd'
         if not Path(sshd).exists(): raise RuntimeError('OpenSSH server missing; install openssh-server')
         host, identity = self.root/'host', self.root/'identity'
@@ -225,6 +225,8 @@ class Fixture:
         config.write_text(f'Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nPidFile {self.root}/sshd.pid\nAuthorizedKeysFile {authorized}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nLogLevel VERBOSE\n')
         if protocol_v2:
             with config.open('a') as output:output.write('AcceptEnv GIT_PROTOCOL\n')
+        if max_sessions is not None:
+            with config.open('a') as output:output.write(f'MaxSessions {max_sessions}\n')
         errors = (self.root/'sshd.log').open('w+b'); self.handles.append(errors)
         server = subprocess.Popen([sshd, '-D', '-e', '-f', str(config)], stderr=errors)
         self.children.append(server); self.ssh_server = server
@@ -1487,8 +1489,11 @@ print('caught-EIO-and-returned-success')
         self.assertEqual(output, b'expected\nunrelated payload\n')
         self.assertEqual(report['backend'], backend)
         self.assertEqual(report['remote_fetches'], 5, report)
-        self.assertEqual(report['remote_session_starts'], 1, report)
         self.assertEqual(report['remote_session_fetch_operations'], 3, report)
+        # A following read can start while a helper validates the previous
+        # pack trailer. At least one of the three fetches must reuse a helper.
+        self.assertGreaterEqual(report['remote_session_starts'], 1, report)
+        self.assertLess(report['remote_session_starts'], report['remote_session_fetch_operations'], report)
         self.assertEqual({oid for request in f.requests for oid in request['wants']},
                          {f.commit, f.tree, f.subtree, f.blob, f.other})
         self.assertFalse(list(f.root.glob('git-on-*')))
@@ -2799,17 +2804,32 @@ signal.pause()
                 if OPTIONS.before_binary and escaped: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
                 self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
 
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
-        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
-        f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
+        f = self.f
+        # Use a file that spills to the authenticated raw store. An ordinary
+        # small fetch can now complete without any temporary pack file.
+        blob = f.git('hash-object', '-w', '--stdin', data=b'x' * (128 * 1024))
+        subtree = f.git('mktree', data=f'100644 blob {blob}\tfile\n'.encode())
+        tree = f.git('mktree', data=f'040000 tree {subtree}\tdeep\n'.encode())
+        commit = f.git('commit-tree', tree, data=b'raw publication fault\n')
+        f.git('update-ref', 'refs/heads/main', commit)
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
         for fault in ('odb','raw'):
             with self.subTest(fault=fault):
                 env=dict(f.env)
                 if fault=='odb':
                     env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
-                code="import errno,os; from pathlib import Path\n"+private_storage_fault(fault)
+                code = "import errno,os; from pathlib import Path\n"
+                if fault == 'raw':
+                    code += (f"raw = next(Path.cwd().parent.glob('raw-objects-*'))\n"
+                             f"target = raw / {blob!r}\ntarget.mkdir()\n")
+                else:
+                    code += private_storage_fault(fault)
                 code+="try:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
-                if fault=='raw':code+="assert not target.exists()\n"
+                if fault == 'raw':
+                    code += "assert target.is_dir()\n"
                 result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=env,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,125,result.stderr)
                 self.assertIn(b'remote object loading failed',result.stderr)

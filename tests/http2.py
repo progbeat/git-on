@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
-from h2.events import DataReceived, RequestReceived, StreamEnded
+from h2.events import DataReceived, RequestReceived, StreamEnded, StreamReset
 
 from remote import ARGS, OPTIONS, Fixture
 
@@ -91,6 +91,12 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                     elif isinstance(event, DataReceived):
                         pending[stream][1].extend(event.data)
                         h2.acknowledge_received_data(event.flow_controlled_length, stream)
+                    elif isinstance(event, StreamReset):
+                        pending.pop(stream, None)
+                        response = responses.pop(stream, None)
+                        if response is not None:
+                            response.cancel()
+                        held.discard(stream)
                     elif isinstance(event, StreamEnded):
                         headers, body = pending.pop(stream)
                         wants = re.findall(rb'want ([0-9a-f]{40})', body)

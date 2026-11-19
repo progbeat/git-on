@@ -287,8 +287,10 @@ non-OpenSSH variants are unsupported and fail before authentication. The runner
 owns control options, including short `-M`/`-S`; caller `-O` control commands
 are rejected. Expanding the owned socket path in caller options cannot bypass
 control-option sanitization. Its master remains available for the run lifetime,
-and lazy reads require the existing socket through OpenSSH mux proxy mode. Normal completion
-and busy-mount retention close the owned master. Recovery records the socket's
+and lazy reads use that socket. Extra SSH channels ask the master to open a
+session. When the master refuses, its existing channels stay available and a
+replacement network connection is blocked. Normal completion and busy-mount
+retention close the owned master. Recovery records the socket's
 exact device/inode and only closes a matching real socket; changed or symbolic
 paths and absent or invalid records are skipped. Uncatchable termination before
 initial advertisement finishes can leave an unrecorded connection; stale cleanup
