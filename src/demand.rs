@@ -22,6 +22,7 @@ use std::{
 
 const CONNECTIONS: usize = 16;
 const INITIAL_CONNECTIONS: usize = 4;
+const STANDBY_SSH_CHANNELS: usize = 5;
 const MAX_WANTS: usize = 64;
 const READ_AHEAD: usize = 4;
 const MAX_READ_AHEAD: usize = 256;
@@ -32,7 +33,8 @@ const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
 const BATCH_TARGET: usize = 4;
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
-const DENSE_SCORE: u8 = 4;
+const DENSE_SCORE: u8 = 2;
+const FORECAST_MISSES: u8 = 4;
 const DENSE_BATCH_TARGET: usize = 24;
 const DENSE_BATCH_WINDOW: Duration = Duration::from_millis(12);
 
@@ -194,6 +196,7 @@ struct Queue {
     pending: HashMap<Oid, Demand>,
     predicted: HashSet<Oid>,
     forecast_score: u8,
+    forecast_misses: u8,
     busy: [bool; CONNECTIONS],
     native_ceiling: Option<usize>,
     failure: Option<String>,
@@ -215,15 +218,26 @@ impl Queue {
     fn forecast_width(&mut self, anchor: Oid) -> usize {
         if self.predicted.remove(&anchor) {
             self.forecast_score = (self.forecast_score + 1).min(MAX_FORECAST_SCORE);
-        } else {
-            self.forecast_score = self.forecast_score.saturating_sub(1);
+            self.forecast_misses = 0;
+        } else if self.forecast_score != 0 {
+            self.forecast_misses += 1;
+            if self.forecast_misses == FORECAST_MISSES {
+                self.forecast_score -= 1;
+                self.forecast_misses = 0;
+            }
+        }
+        if !self.dense() {
+            return READ_AHEAD;
         }
         match self.forecast_score {
-            0..=3 => READ_AHEAD,
-            4..=5 => 64,
-            6..=7 => 128,
+            2..=3 => 64,
+            4..=5 => 128,
             _ => MAX_READ_AHEAD,
         }
+    }
+
+    fn dense(&self) -> bool {
+        self.forecast_score >= DENSE_SCORE && !matches!(self.mode, ConnectionMode::Standard)
     }
 
     fn foreground(&mut self, oid: Oid) -> Demand {
@@ -246,7 +260,7 @@ impl Queue {
         if !transfer_active {
             return None;
         }
-        let (first, window) = if self.forecast_score >= DENSE_SCORE {
+        let (first, window) = if self.dense() {
             if self.waiting.len().max(self.ahead.len()) >= DENSE_BATCH_TARGET {
                 return None;
             }
@@ -269,9 +283,7 @@ impl Queue {
     }
 
     fn native_work(&mut self, index: usize) -> Option<Work> {
-        let channels = if self.forecast_score >= DENSE_SCORE
-            && !matches!(self.mode, ConnectionMode::Standard)
-        {
+        let channels = if self.dense() {
             CONNECTIONS
         } else {
             self.mode.channels()
@@ -351,6 +363,7 @@ impl Pool {
         connection: Connection,
         scratch: &RawBlobs,
         git: &Git,
+        standby: bool,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
@@ -360,9 +373,14 @@ impl Pool {
             wake: None,
         };
         first.set_stop(pool.shared.stop.clone());
-        pool.start(0, Some(first), connection.clone())?;
+        pool.start(0, Some(first), connection.clone(), false)?;
         for index in 1..CONNECTIONS {
-            pool.start(index, None, connection.clone())?;
+            pool.start(
+                index,
+                None,
+                connection.clone(),
+                standby && index <= STANDBY_SSH_CHANNELS,
+            )?;
         }
         Ok(pool)
     }
@@ -427,13 +445,14 @@ impl Pool {
         index: usize,
         session: Option<Session>,
         connection: Connection,
+        standby: bool,
     ) -> Result<()> {
         let shared = self.shared.clone();
         let scratch = self.scratch.clone();
         let git = self.git.clone();
         let worker = thread::Builder::new()
             .name(format!("git-on-native-{index}"))
-            .spawn(move || shared.worker(index, session, connection, &scratch, &git))?;
+            .spawn(move || shared.worker(index, session, connection, &scratch, &git, standby))?;
         self.workers.get_mut().unwrap().push(worker);
         Ok(())
     }
@@ -484,7 +503,7 @@ impl Pool {
             return;
         }
         let mut accepted = 0;
-        for oid in candidates(queue.forecast_score >= DENSE_SCORE) {
+        for oid in candidates(queue.dense()) {
             if queue.pending.contains_key(&oid)
                 || queue.predicted.contains(&oid)
                 || self.scratch.available(oid)
@@ -870,7 +889,14 @@ impl Shared {
         connection: Connection,
         scratch: &RawBlobs,
         git: &Git,
+        standby: bool,
     ) -> Result<()> {
+        if standby {
+            if let Ok(Some(connected)) = connection.connect_additional(self.stop.clone()) {
+                session = Some(connected);
+                self.additional_starts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         loop {
             let (work, failure) = {
                 let mut queue = self.queue.lock().unwrap();
@@ -1003,19 +1029,31 @@ mod tests {
     #[test]
     fn forecast_grows_with_distinct_hits_and_shrinks_on_misses() {
         let mut queue = Queue::default();
-        for index in 0..8 {
+        for index in 0..6 {
             let oid = Oid::from_bytes(&[index; 20]).unwrap();
             queue.predicted.insert(oid);
             let expected = match index {
-                0..=2 => 4,
-                3..=4 => 64,
-                5..=6 => 128,
+                0 => 4,
+                1..=2 => 64,
+                3..=4 => 128,
                 _ => 256,
             };
             assert_eq!(queue.forecast_width(oid), expected);
         }
+        let mut previous = MAX_READ_AHEAD;
         for width in [128, 128, 64, 64, 4] {
+            for _ in 1..FORECAST_MISSES {
+                assert_eq!(queue.forecast_width(Oid::zero()), previous);
+            }
             assert_eq!(queue.forecast_width(Oid::zero()), width);
+            previous = width;
+        }
+
+        queue.mode = ConnectionMode::Standard;
+        for index in 0..6 {
+            let oid = Oid::from_bytes(&[index; 20]).unwrap();
+            queue.predicted.insert(oid);
+            assert_eq!(queue.forecast_width(oid), READ_AHEAD);
         }
     }
 

@@ -91,6 +91,8 @@ successful transfers takes at least 64 milliseconds, the pool can use up to
 16 channels. It can expand earlier if a scan confirms its forecasts while the
 connection is still being measured. SSH opens its channels through the same
 owned master and uses fewer when the server refuses an additional channel.
+After a slow SSH handshake, spare channels can negotiate protocol v2 in
+parallel with preparing the snapshot on that master.
 An idle pool starts an ordinary request immediately. While a transfer is active,
 the queue can wait up to two milliseconds on a slow source. A dense scan can
 wait up to twelve milliseconds to combine overlapping requests.
@@ -99,8 +101,9 @@ A first access to a regular file in a directory opened for enumeration finds
 uncached and previously unscheduled blob OIDs in Git's depth-first order
 through already opened directories. It skips previously considered ranges
 and examines at most 512 remaining entries. The same planner serves FUSE and
-NFS. Speculative packs start with up to four OIDs. Confirmed first accesses to
-predicted objects can expand this to 64, 128 or 256. During a dense scan
+NFS. Speculative packs start with up to four OIDs. On slower connections,
+confirmed first accesses to predicted objects can expand this to 64, 128 or
+256. Consecutive misses reduce the window. During a dense scan
 the planner groups remaining OIDs from the current and recently opened
 directories. At most 512 predictions await an actual access. Ordinary demands
 take precedence and can join an active speculative request without duplicating its fetch. If that

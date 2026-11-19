@@ -666,6 +666,10 @@ impl Remote {
         if self.demand_pool.is_some() || self.pool_checked || crate::terminal_ui::preparing() {
             return Ok(());
         }
+        self.open_demand_pool(false)
+    }
+
+    fn open_demand_pool(&mut self, standby: bool) -> Result<()> {
         let http = self.uses_http();
         if http {
             self.try_http2_pool()?;
@@ -693,6 +697,7 @@ impl Remote {
             connection,
             &self.raw_blobs,
             &self.git,
+            standby,
         )?);
         Ok(())
     }
@@ -925,7 +930,9 @@ impl Remote {
         // An existing agent or identity can open a direct v2 session. Leave
         // interactive authentication to native Git's normal preparation path.
         command.env("SSH_ASKPASS_REQUIRE", "never");
+        let started = Instant::now();
         let session = crate::transport::Session::connect_with_stop(command, false, None);
+        let slow_start = started.elapsed() >= Duration::from_millis(250);
         self.record_socket_owner()?;
         crate::object::check_transfer()?;
         let Ok(Some(mut session)) = session else {
@@ -950,7 +957,15 @@ impl Remote {
         self.session_checked = true;
         self.session_starts += 1;
         let repo = Repository::open_bare(&self.dir)?;
-        Ok(self.fetch_in_session(&repo, &[oid])?.then_some(oid))
+        if !self.fetch_in_session(&repo, &[oid])? {
+            return Ok(None);
+        }
+        if slow_start {
+            // Authenticate once. Extra channels negotiate protocol v2 with
+            // the same master in parallel with preparing the snapshot.
+            self.open_demand_pool(true)?;
+        }
+        Ok(Some(oid))
     }
 
     fn non_http_command(&self, initial: bool) -> Result<Option<Command>> {

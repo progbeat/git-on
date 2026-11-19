@@ -1127,10 +1127,15 @@ impl Overlay {
     fn ensure_size(&mut self, ino: u64) -> FsResult<()> {
         let node = self.node(ino)?;
         if node.size_pending {
-            let size = self
-                ._snapshot
-                .blob_size(node.oid.ok_or(libc::EIO)?)
-                .map_err(snapshot_errno)?;
+            let oid = node.oid.ok_or(libc::EIO)?;
+            // First access can also come through a filesystem operation
+            // that cannot be suspended independently in the backend.
+            if node.attr.kind == FileType::RegularFile && self.parallel_remote_reads() {
+                if let Some(demand) = self.start_remote_demand(oid, Some(ino)) {
+                    demand.finish();
+                }
+            }
+            let size = self._snapshot.blob_size(oid).map_err(snapshot_errno)?;
             let node = self.node_mut(ino)?;
             node.attr.size = size;
             node.attr.blocks = size.div_ceil(512);
