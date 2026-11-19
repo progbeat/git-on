@@ -80,28 +80,28 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-untracked | tests/fuse_protocol.rs | protocol_untracked_writes_unignored_paths_and_keeps_source_immutable |
 | P-cow | tests/fuse_protocol.rs | protocol_all_copy_up_setattr_links_rename_and_whiteouts |
 | P-unlinked-cow | tests/fuse_protocol.rs | protocol_all_setattr_on_unlinked_original_read_handle |
-| I-dir-cache | tests/integration.py | FuseTests.test_readonly_directory_pages_preserve_partial_seek_reopen_and_empty |
-| I-snapshot | tests/integration.py | FuseTests.test_snapshot_ignores_dirty_index_worktree_and_untracked_files |
-| I-file | tests/integration.py | FuseTests.test_file_operation_matrix_preserves_tracked_bytes |
-| I-readonly | tests/integration.py | FuseTests.test_readonly_stateless_large_reads_dup_mmap_and_sync |
-| I-cache-cow | tests/integration.py | FuseTests.test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes |
-| I-directory | tests/integration.py | FuseTests.test_directory_and_rename_operation_matrix_is_atomic |
-| I-links | tests/integration.py | FuseTests.test_symlink_and_hardlink_lifecycle_matrix |
-| I-lazy | tests/integration.py | FuseTests.test_lazy_metadata_does_not_load_unread_blobs_or_descendant_trees |
-| I-large | tests/integration.py | FuseTests.test_large_snapshot_blob_random_and_sequential_reads_agree |
-| I-exec | tests/integration.py | FuseTests.test_executable_mode_symlinks_and_repository_discovery |
-| I-mmap | tests/integration.py | FuseTests.test_append_flags_and_shared_mmap_follow_current_open_description |
-| I-mknod | tests/integration.py | FuseTests.test_mknod_regular_files_follow_policy_and_special_nodes_are_refused |
-| I-sync | tests/integration.py | FuseTests.test_fsync_fdatasync_and_directory_sync_preserve_live_handles |
-| I-statfs | tests/integration.py | FuseTests.test_statvfs_reports_coherent_backing_filesystem_capacity |
-| I-rename | tests/integration.py | FuseTests.test_renameat2_noreplace_and_rejected_flags_are_atomic |
-| I-readdir | tests/integration.py | FuseTests.test_readdir_pagination_and_seekdir_preserve_merged_entries |
-| I-xattr | tests/integration.py | FuseTests.test_xattrs_are_unsupported_without_changing_files_or_directories |
-| I-allocate | tests/integration.py | FuseTests.test_fallocate_and_unknown_ioctl_fail_without_changing_bytes |
-| I-lock | tests/integration.py | FuseTests.test_posix_and_flock_locks_use_local_kernel_fallback |
-| I-pollseek | tests/integration.py | FuseTests.test_poll_and_lseek_use_regular_file_kernel_fallbacks |
-| I-copy | tests/integration.py | FuseTests.test_copy_file_range_kernel_fallback_preserves_offsets_and_snapshot |
-| I-partial | tests/integration.py | FuseTests.test_partial_backing_write_and_sparse_blocks_remain_visible |
+| I-dir-cache | tests/integration.py | MountTests.test_readonly_directory_pages_preserve_partial_seek_reopen_and_empty |
+| I-snapshot | tests/integration.py | MountTests.test_snapshot_ignores_dirty_index_worktree_and_untracked_files |
+| I-file | tests/integration.py | MountTests.test_file_operation_matrix_preserves_tracked_bytes |
+| I-readonly | tests/integration.py | MountTests.test_readonly_stateless_large_reads_dup_mmap_and_sync |
+| I-cache-cow | tests/integration.py | MountTests.test_all_source_cache_is_coherent_across_copy_up_mmap_and_namespace_changes |
+| I-directory | tests/integration.py | MountTests.test_directory_and_rename_operation_matrix_is_atomic |
+| I-links | tests/integration.py | MountTests.test_symlink_and_hardlink_lifecycle_matrix |
+| I-lazy | tests/integration.py | MountTests.test_lazy_metadata_does_not_load_unread_blobs_or_descendant_trees |
+| I-large | tests/integration.py | MountTests.test_large_snapshot_blob_random_and_sequential_reads_agree |
+| I-exec | tests/integration.py | MountTests.test_executable_mode_symlinks_and_repository_discovery |
+| I-mmap | tests/integration.py | MountTests.test_append_flags_and_shared_mmap_follow_current_open_description |
+| I-mknod | tests/integration.py | MountTests.test_mknod_regular_files_follow_policy_and_special_nodes_are_refused |
+| I-sync | tests/integration.py | MountTests.test_fsync_fdatasync_and_directory_sync_preserve_live_handles |
+| I-statfs | tests/integration.py | MountTests.test_statvfs_reports_coherent_backing_filesystem_capacity |
+| I-rename | tests/integration.py | MountTests.test_renameat2_noreplace_and_rejected_flags_are_atomic |
+| I-readdir | tests/integration.py | MountTests.test_readdir_pagination_and_seekdir_preserve_merged_entries |
+| I-xattr | tests/integration.py | MountTests.test_xattrs_are_unsupported_without_changing_files_or_directories |
+| I-allocate | tests/integration.py | MountTests.test_fallocate_and_unknown_ioctl_fail_without_changing_bytes |
+| I-lock | tests/integration.py | MountTests.test_posix_and_flock_locks_use_local_kernel_fallback |
+| I-pollseek | tests/integration.py | MountTests.test_poll_and_lseek_use_regular_file_kernel_fallbacks |
+| I-copy | tests/integration.py | MountTests.test_copy_file_range_kernel_fallback_preserves_offsets_and_snapshot |
+| I-partial | tests/integration.py | MountTests.test_partial_backing_write_and_sparse_blocks_remain_visible |
 <!-- TEST IDS END -->
 
 ## Callback matrix
@@ -203,8 +203,8 @@ The published registry fuser 0.18.0 owns Linux protocol handling and backing
 registration. Its locked checksum and unchanged reviewed Filesystem trait are
 checked above; no local fork or FUSE protocol implementation is shipped.
 `src/backend/linux.rs` converts typed callbacks into the shared Overlay engine.
-macOS mounts are not supported. Mac CLI/materialization tests do not
-establish FUSE mount behavior.
+macOS uses the [separate NFSv4.1 protocol adapter](nfs.md). Linux FUSE
+acceptance runs on a host with a real FUSE device.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
 FOPEN_PASSTHROUGH for command-created regular files only, after policy and access

@@ -32,6 +32,11 @@ struct Node {
     // coexist with source data: oid stays present until content copy-up.
     immutable: bool,
     oid: Option<Oid>,
+    size_pending: bool,
+    #[cfg(target_os = "macos")]
+    change: u64,
+    #[cfg(target_os = "macos")]
+    create_verifier: Option<[u8; 8]>,
     lookups: u64,
     snapshot_path: Option<PathBuf>,
     bytes: Vec<u8>,
@@ -122,12 +127,15 @@ pub struct Overlay {
     next_ino: u64,
     next_handle: u64,
     snapshot_time: SystemTime,
+    #[cfg(target_os = "macos")]
+    preserve_linked_inodes: bool,
 }
 
 impl Overlay {
     pub(crate) fn read_only(&self) -> bool {
         self.write_policy == WritePolicy::None
     }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn readonly_file_attributes(&self, ino: u64) -> FsResult<FileAttr> {
         if !self.read_only() {
             return Err(libc::EBADF);
@@ -139,6 +147,7 @@ impl Overlay {
             _ => Err(libc::ELOOP),
         }
     }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn unchanged_source_data(&self, ino: u64) -> bool {
         self.nodes.get(&ino).is_some_and(|node| {
             node.oid.is_some()
@@ -146,6 +155,7 @@ impl Overlay {
                 && node.attr.kind == FileType::RegularFile
         })
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn protected_source(&self, ino: u64) -> bool {
         self.write_policy != WritePolicy::All
             && self
@@ -188,6 +198,11 @@ impl Overlay {
                 ),
                 immutable: true,
                 oid: Some(snapshot.tree_oid),
+                size_pending: false,
+                #[cfg(target_os = "macos")]
+                change: 1,
+                #[cfg(target_os = "macos")]
+                create_verifier: None,
                 lookups: 1,
                 snapshot_path: Some(PathBuf::new()),
                 bytes: Vec::new(),
@@ -224,6 +239,8 @@ impl Overlay {
             next_ino: 2,
             next_handle: 1,
             snapshot_time,
+            #[cfg(target_os = "macos")]
+            preserve_linked_inodes: false,
         })
     }
     fn lower_path(&self, path: &Path) -> Option<PathBuf> {
@@ -240,17 +257,25 @@ impl Overlay {
     /// Materialize inode metadata only for the requested pathname. No sibling
     /// blobs or descendant trees are loaded as a side effect.
     fn ensure(&mut self, path: &Path) -> FsResult<u64> {
-        if let Some(ino) = self.paths.get(path) {
-            if self.nodes.contains_key(ino) {
-                return Ok(*ino);
+        self.ensure_entry(path, true)
+    }
+    fn ensure_entry(&mut self, path: &Path, size: bool) -> FsResult<u64> {
+        if let Some(&ino) = self.paths.get(path) {
+            if self.nodes.contains_key(&ino) {
+                if size {
+                    self.ensure_size(ino)?;
+                }
+                return Ok(ino);
             }
         }
         let source = self.lower_path(path).ok_or(libc::ENOENT)?;
-        let entry = self
-            ._snapshot
-            .entry(&source)
-            .map_err(snapshot_errno)?
-            .ok_or(libc::ENOENT)?;
+        let entry = if size {
+            self._snapshot.entry(&source)
+        } else {
+            self._snapshot.entry_metadata(&source)
+        }
+        .map_err(snapshot_errno)?
+        .ok_or(libc::ENOENT)?;
         let source_parent = self.source_directory(source.parent().ok_or(libc::EIO)?)?;
         let directory = &self.source_directories[source_parent];
         let index = directory
@@ -262,7 +287,7 @@ impl Overlay {
     }
     /// The readonly namespace cannot redirect or shadow its source parent.
     /// Reuse that parent's prepared name index instead of resolving from root.
-    fn ensure_readonly_child(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
+    fn ensure_readonly_child(&mut self, parent: u64, name: &OsStr, size: bool) -> FsResult<u64> {
         debug_assert!(self.read_only());
         let node = self.node(parent)?;
         if node.attr.kind != FileType::Directory {
@@ -287,6 +312,9 @@ impl Overlay {
         // Readonly source ranges give the same inode on every lookup. Existing
         // nodes need neither a full pathname allocation nor the ordered index.
         if self.nodes.contains_key(&ino) {
+            if size {
+                self.ensure_size(ino)?;
+            }
             return Ok(ino);
         }
         let path = self
@@ -295,10 +323,13 @@ impl Overlay {
             .as_deref()
             .ok_or(libc::EIO)?
             .join(name);
-        let entry = self
-            ._snapshot
-            .directory_entry(&directory.tree, index, &path)
-            .map_err(snapshot_errno)?;
+        let entry = if size {
+            self._snapshot
+                .directory_entry(&directory.tree, index, &path)
+        } else {
+            Snapshot::directory_entry_metadata(&directory.tree, index, &path)
+        }
+        .map_err(snapshot_errno)?;
         self.insert_source_inode(&path, path.to_path_buf(), entry, ino)
     }
     fn insert_source_inode(
@@ -324,7 +355,7 @@ impl Overlay {
                 attr: Self::attr(
                     ino,
                     kind,
-                    entry.size.ok_or(libc::EIO)?,
+                    entry.size.unwrap_or(0),
                     perm,
                     unsafe { libc::geteuid() },
                     unsafe { libc::getegid() },
@@ -332,6 +363,11 @@ impl Overlay {
                 ),
                 immutable: true,
                 oid: Some(entry.oid),
+                size_pending: entry.size.is_none(),
+                #[cfg(target_os = "macos")]
+                change: 1,
+                #[cfg(target_os = "macos")]
+                create_verifier: None,
                 lookups: 0,
                 snapshot_path: Some(source),
                 bytes: Vec::new(),
@@ -388,6 +424,10 @@ impl Overlay {
             || self.has_open_handle(ino)
             || self.directory_refs.get(&ino).copied().unwrap_or(0) > 0
         {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if self.preserve_linked_inodes && self.nodes.get(&ino).is_some_and(|n| n.attr.nlink != 0) {
             return;
         }
         let removable = self
@@ -670,7 +710,7 @@ impl Overlay {
         }
         Ok(component)
     }
-    fn writable(&self, ino: u64) -> FsResult<()> {
+    pub(crate) fn writable(&self, ino: u64) -> FsResult<()> {
         let node = self.node(ino)?;
         if self.write_policy == WritePolicy::None
             || (node.immutable && self.write_policy != WritePolicy::All)
@@ -723,7 +763,7 @@ impl Overlay {
             handle.reader = None;
             fh = handle.next;
         }
-        let (file, source_integrity) = if preserve_content {
+        let (file, size, source_integrity) = if preserve_content {
             let promoted = self
                 ._snapshot
                 .promote_source(oid, &disk_path)
@@ -736,6 +776,7 @@ impl Overlay {
                 })?;
             (
                 promoted.file,
+                promoted.integrity.size(),
                 promoted
                     .integrity
                     .has_source()
@@ -758,11 +799,14 @@ impl Overlay {
                 let _ = fs::remove_file(&disk_path);
                 return Err(snapshot_errno(error));
             }
-            (file, None)
+            (file, 0, None)
         };
         let keep_file = unlinked || self.has_open_handle(ino);
         let node = self.node_mut(ino)?;
         node.oid = None;
+        node.attr.size = size;
+        node.attr.blocks = size.div_ceil(512);
+        node.size_pending = false;
         node.source_integrity = source_integrity;
         if keep_file {
             node.file = Some(file);
@@ -904,6 +948,11 @@ impl Overlay {
                 attr,
                 immutable: false,
                 oid: None,
+                size_pending: false,
+                #[cfg(target_os = "macos")]
+                change: 1,
+                #[cfg(target_os = "macos")]
+                create_verifier: None,
                 lookups: 0,
                 snapshot_path: None,
                 bytes,
@@ -949,6 +998,20 @@ impl Overlay {
             .filter(|h| h.ino == ino)
             .cloned()
             .ok_or(libc::EBADF)
+    }
+    fn ensure_size(&mut self, ino: u64) -> FsResult<()> {
+        let node = self.node(ino)?;
+        if node.size_pending {
+            let size = self
+                ._snapshot
+                .blob_size(node.oid.ok_or(libc::EIO)?)
+                .map_err(snapshot_errno)?;
+            let node = self.node_mut(ino)?;
+            node.attr.size = size;
+            node.attr.blocks = size.div_ceil(512);
+            node.size_pending = false;
+        }
+        Ok(())
     }
     fn refresh_backing_attr(&mut self, ino: u64) -> FsResult<()> {
         {
@@ -1015,7 +1078,7 @@ impl Overlay {
         attr.mtime = SystemTime::now();
         attr.ctime = attr.mtime;
     }
-    fn truncate(&mut self, ino: u64, size: u64) -> FsResult<()> {
+    pub(crate) fn truncate(&mut self, ino: u64, size: u64) -> FsResult<()> {
         self.writable(ino)?;
         if self.node(ino)?.attr.kind != FileType::RegularFile {
             return Err(libc::EINVAL);
@@ -1023,7 +1086,11 @@ impl Overlay {
         if size > i64::MAX as u64 {
             return Err(libc::EFBIG);
         }
-        if self.node(ino)?.oid.is_some() && self.node(ino)?.attr.size == size {
+        if size != 0 {
+            self.ensure_size(ino)?;
+        }
+        let node = self.node(ino)?;
+        if node.oid.is_some() && !node.size_pending && node.attr.size == size {
             self.copy_metadata_up(ino)?;
             let n = self.node_mut(ino)?;
             n.attr.mtime = SystemTime::now();
@@ -1058,6 +1125,7 @@ impl Overlay {
         }
         self.read_data_inner(ino, Some(fh), offset, size)
     }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn read_without_handle(
         &mut self,
         ino: u64,
@@ -1077,6 +1145,7 @@ impl Overlay {
         if offset < 0 {
             return Err(libc::EINVAL);
         }
+        self.ensure_size(ino)?;
         self.refresh_backing_attr(ino)?;
         #[cfg(feature = "test-metrics")]
         if self.node(ino)?.snapshot_path.is_none() {
@@ -1149,6 +1218,9 @@ impl Overlay {
         #[cfg(feature = "test-metrics")]
         if self.node(ino)?.snapshot_path.is_none() {
             self._snapshot.record_generated_io(true);
+        }
+        if flags & libc::O_APPEND != 0 {
+            self.ensure_size(ino)?;
         }
         let n = self.node(ino)?;
         // FUSE_WRITE_CACHE identifies dirty mmap pages. Their kernel-selected
@@ -1477,9 +1549,10 @@ impl Overlay {
 }
 
 impl Overlay {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
         let ino = if self.read_only() {
-            self.ensure_readonly_child(parent, name)?
+            self.ensure_readonly_child(parent, name, true)?
         } else {
             let p = self.child(parent, name)?;
             self.ensure(&p)?
@@ -1489,10 +1562,12 @@ impl Overlay {
         node.lookups = node.lookups.saturating_add(1);
         Ok(node.attr)
     }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn attributes(&mut self, ino: u64, fh: Option<u64>) -> FsResult<FileAttr> {
         if let Some(fh) = fh {
             self.handle(ino, fh)?;
         }
+        self.ensure_size(ino)?;
         self.refresh_backing_attr(ino)?;
         Ok(self.node(ino)?.attr)
     }
@@ -1571,6 +1646,8 @@ impl Overlay {
             self.disk_file(ino)?.set_times(times).map_err(errno)?;
         }
         self.refresh_backing_attr(ino)?;
+        #[cfg(target_os = "linux")]
+        self.ensure_size(ino)?;
         Ok(self.node(ino)?.attr)
     }
     pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<Vec<u8>> {
@@ -1721,6 +1798,7 @@ impl Overlay {
         self.handle(ino, fh)?;
         self.sync_file_inner(ino, datasync)
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn sync_readonly_file(&mut self, ino: u64, datasync: bool) -> FsResult<()> {
         self.readonly_file_attributes(ino)?;
         self.sync_file_inner(ino, datasync)
@@ -1743,6 +1821,7 @@ impl Overlay {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn sync_directory(&self, ino: u64, fh: u64) -> FsResult<()> {
         self.handle(ino, fh)?;
         File::open(&self.backing)
@@ -1750,7 +1829,7 @@ impl Overlay {
             .sync_all()
             .map_err(errno)
     }
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn validate_handle(&self, ino: u64, fh: u64) -> FsResult<()> {
         self.handle(ino, fh).map(|_| ())
     }
@@ -1759,7 +1838,14 @@ impl Overlay {
         self.close_handle(ino, fh);
         Ok(())
     }
-    pub(crate) fn check_access(&self, ino: u64, uid: u32, gid: u32, mask: i32) -> FsResult<()> {
+    pub(crate) fn check_access(
+        &self,
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+        mask: i32,
+    ) -> FsResult<()> {
         let n = self.node(ino)?;
         if mask & libc::W_OK != 0
             && (self.write_policy == WritePolicy::None
@@ -1773,7 +1859,7 @@ impl Overlay {
         }
         let bits = if uid == n.attr.uid {
             n.attr.perm >> 6
-        } else if gid == n.attr.gid {
+        } else if gid == n.attr.gid || groups.contains(&n.attr.gid) {
             n.attr.perm >> 3
         } else {
             n.attr.perm
@@ -1809,6 +1895,101 @@ impl Overlay {
             fragment_size: s.f_frsize as u32,
         })
     }
+}
+#[cfg(target_os = "macos")]
+impl Overlay {
+    pub(crate) fn retain_nfs_inodes(&mut self) {
+        self.preserve_linked_inodes = true;
+    }
+
+    pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
+        if self.read_only() {
+            self.ensure_readonly_child(parent, name, false)
+        } else {
+            let path = self.child(parent, name)?;
+            self.ensure_entry(&path, false)
+        }
+    }
+
+    pub(crate) fn nfs_parent(&mut self, ino: u64) -> FsResult<u64> {
+        if self.node(ino)?.attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let path = self.path(ino)?;
+        self.ensure(path.parent().ok_or(libc::ENOENT)?)
+    }
+
+    pub(crate) fn nfs_inode_exists(&self, ino: u64) -> bool {
+        self.nodes
+            .get(&ino)
+            .is_some_and(|node| node.attr.nlink != 0 || self.has_open_handle(ino))
+    }
+
+    pub(crate) fn nfs_retain_unlinked_inode(&mut self, ino: u64) -> FsResult<bool> {
+        let node = self.node_mut(ino)?;
+        if node.attr.nlink != 0 {
+            return Ok(false);
+        }
+        node.lookups += 1;
+        Ok(true)
+    }
+
+    pub(crate) fn nfs_attributes(&mut self, ino: u64, size: bool) -> FsResult<(FileAttr, bool)> {
+        if size {
+            self.ensure_size(ino)?;
+        }
+        let node = self.node(ino)?;
+        Ok((node.attr, !node.size_pending))
+    }
+
+    pub(crate) fn nfs_change(&self, ino: u64) -> FsResult<u64> {
+        Ok(self.node(ino)?.change)
+    }
+
+    pub(crate) fn nfs_create_verifier(&self, ino: u64) -> Option<[u8; 8]> {
+        self.nodes.get(&ino).and_then(|node| node.create_verifier)
+    }
+
+    pub(crate) fn nfs_record_create_verifier(&mut self, ino: u64, verifier: [u8; 8]) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.create_verifier = Some(verifier);
+        }
+    }
+
+    pub(crate) fn nfs_mark_changed(&mut self, ino: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.change = node.change.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn nfs_set_handle_flags(&mut self, ino: u64, fh: u64, flags: i32) -> FsResult<()> {
+        let handle = self
+            .handles
+            .get_mut(&fh)
+            .filter(|handle| handle.ino == ino)
+            .ok_or(libc::EBADF)?;
+        handle.flags = flags;
+        Ok(())
+    }
+
+    pub(crate) fn commit_file(&mut self, ino: u64) -> FsResult<()> {
+        let node = self.node(ino)?;
+        if node.attr.kind != FileType::RegularFile {
+            return Err(libc::EINVAL);
+        }
+        if node.oid.is_some() || node.file.is_some() {
+            return self.sync_file_inner(ino, false);
+        }
+        // Unstable writes can outlive the OPEN state that issued them.
+        let file = self.disk_file(ino)?;
+        self.node_mut(ino)?.file = Some(file);
+        let result = self.sync_file_inner(ino, false);
+        self.node_mut(ino)?.file = None;
+        result
+    }
+}
+
+impl Overlay {
     #[cfg(target_os = "linux")]
     pub(crate) fn eligible_backing(&self, ino: u64) -> Option<&File> {
         let node = self.nodes.get(&ino)?;
@@ -2394,6 +2575,52 @@ mod tests {
             fs.read_data(ino, reader, 0, 100).unwrap(),
             b"edited content\n"
         );
+    }
+    #[test]
+    fn failed_write_after_lazy_promotion_keeps_original_size_and_bytes() {
+        const CHILD: &str = "GIT_ON_TEST_LAZY_PROMOTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "filesystem::tests::failed_write_after_lazy_promotion_keeps_original_size_and_bytes",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+        let ino = fs.ensure_entry(Path::new("tracked.tmp"), false).unwrap();
+        let handle = fs.open_file(ino, libc::O_RDWR).unwrap();
+        assert!(fs.nodes[&ino].size_pending);
+        let original = b"pinned content\n";
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: original.len() as _,
+                rlim_max: original.len() as _,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+        }
+        assert_eq!(
+            fs.write_data(ino, handle, original.len() as i64, b"x", 0, 0),
+            Err(libc::EFBIG)
+        );
+        assert!(
+            !fs.unchanged_source_data(ino),
+            "write must reach the promoted backing"
+        );
+        assert_eq!(
+            fs.attributes(ino, None).unwrap().size,
+            original.len() as u64
+        );
+        assert_eq!(fs.read_data(ino, handle, 0, 100).unwrap(), original);
     }
     #[test]
     fn unchanged_size_truncate_retains_source_and_later_write_works_after_unlink() {

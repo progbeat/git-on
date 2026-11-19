@@ -58,9 +58,8 @@ def run(options):
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.operations),str(stat_bytes)]
                 source='file://'+str(f.repo) if options.source=='remote' else str(f.repo)
                 env=dict(f.env)
-                if options.backend=='materialized':
-                    programs=f.root/'programs';programs.mkdir();(programs/'git').symlink_to(shutil.which('git'));env['PATH']=str(programs)
-                argv=[str(options.binary.resolve())]
+                backend_args = ['--backend=copy'] if options.backend=='materialized' else []
+                argv=[str(options.binary.resolve()),*backend_args]
                 if options.source=='remote':argv.append(source)
                 argv+=['main','--write-policy=all','--',*command]
                 result=capture(argv,f.repo if options.source=='local' else f.cwd,env,f.root,metrics=True)

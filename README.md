@@ -40,19 +40,19 @@ Check the installation:
 git on --version
 ```
 
-On Linux, install [FUSE](docs/platforms.md) to use the default write
-policy. See the [installation guide](docs/releases.md#installing-a-published-binary)
+Linux uses [FUSE](docs/platforms.md). macOS 26 and later use
+[local NFSv4.1](docs/nfs.md) with the built-in macOS client. See the [installation guide](docs/releases.md#installing-a-published-binary)
 for custom install locations and other setup options.
 
 ## Usage
 
-Pass a revision before `--`, followed by the command. For example, on Linux:
+Pass a revision before `--`, followed by the command. For example, on Linux or macOS 26 and later:
 
 ```sh
 git on HEAD -- ls
 ```
 
-On macOS, use `--write-policy=all`; other write policies are not supported yet:
+On macOS 13 through 15, explicitly select `--write-policy=all` to run from a temporary copy.
 
 ```sh
 git on HEAD --write-policy=all -- ls
@@ -60,6 +60,11 @@ git on HEAD --write-policy=all -- ls
 
 Commands start at the snapshot's root. Everything after `--` belongs to your
 command.
+
+`--backend=auto` is the default. Use `--backend=fuse` or `--backend=nfs` to require
+a specific mount, or `--backend=copy --write-policy=all` for an eager temporary
+copy. Auto can use a copy when the native mount is unavailable and you
+explicitly allow all writes.
 
 ### Reuse exact source contents
 
@@ -97,7 +102,7 @@ git on "$tree" --write-policy=all -- cargo build
 git on "$tree" --write-policy=all -- cargo test
 ```
 
-By default on Linux, tracked files stay read-only. New files and directories
+By default on native mounts, tracked files stay read-only. New files and directories
 must be ignored by the selected revision's committed `.gitignore` rules. Use
 `all` to edit tracked files or write without ignore rules. See
 [write policies](docs/usage.md#filesystem-behavior) for more control.

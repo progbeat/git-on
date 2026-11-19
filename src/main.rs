@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use git_on::{
+    backend::Backend,
     filesystem::Overlay,
     git::set_foreground as foreground,
     platform::{ensure_unmounted, mount_is_ours},
+    policy::WritePolicy,
     snapshot::Snapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,20 @@ fn clean_unmount(mountpoint: &Path) -> Result<()> {
     let unmount = Command::new("/sbin/umount");
     clean_unmount_with(unmount, mountpoint)
 }
+
+#[cfg(target_os = "macos")]
+fn unmount_dead_server(mountpoint: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // A normal unmount asks the server to flush its data. Once the embedded
+    // server is gone, a hard mount can wait indefinitely for that response.
+    // The caller has already checked the exact mount's source and location.
+    let target = std::ffi::CString::new(mountpoint.as_os_str().as_bytes())?;
+    if unsafe { libc::unmount(target.as_ptr(), libc::MNT_FORCE) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("unmount after NFS server exit");
+    }
+    Ok(())
+}
 struct UnblockedChildExit(libc::sigset_t);
 impl UnblockedChildExit {
     fn new() -> std::io::Result<Self> {
@@ -223,11 +239,21 @@ struct Mounted {
     id: String,
 }
 impl Mounted {
+    fn failed(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(git_on::backend::Session::failed)
+    }
+
     fn finish(&mut self) -> Result<()> {
         if let Some(session) = self.session.take() {
             let result =
                 mount_is_ours(self.mountpoint.parent().unwrap(), &self.id).and_then(|mounted| {
                     if mounted {
+                        #[cfg(target_os = "macos")]
+                        if session.failed() {
+                            return unmount_dead_server(&self.mountpoint);
+                        }
                         clean_unmount(&self.mountpoint)
                     } else {
                         Ok(())
@@ -241,10 +267,17 @@ impl Mounted {
                 std::mem::forget(session);
                 return Err(error);
             }
+            let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()))
+                .map_err(|_| anyhow::anyhow!("filesystem thread panicked"))
+                .and_then(|result| result.context("stop filesystem server"));
             #[cfg(target_os = "macos")]
-            result?;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()))
-                .map_err(|_| anyhow::anyhow!("filesystem thread panicked"))??;
+            if let Err(error) = result {
+                return match joined {
+                    Ok(()) => Err(error),
+                    Err(join_error) => Err(anyhow::anyhow!("{error:#}; {join_error:#}")),
+                };
+            }
+            joined?;
         }
         Ok(())
     }
@@ -254,6 +287,129 @@ impl Drop for Mounted {
         let _ = self.finish();
     }
 }
+#[cfg(target_os = "macos")]
+fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> Result<()> {
+    use std::io::{Read, Seek};
+    #[cfg(feature = "test-metrics")]
+    if env::var_os("GIT_ON_TEST_NFS_MOUNT_ERROR").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        bail!("test NFS mount failure");
+    }
+    let mut diagnostic = tempfile::tempfile_in(mounted.mountpoint.parent().unwrap())?;
+    let mut helper =
+        git_on::backend::nfs::Session::mount_command(&mounted.mountpoint, &mounted.id, policy)?
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(diagnostic.try_clone()?)
+            .spawn()
+            .context("start mount_nfs")?;
+    let status = loop {
+        if git_on::git::cancelled_signal().is_some() || mounted.failed() {
+            kill_group(helper.id(), libc::SIGKILL);
+            helper.wait().context("reap mount_nfs")?;
+            bail!("NFS mount interrupted or server stopped");
+        }
+        match helper.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                signals.wait().for_each(drop);
+            }
+            Err(error) => {
+                kill_group(helper.id(), libc::SIGKILL);
+                let _ = helper.wait();
+                return Err(error).context("wait for mount_nfs");
+            }
+        }
+    };
+    if !status.success() {
+        let mut message = Vec::new();
+        diagnostic.rewind()?;
+        diagnostic.take(4096).read_to_end(&mut message)?;
+        bail!(
+            "mount_nfs returned {status}: {}",
+            String::from_utf8_lossy(&message).trim()
+        );
+    }
+    if !mount_is_ours(mounted.mountpoint.parent().unwrap(), &mounted.id)? {
+        bail!("NFS mount did not become ready");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mount_overlay(
+    overlay: Overlay,
+    dir: &Path,
+    id: &str,
+    policy: WritePolicy,
+    allow_fallback: bool,
+    signals: &mut Signals,
+) -> Result<Option<Mounted>> {
+    let session = match git_on::backend::start_nfs(overlay, id) {
+        Ok(session) => session,
+        Err(error)
+            if allow_fallback
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("start private NFS server"),
+    };
+    let mut mounted = Mounted {
+        session: Some(session),
+        mountpoint: dir.join("mount"),
+        id: id.into(),
+    };
+    match attach_nfs(&mounted, policy, signals) {
+        Ok(()) => Ok(Some(mounted)),
+        Err(attach) => {
+            let filesystem_failed = match mounted.session.as_ref() {
+                Some(git_on::backend::Session::Macos(nfs)) => nfs.filesystem_failed(),
+                None => false,
+            };
+            if let Err(cleanup) = mounted.finish() {
+                return Err(anyhow::anyhow!("{attach:#}; cleanup: {cleanup:#}"));
+            }
+            ensure_unmounted(dir)?;
+            git_on::platform::cleanup_nfs_socket(id)?;
+            if allow_fallback && !filesystem_failed && git_on::git::cancelled_signal().is_none() {
+                Ok(None)
+            } else {
+                Err(attach)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_overlay(
+    overlay: Overlay,
+    dir: &Path,
+    id: &str,
+    policy: WritePolicy,
+    _allow_fallback: bool,
+    _signals: &mut Signals,
+) -> Result<Option<Mounted>> {
+    let mountpoint = dir.join("mount");
+    let session = git_on::backend::mount(overlay, &mountpoint, id, policy)
+        .with_context(|| format!(
+            "cannot mount snapshot at {}; check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support",
+            mountpoint.display()
+        ))?;
+    let mounted = Mounted {
+        session: Some(session),
+        mountpoint,
+        id: id.into(),
+    };
+    if !mount_is_ours(dir, id)? {
+        bail!("FUSE mount did not become ready");
+    }
+    Ok(Some(mounted))
+}
+
 fn child_exited(pid: u32) -> Result<bool> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -326,10 +482,15 @@ fn cleanup(dir: &Path) -> Result<()> {
         bail!("unrecognized temporary directory");
     }
     if mount_is_ours(&dir, &state.id)? {
+        #[cfg(target_os = "linux")]
         clean_unmount(&dir.join("mount"))?;
+        #[cfg(target_os = "macos")]
+        unmount_dead_server(&dir.join("mount"))?;
     }
     ensure_unmounted(&dir)?;
     git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+    #[cfg(target_os = "macos")]
+    git_on::platform::cleanup_nfs_socket(&state.id)?;
     git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
     release_pin(&state)?;
     fs::remove_dir_all(dir)?;
@@ -339,9 +500,13 @@ fn supervise(
     child: &mut std::process::Child,
     signals: &mut Signals,
     terminal: &Terminal,
+    mounted: Option<&Mounted>,
 ) -> Result<ExitStatus> {
     let pid = child.id();
     loop {
+        if mounted.is_some_and(Mounted::failed) {
+            bail!("filesystem server stopped while the command was running");
+        }
         for signal in signals.pending() {
             if matches!(signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT) {
                 kill_group(pid, signal);
@@ -374,7 +539,7 @@ fn supervise(
     Ok(child.wait()?)
 }
 #[cfg(feature = "test-metrics")]
-fn report_metrics(snapshot: &Snapshot) -> Result<()> {
+fn report_metrics(snapshot: &Snapshot, backend: Option<&str>) -> Result<()> {
     use std::os::fd::FromRawFd;
     if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
         let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
@@ -386,20 +551,25 @@ fn report_metrics(snapshot: &Snapshot) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
         let mut output = unsafe { File::from_raw_fd(dup) };
-        serde_json::to_writer(&mut output, &snapshot.metrics())?;
+        let mut values = serde_json::to_value(snapshot.metrics())?;
+        values["backend"] = serde_json::json!(backend);
+        serde_json::to_writer(&mut output, &values)?;
         output.write_all(b"\n")?;
     }
     Ok(())
 }
-fn execute(
-    invoked: Instant,
-    tree: OsString,
-    args: Vec<OsString>,
-    source: Option<OsString>,
-    verify: bool,
-    write_policy: git_on::policy::WritePolicy,
-) -> Result<ExitStatus> {
+fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
+    let cli::RunArgs {
+        tree,
+        repository: source,
+        command: args,
+        verify,
+        write_policy,
+        backend,
+    } = run;
     let mut signals = subscribe_signals()?;
+    #[cfg(target_os = "macos")]
+    let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
     let mut progress = git_on::terminal_ui::StartupProgress::start(invoked, &tree)?;
     if let Some(signal) = git_on::git::cancelled_signal() {
         return Ok(ExitStatus::from_raw(signal));
@@ -424,6 +594,8 @@ fn execute(
     };
     let _lock = held_lock;
     let mut observed = None;
+    #[cfg(feature = "test-metrics")]
+    let mut measured_backend = None;
     let mut result = (|| -> Result<ExitStatus> {
         #[cfg(feature = "test-metrics")]
         if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
@@ -434,9 +606,20 @@ fn execute(
         }
         save(&dir, &state)?;
 
-        let unavailable = git_on::platform::fuse_unavailable();
-        let materialized = unavailable.as_ref().is_ok_and(Option::is_some)
-            && write_policy == git_on::policy::WritePolicy::All;
+        let native = Backend::native();
+        let selected = if backend == Backend::Auto {
+            native
+        } else {
+            backend
+        };
+        let allow_fallback = backend == Backend::Auto && write_policy == WritePolicy::All;
+        let unavailable = match selected {
+            Backend::Copy => Ok(None),
+            selected if selected == native => git_on::platform::mount_unavailable(),
+            _ => Ok(Some(format!("this platform provides {}", native.as_str()))),
+        };
+        let materialized = selected == Backend::Copy
+            || (allow_fallback && unavailable.as_ref().is_ok_and(Option::is_some));
         let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
             source.as_deref(),
@@ -458,38 +641,36 @@ fn execute(
         private_dir(&dir.join("backing"))?;
 
         let unavailable = unavailable?;
-        let mut session = if let Some(reason) = unavailable {
-            if write_policy != git_on::policy::WritePolicy::All {
-                bail!("FUSE unavailable: {reason}; policy {write_policy:?} requires FUSE. Only explicit --write-policy=all supports materialization");
-            }
-            git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
+        let mut session = if materialized {
             None
         } else {
-            let overlay = Overlay::with_write_policy(snapshot, dir.join("backing"), write_policy)?;
-            if let Some(signal) = signals
-                .pending()
-                .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
-            {
+            if let Some(reason) = unavailable {
+                let name = selected.as_str().to_ascii_uppercase();
+                bail!("{name} unavailable: {reason}; use --backend=auto with explicit --write-policy=all to allow a copy");
+            }
+            let overlay =
+                Overlay::with_write_policy(snapshot.clone(), dir.join("backing"), write_policy)?;
+            if let Some(signal) = git_on::git::cancelled_signal() {
                 return Ok(ExitStatus::from_raw(signal));
             }
-            let session = git_on::backend::mount(overlay, &dir.join("mount"), &id, write_policy)
-                .with_context(|| {
-                    #[cfg(target_os = "linux")]
-                    let prerequisite = "check that /dev/fuse is usable and fusermount3 is on PATH; containers need host-granted FUSE mount support";
-                    #[cfg(target_os = "macos")]
-                    let prerequisite = "macOS mounts are outside git-on 1.3.0; explicitly select --write-policy=all for materialization";
-                    format!("cannot mount snapshot at {}; {prerequisite}", dir.join("mount").display())
-                })?;
-            let session = Mounted {
-                session: Some(session),
-                mountpoint: dir.join("mount"),
-                id: id.clone(),
-            };
-            if !mount_is_ours(&dir, &id)? {
-                bail!("FUSE mount did not become ready");
-            }
-            Some(session)
+            mount_overlay(
+                overlay,
+                &dir,
+                &id,
+                write_policy,
+                allow_fallback,
+                &mut signals,
+            )?
         };
+        if session.is_none() {
+            if let Some(signal) = git_on::git::cancelled_signal() {
+                return Ok(ExitStatus::from_raw(signal));
+            }
+            if !materialized {
+                snapshot.fetch_copy_objects()?;
+            }
+            git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
+        }
         if let Some(signal) = signals
             .pending()
             .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
@@ -519,6 +700,18 @@ fn execute(
             });
         }
 
+        #[cfg(feature = "test-metrics")]
+        {
+            measured_backend = Some(
+                match session.as_ref().and_then(|mount| mount.session.as_ref()) {
+                    #[cfg(target_os = "linux")]
+                    Some(git_on::backend::Session::Linux(_)) => "fuse",
+                    #[cfg(target_os = "macos")]
+                    Some(git_on::backend::Session::Macos(_)) => "nfs",
+                    None => Backend::Copy.as_str(),
+                },
+            );
+        }
         progress.finish();
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -542,7 +735,7 @@ fn execute(
 
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
-        let outcome = supervise(&mut child, &mut signals, &terminal);
+        let outcome = supervise(&mut child, &mut signals, &terminal, session.as_ref());
 
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
@@ -572,23 +765,18 @@ fn execute(
     git_on::git::stop_operations();
 
     let mut transport_cleanup_failure = None;
-    if let Some(snapshot) = observed.take() {
+    if let Some(snapshot) = &observed {
         if let Some(failure) = snapshot.remote_failure() {
             result = Err(anyhow::anyhow!(
                 "remote object loading failed; execution incomplete: {failure}"
             ));
         }
         #[cfg(feature = "test-metrics")]
-        if let Err(e) = report_metrics(&snapshot) {
+        if let Err(e) = report_metrics(snapshot, measured_backend) {
             result = Err(e);
         }
         if let Err(error) = snapshot.stop_remote_transport() {
             transport_cleanup_failure = Some(error);
-        }
-        // A busy mount or failed owned transport shutdown keeps the pin and
-        // recovery identity available for explicit stale cleanup.
-        if transport_cleanup_failure.is_some() || mount_is_ours(&dir, &id).unwrap_or(true) {
-            std::mem::forget(snapshot);
         }
     }
 
@@ -610,6 +798,8 @@ fn execute(
         ensure_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
         git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+        #[cfg(target_os = "macos")]
+        git_on::platform::cleanup_nfs_socket(&id)?;
         git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
         release_pin(&state)?;
         if dir.join("remote-repository").exists() {
@@ -625,6 +815,10 @@ fn execute(
     })();
 
     if let Err(e) = cleanup_result {
+        // Keep the exact pin available to a later checked --cleanup.
+        if let Some(snapshot) = observed.take() {
+            std::mem::forget(snapshot);
+        }
         if git_on::git::cancelled_signal().is_some() {
             eprintln!("git-on: {e:#}");
         }
@@ -674,14 +868,7 @@ fn main() {
                 cleanup(Path::new(&directory))?;
                 Ok(ExitStatus::from_raw(0))
             }
-            Ok(cli::Invocation::Run(run)) => execute(
-                invoked,
-                run.tree,
-                run.command.to_vec(),
-                run.repository,
-                run.verify,
-                run.write_policy,
-            ),
+            Ok(cli::Invocation::Run(run)) => execute(invoked, run),
             Err(error) => {
                 error.print()?;
                 Ok(ExitStatus::from_raw(error.exit_code() << 8))
@@ -957,7 +1144,7 @@ mod tests {
                 parent: None,
                 child: None,
             };
-            let status = supervise(&mut child, &mut signals, &terminal).unwrap();
+            let status = supervise(&mut child, &mut signals, &terminal, None).unwrap();
             if script.starts_with("exit") {
                 assert_eq!(status.code(), Some(23));
             } else {
@@ -965,6 +1152,7 @@ mod tests {
             }
         }
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn mount_escapes_are_decoded() {
         assert_eq!(

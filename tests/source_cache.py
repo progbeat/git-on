@@ -38,26 +38,33 @@ def directory_reopen_code(count):
 
 def directory_child_code(count):
     return 'expected='+repr([name.encode() for name in directory_names(count)])+'\n'+r'''
-import ctypes,json,os
+import ctypes,json,os,sys
 libc=ctypes.CDLL(None,use_errno=True)
 class Dirent64(ctypes.Structure):
-    _fields_=[('ino',ctypes.c_uint64),('offset',ctypes.c_int64),
-              ('reclen',ctypes.c_ushort),('kind',ctypes.c_ubyte),('name',ctypes.c_char*256)]
+    if sys.platform=='darwin':
+        _fields_=[('ino',ctypes.c_uint64),('offset',ctypes.c_uint64),
+                  ('reclen',ctypes.c_ushort),('namlen',ctypes.c_ushort),
+                  ('kind',ctypes.c_ubyte),('name',ctypes.c_char*1024)]
+    else:
+        _fields_=[('ino',ctypes.c_uint64),('offset',ctypes.c_int64),
+                  ('reclen',ctypes.c_ushort),('kind',ctypes.c_ubyte),('name',ctypes.c_char*256)]
 libc.opendir.argtypes=[ctypes.c_char_p];libc.opendir.restype=ctypes.c_void_p
-libc.readdir64.argtypes=[ctypes.c_void_p];libc.readdir64.restype=ctypes.POINTER(Dirent64)
+readdir=getattr(libc,'readdir$INODE64',libc.readdir) if sys.platform=='darwin' else libc.readdir64
+readdir.argtypes=[ctypes.c_void_p];readdir.restype=ctypes.POINTER(Dirent64)
 libc.telldir.argtypes=[ctypes.c_void_p];libc.telldir.restype=ctypes.c_long
 libc.seekdir.argtypes=[ctypes.c_void_p,ctypes.c_long]
 libc.rewinddir.argtypes=[ctypes.c_void_p]
 libc.closedir.argtypes=[ctypes.c_void_p];libc.closedir.restype=ctypes.c_int
 expected=set(expected)|{b'.',b'..'}
 def read_one(stream):
-    ctypes.set_errno(0);entry=libc.readdir64(stream)
+    ctypes.set_errno(0);entry=readdir(stream)
     if not entry:
         assert ctypes.get_errno()==0,ctypes.get_errno()
         return None
     entry=entry.contents;name=bytes(entry.name)
     assert name in expected and entry.ino>0,(name,entry.ino)
-    assert entry.kind==(4 if name in {b'.',b'..'} else 8),(name,entry.kind)
+    kind=4 if name in {b'.',b'..'} else 8
+    assert entry.kind==kind or (sys.platform=='darwin' and entry.kind==0),(name,entry.kind)
     return name,entry.ino
 def rest(stream):
     result=[]

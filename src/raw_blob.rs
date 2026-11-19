@@ -72,6 +72,10 @@ pub(crate) struct SourceIntegrity {
     remaining: usize,
 }
 impl SourceIntegrity {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     pub(crate) fn has_source(&self) -> bool {
         self.remaining != 0
     }

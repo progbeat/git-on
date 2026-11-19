@@ -52,9 +52,12 @@ class CiContractTests(unittest.TestCase):
         self.assertEqual({target:configured.get(target) for target in tested},tested,
                          'release builds must use the runners exercised before merge')
 
-    def test_macos_runs_behavior_and_installer_tests(self):
+    def test_macos_requires_native_mounts_and_upstream_conformance(self):
         body=job('macos')
-        for check in ['cargo test --locked','tests/integration.py','tests/materialized.py','tests/test_installer.py']:
+        for check in ['cargo test --locked','tests/integration.py','tests/test_installer.py',
+                      'tests/write_policy.py --binary target/debug/git-on --require-nfs',
+                      'tests/integration.py --binary target/debug/git-on --require-nfs MountTests',
+                      'tests/fsync_contract.py','tests/pynfs_nfs41.py --binary target/debug/git-on --require-nfs']:
             self.assertIn(check,body)
 
     def test_linux_dependency_setup_preserves_supported_runner_git_without_launchpad(self):

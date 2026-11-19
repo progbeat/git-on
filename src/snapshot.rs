@@ -319,6 +319,7 @@ impl BlobReader {
 struct State {
     repo: Repository,
     remote: Option<crate::remote::Remote>,
+    selected_oid: Oid,
     headers: HashMap<Oid, u64>,
     readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
@@ -768,6 +769,7 @@ impl Snapshot {
                 state: Mutex::new(State {
                     repo,
                     remote,
+                    selected_oid: oid,
                     headers: HashMap::new(),
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
@@ -846,6 +848,12 @@ impl Snapshot {
     pub(crate) fn ancestor_tree_lookups_for_test(&self) -> u64 {
         self.state().unwrap().ancestor_tree_lookups
     }
+    pub(crate) fn entry_metadata(&self, path: &Path) -> Result<Option<Entry>> {
+        self.lookup(&mut *self.state()?, path)
+    }
+    pub(crate) fn blob_size(&self, oid: Oid) -> Result<u64> {
+        self.state()?.size(oid)
+    }
     /// Resolve only a path's ancestor trees and requested object's header.
     pub fn entry(&self, path: &Path) -> Result<Option<Entry>> {
         let mut state = self.state()?;
@@ -865,14 +873,21 @@ impl Snapshot {
         index: usize,
         path: &Path,
     ) -> Result<Entry> {
+        let mut entry = Self::directory_entry_metadata(directory, index, path)?;
+        if entry.kind != EntryKind::Directory {
+            entry.size = Some(self.blob_size(entry.oid)?);
+        }
+        Ok(entry)
+    }
+    pub(crate) fn directory_entry_metadata(
+        directory: &Directory,
+        index: usize,
+        path: &Path,
+    ) -> Result<Entry> {
         let (mode, oid) = directory
             .metadata_at(index)
             .context("directory entry missing")?;
-        let mut entry = Self::metadata(mode, oid, path)?;
-        if entry.kind != EntryKind::Directory {
-            entry.size = Some(self.state()?.size(oid)?);
-        }
-        Ok(entry)
+        Self::metadata(mode, oid, path)
     }
     /// Share a verified directory without copying names or reading children.
     pub(crate) fn directory(&self, path: &Path) -> Result<Arc<Directory>> {
@@ -912,6 +927,15 @@ impl Snapshot {
                 ))
             })
             .collect()
+    }
+    /// Fetch a previously selected remote snapshot for automatic copy fallback.
+    pub fn fetch_copy_objects(&self) -> Result<()> {
+        let mut state = self.state()?;
+        let selected = state.selected_oid;
+        if let Some(remote) = &mut state.remote {
+            remote.fetch_copy_objects(selected)?;
+        }
+        Ok(())
     }
     pub(crate) fn begin_materialization(&self) -> Result<()> {
         if let Some(remote) = &mut self.state()?.remote {

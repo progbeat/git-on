@@ -3,6 +3,8 @@
 use std::time::SystemTime;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod nfs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum FileType {
@@ -61,45 +63,80 @@ pub struct Statistics {
     pub fragment_size: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Auto,
+    Fuse,
+    Nfs,
+    Copy,
+}
+
+impl Backend {
+    pub const fn native() -> Self {
+        #[cfg(target_os = "linux")]
+        return Self::Fuse;
+        #[cfg(target_os = "macos")]
+        return Self::Nfs;
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fuse => "fuse",
+            Self::Nfs => "nfs",
+            Self::Copy => "copy",
+        }
+    }
+}
+
 pub enum Session {
     #[cfg(target_os = "linux")]
     Linux(fuser::BackgroundSession),
+    #[cfg(target_os = "macos")]
+    Macos(nfs::Session),
 }
 impl Session {
     pub fn join(self) -> std::io::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Linux(session) => session.join(),
+            #[cfg(target_os = "macos")]
+            Self::Macos(session) => session.join(),
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Macos(session) => session.failed(),
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+pub fn start_nfs(overlay: crate::filesystem::Overlay, id: &str) -> std::io::Result<Session> {
+    nfs::Session::start(overlay, id).map(Session::Macos)
+}
+
+#[cfg(target_os = "linux")]
 pub fn mount(
     overlay: crate::filesystem::Overlay,
     path: &std::path::Path,
     id: &str,
     policy: crate::policy::WritePolicy,
 ) -> std::io::Result<Session> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut config = fuser::Config::default();
-        config.mount_options = vec![
-            fuser::MountOption::FSName(format!("git-on:{id}")),
-            fuser::MountOption::Subtype("git-on".into()),
-            fuser::MountOption::NoSuid,
-            fuser::MountOption::NoDev,
-            fuser::MountOption::DefaultPermissions,
-        ];
-        if policy == crate::policy::WritePolicy::None {
-            config.mount_options.push(fuser::MountOption::RO);
-        }
-        fuser::spawn_mount(linux::Fuse::new(overlay), path, &config).map(Session::Linux)
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
+        fuser::MountOption::FSName(format!("git-on:{id}")),
+        fuser::MountOption::Subtype("git-on".into()),
+        fuser::MountOption::NoSuid,
+        fuser::MountOption::NoDev,
+        fuser::MountOption::DefaultPermissions,
+    ];
+    if policy == crate::policy::WritePolicy::None {
+        config.mount_options.push(fuser::MountOption::RO);
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (overlay, path, id, policy);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "macOS mounts are not supported in git-on 1.3.0",
-        ))
-    }
+    fuser::spawn_mount(linux::Fuse::new(overlay), path, &config).map(Session::Linux)
 }

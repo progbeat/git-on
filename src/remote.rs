@@ -266,7 +266,7 @@ impl Remote {
         if remote.materializing {
             // The explicit eager backend needs all payloads, so it does not
             // depend on server-side filtering or a separate capability probe.
-            let oid = remote.fetch_selected(revision, true)?;
+            let oid = remote.fetch_selected(revision, true, false)?;
             return Ok((remote, oid));
         }
         // Authentication and host-key interaction happen here, before mounting.
@@ -305,7 +305,7 @@ impl Remote {
             bail!("remote server does not advertise object filtering; full-clone fallback is forbidden");
         }
         remote.failed = None;
-        let oid = remote.fetch_selected(revision, false)?;
+        let oid = remote.fetch_selected(revision, false, false)?;
         Ok((remote, oid))
     }
     fn command(&self, initial: bool) -> Result<Command> {
@@ -358,18 +358,20 @@ impl Remote {
         }
         Ok(command)
     }
-    fn fetch_selected(&mut self, revision: &OsStr, initial: bool) -> Result<Oid> {
+    fn fetch_selected(&mut self, revision: &OsStr, initial: bool, refetch: bool) -> Result<Oid> {
         // A fetch refspec belongs to native Git, including its leading '+',
         // namespace abbreviation and destination. All resulting refs and
         // FETCH_HEAD live in this owned bare repository, never in the caller.
         let mut command = self.command(initial)?;
         command.args(["fetch", "--no-tags", "--depth=1"]);
-        if self.materializing {
+        command.args(refetch.then_some("--refetch"));
+        let materializing = self.materializing || refetch;
+        if materializing {
             // Prevent small eager transfers from becoming a second decoded
             // loose-object copy before final-path materialization.
             command.arg("--keep");
         }
-        command.arg(if self.materializing {
+        command.arg(if materializing {
             "--no-filter"
         } else {
             "--filter=tree:0"
@@ -418,7 +420,7 @@ impl Remote {
             selected = Some(oid);
         }
         let oid = selected.context("native Git fetch selected no object to mount")?;
-        if self.materializing {
+        if materializing {
             self.stage_materialization()?;
         } else {
             self.import_received(true, &[oid])?;
@@ -430,6 +432,16 @@ impl Remote {
         self.completed_fetches += 1;
         self.fetch_operations += 1;
         Ok(oid)
+    }
+    pub(crate) fn fetch_copy_objects(&mut self, selected: Oid) -> Result<()> {
+        self.session = None;
+        if crate::spool::Files::size_limit()?.is_none() {
+            // The revision has already been resolved and possibly verified.
+            // Request that exact object again without the lazy fetch filter.
+            let fetched = self.fetch_selected(OsStr::new(&selected.to_string()), false, true)?;
+            anyhow::ensure!(fetched == selected, "remote changed the selected snapshot");
+        }
+        Ok(())
     }
     pub(crate) fn begin_materialization(&mut self) {
         self.materializing = true;
@@ -919,6 +931,7 @@ impl Remote {
             return Ok(());
         };
         let destination = Repository::open_bare(&self.dir)?;
+        let destination_odb = destination.odb()?;
         let odb = received.repo.odb()?;
         let mut failure = None;
         let iteration = odb.foreach(|oid| {
@@ -929,7 +942,7 @@ impl Remote {
                     self.received_blobs
                         .entry(*oid)
                         .or_insert_with(|| received.directory.clone());
-                } else {
+                } else if !destination_odb.exists(*oid) {
                     let object = odb.read(*oid)?;
                     self.publish_received(&destination, *oid, kind, size, object.data())?;
                 }

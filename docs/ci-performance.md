@@ -14,7 +14,7 @@ PR selection compares against the merge base. Push selection compares the actual
 before/after trees, so divergent history cannot hide reverted runtime changes.
 
 Base coverage includes formatting, strict clippy, Rust tests and MSRV, the FUSE
-coverage guard, release policy, real Linux FUSE, macOS CLI/materialization and
+coverage guard, release policy, real Linux FUSE and macOS NFS, macOS 15 materialization and
 native Linux/macOS ARM packages and installers. The native ARM package runner
 uses `macos-15`; other macOS behavior uses `macos-26`.
 

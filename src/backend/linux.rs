@@ -676,7 +676,7 @@ impl Filesystem for Fuse {
             reply,
             self.state()
                 .core
-                .check_access(ino.0, req.uid(), req.gid(), mask.bits()),
+                .check_access(ino.0, req.uid(), req.gid(), &[], mask.bits()),
         );
     }
 }

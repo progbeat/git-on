@@ -91,6 +91,7 @@ fn materialization_does_not_launch_on_an_out_of_range_mode() {
         .args([
             &tree.to_string(),
             "--write-policy=all",
+            "--backend=copy",
             "--",
             "/bin/echo",
             "child-must-not-start",

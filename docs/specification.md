@@ -20,7 +20,7 @@ separate from that contract; a requirement is not a claim of a passing test.
 - Every child-command invocation requires a `--` separator. The first `--`
   always ends runner argument parsing; it cannot escape a revision. Before it,
   accept one operand for the local revision or two for repository and
-  revision. Recognized `--verify` and
+  revision. Recognized `--verify`, `--backend=auto|fuse|nfs|copy` and
   `--write-policy=none|ignored|untracked|all` options may appear anywhere before
   the separator, interspersed with those operands. Boolean options may
   repeat and combine idempotently. Parse only git-on's recognized options;
@@ -97,7 +97,7 @@ is part of this bug fix; it does not require a major version increment.
 
 Remote demand, run-local object lifetime, native verification, authentication
 limits and acceptance requirements are normative in [the remote guide](remote.md).
-The same FUSE and write-policy contract below applies to local and remote runs.
+The native mount and write-policy contracts apply to local and remote runs.
 
 - `--write-policy=ignored` is the default and preserves the existing contract.
   Entries present in the selected tree are immutable. An ignore match does not
@@ -148,29 +148,37 @@ The same FUSE and write-policy contract below applies to local and remote runs.
 [Startup indication](startup-indication.md) defines progress display, terminal
 ownership, and clearing before command execution.
 
-Linux FUSE is preferred whenever available and capable of the requested behavior.
+`--backend=auto` is the default. On Linux it selects FUSE when available.
 Missing kernel passthrough is only an optimization limitation and retains
 ordinary FUSE I/O. Before launching the child, discovery identifies absent or
-inaccessible `/dev/fuse` or `fusermount3`. macOS mounts are outside 1.3.0; the Mac CLI
-reports this concrete capability limitation without probing or activating an
-extension. Only explicit `--write-policy=all` permits an ordinary private-directory
-backend in these cases. Other mount failures remain errors. Never rerun a command
-after a mount or runtime failure. Protected policies never become all implicitly.
-See [platform requirements](platforms.md).
+inaccessible `/dev/fuse` or `fusermount3`. macOS 26 and later use the built-in
+client with the [private NFSv4.1 server](nfs.md). The macOS CLI runs on macOS 13
+or later.
 
-The materialized backend reads the same pinned tree eagerly, preserves bytes,
+An explicit `--backend=fuse` or `--backend=nfs` requires that mount.
+`--backend=copy` requires explicit `--write-policy=all` and creates an eager
+temporary copy of the pinned tree. Auto permits the same copy with explicit
+`--write-policy=all` when a native backend is unavailable. A macOS mount
+attempt may fall back after checked cleanup of the partial mount and before
+launching the command. Git resolution, verification, object loading and child
+execution errors must propagate. Never rerun a command after a mount or
+runtime failure. See the
+[platform requirements](platforms.md).
+
+The copy backend reads the same pinned tree eagerly, preserves bytes,
 symlinks and executable modes, and never applies checkout filters or fabricates
 `.git`. Unsupported objects/names, case or normalization collisions and host
 symlink/permission limitations fail before launch, rather than overwriting,
 renaming or omitting entries. This can fail on an entry the child would not use.
 It costs full-tree startup time, network transfers and temporary disk space.
 Host filesystem operations, xattrs and locks follow the host's ordinary behavior;
-this backend implements the explicit-all subset, not protected FUSE policies.
-The lazy startup/performance requirements below apply to the FUSE backend.
+this backend implements the explicit-all subset.
+The lazy startup and performance requirements below apply to both native mounts.
 
 Remote materialization obtains the selected revision in one shallow transfer
-when host per-file limits permit it. It must not pay a separate network round
-trip for each directory. Compressed objects are decoded into their final paths;
+when host per-file limits permit it. A mount fallback reuses the original
+selection and fetches the full snapshot in one additional shallow transfer.
+Compressed objects are decoded into their final paths;
 already prepared contents are reused for repeated OIDs. Finite per-file limits
 retain bounded transfers rather than creating a pack that exceeds that limit.
 
@@ -211,8 +219,8 @@ affected behavior is claimed verified.
 ## Lazy access and performance
 
 The objective is minimal launch overhead and demand-driven work, including for
-repositories with millions of paths. FUSE must not be a wrapper around a full
-checkout or a complete in-memory copy of the selected tree.
+repositories with millions of paths. Native mounts must avoid full checkouts
+and complete in-memory copies of the selected tree.
 
 1. Before launching the child, git-on must not recursively enumerate the entire
    selected tree, load every blob, or materialize all source files. Resolving and
@@ -320,7 +328,7 @@ functional correctness:
 - Visit more content than decoded memory-cache budgets and verify eviction
   without re-fetching objects already available in the run; do
   not count unavoidable kernel page cache as a second application-owned payload.
-- Run the existing immutable-source, ignore-policy, lifecycle, and real-FUSE
+- Run the existing immutable-source, ignore-policy, lifecycle, and native-mount
   integration checks after changing the loading architecture. Performance must
   not weaken these semantics.
 
