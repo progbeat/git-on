@@ -67,13 +67,18 @@ def ssh_upload_pack(root):
 
 
 class SplitPack:
-    def __init__(self, root, wanted, contents):
+    def __init__(self, root, wanted, contents, base_oid, base_data):
         self.wants = {oid.encode() for oid in wanted}
         self.started = root / 'pack-started'
         self.release = root / 'release-pack'
-        header = b'PACK' + struct.pack('>II', 2, len(contents))
-        entries = [bytes([0x30 | len(data)]) + zlib.compress(data) for data in contents]
-        assert all(len(data) < 16 for data in contents)
+        # Encode the second blob as a REF_DELTA. Its base is a file in a
+        # directory the command will only visit after consuming the forecast.
+        entries = [bytes([0x30 | len(data)]) + zlib.compress(data)
+                   for data in [*contents, base_data]]
+        delta = bytes([len(base_data), len(contents[1]), len(contents[1])]) + contents[1]
+        assert len(delta) < 16 and all(len(data) < 16 for data in [*contents, base_data])
+        entries[1] = bytes([0x70 | len(delta)]) + bytes.fromhex(base_oid) + zlib.compress(delta)
+        header = b'PACK' + struct.pack('>II', 2, len(entries))
         pack = header + b''.join(entries)
         # Open one sideband pkt-line, then pause it immediately after the
         # first blob. Several objects and the PACK trailer are still unsent.
@@ -111,7 +116,7 @@ class StreamingTests(unittest.TestCase):
                 ).encode())
                 commit = fixture.git('commit-tree', root, data=b'separate prefetch\n')
                 fixture.git('update-ref', 'refs/heads/main', commit)
-                split = SplitPack(fixture.root, oids[1:5], data[1:5])
+                split = SplitPack(fixture.root, oids[1:5], data[1:5], oids[-1], data[-1])
                 if transport == 'https':
                     upstream = fixture.https()
                     stack.callback(fixture.server.shutdown)
@@ -151,6 +156,7 @@ while not Path({str(split.started)!r}).exists():
 assert Path('b/first').read_bytes() == {data[1]!r}
 Path({str(ready)!r}).touch()
 assert Path('b/second').read_bytes() == {data[2]!r}
+assert Path('hidden/no').read_bytes() == {data[-1]!r}
 """
                 process = subprocess.Popen(
                     [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
@@ -158,22 +164,26 @@ assert Path('b/second').read_bytes() == {data[2]!r}
                     cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 fixture.children.append(process)
+                def requests():
+                    if transport == 'https':
+                        return [set(group) for _, group in proxy.records]
+                    return [set(line.split()) for line in (fixture.root / 'ssh-wants').read_bytes().splitlines()]
+
                 try:
                     started = await_file(split.started, 12, process)
                     early = started and await_file(ready, 5, process)
+                    self.assertNotIn(hidden.encode(), set().union(*requests()))
                 finally:
                     split.release.touch()
                 _, errors = process.communicate(timeout=15)
                 self.assertTrue(started, f'separate four-object prefetch did not reach the server: {errors!r}')
                 self.assertTrue(early, f'the first file waited for the rest of its pkt-line: {errors!r}')
                 self.assertEqual(process.returncode, 0, errors)
-                if transport == 'https':
-                    wants = [set(group) for _, group in proxy.records]
-                else:
-                    wants = [set(line.split()) for line in (fixture.root / 'ssh-wants').read_bytes().splitlines()]
+                wants = requests()
                 self.assertIn({oids[0].encode()}, wants)
                 self.assertEqual(wants.count(split.wants), 1)
-                self.assertNotIn(hidden.encode(), set().union(*wants))
+                self.assertIn({hidden.encode()}, wants)
+                self.assertNotIn(oids[-1].encode(), set().union(*wants))
 
     def test_ssh_channel_rejection_preserves_the_owned_master(self):
         fixture = fixture_in_short_tmp()

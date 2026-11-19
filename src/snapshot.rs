@@ -1097,7 +1097,7 @@ impl Snapshot {
         if let Some(remote) = state
             .remote
             .as_mut()
-            .filter(|remote| remote.has_received_blob(oid))
+            .filter(|remote| remote.has_packed_object(oid))
         {
             let (size, streamed) =
                 remote.copy_materialized_blob(oid, output, State::validate_blob)?;
@@ -1312,7 +1312,7 @@ impl Snapshot {
         }
         if let Some(remote) = &state.remote {
             objects.extend(remote.raw_blobs.oids()?);
-            objects.extend(remote.received_blob_oids());
+            objects.extend(remote.packed_object_oids());
         }
         objects.sort_unstable();
         objects.dedup();

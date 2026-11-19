@@ -397,7 +397,7 @@ impl Pool {
         }
         // Publication can race a caller's first cache lookup. See the pending
         // flight or the stored object under the same lock that retires flights.
-        if !queue.pending.contains_key(&oid) && self.scratch.get(oid)?.is_some() {
+        if !queue.pending.contains_key(&oid) && self.scratch.available(oid) {
             let demand = Demand::default();
             demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
             return Ok(demand);
@@ -419,7 +419,7 @@ impl Pool {
         for oid in candidates {
             if queue.pending.contains_key(&oid)
                 || queue.predicted.contains(&oid)
-                || !matches!(self.scratch.get(oid), Ok(None))
+                || self.scratch.available(oid)
             {
                 continue;
             }
@@ -542,19 +542,36 @@ impl Shared {
         )
     }
 
-    fn resolve_speculative_pack(
+    fn resolve_pack_remainder(
         &self,
         work: &Work,
         scratch: &RawBlobs,
         git: &Git,
         pack: Spool,
     ) -> Result<()> {
-        let directory = scratch.index_directory()?;
+        let directory = Arc::new(scratch.index_directory()?);
         let mut options = git2::RepositoryInitOptions::new();
         options.bare(true).external_template(false);
         let repository = git2::Repository::init_opts(directory.path(), &options)?;
         let odb = repository.odb()?;
         pack_stream::index(&odb, &pack)?;
+        // Keep unrequested bases compressed until they are needed. A
+        // later demand can then import them without another network fetch.
+        let mut cancelled = None;
+        let indexed = odb.foreach(|oid| {
+            if let Err(error) = object::check_transfer() {
+                cancelled = Some(error);
+                return false;
+            }
+            if !work.items.iter().any(|item| item.oid == *oid) {
+                scratch.remember_packed(*oid, &directory);
+            }
+            true
+        });
+        if let Some(cancelled) = cancelled {
+            return Err(cancelled);
+        }
+        indexed?;
         let mut cache = scratch.clone();
         for item in work.items.iter().filter(|item| !item.demand.ready()) {
             let (size, kind) = odb.read_header(item.oid)?;
@@ -608,8 +625,10 @@ impl Shared {
                 self.prefetches.fetch_add(1, Ordering::Relaxed);
             }
             match pack.fallback {
-                Some(file) if work.speculative => {
-                    self.resolve_speculative_pack(&work, scratch, git, file)?;
+                Some(file)
+                    if work.speculative || work.items.iter().all(|item| item.demand.ready()) =>
+                {
+                    self.resolve_pack_remainder(&work, scratch, git, file)?;
                     Ok(None)
                 }
                 Some(file) => Ok(Some(Acquired::Pack(file))),

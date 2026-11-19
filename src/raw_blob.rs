@@ -506,6 +506,7 @@ impl RawBlobs {
             state: Arc::new(Mutex::new(Store {
                 directory: RawDirectory::new(directory)?,
                 objects: HashMap::new(),
+                packed: HashMap::new(),
                 memory: lru::LruCache::unbounded(),
                 memory_bytes: 0,
                 memory_limit: MEMORY_BUDGET,
@@ -533,6 +534,50 @@ impl RawBlobs {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(state.objects.get(&oid).map(|object| self.blob(oid, object)))
     }
+    pub(crate) fn available(&self, oid: Oid) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.objects.contains_key(&oid) || state.packed.contains_key(&oid)
+    }
+
+    pub(crate) fn has_packed(&self, oid: Oid) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .packed
+            .contains_key(&oid)
+    }
+
+    pub(crate) fn packed_directory(&self, oid: Oid) -> Option<Arc<tempfile::TempDir>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.packed.get(&oid).cloned()
+    }
+
+    pub(crate) fn remember_packed(&self, oid: Oid, directory: &Arc<tempfile::TempDir>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.objects.contains_key(&oid) {
+            state.packed.entry(oid).or_insert_with(|| directory.clone());
+        }
+    }
+
+    pub(crate) fn forget_packed(&self, oid: Oid) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .packed
+            .remove(&oid);
+    }
+
+    #[cfg(feature = "test-metrics")]
+    pub(crate) fn packed_oids(&self) -> Vec<Oid> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .packed
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn for_read(&mut self, oid: Oid) -> Result<Option<(RawBlob, bool)>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(object) = state.objects.get_mut(&oid) else {
@@ -671,6 +716,7 @@ impl RawBlobs {
         for (block, bytes) in buffers.into_iter().enumerate() {
             store.admit(oid, block, bytes)?;
         }
+        store.packed.remove(&oid);
         store.blob_entries += 1;
         store.blob_bytes += size as u64;
         if !resident {
@@ -701,6 +747,7 @@ impl RawBlobs {
                 directory: Some(directory),
             },
         );
+        store.packed.remove(&oid);
         Ok(self.blob(oid, store.objects.get(&oid).unwrap()))
     }
     // Scratch files belong to transport framing/decoding, never the object map.
@@ -919,6 +966,7 @@ impl RawBlobs {
 struct Store {
     directory: RawDirectory,
     objects: HashMap<Oid, Descriptor>,
+    packed: HashMap<Oid, Arc<tempfile::TempDir>>,
     memory: lru::LruCache<Oid, Resident>,
     memory_bytes: usize,
     memory_limit: usize,

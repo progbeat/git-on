@@ -331,14 +331,17 @@ impl Pack {
                 ensure!(entry.data.len() == entry.size, "truncated Git pack object");
                 self.entries += 1;
                 let oid = Oid::from_bytes(&object::finish_sha1(entry.hash)?)?;
-                if let Some(want) = self.wants.iter().position(|&item| item == oid) {
-                    self.wants.swap_remove(want);
-                    (self.publish)(VerifiedObject {
-                        oid,
-                        kind: entry.kind,
-                        data: entry.data,
-                    })?;
-                }
+                let Some(want) = self.wants.iter().position(|&item| item == oid) else {
+                    // Preserve bases or other extra entries through the pack
+                    // decoder instead of discarding a received object.
+                    return self.use_fallback();
+                };
+                self.wants.swap_remove(want);
+                (self.publish)(VerifiedObject {
+                    oid,
+                    kind: entry.kind,
+                    data: entry.data,
+                })?;
             } else if consumed == 0 && used == 0 {
                 break;
             }

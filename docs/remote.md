@@ -106,6 +106,8 @@ a verified object while the rest of its pack is still arriving. The receiver
 also verifies the complete pack's checksum and framing. Deltas and entries
 or packs larger than the in-memory decoder's working buffers use the existing
 pack decoder. Blob payloads enter the same authenticated, run-local store.
+Unrequested objects in a verified pack remain available in compressed form
+for later demands.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with
