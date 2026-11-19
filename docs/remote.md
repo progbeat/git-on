@@ -96,6 +96,8 @@ v2 as soon as the authenticated, owned socket exists. The first channel to
 advertise filtered protocol v2 selects the revision and prepares the snapshot.
 If fetching the selected object also takes at least 64 milliseconds, up to two
 more SSH channels can start negotiating while the root tree is fetched.
+Ready startup channels can serve exact demands while other channels are still
+negotiating and the pool is measuring its first replies.
 When another channel opens during execution, pending requests stay eligible
 on the existing channels until one is available to send them.
 Beyond the initial SSH pool, actual demands open additional channels.

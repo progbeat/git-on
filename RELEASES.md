@@ -16,7 +16,7 @@
 - Wake promptly when a native Git subprocess exits on macOS, reducing polling
   delays during snapshot preparation and pack decoding.
 - Open spare SSH channels while the initial one negotiates Git and during
-  slow root fetches. Let existing channels serve queued reads during setup.
+  slow root fetches. Let ready channels serve queued reads during setup.
 - Prefetch upcoming blobs from already opened directories on both transports.
   Grow the fetch batch during scans that consistently use the prefetched blobs.
 - Decode Git packs as they arrive and make verified objects readable before

@@ -203,6 +203,8 @@ struct Queue {
     forecast_score: u8,
     forecast_misses: u8,
     busy: [bool; CONNECTIONS],
+    initial_channels: usize,
+    starting: [bool; CONNECTIONS],
     connecting: bool,
     native_ceiling: Option<usize>,
     failure: Option<String>,
@@ -305,16 +307,29 @@ impl Queue {
     }
 
     fn native_work(&mut self, index: usize, needs_ssh_channel: bool) -> Option<NativeWork> {
+        let speculative = self.waiting.is_empty();
+        let ready_for_exact = !speculative && !needs_ssh_channel;
         let channels = if self.dense() {
             CONNECTIONS
         } else {
             self.mode.channels()
         }
+        .max(if ready_for_exact {
+            self.initial_channels
+        } else {
+            0
+        })
         .min(self.native_ceiling.unwrap_or(CONNECTIONS));
-        if index >= channels || self.busy[..index].contains(&false) {
+        // An earlier standby cannot claim work while negotiating. Let a
+        // prepared channel serve exact work without opening another channel.
+        if index >= channels
+            || self.busy[..index]
+                .iter()
+                .zip(&self.starting)
+                .any(|(&busy, &starting)| !(busy || ready_for_exact && starting))
+        {
             return None;
         }
-        let speculative = self.waiting.is_empty();
         let pending = if speculative {
             let active = self.busy.iter().filter(|busy| **busy).count();
             if active + 1 >= channels {
@@ -429,6 +444,12 @@ impl Pool {
             workers: Mutex::default(),
             wake: None,
         };
+        {
+            let initial = 1 + standby.len().min(CONNECTIONS - 1);
+            let mut queue = pool.shared.queue.lock().unwrap();
+            queue.initial_channels = initial;
+            queue.starting[1..initial].fill(true);
+        }
         let mut standby = standby.into_iter();
         for index in 1..CONNECTIONS {
             pool.start(index, None, connection.clone(), standby.next())?;
@@ -991,6 +1012,8 @@ impl Shared {
                 session = Some(connected);
                 self.additional_starts.fetch_add(1, Ordering::Relaxed);
             }
+            self.queue.lock().unwrap().starting[index] = false;
+            self.work.notify_all();
         }
         loop {
             let next = {
@@ -1097,6 +1120,23 @@ fn drain_wake(wake: &mut UnixStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_exact_demand_uses_a_prepared_channel() {
+        let oid = Oid::from_bytes(&[7; 20]).unwrap();
+        let mut queue = Queue {
+            initial_channels: 5,
+            ..Queue::default()
+        };
+        queue.busy[..3].fill(true);
+        queue.starting[3] = true;
+        queue.foreground(oid);
+        assert!(queue.native_work(4, true).is_none());
+        let Some(NativeWork::Fetch(work, None)) = queue.native_work(4, false) else {
+            panic!("the prepared SSH channel must serve the exact request");
+        };
+        assert_eq!(work.wants(), [oid]);
+    }
 
     #[test]
     fn expand_only_when_every_startup_reply_is_slow() {
