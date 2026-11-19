@@ -132,23 +132,35 @@ impl Git {
         }
         command
     }
-    pub(crate) fn demand_session_compatible(&self) -> bool {
+    pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
         // Keep caller-defined server programs, server options and fsck policy
-        // on native fetch's complete compatibility path. A controlling TTY
-        // also needs that supervisor: arbitrary credential helpers can read it
-        // even with redirected stdio and GIT_TERMINAL_PROMPT=0.
-        controlling_terminal().is_none()
-            && std::env::var_os("GIT_EXEC_PATH").is_none()
-            && !self.config.iter().any(|(key, value)| {
-                let key = key.as_bytes();
-                key.ends_with(b".uploadpack")
-                    || key.ends_with(b".vcs")
-                    || key.ends_with(b".serveroption")
-                    || key.starts_with(b"fsck.")
-                    || key == b"fetch.fsckobjects"
-                    || key == b"transfer.fsckobjects"
-                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
-            })
+        // on native fetch's complete compatibility path.
+        if self.config.iter().any(|(key, value)| {
+            let key = key.as_bytes();
+            key.ends_with(b".uploadpack")
+                || key.ends_with(b".vcs")
+                || key.ends_with(b".serveroption")
+                || key.starts_with(b"fsck.")
+                || key == b"fetch.fsckobjects"
+                || key == b"transfer.fsckobjects"
+                || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+        }) {
+            return Ok(false);
+        }
+
+        let Some(inherited) = std::env::var_os("GIT_EXEC_PATH") else {
+            return Ok(true);
+        };
+        // Git exports its standard helper directory to external subcommands.
+        // A genuinely custom directory still selects the compatibility path.
+        let mut command = self.command(None);
+        command
+            .arg("--exec-path")
+            .env_remove("GIT_EXEC_PATH")
+            .stdin(Stdio::null());
+        let result = run(command, true)?;
+        Ok(result.status.success()
+            && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
@@ -405,7 +417,7 @@ impl<R: std::io::Read, F: FnOnce(&mut R) -> std::io::Result<()>> std::io::Read
     }
 }
 
-fn controlling_terminal() -> Option<std::fs::File> {
+pub(crate) fn controlling_terminal() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)

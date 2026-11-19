@@ -155,7 +155,6 @@ impl Overlay {
                 && node.attr.kind == FileType::RegularFile
         })
     }
-    #[cfg(target_os = "linux")]
     pub(crate) fn protected_source(&self, ino: u64) -> bool {
         self.write_policy != WritePolicy::All
             && self
@@ -1549,6 +1548,50 @@ impl Overlay {
 }
 
 impl Overlay {
+    pub(crate) fn remote_size_batching(&self) -> bool {
+        self.write_policy != WritePolicy::All && self._snapshot.remote_http()
+    }
+
+    pub(crate) fn can_combine_remote_sizes(&self) -> bool {
+        self._snapshot.can_combine_remote_demand()
+    }
+
+    pub(crate) fn combine_remote_sizes(&self, oids: &[Oid]) {
+        self._snapshot.combine_remote_demand(oids);
+    }
+
+    pub(crate) fn pending_source_size(&self, ino: u64) -> Option<Oid> {
+        let node = self.nodes.get(&ino)?;
+        if node.size_pending && self.protected_source(ino) {
+            node.oid
+        } else {
+            None
+        }
+    }
+
+    /// A queued demand may resolve its name without crossing another remote
+    /// fetch. A prepared source directory has all its ancestors available.
+    pub(crate) fn lookup_cached_inode(&mut self, parent: u64, name: &OsStr) -> Option<u64> {
+        if !self.protected_source(parent) {
+            return None;
+        }
+        let path = self.child(parent, name).ok()?;
+        let source = self.lower_path(&path)?;
+        if !self.source_directory_keys.contains_key(source.parent()?) {
+            return None;
+        }
+        self.lookup_inode(parent, name).ok()
+    }
+
+    pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
+        if self.read_only() {
+            self.ensure_readonly_child(parent, name, false)
+        } else {
+            let path = self.child(parent, name)?;
+            self.ensure_entry(&path, false)
+        }
+    }
+
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
         let ino = if self.read_only() {
@@ -1900,15 +1943,6 @@ impl Overlay {
 impl Overlay {
     pub(crate) fn retain_nfs_inodes(&mut self) {
         self.preserve_linked_inodes = true;
-    }
-
-    pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
-        if self.read_only() {
-            self.ensure_readonly_child(parent, name, false)
-        } else {
-            let path = self.child(parent, name)?;
-            self.ensure_entry(&path, false)
-        }
     }
 
     pub(crate) fn nfs_parent(&mut self, ino: u64) -> FsResult<u64> {

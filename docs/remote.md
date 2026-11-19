@@ -57,16 +57,24 @@ invocation-owned channel. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
 SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
 Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
-Callers with a controlling terminal use native fetch with job-control supervision.
-During preparation, Git-on owns that terminal and presents standard Git/OpenSSH
-askpass requests. Git and its helpers have no controlling terminal; helpers that
-need terminal interaction must use `GIT_ASKPASS` or `SSH_ASKPASS` instead of opening
-`/dev/tty` directly. Configured askpass programs retain their selection policy
-and original environment.
+Interactive preparation uses native fetch with job-control supervision. Git-on
+owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
+request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
+programs retain their selection policy and original environment. Once the
+command starts, HTTP(S) can share a helper with its own session and no
+controlling terminal.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
-custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
-retain the native compatibility path. No fetched object is retried merely to
-change decoders, and no unrelated future OID is requested.
+custom server/vcs/server-option settings, explicit fsck policy, or a custom
+`GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
+helper path supports reuse. No fetched object is retried merely to change
+decoders, and no unrelated future OID is requested.
+
+On FUSE and NFS, concurrent requests for file sizes in the protected source
+can share one exact HTTP(S) fetch. The bounded batch includes only objects
+identified by requests already waiting for service and paths in prepared
+directories. Cached objects and duplicate OIDs are reused. This optimization
+requires an active reusable HTTP(S) session and an unrestricted per-file size
+limit. The mount can begin serving a single demand immediately.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with
@@ -80,8 +88,8 @@ transfers rather than aggregating otherwise readable objects into an oversized
 pack. At most 256 known object IDs from the current directory share one
 native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
 run-local availability and deduplicated before requesting it; all use `tree:0`.
-The same batching applies to metadata required by the FUSE ownership index;
-readonly FUSE demands remain exact. Neither path requests unknown descendants. The batch
+The same batching applies to metadata required by the FUSE ownership index.
+All paths request only known objects. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
 fetch/decode operations; full-process tracing checks those operation counts.

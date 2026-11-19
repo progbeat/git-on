@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod demand;
+
 pub(super) const LEASE_SECONDS: u32 = 90;
 const MAX_CLIENTS: usize = 8;
 const MAX_SESSIONS: usize = 4;
@@ -50,6 +52,40 @@ struct Session {
     slots: Vec<Slot>,
 }
 
+impl Session {
+    fn slot(&self, request: &protocol::Sequence) -> Result<&Slot, Status> {
+        let slot = self.slots.get(request.slot as usize).ok_or(BADSLOT)?;
+        if request.highest >= self.channel.slots {
+            return Err(BAD_HIGH_SLOT);
+        }
+        Ok(slot)
+    }
+
+    fn reply_limit(
+        &self,
+        request: &protocol::Sequence,
+        request_size: usize,
+        count: u32,
+    ) -> Result<usize, Status> {
+        if request_size > self.channel.request as usize {
+            return Err(REQ_TOO_BIG);
+        }
+        if count > self.channel.ops {
+            return Err(TOO_MANY_OPS);
+        }
+        let max_reply = if request.cache_this {
+            self.channel.cached as usize
+        } else {
+            self.channel.response as usize
+        };
+        // Leave space for the RPC header, the longest tag, SEQUENCE and a later error.
+        if max_reply < 1200 {
+            return Err(REP_TOO_BIG_TO_CACHE);
+        }
+        Ok(max_reply)
+    }
+}
+
 pub(super) struct Server {
     pub core: Overlay,
     pub run: [u8; 16],
@@ -73,6 +109,18 @@ pub(super) struct Context {
 }
 
 impl Context {
+    fn new(credentials: Credentials) -> Self {
+        Self {
+            client: 0,
+            credentials,
+            fh: None,
+            saved: None,
+            current_state: None,
+            saved_state: None,
+            closed_inodes: Vec::new(),
+        }
+    }
+
     pub fn inode(&self) -> Result<u64, Status> {
         self.fh.ok_or(NOFILEHANDLE)
     }
@@ -240,15 +288,7 @@ impl Server {
         if request.count == 0 {
             return reply.into_bytes();
         }
-        let mut context = Context {
-            client: 0,
-            credentials,
-            fh: None,
-            saved: None,
-            current_state: None,
-            saved_state: None,
-            closed_inodes: Vec::new(),
-        };
+        let mut context = Context::new(credentials);
         let mut budget = MAX_RECORD - RPC_REPLY_HEADER;
         let mut replay_slot = None;
         let mut count = 0;
@@ -601,10 +641,7 @@ impl Server {
         w: &mut Writer,
     ) -> Result<Sequenced, Status> {
         let session = self.sessions.get(&request.session).ok_or(BADSESSION)?;
-        let slot = session.slots.get(request.slot as usize).ok_or(BADSLOT)?;
-        if request.highest >= session.channel.slots {
-            return Err(BAD_HIGH_SLOT);
-        }
+        let slot = session.slot(request)?;
         if request.id == slot.sequence {
             let prior = slot.last.as_ref().ok_or(SEQ_MISORDERED)?;
             if prior.digest != digest || prior.credentials != credentials {
@@ -619,21 +656,7 @@ impl Server {
         if request.id != slot.sequence.wrapping_add(1) {
             return Err(SEQ_MISORDERED);
         }
-        if request_size > session.channel.request as usize {
-            return Err(REQ_TOO_BIG);
-        }
-        if count > session.channel.ops {
-            return Err(TOO_MANY_OPS);
-        }
-        let max_reply = if request.cache_this {
-            session.channel.cached as usize
-        } else {
-            session.channel.response as usize
-        };
-        if max_reply < 1200 {
-            // Leave space for the RPC header, the longest tag, SEQUENCE, and a later error.
-            return Err(REP_TOO_BIG_TO_CACHE);
-        }
+        let max_reply = session.reply_limit(request, request_size, count)?;
         self.clients
             .get_mut(&session.client)
             .ok_or(BADSESSION)?

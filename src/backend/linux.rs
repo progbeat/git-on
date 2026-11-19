@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Weak},
 };
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::Path,
     sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -25,11 +25,13 @@ const TTL: Duration = Duration::ZERO;
 // generated children or mutable directory streams. A fully readonly namespace
 // may also cache directory pages. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const REMOTE_WORKERS: usize = 8;
 // TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
 // interrupted without a blocked dispatcher. Do not emulate it by polling
 // caller /proc status on ordinary filesystem operations.
 pub struct Fuse {
     state: Mutex<State>,
+    queued_lookups: Option<Mutex<HashMap<u64, (u64, OsString)>>>,
 }
 struct State {
     core: Overlay,
@@ -50,6 +52,7 @@ struct State {
 }
 impl Fuse {
     pub fn new(core: Overlay) -> Self {
+        let queued_lookups = core.remote_size_batching().then(Mutex::default);
         Self {
             state: Mutex::new(State {
                 core,
@@ -64,10 +67,43 @@ impl Fuse {
                 #[cfg(target_os = "linux")]
                 handles: HashMap::new(),
             }),
+            queued_lookups,
         }
     }
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("filesystem operation panicked")
+    }
+
+    fn lookup_state(&self, id: u64, parent: u64, name: &OsStr) -> MutexGuard<'_, State> {
+        let Some(queue) = &self.queued_lookups else {
+            return self.state();
+        };
+        queue.lock().unwrap().insert(id, (parent, name.to_owned()));
+        let mut state = self.state();
+        let waiting = {
+            let mut queue = queue.lock().unwrap();
+            queue.remove(&id);
+            queue.values().cloned().collect::<Vec<_>>()
+        };
+        if !waiting.is_empty() && state.core.can_combine_remote_sizes() {
+            let core = &mut state.core;
+            if let Some(first) = core
+                .lookup_cached_inode(parent, name)
+                .and_then(|ino| core.pending_source_size(ino))
+            {
+                let mut wants = vec![first];
+                for (parent, name) in waiting {
+                    if let Some(oid) = core
+                        .lookup_cached_inode(parent, &name)
+                        .and_then(|ino| core.pending_source_size(ino))
+                    {
+                        wants.push(oid);
+                    }
+                }
+                core.combine_remote_sizes(&wants);
+            }
+        }
+        state
     }
 }
 impl State {
@@ -193,6 +229,11 @@ impl Filesystem for Fuse {
         #[cfg(target_os = "linux")]
         {
             let state = self.state.get_mut().expect("filesystem state poisoned");
+            if self.queued_lookups.is_some() {
+                // The overlay still serializes namespace changes. Allow the
+                // kernel to submit distinct lookups under the same parent.
+                let _ = config.add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS);
+            }
             state.cache_directories =
                 state.core.read_only() && config.kernel_abi() >= fuser::Version(7, 28);
             #[cfg(feature = "test-metrics")]
@@ -218,8 +259,8 @@ impl Filesystem for Fuse {
         let _ = config;
         Ok(())
     }
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let mut state = self.state();
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let mut state = self.lookup_state(req.unique().0, parent.0, name);
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("lookup");
         match state.core.lookup_entry(parent.0, name) {

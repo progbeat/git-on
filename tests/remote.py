@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic native Git, HTTPS and OpenSSH acceptance. Keys are disposable.
 
-The source probe runs the production loader without FUSE; --require-fuse also
-executes the installed CLI through actual mounts. No transport is mocked.
+The source probe runs the production loader without a mount. --require-fuse
+and --require-nfs also execute the CLI through their native mounts.
 """
 import argparse
 import contextlib
@@ -1447,6 +1447,109 @@ print('caught-EIO-and-returned-success')
                 self.assertEqual(wants, expected,
                                  'eager preparation performs separate directory/object fetches')
                 self.assertEqual(list(f.root.glob('git-on-*')),[])
+
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_git_on_in_a_terminal_reuses_the_https_demand_session(self):
+        f = self.f
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        programs = f.root / 'external-command'
+        programs.mkdir()
+        (programs / 'git-on').symlink_to(OPTIONS.binary.resolve())
+        env = dict(f.env, PATH=str(programs) + os.pathsep + f.env['PATH'], TERM='dumb')
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
+        master, slave = pty.openpty()
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, master)
+        with os.fdopen(read_fd, 'rb') as metrics:
+            try:
+                def terminal():
+                    os.setsid()
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                process = subprocess.Popen(
+                    ['git', 'on', url, 'HEAD', '--backend=' + backend, '--',
+                     sys.executable, '-I', '-S', '-c',
+                     "from pathlib import Path; print(Path('deep/file').read_text() + Path('other').read_text(), end='')"],
+                    cwd=f.cwd, env=dict(env, GIT_ON_TEST_METRICS_FD=str(write_fd)),
+                    stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    pass_fds=[write_fd], preexec_fn=terminal,
+                )
+                f.children.append(process)
+            finally:
+                os.close(slave)
+                os.close(write_fd)
+            output, errors = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, errors)
+            report = json.load(metrics)
+        self.assertEqual(output, b'expected\nunrelated payload\n')
+        self.assertEqual(report['backend'], backend)
+        self.assertEqual(report['remote_fetches'], 5, report)
+        self.assertEqual(report['remote_session_starts'], 1, report)
+        self.assertEqual(report['remote_session_fetch_operations'], 3, report)
+        self.assertEqual({oid for request in f.requests for oid in request['wants']},
+                         {f.commit, f.tree, f.subtree, f.blob, f.other})
+        self.assertFalse(list(f.root.glob('git-on-*')))
+
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_concurrent_https_lookups_combine_only_requested_objects(self):
+        f = self.f
+        sizes = list(range(21, 37))
+        wanted = [f.git('hash-object', '-w', '--stdin', data=b'x' * size) for size in sizes]
+        directories = [f.git('mktree', data=f'100644 blob {oid}\tfile\n'.encode())
+                       for oid in wanted]
+        entries = [f'040000 tree {oid}\td{index}'
+                   for index, oid in enumerate(directories)]
+        entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\tunused',
+                        f'040000 tree {f.subtree}\tunvisited'))
+        tree = f.git('mktree', data=('\n'.join(entries) + '\n').encode())
+        commit = f.git('commit-tree', tree, data=b'concurrent lookups\n')
+        f.git('update-ref', 'refs/heads/main', commit)
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        self.addCleanup(f.resume.set)
+        f.stalled_oids.update(wanted)
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
+        command = f"""
+import concurrent.futures
+import os
+import threading
+
+assert 'unvisited' in os.listdir('.')
+assert os.stat('warm').st_size == 9
+sizes = {sizes!r}
+parents = [os.open(f'd{{index}}', os.O_RDONLY | os.O_DIRECTORY) for index in range(len(sizes))]
+for parent in parents:
+    assert os.listdir(parent) == ['file']
+gate = threading.Barrier(len(sizes))
+
+def read(index):
+    gate.wait(timeout=10)
+    parent = parents[index]
+    size = os.stat('file', dir_fd=parent).st_size
+    with os.fdopen(os.open('file', os.O_RDONLY, dir_fd=parent), 'rb') as file:
+        return size, file.read()
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
+    assert list(pool.map(read, range(len(sizes)))) == [(size, b'x' * size) for size in sizes]
+"""
+        process = subprocess.Popen(
+            [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
+             sys.executable, '-I', '-S', '-c', command],
+            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        f.children.append(process)
+        self.assertTrue(f.stalled.wait(timeout=15), 'concurrent lookups did not reach HTTPS')
+        # Leave the first transfer pending while the other threads enter the
+        # mount. There is no latency assertion tied to this scheduling window.
+        time.sleep(.2)
+        f.resume.set()
+        _, errors = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0, errors)
+        batches = [request['wants'] for request in f.requests if request['wants']]
+        self.assertCountEqual([oid for batch in batches for oid in batch],
+                              [commit, tree, f.blob, *directories, *wanted])
+        self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
+        self.assertFalse(list(f.root.glob('git-on-*')))
 
     def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
         f=self.f

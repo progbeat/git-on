@@ -14,7 +14,7 @@ use std::{
 
 const MAX_DIRECTORY_VIEWS: usize = 64;
 const MAX_DIRECTORY_ROWS: usize = 128;
-const READ: u32 = 1;
+pub(super) const READ: u32 = 1;
 const WRITE: u32 = 2;
 
 pub(super) struct OpenState {
@@ -37,7 +37,7 @@ pub(super) struct DirectoryView {
 
 type NfsResult<T> = Result<T, Status>;
 
-fn component(bytes: &[u8]) -> NfsResult<&OsStr> {
+pub(super) fn component(bytes: &[u8]) -> NfsResult<&OsStr> {
     if bytes.len() > MAX_NAME {
         return Err(NAMETOOLONG);
     }
@@ -81,7 +81,7 @@ impl Server {
         bytes
     }
 
-    fn inode_from_handle(&self, bytes: &[u8]) -> NfsResult<u64> {
+    pub(super) fn inode_from_handle(&self, bytes: &[u8]) -> NfsResult<u64> {
         let bytes: &[u8; 24] = bytes.try_into().map_err(|_| BADHANDLE)?;
         let ino = u64::from_be_bytes(bytes[16..].try_into().unwrap());
         if bytes[..16] != self.run || !self.core.nfs_inode_exists(ino) {

@@ -10,6 +10,7 @@ mod xdr;
 use self::server::Server;
 use crate::{filesystem::Overlay, platform, policy::WritePolicy};
 use std::{
+    collections::VecDeque,
     fs::{self, DirBuilder},
     io,
     os::unix::{fs::DirBuilderExt, net::UnixListener as StdListener},
@@ -24,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
     sync::{mpsc, oneshot},
     task::JoinSet,
 };
@@ -169,6 +170,19 @@ enum Job {
     Sweep,
 }
 
+impl Job {
+    fn run(self, server: &mut Server) {
+        match self {
+            Self::Call(data, reply) => {
+                // Once admitted, finish the compound even after disconnect
+                // so a retransmit can use the session slot's cached result.
+                let _ = reply.send(server.rpc(&data));
+            }
+            Self::Sweep => server.sweep(Instant::now()),
+        }
+    }
+}
+
 async fn serve(
     listener: UnixListener,
     mut server: Server,
@@ -178,21 +192,22 @@ async fn serve(
     let (queue, mut jobs) = mpsc::channel(QUEUE_DEPTH);
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stopped = Arc::clone(&stopped);
+    let batch_sizes = server.core.remote_size_batching();
+    let runtime = tokio::runtime::Handle::current();
     // Overlay already serializes tree and backing mutations. A single bounded
     // queue also keeps native Git waits off the runtime's socket tasks.
     let mut worker = tokio::task::spawn_blocking(move || {
-        while let Some(job) = jobs.blocking_recv() {
+        let mut waiting = VecDeque::new();
+        while let Some(job) = waiting.pop_front().or_else(|| jobs.blocking_recv()) {
             if worker_stopped.load(Ordering::Relaxed) {
                 break;
             }
-            match job {
-                Job::Call(data, reply) => {
-                    // Once admitted, finish the compound even after disconnect
-                    // so a retransmit can use the session slot's cached result.
-                    let _ = reply.send(server.rpc(&data));
+            if batch_sizes {
+                if let Job::Call(data, _) = &job {
+                    server.combine_pending_sizes(data, &mut waiting, &mut jobs, &runtime);
                 }
-                Job::Sweep => server.sweep(Instant::now()),
             }
+            job.run(&mut server);
         }
     });
     let mut peers = JoinSet::new();
@@ -218,7 +233,8 @@ async fn serve(
                 match accepted {
                     Ok((socket, _)) => {
                         if socket.peer_cred().is_ok_and(|peer| peer.uid() == 0 || peer.uid() == uid) {
-                            peers.spawn(connection(socket, queue.clone()));
+                            let limit = if batch_sizes { QUEUE_DEPTH } else { 1 };
+                            peers.spawn(connection(socket, queue.clone(), limit));
                         }
                     }
                     Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => (),
@@ -240,30 +256,64 @@ async fn serve(
     result
 }
 
-async fn connection(mut socket: UnixStream, queue: mpsc::Sender<Job>) -> io::Result<()> {
+async fn connection(socket: UnixStream, queue: mpsc::Sender<Job>, limit: usize) -> io::Result<()> {
+    let (mut input, mut output) = socket.into_split();
+    let mut waiting = JoinSet::new();
+    let idle = Duration::from_secs(u64::from(server::LEASE_SECONDS) * 2);
     loop {
-        // One record per permitted connection provides backpressure before
-        // queue admission. A stalled peer may keep a connection for two leases.
-        let idle = Duration::from_secs(u64::from(server::LEASE_SECONDS) * 2);
-        let data = tokio::time::timeout(idle, read_record(&mut socket)).await??;
+        // Keep a partially read record across reply writes. Do not apply the
+        // peer idle timer while the filesystem is still serving its requests.
+        let mut read = std::pin::pin!(read_record(&mut input));
+        let data = loop {
+            let can_read = waiting.len() < limit;
+            if waiting.is_empty() {
+                break tokio::time::timeout(idle, read.as_mut()).await?;
+            }
+            tokio::select! {
+                Some(response) = waiting.join_next() => {
+                    write_response(&mut output, response.map_err(io::Error::other)??, idle).await?;
+                }
+                data = read.as_mut(), if can_read => break data,
+            }
+        };
+        let data = match data {
+            Ok(data) => data,
+            Err(error) => {
+                // A peer can close its write half and still receive the
+                // responses to records that have already been admitted.
+                while let Some(response) = waiting.join_next().await {
+                    write_response(&mut output, response.map_err(io::Error::other)??, idle).await?;
+                }
+                return Err(error);
+            }
+        };
         let (send, receive) = oneshot::channel();
         queue
             .send(Job::Call(data, send))
             .await
             .map_err(io::Error::other)?;
-        if let Some(response) = receive.await.map_err(io::Error::other)? {
-            if response.len() > MAX_RECORD {
-                return Err(io::Error::other("NFS response exceeds record limit"));
-            }
-            tokio::time::timeout(idle, async {
-                socket
-                    .write_all(&(0x8000_0000 | response.len() as u32).to_be_bytes())
-                    .await?;
-                socket.write_all(&response).await
-            })
-            .await??;
-        }
+        waiting.spawn(async move { receive.await.map_err(io::Error::other) });
     }
+}
+
+async fn write_response(
+    output: &mut OwnedWriteHalf,
+    response: Option<Vec<u8>>,
+    idle: Duration,
+) -> io::Result<()> {
+    let Some(response) = response else {
+        return Ok(());
+    };
+    if response.len() > MAX_RECORD {
+        return Err(io::Error::other("NFS response exceeds record limit"));
+    }
+    tokio::time::timeout(idle, async {
+        output
+            .write_all(&(0x8000_0000 | response.len() as u32).to_be_bytes())
+            .await?;
+        output.write_all(&response).await
+    })
+    .await?
 }
 
 async fn read_record(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<Vec<u8>> {

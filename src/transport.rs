@@ -122,7 +122,10 @@ impl Session {
             .stderr(errors.try_clone()?);
         unsafe {
             command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
+                // Credential helpers must not be able to read the command's
+                // terminal through /dev/tty. The session ID also owns a new
+                // process group for transport cancellation and reaping.
+                if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -252,7 +255,10 @@ impl Session {
         output.extend_from_slice(bytes);
         Ok(())
     }
-    pub(crate) fn fetch(&mut self, oid: Oid, pack: &Spool) -> Result<()> {
+    pub(crate) fn stateless(&self) -> bool {
+        self.stateless
+    }
+    pub(crate) fn fetch(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
         // The completed previous response has no diagnostics to retain. A
         // shared regular-file offset is reset only between transactions.
         self.errors.set_len(0)?;
@@ -262,7 +268,9 @@ impl Session {
         let mut request = Vec::with_capacity(256);
         Self::request_packet(&mut request, b"command=fetch\n")?;
         request.extend_from_slice(b"0001");
-        Self::request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
+        for oid in oids {
+            Self::request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
+        }
         for value in [
             b"deepen 1\n".as_slice(),
             b"filter tree:0\n",
@@ -587,7 +595,7 @@ mod tests {
                 bytes.extend_from_slice(b"0000");
                 let file = spool(root.path(), &[]);
                 let (mut session, _request_peer) = peer_response(&bytes);
-                session.fetch(Oid::zero(), &file).unwrap();
+                session.fetch(&[Oid::zero()], &file).unwrap();
                 let mut actual = vec![0; good.len()];
                 file.read_exact_at(&mut actual, 0).unwrap();
                 assert_eq!(actual, good);
@@ -675,7 +683,7 @@ mod tests {
                 stateless: false,
             };
             let file = spool(root.path(), &[]);
-            assert!(session.fetch(Oid::zero(), &file).is_err());
+            assert!(session.fetch(&[Oid::zero()], &file).is_err());
             assert_eq!(file.len().unwrap(), 0);
         }
     }

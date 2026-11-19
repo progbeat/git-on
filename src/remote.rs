@@ -1,4 +1,4 @@
-//! Explicit one-object fetches. Git's promisor auto-fetch is never the loader.
+//! Explicit exact-object fetches. Git's promisor auto-fetch is never the loader.
 use crate::{git::Git, object::TeeRead};
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
@@ -543,18 +543,7 @@ impl Remote {
     /// Ordinary lazy lookup/read retains its exact one-demand behavior.
     pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         let outcome = (|| {
-            let odb = repo.odb()?;
-            let mut unique = HashSet::new();
-            let mut missing = Vec::new();
-            for oid in oids {
-                if unique.insert(*oid)
-                    && !self.has_received_blob(*oid)
-                    && self.raw_blobs.get(*oid)?.is_none()
-                    && !odb.exists(*oid)
-                {
-                    missing.push(*oid);
-                }
-            }
+            let missing = self.missing_demands(repo, oids)?;
             if missing.is_empty() {
                 return Ok(());
             }
@@ -575,6 +564,47 @@ impl Remote {
         })();
         self.record_result(outcome)
     }
+    fn missing_demands(&self, repo: &Repository, oids: &[Oid]) -> Result<Vec<Oid>> {
+        let odb = repo.odb()?;
+        let mut unique = HashSet::new();
+        let mut missing = Vec::new();
+        for oid in oids {
+            if unique.insert(*oid)
+                && !self.has_received_blob(*oid)
+                && self.raw_blobs.get(*oid)?.is_none()
+                && !odb.exists(*oid)
+            {
+                missing.push(*oid);
+            }
+        }
+        Ok(missing)
+    }
+    pub(crate) fn uses_http(&self) -> bool {
+        let url = self.demand_url.as_bytes();
+        url.starts_with(b"https://") || url.starts_with(b"http://")
+    }
+    pub(crate) fn can_combine_demand(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(crate::transport::Session::stateless)
+            && self.failure().is_none()
+            && matches!(crate::spool::Files::size_limit(), Ok(None))
+    }
+    pub(crate) fn combine_demand(&mut self, repo: &Repository, oids: &[Oid]) {
+        if !self.can_combine_demand() {
+            return;
+        }
+        let outcome = (|| {
+            let missing = self.missing_demands(repo, oids)?;
+            if missing.len() > 1 {
+                self.fetch_in_session(repo, &missing)?;
+            }
+            Ok(())
+        })();
+        // All included objects are already demanded. Record transport errors
+        // exactly as for a single request, without re-requesting a failed pack.
+        let _ = self.record_result(outcome);
+    }
     fn record_result<T>(&mut self, outcome: Result<T>) -> Result<T> {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
@@ -593,7 +623,7 @@ impl Remote {
         if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
         }
-        if !self.materializing && oids.len() == 1 && self.fetch_in_session(repo, oids[0])? {
+        if !self.materializing && oids.len() == 1 && self.fetch_in_session(repo, oids)? {
             return Ok(());
         }
         let mut command = self.command(false)?;
@@ -661,12 +691,12 @@ impl Remote {
         self.fetch_operations += 1;
         Ok(())
     }
-    fn start_session(&mut self) -> Result<Option<crate::transport::Session>> {
-        if !self.git.demand_session_compatible() || self.demand_url.as_bytes().starts_with(b"-") {
+    fn start_session(&mut self, http: bool) -> Result<Option<crate::transport::Session>> {
+        if self.demand_url.as_bytes().starts_with(b"-") || !self.git.demand_session_compatible()? {
             return Ok(None);
         }
         let url = self.demand_url.as_bytes();
-        if url.starts_with(b"https://") || url.starts_with(b"http://") {
+        if http {
             let mut command = self.command(false)?;
             command
                 .args(["-c", "protocol.version=2"])
@@ -781,9 +811,18 @@ impl Remote {
         self.session_starts += 1;
         crate::transport::Session::connect(command, false)
     }
-    fn fetch_in_session(&mut self, repo: &Repository, oid: Oid) -> Result<bool> {
+    fn fetch_in_session(&mut self, repo: &Repository, oids: &[Oid]) -> Result<bool> {
         if !self.session_checked {
-            self.session = self.start_session()?;
+            let http = self.uses_http();
+            let terminal = crate::git::controlling_terminal().is_some();
+            if terminal && http && crate::terminal_ui::preparing() {
+                // Preparation owns interactive authentication. Leave the
+                // session decision open until the command is running.
+                return Ok(false);
+            }
+            if http || !terminal {
+                self.session = self.start_session(http)?;
+            }
             self.session_checked = true;
         }
         let Some(session) = self.session.as_mut() else {
@@ -802,12 +841,17 @@ impl Remote {
             );
         }
         let pack = self.raw_blobs.scratch_file()?;
-        if let Err(error) = session.fetch(oid, &pack) {
+        if let Err(error) = session.fetch(oids, &pack) {
             let diagnostic = session.error_text();
             self.session = None;
             return Err(error).with_context(|| {
+                let wanted = if let [oid] = oids {
+                    format!("object {oid}")
+                } else {
+                    format!("objects ({} requests, first {})", oids.len(), oids[0])
+                };
                 format!(
-                    "remote fetch of exact object {oid} failed: {}",
+                    "remote fetch of exact {wanted} failed: {}",
                     diagnostic.trim()
                 )
             });
@@ -815,59 +859,63 @@ impl Remote {
         self.session_fetch_operations += 1;
         self.session_received_pack_bytes =
             self.session_received_pack_bytes.saturating_add(pack.len()?);
-        let complex =
-            if let Some((reader, size, kind)) = crate::transport::ObjectReader::single(&pack)? {
-                self.publish_received(repo, oid, kind, size, reader)?;
+        let single = match oids {
+            [oid] => crate::transport::ObjectReader::single(&pack)?.map(|object| (oid, object)),
+            _ => None,
+        };
+        match single {
+            Some((oid, (reader, size, kind))) => {
+                self.publish_received(repo, *oid, kind, size, reader)?;
                 self.session_decode_operations += 1;
-                false
-            } else {
-                true
-            };
-        if complex {
-            // The generic path handles necessary deltas and multi-object packs
-            // through the existing decoder; never repeat the network request.
-            let target = Repository::open_bare(&self.dir)?;
-            let odb = target.odb()?;
-            let mut transfer_failure = None;
-            let mut writer = odb.packwriter()?;
-            writer.progress(|_| match crate::object::check_transfer() {
-                Ok(()) => true,
-                Err(error) => {
-                    transfer_failure = Some(error);
-                    false
-                }
-            });
-            let indexed = (|| -> Result<()> {
-                let mut offset = 0;
-                let mut bytes = [0; 65536];
-                let size = pack.len()?;
-                while offset < size {
-                    crate::object::check_transfer()?;
-                    let count = (size - offset).min(bytes.len() as u64) as usize;
-                    pack.read_exact_at(&mut bytes[..count], offset)?;
-                    writer.write_all(&bytes[..count])?;
-                    offset += count as u64;
-                }
-                writer.commit()?;
-                Ok(())
-            })();
-            drop(writer);
-            drop(odb);
-            drop(target);
-            if let Some(error) = transfer_failure {
-                return Err(error);
             }
-            indexed?;
-            // Native storage now owns the compressed bytes. Release the wire
-            // staging before allocating any decoded payload.
-            drop(pack);
-            self.import_received(false, &[oid])?;
+            None => {
+                // The generic path handles necessary deltas and multi-object packs
+                // through the existing decoder; never repeat the network request.
+                let target = Repository::open_bare(&self.dir)?;
+                let odb = target.odb()?;
+                let mut transfer_failure = None;
+                let mut writer = odb.packwriter()?;
+                writer.progress(|_| match crate::object::check_transfer() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        transfer_failure = Some(error);
+                        false
+                    }
+                });
+                let indexed = (|| -> Result<()> {
+                    let mut offset = 0;
+                    let mut bytes = [0; 65536];
+                    let size = pack.len()?;
+                    while offset < size {
+                        crate::object::check_transfer()?;
+                        let count = (size - offset).min(bytes.len() as u64) as usize;
+                        pack.read_exact_at(&mut bytes[..count], offset)?;
+                        writer.write_all(&bytes[..count])?;
+                        offset += count as u64;
+                    }
+                    writer.commit()?;
+                    Ok(())
+                })();
+                drop(writer);
+                drop(odb);
+                drop(target);
+                if let Some(error) = transfer_failure {
+                    return Err(error);
+                }
+                indexed?;
+                // Native storage now owns the compressed bytes. Release the wire
+                // staging before allocating any decoded payload.
+                drop(pack);
+                self.import_received(false, oids)?;
+            }
         }
-        anyhow::ensure!(
-            self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
-            "remote did not supply requested object {oid}"
-        );
-        self.completed_fetches += 1;
+        for &oid in oids {
+            anyhow::ensure!(
+                self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
+                "remote did not supply requested object {oid}"
+            );
+        }
+        self.completed_fetches += oids.len() as u64;
         Ok(true)
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack

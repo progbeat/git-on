@@ -803,6 +803,30 @@ impl Snapshot {
             .ok()
             .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
+    pub(crate) fn remote_http(&self) -> bool {
+        self.state().is_ok_and(|state| {
+            state
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.uses_http())
+        })
+    }
+    pub(crate) fn can_combine_remote_demand(&self) -> bool {
+        self.state().is_ok_and(|state| {
+            state
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.can_combine_demand())
+        })
+    }
+    pub(crate) fn combine_remote_demand(&self, oids: &[Oid]) {
+        if let Ok(mut state) = self.state() {
+            let State { repo, remote, .. } = &mut *state;
+            if let Some(remote) = remote {
+                remote.combine_demand(repo, oids);
+            }
+        }
+    }
     fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
         let kind = match mode {
             0o040000 => EntryKind::Directory,
