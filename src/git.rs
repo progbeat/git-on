@@ -282,7 +282,14 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
 /// blocking pipe reads. Temporary capture files have no application quota.
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
     let managed = crate::terminal_ui::owns_terminal();
-    let mut output = run_captured(command, capture || managed, capture || managed, None, None)?;
+    let mut output = run_captured(
+        command,
+        capture || managed,
+        capture || managed,
+        None,
+        None,
+        false,
+    )?;
     if managed && !capture {
         use std::io::Write;
         let _drawing = crate::terminal_ui::native_terminal_lease(true);
@@ -293,12 +300,16 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
     }
     Ok(output)
 }
-pub(crate) fn run_with_input(
+pub(crate) fn run_fetch(
     command: Command,
-    capture: bool,
-    mut input: impl std::io::Read,
+    input: Option<&mut dyn std::io::Read>,
 ) -> Result<std::process::Output> {
-    run_captured(command, capture, capture, None, Some(&mut input))
+    let progress = crate::terminal_ui::progress_enabled();
+    let mut output = run_captured(command, true, true, None, input, true)?;
+    if progress {
+        output.stderr = crate::terminal_ui::progress_diagnostics(&output.stderr);
+    }
+    Ok(output)
 }
 /// Stream native stdout to its consumer while the caller retains process,
 /// cancellation and terminal supervision. The consumer must read to EOF or fail;
@@ -331,7 +342,7 @@ pub(crate) fn run_with_output<T: Send>(
                 failed.store(result.is_err(), Ordering::Release);
                 result
             })?;
-        let result = run_captured(command, false, true, Some(&failed), input);
+        let result = run_captured(command, false, true, Some(&failed), input, false);
         finished.store(true, Ordering::Release);
         let value = transfer
             .join()
@@ -408,6 +419,7 @@ fn run_captured(
     capture_stderr: bool,
     failed_output: Option<&std::sync::atomic::AtomicBool>,
     input: Option<&mut dyn std::io::Read>,
+    progress: bool,
 ) -> Result<std::process::Output> {
     use std::{
         io::{Read, Seek},
@@ -428,6 +440,8 @@ fn run_captured(
         .transpose()?;
     let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
     let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
+    let mut progress = (progress && crate::terminal_ui::progress_enabled())
+        .then(crate::terminal_ui::NativeProgress::new);
     if let Some(stdout) = &stdout {
         command.stdout(stdout.try_clone()?);
     }
@@ -472,6 +486,9 @@ fn run_captured(
     let _operation = crate::terminal_ui::NativeOperation::new(child.id());
     let wakeup = ChildExitWakeup::new(child.id());
     let outcome = loop {
+        if let (Some(progress), Some(stderr)) = (&mut progress, &stderr) {
+            progress.poll(stderr);
+        }
         match crate::terminal_ui::try_wait(&mut child) {
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.into()),
@@ -517,6 +534,7 @@ fn run_captured(
             input.as_ref().map(|input| input.pipe.as_raw_fd()),
         );
     };
+    drop(progress);
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
         if unsafe { libc::tcgetpgrp(fd) } == child.id() as libc::pid_t {

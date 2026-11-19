@@ -168,6 +168,12 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset, not protected FUSE policies.
 The lazy startup/performance requirements below apply to the FUSE backend.
 
+Remote materialization obtains the selected revision in one shallow transfer
+when host per-file limits permit it. It must not pay a separate network round
+trip for each directory. Compressed objects are decoded into their final paths;
+already prepared contents are reused for repeated OIDs. Finite per-file limits
+retain bounded transfers rather than creating a pack that exceeds that limit.
+
 ## FUSE operation coverage requirement
 
 Every callback in the locked `fuser::Filesystem` trait must have an explicit,
@@ -331,10 +337,9 @@ be reported as full million-file reads.
 Every behavior defect found during review must gain a focused regression test
 that reproduces the defect before its fix and passes afterward. Preserve the
 trigger and assert the corrected observable result, including failed-operation
-postconditions. Record the old revision, reproducer and corrected evidence in
-[review regressions](review-regressions.md). Test and documentation defects need
-an appropriate guard or targeted check too. For nondeterministic races, retain
-the observed failure and explain the controlled regression strategy; never
+postconditions. Test and documentation defects need an appropriate guard or
+targeted check too. For nondeterministic races, retain the observed failure and
+explain the controlled regression strategy; never
 invent a deterministic red result or claim exhaustive interleaving coverage.
 
 A seeded randomized real-FUSE test must exercise bounded sequences of file and

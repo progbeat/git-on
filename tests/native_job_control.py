@@ -228,6 +228,8 @@ class NativeJobControlTests(unittest.TestCase):
     def test_forced_askpass_failure_does_not_fall_back_to_terminal(self):
         import subprocess
         f=self.f;shell=self.shell
+        tools=f.root/'eager-auth-tools';tools.mkdir()
+        for name in ('git','ssh'):(tools/name).symlink_to(shutil.which(name))
         for helper in ('empty','default'):
             with self.subTest(helper=helper):
                 env=dict(f.env,SSH_ASKPASS_REQUIRE='force')
@@ -236,25 +238,28 @@ class NativeJobControlTests(unittest.TestCase):
                 native=subprocess.run(['git','ls-remote',self.url,'HEAD'],env=env,
                                       capture_output=True,timeout=15)
                 self.assertNotEqual(native.returncode,0,native.stdout)
-                runner_file=f.root/f'forced-askpass-{helper}'
-                argv=[shutil.which('env'),'-u','SSH_ASKPASS','SSH_ASKPASS_REQUIRE=force']
-                if helper=='empty':argv.append('SSH_ASKPASS=')
-                argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"',
-                             'fixture',str(runner_file),str(remote.OPTIONS.binary),self.url,
-                             'HEAD','--verify','--','/bin/true'])
-                shell.send((shlex.join(argv)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
-                shell.wait_for(runner_file.exists,'runner did not start')
-                shell.groups.add(int(runner_file.read_text()))
-                try:output=shell.expect(shell.prompt,timeout=8)
-                except AssertionError:
-                    with contextlib.suppress(ProcessLookupError):os.killpg(int(runner_file.read_text()),signal.SIGTERM)
-                    shell.expect(shell.prompt)
+                for backend in (('lazy','materialized') if helper=='empty' else ('lazy',)):
+                    runner_file=f.root/f'forced-askpass-{helper}-{backend}'
+                    argv=[shutil.which('env'),'-u','SSH_ASKPASS','SSH_ASKPASS_REQUIRE=force']
+                    if helper=='empty':argv.append('SSH_ASKPASS=')
+                    if backend=='materialized':argv.append('PATH='+str(tools))
+                    argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"',
+                                 'fixture',str(runner_file),str(remote.OPTIONS.binary),self.url,
+                                 'HEAD','--verify',*(['--write-policy=all'] if backend=='materialized' else []),'--','/bin/true'])
+                    shell.send((shlex.join(argv)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
+                    shell.wait_for(runner_file.exists,'runner did not start')
+                    shell.groups.add(int(runner_file.read_text()))
+                    try:output=shell.expect(shell.prompt,timeout=8)
+                    except AssertionError:
+                        with contextlib.suppress(ProcessLookupError):os.killpg(int(runner_file.read_text()),signal.SIGTERM)
+                        shell.expect(shell.prompt)
+                        shell.groups.clear()
+                        raise
                     shell.groups.clear()
-                    raise
-                shell.groups.clear()
-                self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
-                self.assertNotIn(b"identity': ",output)
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
+                    self.assertNotIn(b"identity': ",output)
+                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    if backend=='materialized':self.assertIn(b'Permission denied',output)
 
 
 class HttpsCredentialTerminalTests(unittest.TestCase):
@@ -315,6 +320,11 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                  str(remote.OPTIONS.binary),url,'HEAD','--write-policy=all','--',
                  sys.executable,'-I','-S','-c',
                  "from pathlib import Path; assert Path('deep/file').read_bytes()==b'expected\\n'; print('https-helper-command-ok')"]
+        # A finite per-file limit retains bounded object transfers, so this
+        # scenario continues to exercise authentication on subsequent fetches.
+        command=[sys.executable,'-c',
+                 'import os,resource,sys; resource.setrlimit(resource.RLIMIT_FSIZE,(1048576,1048576)); os.execv(sys.argv[1],sys.argv[1:])',
+                 *command]
         shell.send((shlex.join(command)+'\n').encode())
         prompts=0; deadline=time.monotonic()+20
         while b'\r\nhttps-helper-command-ok\r\n' not in shell.pending:

@@ -40,9 +40,9 @@ SHA-256 object storage, submodules and Git LFS remain unsupported.
 
 ## Object demand and cache lifetime
 
-Remote execution requires Git 2.45.1+. Fetch the selected object and root tree
-before mounting. Each subsequent missing tree or blob is explicitly fetched by
-OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
+Remote execution requires Git 2.45.1+. For lazy execution, fetch the selected
+object and root tree before mounting. Each subsequent missing tree or blob is
+explicitly fetched by OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
 Git also receives `GIT_NO_LAZY_FETCH=1`. Never request `blob:none`, perform a full
 checkout or recursively walk unvisited trees for readonly operations. Subtree
 selection reads only ancestor trees. The first destructive source operation in
@@ -68,9 +68,17 @@ custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
 retain the native compatibility path. No fetched object is retried merely to
 change decoders, and no unrelated future OID is requested.
 
-Explicit-all eager materialization already needs every entry it prepares. For
-that backend, at most 256 known object IDs from the current directory share one
-native `fetch --stdin` and decoder operation. Each object is checked for existing
+Explicit-all eager materialization needs the entire selected tree. When no
+per-file resource limit is in effect, fetch the selected revision once with
+depth one and without an object filter. Retain the compressed pack and decode
+file contents directly into their destination paths, reusing already prepared
+objects. This does not fetch the repository's complete history. This path does
+not require server-side filtering or a separate capability advertisement.
+
+Under finite per-file limits, materialization retains individual-object
+transfers rather than aggregating otherwise readable objects into an oversized
+pack. At most 256 known object IDs from the current directory share one
+native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
 run-local availability and deduplicated before requesting it; all use `tree:0`.
 The same batching applies to metadata required by the FUSE ownership index;
 readonly FUSE demands remain exact. Neither path requests unknown descendants. The batch
@@ -81,8 +89,9 @@ Session request/decode counts and transport process starts are separate from
 native fetch/cat-file counters. Server-side Git subprocesses remain real work,
 included in waited CPU for local source fixtures.
 
-The server must advertise filtering before any object transfer. Rejection of a
-requested unadvertised OID names the OID and includes Git's server diagnostic.
+For filtered lazy or resource-limited execution, the server must advertise
+filtering before any object transfer. Rejection of a requested unadvertised OID
+names the OID and includes Git's server diagnostic.
 
 Two-operand local-path and `file://` sources use upload-pack and require the same
 capabilities. Ordinary local repositories do not enable them by default. When

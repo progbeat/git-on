@@ -61,6 +61,7 @@ fn load_operands(
         Some(source),
         rev,
         verify,
+        false,
         &run,
         "test",
         |_, _, _| Ok(()),

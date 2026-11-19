@@ -652,6 +652,7 @@ impl Snapshot {
             None,
             treeish,
             false,
+            false,
             &std::env::temp_dir(),
             run_id,
             record,
@@ -663,6 +664,7 @@ impl Snapshot {
         source: Option<&OsStr>,
         treeish: &OsStr,
         verify: bool,
+        materialized: bool,
         run_directory: &Path,
         run_id: &str,
         mut record: F,
@@ -671,8 +673,13 @@ impl Snapshot {
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
         let (repo, mut remote, oid, git, local_bridge) = if let Some(source) = source {
-            let (remote, oid) =
-                crate::remote::Remote::open(repo_path, source, treeish, run_directory)?;
+            let (remote, oid) = crate::remote::Remote::open_for_execution(
+                repo_path,
+                source,
+                treeish,
+                run_directory,
+                materialized,
+            )?;
             (
                 Repository::open_bare(&remote.dir)?,
                 Some(remote),

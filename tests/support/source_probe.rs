@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         (source != "local").then_some(source.as_os_str()),
         revision,
         args.iter().any(|x| x == "--verify"),
+        false,
         run.path(),
         "probe",
         |_, _, _| Ok(()),

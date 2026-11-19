@@ -1,6 +1,6 @@
 [package]
 name = "git-on"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
@@ -22,7 +22,7 @@ anyhow = "1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
-indicatif = { version = "=0.18.3", default-features = false }
+indicatif = "=0.18.3"
 lru = { version = "=0.16.3", default-features = false }
 gix-glob = "0.29"
 gix-quote = "0.6.1"

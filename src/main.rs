@@ -400,7 +400,7 @@ fn execute(
     write_policy: git_on::policy::WritePolicy,
 ) -> Result<ExitStatus> {
     let mut signals = subscribe_signals()?;
-    let mut progress = git_on::terminal_ui::StartupProgress::start(invoked)?;
+    let mut progress = git_on::terminal_ui::StartupProgress::start(invoked, &tree)?;
     if let Some(signal) = git_on::git::cancelled_signal() {
         return Ok(ExitStatus::from_raw(signal));
     }
@@ -434,11 +434,15 @@ fn execute(
         }
         save(&dir, &state)?;
 
+        let unavailable = git_on::platform::fuse_unavailable();
+        let materialized = unavailable.as_ref().is_ok_and(Option::is_some)
+            && write_policy == git_on::policy::WritePolicy::All;
         let snapshot = Snapshot::load_source_with_pin_record(
             &env::current_dir()?,
             source.as_deref(),
             &tree,
             verify,
+            materialized,
             &dir,
             &id,
             |git_dir, pin, oid| {
@@ -453,7 +457,7 @@ fn execute(
         private_dir(&dir.join("mount"))?;
         private_dir(&dir.join("backing"))?;
 
-        let unavailable = git_on::platform::fuse_unavailable()?;
+        let unavailable = unavailable?;
         let mut session = if let Some(reason) = unavailable {
             if write_policy != git_on::policy::WritePolicy::All {
                 bail!("FUSE unavailable: {reason}; policy {write_policy:?} requires FUSE. Only explicit --write-policy=all supports materialization");

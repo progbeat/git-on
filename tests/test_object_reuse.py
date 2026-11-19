@@ -58,7 +58,7 @@ class ObjectReuseTests(unittest.TestCase):
         for backend in ('fuse','materialized'):
             good=object_reuse_row('a'*40,backend);count=good['files']
             validate_runner(good,count,8192,144,backend)
-            for change in ('remote_fetches','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads',
+            for change in ('remote_fetches','remote_fetch_operations','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads',
                            'remote_decode_operations','native','unpack','phase','payload','stat'):
                 broken=copy.deepcopy(good)
                 if change in broken['metrics']:broken['metrics'][change]+=1
