@@ -4,7 +4,7 @@ use crate::{
     object, pack_stream,
     raw_blob::RawBlobs,
     spool::Spool,
-    transport::{Connection, Session},
+    transport::{BranchQuery, Connection, Session},
 };
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -20,17 +20,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CONNECTIONS: usize = 8;
+const CONNECTIONS: usize = 16;
 const INITIAL_CONNECTIONS: usize = 4;
-const MAX_WANTS: usize = 8;
+const MAX_WANTS: usize = 64;
 const READ_AHEAD: usize = 4;
-const MAX_READ_AHEAD: usize = 64;
+const MAX_READ_AHEAD: usize = 256;
+const MAX_UNCONSUMED_PREDICTIONS: usize = 512;
 const MAX_FORECAST_SCORE: u8 = 24;
 const NATIVE_BLOB_STREAM_THRESHOLD: usize = 8 * 1024 * 1024;
 const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
 const BATCH_TARGET: usize = 4;
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
+const DENSE_SCORE: u8 = 4;
+const DENSE_BATCH_TARGET: usize = 24;
+const DENSE_BATCH_WINDOW: Duration = Duration::from_millis(12);
 
 pub(crate) enum Acquired {
     Stored,
@@ -212,12 +216,12 @@ impl Queue {
         if self.predicted.remove(&anchor) {
             self.forecast_score = (self.forecast_score + 1).min(MAX_FORECAST_SCORE);
         } else {
-            self.forecast_score = self.forecast_score.saturating_sub(2);
+            self.forecast_score = self.forecast_score.saturating_sub(1);
         }
         match self.forecast_score {
-            0..=2 => READ_AHEAD,
-            3..=5 => 16,
-            6..=8 => 32,
+            0..=3 => READ_AHEAD,
+            4..=5 => 64,
+            6..=7 => 128,
             _ => MAX_READ_AHEAD,
         }
     }
@@ -239,22 +243,40 @@ impl Queue {
     }
 
     fn batch_wait(&self, now: Instant, transfer_active: bool) -> Option<Duration> {
-        if matches!(self.mode, ConnectionMode::Wide)
-            && self.waiting.len() < BATCH_TARGET
-            && transfer_active
-        {
-            return BATCH_WINDOW
-                .checked_sub(now.duration_since(self.waiting.front()?.queued_at))
-                .filter(|remaining| !remaining.is_zero());
+        if !transfer_active {
+            return None;
         }
-        None
+        let (first, window) = if self.forecast_score >= DENSE_SCORE {
+            if self.waiting.len().max(self.ahead.len()) >= DENSE_BATCH_TARGET {
+                return None;
+            }
+            let first = self
+                .waiting
+                .front()
+                .into_iter()
+                .chain(self.ahead.front())
+                .map(|item| item.queued_at)
+                .min()?;
+            (first, DENSE_BATCH_WINDOW)
+        } else if matches!(self.mode, ConnectionMode::Wide) && self.waiting.len() < BATCH_TARGET {
+            (self.waiting.front()?.queued_at, BATCH_WINDOW)
+        } else {
+            return None;
+        };
+        window
+            .checked_sub(now.duration_since(first))
+            .filter(|remaining| !remaining.is_zero())
     }
 
     fn native_work(&mut self, index: usize) -> Option<Work> {
-        let channels = self
-            .mode
-            .channels()
-            .min(self.native_ceiling.unwrap_or(CONNECTIONS));
+        let channels = if self.forecast_score >= DENSE_SCORE
+            && !matches!(self.mode, ConnectionMode::Standard)
+        {
+            CONNECTIONS
+        } else {
+            self.mode.channels()
+        }
+        .min(self.native_ceiling.unwrap_or(CONNECTIONS));
         if index >= channels || self.busy[..index].contains(&false) {
             return None;
         }
@@ -345,9 +367,10 @@ impl Pool {
 
     pub(crate) fn http2(
         configuration: crate::http2::Configuration,
+        branch: Option<BranchQuery>,
         scratch: &RawBlobs,
         git: &Git,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Option<(Self, Option<Oid>)>> {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
         write.set_nonblocking(true)?;
@@ -360,14 +383,17 @@ impl Pool {
         let worker = thread::Builder::new()
             .name("git-on-http2".into())
             .spawn(move || {
-                let client =
-                    crate::http2::Client::negotiate(configuration, worker_state.stop.clone());
-                let Ok(Some(client)) = client else {
+                let client = crate::http2::Client::negotiate(
+                    configuration,
+                    worker_state.stop.clone(),
+                    branch.as_ref(),
+                );
+                let Ok(Some((client, selected))) = client else {
                     // Discovery sends no wants, so using native Git is safe here.
-                    let _ = ready.send(false);
+                    let _ = ready.send(None);
                     return Ok(());
                 };
-                if ready.send(true).is_ok() {
+                if ready.send(Some(selected)).is_ok() {
                     worker_state.run_http2(client, read, &worker_scratch, &worker_git);
                 }
                 Ok(())
@@ -383,7 +409,7 @@ impl Pool {
             .recv()
             .context("Git HTTP/2 dispatcher stopped during discovery")?;
         object::check_transfer()?;
-        Ok(ready.then_some(pool))
+        Ok(ready.map(|selected| (pool, selected)))
     }
 
     fn wake(&self) {
@@ -431,7 +457,12 @@ impl Pool {
         Ok(demand)
     }
 
-    pub(crate) fn prefetch(&self, anchor: Oid, candidates: impl IntoIterator<Item = Oid>) {
+    pub(crate) fn prefetch<I: Iterator<Item = Oid>>(
+        &self,
+        anchor: Oid,
+        candidates: impl FnOnce(bool) -> I,
+        mut in_git: impl FnMut(Oid) -> bool,
+    ) {
         let mut queue = self.shared.queue.lock().unwrap();
         if self.shared.stop.load(Ordering::Relaxed)
             || queue.failure.is_some()
@@ -442,15 +473,20 @@ impl Pool {
         // Only the first real access to a predicted OID earns credit.
         // Keep a bounded distance ahead of those observed accesses.
         let width = queue.forecast_width(anchor);
-        let limit = width.min((4 * width).saturating_sub(queue.predicted.len()));
+        let limit = width.min(
+            (4 * width)
+                .min(MAX_UNCONSUMED_PREDICTIONS)
+                .saturating_sub(queue.predicted.len()),
+        );
         if limit == 0 {
             return;
         }
         let mut accepted = 0;
-        for oid in candidates {
+        for oid in candidates(queue.forecast_score >= DENSE_SCORE) {
             if queue.pending.contains_key(&oid)
                 || queue.predicted.contains(&oid)
                 || self.scratch.available(oid)
+                || in_git(oid)
             {
                 continue;
             }
@@ -958,18 +994,18 @@ mod tests {
     #[test]
     fn forecast_grows_with_distinct_hits_and_shrinks_on_misses() {
         let mut queue = Queue::default();
-        for index in 0..9 {
+        for index in 0..8 {
             let oid = Oid::from_bytes(&[index; 20]).unwrap();
             queue.predicted.insert(oid);
             let expected = match index {
-                0..=1 => 4,
-                2..=4 => 16,
-                5..=7 => 32,
-                _ => 64,
+                0..=2 => 4,
+                3..=4 => 64,
+                5..=6 => 128,
+                _ => 256,
             };
             assert_eq!(queue.forecast_width(oid), expected);
         }
-        for width in [32, 16, 16, 4] {
+        for width in [128, 128, 64, 64, 4] {
             assert_eq!(queue.forecast_width(Oid::zero()), width);
         }
     }

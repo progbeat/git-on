@@ -844,10 +844,10 @@ impl Snapshot {
                 .is_some_and(|remote| remote.reusable_transport())
         })
     }
-    pub(crate) fn start_remote_demand(
+    pub(crate) fn start_remote_demand<I: Iterator<Item = Oid>>(
         &self,
         oid: Oid,
-        candidates: Option<impl Iterator<Item = Oid>>,
+        candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Option<PendingObject> {
         let mut state = self.state().ok()?;
         if state.headers.contains_key(&oid) {

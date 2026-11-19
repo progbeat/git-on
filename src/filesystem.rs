@@ -9,7 +9,7 @@ use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, Entry, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-const PREFETCH_SCAN_LIMIT: usize = 256;
+const PREFETCH_SCAN_LIMIT: usize = 512;
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
@@ -63,6 +63,7 @@ struct SourceDirectory {
     base: u64,
     opened: bool,
     considered: BTreeMap<usize, usize>,
+    dense_offset: usize,
 }
 
 impl SourceDirectory {
@@ -96,14 +97,48 @@ struct DfsFrame {
 struct OpenedFiles<'a> {
     directories: &'a mut [SourceDirectory],
     keys: &'a HashMap<PathBuf, usize>,
+    frontier: &'a mut VecDeque<usize>,
     stack: Vec<DfsFrame>,
     remaining: usize,
+    dense: bool,
+    anchor: Option<usize>,
+}
+
+impl OpenedFiles<'_> {
+    fn prioritize(mut self, dense: bool) -> Self {
+        self.dense = dense;
+        self
+    }
+
+    fn next_dense(&mut self) -> Option<Oid> {
+        while self.remaining != 0 {
+            let key = self.anchor.or_else(|| self.frontier.back().copied())?;
+            let directory = &mut self.directories[key];
+            let index = directory.next_candidate(directory.dense_offset);
+            let Some((mode, oid)) = directory.tree.metadata_at(index) else {
+                if self.anchor.take().is_none() {
+                    self.frontier.pop_back();
+                }
+                continue;
+            };
+            self.remaining -= 1;
+            directory.dense_offset = index + 1;
+            if matches!(mode, 0o100644 | 0o100755) {
+                directory.consider(index);
+                return Some(oid);
+            }
+        }
+        None
+    }
 }
 
 impl Iterator for OpenedFiles<'_> {
     type Item = Oid;
 
     fn next(&mut self) -> Option<Oid> {
+        if self.dense {
+            return self.next_dense();
+        }
         while self.remaining != 0 {
             let frame = self.stack.last_mut()?;
             let directory = &mut self.directories[frame.key];
@@ -198,6 +233,7 @@ pub struct Overlay {
     dirty_directories: HashSet<u64>,
     source_directories: Vec<SourceDirectory>,
     source_directory_keys: HashMap<PathBuf, usize>,
+    prefetch_frontier: VecDeque<usize>,
     #[cfg(test)]
     directory_prepared_rows: usize,
     next_ino: u64,
@@ -309,6 +345,7 @@ impl Overlay {
             dirty_directories: HashSet::new(),
             source_directories: Vec::new(),
             source_directory_keys: HashMap::new(),
+            prefetch_frontier: VecDeque::new(),
             #[cfg(test)]
             directory_prepared_rows: 0,
             next_ino: 2,
@@ -547,6 +584,7 @@ impl Overlay {
             base,
             opened: false,
             considered: BTreeMap::new(),
+            dense_offset: 0,
         });
         self.source_directory_keys.insert(source, key);
         Ok(key)
@@ -635,7 +673,11 @@ impl Overlay {
             .map(|source| self.source_directory(&source))
             .transpose()?;
         if let Some(key) = source {
-            self.source_directories[key].opened = true;
+            let directory = &mut self.source_directories[key];
+            if !directory.opened {
+                directory.opened = true;
+                self.prefetch_frontier.push_back(key);
+            }
         }
         let mut rows = None;
         let entries = if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
@@ -1648,7 +1690,7 @@ impl Overlay {
     ) -> Option<crate::snapshot::PendingObject> {
         let snapshot = self._snapshot.clone();
         let files = inode.and_then(|ino| self.opened_files_after(ino));
-        snapshot.start_remote_demand(oid, files)
+        snapshot.start_remote_demand(oid, files.map(|files| move |dense| files.prioritize(dense)))
     }
 
     fn opened_files_after(&mut self, ino: u64) -> Option<OpenedFiles<'_>> {
@@ -1678,8 +1720,11 @@ impl Overlay {
         Some(OpenedFiles {
             directories: &mut self.source_directories,
             keys: &self.source_directory_keys,
+            frontier: &mut self.prefetch_frontier,
             stack,
             remaining: PREFETCH_SCAN_LIMIT,
+            dense: false,
+            anchor: Some(parent_key),
         })
     }
 
@@ -2281,6 +2326,43 @@ mod tests {
         overlay.open_directory(1, libc::O_RDONLY).unwrap();
         let anchor = overlay.ensure(Path::new("a")).unwrap();
         assert_eq!(overlay.opened_files_after(anchor).unwrap().next(), None);
+    }
+
+    #[test]
+    fn dense_forecast_consumes_only_opened_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        let mut blobs = Vec::new();
+        for name in ["current", "recent", "unopened"] {
+            let blob = repo.blob(name.as_bytes()).unwrap();
+            blobs.push(blob);
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("file", blob, 0o100644).unwrap();
+            root.insert(name, tree.write().unwrap(), 0o040000).unwrap();
+        }
+        let root = root.write().unwrap();
+        let snapshot = Snapshot::load(repo.path(), OsStr::new(&root.to_string()), "dense").unwrap();
+        let mut overlay = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        for name in ["current", "recent"] {
+            let inode = overlay.ensure(Path::new(name)).unwrap();
+            overlay.open_directory(inode, libc::O_RDONLY).unwrap();
+        }
+        // A lookup can already have decoded the tree of an unopened directory.
+        overlay.ensure(Path::new("unopened/file")).unwrap();
+        let anchor = overlay.ensure(Path::new("current/file")).unwrap();
+        let forecast = |overlay: &mut Overlay| {
+            overlay
+                .opened_files_after(anchor)
+                .unwrap()
+                .prioritize(true)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(forecast(&mut overlay), blobs[..2]);
+        assert!(forecast(&mut overlay).is_empty());
+        let third = overlay.ensure(Path::new("unopened")).unwrap();
+        overlay.open_directory(third, libc::O_RDONLY).unwrap();
+        assert_eq!(forecast(&mut overlay), blobs[2..]);
     }
 
     fn fixture() -> (TempDir, Overlay) {

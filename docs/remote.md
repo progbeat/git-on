@@ -53,14 +53,14 @@ tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
 Where protocol v2 and the caller's policy permit, exact demands reuse
-invocation-owned channels. Native Git still resolves the original repository and
-refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
-SSH path and port bytes; unknown formats retain native fetch. Native Git
-resolves symbolic revisions and refspecs with the caller's credentials,
-proxies and TLS policy. A full SHA-1 object ID can use the reusable HTTPS
-channel for the initial fetch after validating filtering and authentication.
-SSH can fetch that same exact object over a channel on the authenticated master
-and reuse the channel for the root tree and later demands.
+invocation-owned channels. Native Git resolves the original repository.
+Its optional `fetch-pack --diag-url` diagnostics supply decoded file/SSH path
+and port bytes. Unknown formats retain native fetch. A full SHA-1 object ID
+or unambiguous branch can use the reusable HTTPS channel for the initial fetch
+after validating filtering and authentication. An SSH identity that
+authenticates without a prompt can select the branch or exact object ID and
+fetch the root tree over one owned channel. Other refspecs use native Git's
+selection with the caller's credentials, proxies and TLS policy.
 Interactive preparation uses native fetch with job-control supervision. Git-on
 owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
 request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
@@ -81,26 +81,29 @@ an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
 It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
 the peer govern the active streams. After eight consistently slow replies,
 the loader can briefly wait for overlapping demands to share a fetch.
-Each fetch can group up to eight already pending OIDs.
+Each foreground fetch can group up to 64 already pending OIDs.
 Explicit Git HTTP configuration, authentication outside the supported exchange,
 and servers without HTTP/2 or filtered protocol v2 use the native helper.
 Transport selection completes before any object demand is sent.
 
 Native helpers start with four available channels. If each of the first eight
-successful pack transfers takes at least 64 milliseconds, eight channels become
-available for the rest of the invocation. SSH opens its channels through the
-same owned master and uses fewer when the server refuses an additional channel.
-An idle pool starts an ordinary request immediately. On a slow source the queue
-can wait up to two milliseconds to combine overlapping demands.
+successful transfers takes at least 64 milliseconds, the pool can use up to
+16 channels. It can expand earlier if a scan confirms its forecasts while the
+connection is still being measured. SSH opens its channels through the same
+owned master and uses fewer when the server refuses an additional channel.
+An idle pool starts an ordinary request immediately. While a transfer is active,
+the queue can wait up to two milliseconds on a slow source. A dense scan can
+wait up to twelve milliseconds to combine overlapping requests.
 
 A first access to a regular file in a directory opened for enumeration finds
 uncached and previously unscheduled blob OIDs in Git's depth-first order
 through already opened directories. It skips previously considered ranges
-and examines at most 256 remaining entries. The same planner serves FUSE and
+and examines at most 512 remaining entries. The same planner serves FUSE and
 NFS. Speculative packs start with up to four OIDs. Confirmed first accesses to
-predicted objects can expand this to 16, 32 or 64, with a bound on the number
-of predictions awaiting an actual access. Ordinary demands take precedence and
-can join an active speculative request without duplicating its fetch. If that
+predicted objects can expand this to 64, 128 or 256. During a dense scan
+the planner groups remaining OIDs from the current and recently opened
+directories. At most 512 predictions await an actual access. Ordinary demands
+take precedence and can join an active speculative request without duplicating its fetch. If that
 speculation fails, only waiting ordinary demands reenter the request queue.
 These paths require a reusable transport and an unrestricted per-file size
 limit.

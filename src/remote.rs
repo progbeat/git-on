@@ -275,10 +275,8 @@ impl Remote {
             let oid = remote.fetch_selected(revision, true, false)?;
             return Ok((remote, oid));
         }
-        // An unabbreviated object ID needs no ref advertisement to select its
-        // value. Reuse the capability-checked channel for mounting and later
-        // demands. Named revisions still go through native Git selection.
-        let exact = (crate::spool::Files::size_limit()?.is_none()
+        let unrestricted = crate::spool::Files::size_limit()?.is_none();
+        let exact = (unrestricted
             && revision.as_bytes().len() == 40
             && revision.as_bytes().iter().all(u8::is_ascii_hexdigit))
         .then(|| {
@@ -287,12 +285,21 @@ impl Remote {
                 .and_then(|value| Oid::from_str(value).ok())
         })
         .flatten();
-        if let Some(oid) = exact {
-            if remote.open_http2_pool()? {
+        // Select an exact ID or unambiguous branch on the same channel used
+        // for mounting and later demands. Other refspecs use native Git.
+        let branch = (unrestricted && exact.is_none())
+            .then(|| crate::transport::BranchQuery::new(revision))
+            .flatten();
+        if exact.is_some() || branch.is_some() {
+            let selected = remote.open_http2_pool(branch.clone())?.or(exact);
+            if let Some(oid) = selected.filter(|_| remote.demand_pool.is_some()) {
                 remote.http2_checked = true;
                 remote.pool_checked = true;
                 let repo = Repository::open_bare(&remote.dir)?;
                 remote.fetch(&repo, &[oid])?;
+                return Ok((remote, oid));
+            }
+            if let Some(oid) = remote.select_ssh(exact, branch.as_ref())? {
                 return Ok((remote, oid));
             }
         }
@@ -624,11 +631,11 @@ impl Remote {
         self.uses_http() || self.socket.is_some()
     }
 
-    pub(crate) fn start_demand(
+    pub(crate) fn start_demand<I: Iterator<Item = Oid>>(
         &mut self,
         repo: &Repository,
         oid: Oid,
-        candidates: Option<impl Iterator<Item = Oid>>,
+        candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Result<Option<crate::demand::Demand>> {
         let outcome = (|| {
             if !self.reusable_transport()
@@ -648,7 +655,7 @@ impl Remote {
             };
             let demand = wanted.then(|| pool.request(oid)).transpose()?;
             if let Some(candidates) = candidates.filter(|_| self.forecast_seen.insert(oid)) {
-                pool.prefetch(oid, candidates.filter(|oid| !odb.exists(*oid)));
+                pool.prefetch(oid, candidates, |oid| odb.exists(oid));
             }
             Ok(demand)
         })();
@@ -697,30 +704,36 @@ impl Remote {
             return Ok(());
         }
         self.http2_checked = true;
-        self.open_http2_pool()?;
+        self.open_http2_pool(None)?;
         Ok(())
     }
 
-    fn open_http2_pool(&mut self) -> Result<bool> {
+    fn open_http2_pool(
+        &mut self,
+        branch: Option<crate::transport::BranchQuery>,
+    ) -> Result<Option<Oid>> {
         if !self.demand_url.as_bytes().starts_with(b"https://")
             || !self.git.http2_compatible()
             || !self.git.demand_session_compatible()?
         {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(configuration) =
             crate::http2::Configuration::new(&self.demand_url, self.command(false)?)
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        self.demand_pool = crate::demand::Pool::http2(configuration, &self.raw_blobs, &self.git)?;
-        if self.demand_pool.is_some() {
-            if let Some(session) = self.session.take() {
-                session.stop()?;
-            }
-            self.session_starts += 1;
+        let Some((pool, selected)) =
+            crate::demand::Pool::http2(configuration, branch, &self.raw_blobs, &self.git)?
+        else {
+            return Ok(None);
+        };
+        if let Some(session) = self.session.take() {
+            session.stop()?;
         }
-        Ok(self.demand_pool.is_some())
+        self.demand_pool = Some(pool);
+        self.session_starts += 1;
+        Ok(selected)
     }
     pub(crate) fn finish_demand(
         &mut self,
@@ -881,7 +894,7 @@ impl Remote {
         let command = if http {
             Some(self.http_command()?)
         } else {
-            self.non_http_command()?
+            self.non_http_command(false)?
         };
         Ok(command
             .map(|command| crate::transport::Connection::new(command, http, self.ssh_socket())))
@@ -895,7 +908,52 @@ impl Remote {
         connection.connect(None)
     }
 
-    fn non_http_command(&self) -> Result<Option<Command>> {
+    fn select_ssh(
+        &mut self,
+        exact: Option<Oid>,
+        branch: Option<&crate::transport::BranchQuery>,
+    ) -> Result<Option<Oid>> {
+        if self.socket.is_none()
+            || !self.git.transport_policy_is_default("ssh")
+            || !self.git.demand_session_compatible()?
+        {
+            return Ok(None);
+        }
+        let Some(mut command) = self.non_http_command(true)? else {
+            return Ok(None);
+        };
+        // An existing agent or identity can open a direct v2 session. Leave
+        // interactive authentication to native Git's normal preparation path.
+        command.env("SSH_ASKPASS_REQUIRE", "never");
+        let session = crate::transport::Session::connect_with_stop(command, false, None);
+        self.record_socket_owner()?;
+        crate::object::check_transfer()?;
+        let Ok(Some(mut session)) = session else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.socket_owner.is_some(),
+            "OpenSSH did not create the owned control socket"
+        );
+        let oid = match (exact, branch) {
+            (Some(oid), _) => oid,
+            (None, Some(branch)) => match session.select_branch(branch) {
+                Ok(Some(oid)) => oid,
+                _ => {
+                    crate::object::check_transfer()?;
+                    return Ok(None);
+                }
+            },
+            (None, None) => return Ok(None),
+        };
+        self.session = Some(session);
+        self.session_checked = true;
+        self.session_starts += 1;
+        let repo = Repository::open_bare(&self.dir)?;
+        Ok(self.fetch_in_session(&repo, &[oid])?.then_some(oid))
+    }
+
+    fn non_http_command(&self, initial: bool) -> Result<Option<Command>> {
         let url = self.demand_url.as_bytes();
         // Native Git, rather than a second URL grammar, decodes paths, ports,
         // scp-style names and percent escapes. Unknown diagnostics keep fetch.
@@ -945,7 +1003,7 @@ impl Remote {
         else {
             return Ok(None);
         };
-        let native = self.command(false)?;
+        let native = self.command(initial)?;
         let mut command = if protocol == b"file" {
             let mut command = Command::new("git");
             command.arg("upload-pack").arg(OsStr::from_bytes(path));

@@ -165,7 +165,7 @@ assert Path('b/second').read_bytes() == {data[2]!r}
 assert Path('hidden/no').read_bytes() == {data[-1]!r}
 """
                 process = subprocess.Popen(
-                    [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
+                    [OPTIONS.binary, url, commit, mount_flag(), '--write-policy=none', '--',
                      sys.executable, '-I', '-S', '-c', script],
                     cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
@@ -193,6 +193,8 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
                 self.assertTrue(early, f'the first file waited for the rest of its pkt-line: {errors!r}')
                 self.assertEqual(process.returncode, 0, errors)
                 wants = requests()
+                if transport == 'ssh':
+                    self.assertTrue(all(wants), 'exact SSH startup made a separate ref query')
                 self.assertIn({oids[0].encode()}, wants)
                 self.assertEqual(wants.count(split.wants), 1)
                 self.assertIn({hidden.encode()}, wants)

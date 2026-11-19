@@ -174,7 +174,11 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    pub(crate) fn negotiate(config: Configuration, stop: Arc<AtomicBool>) -> Result<Option<Self>> {
+    pub(crate) fn negotiate(
+        config: Configuration,
+        stop: Arc<AtomicBool>,
+        branch: Option<&transport::BranchQuery>,
+    ) -> Result<Option<(Self, Option<git2::Oid>)>> {
         let mut multi = Multi::new();
         multi.pipelining(false, true)?;
         // All submitted requests share the connection. libcurl applies the
@@ -207,7 +211,7 @@ impl Client {
         // upload-pack POSTs. Negotiate that exchange before sending wants.
         let response = client.discovery(
             "git-upload-pack",
-            Some(transport::http_post_probe()?),
+            Some(transport::reference_request(branch)?),
             &mut credential,
         )?;
         if response.response_code()? != 200
@@ -219,8 +223,8 @@ impl Client {
         let Body::Discovery(bytes) = &response.get_ref().body else {
             unreachable!()
         };
-        transport::check_http_post_probe(bytes)?;
-        Ok(Some(client))
+        let selected = transport::read_http_branch(bytes, branch)?;
+        Ok((branch.is_none() || selected.is_some()).then_some((client, selected)))
     }
 
     fn easy(&self, service: &str, body: Body, request: Option<Vec<u8>>) -> Result<Easy2<Response>> {

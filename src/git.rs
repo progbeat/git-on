@@ -165,26 +165,31 @@ impl Git {
     pub(crate) fn http2_compatible(&self) -> bool {
         // Native Git remains responsible for explicit HTTP configuration
         // and transport policy. Apply this before any libcurl discovery.
-        !self.config.iter().any(|(key, _)| {
-            let key = key.as_bytes();
-            key.starts_with(b"http.")
-                || key == b"protocol.allow"
-                || key == b"protocol.https.allow"
-                || key.starts_with(b"remote.")
-                    && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
-        }) && !std::env::vars_os().any(|(key, _)| {
-            let key = key.as_bytes();
-            key.starts_with(b"GIT_HTTP_")
-                || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
-                || matches!(
-                    key,
-                    b"GIT_TRACE_CURL"
-                        | b"GIT_TRACE_PACKET"
-                        | b"GIT_CURL_VERBOSE"
-                        | b"GIT_ALLOW_PROTOCOL"
-                        | b"GIT_PROTOCOL_FROM_USER"
-                )
-        })
+        self.transport_policy_is_default("https")
+            && !self.config.iter().any(|(key, _)| {
+                let key = key.as_bytes();
+                key.starts_with(b"http.")
+                    || key.starts_with(b"remote.")
+                        && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
+            })
+            && !std::env::vars_os().any(|(key, _)| {
+                let key = key.as_bytes();
+                key.starts_with(b"GIT_HTTP_")
+                    || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
+                    || matches!(
+                        key,
+                        b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
+                    )
+            })
+    }
+    pub(crate) fn transport_policy_is_default(&self, protocol: &str) -> bool {
+        let key = format!("protocol.{protocol}.allow");
+        !self
+            .config
+            .iter()
+            .any(|(configured, _)| configured == "protocol.allow" || configured == key.as_str())
+            && std::env::var_os("GIT_ALLOW_PROTOCOL").is_none()
+            && std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none()
     }
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);

@@ -234,7 +234,8 @@ and complete in-memory copies of the selected tree.
    file payloads. On reusable remote transports, the first actual request for
    a regular-file OID in an opened directory can schedule subsequent OIDs in
    depth-first order through already opened directories. The window starts at
-   four objects and expands only as first accesses confirm earlier forecasts.
+   four objects. When first accesses confirm earlier forecasts, the planner
+   can group remaining files from the current and recently opened directories.
    A lookup in an
    unopened directory may load only the necessary blob headers, applicable
    ignore files, and required Git object decoding.

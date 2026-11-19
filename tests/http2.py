@@ -194,7 +194,7 @@ with ThreadPoolExecutor(1) as pool:
             try:
                 process = subprocess.Popen(
                     [OPTIONS.binary, f'https://127.0.0.1:{proxy.server_address[1]}/server.git',
-                     fixture.commit, backend_flag, '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', code],
+                     'main', backend_flag, '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', code],
                     cwd=fixture.cwd, env=env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 fixture.children.append(process)

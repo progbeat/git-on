@@ -1,5 +1,5 @@
-//! Invocation-owned native transports. Git still resolves the source/refspec;
-//! protocol v2 permits successive exact-object requests on an existing channel.
+//! Invocation-owned native transports. Protocol v2 permits branch selection
+//! and successive exact-object requests on the same channel.
 use crate::spool::Spool;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
@@ -303,6 +303,10 @@ impl Session {
         line.pop();
         Ok(line)
     }
+    pub(crate) fn select_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        self.input.write_all(&reference_request(Some(query))?)?;
+        read_selected_branch(&mut self.output, Some(query))
+    }
     pub(crate) fn fetch_stream(
         &mut self,
         oids: &[Oid],
@@ -446,21 +450,106 @@ fn read_v2_capabilities(input: &mut impl Read) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn http_post_probe() -> Result<Vec<u8>> {
+#[derive(Clone)]
+pub(crate) struct BranchQuery {
+    wanted: String,
+    alternatives: Vec<String>,
+}
+
+impl BranchQuery {
+    pub(crate) fn new(revision: &std::ffi::OsStr) -> Option<Self> {
+        let revision = revision.to_str()?;
+        if revision.is_empty()
+            || revision.len() > 1024
+            || revision.starts_with('-')
+            || revision == "HEAD"
+        {
+            return None;
+        }
+        let wanted = if revision.starts_with("refs/heads/") {
+            revision.to_owned()
+        } else {
+            if revision.starts_with("refs/") {
+                return None;
+            }
+            format!("refs/heads/{revision}")
+        };
+        git2::Reference::is_valid_name(&wanted).then(|| {
+            // Match Git's DWIM rules conservatively. Any competing ref leaves
+            // the selection to native Git.
+            let mut alternatives = vec![
+                revision.to_owned(),
+                format!("refs/{revision}"),
+                format!("refs/heads/{revision}"),
+                format!("refs/tags/{revision}"),
+                format!("refs/remotes/{revision}"),
+                format!("refs/remotes/{revision}/HEAD"),
+            ];
+            alternatives.retain(|other| *other != wanted);
+            Self {
+                wanted,
+                alternatives,
+            }
+        })
+    }
+
+    fn prefixes(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.wanted.as_str()).chain(self.alternatives.iter().map(String::as_str))
+    }
+}
+
+pub(crate) fn reference_request(query: Option<&BranchQuery>) -> Result<Vec<u8>> {
     let mut request = Vec::new();
     request_packet(&mut request, b"command=ls-refs\n")?;
     request.extend_from_slice(b"0001");
-    request_packet(&mut request, b"ref-prefix refs/git-on/probe/\n")?;
+    if let Some(query) = query {
+        for prefix in query.prefixes() {
+            request_packet(&mut request, format!("ref-prefix {prefix}\n").as_bytes())?;
+        }
+    } else {
+        request_packet(&mut request, b"ref-prefix refs/git-on/probe/\n")?;
+    }
     request.extend_from_slice(b"0000");
     Ok(request)
 }
 
-pub(crate) fn check_http_post_probe(mut input: &[u8]) -> Result<()> {
+pub(crate) fn read_http_branch(
+    mut input: &[u8],
+    query: Option<&BranchQuery>,
+) -> Result<Option<Oid>> {
+    let selected = read_selected_branch(&mut input, query)?;
+    check_http_end(input)?;
+    Ok(selected)
+}
+
+fn read_selected_branch(input: &mut impl Read, query: Option<&BranchQuery>) -> Result<Option<Oid>> {
+    let mut selected = None;
+    let mut ambiguous = false;
     loop {
-        match read_packet(&mut input)? {
-            Packet::Data(_) => (),
-            Packet::Flush => return check_http_end(input),
-            _ => return Err(invalid("invalid Git HTTP reference response")),
+        match read_packet(input)? {
+            Packet::Data(line) => {
+                if let Some(query) = query {
+                    let mut fields = packet_text(&line).split(|&byte| byte == b' ');
+                    let id = fields.next().unwrap_or_default();
+                    let name = fields.next().unwrap_or_default();
+                    if name == query.wanted.as_bytes() {
+                        ambiguous |= selected.is_some();
+                        ensure!(
+                            id.len() == 40 && id.iter().all(u8::is_ascii_hexdigit),
+                            "invalid Git reference object ID"
+                        );
+                        selected = Some(Oid::from_str(std::str::from_utf8(id)?)?);
+                    } else if query
+                        .alternatives
+                        .iter()
+                        .any(|other| other.as_bytes() == name)
+                    {
+                        ambiguous = true;
+                    }
+                }
+            }
+            Packet::Flush => return Ok(selected.filter(|_| !ambiguous)),
+            _ => return Err(invalid("invalid Git reference response")),
         }
     }
 }
@@ -745,6 +834,32 @@ mod tests {
             output.push(b'\n');
         }
     }
+    #[test]
+    fn branch_selection_ignores_longer_prefixes_and_leaves_ambiguities_to_git() {
+        let query = BranchQuery::new(std::ffi::OsStr::new("release/candidate")).unwrap();
+        let mut response = Vec::new();
+        let selected = Oid::from_bytes(&[3; 20]).unwrap();
+        let other = Oid::from_bytes(&[4; 20]).unwrap();
+        for (oid, name) in [
+            (selected, "refs/heads/release/candidate"),
+            (other, "refs/heads/release/candidate-next"),
+        ] {
+            text_packet(&mut response, format!("{oid} {name}").as_bytes(), true);
+        }
+        assert_eq!(
+            read_http_branch(&[response.as_slice(), b"00000002"].concat(), Some(&query)).unwrap(),
+            Some(selected)
+        );
+        text_packet(
+            &mut response,
+            format!("{other} refs/tags/release/candidate").as_bytes(),
+            true,
+        );
+        response.extend_from_slice(b"0000");
+        let (mut session, _peer) = peer_response(&response);
+        assert_eq!(session.select_branch(&query).unwrap(), None);
+    }
+
     #[test]
     fn text_handshake_accepts_optional_lf() {
         for version_lf in [false, true] {

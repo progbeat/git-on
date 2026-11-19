@@ -11,7 +11,8 @@
   within the existing per-session replay memory limit.
 - Multiplex Git object fetches on one HTTP/2 connection where the HTTPS
   source and caller configuration support it.
-- Reuse authenticated channels during startup for exact remote revisions.
+- Reuse authenticated channels during startup for exact object IDs and
+  unambiguous remote branches.
 - Prefetch upcoming blobs from already opened directories on both transports.
   Grow the fetch batch during scans that consistently use the prefetched blobs.
 - Decode Git packs as they arrive and make verified objects readable before
