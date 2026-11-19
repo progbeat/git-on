@@ -654,7 +654,7 @@ impl<'a> NativeInput<'a> {
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
 struct ChildExitWakeup {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: Option<std::os::fd::OwnedFd>,
 }
 impl ChildExitWakeup {
@@ -667,16 +667,41 @@ impl ChildExitWakeup {
                 fd: (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::FromRawFd;
+
+            // Darwin creates the descriptor close-on-exec. Poll wakes when
+            // the notification arrives; the existing try_wait reaps the child.
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Self { fd: None };
+            }
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+            let exit = libc::kevent {
+                ident: pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let registered =
+                unsafe { libc::kevent(queue, &exit, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            Self {
+                fd: (registered == 0).then_some(fd),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = pid;
             Self {}
         }
     }
     fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let exit = -1;
         if exit >= 0 || input.is_some() {
             let mut descriptors = [
@@ -829,6 +854,28 @@ mod transport_policy_tests {
             assert!(!git.http2_compatible(), "{key}");
         }
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn darwin_child_exit_notifies_the_wait_loop() {
+    use std::os::fd::AsRawFd;
+
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let wakeup = ChildExitWakeup::new(child.id());
+    drop(child.stdin.take());
+    let mut event = libc::pollfd {
+        fd: wakeup.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let notified = event.fd >= 0 && unsafe { libc::poll(&mut event, 1, 5000) } == 1;
+    assert!(child.wait().unwrap().success());
+    assert!(notified && event.revents & libc::POLLIN != 0);
 }
 
 #[cfg(all(test, target_os = "linux"))]
