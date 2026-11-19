@@ -393,17 +393,22 @@ fn read_packet(input: &mut impl Read) -> Result<Packet> {
         length @ 4..=65520 => {
             let mut bytes = vec![0; length - 4];
             input.read_exact(&mut bytes)?;
-            if let Some(error) = bytes.strip_prefix(b"ERR ") {
-                bail!(
-                    "remote exact-object request rejected: {}",
-                    String::from_utf8_lossy(error)
-                );
-            }
+            check_packet_error(&bytes)?;
             Packet::Data(bytes)
         }
         _ => return Err(invalid("invalid demand packet length")),
     })
 }
+pub(crate) fn check_packet_error(bytes: &[u8]) -> Result<()> {
+    if let Some(error) = bytes.strip_prefix(b"ERR ") {
+        bail!(
+            "remote exact-object request rejected: {}",
+            String::from_utf8_lossy(error)
+        );
+    }
+    Ok(())
+}
+
 fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     write!(output, "{:04x}", bytes.len() + 4)?;
     output.extend_from_slice(bytes);

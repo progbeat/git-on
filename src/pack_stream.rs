@@ -123,14 +123,19 @@ impl Response {
                 let (channel, payload) = match self.channel {
                     Some(channel) => (channel, part),
                     None => {
-                        self.channel = Some(part[0]);
-                        (part[0], &part[1..])
+                        let channel = part[0];
+                        self.channel = Some(channel);
+                        // A Git ERR packet is not prefixed with a sideband.
+                        if channel == b'E' {
+                            self.text.push(channel);
+                        }
+                        (channel, &part[1..])
                     }
                 };
                 match channel {
                     1 => self.pack.write(payload)?,
                     2 => (),
-                    3 => self.text.extend_from_slice(payload),
+                    3 | b'E' => self.text.extend_from_slice(payload),
                     _ => bail!("invalid Git pack sideband"),
                 }
             } else {
@@ -144,6 +149,9 @@ impl Response {
     }
 
     fn finish_packet(&mut self) -> Result<()> {
+        if matches!(self.phase, Phase::Section | Phase::Shallow) || self.channel == Some(b'E') {
+            crate::transport::check_packet_error(&self.text)?;
+        }
         match self.phase {
             Phase::Section => match crate::transport::packet_text(&self.text) {
                 b"packfile" => self.phase = Phase::Pack,
@@ -160,6 +168,7 @@ impl Response {
                     String::from_utf8_lossy(&self.text)
                 );
             }
+            Phase::Pack if self.channel == Some(b'E') => bail!("invalid Git pack sideband"),
             _ => (),
         }
         self.text.clear();
@@ -430,4 +439,31 @@ fn entry_header(bytes: &[u8]) -> Result<Option<(Option<ObjectType>, usize, usize
         shift += 7;
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_fetch_keeps_server_rejection_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let reason = "upload-pack denied the requested object";
+        let packet = format!("{:04x}ERR {reason}", 8 + reason.len());
+        for prefix in [b"".as_slice(), b"0011shallow-info\n", b"000dpackfile\n"] {
+            let mut response = Response::new(
+                scratch.clone(),
+                vec![Oid::zero()],
+                Box::new(|_| panic!("a rejected fetch published an object")),
+            );
+            response.write_http(prefix).unwrap();
+            let error = packet
+                .as_bytes()
+                .chunks(2)
+                .find_map(|chunk| response.write_http(chunk).err())
+                .expect("expected upload-pack rejection");
+            assert!(error.to_string().contains(reason), "{error:#}");
+        }
+    }
 }
