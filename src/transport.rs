@@ -3,14 +3,18 @@
 use crate::spool::Spool;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
-use sha1_checked::{Digest, Sha1};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{
+            fs::{FileTypeExt, MetadataExt},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -106,6 +110,69 @@ impl Drop for Owner {
     }
 }
 
+pub(crate) struct SshSocket {
+    pub(crate) path: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl SshSocket {
+    pub(crate) fn check(&self) -> Result<()> {
+        ensure!(
+            fs::symlink_metadata(&self.path).is_ok_and(|metadata| metadata.file_type().is_socket()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode),
+            "owned SSH control connection is unavailable; reconnection is forbidden"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Connection {
+    command: Arc<Command>,
+    helper: bool,
+    ssh: Option<Arc<SshSocket>>,
+}
+
+impl Connection {
+    pub(crate) fn new(command: Command, helper: bool, ssh: Option<SshSocket>) -> Self {
+        Self {
+            command: Arc::new(command),
+            helper,
+            ssh: ssh.map(Arc::new),
+        }
+    }
+
+    pub(crate) fn is_ssh(&self) -> bool {
+        self.ssh.is_some()
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if let Some(socket) = &self.ssh {
+            socket.check()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connect(&self, stop: Stop) -> Result<Option<Session>> {
+        self.check()?;
+        let mut command = Command::new(self.command.get_program());
+        command.args(self.command.get_args());
+        if let Some(directory) = self.command.get_current_dir() {
+            command.current_dir(directory);
+        }
+        for (key, value) in self.command.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        Session::connect_with_stop(command, self.helper, stop)
+    }
+}
+
 pub(crate) struct Session {
     owner: Owner,
     input: Output,
@@ -122,12 +189,13 @@ enum Packet {
 }
 // Git text pkt-lines accept an optional terminal LF. Never apply this to
 // sideband pack payloads, which remain byte-exact binary data.
-fn packet_text(bytes: &[u8]) -> &[u8] {
+pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 impl Session {
     /// A missing protocol/helper capability is an optional optimization miss,
     /// before any fetch. Errors after a fetch request must never retry it.
+    #[cfg(test)]
     pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
         Self::connect_with_stop(command, helper, None)
     }
@@ -224,8 +292,29 @@ impl Session {
         line.pop();
         Ok(line)
     }
+    pub(crate) fn fetch_stream(
+        &mut self,
+        oids: &[Oid],
+        response: crate::pack_stream::Response,
+    ) -> Result<crate::pack_stream::Received> {
+        let result = (|| {
+            self.errors.set_len(0)?;
+            self.errors.rewind()?;
+            self.input.write_all(&exact_request(oids)?)?;
+            let pack = response.read(&mut self.output)?;
+            self.check_helper_end()?;
+            Ok(pack)
+        })();
+        self.with_fetch_context(oids, result)
+    }
+
     pub(crate) fn fetch_exact(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
-        self.fetch(oids, pack).with_context(|| {
+        let result = self.fetch(oids, pack);
+        self.with_fetch_context(oids, result)
+    }
+
+    fn with_fetch_context<T>(&mut self, oids: &[Oid], result: Result<T>) -> Result<T> {
+        result.with_context(|| {
             let diagnostic = self.error_text();
             let wanted = if let [oid] = oids {
                 format!("object {oid}")
@@ -245,6 +334,10 @@ impl Session {
         self.errors.rewind()?;
         self.input.write_all(&exact_request(oids)?)?;
         read_pack(&mut self.output, pack)?;
+        self.check_helper_end()
+    }
+
+    fn check_helper_end(&mut self) -> Result<()> {
         if self.stateless {
             ensure!(
                 read_packet(&mut self.output)? == Packet::End,
@@ -269,22 +362,25 @@ impl Session {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+pub(crate) fn packet_length(header: &[u8; 4]) -> Result<usize> {
+    ensure!(
+        header.iter().all(u8::is_ascii_hexdigit),
+        "invalid demand packet length"
+    );
+    Ok(usize::from_str_radix(std::str::from_utf8(header)?, 16)?)
+}
+
 fn read_packet(input: &mut impl Read) -> Result<Packet> {
     let mut header = [0; 4];
     input
         .read_exact(&mut header)
         .context("read demand packet header")?;
-    ensure!(
-        header.iter().all(u8::is_ascii_hexdigit),
-        "invalid demand packet length"
-    );
-    let length = u16::from_str_radix(std::str::from_utf8(&header)?, 16)?;
-    Ok(match length {
+    Ok(match packet_length(&header)? {
         0 => Packet::Flush,
         1 => Packet::Delimiter,
         2 => Packet::End,
-        4..=65520 => {
-            let mut bytes = vec![0; usize::from(length) - 4];
+        length @ 4..=65520 => {
+            let mut bytes = vec![0; length - 4];
             input.read_exact(&mut bytes)?;
             if let Some(error) = bytes.strip_prefix(b"ERR ") {
                 bail!(
@@ -370,7 +466,7 @@ pub(crate) fn read_http_capabilities(mut input: &[u8]) -> Result<bool> {
 
 pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
     // One small exact-demand request, not one syscall/signal-status read
-    // for every pkt-line header and body. No future objects are prefetched.
+    // for every pkt-line header and body. Every wanted OID is explicit.
     let mut request = Vec::with_capacity(256);
     request_packet(&mut request, b"command=fetch\n")?;
     request.extend_from_slice(b"0001");
@@ -434,48 +530,27 @@ fn check_http_end(input: impl Read) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_http_pack(mut input: impl Read, pack: &Spool) -> Result<()> {
-    read_pack(&mut input, pack)?;
-    check_http_end(input)
-}
-
 // Keep the trailer out of the checksum without retaining the pack in RAM.
 struct PackWriter<'a> {
     output: BufWriter<&'a Spool>,
-    hash: Sha1,
-    tail: Vec<u8>,
+    checksum: crate::pack_stream::Checksum,
 }
 impl<'a> PackWriter<'a> {
     fn new(file: &'a Spool) -> Self {
         Self {
             output: BufWriter::with_capacity(64 * 1024, file),
-            hash: Sha1::new(),
-            tail: Vec::with_capacity(20),
+            checksum: crate::pack_stream::Checksum::default(),
         }
     }
     fn finish(mut self) -> Result<()> {
         self.output.flush()?;
-        ensure!(
-            self.tail.len() == 20 && crate::object::finish_sha1(self.hash)?.as_slice() == self.tail,
-            "received pack checksum mismatch"
-        );
-        Ok(())
+        self.checksum.finish()
     }
 }
 impl Write for PackWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.output.write_all(bytes)?;
-        if bytes.len() >= 20 {
-            self.hash.update(&self.tail);
-            self.hash.update(&bytes[..bytes.len() - 20]);
-            self.tail.clear();
-            self.tail.extend_from_slice(&bytes[bytes.len() - 20..]);
-        } else {
-            let excess = (self.tail.len() + bytes.len()).saturating_sub(20);
-            self.hash.update(&self.tail[..excess]);
-            self.tail.drain(..excess);
-            self.tail.extend_from_slice(bytes);
-        }
+        self.checksum.update(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -599,6 +674,7 @@ impl Read for ObjectReader<'_> {
 mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
+    use sha1_checked::{Digest, Sha1};
     fn pack(payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
         let mut size = payload.len();

@@ -69,6 +69,12 @@ pub(crate) fn check_transfer() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn object_hash(kind: ObjectType, size: usize) -> Sha1 {
+    let mut hash = Sha1::new();
+    hash.update(format!("{} {size}\0", kind.str()).as_bytes());
+    hash
+}
+
 pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {
     let result = hash.try_finalize();
     if result.has_collision() {
@@ -144,11 +150,9 @@ pub(crate) struct VerifiedWriter<W> {
 }
 impl<W: Write> VerifiedWriter<W> {
     pub(crate) fn new(output: W, kind: ObjectType, size: usize, oid: Oid) -> Self {
-        let mut hash = Sha1::new();
-        hash.update(format!("{} {size}\0", kind.str()).as_bytes());
         Self {
             output,
-            hash,
+            hash: object_hash(kind, size),
             remaining: size,
             oid,
         }

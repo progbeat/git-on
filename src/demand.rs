@@ -1,13 +1,16 @@
-//! Bounded HTTPS demand scheduling. Workers receive checked pack bytes and
-//! leave publication to the snapshot's single object-store writer.
-use crate::{object, raw_blob::RawBlobs, spool::Spool, transport::Session};
+//! One request queue for HTTP/2, native HTTPS helpers and owned SSH channels.
+use crate::{
+    object, pack_stream,
+    raw_blob::RawBlobs,
+    spool::Spool,
+    transport::{Connection, Session},
+};
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Read, Write},
     os::unix::net::UnixStream,
-    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
@@ -16,30 +19,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const CONNECTIONS: usize = 8;
+const CONNECTIONS: usize = 8;
 const INITIAL_CONNECTIONS: usize = 4;
-const MAX_OUTSTANDING: usize = 32;
 const MAX_WANTS: usize = 8;
+const READ_AHEAD: usize = 4;
 const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
 const BATCH_TARGET: usize = 4;
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
 
+pub(crate) enum Acquired {
+    Stored,
+    Object(pack_stream::VerifiedObject),
+    Pack(Spool),
+}
+
 pub(crate) struct Batch {
     pub(crate) oids: Vec<Oid>,
-    pack: Mutex<Option<Result<Spool>>>,
+    result: Mutex<Option<Result<Acquired>>>,
 }
 
 impl Batch {
-    fn new(oids: Vec<Oid>, pack: Result<Spool>) -> Arc<Self> {
+    fn new(oids: Vec<Oid>, result: Result<Acquired>) -> Arc<Self> {
         Arc::new(Self {
             oids,
-            pack: Mutex::new(Some(pack)),
+            result: Mutex::new(Some(result)),
         })
     }
 
-    pub(crate) fn take_pack(&self) -> Option<Result<Spool>> {
-        self.pack.lock().unwrap().take()
+    pub(crate) fn take(&self) -> Option<Result<Acquired>> {
+        self.result.lock().unwrap().take()
     }
 }
 
@@ -50,6 +59,9 @@ pub(crate) struct Demand(Arc<Flight>);
 struct Flight {
     state: Mutex<FlightState>,
     ready: Condvar,
+    // This is changed only while the queue is locked. Workers may observe
+    // demand joining a speculative request after it has been submitted.
+    required: AtomicBool,
 }
 
 #[derive(Default)]
@@ -83,9 +95,12 @@ impl Demand {
         state.batch.as_ref().unwrap().clone()
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn ready(&self) -> bool {
         self.0.state.lock().unwrap().batch.is_some()
+    }
+
+    fn required(&self) -> bool {
+        self.0.required.load(Ordering::Relaxed)
     }
 
     #[cfg(target_os = "macos")]
@@ -105,6 +120,25 @@ struct QueuedDemand {
     queued_at: Instant,
 }
 
+struct Work {
+    items: Vec<QueuedDemand>,
+    speculative: bool,
+}
+
+impl Work {
+    fn take(queue: &mut VecDeque<QueuedDemand>, speculative: bool) -> Option<Self> {
+        let count = queue.len().min(MAX_WANTS);
+        (count != 0).then(|| Self {
+            items: queue.drain(..count).collect(),
+            speculative,
+        })
+    }
+
+    fn wants(&self) -> Vec<Oid> {
+        self.items.iter().map(|item| item.oid).collect()
+    }
+}
+
 enum ConnectionMode {
     Probing(u8),
     Standard,
@@ -118,68 +152,144 @@ impl Default for ConnectionMode {
 }
 
 impl ConnectionMode {
-    fn record_reply(&mut self, elapsed: Duration) -> bool {
-        let Self::Probing(samples) = self else {
-            return false;
-        };
-        // A fast reply rules out consistently high startup latency. Later
-        // bursts of slow replies can reflect server load or larger packs.
-        if elapsed < SLOW_REPLY {
-            *self = Self::Standard;
-        } else {
-            *samples += 1;
-            if *samples == REPLY_SAMPLES {
-                *self = Self::Wide;
-            }
+    fn record_reply(&mut self, elapsed: Duration) {
+        if let Self::Probing(samples) = self {
+            *self = if elapsed < SLOW_REPLY {
+                Self::Standard
+            } else if *samples + 1 == REPLY_SAMPLES {
+                Self::Wide
+            } else {
+                Self::Probing(*samples + 1)
+            };
         }
-        !matches!(self, Self::Probing(_))
+    }
+
+    fn channels(&self) -> usize {
+        if matches!(self, Self::Wide) {
+            CONNECTIONS
+        } else {
+            INITIAL_CONNECTIONS
+        }
     }
 }
 
 #[derive(Default)]
 struct Queue {
     waiting: VecDeque<QueuedDemand>,
+    ahead: VecDeque<QueuedDemand>,
     pending: HashMap<Oid, Demand>,
-    outstanding: usize,
+    predicted: HashSet<Oid>,
     busy: [bool; CONNECTIONS],
+    native_ceiling: Option<usize>,
     failure: Option<String>,
     mode: ConnectionMode,
 }
 
 impl Queue {
+    fn insert(&mut self, oid: Oid) -> QueuedDemand {
+        let demand = Demand::default();
+        self.pending.insert(oid, demand.clone());
+        QueuedDemand {
+            oid,
+            demand,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn foreground(&mut self, oid: Oid) -> Demand {
+        if let Some(demand) = self.pending.get(&oid).cloned() {
+            if !demand.0.required.swap(true, Ordering::Relaxed) {
+                if let Some(index) = self.ahead.iter().position(|candidate| candidate.oid == oid) {
+                    self.waiting.push_back(self.ahead.remove(index).unwrap());
+                }
+            }
+            return demand;
+        }
+        let entry = self.insert(oid);
+        entry.demand.0.required.store(true, Ordering::Relaxed);
+        let demand = entry.demand.clone();
+        self.waiting.push_back(entry);
+        demand
+    }
+
     fn batch_wait(&self, now: Instant, transfer_active: bool) -> Option<Duration> {
         if matches!(self.mode, ConnectionMode::Wide)
             && self.waiting.len() < BATCH_TARGET
             && transfer_active
         {
-            BATCH_WINDOW
+            return BATCH_WINDOW
                 .checked_sub(now.duration_since(self.waiting.front()?.queued_at))
-                .filter(|remaining| !remaining.is_zero())
+                .filter(|remaining| !remaining.is_zero());
+        }
+        None
+    }
+
+    fn native_work(&mut self, index: usize) -> Option<Work> {
+        let channels = self
+            .mode
+            .channels()
+            .min(self.native_ceiling.unwrap_or(CONNECTIONS));
+        if index >= channels || self.busy[..index].contains(&false) {
+            return None;
+        }
+        let active = self.busy.iter().filter(|busy| **busy).count();
+        Work::take(&mut self.waiting, false).or_else(|| {
+            (active + 1 < channels)
+                .then(|| Work::take(&mut self.ahead, true))
+                .flatten()
+        })
+    }
+
+    fn retry(&mut self, mut item: QueuedDemand, speculative: bool) {
+        if !speculative || item.demand.required() {
+            item.queued_at = Instant::now();
+            self.waiting.push_back(item);
         } else {
-            None
+            self.pending.remove(&item.oid);
         }
     }
+
+    fn prune_prefetch(&mut self) {
+        if self.native_ceiling == Some(1) {
+            for item in self.ahead.drain(..) {
+                self.pending.remove(&item.oid);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Metrics {
+    pub(crate) oids: u64,
+    pub(crate) packs: u64,
+    pub(crate) bytes: u64,
+    pub(crate) streamed_packs: u64,
+    pub(crate) prefetches: u64,
 }
 
 #[derive(Default)]
 struct Shared {
     queue: Mutex<Queue>,
     work: Condvar,
-    mode_ready: Condvar,
     stop: Arc<AtomicBool>,
     additional_starts: AtomicU64,
     http2_fetches: AtomicU64,
     http2_peak: AtomicU64,
+    oids: AtomicU64,
+    packs: AtomicU64,
+    bytes: AtomicU64,
+    streamed_packs: AtomicU64,
+    prefetches: AtomicU64,
 }
 
 struct Http2Batch {
-    oids: Vec<Oid>,
-    work: Vec<QueuedDemand>,
+    work: Work,
     started: Instant,
 }
 
 pub(crate) struct Pool {
     shared: Arc<Shared>,
+    scratch: RawBlobs,
     workers: Mutex<Vec<JoinHandle<Result<()>>>>,
     wake: Option<UnixStream>,
 }
@@ -187,18 +297,19 @@ pub(crate) struct Pool {
 impl Pool {
     pub(crate) fn new(
         mut first: Session,
-        additional: Vec<Command>,
+        connection: Connection,
         scratch: &RawBlobs,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
+            scratch: scratch.clone(),
             workers: Mutex::default(),
             wake: None,
         };
         first.set_stop(pool.shared.stop.clone());
-        pool.start(0, Some(first), None, scratch)?;
-        for (index, command) in additional.into_iter().enumerate() {
-            pool.start(index + 1, None, Some(command), scratch)?;
+        pool.start(0, Some(first), connection.clone())?;
+        for index in 1..CONNECTIONS {
+            pool.start(index, None, connection.clone())?;
         }
         Ok(pool)
     }
@@ -219,9 +330,8 @@ impl Pool {
             .spawn(move || {
                 let client =
                     crate::http2::Client::negotiate(configuration, worker_state.stop.clone());
-                // No exact want has been sent during discovery. A different
-                // protocol or an unsupported authentication exchange can use Git.
                 let Ok(Some(client)) = client else {
+                    // Discovery sends no wants, so using native Git is safe here.
                     let _ = ready.send(false);
                     return Ok(());
                 };
@@ -232,6 +342,7 @@ impl Pool {
             })?;
         let pool = Self {
             shared,
+            scratch: scratch.clone(),
             workers: Mutex::new(vec![worker]),
             wake: Some(write),
         };
@@ -242,7 +353,8 @@ impl Pool {
         Ok(ready.then_some(pool))
     }
 
-    fn wake_dispatcher(&self) {
+    fn wake(&self) {
+        self.shared.work.notify_all();
         if let Some(mut wake) = self.wake.as_ref() {
             // A full signal socket is already readable.
             let _ = wake.write(&[1]);
@@ -253,14 +365,13 @@ impl Pool {
         &mut self,
         index: usize,
         session: Option<Session>,
-        command: Option<Command>,
-        scratch: &RawBlobs,
+        connection: Connection,
     ) -> Result<()> {
         let shared = self.shared.clone();
-        let scratch = scratch.clone();
+        let scratch = self.scratch.clone();
         let worker = thread::Builder::new()
-            .name(format!("git-on-https-{index}"))
-            .spawn(move || shared.worker(index, session, command, &scratch))?;
+            .name(format!("git-on-native-{index}"))
+            .spawn(move || shared.worker(index, session, connection, &scratch))?;
         self.workers.get_mut().unwrap().push(worker);
         Ok(())
     }
@@ -268,31 +379,50 @@ impl Pool {
     pub(crate) fn request(&self, oid: Oid) -> Result<Demand> {
         object::check_transfer()?;
         let mut queue = self.shared.queue.lock().unwrap();
-        loop {
-            if let Some(demand) = queue.pending.get(&oid) {
-                return Ok(demand.clone());
+        if self.shared.stop.load(Ordering::Relaxed) {
+            return Err(object::OperationCancelled.into());
+        }
+        if let Some(error) = &queue.failure {
+            bail!("remote object transport previously failed: {error}");
+        }
+        // Publication can race a caller's first cache lookup. See the pending
+        // flight or the stored object under the same lock that retires flights.
+        if !queue.pending.contains_key(&oid) && self.scratch.get(oid)?.is_some() {
+            let demand = Demand::default();
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+            return Ok(demand);
+        }
+        let demand = queue.foreground(oid);
+        self.wake();
+        Ok(demand)
+    }
+
+    pub(crate) fn prefetch(&self, candidates: impl IntoIterator<Item = Oid>) {
+        let mut queue = self.shared.queue.lock().unwrap();
+        if self.shared.stop.load(Ordering::Relaxed)
+            || queue.failure.is_some()
+            || queue.native_ceiling == Some(1)
+        {
+            return;
+        }
+        let mut accepted = 0;
+        for oid in candidates {
+            if queue.pending.contains_key(&oid)
+                || queue.predicted.contains(&oid)
+                || !matches!(self.scratch.get(oid), Ok(None))
+            {
+                continue;
             }
-            if self.shared.stop.load(Ordering::Relaxed) {
-                return Err(object::OperationCancelled.into());
+            queue.predicted.insert(oid);
+            let entry = queue.insert(oid);
+            queue.ahead.push_back(entry);
+            accepted += 1;
+            if accepted == READ_AHEAD {
+                break;
             }
-            if let Some(error) = &queue.failure {
-                bail!("remote object transport previously failed: {error}");
-            }
-            if self.wake.is_some() || queue.outstanding < MAX_OUTSTANDING {
-                let demand = Demand::default();
-                queue.pending.insert(oid, demand.clone());
-                queue.waiting.push_back(QueuedDemand {
-                    oid,
-                    demand: demand.clone(),
-                    queued_at: Instant::now(),
-                });
-                queue.outstanding += 1;
-                self.shared.work.notify_all();
-                self.wake_dispatcher();
-                return Ok(demand);
-            }
-            queue = self.shared.work.wait(queue).unwrap();
-            object::check_transfer()?;
+        }
+        if accepted != 0 {
+            self.wake();
         }
     }
 
@@ -311,6 +441,17 @@ impl Pool {
         self.shared.additional_starts.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn metrics(&self) -> Metrics {
+        let s = &self.shared;
+        Metrics {
+            oids: s.oids.load(Ordering::Relaxed),
+            packs: s.packs.load(Ordering::Relaxed),
+            bytes: s.bytes.load(Ordering::Relaxed),
+            streamed_packs: s.streamed_packs.load(Ordering::Relaxed),
+            prefetches: s.prefetches.load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn http2_metrics(&self) -> (u64, u64) {
         (
             self.shared.http2_fetches.load(Ordering::Relaxed),
@@ -323,13 +464,13 @@ impl Pool {
             let mut queue = self.shared.queue.lock().unwrap();
             self.shared.stop.store(true, Ordering::Relaxed);
             std::mem::take(&mut queue.waiting)
+                .into_iter()
+                .chain(std::mem::take(&mut queue.ahead))
         };
-        self.shared.work.notify_all();
-        self.shared.mode_ready.notify_all();
-        self.wake_dispatcher();
-        for QueuedDemand { oid, demand, .. } in waiting {
-            demand.complete(Batch::new(
-                vec![oid],
+        self.wake();
+        for item in waiting {
+            item.demand.complete(Batch::new(
+                vec![item.oid],
                 Err(object::OperationCancelled.into()),
             ));
         }
@@ -337,7 +478,7 @@ impl Pool {
         for worker in self.workers.lock().unwrap().drain(..) {
             let result = worker
                 .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("HTTPS worker panicked")));
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Git transport worker panicked")));
             if outcome.is_ok() {
                 outcome = result;
             }
@@ -353,22 +494,158 @@ impl Drop for Pool {
 }
 
 impl Shared {
-    fn run_http2(
+    fn response(
+        self: &Arc<Self>,
+        work: &Work,
+        oids: &[Oid],
+        scratch: &RawBlobs,
+    ) -> pack_stream::Response {
+        let shared = self.clone();
+        let mut cache = scratch.clone();
+        let speculative = work.speculative;
+        let tasks: Vec<_> = work
+            .items
+            .iter()
+            .map(|item| (item.oid, item.demand.clone()))
+            .collect();
+        pack_stream::Response::new(
+            scratch.clone(),
+            oids.to_vec(),
+            Box::new(move |object| {
+                let oid = object.oid();
+                let demand = &tasks
+                    .iter()
+                    .find(|(wanted, _)| *wanted == oid)
+                    .expect("known want")
+                    .1;
+                let acquired = if object.kind() == git2::ObjectType::Blob {
+                    cache.insert_verified_blob(&object)?;
+                    Acquired::Stored
+                } else {
+                    anyhow::ensure!(!speculative, "prefetched object is not a blob");
+                    Acquired::Object(object)
+                };
+                shared.oids.fetch_add(1, Ordering::Relaxed);
+                demand.complete(Batch::new(vec![oid], Ok(acquired)));
+                Ok(())
+            }),
+        )
+    }
+
+    fn resolve_speculative_pack(&self, work: &Work, scratch: &RawBlobs, pack: Spool) -> Result<()> {
+        let directory = scratch.index_directory()?;
+        let mut options = git2::RepositoryInitOptions::new();
+        options.bare(true).external_template(false);
+        let repository = git2::Repository::init_opts(directory.path(), &options)?;
+        let odb = repository.odb()?;
+        pack_stream::index(&odb, &pack)?;
+        let mut cache = scratch.clone();
+        for item in work.items.iter().filter(|item| !item.demand.ready()) {
+            let object = odb.read(item.oid)?;
+            cache.insert_prefetched_odb_blob(item.oid, &object)?;
+            self.oids.fetch_add(1, Ordering::Relaxed);
+            item.demand
+                .complete(Batch::new(vec![item.oid], Ok(Acquired::Stored)));
+        }
+        Ok(())
+    }
+
+    fn finish(
         &self,
+        mut work: Work,
+        result: Result<pack_stream::Received>,
+        started: Instant,
+        lane: Option<usize>,
+        scratch: &RawBlobs,
+    ) {
+        let result = result.and_then(|pack| {
+            self.packs.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(pack.bytes, Ordering::Relaxed);
+            if lane.is_none() {
+                self.http2_fetches.fetch_add(1, Ordering::Relaxed);
+            }
+            if work.speculative {
+                self.prefetches.fetch_add(1, Ordering::Relaxed);
+            }
+            match pack.fallback {
+                Some(file) if work.speculative => {
+                    self.resolve_speculative_pack(&work, scratch, file)?;
+                    Ok(None)
+                }
+                Some(file) => Ok(Some(Acquired::Pack(file))),
+                None => {
+                    self.streamed_packs.fetch_add(1, Ordering::Relaxed);
+                    Ok(None)
+                }
+            }
+        });
+
+        let mut queue = self.queue.lock().unwrap();
+        if let Some(index) = lane {
+            queue.busy[index] = false;
+        }
+        // Retire a speculative success from the queue once its verified blob
+        // is visible in the raw store. A foreground waiter still holds a clone.
+        work.items.retain(|item| {
+            if !item.demand.ready() {
+                return true;
+            }
+            if work.speculative && !item.demand.required() {
+                queue.pending.remove(&item.oid);
+            }
+            false
+        });
+        let result = match result {
+            Ok(payload) => {
+                queue.mode.record_reply(started.elapsed());
+                payload.map(Ok)
+            }
+            Err(error)
+                if work.speculative
+                    && !self.stop.load(Ordering::Relaxed)
+                    && !object::is_cancelled(&error) =>
+            {
+                for item in work.items {
+                    queue.retry(item, true);
+                }
+                self.work.notify_all();
+                return;
+            }
+            Err(error) => {
+                if !work.speculative && !object::is_cancelled(&error) {
+                    queue.failure.get_or_insert_with(|| format!("{error:#}"));
+                }
+                Some(Err(error))
+            }
+        };
+        drop(queue);
+        if let Some(result) = result {
+            let batch = Batch::new(work.wants(), result);
+            for item in work.items {
+                item.demand.complete(batch.clone());
+            }
+        }
+        self.work.notify_all();
+    }
+
+    fn run_http2(
+        self: &Arc<Self>,
         mut client: crate::http2::Client,
         mut wake: UnixStream,
         scratch: &RawBlobs,
     ) {
-        let result = self.drive_http2(&mut client, &mut wake, scratch);
-        let failure = result.err().filter(|error| !object::is_cancelled(error));
+        let failure = self
+            .drive_http2(&mut client, &mut wake, scratch)
+            .err()
+            .filter(|error| !object::is_cancelled(error));
         let pending = {
             let mut queue = self.queue.lock().unwrap();
             if let Some(error) = &failure {
                 queue.failure.get_or_insert_with(|| format!("{error:#}"));
             }
             queue.waiting.clear();
-            queue.outstanding = 0;
-            queue.pending.clone()
+            queue.ahead.clear();
+            std::mem::take(&mut queue.pending)
         };
         for (oid, demand) in pending {
             let error = failure.as_ref().map_or_else(
@@ -381,7 +658,7 @@ impl Shared {
     }
 
     fn drive_http2(
-        &self,
+        self: &Arc<Self>,
         client: &mut crate::http2::Client,
         wake: &mut UnixStream,
         scratch: &RawBlobs,
@@ -391,187 +668,148 @@ impl Shared {
         while !self.stop.load(Ordering::Relaxed) {
             object::check_transfer()?;
             drain_wake(wake)?;
-            let (mut waiting, failure, delay) = {
+            let (waiting, ahead, failure, delay) = {
                 let mut queue = self.queue.lock().unwrap();
-                let delay = if queue.failure.is_none() {
-                    queue.batch_wait(Instant::now(), !active.is_empty())
+                let delay = queue
+                    .failure
+                    .is_none()
+                    .then(|| queue.batch_wait(Instant::now(), !active.is_empty()))
+                    .flatten();
+                let (waiting, ahead) = if delay.is_none() {
+                    (
+                        std::mem::take(&mut queue.waiting),
+                        std::mem::take(&mut queue.ahead),
+                    )
                 } else {
-                    None
+                    (VecDeque::new(), VecDeque::new())
                 };
-                let waiting = if delay.is_some() {
-                    VecDeque::new()
-                } else {
-                    std::mem::take(&mut queue.waiting)
-                };
-                (waiting, queue.failure.clone(), delay)
+                (waiting, ahead, queue.failure.clone(), delay)
             };
-            while !waiting.is_empty() {
-                let count = waiting.len().min(MAX_WANTS);
-                let work: Vec<_> = waiting.drain(..count).collect();
-                let oids: Vec<_> = work.iter().map(|item| item.oid).collect();
-                if let Some(error) = &failure {
-                    self.finish_http2(oids, work, Err(anyhow::anyhow!("{error}")), None);
-                    continue;
+            for (mut batches, speculative) in [(waiting, false), (ahead, true)] {
+                while let Some(work) = Work::take(&mut batches, speculative) {
+                    let started = Instant::now();
+                    let oids = work.wants();
+                    let submitted = match &failure {
+                        Some(error) => Err(anyhow::anyhow!("{error}")),
+                        None => {
+                            token = token
+                                .checked_add(1)
+                                .context("Git HTTP/2 request ID overflow")?;
+                            client.start(token, &oids, self.response(&work, &oids, scratch))
+                        }
+                    };
+                    match submitted {
+                        Ok(()) => {
+                            active.insert(token, Http2Batch { work, started });
+                        }
+                        Err(error) => self.finish(work, Err(error), started, None, scratch),
+                    }
+                    self.http2_peak
+                        .fetch_max(active.len() as u64, Ordering::Relaxed);
                 }
-                token = token
-                    .checked_add(1)
-                    .context("Git HTTP/2 request ID overflow")?;
-                client.start(token, &oids, scratch)?;
-                active.insert(
-                    token,
-                    Http2Batch {
-                        oids,
-                        work,
-                        started: Instant::now(),
-                    },
-                );
-                self.http2_peak
-                    .fetch_max(active.len() as u64, Ordering::Relaxed);
             }
-            for (token, pack) in client.progress(scratch)? {
-                let Http2Batch {
-                    oids,
-                    work,
-                    started,
-                } = active
+            for (token, pack) in client.progress()? {
+                let Http2Batch { work, started } = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
-                if pack.is_ok() {
-                    self.http2_fetches.fetch_add(1, Ordering::Relaxed);
-                }
-                self.finish_http2(oids, work, pack, Some(started.elapsed()));
+                self.finish(work, pack, started, None, scratch);
             }
-            // The wake socket makes new demands and shutdown visible while
-            // libcurl waits on the connection. The interval checks signals
-            // even before the runner reaches transport cleanup.
             let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
                 remaining.max(Duration::from_millis(1))
             });
-            client.wait(wake, timeout)?;
+            // A failed prefetch can enqueue an exact retry from this thread.
+            if delay.is_some() || self.queue.lock().unwrap().waiting.is_empty() {
+                client.wait(wake, timeout)?;
+            }
         }
         Ok(())
     }
 
-    fn finish_http2(
-        &self,
-        oids: Vec<Oid>,
-        work: Vec<QueuedDemand>,
-        pack: Result<Spool>,
-        elapsed: Option<Duration>,
-    ) {
-        {
-            let mut queue = self.queue.lock().unwrap();
-            if let Err(error) = &pack {
-                if queue.failure.is_none() && !object::is_cancelled(error) {
-                    queue.failure = Some(format!("{error:#}"));
-                }
-            } else if let Some(elapsed) = elapsed {
-                queue.mode.record_reply(elapsed);
-            }
-            queue.outstanding -= work.len();
-        }
-        let batch = Batch::new(oids, pack);
-        for item in work {
-            item.demand.complete(batch.clone());
-        }
-    }
-
     fn worker(
-        &self,
+        self: &Arc<Self>,
         index: usize,
         mut session: Option<Session>,
-        mut command: Option<Command>,
+        connection: Connection,
         scratch: &RawBlobs,
     ) -> Result<()> {
-        if index >= INITIAL_CONNECTIONS {
-            // Spare workers do not compete for the work queue during probing.
-            let queue = self.queue.lock().unwrap();
-            let queue = self
-                .mode_ready
-                .wait_while(queue, |queue| {
-                    !self.stop.load(Ordering::Relaxed)
-                        && matches!(queue.mode, ConnectionMode::Probing(_))
-                })
-                .unwrap();
-            if !matches!(queue.mode, ConnectionMode::Wide) {
-                return Ok(());
-            }
-        }
         loop {
-            let next = {
+            let (work, failure) = {
                 let mut queue = self.queue.lock().unwrap();
                 loop {
-                    queue = self
-                        .work
-                        .wait_while(queue, |queue| {
-                            !self.stop.load(Ordering::Relaxed)
-                                && (queue.waiting.is_empty()
-                                    || queue.busy[..index].contains(&false))
-                        })
-                        .unwrap();
-                    if self.stop.load(Ordering::Relaxed) {
-                        break None;
+                    if self.stop.load(Ordering::Relaxed)
+                        || queue.native_ceiling.is_some_and(|ceiling| index >= ceiling)
+                    {
+                        return session.as_ref().map_or(Ok(()), Session::stop);
                     }
-                    if let Some(remaining) =
+                    if let Some(delay) =
                         queue.batch_wait(Instant::now(), queue.busy.contains(&true))
                     {
-                        queue = self.work.wait_timeout(queue, remaining).unwrap().0;
+                        queue = self.work.wait_timeout(queue, delay).unwrap().0;
                         continue;
                     }
-                    // Use an established lower-numbered connection first.
-                    let count = queue.waiting.len().min(MAX_WANTS);
-                    let work: Vec<_> = queue.waiting.drain(..count).collect();
-                    queue.busy[index] = true;
-                    break Some((work, queue.failure.clone()));
+                    if let Some(work) = queue.native_work(index) {
+                        queue.busy[index] = true;
+                        break (work, queue.failure.clone());
+                    }
+                    queue = self.work.wait(queue).unwrap();
                 }
-            };
-            let Some((work, failure)) = next else {
-                break;
             };
             self.work.notify_all();
-            let oids = work.iter().map(|item| item.oid).collect::<Vec<_>>();
-            let result = (|| {
-                if let Some(failure) = failure {
-                    bail!("remote object transport previously failed: {failure}");
-                }
-                object::check_transfer()?;
-                if session.is_none() {
-                    self.additional_starts.fetch_add(1, Ordering::Relaxed);
-                    let command = command.take().context("missing HTTPS helper command")?;
-                    session = Session::connect_with_stop(command, true, Some(self.stop.clone()))?;
-                }
-                let session = session
-                    .as_mut()
-                    .context("HTTPS helper cannot reuse its connection")?;
-                let pack = scratch.scratch_file()?;
-                let started = Instant::now();
-                session.fetch_exact(&oids, &pack)?;
-                Ok((pack, started.elapsed()))
-            })();
-            let result = {
-                let mut queue = self.queue.lock().unwrap();
-                let result = result.map(|(pack, elapsed)| {
-                    if queue.mode.record_reply(elapsed) {
-                        self.mode_ready.notify_all();
+            let started = Instant::now();
+            if session.is_none() && failure.is_none() {
+                let connected = connection
+                    .connect(Some(self.stop.clone()))
+                    .and_then(|session| {
+                        session.context("native Git cannot open a reusable demand channel")
+                    });
+                match connected {
+                    Ok(new) => {
+                        if index != 0 {
+                            self.additional_starts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        session = Some(new);
                     }
-                    pack
-                });
-                if let Err(error) = &result {
-                    if queue.failure.is_none() && !object::is_cancelled(error) {
-                        queue.failure = Some(format!("{error:#}"));
+                    Err(_)
+                        if index != 0
+                            && connection.is_ssh()
+                            && !self.stop.load(Ordering::Relaxed) =>
+                    {
+                        // The master may have a lower MaxSessions. Nothing has
+                        // been sent over this channel, so narrower reuse is safe.
+                        let mut queue = self.queue.lock().unwrap();
+                        queue.busy[index] = false;
+                        queue.native_ceiling =
+                            Some(queue.native_ceiling.unwrap_or(CONNECTIONS).min(index));
+                        for item in work.items {
+                            queue.retry(item, work.speculative);
+                        }
+                        queue.prune_prefetch();
+                        self.work.notify_all();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        self.finish(work, Err(error), started, Some(index), scratch);
+                        continue;
                     }
                 }
-                queue.outstanding -= work.len();
-                queue.busy[index] = false;
-                result
-            };
-            let batch = Batch::new(oids, result);
-            for item in work {
-                item.demand.complete(batch.clone());
             }
-            self.work.notify_all();
+            let result = if let Some(error) = failure {
+                Err(anyhow::anyhow!("{error}"))
+            } else {
+                let oids = work.wants();
+                connection.check().and_then(|_| {
+                    session
+                        .as_mut()
+                        .unwrap()
+                        .fetch_stream(&oids, self.response(&work, &oids, scratch))
+                })
+            };
+            if result.is_err() {
+                // fetch_stream reaps a channel with an incomplete response.
+                session = None;
+            }
+            self.finish(work, result, started, Some(index), scratch);
         }
-        session.as_ref().map_or(Ok(()), Session::stop)
     }
 }
 
@@ -587,7 +825,6 @@ fn drain_wake(wake: &mut UnixStream) -> io::Result<()> {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,17 +834,50 @@ mod tests {
         let mut variable = ConnectionMode::default();
         let mut slow = ConnectionMode::default();
         for _ in 1..REPLY_SAMPLES {
-            assert!(!slow.record_reply(SLOW_REPLY));
-            assert!(!variable.record_reply(SLOW_REPLY));
+            slow.record_reply(SLOW_REPLY);
+            variable.record_reply(SLOW_REPLY);
         }
-        assert!(variable.record_reply(SLOW_REPLY / 2));
+        variable.record_reply(SLOW_REPLY / 2);
         for _ in 0..REPLY_SAMPLES {
-            assert!(!variable.record_reply(SLOW_REPLY));
+            variable.record_reply(SLOW_REPLY);
         }
         assert!(matches!(variable, ConnectionMode::Standard));
-        assert!(slow.record_reply(SLOW_REPLY));
-        assert!(!slow.record_reply(SLOW_REPLY / 2));
+        slow.record_reply(SLOW_REPLY);
+        slow.record_reply(SLOW_REPLY / 2);
         assert!(matches!(slow, ConnectionMode::Wide));
+    }
+
+    #[test]
+    fn failed_speculation_requeues_the_live_waiter() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Shared::default();
+        let used = Oid::from_bytes(&[1; 20]).unwrap();
+        let unused = Oid::from_bytes(&[2; 20]).unwrap();
+        let (work, demand) = {
+            let mut queue = shared.queue.lock().unwrap();
+            for oid in [used, unused] {
+                let item = queue.insert(oid);
+                queue.ahead.push_back(item);
+            }
+            let work = Work::take(&mut queue.ahead, true).unwrap();
+            // The file became required after the speculative pack was sent.
+            (work, queue.foreground(used))
+        };
+        shared.finish(
+            work,
+            Err(anyhow::anyhow!("prefetch refused")),
+            Instant::now(),
+            None,
+            &scratch,
+        );
+        let queue = shared.queue.lock().unwrap();
+        assert!(queue.failure.is_none());
+        assert!(!queue.pending.contains_key(&unused));
+        assert_eq!(queue.waiting.len(), 1);
+        assert_eq!(queue.waiting[0].oid, used);
+        assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
+        assert!(!demand.ready());
     }
 
     #[test]

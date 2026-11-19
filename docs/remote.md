@@ -67,8 +67,8 @@ terminal.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy, or a custom
 `GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
-helper path supports reuse. No fetched object is retried merely to change
-decoders, and no unrelated future OID is requested.
+helper path supports reuse. The decoder reuses the bytes already received when
+a pack requires the fallback decoder.
 
 On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
@@ -83,19 +83,29 @@ Explicit Git HTTP configuration, authentication outside the supported exchange,
 and servers without HTTP/2 or filtered protocol v2 use the native helper.
 Transport selection completes before any object demand is sent.
 
-The native HTTP(S) loader initially allows four invocation-owned connections.
-If each of the first eight successful pack transfers takes at least
-64 milliseconds, the loader allows eight connections for the rest of the
-invocation.
-One entry represents each pending OID and a fetch can group up to eight OIDs
-already requested. After expansion, the loader can wait up to two milliseconds
-from its oldest pending OID to collect four requests while another transfer is
-in flight. An idle pool starts a request immediately.
-Additional helpers start when demands overlap. Cached objects bypass the queue.
-The native-loader queue bounds outstanding objects. Both transports receive
-and check packs outside the queue lock. The snapshot verifies and publishes
-the objects through its normal store. Parallel demand requires a reusable
-HTTP(S) transport and an unrestricted per-file size limit.
+Native helpers start with four available channels. If each of the first eight
+successful pack transfers takes at least 64 milliseconds, eight channels become
+available for the rest of the invocation. SSH opens its channels through the
+same owned master and uses fewer when the server refuses an additional channel.
+An idle pool starts an ordinary request immediately. On a slow source the queue
+can wait up to two milliseconds to combine overlapping demands.
+
+A first access to a regular file in a directory opened for enumeration can
+schedule the next four uncached and previously unscheduled blob OIDs in Git's
+depth-first order through already opened directories. The same planner serves
+FUSE and NFS and uses separate packs for speculative work. Ordinary demands
+take precedence and can join an active speculative request without duplicating
+its fetch. If that speculation fails, only waiting ordinary demands reenter
+the request queue. These paths require a reusable transport and an unrestricted
+per-file size limit.
+
+The HTTPS and SSH receivers share the same incremental Git framing and pack
+decoder. It inflates ordinary entries in memory and verifies the canonical Git
+OID against the requested OIDs before notifying a waiting read. It can publish
+a verified object while the rest of its pack is still arriving. The receiver
+also verifies the complete pack's checksum and framing. Deltas and entries
+or packs larger than the in-memory decoder's working buffers use the existing
+pack decoder. Blob payloads enter the same authenticated, run-local store.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with

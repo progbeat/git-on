@@ -243,7 +243,8 @@ impl Filesystem for Fuse {
                 SourceLookup::Inode(ino) => (Some(ino), state.core.pending_source_size(ino)),
                 SourceLookup::Tree(oid) => (None, Some(oid)),
             };
-            let Some(pending) = oid.and_then(|oid| state.core.start_remote_demand(oid)) else {
+            let Some(pending) = oid.and_then(|oid| state.core.start_remote_demand(oid, inode))
+            else {
                 break inode;
             };
             drop(state);
@@ -638,7 +639,7 @@ impl Filesystem for Fuse {
             .parallel_reads
             .then(|| state.core.pending_source_tree(ino.0))
             .flatten()
-            .and_then(|oid| state.core.start_remote_demand(oid))
+            .and_then(|oid| state.core.start_remote_demand(oid, None))
         {
             drop(state);
             pending.finish();

@@ -1564,10 +1564,11 @@ import time
 assert 'unvisited' in os.listdir('.')
 assert os.stat('warm').st_size == 9
 sizes = {sizes!r}
-parents = [os.open(f'd{{index}}', os.O_RDONLY | os.O_DIRECTORY) for index in range(len(sizes))]
-alias = os.open('alias', os.O_RDONLY | os.O_DIRECTORY)
+parents = [Path(f'd{{index}}') for index in range(len(sizes))]
+alias = Path('alias')
+# Warm each parent with a lookup so this case measures foreground requests.
 for parent in [*parents, alias]:
-    assert os.listdir(parent) == ['file']
+    assert not (parent / 'absent').exists()
 control = Path({str(f.root)!r})
 
 def wait_for(name):
@@ -1577,9 +1578,8 @@ def wait_for(name):
         time.sleep(.01)
 
 def read(parent):
-    size = os.stat('file', dir_fd=parent).st_size
-    with os.fdopen(os.open('file', os.O_RDONLY, dir_fd=parent), 'rb') as file:
-        return size, file.read()
+    path = parent / 'file'
+    return path.stat().st_size, path.read_bytes()
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
     first = pool.submit(read, parents[0])

@@ -31,7 +31,7 @@ RPC records are limited to 2 MiB, individual read and write payloads to 1 MiB,
 and each COMPOUND to 64 operations. The server limits active connections,
 queued requests and session slots. Expired client state releases its open
 handles, locks and directory views. Each session slot caches its last reply
-including a successful prefix followed by an error. Mounts with parallel HTTP(S)
+including a successful prefix followed by an error. Mounts with parallel remote
 object reads can negotiate up to 32 slots. The negotiated maximum reply size
 keeps each session's replay storage within 16 MiB. Git data requests can remain
 outstanding until they complete or the invocation is cancelled.

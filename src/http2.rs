@@ -2,9 +2,7 @@
 //! libcurl multi handle. Native Git still selects and verifies the revision.
 use crate::{
     object::{check_transfer, OperationCancelled},
-    raw_blob::RawBlobs,
-    spool::Spool,
-    transport,
+    pack_stream, transport,
 };
 use anyhow::{bail, ensure, Context, Result};
 use curl::{
@@ -15,7 +13,7 @@ use git2::Oid;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    io::{self, BufReader, Read, Seek, Write},
+    io::{self, Read},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::PathBuf,
     process::Command,
@@ -103,7 +101,7 @@ fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
 
 enum Body {
     Discovery(Vec<u8>),
-    Reply(Spool),
+    Reply(Box<pack_stream::Response>),
 }
 
 struct Response {
@@ -111,6 +109,8 @@ struct Response {
     error: Option<io::Error>,
     stop: Arc<AtomicBool>,
     h2: bool,
+    ok: bool,
+    git_pack: bool,
     basic: bool,
 }
 
@@ -122,7 +122,10 @@ impl Handler for Response {
                 Ok(())
             }
             Body::Discovery(_) => Err(io::Error::other("Git HTTP discovery response is oversized")),
-            Body::Reply(file) => (&*file).write_all(data),
+            Body::Reply(stream) if self.h2 && self.ok && self.git_pack => {
+                stream.write_http(data).map_err(io::Error::other)
+            }
+            Body::Reply(_) => Ok(()),
         };
         match result {
             Ok(()) => Ok(data.len()),
@@ -136,11 +139,16 @@ impl Handler for Response {
     fn header(&mut self, data: &[u8]) -> bool {
         if data.starts_with(b"HTTP/") {
             self.h2 = data.starts_with(b"HTTP/2 ");
+            self.ok = data.split(u8::is_ascii_whitespace).nth(1) == Some(b"200");
+            self.git_pack = false;
             self.basic = false;
             if let Body::Discovery(bytes) = &mut self.body {
                 bytes.clear();
             }
         } else if let Some(colon) = data.iter().position(|&byte| byte == b':') {
+            if data[..colon].eq_ignore_ascii_case(b"content-type") {
+                self.git_pack = data[colon + 1..].trim_ascii() == PACK_RESULT;
+            }
             if data[..colon].eq_ignore_ascii_case(b"www-authenticate") {
                 self.basic |= data[colon + 1..]
                     .split(u8::is_ascii_whitespace)
@@ -221,6 +229,8 @@ impl Client {
             error: None,
             stop: self.stop.clone(),
             h2: false,
+            ok: false,
+            git_pack: false,
             basic: false,
         });
         easy.url(&format!("{}/{service}", self.base))?;
@@ -287,10 +297,15 @@ impl Client {
         }
     }
 
-    pub(crate) fn start(&mut self, token: usize, oids: &[Oid], scratch: &RawBlobs) -> Result<()> {
+    pub(crate) fn start(
+        &mut self,
+        token: usize,
+        oids: &[Oid],
+        response: pack_stream::Response,
+    ) -> Result<()> {
         let easy = self.easy(
             "git-upload-pack",
-            Body::Reply(scratch.scratch_file()?),
+            Body::Reply(Box::new(response)),
             Some(transport::exact_request(oids)?),
         )?;
         let mut handle = self.multi.add2(easy)?;
@@ -299,7 +314,7 @@ impl Client {
         Ok(())
     }
 
-    pub(crate) fn progress(&mut self, scratch: &RawBlobs) -> Result<Vec<(usize, Result<Spool>)>> {
+    pub(crate) fn progress(&mut self) -> Result<Vec<(usize, Result<pack_stream::Received>)>> {
         self.multi.perform()?;
         let mut finished = Vec::new();
         self.multi.messages(|message| {
@@ -316,7 +331,7 @@ impl Client {
                     .remove(&token)
                     .context("unknown Git HTTP/2 request")?;
                 let mut response = self.multi.remove2(handle)?;
-                let result = self.finish(&mut response, outcome, scratch);
+                let result = self.finish(&mut response, outcome);
                 Ok((token, result))
             })
             .collect()
@@ -326,15 +341,14 @@ impl Client {
         &self,
         response: &mut Easy2<Response>,
         outcome: Result<(), curl::Error>,
-        scratch: &RawBlobs,
-    ) -> Result<Spool> {
+    ) -> Result<pack_stream::Received> {
+        if let Some(error) = response.get_mut().error.take() {
+            return Err(error.into());
+        }
         if self.stop.load(Ordering::Relaxed) {
             return Err(OperationCancelled.into());
         }
         check_transfer()?;
-        if let Some(error) = response.get_mut().error.take() {
-            return Err(error.into());
-        }
         outcome.context("receive Git HTTP/2 response")?;
         let status = response.response_code()?;
         ensure!(status == 200, "Git HTTP/2 fetch returned HTTP {status}");
@@ -342,14 +356,11 @@ impl Client {
             response.get_ref().h2 && response.content_type_bytes()? == Some(PACK_RESULT),
             "invalid Git HTTP/2 fetch response"
         );
-        let Body::Reply(reply) = &response.get_ref().body else {
+        let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
+        let Body::Reply(stream) = body else {
             bail!("missing Git HTTP/2 fetch body");
         };
-        let mut reply = reply;
-        reply.rewind()?;
-        let pack = scratch.scratch_file()?;
-        transport::read_http_pack(BufReader::new(reply), &pack)?;
-        Ok(pack)
+        stream.finish_http()
     }
 
     pub(crate) fn wait(&self, wake: &UnixStream, timeout: Duration) -> Result<()> {

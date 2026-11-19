@@ -766,6 +766,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
 
     let mut transport_cleanup_failure = None;
     if let Some(snapshot) = &observed {
+        if let Err(error) = snapshot.stop_remote_transport() {
+            transport_cleanup_failure = Some(error);
+        }
         if let Some(failure) = snapshot.remote_failure() {
             result = Err(anyhow::anyhow!(
                 "remote object loading failed; execution incomplete: {failure}"
@@ -774,9 +777,6 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         #[cfg(feature = "test-metrics")]
         if let Err(e) = report_metrics(snapshot, measured_backend) {
             result = Err(e);
-        }
-        if let Err(error) = snapshot.stop_remote_transport() {
-            transport_cleanup_failure = Some(error);
         }
     }
 

@@ -32,6 +32,7 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         self.authorization = authorization
         self.upstream_tls = ssl.create_default_context(cafile=fixture.env['GIT_SSL_CAINFO'])
         self.records = []
+        self.split_pack = None
         self.unauthenticated_wants = set()
         super().__init__(('127.0.0.1', 0), MultiplexedRequests)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -74,6 +75,7 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
         self.request.settimeout(.02)
         pending = {}
         responses = {}
+        held = set()
         with ThreadPoolExecutor() as workers:
             while True:
                 try:
@@ -94,6 +96,19 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                         wants = re.findall(rb'want ([0-9a-f]{40})', body)
                         if wants:
                             self.server.records.append((self.client_address, wants))
+                        split = self.server.split_pack
+                        if (split is not None and set(wants) == split.wants
+                                and headers.get('authorization') == self.server.authorization):
+                            h2.send_headers(stream, [
+                                (':status', '200'),
+                                ('content-type', 'application/x-git-upload-pack-result'),
+                                ('content-length', str(len(split.prefix) + len(split.tail))),
+                            ])
+                            h2.send_data(stream, split.prefix)
+                            self.request.sendall(h2.data_to_send())
+                            split.started.touch()
+                            held.add(stream)
+                            continue
                         forwarded = {key: value for key, value in headers.items() if not key.startswith(':')}
                         responses[stream] = workers.submit(
                             self.server.forward, headers[':method'], headers[':path'], forwarded, body,
@@ -111,6 +126,10 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                     h2.send_headers(stream, headers, end_stream=not body)
                     if body:
                         h2.send_data(stream, body, end_stream=True)
+                if held and self.server.split_pack.release.exists():
+                    for stream in held:
+                        h2.send_data(stream, self.server.split_pack.tail, end_stream=True)
+                    held.clear()
                 outgoing = h2.data_to_send()
                 if outgoing:
                     self.request.sendall(outgoing)

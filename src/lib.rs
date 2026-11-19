@@ -6,6 +6,7 @@ pub mod git;
 mod http2;
 pub mod materialize;
 pub mod object;
+mod pack_stream;
 pub mod platform;
 pub mod policy;
 mod raw_blob;

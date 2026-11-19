@@ -59,7 +59,50 @@ struct Handle {
 struct SourceDirectory {
     tree: Arc<crate::tree::Directory>,
     base: u64,
+    opened: bool,
 }
+
+struct DfsFrame {
+    path: PathBuf,
+    key: usize,
+    next: usize,
+}
+
+/// Walk the already-open source view in Git tree order. Each frame borrows
+/// the parsed tree rather than building a second index of the directory's files.
+struct OpenedFiles<'a> {
+    overlay: &'a Overlay,
+    stack: Vec<DfsFrame>,
+}
+
+impl Iterator for OpenedFiles<'_> {
+    type Item = Oid;
+
+    fn next(&mut self) -> Option<Oid> {
+        while let Some(frame) = self.stack.last_mut() {
+            let directory = &self.overlay.source_directories[frame.key];
+            let index = frame.next;
+            let Some((mode, oid)) = directory.tree.metadata_at(index) else {
+                self.stack.pop();
+                continue;
+            };
+            frame.next += 1;
+            match mode {
+                0o100644 | 0o100755 if directory.opened => return Some(oid),
+                0o040000 => {
+                    let (name, _) = directory.tree.at(index)?;
+                    let path = frame.path.join(name);
+                    if let Some(&key) = self.overlay.source_directory_keys.get(&path) {
+                        self.stack.push(DfsFrame { path, key, next: 0 });
+                    }
+                }
+                _ => (),
+            }
+        }
+        None
+    }
+}
+
 enum DirectoryEntries {
     Source(usize),
     Merged(DirectoryVersion),
@@ -466,7 +509,11 @@ impl Overlay {
             .checked_add(u64::try_from(tree.len()).map_err(|_| libc::ENOSPC)?)
             .ok_or(libc::ENOSPC)?;
         let key = self.source_directories.len();
-        self.source_directories.push(SourceDirectory { tree, base });
+        self.source_directories.push(SourceDirectory {
+            tree,
+            base,
+            opened: false,
+        });
         self.source_directory_keys.insert(source, key);
         Ok(key)
     }
@@ -553,6 +600,9 @@ impl Overlay {
             .clone()
             .map(|source| self.source_directory(&source))
             .transpose()?;
+        if let Some(key) = source {
+            self.source_directories[key].opened = true;
+        }
         let mut rows = None;
         let entries = if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
             DirectoryEntries::Source(key)
@@ -1554,11 +1604,46 @@ pub(crate) enum SourceLookup {
 
 impl Overlay {
     pub(crate) fn parallel_remote_reads(&self) -> bool {
-        self.write_policy != WritePolicy::All && self._snapshot.remote_http()
+        self.write_policy != WritePolicy::All && self._snapshot.reusable_remote_transport()
     }
 
-    pub(crate) fn start_remote_demand(&self, oid: Oid) -> Option<crate::snapshot::PendingObject> {
-        self._snapshot.start_remote_demand(oid)
+    pub(crate) fn start_remote_demand(
+        &self,
+        oid: Oid,
+        inode: Option<u64>,
+    ) -> Option<crate::snapshot::PendingObject> {
+        let files = inode.and_then(|ino| self.opened_files_after(ino));
+        self._snapshot.start_remote_demand(oid, files)
+    }
+
+    fn opened_files_after(&self, ino: u64) -> Option<OpenedFiles<'_>> {
+        let node = self.nodes.get(&ino)?;
+        if node.attr.kind != FileType::RegularFile {
+            return None;
+        }
+        let mut source = node.snapshot_path.as_deref()?;
+        let parent_key = *self.source_directory_keys.get(source.parent()?)?;
+        if !self.source_directories[parent_key].opened {
+            return None;
+        }
+        let mut stack = Vec::new();
+        while let (Some(parent), Some(name)) = (source.parent(), source.file_name()) {
+            if let Some(&key) = self.source_directory_keys.get(parent) {
+                if let Some(index) = self.source_directories[key].tree.index(name) {
+                    stack.push(DfsFrame {
+                        path: parent.to_owned(),
+                        key,
+                        next: index + 1,
+                    });
+                }
+            }
+            source = parent;
+        }
+        stack.reverse();
+        Some(OpenedFiles {
+            overlay: self,
+            stack,
+        })
     }
 
     pub(crate) fn pending_source_tree(&self, ino: u64) -> Option<Oid> {

@@ -26,7 +26,7 @@ use tokio::{
 type SlotKey = (SessionId, u32);
 
 enum ObjectDemand {
-    Final(Oid),
+    Final(Oid, Option<u64>),
     ParentTree(Oid),
 }
 
@@ -142,11 +142,11 @@ impl Server {
         demand: ObjectDemand,
         wake: &Arc<Notify>,
     ) -> Option<(PendingObject, bool)> {
-        let (oid, recheck_lookup) = match demand {
-            ObjectDemand::Final(oid) => (oid, false),
-            ObjectDemand::ParentTree(oid) => (oid, true),
+        let (oid, inode, recheck_lookup) = match demand {
+            ObjectDemand::Final(oid, inode) => (oid, inode, false),
+            ObjectDemand::ParentTree(oid) => (oid, None, true),
         };
-        let object = self.core.start_remote_demand(oid)?;
+        let object = self.core.start_remote_demand(oid, inode)?;
         object.notify_when_ready(wake);
         Some((object, recheck_lookup))
     }
@@ -223,7 +223,7 @@ impl Server {
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
                 self.attribute_size_demand(ino, *mask)
-                    .map(ObjectDemand::Final)
+                    .map(|oid| ObjectDemand::Final(oid, Some(ino)))
             }
             [PutFh(handle), GetAttr(parent_mask), Lookup(name), GetFh, GetAttr(mask)] => {
                 self.lookup_size_demand(credentials, handle, Some(*parent_mask), name, *mask)
@@ -250,7 +250,7 @@ impl Server {
         }
         self.require_access(&Context::new(credentials), ino, libc::R_OK | libc::X_OK)
             .ok()?;
-        Some(ObjectDemand::Final(oid))
+        Some(ObjectDemand::Final(oid, None))
     }
 
     fn attribute_size_demand(&self, ino: u64, mask: Bitmap) -> Option<Oid> {
@@ -283,7 +283,7 @@ impl Server {
         {
             SourceLookup::Inode(ino) => self
                 .attribute_size_demand(ino, mask)
-                .map(ObjectDemand::Final),
+                .map(|oid| ObjectDemand::Final(oid, Some(ino))),
             SourceLookup::Tree(oid) => Some(ObjectDemand::ParentTree(oid)),
         }
     }

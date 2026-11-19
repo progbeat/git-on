@@ -582,6 +582,43 @@ impl RawBlobs {
             crate::object::copy_verified(input, output, ObjectType::Blob, size, oid)
         })
     }
+    pub(crate) fn insert_verified_blob(
+        &mut self,
+        object: &crate::pack_stream::VerifiedObject,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            object.kind() == ObjectType::Blob,
+            "streamed object is not a blob"
+        );
+        self.insert_blob(object.oid(), object.data().len(), false, |output| {
+            output.write_all(object.data())?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_prefetched_odb_blob(
+        &mut self,
+        oid: Oid,
+        object: &git2::OdbObject<'_>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            object.id() == oid && object.kind() == ObjectType::Blob,
+            "prefetched ODB object identity/type changed"
+        );
+        self.insert_blob(oid, object.len(), false, |output| {
+            crate::object::copy_odb_blob(object, output)
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn index_directory(&self) -> io::Result<tempfile::TempDir> {
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        tempfile::Builder::new()
+            .prefix("index-")
+            .tempdir_in(store.directory._owner.path())
+    }
+
     fn insert_blob(
         &mut self,
         oid: Oid,

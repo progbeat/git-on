@@ -161,6 +161,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/http2-tests"
           "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
           "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on --require-fuse
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/release/git-on --require-fuse
       - name: Share the exact-head instrumented runner with WebKit
         if: needs.changes.outputs.scale == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -485,6 +486,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/http2-tests"
           "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
           "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/debug/git-on --require-nfs
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/debug/git-on --require-nfs
       - name: Run upstream pynfs over the production socket
         run: |
           git clone https://github.com/linux-nfs/pynfs.git "$RUNNER_TEMP/pynfs"

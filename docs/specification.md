@@ -230,13 +230,16 @@ and complete in-memory copies of the selected tree.
    needed for those operations. Listing a directory may decode that directory's
    tree object, but must not recursively enumerate its children. Resolving a
    deep path may read its ancestor trees.
-3. File contents are loaded on demand. A lookup or directory listing must not
-   read unrelated file payloads. Blob headers, applicable ignore files, and
-   required Git object decoding are permitted when necessary for the operation.
+3. File contents are loaded on demand. Directory listings alone do not load
+   file payloads. On reusable remote transports, a regular-file request in an
+   opened directory can also schedule up to four subsequent regular-file OIDs
+   in depth-first order through already opened directories. A lookup in an
+   unopened directory may load only the necessary blob headers, applicable
+   ignore files, and required Git object decoding.
 4. Git storage encoding may require decoding a whole object or its delta bases,
-   even for a partial read. This is not permission to preload unrelated trees
-   or payloads. The implementation must distinguish requested content from
-   necessary storage-level work when reporting measurements.
+   even for a partial read. Remote read-ahead uses the already parsed directory
+   view and does not open additional trees. Measurements distinguish requested
+   objects, speculative transfers, and necessary storage-level decoding.
 5. Write-policy checks must load applicable pinned ignore rules on demand and
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.

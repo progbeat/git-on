@@ -243,6 +243,8 @@ pub struct SnapshotMetrics {
     pub remote_session_starts: u64,
     pub remote_http2_fetch_operations: u64,
     pub remote_http2_peak_requests: u64,
+    pub remote_streamed_packs: u64,
+    pub remote_prefetch_packs: u64,
     /// Native Git's retained received packs, possibly normalized by index-pack.
     pub remote_native_pack_bytes: u64,
     /// Exact received Git pack payloads on invocation-owned demand sessions.
@@ -834,21 +836,28 @@ impl Snapshot {
             .ok()
             .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
-    pub(crate) fn remote_http(&self) -> bool {
+    pub(crate) fn reusable_remote_transport(&self) -> bool {
         self.state().is_ok_and(|state| {
             state
                 .remote
                 .as_ref()
-                .is_some_and(|remote| remote.uses_http())
+                .is_some_and(|remote| remote.reusable_transport())
         })
     }
-    pub(crate) fn start_remote_demand(&self, oid: Oid) -> Option<PendingObject> {
+    pub(crate) fn start_remote_demand(
+        &self,
+        oid: Oid,
+        candidates: Option<impl Iterator<Item = Oid>>,
+    ) -> Option<PendingObject> {
         let mut state = self.state().ok()?;
         if state.headers.contains_key(&oid) {
             return None;
         }
         let State { repo, remote, .. } = &mut *state;
-        let demand = remote.as_mut()?.start_demand(repo, oid).ok()??;
+        let demand = remote
+            .as_mut()?
+            .start_demand(repo, oid, candidates)
+            .ok()??;
         Some(PendingObject {
             snapshot: self.clone(),
             demand,
@@ -1229,6 +1238,8 @@ impl Snapshot {
                 metrics.remote_http2_fetch_operations,
                 metrics.remote_http2_peak_requests,
             ) = remote.http2_metrics();
+            (metrics.remote_streamed_packs, metrics.remote_prefetch_packs) =
+                remote.response_metrics();
             (
                 metrics.remote_native_pack_bytes,
                 metrics.remote_session_pack_bytes,
