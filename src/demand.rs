@@ -129,7 +129,8 @@ struct Work {
 
 impl Work {
     fn take(queue: &mut VecDeque<QueuedDemand>, speculative: bool) -> Option<Self> {
-        let count = queue.len().min(MAX_WANTS);
+        let limit = if speculative { READ_AHEAD } else { MAX_WANTS };
+        let count = queue.len().min(limit);
         (count != 0).then(|| Self {
             items: queue.drain(..count).collect(),
             speculative,
@@ -908,6 +909,19 @@ mod tests {
         slow.record_reply(SLOW_REPLY);
         slow.record_reply(SLOW_REPLY / 2);
         assert!(matches!(slow, ConnectionMode::Wide));
+    }
+
+    #[test]
+    fn speculative_pack_stays_at_four_wants_when_forecasts_overlap() {
+        let mut queue = Queue::default();
+        for index in 0..6 {
+            let item = queue.insert(Oid::from_bytes(&[index; 20]).unwrap());
+            queue.ahead.push_back(item);
+        }
+        let first = Work::take(&mut queue.ahead, true).unwrap();
+        assert_eq!(first.items.len(), 4);
+        let next = Work::take(&mut queue.ahead, true).unwrap();
+        assert_eq!(next.items.len(), 2);
     }
 
     #[test]

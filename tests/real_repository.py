@@ -33,6 +33,7 @@ DEMAND_LIMITS = dict(tree_reads=32, prepared_tree_entries=4096, header_reads=128
     blob_loads=128, blob_bytes=1024*1024, remote_raw_blob_imports=128,
     remote_raw_blob_bytes=1024*1024)
 PACK_LIMIT = 1024*1024
+PREFETCH_WANTS = 4
 
 
 def command():
@@ -101,11 +102,17 @@ def validate_reports(data, head):
     received = metrics['remote_native_pack_bytes'] + metrics['remote_session_pack_bytes']
     if not 0 < received <= PACK_LIMIT:
         raise ValueError('public command transferred too much source data')
-    if (not 0 < metrics['blob_loads'] == metrics['remote_raw_blob_imports']
-            or not 0 < metrics['blob_bytes'] == metrics['remote_raw_blob_bytes']
-            or type(metrics['fuse_requests'].get('read')) is not int
-            or metrics['fuse_requests']['read'] <= 0):
-        raise ValueError('missing real FUSE reads or repeated payload preparation')
+    prefetches = metrics.get('remote_prefetch_packs')
+    surplus = metrics['remote_raw_blob_imports'] - metrics['blob_loads']
+    if (type(prefetches) is not int or prefetches < 0
+            or not 0 <= surplus <= PREFETCH_WANTS * prefetches
+            or not 0 < metrics['blob_loads']
+            or not 0 < metrics['blob_bytes'] <= metrics['remote_raw_blob_bytes']
+            or (not surplus and metrics['blob_bytes'] != metrics['remote_raw_blob_bytes'])):
+        raise ValueError('unaccounted remote blob imports or repeated payload preparation')
+    reads = metrics['fuse_requests'].get('read')
+    if type(reads) is not int or reads <= 0:
+        raise ValueError('missing real FUSE reads')
     return dict(public_https_invocations=1, passes=2, upstream_tests_per_pass=LIGHT_TEST_COUNT,
         elapsed_ns=elapsed, blob_loads=metrics['blob_loads'], received_pack_bytes=received)
 

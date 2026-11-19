@@ -18,6 +18,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+const PREFETCH_SCAN_LIMIT: usize = 32;
+
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
@@ -73,13 +75,15 @@ struct DfsFrame {
 struct OpenedFiles<'a> {
     overlay: &'a Overlay,
     stack: Vec<DfsFrame>,
+    remaining: usize,
 }
 
 impl Iterator for OpenedFiles<'_> {
     type Item = Oid;
 
     fn next(&mut self) -> Option<Oid> {
-        while let Some(frame) = self.stack.last_mut() {
+        while self.remaining != 0 {
+            let frame = self.stack.last_mut()?;
             let directory = &self.overlay.source_directories[frame.key];
             let index = frame.next;
             let Some((mode, oid)) = directory.tree.metadata_at(index) else {
@@ -87,6 +91,9 @@ impl Iterator for OpenedFiles<'_> {
                 continue;
             };
             frame.next += 1;
+            // Count skipped entries as well, including cached OIDs that the
+            // caller rejects. Reverse or sparse access stays bounded.
+            self.remaining -= 1;
             match mode {
                 0o100644 | 0o100755 if directory.opened => return Some(oid),
                 0o040000 => {
@@ -1643,6 +1650,7 @@ impl Overlay {
         Some(OpenedFiles {
             overlay: self,
             stack,
+            remaining: PREFETCH_SCAN_LIMIT,
         })
     }
 
@@ -2223,6 +2231,27 @@ mod tests {
         })
         .unwrap();
         rows
+    }
+
+    #[test]
+    fn opened_dfs_does_not_search_past_a_long_run_of_skipped_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"anchor").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("a", blob, 0o100644).unwrap();
+        for index in 0..64 {
+            tree.insert(format!("b-{index:02}"), blob, 0o120000)
+                .unwrap();
+        }
+        tree.insert("z", blob, 0o100644).unwrap();
+        let oid = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "prefetch").unwrap();
+        let mut overlay = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        overlay.open_directory(1, libc::O_RDONLY).unwrap();
+        let anchor = overlay.ensure(Path::new("a")).unwrap();
+        assert_eq!(overlay.opened_files_after(anchor).unwrap().next(), None);
     }
 
     fn fixture() -> (TempDir, Overlay) {

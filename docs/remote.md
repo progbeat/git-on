@@ -91,9 +91,10 @@ An idle pool starts an ordinary request immediately. On a slow source the queue
 can wait up to two milliseconds to combine overlapping demands.
 
 A first access to a regular file in a directory opened for enumeration can
-schedule the next four uncached and previously unscheduled blob OIDs in Git's
-depth-first order through already opened directories. The same planner serves
-FUSE and NFS and uses separate packs for speculative work. Ordinary demands
+find up to four uncached and previously unscheduled blob OIDs in the next 32
+entries of Git's depth-first order through already opened directories. The
+same planner serves FUSE and NFS. Each speculative pack contains up to four
+OIDs. Ordinary demands
 take precedence and can join an active speculative request without duplicating
 its fetch. If that speculation fails, only waiting ordinary demands reenter
 the request queue. These paths require a reusable transport and an unrestricted
