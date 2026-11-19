@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -231,45 +232,82 @@ with ThreadPoolExecutor(12) as pool:
     def test_large_speculative_blob_uses_the_native_streaming_decoder(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
-        large = fixture.git('hash-object', '-w', '--stdin', data=b'x' * (9 * 1024 * 1024))
+        size = 9 * 1024 * 1024
+        large = fixture.git('hash-object', '-w', '--stdin', data=b'x' * size)
+        hidden = fixture.git('mktree', data=f'100644 blob {fixture.other}\tfile\n'.encode())
         tree = fixture.git('mktree', data=(
-            f'100644 blob {fixture.blob}\ta\n100644 blob {large}\tb\n'
+            f'100644 blob {fixture.blob}\ta\n100644 blob {large}\tb\n040000 tree {hidden}\thidden\n'
         ).encode())
         commit = fixture.git('commit-tree', tree, data=b'large speculative blob\n')
         fixture.git('update-ref', 'refs/heads/main', commit)
-        url = fixture.https()
+        backend = fixture.https()
         self.addCleanup(fixture.server.shutdown)
-        trace = fixture.root / 'native.jsonl'
-        fixture.env['GIT_TRACE2_EVENT'] = str(trace)
-        script = f"""
-import json, os, time
-from pathlib import Path
-assert sorted(os.listdir('.')) == ['a', 'b']
-assert Path('a').read_bytes() == b'expected\\n'
-trace = Path({str(trace)!r})
-deadline = time.monotonic() + 8
-while time.monotonic() < deadline:
-    lines = trace.read_text().splitlines()
-    events = []
-    for line in lines:
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    starts = {{e['sid'] for e in events if e['event'] == 'start'
-               and e['argv'][-3:] == ['cat-file', 'blob', {large!r}]}}
-    if any(e['event'] == 'exit' and e['sid'] in starts and e['code'] == 0 for e in events):
-        break
-    time.sleep(.02)
-else:
-    raise AssertionError('the unused large blob did not use the native streaming decoder')
-"""
-        result = subprocess.run(
-            [OPTIONS.binary, url, 'HEAD', mount_flag(), '--write-policy=none', '--',
-             sys.executable, '-I', '-S', '-c', script],
-            cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=20,
+        basic = base64.b64encode(b'fixture:example-password').decode()
+        proxy = Multiplexer(fixture, backend, 'Basic ' + basic)
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        fixture.env.update(
+            GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='credential.helper',
+            GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        started = fixture.root / 'decode-started'
+        release = fixture.root / 'release-decoder'
+        independent = fixture.root / 'independent-read'
+        tools = fixture.root / 'tools'
+        tools.mkdir()
+        wrapper = tools / 'git'
+        wrapper.write_text(f"""#!{sys.executable}
+import os, shutil, subprocess, sys, time
+from pathlib import Path
+native = {shutil.which('git')!r}
+args = sys.argv[1:]
+if args[-3:] != ['cat-file', 'blob', {large!r}]:
+    os.execv(native, [native, *args])
+with subprocess.Popen([native, *args], stdout=subprocess.PIPE) as child:
+    first = child.stdout.read(1)
+    assert first
+    sys.stdout.buffer.write(first)
+    sys.stdout.buffer.flush()
+    Path({str(started)!r}).touch()
+    deadline = time.monotonic() + 12
+    while not Path({str(release)!r}).exists():
+        assert time.monotonic() < deadline, 'decoder was never released'
+        time.sleep(.01)
+    shutil.copyfileobj(child.stdout, sys.stdout.buffer)
+    sys.exit(child.wait())
+""")
+        wrapper.chmod(0o700)
+        fixture.env['PATH'] = str(tools) + os.pathsep + fixture.env['PATH']
+        script = f"""
+import os, time
+from pathlib import Path
+assert sorted(os.listdir('.')) == ['a', 'b', 'hidden']
+assert Path('a').read_bytes() == b'expected\\n'
+deadline = time.monotonic() + 12
+while not Path({str(started)!r}).exists():
+    assert time.monotonic() < deadline, 'the prefetched blob did not reach the native decoder'
+    time.sleep(.01)
+assert Path('hidden/file').read_bytes() == b'unrelated payload\\n'
+Path({str(independent)!r}).touch()
+assert Path('b').stat().st_size == {size}
+"""
+        process = subprocess.Popen(
+            [OPTIONS.binary, url, commit, mount_flag(), '--write-policy=none', '--',
+             sys.executable, '-I', '-S', '-c', script],
+            cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        fixture.children.append(process)
+        try:
+            decoding = await_file(started, 8, process)
+            overlapped = decoding and await_file(independent, 4, process)
+        finally:
+            release.touch()
+        _, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertTrue(decoding, 'the speculative object did not use the native decoder')
+        self.assertTrue(overlapped, 'the unrelated read waited for the large pack decoder')
         self.assertEqual(sum(large in request['wants'] for request in fixture.requests), 1)
 
 

@@ -9,12 +9,12 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use git2::Oid;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io::{self, Read, Write},
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -27,6 +27,7 @@ const MAX_WANTS: usize = 64;
 const READ_AHEAD: usize = 4;
 const MAX_READ_AHEAD: usize = 256;
 const MAX_UNCONSUMED_PREDICTIONS: usize = 512;
+const MIN_PREDICTION_AGE: usize = 8;
 const MAX_FORECAST_SCORE: u8 = 24;
 const NATIVE_BLOB_STREAM_THRESHOLD: usize = 8 * 1024 * 1024;
 const REPLY_SAMPLES: u8 = 8;
@@ -153,6 +154,10 @@ impl Work {
     fn wants(&self) -> Vec<Oid> {
         self.items.iter().map(|item| item.oid).collect()
     }
+
+    fn cache_remainder(&self) -> bool {
+        self.speculative || self.items.iter().all(|item| item.demand.ready())
+    }
 }
 
 enum ConnectionMode {
@@ -194,7 +199,8 @@ struct Queue {
     waiting: VecDeque<QueuedDemand>,
     ahead: VecDeque<QueuedDemand>,
     pending: HashMap<Oid, Demand>,
-    predicted: HashSet<Oid>,
+    predicted: HashMap<Oid, u64>,
+    forecast_step: u64,
     forecast_score: u8,
     forecast_misses: u8,
     busy: [bool; CONNECTIONS],
@@ -216,7 +222,8 @@ impl Queue {
     }
 
     fn forecast_width(&mut self, anchor: Oid) -> usize {
-        if self.predicted.remove(&anchor) {
+        self.forecast_step = self.forecast_step.saturating_add(1);
+        if self.predicted.remove(&anchor).is_some() {
             self.forecast_score = (self.forecast_score + 1).min(MAX_FORECAST_SCORE);
             self.forecast_misses = 0;
         } else if self.forecast_score != 0 {
@@ -238,6 +245,21 @@ impl Queue {
 
     fn dense(&self) -> bool {
         self.forecast_score >= DENSE_SCORE && !matches!(self.mode, ConnectionMode::Standard)
+    }
+
+    fn prediction_room(&mut self, width: usize) -> usize {
+        let capacity = (4 * width).min(MAX_UNCONSUMED_PREDICTIONS);
+        if self.predicted.len() >= capacity && !matches!(self.mode, ConnectionMode::Standard) {
+            // Completed guesses from an earlier part of a scan can occupy
+            // the whole window while callers move through another subtree.
+            // Give their slots back without dropping a flight in progress.
+            let oldest = self
+                .forecast_step
+                .saturating_sub(width.max(MIN_PREDICTION_AGE) as u64);
+            self.predicted
+                .retain(|oid, &mut step| step > oldest || self.pending.contains_key(oid));
+        }
+        capacity.saturating_sub(self.predicted.len()).min(width)
     }
 
     fn foreground(&mut self, oid: Oid) -> Demand {
@@ -349,12 +371,14 @@ struct Http2Batch {
     started: Instant,
 }
 
+type FallbackPack = (Http2Batch, pack_stream::Received);
+
 pub(crate) struct Pool {
     shared: Arc<Shared>,
     scratch: RawBlobs,
     git: Arc<Git>,
     workers: Mutex<Vec<JoinHandle<Result<()>>>>,
-    wake: Option<UnixStream>,
+    wake: Option<Arc<UnixStream>>,
 }
 
 impl Pool {
@@ -394,12 +418,14 @@ impl Pool {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
         write.set_nonblocking(true)?;
+        let signal = Arc::new(write);
+        let worker_signal = signal.clone();
         let shared = Arc::<Shared>::default();
         let worker_state = shared.clone();
         let worker_scratch = scratch.clone();
         let git = Arc::new(git.clone());
         let worker_git = git.clone();
-        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let (ready, result) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("git-on-http2".into())
             .spawn(move || {
@@ -414,7 +440,13 @@ impl Pool {
                     return Ok(());
                 };
                 if ready.send(Some(selected)).is_ok() {
-                    worker_state.run_http2(client, read, &worker_scratch, &worker_git);
+                    worker_state.run_http2(
+                        client,
+                        read,
+                        worker_signal,
+                        &worker_scratch,
+                        &worker_git,
+                    );
                 }
                 Ok(())
             })?;
@@ -423,7 +455,7 @@ impl Pool {
             scratch: scratch.clone(),
             git,
             workers: Mutex::new(vec![worker]),
-            wake: Some(write),
+            wake: Some(signal),
         };
         let ready = result
             .recv()
@@ -434,9 +466,8 @@ impl Pool {
 
     fn wake(&self) {
         self.shared.work.notify_all();
-        if let Some(mut wake) = self.wake.as_ref() {
-            // A full signal socket is already readable.
-            let _ = wake.write(&[1]);
+        if let Some(wake) = self.wake.as_ref() {
+            signal_http2(wake);
         }
     }
 
@@ -494,24 +525,21 @@ impl Pool {
         // Only the first real access to a predicted OID earns credit.
         // Keep a bounded distance ahead of those observed accesses.
         let width = queue.forecast_width(anchor);
-        let limit = width.min(
-            (4 * width)
-                .min(MAX_UNCONSUMED_PREDICTIONS)
-                .saturating_sub(queue.predicted.len()),
-        );
+        let limit = queue.prediction_room(width);
         if limit == 0 {
             return;
         }
         let mut accepted = 0;
         for oid in candidates(queue.dense()) {
             if queue.pending.contains_key(&oid)
-                || queue.predicted.contains(&oid)
+                || queue.predicted.contains_key(&oid)
                 || self.scratch.available(oid)
                 || in_git(oid)
             {
                 continue;
             }
-            queue.predicted.insert(oid);
+            let step = queue.forecast_step;
+            queue.predicted.insert(oid, step);
             let mut entry = queue.insert(oid);
             entry.prefetch_width = width;
             queue.ahead.push_back(entry);
@@ -721,9 +749,7 @@ impl Shared {
                 self.prefetches.fetch_add(1, Ordering::Relaxed);
             }
             match pack.fallback {
-                Some(file)
-                    if work.speculative || work.items.iter().all(|item| item.demand.ready()) =>
-                {
+                Some(file) if work.cache_remainder() => {
                     self.resolve_pack_remainder(&work, scratch, git, file)?;
                     Ok(None)
                 }
@@ -758,6 +784,7 @@ impl Shared {
             Err(error)
                 if work.speculative
                     && !self.stop.load(Ordering::Relaxed)
+                    && queue.failure.is_none()
                     && !object::is_cancelled(&error) =>
             {
                 for item in work.items {
@@ -787,13 +814,36 @@ impl Shared {
         self: &Arc<Self>,
         mut client: crate::http2::Client,
         mut wake: UnixStream,
+        signal: Arc<UnixStream>,
         scratch: &RawBlobs,
         git: &Git,
     ) {
-        let failure = self
-            .drive_http2(&mut client, &mut wake, scratch, git)
-            .err()
-            .filter(|error| !object::is_cancelled(error));
+        let decoding = AtomicBool::new(true);
+        thread::scope(|scope| {
+            let (defer, fallback) = mpsc::channel::<FallbackPack>();
+            let running = &decoding;
+            let decoder = thread::Builder::new()
+                .name("git-on-pack-fallback".into())
+                .spawn_scoped(scope, move || {
+                    for (batch, pack) in fallback {
+                        if self.stop.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        self.finish(batch.work, Ok(pack), batch.started, None, scratch, git);
+                        signal_http2(&signal);
+                    }
+                });
+            let outcome = match decoder {
+                Ok(_) => self.drive_http2(&mut client, &mut wake, &defer, scratch, git),
+                Err(error) => Err(error).context("start Git pack fallback decoder"),
+            };
+            decoding.store(false, Ordering::Relaxed);
+            drop(defer);
+            self.finish_http2(outcome.err().filter(|error| !object::is_cancelled(error)));
+        });
+    }
+
+    fn finish_http2(&self, failure: Option<anyhow::Error>) {
         let pending = {
             let mut queue = self.queue.lock().unwrap();
             if let Some(error) = &failure {
@@ -817,6 +867,7 @@ impl Shared {
         self: &Arc<Self>,
         client: &mut crate::http2::Client,
         wake: &mut UnixStream,
+        defer: &mpsc::Sender<FallbackPack>,
         scratch: &RawBlobs,
         git: &Git,
     ) -> Result<()> {
@@ -866,10 +917,17 @@ impl Shared {
                 }
             }
             for (token, pack) in client.progress()? {
-                let Http2Batch { work, started } = active
+                let batch = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
-                self.finish(work, pack, started, None, scratch, git);
+                match pack {
+                    Ok(pack) if pack.fallback.is_some() && batch.work.cache_remainder() => {
+                        defer
+                            .send((batch, pack))
+                            .map_err(|_| anyhow::anyhow!("Git pack fallback decoder stopped"))?;
+                    }
+                    pack => self.finish(batch.work, pack, batch.started, None, scratch, git),
+                }
             }
             let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
                 remaining.max(Duration::from_millis(1))
@@ -979,6 +1037,11 @@ impl Shared {
     }
 }
 
+fn signal_http2(mut wake: &UnixStream) {
+    // A full signal socket is already readable.
+    let _ = wake.write(&[1]);
+}
+
 fn drain_wake(wake: &mut UnixStream) -> io::Result<()> {
     let mut buffer = [0; 256];
     loop {
@@ -1031,7 +1094,7 @@ mod tests {
         let mut queue = Queue::default();
         for index in 0..6 {
             let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid);
+            queue.predicted.insert(oid, queue.forecast_step);
             let expected = match index {
                 0 => 4,
                 1..=2 => 64,
@@ -1052,9 +1115,29 @@ mod tests {
         queue.mode = ConnectionMode::Standard;
         for index in 0..6 {
             let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid);
+            queue.predicted.insert(oid, queue.forecast_step);
             assert_eq!(queue.forecast_width(oid), READ_AHEAD);
         }
+    }
+
+    #[test]
+    fn old_completed_predictions_release_slots_but_live_requests_keep_them() {
+        let mut queue = Queue {
+            forecast_step: 12,
+            ..Queue::default()
+        };
+        for index in 0..4 * READ_AHEAD as u8 {
+            let oid = Oid::from_bytes(&[index; 20]).unwrap();
+            queue.predicted.insert(oid, 4);
+        }
+        let active = Oid::from_bytes(&[1; 20]).unwrap();
+        let recent = Oid::from_bytes(&[2; 20]).unwrap();
+        queue.pending.insert(active, Demand::default());
+        queue.predicted.insert(recent, 11);
+        assert_eq!(queue.prediction_room(READ_AHEAD), READ_AHEAD);
+        assert_eq!(queue.predicted.len(), 2);
+        assert!(queue.predicted.contains_key(&active));
+        assert!(queue.predicted.contains_key(&recent));
     }
 
     #[test]

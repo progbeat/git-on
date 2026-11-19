@@ -8,13 +8,16 @@ use anyhow::{Context, Result};
 use git2::{ObjectType, Oid};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::CString,
     fs::{File, Metadata},
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
+    },
 };
 
 pub(crate) const MEMORY_BUDGET: usize = 16 * 1024 * 1024;
@@ -333,10 +336,10 @@ impl RawBlob {
 /// rename. One last-read descriptor is shared by the store; blobs and child
 /// handles do not each retain a descriptor. Every disk read rechecks metadata.
 struct RawDirectory {
-    fd: File,
+    fd: Arc<File>,
     reader: Option<(Oid, Arc<File>)>,
     _owner: tempfile::TempDir,
-    writes: std::cell::Cell<(u64, u64)>,
+    writes: Arc<WriteMetrics>,
     #[cfg(test)]
     open_calls: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -353,10 +356,10 @@ impl RawDirectory {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(owner.path())?;
         Ok(Self {
-            fd,
+            fd: Arc::new(fd),
             reader: None,
             _owner: owner,
-            writes: std::cell::Cell::new((0, 0)),
+            writes: Arc::default(),
             #[cfg(test)]
             open_calls: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -409,14 +412,14 @@ impl RawDirectory {
         self.reader = Some((oid, file.clone()));
         Ok(file)
     }
-    fn pending(&self) -> Result<Pending<'_>> {
+    fn pending(&self) -> Result<Pending> {
         let name = CString::new(format!("pending-{}", uuid::Uuid::new_v4()))?;
         self.pending_name(name)
     }
-    fn pending_name(&self, name: CString) -> Result<Pending<'_>> {
+    fn pending_name(&self, name: CString) -> Result<Pending> {
         let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, None)?;
         Ok(Pending {
-            directory: self,
+            directory: self.fd.clone(),
             name,
             file,
             committed: false,
@@ -443,39 +446,42 @@ impl RawDirectory {
         }
     }
 }
+
+#[derive(Default)]
+struct WriteMetrics {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
 struct RawWriter<'a> {
     file: &'a mut File,
-    totals: &'a std::cell::Cell<(u64, u64)>,
+    totals: &'a WriteMetrics,
 }
 impl Write for RawWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let (calls, written) = self.totals.get();
-        self.totals.set((calls.saturating_add(1), written));
+        self.totals.calls.fetch_add(1, Ordering::Relaxed);
         let count = self.file.write(bytes)?;
-        self.totals.set((
-            calls.saturating_add(1),
-            written.saturating_add(count as u64),
-        ));
+        self.totals.bytes.fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
 }
-struct Pending<'a> {
-    directory: &'a RawDirectory,
+struct Pending {
+    directory: Arc<File>,
     name: CString,
     file: File,
     committed: bool,
 }
-impl Pending<'_> {
+impl Pending {
     fn commit(mut self, oid: Oid) -> Result<()> {
         let target = CString::new(oid.to_string())?;
         if unsafe {
             libc::renameat(
-                self.directory.fd.as_raw_fd(),
+                self.directory.as_raw_fd(),
                 self.name.as_ptr(),
-                self.directory.fd.as_raw_fd(),
+                self.directory.as_raw_fd(),
                 target.as_ptr(),
             )
         } != 0
@@ -486,11 +492,11 @@ impl Pending<'_> {
         Ok(())
     }
 }
-impl Drop for Pending<'_> {
+impl Drop for Pending {
     fn drop(&mut self) {
         if !self.committed {
             unsafe {
-                libc::unlinkat(self.directory.fd.as_raw_fd(), self.name.as_ptr(), 0);
+                libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
             }
         }
     }
@@ -499,13 +505,29 @@ impl Drop for Pending<'_> {
 #[derive(Clone)]
 pub(crate) struct RawBlobs {
     state: Arc<Mutex<Store>>,
+    prepared: Arc<Condvar>,
 }
+
+struct BlobPreparation<'a> {
+    blobs: &'a RawBlobs,
+    oid: Oid,
+}
+
+impl Drop for BlobPreparation<'_> {
+    fn drop(&mut self) {
+        let mut store = self.blobs.state.lock().unwrap_or_else(|e| e.into_inner());
+        store.preparing.remove(&self.oid);
+        self.blobs.prepared.notify_all();
+    }
+}
+
 impl RawBlobs {
     pub(crate) fn new(directory: &Path) -> Result<Self> {
         Ok(Self {
             state: Arc::new(Mutex::new(Store {
                 directory: RawDirectory::new(directory)?,
                 objects: HashMap::new(),
+                preparing: HashSet::new(),
                 packed: HashMap::new(),
                 memory: lru::LruCache::unbounded(),
                 memory_bytes: 0,
@@ -520,6 +542,7 @@ impl RawBlobs {
                 #[cfg(test)]
                 authenticated_bytes: 0,
             })),
+            prepared: Arc::default(),
         })
     }
     fn blob(&self, oid: Oid, object: &Descriptor) -> RawBlob {
@@ -671,7 +694,10 @@ impl RawBlobs {
         used: bool,
         transfer: impl FnOnce(&mut dyn Write) -> Result<()>,
     ) -> Result<RawBlob> {
-        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A spill can wait for the transport or a decoder. Hold the
+        // reservation until publication, leaving other OIDs accessible.
+        let _preparation;
+        let mut store = self.wait_for_preparation(oid);
         if let Some(object) = store.objects.get(&oid) {
             return Ok(self.blob(oid, object));
         }
@@ -692,9 +718,17 @@ impl RawBlobs {
             (digests, buffers)
         } else {
             let mut pending = store.directory.pending()?;
-            let mut output = Blocks::new(store.directory.writer(&mut pending.file));
+            let totals = store.directory.writes.clone();
+            store.preparing.insert(oid);
+            drop(store);
+            _preparation = BlobPreparation { blobs: self, oid };
+            let mut output = Blocks::new(RawWriter {
+                file: &mut pending.file,
+                totals: &totals,
+            });
             transfer(&mut output)?;
             let (_, digests) = output.finish();
+            store = self.state.lock().unwrap_or_else(|e| e.into_inner());
             pending.commit(oid)?;
             (digests, Vec::new())
         };
@@ -724,6 +758,13 @@ impl RawBlobs {
             store.disk_bytes += size as u64;
         }
         Ok(self.blob(oid, store.objects.get(&oid).unwrap()))
+    }
+
+    fn wait_for_preparation(&self, oid: Oid) -> MutexGuard<'_, Store> {
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.prepared
+            .wait_while(store, |store| store.preparing.contains(&oid))
+            .unwrap_or_else(|e| e.into_inner())
     }
     pub(crate) fn insert_tree(
         &mut self,
@@ -874,10 +915,7 @@ impl RawBlobs {
         })
     }
     pub(crate) fn discard(&self, oid: Oid) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .forget_blob(oid)
+        self.wait_for_preparation(oid).forget_blob(oid)
     }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
@@ -918,12 +956,12 @@ impl RawBlobs {
         (store.disk_bytes, store.disk_entries)
     }
     pub(crate) fn write_metrics(&self) -> (u64, u64) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .directory
-            .writes
-            .get()
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let writes = &store.directory.writes;
+        (
+            writes.calls.load(Ordering::Relaxed),
+            writes.bytes.load(Ordering::Relaxed),
+        )
     }
     pub(crate) fn tree_metrics(&self) -> (u64, usize, usize) {
         let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -966,6 +1004,7 @@ impl RawBlobs {
 struct Store {
     directory: RawDirectory,
     objects: HashMap<Oid, Descriptor>,
+    preparing: HashSet<Oid>,
     packed: HashMap<Oid, Arc<tempfile::TempDir>>,
     memory: lru::LruCache<Oid, Resident>,
     memory_bytes: usize,
