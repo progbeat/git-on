@@ -1547,13 +1547,31 @@ impl Overlay {
     }
 }
 
+pub(crate) enum SourceLookup {
+    Inode(u64),
+    Tree(Oid),
+}
+
 impl Overlay {
-    pub(crate) fn parallel_remote_sizes(&self) -> bool {
+    pub(crate) fn parallel_remote_reads(&self) -> bool {
         self.write_policy != WritePolicy::All && self._snapshot.remote_http()
     }
 
-    pub(crate) fn start_remote_size(&self, oid: Oid) -> Option<crate::snapshot::PendingObject> {
+    pub(crate) fn start_remote_demand(&self, oid: Oid) -> Option<crate::snapshot::PendingObject> {
         self._snapshot.start_remote_demand(oid)
+    }
+
+    pub(crate) fn pending_source_tree(&self, ino: u64) -> Option<Oid> {
+        let node = self.nodes.get(&ino)?;
+        let source = node.snapshot_path.as_ref()?;
+        if node.attr.kind == FileType::Directory
+            && self.protected_source(ino)
+            && !self.source_directory_keys.contains_key(source)
+        {
+            node.oid
+        } else {
+            None
+        }
     }
 
     pub(crate) fn pending_source_size(&self, ino: u64) -> Option<Oid> {
@@ -1565,18 +1583,41 @@ impl Overlay {
         }
     }
 
-    /// A queued demand may resolve its name without crossing another remote
-    /// fetch. A prepared source directory has all its ancestors available.
-    pub(crate) fn lookup_cached_inode(&mut self, parent: u64, name: &OsStr) -> Option<u64> {
+    /// Resolve a protected pathname using local metadata, or identify the
+    /// exact parent tree that its lookup still requires.
+    pub(crate) fn probe_source_lookup(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+    ) -> Option<SourceLookup> {
         if !self.protected_source(parent) {
             return None;
         }
         let path = self.child(parent, name).ok()?;
-        let source = self.lower_path(&path)?;
-        if !self.source_directory_keys.contains_key(source.parent()?) {
-            return None;
+        if let Some(&ino) = self
+            .paths
+            .get(&path)
+            .filter(|ino| self.nodes.contains_key(ino))
+        {
+            return Some(SourceLookup::Inode(ino));
         }
-        self.lookup_inode(parent, name).ok()
+        let source = self.lower_path(&path)?;
+        let source_parent = source.parent()?;
+        if !self.source_directory_keys.contains_key(source_parent) {
+            let node = self.nodes.get(&parent)?;
+            if node.snapshot_path.as_deref()? != source_parent {
+                return None;
+            }
+            let oid = node.oid?;
+            let Some(tree) = self._snapshot.directory_by_oid_if_available(oid).ok()? else {
+                return Some(SourceLookup::Tree(oid));
+            };
+            self.insert_source_directory(source_parent.to_owned(), tree)
+                .ok()?;
+        }
+        self.lookup_inode(parent, name)
+            .ok()
+            .map(SourceLookup::Inode)
     }
 
     pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {

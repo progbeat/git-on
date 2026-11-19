@@ -191,14 +191,14 @@ async fn serve(
     let (queue, mut jobs) = mpsc::channel(QUEUE_DEPTH);
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stopped = Arc::clone(&stopped);
-    let parallel_sizes = server.core.parallel_remote_sizes();
+    let parallel_reads = server.core.parallel_remote_reads();
     let runtime = tokio::runtime::Handle::current();
     let wake = Arc::new(Notify::new());
     let worker_wake = wake.clone();
     // Overlay already serializes tree and backing mutations. A single bounded
     // queue also keeps native Git waits off the runtime's socket tasks.
     let mut worker = tokio::task::spawn_blocking(move || {
-        if parallel_sizes {
+        if parallel_reads {
             server.serve_parallel(&mut jobs, &worker_stopped, &runtime, &worker_wake);
             return;
         }
@@ -232,7 +232,7 @@ async fn serve(
                 match accepted {
                     Ok((socket, _)) => {
                         if socket.peer_cred().is_ok_and(|peer| peer.uid() == 0 || peer.uid() == uid) {
-                            let limit = if parallel_sizes { QUEUE_DEPTH } else { 1 };
+                            let limit = if parallel_reads { QUEUE_DEPTH } else { 1 };
                             peers.spawn(connection(socket, queue.clone(), limit));
                         }
                     }

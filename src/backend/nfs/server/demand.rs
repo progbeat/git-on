@@ -9,7 +9,7 @@ use super::{
     protocol::{self, Credentials, Rpc, SessionId, MAX_OPS},
     Context, Server, Writer, MIN_CHANNEL_SIZE,
 };
-use crate::{backend::FileType, snapshot::PendingObject};
+use crate::{backend::FileType, filesystem::SourceLookup, snapshot::PendingObject};
 use git2::Oid;
 use std::{
     sync::{
@@ -25,10 +25,16 @@ use tokio::{
 
 type SlotKey = (SessionId, u32);
 
+enum ObjectDemand {
+    Final(Oid),
+    ParentTree(Oid),
+}
+
 struct ParkedCall {
     job: Job,
     slot: SlotKey,
     object: PendingObject,
+    recheck_lookup: bool,
 }
 
 enum Event {
@@ -52,6 +58,24 @@ impl Server {
                 if parked[index].object.ready() {
                     let call = parked.swap_remove(index);
                     call.object.finish();
+                    if call.recheck_lookup {
+                        let next = match &call.job {
+                            Job::Call(data, _) => self.read_request(data, &parked),
+                            Job::Sweep => None,
+                        };
+                        if let Some((slot, Some(demand))) = next {
+                            if let Some((object, recheck_lookup)) = self.start_demand(demand, wake)
+                            {
+                                parked.push(ParkedCall {
+                                    job: call.job,
+                                    slot,
+                                    object,
+                                    recheck_lookup,
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     call.job.run(self);
                 } else {
                     index += 1;
@@ -89,10 +113,14 @@ impl Server {
                     }
                 }
                 Job::Call(data, _) => match self.read_request(data, &parked) {
-                    Some((slot, Some(oid))) => {
-                        if let Some(object) = self.core.start_remote_size(oid) {
-                            object.notify_when_ready(wake);
-                            parked.push(ParkedCall { job, slot, object });
+                    Some((slot, Some(demand))) => {
+                        if let Some((object, recheck_lookup)) = self.start_demand(demand, wake) {
+                            parked.push(ParkedCall {
+                                job,
+                                slot,
+                                object,
+                                recheck_lookup,
+                            });
                             continue;
                         }
                     }
@@ -109,13 +137,27 @@ impl Server {
         }
     }
 
+    fn start_demand(
+        &self,
+        demand: ObjectDemand,
+        wake: &Arc<Notify>,
+    ) -> Option<(PendingObject, bool)> {
+        let (oid, recheck_lookup) = match demand {
+            ObjectDemand::Final(oid) => (oid, false),
+            ObjectDemand::ParentTree(oid) => (oid, true),
+        };
+        let object = self.core.start_remote_demand(oid)?;
+        object.notify_when_ready(wake);
+        Some((object, recheck_lookup))
+    }
+
     /// Inspect a new request without consuming its sequence ID. Suspended
     /// requests use the normal RPC path when the demanded object is available.
     fn read_request(
         &mut self,
         data: &[u8],
         parked: &[ParkedCall],
-    ) -> Option<(SlotKey, Option<Oid>)> {
+    ) -> Option<(SlotKey, Option<ObjectDemand>)> {
         let (_, Rpc::Compound(credentials, request)) = protocol::rpc(data).ok()? else {
             return None;
         };
@@ -145,7 +187,7 @@ impl Server {
         {
             return None;
         }
-        if parked.is_empty() && !matches!(call.count, 3 | 5 | 6) {
+        if parked.is_empty() && !(3..=6).contains(&call.count) {
             return Some((id, None));
         }
         let ops: Vec<_> = (1..call.count).map(|_| next()).collect::<Option<_>>()?;
@@ -168,9 +210,20 @@ impl Server {
             return None;
         }
         let oid = match ops.as_slice() {
+            [PutFh(handle), ReadDir {
+                cookie: 0,
+                maxcount,
+                ..
+            }] if *maxcount >= 16 => self.directory_demand(credentials, handle, None),
+            [PutFh(handle), GetAttr(mask), ReadDir {
+                cookie: 0,
+                maxcount,
+                ..
+            }] if *maxcount >= 16 => self.directory_demand(credentials, handle, Some(*mask)),
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
                 self.attribute_size_demand(ino, *mask)
+                    .map(ObjectDemand::Final)
             }
             [PutFh(handle), GetAttr(parent_mask), Lookup(name), GetFh, GetAttr(mask)] => {
                 self.lookup_size_demand(credentials, handle, Some(*parent_mask), name, *mask)
@@ -181,6 +234,23 @@ impl Server {
             _ => None,
         };
         Some((id, oid))
+    }
+
+    fn directory_demand(
+        &mut self,
+        credentials: Credentials,
+        handle: &[u8],
+        prior_mask: Option<Bitmap>,
+    ) -> Option<ObjectDemand> {
+        let ino = self.inode_from_handle(handle).ok()?;
+        let oid = self.core.pending_source_tree(ino)?;
+        if let Some(mask) = prior_mask {
+            self.get_attributes(ino, mask, false, &mut Writer::default())
+                .ok()?;
+        }
+        self.require_access(&Context::new(credentials), ino, libc::R_OK | libc::X_OK)
+            .ok()?;
+        Some(ObjectDemand::Final(oid))
     }
 
     fn attribute_size_demand(&self, ino: u64, mask: Bitmap) -> Option<Oid> {
@@ -196,7 +266,7 @@ impl Server {
         parent_mask: Option<Bitmap>,
         name: &[u8],
         mask: Bitmap,
-    ) -> Option<Oid> {
+    ) -> Option<ObjectDemand> {
         let parent = self.inode_from_handle(handle).ok()?;
         if self.core.nfs_attributes(parent, false).ok()?.0.kind != FileType::Directory {
             return None;
@@ -207,9 +277,14 @@ impl Server {
         }
         self.require_access(&Context::new(credentials), parent, libc::X_OK)
             .ok()?;
-        let ino = self
+        match self
             .core
-            .lookup_cached_inode(parent, component(name).ok()?)?;
-        self.attribute_size_demand(ino, mask)
+            .probe_source_lookup(parent, component(name).ok()?)?
+        {
+            SourceLookup::Inode(ino) => self
+                .attribute_size_demand(ino, mask)
+                .map(ObjectDemand::Final),
+            SourceLookup::Tree(oid) => Some(ObjectDemand::ParentTree(oid)),
+        }
     }
 }

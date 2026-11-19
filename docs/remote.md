@@ -69,9 +69,11 @@ custom server/vcs/server-option settings, explicit fsck policy, or a custom
 helper path supports reuse. No fetched object is retried merely to change
 decoders, and no unrelated future OID is requested.
 
-On FUSE and NFS, a size lookup for an unavailable protected source blob in a
-prepared directory can wait independently of the filesystem worker. The two
-backends share an HTTP(S) loader with up to four invocation-owned connections.
+On FUSE and NFS, protected directory and file lookups can wait for an exact
+object independently of the filesystem worker. A cold pathname lookup can
+wait for its parent tree, then resolve the name and wait for its file size.
+Directory enumeration can wait for its tree as well. The two backends share an
+HTTP(S) loader with up to four invocation-owned connections.
 One entry represents each pending OID and a fetch can group up to eight OIDs
 already requested. Single requests reuse the first connection immediately.
 The other helpers start when demands overlap. Cached objects bypass the queue.

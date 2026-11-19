@@ -1627,6 +1627,63 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
         self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
         self.assertFalse(list(f.root.glob('git-on-*')))
 
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_cold_directory_demand_overlaps_file_lookup(self):
+        f = self.f
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        self.addCleanup(f.resume.set)
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
+        for operation, check, children in (
+            ("os.listdir, 'deep'", "['file']", []),
+            ("lambda: os.stat('deep/file').st_size", '9', [f.blob]),
+        ):
+            with self.subTest(operation=operation):
+                f.requests.clear()
+                f.stalled.clear()
+                f.resume.clear()
+                f.stalled_oids = {f.subtree}
+                gate = f.root / 'start-independent'
+                done = f.root / 'independent-done'
+                for path in (gate, done):
+                    path.unlink(missing_ok=True)
+                code = f"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import os
+import time
+assert 'deep' in os.listdir('.')
+with ThreadPoolExecutor(1) as pool:
+    first = pool.submit({operation})
+    while not Path({str(gate)!r}).exists():
+        time.sleep(.01)
+    assert os.stat('other').st_size == 18
+    Path({str(done)!r}).touch()
+    assert first.result() == {check}
+"""
+                process = subprocess.Popen(
+                    [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend,
+                     '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', code],
+                    cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                f.children.append(process)
+                try:
+                    reached_tree = f.stalled.wait(timeout=10)
+                    gate.touch()
+                    deadline = time.monotonic() + 5
+                    while not done.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    overlapped = done.exists()
+                finally:
+                    f.resume.set()
+                _, errors = process.communicate(timeout=12)
+                self.assertEqual(process.returncode, 0, errors)
+                self.assertTrue(reached_tree, 'operation did not demand the cold tree')
+                self.assertTrue(overlapped, 'independent lookup waited for the cold tree')
+                self.assertCountEqual([oid for request in f.requests for oid in request['wants']],
+                                      [f.commit, f.tree, f.subtree, f.other, *children])
+                self.assertFalse(list(f.root.glob('git-on-*')))
+
     @unittest.skipUnless(OPTIONS.require_fuse, 'requires the FUSE directory reference lifecycle')
     def test_fuse_lookup_survives_directory_close_during_https_wait(self):
         f = self.f

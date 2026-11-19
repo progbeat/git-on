@@ -953,6 +953,19 @@ impl Snapshot {
     pub(crate) fn directory_by_oid(&self, oid: Oid) -> Result<Arc<Directory>> {
         self.state()?.tree(oid)
     }
+
+    pub(crate) fn directory_by_oid_if_available(&self, oid: Oid) -> Result<Option<Arc<Directory>>> {
+        let mut state = self.state()?;
+        if let Some((tree, first)) = state.raw_store().and_then(|raw| raw.directory(oid)) {
+            state.metrics.tree_reads += u64::from(first);
+            state.metrics.cache_hits += u64::from(!first);
+            return Ok(Some(tree));
+        }
+        if state.repo.odb()?.exists(oid) {
+            return state.tree(oid).map(Some);
+        }
+        Ok(None)
+    }
     /// Enumerate one directory without reading child tree objects or blob headers.
     pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
         self.directory(path)?
