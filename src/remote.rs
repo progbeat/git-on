@@ -993,10 +993,20 @@ impl Remote {
         self.session_checked = true;
         self.session_starts += 1;
         let repo = Repository::open_bare(&self.dir)?;
+        let fetch_started = Instant::now();
         if !self.fetch_in_session(&repo, &[oid])? {
             return Ok(None);
         }
         if let Some(connection) = connection {
+            if fetch_started.elapsed() >= crate::demand::SLOW_REPLY {
+                // Let the first fetch finish before negotiating the next
+                // spares, so they can open while the root is being fetched.
+                for _ in 0..SSH_STANDBY_CHANNELS {
+                    if let Ok(candidate) = connection.start_additional() {
+                        candidates.push(candidate);
+                    }
+                }
+            }
             let mut pool = crate::demand::Pool::prepare_native(
                 &connection,
                 &self.raw_blobs,

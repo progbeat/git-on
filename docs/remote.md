@@ -94,6 +94,8 @@ owned master and uses fewer when the server refuses an additional channel.
 On a slow SSH startup, up to two spare channels can begin negotiating protocol
 v2 as soon as the authenticated, owned socket exists. The first channel to
 advertise filtered protocol v2 selects the revision and prepares the snapshot.
+If fetching the selected object also takes at least 64 milliseconds, up to two
+more SSH channels can start negotiating while the root tree is fetched.
 When another channel opens during execution, pending requests stay eligible
 on the existing channels until one is available to send them.
 Beyond the initial SSH pool, actual demands open additional channels.
