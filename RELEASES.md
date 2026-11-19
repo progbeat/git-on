@@ -13,6 +13,7 @@
   source and caller configuration support it.
 - Reuse authenticated channels during startup for exact object IDs and
   unambiguous remote branches.
+- Preserve native Git selection for force-prefixed fetch refspecs.
 - Wake promptly when a native Git subprocess exits on macOS, reducing polling
   delays during snapshot preparation and pack decoding.
 - Open spare SSH channels while the initial one negotiates Git and during

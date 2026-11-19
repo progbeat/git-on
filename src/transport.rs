@@ -512,6 +512,7 @@ impl BranchQuery {
         if revision.is_empty()
             || revision.len() > 1024
             || revision.starts_with('-')
+            || revision.starts_with('+')
             || revision == "HEAD"
         {
             return None;

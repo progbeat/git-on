@@ -402,6 +402,21 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file')
                 self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_force_prefixed_refspec_follows_native_ssh_selection(self):
+        f = self.f
+        other_tree = f.git('mktree', data=f'100644 blob {f.other}\tfile\n'.encode())
+        other = f.git('commit-tree', other_tree, data=b'force refspec fixture\n')
+        f.git('update-ref', 'refs/heads/+main', other)
+        source = f.ssh(protocol_v2=True)
+        for revision, commit, tree in (
+            ('+main', f.commit, f.tree),
+            ('refs/heads/+main', other, other_tree),
+        ):
+            with self.subTest(revision=revision):
+                self.assertEqual(self.fetched_oid(source, revision), commit)
+                process = f.probe(source, revision)
+                self.assertEqual(f.line(process)['tree'], tree)
+                f.finish(process)
     def test_fetch_branch_tag_collision_follows_native_precedence(self):
         f=self.f; source='file://'+str(f.repo)
         other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
