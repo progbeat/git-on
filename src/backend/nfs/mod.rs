@@ -10,7 +10,6 @@ mod xdr;
 use self::server::Server;
 use crate::{filesystem::Overlay, platform, policy::WritePolicy};
 use std::{
-    collections::VecDeque,
     fs::{self, DirBuilder},
     io,
     os::unix::{fs::DirBuilderExt, net::UnixListener as StdListener},
@@ -26,7 +25,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Notify},
     task::JoinSet,
 };
 use xdr::{fragment, MAX_RECORD};
@@ -192,20 +191,20 @@ async fn serve(
     let (queue, mut jobs) = mpsc::channel(QUEUE_DEPTH);
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stopped = Arc::clone(&stopped);
-    let batch_sizes = server.core.remote_size_batching();
+    let parallel_sizes = server.core.parallel_remote_sizes();
     let runtime = tokio::runtime::Handle::current();
+    let wake = Arc::new(Notify::new());
+    let worker_wake = wake.clone();
     // Overlay already serializes tree and backing mutations. A single bounded
     // queue also keeps native Git waits off the runtime's socket tasks.
     let mut worker = tokio::task::spawn_blocking(move || {
-        let mut waiting = VecDeque::new();
-        while let Some(job) = waiting.pop_front().or_else(|| jobs.blocking_recv()) {
+        if parallel_sizes {
+            server.serve_parallel(&mut jobs, &worker_stopped, &runtime, &worker_wake);
+            return;
+        }
+        while let Some(job) = jobs.blocking_recv() {
             if worker_stopped.load(Ordering::Relaxed) {
                 break;
-            }
-            if batch_sizes {
-                if let Job::Call(data, _) = &job {
-                    server.combine_pending_sizes(data, &mut waiting, &mut jobs, &runtime);
-                }
             }
             job.run(&mut server);
         }
@@ -233,7 +232,7 @@ async fn serve(
                 match accepted {
                     Ok((socket, _)) => {
                         if socket.peer_cred().is_ok_and(|peer| peer.uid() == 0 || peer.uid() == uid) {
-                            let limit = if batch_sizes { QUEUE_DEPTH } else { 1 };
+                            let limit = if parallel_sizes { QUEUE_DEPTH } else { 1 };
                             peers.spawn(connection(socket, queue.clone(), limit));
                         }
                     }
@@ -248,6 +247,7 @@ async fn serve(
     }
     drop(listener);
     stopped.store(true, Ordering::Relaxed);
+    wake.notify_one();
     peers.shutdown().await;
     drop(queue);
     if !worker_done {

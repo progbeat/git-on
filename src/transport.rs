@@ -12,17 +12,35 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
-struct Input(UnixStream);
+type Stop = Option<Arc<AtomicBool>>;
+
+fn check_transfer(stop: &Stop) -> io::Result<()> {
+    if stop
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Err(io::Error::other(
+            anyhow::Error::new(crate::object::OperationCancelled)
+                .context("owned HTTPS transport stopped"),
+        ));
+    }
+    crate::object::check_transfer().map_err(io::Error::other)
+}
+
+struct Input(UnixStream, Stop);
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            check_transfer(&self.1)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
@@ -37,11 +55,11 @@ impl Read for Input {
         }
     }
 }
-struct Output(UnixStream);
+struct Output(UnixStream, Stop);
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            check_transfer(&self.1)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLOUT,
@@ -110,8 +128,15 @@ fn packet_text(bytes: &[u8]) -> &[u8] {
 impl Session {
     /// A missing protocol/helper capability is an optional optimization miss,
     /// before any fetch. Errors after a fetch request must never retry it.
-    pub(crate) fn connect(mut command: Command, helper: bool) -> Result<Option<Self>> {
-        crate::object::check_transfer()?;
+    pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
+        Self::connect_with_stop(command, helper, None)
+    }
+    pub(crate) fn connect_with_stop(
+        mut command: Command,
+        helper: bool,
+        stop: Stop,
+    ) -> Result<Option<Self>> {
+        check_transfer(&stop)?;
         let (input, to_child) = UnixStream::pair()?;
         input.set_nonblocking(true)?;
         let (output, from_child) = UnixStream::pair()?;
@@ -139,8 +164,8 @@ impl Session {
         drop(command);
         let mut session = Self {
             owner: Owner(Mutex::new(Some(child))),
-            input: Output(input),
-            output: BufReader::with_capacity(64 * 1024, Input(output)),
+            input: Output(input, stop.clone()),
+            output: BufReader::with_capacity(64 * 1024, Input(output, stop)),
             errors,
             stateless: helper,
         };
@@ -153,6 +178,10 @@ impl Session {
                     .with_context(|| format!("open native demand channel: {}", diagnostic.trim()))
             }
         }
+    }
+    pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.input.1 = Some(stop.clone());
+        self.output.get_mut().1 = Some(stop);
     }
     fn handshake(&mut self, helper: bool) -> Result<bool> {
         if helper {
@@ -255,8 +284,19 @@ impl Session {
         output.extend_from_slice(bytes);
         Ok(())
     }
-    pub(crate) fn stateless(&self) -> bool {
-        self.stateless
+    pub(crate) fn fetch_exact(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
+        self.fetch(oids, pack).with_context(|| {
+            let diagnostic = self.error_text();
+            let wanted = if let [oid] = oids {
+                format!("object {oid}")
+            } else {
+                format!("objects ({} requests, first {})", oids.len(), oids[0])
+            };
+            format!(
+                "remote fetch of exact {wanted} failed: {}",
+                diagnostic.trim()
+            )
+        })
     }
     pub(crate) fn fetch(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
         // The completed previous response has no diagnostics to retain. A
@@ -533,8 +573,8 @@ mod tests {
         source.shutdown(std::net::Shutdown::Write).unwrap();
         let session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input),
-            output: BufReader::new(Input(output)),
+            input: Output(input, None),
+            output: BufReader::new(Input(output, None)),
             errors: tempfile::tempfile().unwrap(),
             stateless: false,
         };
@@ -677,8 +717,8 @@ mod tests {
             source.shutdown(std::net::Shutdown::Write).unwrap();
             let mut session = Session {
                 owner: Owner(Mutex::new(None)),
-                input: Output(input),
-                output: BufReader::new(Input(output)),
+                input: Output(input, None),
+                output: BufReader::new(Input(output, None)),
                 errors: tempfile::tempfile().unwrap(),
                 stateless: false,
             };
@@ -736,8 +776,8 @@ mod tests {
         errors.write_all(b"actual failure").unwrap();
         let mut session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input),
-            output: BufReader::new(Input(output)),
+            input: Output(input, None),
+            output: BufReader::new(Input(output, None)),
             errors,
             stateless: false,
         };

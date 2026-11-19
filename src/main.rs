@@ -784,7 +784,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         if let Some(error) = transport_cleanup_failure {
             return Err(error).with_context(|| {
                 format!(
-                    "owned SSH shutdown failed; recovery state retained at {}",
+                    "owned remote transport shutdown failed; recovery state retained at {}",
                     dir.display()
                 )
             });

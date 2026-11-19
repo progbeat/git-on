@@ -9,88 +9,113 @@ use super::{
     protocol::{self, Credentials, Rpc, SessionId, MAX_OPS},
     Context, Server, Writer, MIN_CHANNEL_SIZE,
 };
-use crate::backend::FileType;
+use crate::{backend::FileType, snapshot::PendingObject};
 use git2::Oid;
-use std::{collections::VecDeque, time::Duration};
-use tokio::{runtime::Handle, sync::mpsc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, Notify},
+};
 
-enum ReadRequest {
-    Size(Oid),
-    DirectoryAttributes,
-    Other,
+type SlotKey = (SessionId, u32);
+
+struct ParkedCall {
+    job: Job,
+    slot: SlotKey,
+    object: PendingObject,
+}
+
+enum Event {
+    Job(Option<Job>),
+    Completion,
 }
 
 impl Server {
-    pub(in crate::backend::nfs) fn combine_pending_sizes(
+    pub(in crate::backend::nfs) fn serve_parallel(
         &mut self,
-        first: &[u8],
-        waiting: &mut VecDeque<Job>,
         jobs: &mut mpsc::Receiver<Job>,
+        stopped: &AtomicBool,
         runtime: &Handle,
+        wake: &Arc<Notify>,
     ) {
-        if (waiting.is_empty() && jobs.is_empty()) || !self.core.can_combine_remote_sizes() {
-            return;
-        }
-        let mut slots = Vec::new();
-        let Some(ReadRequest::Size(first)) = self.read_request(first, &mut slots) else {
-            return;
-        };
-        let mut wants = vec![first];
-        let mut checked = 0;
-        let mut unblocked = false;
-        let until = Instant::now() + Duration::from_millis(3);
-        for _ in 0..(2 * QUEUE_DEPTH - 1) {
-            if checked == QUEUE_DEPTH - 1 {
-                break;
+        let mut parked = Vec::<ParkedCall>::new();
+        let mut barrier = None;
+        while !stopped.load(Ordering::Relaxed) {
+            let mut index = 0;
+            while index < parked.len() {
+                if parked[index].object.ready() {
+                    let call = parked.swap_remove(index);
+                    call.object.finish();
+                    call.job.run(self);
+                } else {
+                    index += 1;
+                }
             }
-            if checked == waiting.len() {
-                let job = jobs.try_recv().ok().or_else(|| {
-                    // A directory-attribute reply may let an independent
-                    // lookup reach us. A lone lookup incurs no wait.
-                    unblocked
-                        .then(|| {
-                            runtime.block_on(async {
-                                tokio::time::timeout_at(until, jobs.recv())
-                                    .await
-                                    .ok()
-                                    .flatten()
-                            })
-                        })
-                        .flatten()
-                });
-                let Some(job) = job else { break };
-                waiting.push_back(job);
-            }
-            let Job::Call(data, _) = &waiting[checked] else {
-                break;
+            let event = if parked.is_empty() {
+                Event::Job(barrier.take().or_else(|| jobs.blocking_recv()))
+            } else if barrier.is_some() || parked.len() == QUEUE_DEPTH {
+                runtime.block_on(wake.notified());
+                Event::Completion
+            } else {
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = wake.notified() => Event::Completion,
+                        job = jobs.recv() => Event::Job(job),
+                    }
+                })
             };
-            match self.read_request(data, &mut slots) {
-                Some(ReadRequest::Size(oid)) => {
-                    wants.push(oid);
-                    checked += 1;
-                    unblocked = false;
+            let job = match event {
+                Event::Job(Some(job)) if !stopped.load(Ordering::Relaxed) => job,
+                Event::Completion => continue,
+                _ => break,
+            };
+            match &job {
+                Job::Sweep => {
+                    // Pending validated slots still hold their clients' leases.
+                    let now = Instant::now();
+                    for call in &parked {
+                        if let Some(session) = self.sessions.get(&call.slot.0) {
+                            if let Some(client) = self.clients.get_mut(&session.client) {
+                                client.active = now;
+                            }
+                        }
+                    }
                 }
-                Some(ReadRequest::DirectoryAttributes) => {
-                    waiting.remove(checked).unwrap().run(self);
-                    slots.pop();
-                    unblocked = true;
-                }
-                Some(ReadRequest::Other) => checked += 1,
-                None => break,
+                Job::Call(data, _) => match self.read_request(data, &parked) {
+                    Some((slot, Some(oid))) => {
+                        if let Some(object) = self.core.start_remote_size(oid) {
+                            object.notify_when_ready(wake);
+                            parked.push(ParkedCall { job, slot, object });
+                            continue;
+                        }
+                    }
+                    None if !parked.is_empty() => {
+                        // Keep replays, session teardown and mutations in
+                        // order with calls suspended on their object sizes.
+                        barrier = Some(job);
+                        continue;
+                    }
+                    _ => (),
+                },
             }
-        }
-        if wants.len() > 1 {
-            self.core.combine_remote_sizes(&wants);
+            job.run(self);
         }
     }
 
-    /// A valid, independent slot may be inspected without executing its RPC.
-    /// Requests that can modify the namespace or session end the lookahead.
+    /// Inspect a new request without consuming its sequence ID. Suspended
+    /// requests use the normal RPC path when the demanded object is available.
     fn read_request(
         &mut self,
         data: &[u8],
-        slots: &mut Vec<(SessionId, u32)>,
-    ) -> Option<ReadRequest> {
+        parked: &[ParkedCall],
+    ) -> Option<(SlotKey, Option<Oid>)> {
         let (_, Rpc::Compound(credentials, request)) = protocol::rpc(data).ok()? else {
             return None;
         };
@@ -110,7 +135,7 @@ impl Server {
         let slot = session.slot(&sequence).ok()?;
         // The short attribute calls below fit in the minimum channel size,
         // including the maximum tag and space for each operation's result.
-        if slots.contains(&id)
+        if parked.iter().any(|call| call.slot == id)
             || sequence.id != slot.sequence.wrapping_add(1)
             || self.clients.get(&session.client)?.uid != credentials.uid
             || session
@@ -119,6 +144,9 @@ impl Server {
                 < MIN_CHANNEL_SIZE as usize
         {
             return None;
+        }
+        if parked.is_empty() && !matches!(call.count, 3 | 5 | 6) {
+            return Some((id, None));
         }
         let ops: Vec<_> = (1..call.count).map(|_| next()).collect::<Option<_>>()?;
         call.ops.finish().ok()?;
@@ -139,24 +167,20 @@ impl Server {
         }) {
             return None;
         }
-        slots.push(id);
         let oid = match ops.as_slice() {
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
-                let mask = get_mask(*mask, false).ok()?;
-                if self.core.protected_source(ino)
-                    && self.core.nfs_attributes(ino, false).ok()?.0.kind == FileType::Directory
-                {
-                    return Some(ReadRequest::DirectoryAttributes);
-                }
-                self.attribute_size_demand(ino, mask)
+                self.attribute_size_demand(ino, *mask)
             }
             [PutFh(handle), GetAttr(parent_mask), Lookup(name), GetFh, GetAttr(mask)] => {
-                self.lookup_size_demand(credentials, handle, *parent_mask, name, *mask)
+                self.lookup_size_demand(credentials, handle, Some(*parent_mask), name, *mask)
+            }
+            [PutFh(handle), Lookup(name), GetFh, GetAttr(mask)] => {
+                self.lookup_size_demand(credentials, handle, None, name, *mask)
             }
             _ => None,
         };
-        Some(oid.map_or(ReadRequest::Other, ReadRequest::Size))
+        Some((id, oid))
     }
 
     fn attribute_size_demand(&self, ino: u64, mask: Bitmap) -> Option<Oid> {
@@ -169,7 +193,7 @@ impl Server {
         &mut self,
         credentials: Credentials,
         handle: &[u8],
-        parent_mask: Bitmap,
+        parent_mask: Option<Bitmap>,
         name: &[u8],
         mask: Bitmap,
     ) -> Option<Oid> {
@@ -177,8 +201,10 @@ impl Server {
         if self.core.nfs_attributes(parent, false).ok()?.0.kind != FileType::Directory {
             return None;
         }
-        self.get_attributes(parent, parent_mask, false, &mut Writer::default())
-            .ok()?;
+        if let Some(parent_mask) = parent_mask {
+            self.get_attributes(parent, parent_mask, false, &mut Writer::default())
+                .ok()?;
+        }
         self.require_access(&Context::new(credentials), parent, libc::X_OK)
             .ok()?;
         let ino = self

@@ -52,8 +52,8 @@ depth; ordinary reads, writable opens and metadata changes do not build that ind
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
-Where protocol v2 and the caller's policy permit, exact demands share one
-invocation-owned channel. Native Git still resolves the original repository and
+Where protocol v2 and the caller's policy permit, exact demands reuse
+invocation-owned channels. Native Git still resolves the original repository and
 refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
 SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
 Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
@@ -61,20 +61,24 @@ Interactive preparation uses native fetch with job-control supervision. Git-on
 owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
 request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
 programs retain their selection policy and original environment. Once the
-command starts, HTTP(S) can share a helper with its own session and no
-controlling terminal.
+command starts, HTTP(S) helpers run in their own sessions without a controlling
+terminal.
 SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy, or a custom
 `GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
 helper path supports reuse. No fetched object is retried merely to change
 decoders, and no unrelated future OID is requested.
 
-On FUSE and NFS, concurrent requests for file sizes in the protected source
-can share one exact HTTP(S) fetch. The bounded batch includes only objects
-identified by requests already waiting for service and paths in prepared
-directories. Cached objects and duplicate OIDs are reused. This optimization
-requires an active reusable HTTP(S) session and an unrestricted per-file size
-limit. The mount can begin serving a single demand immediately.
+On FUSE and NFS, a size lookup for an unavailable protected source blob in a
+prepared directory can wait independently of the filesystem worker. The two
+backends share an HTTP(S) loader with up to four invocation-owned connections.
+One entry represents each pending OID and a fetch can group up to eight OIDs
+already requested. Single requests reuse the first connection immediately.
+The other helpers start when demands overlap. Cached objects bypass the queue.
+The queue bounds outstanding objects, and transfer workers release its mutex
+before receiving and checking a pack. The snapshot then verifies and publishes
+the objects through its normal store. This path requires a reusable HTTP(S)
+session and an unrestricted per-file size limit.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with

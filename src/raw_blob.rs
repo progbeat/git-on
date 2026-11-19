@@ -496,6 +496,7 @@ impl Drop for Pending<'_> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RawBlobs {
     state: Arc<Mutex<Store>>,
 }

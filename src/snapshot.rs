@@ -624,6 +624,35 @@ pub struct Snapshot {
     pub pin_ref: String,
     inner: Arc<Inner>,
 }
+
+pub(crate) struct PendingObject {
+    snapshot: Snapshot,
+    demand: crate::demand::Demand,
+}
+
+impl PendingObject {
+    pub(crate) fn finish(self) {
+        let batch = self.demand.wait();
+        if let Ok(mut state) = self.snapshot.state() {
+            let State { repo, remote, .. } = &mut *state;
+            if let Some(remote) = remote {
+                // The normal filesystem operation returns its usual error
+                // and the snapshot retains any transport/import failure.
+                let _ = remote.finish_demand(repo, &batch);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready(&self) -> bool {
+        self.demand.ready()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn notify_when_ready(&self, notify: &Arc<tokio::sync::Notify>) {
+        self.demand.notify_when_ready(notify);
+    }
+}
 impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
@@ -811,21 +840,17 @@ impl Snapshot {
                 .is_some_and(|remote| remote.uses_http())
         })
     }
-    pub(crate) fn can_combine_remote_demand(&self) -> bool {
-        self.state().is_ok_and(|state| {
-            state
-                .remote
-                .as_ref()
-                .is_some_and(|remote| remote.can_combine_demand())
-        })
-    }
-    pub(crate) fn combine_remote_demand(&self, oids: &[Oid]) {
-        if let Ok(mut state) = self.state() {
-            let State { repo, remote, .. } = &mut *state;
-            if let Some(remote) = remote {
-                remote.combine_demand(repo, oids);
-            }
+    pub(crate) fn start_remote_demand(&self, oid: Oid) -> Option<PendingObject> {
+        let mut state = self.state().ok()?;
+        if state.headers.contains_key(&oid) {
+            return None;
         }
+        let State { repo, remote, .. } = &mut *state;
+        let demand = remote.as_mut()?.start_demand(repo, oid).ok()??;
+        Some(PendingObject {
+            snapshot: self.clone(),
+            demand,
+        })
     }
     fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
         let kind = match mode {

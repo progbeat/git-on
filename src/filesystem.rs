@@ -1548,16 +1548,12 @@ impl Overlay {
 }
 
 impl Overlay {
-    pub(crate) fn remote_size_batching(&self) -> bool {
+    pub(crate) fn parallel_remote_sizes(&self) -> bool {
         self.write_policy != WritePolicy::All && self._snapshot.remote_http()
     }
 
-    pub(crate) fn can_combine_remote_sizes(&self) -> bool {
-        self._snapshot.can_combine_remote_demand()
-    }
-
-    pub(crate) fn combine_remote_sizes(&self, oids: &[Oid]) {
-        self._snapshot.combine_remote_demand(oids);
+    pub(crate) fn start_remote_size(&self, oid: Oid) -> Option<crate::snapshot::PendingObject> {
+        self._snapshot.start_remote_demand(oid)
     }
 
     pub(crate) fn pending_source_size(&self, ino: u64) -> Option<Oid> {
@@ -1600,6 +1596,15 @@ impl Overlay {
             let p = self.child(parent, name)?;
             self.ensure(&p)?
         };
+        self.lookup_attr(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_prepared_entry(&mut self, ino: u64) -> FsResult<FileAttr> {
+        self.ensure_size(ino)?;
+        self.lookup_attr(ino)
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn lookup_attr(&mut self, ino: u64) -> FsResult<FileAttr> {
         self.refresh_backing_attr(ino)?;
         let node = self.node_mut(ino)?;
         node.lookups = node.lookups.saturating_add(1);

@@ -471,6 +471,7 @@ jobs:
           python3 tests/remote.py --binary target/debug/git-on --require-nfs \
             RemoteTests.test_materialized_remote_fetches_the_selected_tree_once \
             RemoteTests.test_git_on_in_a_terminal_reuses_the_https_demand_session \
+            RemoteTests.test_cancel_concurrent_https_demands \
             RemoteTests.test_concurrent_https_lookups_combine_only_requested_objects
           GIT_ON_TEST_FSYNC_ERROR=1 cargo test --locked --lib --features test-metrics backend::nfs::tests::sync_errors_are_returned_in_rpc_replies -- --exact --ignored
       - name: Run upstream pynfs over the production socket

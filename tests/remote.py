@@ -14,6 +14,7 @@ import os
 import pty
 from pathlib import Path
 import pwd
+import queue
 import random
 import re
 import select
@@ -133,6 +134,7 @@ class Fixture:
         self.deny_auth = False
         self.stalled_oids = set()
         self.stalled = threading.Event()
+        self.stalled_requests = queue.Queue()
         self.resume = threading.Event()
         self.children = []
         self.handles = []
@@ -168,6 +170,7 @@ class Fixture:
                 wants = [x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)]
                 stalled_request = bool(fixture.stalled_oids.intersection(wants))
                 if stalled_request:
+                    fixture.stalled_requests.put(wants)
                     fixture.stalled.set()
                     if not fixture.resume.wait(timeout=30):
                         self.send_error(504,'controlled transport stall timed out'); return
@@ -1491,6 +1494,48 @@ print('caught-EIO-and-returned-success')
         self.assertFalse(list(f.root.glob('git-on-*')))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_cancel_concurrent_https_demands(self):
+        f = self.f
+        tree = f.git('mktree', data=(f'100644 blob {f.blob}\tfirst\n'
+                                    f'100644 blob {f.other}\tsecond\n').encode())
+        commit = f.git('commit-tree', tree, data=b'cancel concurrent fetches\n')
+        f.git('update-ref', 'refs/heads/main', commit)
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        self.addCleanup(f.resume.set)
+        f.stalled_oids.update((f.blob, f.other))
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
+        gate = f.root / 'start-second'
+        code = f"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import os
+import time
+assert sorted(os.listdir('.')) == ['first', 'second']
+with ThreadPoolExecutor(2) as pool:
+    first = pool.submit(os.stat, 'first')
+    while not Path({str(gate)!r}).exists():
+        time.sleep(.01)
+    second = pool.submit(os.stat, 'second')
+    first.result()
+    second.result()
+"""
+        process = subprocess.Popen(
+            [str(OPTIONS.binary), url, commit, '--backend=' + backend, '--write-policy=none',
+             '--', sys.executable, '-I', '-S', '-c', code],
+            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        f.children.append(process)
+        self.assertEqual(f.stalled_requests.get(timeout=12), [f.blob])
+        gate.touch()
+        self.assertEqual(f.stalled_requests.get(timeout=8), [f.other])
+        process.send_signal(signal.SIGTERM)
+        _, errors = process.communicate(timeout=12)
+        self.assertEqual(process.returncode, -signal.SIGTERM, errors)
+        self.assertNotIn(b'execution incomplete', errors)
+        self.assertFalse(list(f.root.glob('git-on-*')))
+
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_concurrent_https_lookups_combine_only_requested_objects(self):
         f = self.f
         sizes = list(range(21, 37))
@@ -1500,6 +1545,7 @@ print('caught-EIO-and-returned-success')
         entries = [f'040000 tree {oid}\td{index}'
                    for index, oid in enumerate(directories)]
         entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\tunused',
+                        f'100644 blob {f.blob}\twarm-alias', f'040000 tree {directories[0]}\talias',
                         f'040000 tree {f.subtree}\tunvisited'))
         tree = f.git('mktree', data=('\n'.join(entries) + '\n').encode())
         commit = f.git('commit-tree', tree, data=b'concurrent lookups\n')
@@ -1512,25 +1558,40 @@ print('caught-EIO-and-returned-success')
         command = f"""
 import concurrent.futures
 import os
-import threading
+from pathlib import Path
+import time
 
 assert 'unvisited' in os.listdir('.')
 assert os.stat('warm').st_size == 9
 sizes = {sizes!r}
 parents = [os.open(f'd{{index}}', os.O_RDONLY | os.O_DIRECTORY) for index in range(len(sizes))]
-for parent in parents:
+alias = os.open('alias', os.O_RDONLY | os.O_DIRECTORY)
+for parent in [*parents, alias]:
     assert os.listdir(parent) == ['file']
-gate = threading.Barrier(len(sizes))
+control = Path({str(f.root)!r})
 
-def read(index):
-    gate.wait(timeout=10)
-    parent = parents[index]
+def wait_for(name):
+    deadline = time.monotonic() + 20
+    while not (control / name).exists():
+        assert time.monotonic() < deadline, name
+        time.sleep(.01)
+
+def read(parent):
     size = os.stat('file', dir_fd=parent).st_size
     with os.fdopen(os.open('file', os.O_RDONLY, dir_fd=parent), 'rb') as file:
         return size, file.read()
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
-    assert list(pool.map(read, range(len(sizes)))) == [(size, b'x' * size) for size in sizes]
+    first = pool.submit(read, parents[0])
+    wait_for('start-next')
+    second = pool.submit(read, parents[1])
+    duplicate = pool.submit(read, alias)
+    wait_for('check-cached')
+    assert os.stat('warm-alias').st_size == 9
+    (control / 'cached-ready').touch()
+    rest = list(pool.map(read, parents[2:]))
+    assert [first.result(), second.result(), *rest] == [(size, b'x' * size) for size in sizes]
+    assert duplicate.result() == first.result()
 """
         process = subprocess.Popen(
             [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
@@ -1538,9 +1599,24 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
             cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         f.children.append(process)
-        self.assertTrue(f.stalled.wait(timeout=15), 'concurrent lookups did not reach HTTPS')
-        # Leave the first transfer pending while the other threads enter the
-        # mount. There is no latency assertion tied to this scheduling window.
+        def next_stalled(message, timeout=10):
+            try:
+                return f.stalled_requests.get(timeout=timeout)
+            except queue.Empty:
+                self.fail(message)
+        self.assertEqual(next_stalled('first lookup did not reach HTTPS'), [wanted[0]])
+        (f.root / 'start-next').touch()
+        self.assertEqual(next_stalled('second lookup waited behind the first transfer'), [wanted[1]])
+        (f.root / 'check-cached').touch()
+        ready = f.root / 'cached-ready'
+        deadline = time.monotonic() + 5
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(ready.exists(), 'cached blob waited behind the transfers')
+        next_stalled('third connection did not receive an exact demand')
+        next_stalled('fourth connection did not receive an exact demand')
+        # Hold all connections until the other concurrent callbacks reach the
+        # mount. The next free connection can batch already pending requests.
         time.sleep(.2)
         f.resume.set()
         _, errors = process.communicate(timeout=30)
@@ -1550,6 +1626,51 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
                               [commit, tree, f.blob, *directories, *wanted])
         self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
         self.assertFalse(list(f.root.glob('git-on-*')))
+
+    @unittest.skipUnless(OPTIONS.require_fuse, 'requires the FUSE directory reference lifecycle')
+    def test_fuse_lookup_survives_directory_close_during_https_wait(self):
+        f = self.f
+        tree = f.git('mktree', data=f'100644 blob {f.blob}\tfile\n'.encode())
+        commit = f.git('commit-tree', tree, data=b'close directory during lookup\n')
+        f.git('update-ref', 'refs/heads/main', commit)
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        self.addCleanup(f.resume.set)
+        f.stalled_oids.add(f.blob)
+        close = f.root / 'close-stream'
+        closed = f.root / 'stream-closed'
+        code = f"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import os
+import time
+with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
+    assert next(stream).name == 'file'
+    result = pool.submit(os.stat, 'file')
+    while not Path({str(close)!r}).exists():
+        time.sleep(.01)
+    stream.close()
+    os.statvfs('.')
+    Path({str(closed)!r}).touch()
+    assert result.result().st_size == 9
+"""
+        process = subprocess.Popen(
+            [str(OPTIONS.binary), url, commit, '--backend=fuse', '--write-policy=none',
+             '--', sys.executable, '-I', '-S', '-c', code],
+            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        f.children.append(process)
+        self.assertTrue(f.stalled.wait(timeout=12), 'lookup did not reach HTTPS')
+        close.touch()
+        deadline = time.monotonic() + 5
+        while not closed.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(closed.exists(), 'directory close did not reach FUSE')
+        # The kernel may send RELEASEDIR asynchronously after close.
+        time.sleep(.2)
+        f.resume.set()
+        _, errors = process.communicate(timeout=12)
+        self.assertEqual(process.returncode, 0, errors)
 
     def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
         f=self.f

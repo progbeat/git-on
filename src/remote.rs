@@ -147,6 +147,7 @@ pub struct Remote {
     session_received_pack_bytes: u64,
     session: Option<crate::transport::Session>,
     session_checked: bool,
+    demand_pool: Option<crate::demand::Pool>,
     demand_url: OsString,
     socket: Option<PathBuf>,
     socket_owner: Option<SocketOwner>,
@@ -249,6 +250,7 @@ impl Remote {
             session_received_pack_bytes: 0,
             session: None,
             session_checked: false,
+            demand_pool: None,
             demand_url: OsString::from_vec(url.to_vec()),
             socket,
             socket_owner: None,
@@ -583,33 +585,62 @@ impl Remote {
         let url = self.demand_url.as_bytes();
         url.starts_with(b"https://") || url.starts_with(b"http://")
     }
-    pub(crate) fn can_combine_demand(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(crate::transport::Session::stateless)
-            && self.failure().is_none()
-            && matches!(crate::spool::Files::size_limit(), Ok(None))
-    }
-    pub(crate) fn combine_demand(&mut self, repo: &Repository, oids: &[Oid]) {
-        if !self.can_combine_demand() {
-            return;
-        }
+    pub(crate) fn start_demand(
+        &mut self,
+        repo: &Repository,
+        oid: Oid,
+    ) -> Result<Option<crate::demand::Demand>> {
         let outcome = (|| {
-            let missing = self.missing_demands(repo, oids)?;
-            if missing.len() > 1 {
-                self.fetch_in_session(repo, &missing)?;
+            if !self.uses_http()
+                || self.raw_blobs.get(oid)?.is_some()
+                || self.has_received_blob(oid)
+                || repo.odb()?.exists(oid)
+                || self.failure().is_some()
+                || crate::spool::Files::size_limit()?.is_some()
+            {
+                return Ok(None);
             }
-            Ok(())
+            if self.demand_pool.is_none() {
+                self.prepare_session()?;
+                if self.session.is_none() {
+                    return Ok(None);
+                }
+                let commands = (1..crate::demand::CONNECTIONS)
+                    .map(|_| self.http_command())
+                    .collect::<Result<_>>()?;
+                self.demand_pool = Some(crate::demand::Pool::new(
+                    self.session.take().unwrap(),
+                    commands,
+                    &self.raw_blobs,
+                )?);
+            }
+            self.demand_pool.as_ref().unwrap().request(oid).map(Some)
         })();
-        // All included objects are already demanded. Record transport errors
-        // exactly as for a single request, without re-requesting a failed pack.
-        let _ = self.record_result(outcome);
+        self.record_result(outcome)
+    }
+    pub(crate) fn finish_demand(
+        &mut self,
+        repo: &Repository,
+        batch: &crate::demand::Batch,
+    ) -> Result<()> {
+        let Some(pack) = batch.take_pack() else {
+            if let Some(error) = self.failure() {
+                bail!("remote object transport previously failed: {error}");
+            }
+            return Ok(());
+        };
+        let outcome = pack.and_then(|pack| self.publish_session_pack(repo, &batch.oids, pack));
+        self.demand_pool.as_ref().unwrap().retire(&batch.oids);
+        self.record_result(outcome)
     }
     fn record_result<T>(&mut self, outcome: Result<T>) -> Result<T> {
         if let Err(error) = &outcome {
             // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
-            if !crate::object::is_cancelled(error) && self.failure().is_none() {
+            if !crate::object::is_cancelled(error)
+                && self.failed.is_none()
+                && self.raw_blobs.failure().is_none()
+            {
                 self.failed = Some(format!("{error:#}"));
                 let _drawing = crate::terminal_ui::native_terminal_lease(true);
                 eprintln!("git-on: remote object loading failed: {error:#}");
@@ -622,6 +653,10 @@ impl Remote {
         // before either transport can start another missing-object demand.
         if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
+        }
+        if let ([oid], Some(pool)) = (oids, &self.demand_pool) {
+            let batch = pool.request(*oid)?.wait();
+            return self.finish_demand(repo, &batch);
         }
         if !self.materializing && oids.len() == 1 && self.fetch_in_session(repo, oids)? {
             return Ok(());
@@ -691,22 +726,26 @@ impl Remote {
         self.fetch_operations += 1;
         Ok(())
     }
+    fn http_command(&self) -> Result<Command> {
+        let mut command = self.command(false)?;
+        command
+            .args(["-c", "protocol.version=2"])
+            .arg(if self.demand_url.as_bytes().starts_with(b"https://") {
+                "remote-https"
+            } else {
+                "remote-http"
+            })
+            .arg(&self.source)
+            .arg(&self.demand_url);
+        Ok(command)
+    }
     fn start_session(&mut self, http: bool) -> Result<Option<crate::transport::Session>> {
         if self.demand_url.as_bytes().starts_with(b"-") || !self.git.demand_session_compatible()? {
             return Ok(None);
         }
         let url = self.demand_url.as_bytes();
         if http {
-            let mut command = self.command(false)?;
-            command
-                .args(["-c", "protocol.version=2"])
-                .arg(if url.starts_with(b"https://") {
-                    "remote-https"
-                } else {
-                    "remote-http"
-                })
-                .arg(&self.source)
-                .arg(&self.demand_url);
+            let command = self.http_command()?;
             self.session_starts += 1;
             return crate::transport::Session::connect(command, true);
         }
@@ -811,20 +850,24 @@ impl Remote {
         self.session_starts += 1;
         crate::transport::Session::connect(command, false)
     }
-    fn fetch_in_session(&mut self, repo: &Repository, oids: &[Oid]) -> Result<bool> {
+    fn prepare_session(&mut self) -> Result<()> {
         if !self.session_checked {
             let http = self.uses_http();
             let terminal = crate::git::controlling_terminal().is_some();
             if terminal && http && crate::terminal_ui::preparing() {
                 // Preparation owns interactive authentication. Leave the
                 // session decision open until the command is running.
-                return Ok(false);
+                return Ok(());
             }
             if http || !terminal {
                 self.session = self.start_session(http)?;
             }
             self.session_checked = true;
         }
+        Ok(())
+    }
+    fn fetch_in_session(&mut self, repo: &Repository, oids: &[Oid]) -> Result<bool> {
+        self.prepare_session()?;
         let Some(session) = self.session.as_mut() else {
             return Ok(false);
         };
@@ -841,21 +884,19 @@ impl Remote {
             );
         }
         let pack = self.raw_blobs.scratch_file()?;
-        if let Err(error) = session.fetch(oids, &pack) {
-            let diagnostic = session.error_text();
+        if let Err(error) = session.fetch_exact(oids, &pack) {
             self.session = None;
-            return Err(error).with_context(|| {
-                let wanted = if let [oid] = oids {
-                    format!("object {oid}")
-                } else {
-                    format!("objects ({} requests, first {})", oids.len(), oids[0])
-                };
-                format!(
-                    "remote fetch of exact {wanted} failed: {}",
-                    diagnostic.trim()
-                )
-            });
+            return Err(error);
         }
+        self.publish_session_pack(repo, oids, pack)?;
+        Ok(true)
+    }
+    fn publish_session_pack(
+        &mut self,
+        repo: &Repository,
+        oids: &[Oid],
+        pack: crate::spool::Spool,
+    ) -> Result<()> {
         self.session_fetch_operations += 1;
         self.session_received_pack_bytes =
             self.session_received_pack_bytes.saturating_add(pack.len()?);
@@ -865,8 +906,12 @@ impl Remote {
         };
         match single {
             Some((oid, (reader, size, kind))) => {
-                self.publish_received(repo, *oid, kind, size, reader)?;
-                self.session_decode_operations += 1;
+                if self.demand_pool.is_none()
+                    || self.raw_blobs.get(*oid)?.is_none() && !repo.odb()?.exists(*oid)
+                {
+                    self.publish_received(repo, *oid, kind, size, reader)?;
+                    self.session_decode_operations += 1;
+                }
             }
             None => {
                 // The generic path handles necessary deltas and multi-object packs
@@ -916,7 +961,7 @@ impl Remote {
             );
         }
         self.completed_fetches += oids.len() as u64;
-        Ok(true)
+        Ok(())
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack
     /// per demand makes later Git/libgit2 pack discovery grow with all previous
@@ -1176,6 +1221,9 @@ impl Remote {
     }
     /// Release the owned master even when the snapshot pin must remain for recovery.
     pub fn stop_transport(&self) -> Result<()> {
+        if let Some(pool) = &self.demand_pool {
+            pool.stop()?;
+        }
         if let Some(session) = &self.session {
             session.stop()?;
         }
@@ -1214,7 +1262,14 @@ impl Remote {
         Ok(())
     }
     pub fn failure(&self) -> Option<String> {
-        self.failed.clone().or_else(|| self.raw_blobs.failure())
+        self.failed
+            .clone()
+            .or_else(|| self.raw_blobs.failure())
+            .or_else(|| {
+                self.demand_pool
+                    .as_ref()
+                    .and_then(crate::demand::Pool::failure)
+            })
     }
     pub(crate) fn completed_fetches(&self) -> u64 {
         self.completed_fetches
@@ -1229,7 +1284,11 @@ impl Remote {
         (
             self.session_fetch_operations,
             self.session_decode_operations,
-            self.session_starts,
+            self.session_starts
+                + self
+                    .demand_pool
+                    .as_ref()
+                    .map_or(0, crate::demand::Pool::additional_starts),
         )
     }
     pub(crate) fn received_pack_bytes(&self) -> (u64, u64) {
@@ -1243,7 +1302,7 @@ impl Drop for Remote {
     fn drop(&mut self) {
         if let Err(error) = self.stop_transport() {
             let _drawing = crate::terminal_ui::native_terminal_lease(true);
-            eprintln!("git-on: owned SSH shutdown failed: {error:#}");
+            eprintln!("git-on: owned remote transport shutdown failed: {error:#}");
         }
     }
 }

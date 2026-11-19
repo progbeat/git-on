@@ -1,4 +1,5 @@
 pub mod backend;
+mod demand;
 mod directory_view;
 pub mod filesystem;
 pub mod git;
