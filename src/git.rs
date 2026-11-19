@@ -163,11 +163,13 @@ impl Git {
             && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
     pub(crate) fn http2_compatible(&self) -> bool {
-        // The HTTPS helper remains responsible for explicit Git HTTP
-        // configuration, including URL-scoped settings and remote proxies.
+        // Native Git remains responsible for explicit HTTP configuration
+        // and transport policy. Apply this before any libcurl discovery.
         !self.config.iter().any(|(key, _)| {
             let key = key.as_bytes();
             key.starts_with(b"http.")
+                || key == b"protocol.allow"
+                || key == b"protocol.https.allow"
                 || key.starts_with(b"remote.")
                     && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
         }) && !std::env::vars_os().any(|(key, _)| {
@@ -176,7 +178,11 @@ impl Git {
                 || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
                 || matches!(
                     key,
-                    b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
+                    b"GIT_TRACE_CURL"
+                        | b"GIT_TRACE_PACKET"
+                        | b"GIT_CURL_VERBOSE"
+                        | b"GIT_ALLOW_PROTOCOL"
+                        | b"GIT_PROTOCOL_FROM_USER"
                 )
         })
     }
@@ -799,6 +805,23 @@ impl SplitByte for [u8] {
         match self.iter().position(|x| *x == b) {
             Some(n) => (&self[..n], Some(&self[n + 1..])),
             None => (self, None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_transport_policy_keeps_http2_on_native_git() {
+        for key in ["protocol.allow", "protocol.https.allow"] {
+            let git = Git {
+                cwd: PathBuf::new(),
+                config: vec![(key.into(), Some("never".into()))],
+                original_dir: None,
+            };
+            assert!(!git.http2_compatible(), "{key}");
         }
     }
 }
