@@ -228,6 +228,21 @@ impl Queue {
         if self.predicted.remove(&anchor).is_some() {
             self.forecast_score = (self.forecast_score + 1).min(MAX_FORECAST_SCORE);
             self.forecast_misses = 0;
+            // On a slow source, overlapping reads reinforce the first hit.
+            if self.forecast_score == 1
+                && matches!(
+                    self.mode,
+                    ConnectionMode::Probing(1..) | ConnectionMode::Wide
+                )
+                && self
+                    .pending
+                    .values()
+                    .filter(|demand| demand.required() && !demand.ready())
+                    .nth(1)
+                    .is_some()
+            {
+                self.forecast_score = DENSE_SCORE;
+            }
         } else if self.forecast_score != 0 {
             self.forecast_misses += 1;
             if self.forecast_misses == FORECAST_MISSES {
@@ -1197,6 +1212,32 @@ mod tests {
             let oid = Oid::from_bytes(&[index; 20]).unwrap();
             queue.predicted.insert(oid, queue.forecast_step);
             assert_eq!(queue.forecast_width(oid), READ_AHEAD);
+        }
+    }
+
+    #[test]
+    fn a_slow_overlapping_scan_can_expand_after_one_hit() {
+        let anchor = Oid::from_bytes(&[1; 20]).unwrap();
+        let other = Oid::from_bytes(&[2; 20]).unwrap();
+        for (mode, complete_other, expected) in [
+            (ConnectionMode::Probing(0), false, READ_AHEAD),
+            (ConnectionMode::Standard, false, READ_AHEAD),
+            (ConnectionMode::Probing(1), true, READ_AHEAD),
+            (ConnectionMode::Probing(1), false, 64),
+        ] {
+            let mut queue = Queue {
+                mode,
+                ..Queue::default()
+            };
+            queue.foreground(anchor);
+            let pending = queue.foreground(other);
+            if complete_other {
+                pending.complete(Batch::new(vec![other], Ok(Acquired::Stored)));
+            }
+            // Parallel requests alone leave the initial DFS pack at four.
+            assert_eq!(queue.forecast_width(other), READ_AHEAD);
+            queue.predicted.insert(anchor, queue.forecast_step);
+            assert_eq!(queue.forecast_width(anchor), expected);
         }
     }
 

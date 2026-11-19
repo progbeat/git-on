@@ -21,6 +21,7 @@
 - Open spare SSH channels while the initial one negotiates Git and during
   slow root fetches. Let ready channels serve queued reads during setup.
 - Prefetch upcoming blobs from already opened directories on both transports.
-  Grow the fetch batch during scans that consistently use the prefetched blobs.
+  Grow the fetch batch after confirmed reads, with earlier expansion when
+  overlapping reads already wait on a slow source.
 - Decode Git packs as they arrive and make verified objects readable before
   the rest of the pack finishes downloading.

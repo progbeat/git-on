@@ -112,7 +112,9 @@ through already opened directories. It skips previously considered ranges
 and examines at most 512 remaining entries. The same planner serves FUSE and
 NFS. Speculative packs start with up to four OIDs. On slower connections,
 confirmed first accesses to predicted objects can expand this to 64, 128 or
-256. Consecutive misses reduce the window. During a dense scan
+256. The first confirmation can expand the window to 64 after a slow reply
+when two or more required objects are still pending. Consecutive misses reduce
+the window. During a dense scan
 the planner groups remaining OIDs from the current and recently opened
 directories. The predictor tracks at most 512 OIDs ahead of actual accesses.
 When the window fills on a slower connection, completed predictions age out
