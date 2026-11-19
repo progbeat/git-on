@@ -305,7 +305,7 @@ impl Remote {
         }
         // Authentication and host-key interaction happen here, before mounting.
         let capabilities = tempfile::NamedTempFile::new_in(run)?;
-        let mut command = remote.command(true)?;
+        let mut command = remote.command(remote.socket_owner.is_none())?;
         command
             .args(["-c", "protocol.version=2"])
             .env("GIT_TRACE_PACKET", capabilities.path())
@@ -1403,6 +1403,13 @@ impl Remote {
         let Some(socket) = &self.socket else {
             return Ok(());
         };
+        if let Some(owner) = &self.socket_owner {
+            anyhow::ensure!(
+                owned_socket(socket, owner),
+                "owned SSH control connection changed during preparation"
+            );
+            return Ok(());
+        }
         let metadata = match fs::symlink_metadata(socket) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

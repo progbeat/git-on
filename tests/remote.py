@@ -2016,6 +2016,17 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         self.assertLessEqual(len(list(Path(f'/proc/{process.pid}/fd').iterdir())),48)
         f.finish(process)
 
+    def test_short_ssh_tag_reuses_the_bootstrap_connection(self):
+        f = self.f
+        f.git('update-ref', 'refs/tags/release', f.commit)
+        url = f.ssh(protocol_v2=True)
+        process = f.probe(url, 'release')
+        self.assertEqual(f.line(process)['tree'], f.tree)
+        value, _ = f.operation(process, 'read deep/file')
+        self.assertEqual(value['data'], 'expected\n')
+        f.finish(process)
+        self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
     def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
         f=self.f;url=f.ssh(protocol_v2=True)
         process=f.probe(url);f.line(process)
