@@ -60,7 +60,9 @@ impl Server {
                     call.object.finish();
                     if call.recheck_lookup {
                         let next = match &call.job {
-                            Job::Call(data, _) => self.read_request(data, &parked),
+                            Job::Call(data, _) => {
+                                self.read_request(data, parked.iter().map(|call| call.slot))
+                            }
                             Job::Sweep => None,
                         };
                         if let Some((slot, Some(demand))) = next {
@@ -112,7 +114,9 @@ impl Server {
                         }
                     }
                 }
-                Job::Call(data, _) => match self.read_request(data, &parked) {
+                Job::Call(data, _) => match self
+                    .read_request(data, parked.iter().map(|call| call.slot))
+                {
                     Some((slot, Some(demand))) => {
                         if let Some((object, recheck_lookup)) = self.start_demand(demand, wake) {
                             parked.push(ParkedCall {
@@ -156,7 +160,7 @@ impl Server {
     fn read_request(
         &mut self,
         data: &[u8],
-        parked: &[ParkedCall],
+        mut parked: impl ExactSizeIterator<Item = SlotKey>,
     ) -> Option<(SlotKey, Option<ObjectDemand>)> {
         let (_, Rpc::Compound(credentials, request)) = protocol::rpc(data).ok()? else {
             return None;
@@ -175,11 +179,11 @@ impl Server {
         let id = (sequence.session, sequence.slot);
         let session = self.sessions.get(&sequence.session)?;
         let slot = session.slot(&sequence).ok()?;
+        let idle = parked.len() == 0;
         // The short attribute calls below fit in the minimum channel size,
         // including the maximum tag and space for each operation's result.
-        if parked.iter().any(|call| call.slot == id)
+        if parked.any(|slot| slot == id)
             || sequence.id != slot.sequence.wrapping_add(1)
-            || self.clients.get(&session.client)?.uid != credentials.uid
             || session
                 .reply_limit(&sequence, data.len(), call.count)
                 .ok()?
@@ -187,39 +191,27 @@ impl Server {
         {
             return None;
         }
-        if parked.is_empty() && !(3..=6).contains(&call.count) {
-            return Some((id, None));
+        let same_uid = self.clients.get(&session.client)?.uid == credentials.uid;
+        if idle && !(3..=6).contains(&call.count) {
+            return same_uid.then_some((id, None));
         }
         let ops: Vec<_> = (1..call.count).map(|_| next()).collect::<Option<_>>()?;
         call.ops.finish().ok()?;
-        if !ops.iter().all(|op| match op {
-            Open(open) => open.create.is_none() && open.access & 3 == READ,
-            PutFh(_)
-            | PutRoot
-            | Access(_)
-            | GetAttr(_)
-            | Lookup(_)
-            | GetFh
-            | Read(..)
-            | ReadDir { .. }
-            | Close(_)
-            | Save
-            | Restore => true,
-            _ => false,
-        }) {
-            return None;
-        }
-        let oid = match ops.as_slice() {
+        // AUTH_SYS credentials belong to the call. Short attribute and lookup
+        // compounds can use an independent slot even under a different UID.
+        let demand = match ops.as_slice() {
             [PutFh(handle), ReadDir {
                 cookie: 0,
                 maxcount,
                 ..
-            }] if *maxcount >= 16 => self.directory_demand(credentials, handle, None),
+            }] if same_uid && *maxcount >= 16 => self.directory_demand(credentials, handle, None),
             [PutFh(handle), GetAttr(mask), ReadDir {
                 cookie: 0,
                 maxcount,
                 ..
-            }] if *maxcount >= 16 => self.directory_demand(credentials, handle, Some(*mask)),
+            }] if same_uid && *maxcount >= 16 => {
+                self.directory_demand(credentials, handle, Some(*mask))
+            }
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
                 self.attribute_size_demand(ino, *mask)
@@ -231,9 +223,36 @@ impl Server {
             [PutFh(handle), Lookup(name), GetFh, GetAttr(mask)] => {
                 self.lookup_size_demand(credentials, handle, None, name, *mask)
             }
-            _ => None,
+            _ => {
+                if !same_uid
+                    || !ops.iter().all(|op| match op {
+                        Open(open) => open.create.is_none() && open.access & 3 == READ,
+                        PutFh(_)
+                        | PutRoot
+                        | Access(_)
+                        | GetAttr(_)
+                        | Lookup(_)
+                        | GetFh
+                        | Read(..)
+                        | ReadDir { .. }
+                        | Close(_)
+                        | Save
+                        | Restore => true,
+                        _ => false,
+                    })
+                {
+                    return None;
+                }
+                None
+            }
         };
-        Some((id, oid))
+        // Reserve only the exact object during admission under a different
+        // UID. The regular RPC path applies permissions and read-ahead.
+        let demand = match demand {
+            Some(ObjectDemand::Final(oid, _)) if !same_uid => Some(ObjectDemand::Final(oid, None)),
+            demand => demand,
+        };
+        Some((id, demand))
     }
 
     fn directory_demand(
@@ -286,5 +305,94 @@ impl Server {
                 .map(|oid| ObjectDemand::Final(oid, Some(ino))),
             SourceLookup::Tree(oid) => Some(ObjectDemand::ParentTree(oid)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        backend::nfs::{
+            status::{ACCESS, OK, SEQ_FALSE_RETRY},
+            tests::{call_as, fixture, results, sequence, session_with, xdr},
+        },
+        policy::WritePolicy,
+    };
+
+    #[test]
+    fn mixed_uid_attribute_calls_preserve_permissions_and_slot_order() {
+        let (_dir, mut server) = fixture(WritePolicy::Untracked);
+        let owner = |xid, count, ops: &[u8]| call_as(xid, count, ops, 10, 11, &[]);
+        let reader = |xid, count, ops: &[u8]| call_as(xid, count, ops, 20, 21, &[]);
+        let session = session_with(&mut server, owner);
+        let ino = server.core.lookup_inode(1, "tracked".as_ref()).unwrap();
+        let handle = server.filehandle(ino);
+        let getattr = xdr(|w| {
+            sequence(w, &session, 1, 1, 3);
+            w.u32(22); // PUTFH
+            w.opaque(&handle);
+            w.u32(9); // GETATTR size
+            w.u32(1);
+            w.u32(1 << 4);
+        });
+        let request = reader(3, 3, &getattr);
+        let parked = || [(session, 0)].into_iter();
+        assert!(matches!(
+            server.read_request(&request, parked()),
+            Some(((id, 1), Some(ObjectDemand::Final(_, None)))) if id == session
+        ));
+        assert!(server
+            .read_request(&request, [(session, 1)].into_iter())
+            .is_none());
+        let reply = server.rpc(&request).unwrap();
+        results(&reply, OK, 3);
+        assert!(server.read_request(&request, parked()).is_none());
+        assert_eq!(server.rpc(&request).unwrap(), reply);
+        results(
+            &server.rpc(&owner(4, 3, &getattr)).unwrap(),
+            SEQ_FALSE_RETRY,
+            1,
+        );
+
+        let private = server
+            .core
+            .create_node(
+                1,
+                "private".as_ref(),
+                FileType::Directory,
+                0o700,
+                10,
+                11,
+                Vec::new(),
+            )
+            .unwrap();
+        let lookup = xdr(|w| {
+            sequence(w, &session, 2, 1, 3);
+            w.u32(22); // PUTFH
+            w.opaque(&server.filehandle(private.ino));
+            w.u32(15); // LOOKUP
+            w.opaque(b"child");
+            w.u32(10); // GETFH
+            w.u32(9); // GETATTR size
+            w.u32(1);
+            w.u32(1 << 4);
+        });
+        let request = reader(5, 5, &lookup);
+        assert!(matches!(
+            server.read_request(&request, parked()),
+            Some((_, None))
+        ));
+        results(&server.rpc(&request).unwrap(), ACCESS, 3);
+
+        let remove = xdr(|w| {
+            sequence(w, &session, 3, 1, 3);
+            w.u32(22); // PUTFH
+            w.opaque(&server.filehandle(1));
+            w.u32(28); // REMOVE
+            w.opaque(b"private");
+        });
+        assert!(server
+            .read_request(&reader(6, 3, &remove), parked())
+            .is_none());
     }
 }

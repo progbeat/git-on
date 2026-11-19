@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
-fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
+pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
     let directory = tempfile::tempdir().unwrap();
     let repo = git2::Repository::init(directory.path()).unwrap();
     let blob = repo.blob(b"tracked bytes").unwrap();
@@ -30,7 +30,7 @@ fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
     )
 }
 
-fn xdr(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
+pub(super) fn xdr(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
     let mut w = Writer::default();
     write(&mut w);
     w.into_bytes()
@@ -47,7 +47,14 @@ fn call(xid: u32, count: u32, ops: &[u8]) -> Vec<u8> {
     )
 }
 
-fn call_as(xid: u32, count: u32, ops: &[u8], uid: u32, gid: u32, groups: &[u32]) -> Vec<u8> {
+pub(super) fn call_as(
+    xid: u32,
+    count: u32,
+    ops: &[u8],
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+) -> Vec<u8> {
     xdr(|w| {
         for n in [xid, 0, 2, 100003, 4, 1, 1] {
             w.u32(n);
@@ -72,7 +79,7 @@ fn call_as(xid: u32, count: u32, ops: &[u8], uid: u32, gid: u32, groups: &[u32])
     })
 }
 
-fn results(reply: &[u8], expected: u32, count: u32) -> Reader<'_> {
+pub(super) fn results(reply: &[u8], expected: u32, count: u32) -> Reader<'_> {
     let mut r = Reader::new(reply);
     r.take(20).unwrap();
     assert_eq!(r.u32().unwrap(), 0); // RPC accepted
@@ -86,7 +93,10 @@ fn session(server: &mut Server) -> [u8; 16] {
     session_with(server, call)
 }
 
-fn session_with(server: &mut Server, call: impl Fn(u32, u32, &[u8]) -> Vec<u8>) -> [u8; 16] {
+pub(super) fn session_with(
+    server: &mut Server,
+    call: impl Fn(u32, u32, &[u8]) -> Vec<u8>,
+) -> [u8; 16] {
     let exchange = xdr(|w| {
         w.u32(42);
         w.fixed(&[7; 8]);
@@ -127,7 +137,7 @@ fn session_with(server: &mut Server, call: impl Fn(u32, u32, &[u8]) -> Vec<u8>) 
     r.fixed().unwrap()
 }
 
-fn sequence(w: &mut Writer, session: &[u8; 16], sequence: u32, slot: u32, highest: u32) {
+pub(super) fn sequence(w: &mut Writer, session: &[u8; 16], sequence: u32, slot: u32, highest: u32) {
     w.u32(53);
     w.fixed(session);
     for n in [sequence, slot, highest, 1] {

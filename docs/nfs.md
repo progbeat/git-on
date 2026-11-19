@@ -35,6 +35,9 @@ including a successful prefix followed by an error. Mounts with parallel remote
 object reads can negotiate up to 32 slots. The negotiated maximum reply size
 keeps each session's replay storage within 16 MiB. Git data requests can remain
 outstanding until they complete or the invocation is cancelled.
+Short GETATTR and LOOKUP compounds can use an independent slot while another
+slot waits for a Git object. A single client session can send these calls under
+different AUTH_SYS credentials. Permission checks use each call's credentials.
 
 The mount can start without traversing descendant trees or reading their files.
 GETATTR obtains the requested attributes. Directory listing uses the shared
