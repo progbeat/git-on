@@ -191,6 +191,11 @@ impl Git {
             && std::env::var_os("GIT_ALLOW_PROTOCOL").is_none()
             && std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none()
     }
+
+    pub(crate) fn sets_protocol_version(&self) -> bool {
+        self.config.iter().any(|(key, _)| key == "protocol.version")
+    }
+
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());

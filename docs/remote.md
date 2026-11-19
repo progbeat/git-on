@@ -67,7 +67,7 @@ request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
 programs retain their selection policy and original environment. Once the
 command starts, HTTP(S) helpers run in their own sessions without a controlling
 terminal.
-SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
+SSH reuses only the existing identity-checked owned master. Explicit protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy, or a custom
 `GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
 helper path supports reuse. The decoder reuses the bytes already received when
@@ -92,8 +92,12 @@ successful transfers takes at least 64 milliseconds, the pool can use up to
 connection is still being measured. SSH opens its channels through the same
 owned master and uses fewer when the server refuses an additional channel.
 On a slow SSH startup, up to two spare channels can begin negotiating protocol
-v2 as soon as the authenticated, owned socket exists. The first channel to
-advertise filtered protocol v2 selects the revision and prepares the snapshot.
+v2 as soon as the authenticated, owned socket exists. When the caller leaves
+the protocol version unconfigured, an unambiguous named branch can use a Git
+v0 ref advertisement while filtered protocol v2 channels negotiate on the
+same master. A ready channel
+can fetch the selected commit while another channel awaits an `ls-refs` reply.
+Object requests on this path use filtered protocol v2.
 If fetching the selected object also takes at least 64 milliseconds, up to two
 more SSH channels can start negotiating while the root tree is fetched.
 Ready startup channels can serve exact demands while other channels are still

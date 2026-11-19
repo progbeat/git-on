@@ -67,6 +67,34 @@ def ssh_upload_pack(root):
             git.stdin.close()
 
 
+def ssh_branch_pack(root):
+    repository = root / 'server.git'
+    assert shlex.split(os.environ['SSH_ORIGINAL_COMMAND']) == ['git-upload-pack', str(repository)]
+    command = ['git', 'upload-pack', str(repository)]
+    requested = root / 'branch-query'
+    released = root / 'release-branch-query'
+    if os.environ.get('GIT_PROTOCOL') == 'version=0':
+        (root / 'legacy-advertised').touch()
+        assert await_file(requested, 12)
+        os.execvp('git', command)
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as git:
+        try:
+            for packet in packets(git.stdout):
+                sys.stdout.buffer.write(packet)
+            sys.stdout.buffer.flush()
+            while request := b''.join(packets(sys.stdin.buffer)):
+                if b'command=ls-refs\n' in request:
+                    requested.touch()
+                    assert await_file(released, 12)
+                git.stdin.write(request)
+                git.stdin.flush()
+                for packet in packets(git.stdout):
+                    sys.stdout.buffer.write(packet)
+                sys.stdout.buffer.flush()
+        finally:
+            git.stdin.close()
+
+
 class SplitPack:
     def __init__(self, root, wanted, contents, base_oid, base_data):
         self.wants = {oid.encode() for oid in wanted}
@@ -99,6 +127,47 @@ def mount_flag():
 
 
 class StreamingTests(unittest.TestCase):
+    def ssh_branch_fixture(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        url = fixture.ssh(protocol_v2=True)
+        authorized = fixture.root / 'authorized'
+        shim = shlex.join([sys.executable, str(Path(__file__).resolve()), '--ssh-branch', str(fixture.root)])
+        authorized.write_text(f'command="{shim}" ' + authorized.read_text())
+        return fixture, url
+
+    def test_ssh_branch_can_use_a_late_advertisement_while_ls_refs_is_held(self):
+        fixture, url = self.ssh_branch_fixture()
+        process = subprocess.Popen(
+            [OPTIONS.binary, url, 'main', mount_flag(), '--write-policy=none', '--', 'cat', 'deep/file'],
+            cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        fixture.children.append(process)
+        try:
+            self.assertTrue(await_file(fixture.root / 'branch-query', 8, process))
+            try:
+                output, errors = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail('the named revision waited for the held ls-refs reply')
+        finally:
+            (fixture.root / 'release-branch-query').touch()
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertEqual(output, b'expected\n')
+        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
+    def test_ssh_branch_respects_explicit_protocol_v2(self):
+        fixture, url = self.ssh_branch_fixture()
+        (fixture.root / 'release-branch-query').touch()
+        fixture.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.version', GIT_CONFIG_VALUE_0='2')
+        result = subprocess.run(
+            [OPTIONS.binary, url, 'main', mount_flag(), '--write-policy=none', '--', 'cat', 'deep/file'],
+            cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+        self.assertTrue((fixture.root / 'branch-query').is_file())
+        self.assertFalse((fixture.root / 'legacy-advertised').exists())
+
     def test_directory_dfs_prefetch_is_separate_and_publishes_early(self):
         self.assertTrue(OPTIONS.require_fuse or OPTIONS.require_nfs)
         for transport in ('https', 'ssh'):
@@ -319,5 +388,7 @@ assert Path('b').stat().st_size == {size}
 if __name__ == '__main__':
     if sys.argv[1:2] == ['--ssh-pack']:
         ssh_upload_pack(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ['--ssh-branch']:
+        ssh_branch_pack(Path(sys.argv[2]))
     else:
         unittest.main(argv=[sys.argv[0], *ARGS])

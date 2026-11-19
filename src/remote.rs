@@ -16,7 +16,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -938,6 +941,9 @@ impl Remote {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "/bin/false")
             .env("SSH_ASKPASS", "/bin/false");
+        if let Some(branch) = branch.filter(|_| !self.git.sets_protocol_version()) {
+            return self.select_ssh_branch(branch, command, additional);
+        }
         let mut candidates: Vec<_> = transport::StartingSession::spawn(command, false, None)
             .into_iter()
             .collect();
@@ -989,6 +995,119 @@ impl Remote {
             },
             (None, None) => return Ok(None),
         };
+        self.fetch_selected_ssh(oid, session, connection, candidates)
+    }
+
+    fn select_ssh_branch(
+        &mut self,
+        branch: &transport::BranchQuery,
+        mut command: Command,
+        additional: Command,
+    ) -> Result<Option<Oid>> {
+        // The first channel can advertise refs as soon as it opens. Negotiate
+        // the object channels through the same authenticated OpenSSH master.
+        command.env("GIT_PROTOCOL", "version=0");
+        let stop = Arc::new(AtomicBool::new(false));
+        let Ok(starter) = transport::StartingSession::spawn(command, false, Some(stop.clone()))
+        else {
+            crate::object::check_transfer()?;
+            return Ok(None);
+        };
+        let picked = std::thread::scope(|scope| {
+            let (send, receive) = mpsc::sync_channel(1);
+            let advertisement = scope.spawn(move || {
+                let _ = send.send(starter.advertised_branch(branch).ok().flatten());
+            });
+            let picked = (|| -> Result<_> {
+                let connection = loop {
+                    self.record_socket_owner()?;
+                    if let Some(socket) = self.ssh_socket() {
+                        break transport::Connection::new(additional, false, Some(socket));
+                    }
+                    if advertisement.is_finished() {
+                        return Ok(None);
+                    }
+                    crate::object::check_transfer()?;
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let mut candidates = (0..=SSH_STANDBY_CHANNELS)
+                    .filter_map(|_| connection.start_additional().ok())
+                    .collect::<Vec<_>>();
+                while !candidates.is_empty() {
+                    if let Some(index) =
+                        transport::StartingSession::wait_for_advertisement(&candidates)?
+                    {
+                        if let Ok(Some(primary)) = candidates.swap_remove(index).negotiate() {
+                            let result =
+                                Self::resolve_ssh_branch(primary, &mut candidates, branch, receive);
+                            crate::object::check_transfer()?;
+                            return Ok(result
+                                .ok()
+                                .flatten()
+                                .map(|(session, oid)| (connection, candidates, session, oid)));
+                        }
+                    }
+                }
+                // A master with only one session can reject every spare
+                // while its first upload-pack is still opening. Finish that
+                // channel before falling back on the authenticated socket.
+                let _ = advertisement.join();
+                Ok(None)
+            })();
+            stop.store(true, Ordering::Relaxed);
+            picked
+        })?;
+        let Some((connection, candidates, session, oid)) = picked else {
+            return Ok(None);
+        };
+        self.session_starts += 1;
+        self.fetch_selected_ssh(oid, session, Some(connection), candidates)
+    }
+
+    fn resolve_ssh_branch(
+        mut primary: transport::Session,
+        spares: &mut Vec<transport::StartingSession>,
+        branch: &transport::BranchQuery,
+        advertisement: mpsc::Receiver<Option<Oid>>,
+    ) -> Result<Option<(transport::Session, Oid)>> {
+        match advertisement.try_recv() {
+            Ok(Some(oid)) => return Ok(Some((primary, oid))),
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                return Ok(primary.select_branch(branch)?.map(|oid| (primary, oid)));
+            }
+            Err(mpsc::TryRecvError::Empty) => (),
+        }
+        primary.request_branch(branch)?;
+        let mut advertised = None;
+        while !primary.branch_ready()? {
+            if advertised.is_none() {
+                match advertisement.try_recv() {
+                    Ok(Some(oid)) => advertised = Some(oid),
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => (),
+                }
+            }
+            if let Some(oid) = advertised {
+                if let Some(index) = spares
+                    .iter()
+                    .position(transport::StartingSession::filtered_v2_ready)
+                {
+                    if let Ok(Some(secondary)) = spares.swap_remove(index).negotiate() {
+                        return Ok(Some((secondary, oid)));
+                    }
+                }
+            }
+        }
+        Ok(primary.read_branch(branch)?.map(|oid| (primary, oid)))
+    }
+
+    fn fetch_selected_ssh(
+        &mut self,
+        oid: Oid,
+        session: transport::Session,
+        connection: Option<transport::Connection>,
+        mut candidates: Vec<transport::StartingSession>,
+    ) -> Result<Option<Oid>> {
         self.session = Some(session);
         self.session_checked = true;
         self.session_starts += 1;

@@ -264,6 +264,27 @@ impl StartingSession {
         Ok(sockets.iter().position(|socket| socket.revents != 0))
     }
 
+    pub(crate) fn advertised_branch(mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        let selected = read_selected_branch(&mut self.0.output, Some(query), true)?;
+        let _ = self.0.input.write_all(b"0000");
+        Ok(selected)
+    }
+
+    /// An optional spare must have a complete handshake before it can take
+    /// over from an in-flight ref query on another channel.
+    pub(crate) fn filtered_v2_ready(&self) -> bool {
+        let mut preview = [0; 4096];
+        let read = unsafe {
+            libc::recv(
+                self.0.output.get_ref().0.as_raw_fd(),
+                preview.as_mut_ptr().cast(),
+                preview.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        read > 0 && read_v2_capabilities(&mut &preview[..read as usize]).unwrap_or(false)
+    }
+
     pub(crate) fn negotiate(mut self) -> Result<Option<Session>> {
         let session = &mut self.0;
         match session.handshake(session.stateless) {
@@ -354,8 +375,34 @@ impl Session {
         Ok(line)
     }
     pub(crate) fn select_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        self.request_branch(query)?;
+        self.read_branch(query)
+    }
+
+    pub(crate) fn request_branch(&mut self, query: &BranchQuery) -> Result<()> {
         self.input.write_all(&reference_request(Some(query))?)?;
-        read_selected_branch(&mut self.output, Some(query))
+        Ok(())
+    }
+
+    pub(crate) fn branch_ready(&self) -> io::Result<bool> {
+        check_transfer(&self.output.get_ref().1)?;
+        if !self.output.buffer().is_empty() {
+            return Ok(true);
+        }
+        let mut socket = libc::pollfd {
+            fd: self.output.get_ref().0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut socket, 1, 5) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => Ok(false),
+            -1 => Err(io::Error::last_os_error()),
+            ready => Ok(ready != 0),
+        }
+    }
+
+    pub(crate) fn read_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        read_selected_branch(&mut self.output, Some(query), false)
     }
     pub(crate) fn fetch_stream(
         &mut self,
@@ -568,19 +615,35 @@ pub(crate) fn read_http_branch(
     mut input: &[u8],
     query: Option<&BranchQuery>,
 ) -> Result<Option<Oid>> {
-    let selected = read_selected_branch(&mut input, query)?;
+    let selected = read_selected_branch(&mut input, query, false)?;
     check_http_end(input)?;
     Ok(selected)
 }
 
-fn read_selected_branch(input: &mut impl Read, query: Option<&BranchQuery>) -> Result<Option<Oid>> {
+fn read_selected_branch(
+    input: &mut impl Read,
+    query: Option<&BranchQuery>,
+    full_advertisement: bool,
+) -> Result<Option<Oid>> {
     let mut selected = None;
     let mut ambiguous = false;
+    let mut advertised_size = 0;
     loop {
         match read_packet(input)? {
             Packet::Data(line) => {
                 if let Some(query) = query {
-                    let mut fields = packet_text(&line).split(|&byte| byte == b' ');
+                    let mut reference = line.as_slice();
+                    if full_advertisement {
+                        let first = advertised_size == 0;
+                        advertised_size += 4 + line.len();
+                        if advertised_size > 128 * 1024 {
+                            return Ok(None);
+                        }
+                        if first {
+                            reference = reference.split(|&byte| byte == 0).next().unwrap();
+                        }
+                    }
+                    let mut fields = packet_text(reference).split(|&byte| byte == b' ');
                     let id = fields.next().unwrap_or_default();
                     let name = fields.next().unwrap_or_default();
                     if name == query.wanted.as_bytes() {

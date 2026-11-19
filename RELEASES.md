@@ -20,6 +20,8 @@
   delays during snapshot preparation and pack decoding.
 - Open spare SSH channels while the initial one negotiates Git and during
   slow root fetches. Let ready channels serve queued reads during setup.
+- Resolve an unambiguous SSH branch while object channels open, allowing a
+  ready channel to fetch the commit while another waits for its ref reply.
 - Prefetch upcoming blobs from already opened directories on both transports.
   Grow the fetch batch after confirmed reads, with earlier expansion when
   overlapping reads already wait on a slow source.
