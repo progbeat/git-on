@@ -20,6 +20,7 @@ const MAX_OUTSTANDING: usize = 32;
 const MAX_WANTS: usize = 8;
 const REPLY_SAMPLES: u8 = 8;
 const SLOW_REPLY: Duration = Duration::from_millis(64);
+const BATCH_TARGET: usize = 4;
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 pub(crate) struct Batch {
@@ -143,7 +144,7 @@ struct Queue {
 impl Queue {
     fn batch_wait(&self, now: Instant) -> Option<Duration> {
         if matches!(self.mode, ConnectionMode::Wide)
-            && self.waiting.len() == 1
+            && self.waiting.len() < BATCH_TARGET
             && self.busy.contains(&true)
         {
             BATCH_WINDOW
@@ -402,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_briefly_only_when_one_wide_mode_demand_can_join_others() {
+    fn batch_waits_for_more_demands_until_target_or_deadline() {
         let now = Instant::now();
         let mut queue = Queue::default();
         queue.waiting.push_back(QueuedDemand {
@@ -418,11 +419,14 @@ mod tests {
         queue.busy[0] = false;
         assert_eq!(queue.batch_wait(now), None);
         queue.busy[0] = true;
-        queue.waiting.push_back(QueuedDemand {
-            oid: Oid::from_bytes(&[1; 20]).unwrap(),
-            demand: Demand::default(),
-            queued_at: now,
-        });
+        for index in 1..BATCH_TARGET {
+            assert_eq!(queue.batch_wait(now), Some(BATCH_WINDOW));
+            queue.waiting.push_back(QueuedDemand {
+                oid: Oid::from_bytes(&[index as u8; 20]).unwrap(),
+                demand: Demand::default(),
+                queued_at: now,
+            });
+        }
         assert_eq!(queue.batch_wait(now), None);
     }
 }

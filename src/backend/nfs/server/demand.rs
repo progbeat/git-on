@@ -4,7 +4,7 @@ use super::{
         files::{component, READ},
         protocol::Operation::*,
         xdr::Bitmap,
-        Job, QUEUE_DEPTH,
+        Job, REMOTE_READ_WINDOW,
     },
     protocol::{self, Credentials, Rpc, SessionId, MAX_OPS},
     Context, Server, Writer, MIN_CHANNEL_SIZE,
@@ -83,7 +83,7 @@ impl Server {
             }
             let event = if parked.is_empty() {
                 Event::Job(barrier.take().or_else(|| jobs.blocking_recv()))
-            } else if barrier.is_some() || parked.len() == QUEUE_DEPTH {
+            } else if barrier.is_some() || parked.len() == REMOTE_READ_WINDOW {
                 runtime.block_on(wake.notified());
                 Event::Completion
             } else {

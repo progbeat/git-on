@@ -32,6 +32,7 @@ use xdr::{fragment, MAX_RECORD};
 
 const MAX_CONNECTIONS: usize = 16;
 const QUEUE_DEPTH: usize = 8;
+const REMOTE_READ_WINDOW: usize = 32;
 const MAX_FRAGMENTS: usize = 256;
 
 #[derive(Default)]
@@ -232,7 +233,7 @@ async fn serve(
                 match accepted {
                     Ok((socket, _)) => {
                         if socket.peer_cred().is_ok_and(|peer| peer.uid() == 0 || peer.uid() == uid) {
-                            let limit = if parallel_reads { QUEUE_DEPTH } else { 1 };
+                            let limit = if parallel_reads { REMOTE_READ_WINDOW } else { 1 };
                             peers.spawn(connection(socket, queue.clone(), limit));
                         }
                     }

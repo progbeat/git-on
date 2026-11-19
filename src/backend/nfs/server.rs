@@ -18,9 +18,20 @@ mod demand;
 pub(super) const LEASE_SECONDS: u32 = 90;
 const MAX_CLIENTS: usize = 8;
 const MAX_SESSIONS: usize = 4;
-const MAX_SLOTS: u32 = 8;
+const BASE_SLOTS: u32 = 8;
 const MIN_CHANNEL_SIZE: u32 = 4096;
 const RPC_REPLY_HEADER: usize = 24;
+
+fn fore_slot_limit(response: u32, parallel_reads: bool) -> u32 {
+    if parallel_reads {
+        // Every slot can retain a complete reply. Preserve the session's
+        // original byte bound when the negotiated replies are small.
+        let replay_budget = BASE_SLOTS * MAX_RECORD as u32;
+        (replay_budget / response).min(super::REMOTE_READ_WINDOW as u32)
+    } else {
+        BASE_SLOTS
+    }
+}
 
 struct Client {
     owner: Box<[u8]>,
@@ -579,12 +590,14 @@ impl Server {
         {
             return Err(TOOSMALL);
         }
+        let response = fore.response.min(MAX_RECORD as u32);
+        let max_slots = fore_slot_limit(response, self.core.parallel_remote_reads());
         let channel = Channel {
             request: fore.request.min(MAX_RECORD as u32),
-            response: fore.response.min(MAX_RECORD as u32),
+            response,
             cached: fore.cached.min(fore.response).min(MAX_RECORD as u32),
             ops: fore.ops.min(MAX_OPS as u32),
-            slots: fore.slots.min(MAX_SLOTS),
+            slots: fore.slots.min(max_slots),
         };
         if !client.confirmed {
             let replaced: Vec<_> = self
@@ -678,4 +691,19 @@ impl Server {
 enum Sequenced {
     New(u64, usize),
     Replay(Vec<u8>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fore_slots_expand_within_the_original_replay_budget() {
+        let max_reply = MAX_RECORD as u32;
+        assert_eq!(fore_slot_limit(max_reply, true), BASE_SLOTS);
+        assert_eq!(fore_slot_limit(max_reply / 2, true), 16);
+        assert_eq!(fore_slot_limit(max_reply / 4, true), 32);
+        assert_eq!(fore_slot_limit(MIN_CHANNEL_SIZE, true), 32);
+        assert_eq!(fore_slot_limit(MIN_CHANNEL_SIZE, false), BASE_SLOTS);
+    }
 }
