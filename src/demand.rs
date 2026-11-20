@@ -791,9 +791,9 @@ impl Shared {
         );
         if let Some(forecast) = forecast {
             response.set_required(move |remaining| {
-                forecast
-                    .iter()
-                    .any(|(oid, demand)| demand.required() && remaining.contains(oid))
+                forecast.iter().any(|(oid, demand)| {
+                    demand.required() && remaining.contains(oid) && !demand.ready()
+                })
             });
         }
         response
@@ -1507,6 +1507,54 @@ mod tests {
                 .complete_object(oid, &flight, true, Acquired::Stored);
         }
         assert_eq!(pool.metrics().oids, 1);
+    }
+
+    #[test]
+    fn a_satisfied_forecast_leaves_the_foreground_decode_buffer_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RawBlobs::new(directory.path()).unwrap();
+        let held: Vec<_> = (0..7)
+            .map(|_| {
+                cache
+                    .reserve_pack_decode(|| false, object::check_transfer)
+                    .unwrap()
+            })
+            .collect();
+        let shared = Arc::<Shared>::default();
+        let oid = Oid::from_bytes(&[1; 20]).unwrap();
+        let work = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            let work = Work::take(&mut queue.ahead, true).unwrap();
+            let demand = queue.foreground(oid);
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+            work
+        };
+        let mut pack = shared.response(&work, &[oid], &cache);
+        let (start, started) = mpsc::channel();
+        let (write, written) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                start.send(()).unwrap();
+                write
+                    .send(
+                        pack.write_http(
+                            b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20",
+                        ),
+                    )
+                    .unwrap();
+            });
+            let began = started.recv_timeout(Duration::from_secs(3));
+            let attempted = written.recv_timeout(Duration::from_millis(150));
+            drop(held);
+            began.unwrap();
+            assert!(matches!(attempted, Err(mpsc::RecvTimeoutError::Timeout)));
+            written
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[test]
