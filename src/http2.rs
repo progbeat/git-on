@@ -107,11 +107,22 @@ fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
 // of requests libcurl can multiplex. A full queue pauses only that transfer.
 const QUEUE_CHUNKS: usize = 8;
 
+pub(crate) type ReportFailure = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
+
+fn note_failure<T>(report: Option<&ReportFailure>, result: &Result<T>) {
+    if let (Some(report), Err(error)) = (report, result) {
+        if !crate::object::is_cancelled(error) {
+            report(error);
+        }
+    }
+}
+
 enum Body {
     Discovery(Vec<u8>),
     PendingReply {
         pack: Box<pack_stream::Response>,
         wake: Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
     },
     Reply(Decoder),
 }
@@ -120,6 +131,7 @@ struct Decoder {
     input: Option<SyncSender<Vec<u8>>>,
     buffered: Arc<AtomicUsize>,
     transport: Arc<Mutex<Option<Result<()>>>>,
+    report_failure: Option<ReportFailure>,
     result: Receiver<Result<pack_stream::Received>>,
     thread: Option<JoinHandle<()>>,
     paused: bool,
@@ -130,6 +142,7 @@ impl Decoder {
         mut pack: Box<pack_stream::Response>,
         stop: Arc<AtomicBool>,
         wake: Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
     ) -> io::Result<Self> {
         let (input, chunks) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CHUNKS);
         let (complete, result) = mpsc::channel();
@@ -137,6 +150,7 @@ impl Decoder {
         let transport = Arc::new(Mutex::new(None::<Result<()>>));
         let pending = buffered.clone();
         let outcome = transport.clone();
+        let report = report_failure.clone();
         let thread = thread::Builder::new()
             .name("git-on-http-pack".into())
             .spawn(move || {
@@ -157,6 +171,7 @@ impl Decoder {
                         .unwrap_or_else(|| Err(OperationCancelled.into()))?;
                     pack.finish_http()
                 })();
+                note_failure(report.as_ref(), &received);
                 let _ = complete.send(received);
                 crate::demand::signal_http2(&wake);
             })?;
@@ -164,6 +179,7 @@ impl Decoder {
             input: Some(input),
             buffered,
             transport,
+            report_failure,
             result,
             thread: Some(thread),
             paused: false,
@@ -202,6 +218,7 @@ impl Decoder {
     }
 
     fn end(&mut self, outcome: Result<()>) {
+        note_failure(self.report_failure.as_ref(), &outcome);
         *self.transport.lock().unwrap() = Some(outcome);
         drop(self.input.take());
     }
@@ -240,10 +257,15 @@ impl Handler for Response {
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
         if self.h2 && self.ok && self.git_pack && matches!(self.body, Body::PendingReply { .. }) {
             let body = std::mem::replace(&mut self.body, Body::Discovery(Vec::new()));
-            let Body::PendingReply { pack, wake } = body else {
+            let Body::PendingReply {
+                pack,
+                wake,
+                report_failure,
+            } = body
+            else {
                 unreachable!()
             };
-            match Decoder::start(pack, self.stop.clone(), wake) {
+            match Decoder::start(pack, self.stop.clone(), wake, report_failure) {
                 Ok(decoder) => self.body = Body::Reply(decoder),
                 Err(error) => {
                     self.error = Some(error);
@@ -438,12 +460,14 @@ impl Client {
         oids: &[Oid],
         response: pack_stream::Response,
         wake: &Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
     ) -> Result<()> {
         let easy = self.easy(
             "git-upload-pack",
             Body::PendingReply {
                 pack: Box::new(response),
                 wake: wake.clone(),
+                report_failure,
             },
             Some(transport::exact_request(oids)?),
         )?;
@@ -578,12 +602,9 @@ mod tests {
     use super::*;
     use std::{io::Write, sync::mpsc, thread};
 
-    #[test]
-    fn blocked_decode_does_not_hold_an_independent_reply() {
+    fn framed_blob() -> (Oid, Vec<u8>, Vec<u8>) {
         use sha1_checked::{Digest, Sha1};
 
-        let directory = tempfile::tempdir().unwrap();
-        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
         let oid = Oid::hash_object(git2::ObjectType::Blob, b"x").unwrap();
         let mut encoder = flate2::write::ZlibEncoder::new(
             b"PACK\0\0\0\x02\0\0\0\x01\x31".to_vec(),
@@ -597,6 +618,96 @@ mod tests {
         let mut tail = format!("{:04x}\x01", trailer.len() + 5).into_bytes();
         tail.extend_from_slice(&trailer);
         tail.extend_from_slice(b"0000");
+        (oid, frame, tail)
+    }
+
+    #[test]
+    fn decoded_pack_failure_is_reported_without_another_dispatch_pass() {
+        let (oid, frame, _) = framed_blob();
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (publish, published) = mpsc::channel();
+        let pack = pack_stream::Response::new(
+            scratch,
+            vec![oid],
+            Box::new(move |object| {
+                assert_eq!(object.oid(), oid);
+                publish.send(())?;
+                Ok(())
+            }),
+        );
+        let (_read, wake) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let (report, reported) = mpsc::channel();
+        let mut decoder = Decoder::start(
+            Box::new(pack),
+            Arc::default(),
+            Arc::new(wake),
+            Some(Arc::new(move |error| {
+                let _ = report.send(error.to_string());
+            })),
+        )
+        .unwrap();
+        decoder.feed(&frame).unwrap();
+        published.recv_timeout(Duration::from_secs(3)).unwrap();
+        decoder.feed(b"zzzz").unwrap();
+        let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
+        let expected = result.err().expect("malformed packet").to_string();
+        drop(decoder);
+        assert_eq!(
+            reported
+                .try_recv()
+                .expect("decoder discarded a diagnosed error"),
+            expected
+        );
+    }
+
+    #[test]
+    fn terminal_transport_failure_survives_decoder_cancellation() {
+        let (oid, frame, _) = framed_blob();
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (publish, published) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let pack = pack_stream::Response::new(
+            scratch,
+            vec![oid],
+            Box::new(move |_| {
+                publish.send(())?;
+                resumed.recv()?;
+                Ok(())
+            }),
+        );
+        let (_read, wake) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (report, reported) = mpsc::channel();
+        let mut decoder = Decoder::start(
+            Box::new(pack),
+            stop.clone(),
+            Arc::new(wake),
+            Some(Arc::new(move |error| {
+                let _ = report.send(error.to_string());
+            })),
+        )
+        .unwrap();
+        decoder.feed(&frame).unwrap();
+        published.recv_timeout(Duration::from_secs(3)).unwrap();
+        decoder.feed(b"0000").unwrap();
+        decoder.end(Err(anyhow::anyhow!("required transfer was reset")));
+        stop.store(true, Ordering::Relaxed);
+        release.send(()).unwrap();
+        let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(result.as_ref().is_err_and(crate::object::is_cancelled));
+        drop(decoder);
+        assert_eq!(reported.try_recv().unwrap(), "required transfer was reset");
+    }
+
+    #[test]
+    fn blocked_decode_does_not_hold_an_independent_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (oid, frame, tail) = framed_blob();
         let (started, wait_for_start) = mpsc::channel();
         let (release, wait_for_release) = mpsc::channel();
         let (published, wait_for_publication) = mpsc::channel();
@@ -612,6 +723,7 @@ mod tests {
                     publish,
                 )),
                 wake: wake.clone(),
+                report_failure: None,
             },
             error: None,
             stop: Arc::default(),

@@ -263,6 +263,7 @@ pub struct SnapshotMetrics {
     pub hot_blob_cache_bytes: usize,
     pub hot_blob_cache_entries: usize,
     pub hot_blob_spill_bytes: usize,
+    pub verified_decode_buffer_bytes: usize,
     pub blob_cache_limit: usize,
     pub tree_cache_bytes: usize,
     pub tree_cache_entries: usize,
@@ -1170,6 +1171,7 @@ impl Snapshot {
                 metrics.hot_blob_cache_bytes,
                 metrics.hot_blob_cache_entries,
                 metrics.hot_blob_spill_bytes,
+                metrics.verified_decode_buffer_bytes,
             ) = raw.hot_metrics();
         }
         // Parsed metadata is invocation-local and retained for touched OIDs;

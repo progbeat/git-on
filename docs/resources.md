@@ -10,10 +10,16 @@ A hot read uses the verified buffer without writing a raw file.
 
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. Another large
-admission can wait for that spill once the hot cache is full. Prepared objects
-remain reusable across close/reopen and RAM eviction without another fetch or
-decode. If an optional disk-block admission needs a spill that fails, return the
-checked bytes and keep the unbacked resident.
+admission can wait for that spill once the hot cache is full. One demanded
+HTTPS or SSH blob can be served from its verified decoder buffer during that
+wait. The buffer bounds early publication while network requests can still
+run concurrently.
+If a blob exceeds the current file-size limit, a fitting resident can be
+spilled in its place.
+When no resident fits, an eligible new blob can go directly to verified backing.
+Prepared objects remain reusable across close/reopen and RAM eviction without
+another fetch or decode. If an optional disk-block admission needs a spill that
+fails, return the checked bytes and keep the unbacked resident.
 
 ## Metadata and source decoding
 
@@ -86,6 +92,7 @@ selected revision and enough space for the same command to finish.
 is later discarded. Transport/metadata staging and durability work are excluded.
 The separate retained-raw counters describe current storage, not cumulative I/O.
 `hot_blob_spill_bytes` measures the whole buffer held by an unfinished eviction.
+`verified_decode_buffer_bytes` measures published pack buffers awaiting cache placement.
 
 ## Integrity
 

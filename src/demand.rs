@@ -718,19 +718,22 @@ impl Shared {
                     .find(|(wanted, _)| *wanted == oid)
                     .expect("known want")
                     .1;
-                let acquired = if object.kind() == git2::ObjectType::Blob {
-                    cache.insert_verified_blob(object)?;
-                    if speculative {
-                        shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Acquired::Stored
+                let publish = |acquired| {
+                    shared.oids.fetch_add(1, Ordering::Relaxed);
+                    demand.complete(Batch::new(vec![oid], Ok(acquired)));
+                };
+                if object.kind() == git2::ObjectType::Blob {
+                    cache.insert_verified_blob(object, !speculative || demand.required(), || {
+                        if speculative {
+                            shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+                        }
+                        publish(Acquired::Stored);
+                    })
                 } else {
                     anyhow::ensure!(!speculative, "prefetched object is not a blob");
-                    Acquired::Object(object)
-                };
-                shared.oids.fetch_add(1, Ordering::Relaxed);
-                demand.complete(Batch::new(vec![oid], Ok(acquired)));
-                Ok(())
+                    publish(Acquired::Object(object));
+                    Ok(())
+                }
             }),
         )
     }
@@ -980,11 +983,26 @@ impl Shared {
                             token = token
                                 .checked_add(1)
                                 .context("Git HTTP/2 request ID overflow")?;
+                            let report_failure: Option<crate::http2::ReportFailure> = if speculative
+                            {
+                                None
+                            } else {
+                                let shared = self.clone();
+                                Some(Arc::new(move |error| {
+                                    shared
+                                        .queue
+                                        .lock()
+                                        .unwrap()
+                                        .failure
+                                        .get_or_insert_with(|| format!("{error:#}"));
+                                }))
+                            };
                             client.start(
                                 token,
                                 &oids,
                                 self.response(&work, &oids, scratch),
                                 decoder_wake,
+                                report_failure,
                             )
                         }
                     };

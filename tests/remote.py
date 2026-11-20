@@ -2867,7 +2867,7 @@ signal.pause()
         blob = f.git('hash-object', '-w', '--stdin', data=b'x' * (128 * 1024))
         subtree = f.git('mktree', data=f'100644 blob {blob}\tfile\n'.encode())
         rows=[f'040000 tree {subtree}\tdeep\n']
-        for index in range(8):
+        for index in range(9):
             filler=f.git('hash-object','-w','--stdin',data=bytes([index])*(64*1024+1))
             rows.append(f'100644 blob {filler}\tfiller-{index}\n')
         tree=f.git('mktree',data=''.join(rows).encode())
@@ -2885,7 +2885,7 @@ signal.pause()
                     code += ("assert Path('deep/file').read_bytes()[:1] == b'x'\n"
                              "raw = next(Path.cwd().parent.glob('raw-objects-*'))\n"
                              f"target = raw / {blob!r}\ntarget.mkdir()\n")
-                    operation = " for i in range(8):assert Path(f'filler-{i}').read_bytes()[0] == i\n"
+                    operation = " for i in range(9):assert Path(f'filler-{i}').read_bytes()[0] == i\n"
                 else:
                     code += private_storage_fault(fault)
                     operation = " open('deep/file').read()\n"

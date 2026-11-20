@@ -1348,7 +1348,12 @@ assert not Path('out/final-hard').exists()
     def test_raw_file_limit_with_default_signal_cleans_mount_and_pin(self):
         (self.repo / 'large-raw').write_bytes(b'x' * (1024 * 1024))
         self.add_spill_blobs(self.repo)
-        git(self.repo, 'add', 'large-raw', 'spill')
+        oversized = self.repo / 'over-limit'
+        oversized.mkdir()
+        for index in range(8):
+            (oversized / str(index)).write_bytes(bytes([index]) * (128 * 1024 + 1))
+        (self.repo / 'fits-limit').write_bytes(b'f' * (64 * 1024 + 2))
+        git(self.repo, 'add', 'large-raw', 'spill', 'over-limit', 'fits-limit')
         git(self.repo, 'commit', '--quiet', '-m', 'raw file limit')
         git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
         git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
@@ -1356,10 +1361,20 @@ assert not Path('out/final-hard').exists()
 import errno, sys
 with open('large-raw', 'rb', buffering=0) as source:
     assert source.read(1) == b'x'
+for index in range(9):
+    with open('spill/%d' % index, 'rb', buffering=0) as source:
+        assert source.read(1) == bytes([index])
+with open('large-raw', 'rb', buffering=0) as source:
+    assert source.read(1) == b'x'
+for index in range(7):
+    with open('over-limit/%d' % index, 'rb', buffering=0) as source:
+        assert source.read(1) == bytes([index])
+# All eight hot blobs now exceed the per-file limit.
+with open('fits-limit', 'rb', buffering=0) as source:
+    assert source.read(2) == b'ff'
 try:
-    for index in range(9):
-        with open('spill/%d' % index, 'rb', buffering=0) as source:
-            assert source.read(1) == bytes([index])
+    with open('over-limit/7', 'rb', buffering=0) as source:
+        source.read(1)
 except OSError as error:
     assert error.errno in (errno.EIO, errno.EFBIG), error
     print('handled raw file limit')
