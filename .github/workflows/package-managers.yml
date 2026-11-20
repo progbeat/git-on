@@ -1,0 +1,178 @@
+name: Package managers
+
+on:
+  pull_request:
+    paths:
+      - Formula/git-on.rb
+      - scripts/build-apt-repository.sh
+      - scripts/apt-source.sh
+      - .github/workflows/package-managers.yml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published immutable stable release to package (without v)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        os: [macos-15, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install and test the formula through a tap
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+              eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          brew tap progbeat/git-on "file://$GITHUB_WORKSPACE"
+          brew install progbeat/git-on/git-on
+          brew test progbeat/git-on/git-on
+          git on --version
+
+  apt:
+    if: github.event_name == 'pull_request' || (github.repository == 'progbeat/git-on' && github.ref == 'refs/heads/master')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install archive utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils binutils dpkg-dev
+      - name: Build archive
+        id: archive
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_VERSION:-$(sed -n 's/^  version "\([0-9.]*\)"$/\1/p' Formula/git-on.rb)}
+          scripts/build-apt-repository.sh "$version" "$RUNNER_TEMP/apt-repository"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check reproducibility on the same runner
+        if: github.event_name == 'pull_request'
+        env:
+          RELEASE_VERSION: ${{ steps.archive.outputs.version }}
+        run: |
+          scripts/build-apt-repository.sh "$RELEASE_VERSION" "$RUNNER_TEMP/apt-repeat"
+          cmp "$RUNNER_TEMP"/apt-{repository,repeat}/git-on_"${RELEASE_VERSION}"_amd64.deb
+      - name: Install by package name from the signed test repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.archive.outputs.version }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d)
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Git-on CI <ci@example.invalid>' rsa3072 sign 1d
+          repo="$RUNNER_TEMP/apt-repository-ci"
+          cp -a "$RUNNER_TEMP/apt-repository" "$repo"
+          gpg --batch --armor --output "$repo/InRelease" --clearsign "$repo/Release"
+
+          source=/etc/apt/sources.list.d/git-on-ci.sources
+          gpg --batch --armor --export | scripts/apt-source.sh "file:$repo" > "$RUNNER_TEMP/git-on-ci.sources"
+          # Without the embedded key, the signature is not trusted.
+          sed '/^Signed-By:$/,$d' "$RUNNER_TEMP/git-on-ci.sources" | sudo tee "$source"
+          if sudo env LC_ALL=C apt-get -o Dir::Etc::sourcelist="$source" -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any update >"$RUNNER_TEMP/apt-unsigned.log" 2>&1; then
+              echo 'APT unexpectedly accepted the repository without its verification key.' >&2
+              exit 1
+          fi
+          cat "$RUNNER_TEMP/apt-unsigned.log"
+          grep -E "NO_PUBKEY|[Mm]issing key" "$RUNNER_TEMP/apt-unsigned.log"
+
+          sudo install -m644 "$RUNNER_TEMP/git-on-ci.sources" "$source"
+          sudo apt-get -o APT::Update::Error-Mode=any update
+          sudo apt-get install -y git-on
+          test "$(git on --version)" = "git-on $RELEASE_VERSION"
+      - name: Transfer the unsigned archive to the publish job
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: apt-repository
+          path: ${{ runner.temp }}/apt-repository
+          if-no-files-found: error
+
+  publish-apt:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'progbeat/git-on' && github.ref == 'refs/heads/master'
+    needs: apt
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: git-on-apt-pages
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: apt-repository
+          path: site/apt
+      - id: pages
+        uses: actions/configure-pages@v5
+      - name: Verify that the selected release is still current
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          latest=$(curl --proto '=https' -fsSL "$GITHUB_API_URL/repos/progbeat/git-on/releases/latest" | jq -er 'select(.immutable == true) | .tag_name')
+          test "$latest" = "v$RELEASE_VERSION"
+      - name: Refuse to change a published package at the same URL
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -euo pipefail
+          : "${PAGES_BASE_URL:?Configure GitHub Pages with GitHub Actions as its source first}"
+          package=git-on_${RELEASE_VERSION}_amd64.deb
+          status=$(curl --proto '=https' -sSL --max-time 30 -H 'Cache-Control: no-cache' -o "$RUNNER_TEMP/published.deb" -w '%{http_code}' "${PAGES_BASE_URL%/}/apt/$package?run=$GITHUB_RUN_ID")
+          case "$status" in
+              200) cmp "site/apt/$package" "$RUNNER_TEMP/published.deb" ;;
+              404) ;;
+              *) echo "Could not check published package: HTTP $status" >&2; exit 1 ;;
+          esac
+      - name: Sign the APT archive
+        shell: bash
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_FINGERPRINT: ${{ vars.APT_SIGNING_FINGERPRINT }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -euo pipefail
+          : "${APT_SIGNING_KEY:?Configure the Git-on APT archive signing key first}"
+          : "${PAGES_BASE_URL:?Configure GitHub Pages with GitHub Actions as its source first}"
+          [[ "$APT_SIGNING_FINGERPRINT" =~ ^[[:xdigit:]]{40}$ ]]
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d)
+          trap 'gpgconf --kill gpg-agent; rm -rf -- "$GNUPGHOME"' EXIT
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          unset APT_SIGNING_KEY
+          cd site/apt
+          gpg --batch --armor --local-user "$APT_SIGNING_FINGERPRINT" --output InRelease --clearsign Release
+          gpg --batch --armor --export-options export-minimal --export "$APT_SIGNING_FINGERPRINT" > git-on.asc
+          "$GITHUB_WORKSPACE/scripts/apt-source.sh" "${PAGES_BASE_URL%/}/apt" < git-on.asc > git-on.sources
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

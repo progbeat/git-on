@@ -44,6 +44,18 @@ Linux uses [FUSE](docs/platforms.md). macOS 26 and later use
 [local NFSv4.1](docs/nfs.md) with the built-in macOS client. See the [installation guide](docs/releases.md#installing-a-published-binary)
 for custom install locations and other setup options.
 
+Homebrew can install the same binaries from this repository's tap:
+
+```sh
+brew tap progbeat/git-on https://github.com/progbeat/git-on.git
+brew install progbeat/git-on/git-on
+```
+
+Git-on uses native Git. The Linux Homebrew build also requires system glibc
+2.34 or later, zlib and libgcc. Install your distribution's FUSE 3 tooling
+for native mounts.
+For Debian and Ubuntu, see [APT installation](docs/releases.md#apt-on-debian-and-ubuntu).
+
 ## Usage
 
 Pass a revision before `--`, followed by the command. For example, on Linux or macOS 26 and later:

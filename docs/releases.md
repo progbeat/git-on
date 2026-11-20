@@ -125,6 +125,44 @@ final invocations can execute. Signalling only the wrapper PID does not guarante
 child cancellation; interrupt the foreground process group normally. These are
 the owner's accepted streaming limits, not additional installer guarantees.
 
+## APT on Debian and Ubuntu
+
+Once the Git-on APT archive is published, add its signed source on amd64
+Debian 12+ or Ubuntu 22.04+:
+
+```sh
+curl --proto '=https' -fsSLO https://progbeat.github.io/git-on/apt/git-on.sources
+sudo install -m 0644 git-on.sources /etc/apt/sources.list.d/git-on.sources
+sudo apt update
+sudo apt install git-on
+```
+
+The source embeds a key scoped to this repository. Installing the package
+does not configure mount permissions; lazy Linux snapshots still require
+access to `/dev/fuse`.
+
+### Updating the package channels
+
+These channels reuse stable, immutable release binaries and do not create a
+second binary release. For Homebrew, update `Formula/git-on.rb` to the
+published version and both SHA-256 values from the release. Confirm both
+Homebrew installation checks before merging that update.
+
+For APT, set the source of this repository's GitHub Pages site to GitHub
+Actions. In the protected `github-pages` environment, configure the dedicated
+GnuPG signing key as the `APT_SIGNING_KEY` secret and store its public primary
+fingerprint as the `APT_SIGNING_FINGERPRINT` variable. The signing subkey
+available to the workflow must be usable without an interactive passphrase.
+Keep the private key out of source control and logs.
+
+Run **Package managers** from `master` with the published stable version
+(without `v`). It checks the release archive digest, builds the package and
+publishes the signed index. It rejects attempts to change package bytes at an
+existing version URL. The archive serves only the current stable release.
+If an upgrade replaces a version still in the local APT index, run `apt update`
+again before installing. Check the live APT source and install from it before
+announcing availability.
+
 ## Release artifacts and checksum policy
 
 Cargo-dist generates the Linux x86_64 and Apple Silicon `.tar.gz` archives,
