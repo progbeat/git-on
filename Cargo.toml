@@ -35,7 +35,6 @@ signal-hook = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 tempfile = "3"
-curl = { version = "0.4.50", default-features = false }
 url = "2.5"
 
 [profile.release]
@@ -49,7 +48,9 @@ inherits = "release"
 lto = "thin"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+curl = { version = "0.4.50", features = ["http2", "static-curl", "static-ssl"] }
 fuser = { version = "=0.18.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+curl = { version = "0.4.50", default-features = false }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

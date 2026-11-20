@@ -19,7 +19,7 @@ metadata. No separate release PR, manual tag, or CHANGELOG history is required.
 3. Run `python3 tests/test_release_policy.py`, the normal checks, and
    `python3 scripts/release_policy.py --base origin/master` after fetching master.
 4. When another PR merges first, update from master and recalculate any required version.
-   Never reuse a released version. Multiple commits within one PR share one bump.
+   Multiple commits within one PR share one bump.
 
 Nonrelease changes retain current master's package version and release notes;
 an unnecessary version bump is rejected. Mixed binary/documentation changes
@@ -33,17 +33,9 @@ When a crate has separate runtime/build and dev versions, classification matches
 the declared runtime/build version to its locked edge. If the manifest and lock
 cannot identify one edge, validation fails explicitly instead of guessing its kind.
 
-Use patch for backwards-compatible binary bug fixes. Use minor for new
-backwards-compatible capabilities, such as an optional write policy. Use major for
-breaking the documented CLI, filesystem, environment or platform contract.
-Assess compatibility against the requirements in the specification and interview.
-Restoring required behavior after an implementation defect is a bug fix, even
-when it changes observable behavior. Changing the required contract itself is a
-breaking change. Describe the user-visible effects in the release notes.
-These rules also apply before 1.0: this project deliberately reserves major bumps
-for breaking changes instead of silently treating every 0.x release as breaking.
-CI can validate the numeric increment and notes; semantic classification requires
-review of the change. Agents are responsible for proposing the correct kind.
+Choose the version according to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+Git-on's public API is the behavior promised in the [specification](specification.md)
+and user guides.
 
 For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.
@@ -168,6 +160,5 @@ cargo install --path . --locked
 
 Mac builds use the operating system's NFS client for native mounts on macOS 26
 and later. They also support explicit-all materialization on macOS 13 and later.
-Linux uses registry fuser 0.18. Linux builds need a libcurl development
-package such as `libcurl4-openssl-dev` on Ubuntu. macOS builds use libcurl from
-the system SDK.
+Mac builds link to the libcurl supplied by the system SDK. Linux uses registry
+fuser 0.18.

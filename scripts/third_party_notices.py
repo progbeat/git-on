@@ -10,22 +10,33 @@ from pathlib import Path
 import subprocess
 
 
-def collect(metadata):
+def collect(metadata, *, system_curl=False):
     packages={p['id']:p for p in metadata['packages']}
     nodes={n['id']:n for n in metadata['resolve']['nodes']}
+    # Cargo metadata unifies features across targets even when filtering by platform.
+    excluded_curl_deps = {
+        'curl': {'openssl-probe', 'openssl-sys'},
+        'curl-sys': {'openssl-sys', 'libnghttp2-sys'},
+    } if system_curl else {}
     todo=[metadata['resolve']['root']];selected=set()
     while todo:
         identifier=todo.pop()
         if identifier in selected:continue
         selected.add(identifier)
-        todo.extend(d['pkg'] for d in nodes[identifier]['deps'] if any(k['kind']!='dev' for k in d['dep_kinds']))
+        excluded = excluded_curl_deps.get(packages[identifier].get('name'), ())
+        todo.extend(d['pkg'] for d in nodes[identifier]['deps']
+                    if packages[d['pkg']]['name'] not in excluded
+                    and any(k['kind']!='dev' for k in d['dep_kinds']))
+    bundled={'libgit2-sys':['libgit2/COPYING','libgit2/deps/*/LICENSE*','libgit2/deps/*/COPYING*'],
+             'libz-sys':['src/zlib/LICENSE'], 'libssh2-sys':['libssh2/COPYING'],
+             'libnghttp2-sys':['nghttp2/COPYING'], 'openssl-src':['openssl/LICENSE.txt']}
+    if not system_curl:
+        bundled['curl-sys']=['curl/COPYING']
     sections=[]
     for p in sorted((packages[i] for i in selected if i != metadata['resolve']['root']),key=lambda p:(p['name'],p['version'])):
         root=Path(p['manifest_path']).parent.resolve()
         paths={f for f in root.iterdir() if f.is_file() and f.name.lower().startswith(('license','copying','copyright','notice'))}
         if p['license_file']:paths.add(root/p['license_file'])
-        bundled={'libgit2-sys':['libgit2/COPYING','libgit2/deps/*/LICENSE*','libgit2/deps/*/COPYING*'],
-                 'libz-sys':['src/zlib/LICENSE'], 'libssh2-sys':['libssh2/COPYING']}
         for pattern in bundled.get(p['name'],[]):paths.update(root.glob(pattern))
         if not paths:raise ValueError('missing license text: '+p['name'])
         sections.append('\n## '+p['name']+' '+p['version']+'\nDeclared license: '+str(p['license'])+'\n')
@@ -42,7 +53,8 @@ def main():
     p.add_argument('--output',type=Path,default=Path('THIRD_PARTY_NOTICES'))
     args=p.parse_args()
     metadata=json.loads(subprocess.check_output(['cargo','metadata','--locked','--offline','--format-version=1','--filter-platform',args.target]))
-    text='Third-party software notices for git-on\nTarget: '+args.target+'\nThe project LICENSE is distributed separately.\n'+collect(metadata)
+    notices=collect(metadata, system_curl=args.target=='aarch64-apple-darwin')
+    text='Third-party software notices for git-on\nTarget: '+args.target+'\nThe project LICENSE is distributed separately.\n'+notices
     args.output.write_text(text)
     print('Wrote locked runtime/build dependency license texts to '+str(args.output))
 

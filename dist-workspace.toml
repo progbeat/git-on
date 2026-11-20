@@ -27,9 +27,6 @@ hosting = "github"
 # Generated from the exact target's locked runtime/build sources before packing.
 include = ["THIRD_PARTY_NOTICES"]
 
-[dist.dependencies.apt]
-libcurl4-openssl-dev = "*"
-
 # Match the runners exercised by the native package CI job.
 [dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
