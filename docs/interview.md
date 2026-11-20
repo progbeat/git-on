@@ -91,60 +91,6 @@ deprecation practices so that users know what to expect.
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
 
-**Error-handling requirement:** Allowing manual cleanup does not permit avoidable
-abrupt termination. When an error can be handled and the run can shut down and
-clean up normally, Git-on must do so without making the user remove leftover state.
+**Question**: How much free disk space should be sufficient for Git-on to run a command?
 
-**Question:** Two requirements need to be reconciled: at most one decoded copy
-and no repeated decoding of any prepared OID. After the command overwrites or
-deletes a file, may Git-on release its old decoded bytes while retaining the
-original Git object locally in compressed form? If an unchanged file with the
-same OID is needed later, this would require local decoding, without another
-network download.
-
-**Answer:** No, repeated decoding is forbidden.
-
-## Startup indication
-
-See [Startup indication](startup-indication.md) for the behavioral contract.
-
-**Question:** Would an animated indicator in the terminal title, with
-the title restored before the command, be acceptable? This would show
-preparation without intercepting Git/helper input or interfering with prompts.
-Or must the indicator be in the terminal's working area?
-
-**Answer:** No Git helpers should independently write to the terminal. Git-on
-should own the terminal; once the command starts, the command owns it.
-
-**Question:** After startup, must the command receive the original terminal
-without an intermediary, as the specification currently requires? Or is one
-private PTY for the entire invocation acceptable: Git-on manages the UI during
-preparation, then the command becomes the foreground owner of that PTY while
-Git-on transparently relays terminal bytes? The second option can preserve
-arbitrary typeahead without guessing prompt boundaries; redirected streams
-would remain direct.
-
-**Answer:** What I need in general is that a human launching it from a terminal
-should not have to guess what is currently happening, so there must be an
-indication. But, for example, if output is redirected to a file, there should be
-no indication. Like utilities that display color in a terminal but do not write
-ANSI color codes when output is written to a file: it should work that way here.
-
-**Question:** To preserve ordinary terminal-input behavior, would an animated
-status in the terminal title be acceptable? Git/SSH prompts would remain
-ordinary, and the title would be restored before starting the command. Or must
-the status be beside the command text?
-
-**Answer:** The status must be beside the command text.
-
-**Display requirement:** Show preparation activity, clear every trace once
-ready, and start the command as if there had been no indication.
-
-**Question:** Startup indication requires Git-on to own the terminal while
-preparing the command, while existing behavior should be preserved. Credential
-helpers can read and write `/dev/tty` directly, and native Git receives the
-terminal for its entire invocation, including network waits. Which contract
-should be retained for startup indication?
-
-**Answer:** I meant not to change behavior if the change does not follow from
-the task specification.
+**Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.
