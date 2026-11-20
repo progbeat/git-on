@@ -157,8 +157,8 @@ Keep the private key out of source control and logs.
 
 Run **Package managers** from `master` with the published stable version
 (without `v`). It checks the release archive digest, builds the package and
-publishes the signed index. It rejects attempts to change package bytes at an
-existing version URL. The archive serves only the current stable release.
+publishes the signed index. It rejects downgrades and attempts to change
+package bytes at an existing version URL. The archive serves only the current stable release.
 If an upgrade replaces a version still in the local APT index, run `apt update`
 again before installing. Check the live APT source and install from it before
 announcing availability.

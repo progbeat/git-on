@@ -5,6 +5,7 @@ on:
     paths:
       - Formula/git-on.rb
       - scripts/build-apt-repository.sh
+      - scripts/check-apt-version.sh
       - scripts/apt-source.sh
       - .github/workflows/package-managers.yml
   workflow_dispatch:
@@ -69,6 +70,25 @@ jobs:
         run: |
           scripts/build-apt-repository.sh "$RELEASE_VERSION" "$RUNNER_TEMP/apt-repeat"
           cmp "$RUNNER_TEMP"/apt-{repository,repeat}/git-on_"${RELEASE_VERSION}"_amd64.deb
+      - name: Check that the APT channel rejects a downgrade
+        if: github.event_name == 'pull_request'
+        env:
+          RELEASE_VERSION: ${{ steps.archive.outputs.version }}
+        run: |
+          index="$RUNNER_TEMP/apt-repository/Packages"
+          scripts/check-apt-version.sh "$RELEASE_VERSION" "$index"
+          printf 'Version: 1.0.9\n' > "$RUNNER_TEMP/previous-apt-index"
+          scripts/check-apt-version.sh 1.0.10 "$RUNNER_TEMP/previous-apt-index"
+          if scripts/check-apt-version.sh 1.0.8 "$RUNNER_TEMP/previous-apt-index" 2>"$RUNNER_TEMP/downgrade.log"; then
+              echo 'The APT channel unexpectedly accepted a downgrade.' >&2
+              exit 1
+          fi
+          grep -Fx 'Refusing to downgrade the APT archive from 1.0.9 to 1.0.8.' "$RUNNER_TEMP/downgrade.log"
+          printf 'Version: \n' >> "$RUNNER_TEMP/previous-apt-index"
+          if scripts/check-apt-version.sh 1.0.10 "$RUNNER_TEMP/previous-apt-index"; then
+              echo 'The APT channel unexpectedly accepted a malformed index.' >&2
+              exit 1
+          fi
       - name: Install by package name from the signed test repository
         shell: bash
         env:
@@ -136,7 +156,7 @@ jobs:
           set -euo pipefail
           latest=$(curl --proto '=https' -fsSL "$GITHUB_API_URL/repos/progbeat/git-on/releases/latest" | jq -er 'select(.immutable == true) | .tag_name')
           test "$latest" = "v$RELEASE_VERSION"
-      - name: Refuse to change a published package at the same URL
+      - name: Verify continuity with the published APT archive
         shell: bash
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -145,7 +165,17 @@ jobs:
           set -euo pipefail
           : "${PAGES_BASE_URL:?Configure GitHub Pages with GitHub Actions as its source first}"
           package=git-on_${RELEASE_VERSION}_amd64.deb
-          status=$(curl --proto '=https' -sSL --max-time 30 -H 'Cache-Control: no-cache' -o "$RUNNER_TEMP/published.deb" -w '%{http_code}' "${PAGES_BASE_URL%/}/apt/$package?run=$GITHUB_RUN_ID")
+          published="${PAGES_BASE_URL%/}/apt"
+          fetch_status() {
+              curl --proto '=https' -sSL --max-time 30 -H 'Cache-Control: no-cache' -o "$1" -w '%{http_code}' "$published/$2?run=$GITHUB_RUN_ID"
+          }
+          status=$(fetch_status "$RUNNER_TEMP/published.Packages" Packages)
+          case "$status" in
+              200) scripts/check-apt-version.sh "$RELEASE_VERSION" "$RUNNER_TEMP/published.Packages" ;;
+              404) ;;
+              *) echo "Could not check the published APT index: HTTP $status" >&2; exit 1 ;;
+          esac
+          status=$(fetch_status "$RUNNER_TEMP/published.deb" "$package")
           case "$status" in
               200) cmp "site/apt/$package" "$RUNNER_TEMP/published.deb" ;;
               404) ;;
