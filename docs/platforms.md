@@ -4,16 +4,18 @@ Git-on builds Linux x86_64 and Apple Silicon CLI binaries. Linux mounts use
 registry fuser 0.18.0. A usable `/dev/fuse` and `fusermount3` are required;
 optional passthrough does not change that requirement.
 
+HTTPS uses the system libcurl and its TLS and HTTP/2 libraries. The Linux
+binary loads the distribution's `libcurl.so.4` at startup. On Ubuntu the
+`curl` package installs this dependency. macOS supplies libcurl as part of
+the operating system. The optimized transport requires TLS and HTTP/2 support
+in libcurl. Native Git handles HTTPS on builds that lack either capability.
+
 ## Apple Silicon
 
 The CLI runs on macOS 13 or later. macOS 26 and later can mount a lazy snapshot
 with any write policy using the built-in NFSv4.1 client and a private local
 socket. This needs an ordinary user account and a writable temporary directory.
 The same console installer installs the single executable.
-
-HTTPS uses the operating system's libcurl. The optimized transport requires
-TLS and HTTP/2 support in libcurl. Native Git handles HTTPS on versions of
-libcurl that lack either capability.
 
 On earlier versions, `--backend=auto` uses a temporary copy when
 `--write-policy=all` is explicit. The same fallback is available when the NFS
