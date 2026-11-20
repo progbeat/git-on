@@ -155,7 +155,7 @@ impl Decoder {
             .name("git-on-http-pack".into())
             .spawn(move || {
                 let received = (|| {
-                    for chunk in chunks {
+                    for chunk in &chunks {
                         if pending.fetch_sub(1, Ordering::AcqRel) >= QUEUE_CHUNKS {
                             crate::demand::signal_http2(&wake);
                         }
@@ -639,26 +639,35 @@ mod tests {
         let (_read, wake) = UnixStream::pair().unwrap();
         wake.set_nonblocking(true).unwrap();
         let (report, reported) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Mutex::new(resume);
         let mut decoder = Decoder::start(
             Box::new(pack),
             Arc::default(),
             Arc::new(wake),
             Some(Arc::new(move |error| {
                 let _ = report.send(error.to_string());
+                resume.lock().unwrap().recv().unwrap();
             })),
         )
         .unwrap();
         decoder.feed(&frame).unwrap();
         published.recv_timeout(Duration::from_secs(3)).unwrap();
         decoder.feed(b"zzzz").unwrap();
+        let diagnostic = reported.recv_timeout(Duration::from_secs(3));
+        let accepted = decoder.feed(b"0000");
+        let _ = release.send(());
         let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
         let expected = result.err().expect("malformed packet").to_string();
         drop(decoder);
         assert_eq!(
-            reported
-                .try_recv()
-                .expect("decoder discarded a diagnosed error"),
+            diagnostic.expect("decoder discarded a diagnosed error"),
             expected
+        );
+        assert_eq!(
+            accepted.unwrap(),
+            4,
+            "libcurl saw a write error before the decoder's report finished"
         );
     }
 

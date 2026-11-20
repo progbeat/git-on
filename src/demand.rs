@@ -83,10 +83,15 @@ struct FlightState {
 
 impl Demand {
     fn complete(&self, batch: Arc<Batch>) {
+        self.complete_with(batch, || {});
+    }
+
+    fn complete_with(&self, batch: Arc<Batch>, record: impl FnOnce()) {
         let mut state = self.0.state.lock().unwrap();
         if state.batch.is_some() {
             return;
         }
+        record();
         state.batch = Some(batch);
         self.0.ready.notify_all();
         #[cfg(target_os = "macos")]
@@ -577,6 +582,10 @@ impl Pool {
             return Ok(demand);
         }
         let demand = queue.foreground(oid);
+        if self.scratch.claim_forecast(oid) {
+            self.shared
+                .complete_object(oid, &demand, true, Acquired::Stored);
+        }
         self.wake();
         Ok(demand)
     }
@@ -694,6 +703,15 @@ impl Drop for Pool {
 }
 
 impl Shared {
+    fn complete_object(&self, oid: Oid, demand: &Demand, speculative: bool, acquired: Acquired) {
+        demand.complete_with(Batch::new(vec![oid], Ok(acquired)), || {
+            self.oids.fetch_add(1, Ordering::Relaxed);
+            if speculative {
+                self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
     fn response(
         self: &Arc<Self>,
         work: &Work,
@@ -719,16 +737,15 @@ impl Shared {
                     .expect("known want")
                     .1;
                 let publish = |acquired| {
-                    shared.oids.fetch_add(1, Ordering::Relaxed);
-                    demand.complete(Batch::new(vec![oid], Ok(acquired)));
+                    shared.complete_object(oid, demand, speculative, acquired);
                 };
                 if object.kind() == git2::ObjectType::Blob {
-                    cache.insert_verified_blob(object, !speculative || demand.required(), || {
-                        if speculative {
-                            shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
-                        }
-                        publish(Acquired::Stored);
-                    })
+                    cache.insert_verified_blob(
+                        object,
+                        speculative,
+                        || !speculative || demand.required(),
+                        || publish(Acquired::Stored),
+                    )
                 } else {
                     anyhow::ensure!(!speculative, "prefetched object is not a blob");
                     publish(Acquired::Object(object));

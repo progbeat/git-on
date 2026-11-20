@@ -6,17 +6,15 @@ Each invocation owns its prepared objects and temporary storage. A 16 MiB
 block LRU charges allocation capacity plus 512 bytes per retained entry. It
 holds whole blobs up to 64 KiB and at most one recently read block per spilled
 blob. A separate LRU retains the eight most recently used larger blobs whole.
-A hot read uses the verified buffer without writing a raw file.
+Newly verified larger blobs enter this cache. A hot read uses the verified
+buffer without writing a raw file.
 
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. Another large
-admission can wait for that spill once the hot cache is full. One demanded
-HTTPS or SSH blob can be served from its verified decoder buffer during that
-wait. The buffer bounds early publication while network requests can still
-run concurrently.
-If a blob exceeds the current file-size limit, a fitting resident can be
-spilled in its place.
-When no resident fits, an eligible new blob can go directly to verified backing.
+admission can wait for that spill once the hot cache is full. HTTPS and SSH
+decoders reserve one of eight active buffers before inflating a large blob.
+A read can use its verified buffer while placement waits, including after
+joining an in-progress prefetch. Network requests can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without
 another fetch or decode. If an optional disk-block admission needs a spill that
 fails, return the checked bytes and keep the unbacked resident.

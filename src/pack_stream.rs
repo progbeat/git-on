@@ -260,6 +260,7 @@ struct Entry {
     inflater: Decompress,
     hash: Sha1,
     data: Vec<u8>,
+    _decode: Option<crate::raw_blob::PackDecode>,
 }
 
 impl Pack {
@@ -335,6 +336,9 @@ impl Pack {
                 let Some(kind) = kind else {
                     return self.use_fallback();
                 };
+                let decode = (kind == ObjectType::Blob && size > crate::raw_blob::BLOCK)
+                    .then(|| self.scratch.reserve_pack_decode())
+                    .transpose()?;
                 self.position += length;
                 self.entry = Some(Entry {
                     kind,
@@ -342,6 +346,7 @@ impl Pack {
                     inflater: Decompress::new(true),
                     hash: object::object_hash(kind, size),
                     data: Vec::new(),
+                    _decode: decode,
                 });
             }
             let entry = self.entry.as_mut().expect("entry initialized");

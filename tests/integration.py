@@ -1345,57 +1345,6 @@ assert not Path('out/final-hard').exists()
             for run in self.system_tmp.glob('git-on-*'):
                 self.assert_success(self.cleanup_run(run))
 
-    def test_raw_file_limit_with_default_signal_cleans_mount_and_pin(self):
-        (self.repo / 'large-raw').write_bytes(b'x' * (1024 * 1024))
-        self.add_spill_blobs(self.repo)
-        oversized = self.repo / 'over-limit'
-        oversized.mkdir()
-        for index in range(8):
-            (oversized / str(index)).write_bytes(bytes([index]) * (128 * 1024 + 1))
-        (self.repo / 'fits-limit').write_bytes(b'f' * (64 * 1024 + 2))
-        git(self.repo, 'add', 'large-raw', 'spill', 'over-limit', 'fits-limit')
-        git(self.repo, 'commit', '--quiet', '-m', 'raw file limit')
-        git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
-        git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
-        code = """
-import errno, sys
-with open('large-raw', 'rb', buffering=0) as source:
-    assert source.read(1) == b'x'
-for index in range(9):
-    with open('spill/%d' % index, 'rb', buffering=0) as source:
-        assert source.read(1) == bytes([index])
-with open('large-raw', 'rb', buffering=0) as source:
-    assert source.read(1) == b'x'
-for index in range(7):
-    with open('over-limit/%d' % index, 'rb', buffering=0) as source:
-        assert source.read(1) == bytes([index])
-# All eight hot blobs now exceed the per-file limit.
-with open('fits-limit', 'rb', buffering=0) as source:
-    assert source.read(2) == b'ff'
-try:
-    with open('over-limit/7', 'rb', buffering=0) as source:
-        source.read(1)
-except OSError as error:
-    assert error.errno in (errno.EIO, errno.EFBIG), error
-    print('handled raw file limit')
-    sys.exit(23)
-raise AssertionError('raw write unexpectedly exceeded the file limit')
-"""
-        for source, expected in (([], 23), ([self.repo.as_uri()], 125)):
-            with self.subTest(source=source):
-                try:
-                    result = subprocess.run([str(BINARY), *source, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
-                                            cwd=self.repo, env=self.environment(), capture_output=True, timeout=60,
-                                            preexec_fn=lambda: file_size_limits(128 * 1024))
-                    self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
-                    self.assertEqual(result.stdout, b'handled raw file limit\n')
-                    if source:
-                        self.assertIn(b'File too large', result.stderr)
-                    self.assert_no_runtime_files()
-                finally:
-                    for run in self.system_tmp.glob('git-on-*'):
-                        self.cleanup_run(run)
-
     @unittest.skipUnless(sys.platform == "linux", "Linux prlimit")
     def test_checked_block_read_survives_cache_spill_limits_locally_and_remotely(self):
         directory = self.repo / 'cache-spill'
@@ -1497,32 +1446,26 @@ os.close(fd)
         self.assert_success(result)
         self.assert_no_runtime_files()
 
-    @fuse_only
     def test_truncate_spilled_source_copies_only_the_retained_prefix(self):
-        size=2*1024*1024
-        (self.repo/'large').write_bytes(b'x'*size)
+        (self.repo/'large').write_bytes(b'x'*(3*65536+17))
         self.add_spill_blobs(self.repo)
         git(self.repo,'add','.');git(self.repo,'commit','-qm','shrink spilled source')
+        oid=git(self.repo,'rev-parse','HEAD:large')
         command=[sys.executable,'-I','-S','-c',r'''
-import os,resource,sys
+import os,sys
 from pathlib import Path
-size=int(sys.argv[1])
 fd=os.open('large',os.O_RDWR)
 assert os.pread(fd,1,0)==b'x'
 for index in range(9):
  with open(Path('spill')/str(index),'rb') as filler:assert filler.read(1)==bytes([index])
-assert any(raw.stat().st_size==size for raw in Path.cwd().parent.glob('raw-objects-*/*'))
-runner=os.getppid()
-limits=resource.prlimit(runner,resource.RLIMIT_FSIZE)
-try:
- resource.prlimit(runner,resource.RLIMIT_FSIZE,(4096,limits[1]))
- os.ftruncate(fd,4096)
-finally:
- resource.prlimit(runner,resource.RLIMIT_FSIZE,limits)
+raw=next(Path.cwd().parent.glob('raw-objects-*'))/sys.argv[1]
+with raw.open('r+b',buffering=0) as source:
+ assert os.pwrite(source.fileno(),b'!',2*65536+7)==1
+os.ftruncate(fd,4096)
 assert os.fstat(fd).st_size==4096
 assert os.pread(fd,4100,0)==b'x'*4096
 os.close(fd)
-''',str(size)]
+''',oid]
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
         self.assert_success(result)
         self.assert_no_runtime_files()

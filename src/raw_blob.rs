@@ -24,6 +24,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
+    time::Duration,
 };
 
 pub(crate) const MEMORY_BUDGET: usize = 16 * 1024 * 1024;
@@ -606,12 +607,7 @@ impl HotWriter {
                                         let mut store =
                                             state.lock().unwrap_or_else(|e| e.into_inner());
                                         store.finish_spill(job.oid, blocks);
-                                        if let Some((retained, bytes)) = store.spilling.take() {
-                                            if retained != job.oid {
-                                                store.hot.pop(&job.oid);
-                                                store.hot.put(retained, bytes);
-                                            }
-                                        }
+                                        store.spilling = None;
                                     });
                             let _ = job.result.send(result);
                         }
@@ -658,6 +654,23 @@ pub(crate) struct RawBlobs {
     state: Arc<Mutex<Store>>,
     prepared: Arc<Condvar>,
     hot_writer: Arc<Mutex<HotWriter>>,
+    pack_decodes: Arc<PackDecodes>,
+}
+
+#[derive(Default)]
+struct PackDecodes {
+    active: Mutex<usize>,
+    ready: Condvar,
+}
+
+pub(crate) struct PackDecode(Arc<PackDecodes>);
+
+impl Drop for PackDecode {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        self.0.ready.notify_one();
+    }
 }
 
 struct BlobPreparation<'a> {
@@ -669,6 +682,7 @@ impl Drop for BlobPreparation<'_> {
     fn drop(&mut self) {
         let mut store = self.blobs.state.lock().unwrap_or_else(|e| e.into_inner());
         store.preparing.remove(&self.oid);
+        store.forecasts.remove(&self.oid);
         self.blobs.prepared.notify_all();
     }
 }
@@ -684,7 +698,8 @@ impl RawBlobs {
                 memory: lru::LruCache::unbounded(),
                 hot: lru::LruCache::unbounded(),
                 spilling: None,
-                decoded: None,
+                decoded: HashMap::new(),
+                forecasts: HashMap::new(),
                 hot_limit: HOT_BLOBS,
                 memory_bytes: 0,
                 memory_limit: MEMORY_BUDGET,
@@ -700,7 +715,24 @@ impl RawBlobs {
             })),
             prepared: Arc::default(),
             hot_writer: Arc::default(),
+            pack_decodes: Arc::default(),
         })
+    }
+
+    pub(crate) fn reserve_pack_decode(&self) -> Result<PackDecode> {
+        let slots = &self.pack_decodes;
+        let mut active = slots.active.lock().unwrap_or_else(|e| e.into_inner());
+        // Apply backpressure before a complete buffer is allocated. Check
+        // cancellation while waiting so an interrupted fetch can unwind.
+        while *active == HOT_BLOBS {
+            crate::object::check_transfer()?;
+            (active, _) = slots
+                .ready
+                .wait_timeout(active, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        Ok(PackDecode(slots.clone()))
     }
     fn blob(&self, oid: Oid, object: &Descriptor) -> RawBlob {
         RawBlob {
@@ -780,7 +812,7 @@ impl RawBlobs {
         Some((directory, first))
     }
     pub(crate) fn insert(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
-        self.insert_blob(oid, size, true, None::<fn()>, || {
+        self.insert_blob(oid, size, true, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
@@ -804,7 +836,7 @@ impl RawBlobs {
         size: usize,
         input: impl Read,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, size, false, None::<fn()>, || {
+        self.insert_blob(oid, size, false, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
@@ -814,7 +846,8 @@ impl RawBlobs {
     pub(crate) fn insert_verified_blob(
         &mut self,
         object: crate::pack_stream::VerifiedObject,
-        waiting: bool,
+        speculative: bool,
+        waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(),
     ) -> Result<()> {
         anyhow::ensure!(
@@ -822,24 +855,76 @@ impl RawBlobs {
             "streamed object is not a blob"
         );
         let oid = object.oid();
-        self.insert_verified_bytes(oid, object.into_data(), waiting, ready)
+        self.insert_verified_bytes(oid, object.into_data(), speculative, waiting, ready)
     }
 
     fn insert_verified_bytes(
         &mut self,
         oid: Oid,
         bytes: Vec<u8>,
-        waiting: bool,
+        speculative: bool,
+        waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(),
     ) -> Result<()> {
         let size = bytes.len();
-        if waiting {
-            self.insert_blob(oid, size, false, Some(ready), || Ok(bytes))?;
-        } else {
-            self.insert_blob(oid, size, false, None::<fn()>, || Ok(bytes))?;
+        if size <= BLOCK {
+            self.insert_blob(oid, size, false, || Ok(bytes))?;
+            ready();
+            return Ok(());
+        }
+
+        let _preparation;
+        let mut store = self.wait_for_preparation(oid);
+        if store.objects.contains_key(&oid) {
+            drop(store);
+            ready();
+            return Ok(());
+        }
+        if let Some(error) = &store.failure {
+            anyhow::bail!("verified object storage previously failed: {error}");
+        }
+        let payload = Arc::new(bytes);
+        store.preparing.insert(oid);
+        _preparation = BlobPreparation { blobs: self, oid };
+        if speculative {
+            store.forecasts.insert(oid, payload.clone());
+        }
+        let mut ready = Some(ready);
+        // Check demand after registering the buffer under the same store lock
+        // used by a late reader to claim a completed forecast.
+        if waiting() && store.can_publish_decoded(oid) {
+            store.publish_decoded(oid, payload.clone());
+            drop(store);
+            ready.take().unwrap()();
+            store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        }
+
+        let result = self.admit_blob(store, oid, false, Vec::new(), Some(payload));
+        if let Err(error) = &result {
+            let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            store.forecasts.remove(&oid);
+            if store.decoded.contains_key(&oid) && !crate::object::is_cancelled(error) {
+                // A real reader claimed these verified bytes. Keep them
+                // readable and propagate the failed admission at shutdown.
+                store.failure.get_or_insert_with(|| format!("{error:#}"));
+            }
+        } else if let Some(ready) = ready {
             ready();
         }
-        Ok(())
+        result.map(|_| ())
+    }
+
+    pub(crate) fn claim_forecast(&self, oid: Oid) -> bool {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(payload) = store.forecasts.get(&oid) else {
+            return false;
+        };
+        if !store.can_publish_decoded(oid) {
+            return false;
+        }
+        let payload = payload.clone();
+        store.publish_decoded(oid, payload);
+        true
     }
 
     pub(crate) fn insert_prefetched_odb_blob(
@@ -861,7 +946,7 @@ impl RawBlobs {
         object: &git2::OdbObject<'_>,
         used: bool,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, object.len(), used, None::<fn()>, || {
+        self.insert_blob(oid, object.len(), used, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(object.len())?;
             crate::object::copy_odb_blob(object, &mut bytes)?;
@@ -881,22 +966,16 @@ impl RawBlobs {
         oid: Oid,
         size: usize,
         used: bool,
-        mut ready: Option<impl FnOnce()>,
         decode: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<RawBlob> {
         let _preparation;
         let mut store = self.wait_for_preparation(oid);
         if let Some(object) = store.objects.get(&oid) {
-            let blob = self.blob(oid, object);
-            drop(store);
-            if let Some(ready) = ready {
-                ready();
-            }
-            return Ok(blob);
+            return Ok(self.blob(oid, object));
         }
         // A large decode can wait for Git. Reserve its OID without holding
         // the cache lock, so unrelated reads and publications can proceed.
-        let mut bytes = if size > BLOCK {
+        let bytes = if size > BLOCK {
             store.preparing.insert(oid);
             drop(store);
             _preparation = BlobPreparation { blobs: self, oid };
@@ -907,44 +986,7 @@ impl RawBlobs {
             decode()?
         };
         anyhow::ensure!(bytes.len() == size, "verified blob length changed");
-
-        // Keep one demanded verified buffer readable while its decoder waits
-        // for cache placement. Further decoders wait to acknowledge their
-        // reads, bounding the number of completed reads ahead of a slow spill.
-        let mut shared = None;
-        if ready.is_some() && size > BLOCK && store.hot_limit != 0 {
-            if let Some(error) = &store.failure {
-                anyhow::bail!("verified object storage previously failed: {error}");
-            }
-            if store.decoded.is_none()
-                && Files::size_limit()?.is_none_or(|limit| size as u64 <= limit)
-            {
-                let payload = Arc::new(std::mem::take(&mut bytes));
-                store.decoded = Some((oid, payload.clone()));
-                store.publish_blob(oid, size, used);
-                shared = Some(payload);
-                drop(store);
-                ready.take().unwrap()();
-                store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            }
-        }
-        let early = shared.is_some();
-        let result = self.admit_blob(store, oid, used, bytes, shared);
-        match &result {
-            Ok(_) => {
-                if let Some(ready) = ready {
-                    ready();
-                }
-            }
-            Err(error) if early && !crate::object::is_cancelled(error) => {
-                // The announced bytes remain readable. Propagate a failed
-                // admission to the invocation and prevent new publications.
-                let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                store.failure.get_or_insert_with(|| format!("{error:#}"));
-            }
-            Err(_) => {}
-        }
-        result
+        self.admit_blob(store, oid, used, bytes, None)
     }
 
     fn admit_blob<'a>(
@@ -955,7 +997,6 @@ impl RawBlobs {
         bytes: Vec<u8>,
         shared: Option<Arc<Vec<u8>>>,
     ) -> Result<RawBlob> {
-        let published = shared.is_some();
         let payload = shared.as_deref().unwrap_or(&bytes);
         let size = payload.len();
         let weight = payload
@@ -963,7 +1004,7 @@ impl RawBlobs {
             .checked_add(ENTRY_CHARGE)
             .context("resident allocation size")?;
         let resident = size != 0 && size <= BLOCK && weight <= store.memory_limit;
-        let mut hot = size > BLOCK && store.hot_limit != 0;
+        let hot = size > BLOCK && store.hot_limit != 0;
 
         if resident {
             store.make_room(weight)?;
@@ -971,50 +1012,20 @@ impl RawBlobs {
         if hot {
             drop(store);
             let mut writer = self.hot_writer.lock().unwrap_or_else(|e| e.into_inner());
-            match self.complete_eviction(&mut writer) {
-                Ok(ready) => {
-                    store = ready;
-                    if store.hot.len() == store.hot_limit {
-                        let limit = Files::size_limit()?.unwrap_or(u64::MAX);
-                        let victim = store
-                            .hot
-                            .iter()
-                            .rev()
-                            .find(|(_, bytes)| bytes.len() as u64 <= limit);
-                        if let Some((&victim, bytes)) = victim {
-                            writer.submit(&self.state, &store, victim, bytes.clone())?;
-                            store.spilling = store.hot.pop(&victim).map(|bytes| (victim, bytes));
-                        } else {
-                            hot = false;
-                        }
-                    }
-                }
-                Err(error) if spill_capacity_error(&error) => {
-                    store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    hot = false;
-                }
-                Err(error) => return Err(error),
+            store = self.complete_eviction(&mut writer)?;
+            if store.hot.len() == store.hot_limit {
+                let (&victim, bytes) = store.hot.peek_lru().context("missing hot blob")?;
+                writer.submit(&self.state, &store, victim, bytes.clone())?;
+                store.spilling = store.hot.pop_lru();
             }
         }
         let file = size != 0 && !resident && !hot;
-        let blocks = if file && size > BLOCK {
-            // Keep existing residents and back this blob directly if none
-            // can be spilled. Readers of other OIDs can still proceed.
-            if Files::size_limit()?.is_some_and(|limit| size as u64 > limit) {
-                return Err(io::Error::from_raw_os_error(libc::EFBIG).into());
-            }
-            let pending = store.directory.begin_spill(oid)?;
-            let writes = store.directory.writes.clone();
-            drop(store);
-            let digests = pending.write_verified(payload, &writes)?;
-            store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            digests
-        } else if file {
+        let blocks = if file {
             store.directory.spill(oid, payload)?
         } else {
             Box::new([])
         };
-        if !published {
+        if !store.objects.contains_key(&oid) {
             store.publish_blob(oid, size, used);
         }
         if resident {
@@ -1027,61 +1038,22 @@ impl RawBlobs {
         if file {
             store.finish_spill(oid, blocks);
         }
-        if published {
-            store.decoded = None;
-        }
+        store.decoded.remove(&oid);
         Ok(self.blob(oid, &store.objects[&oid]))
     }
 
     fn complete_eviction(&self, writer: &mut HotWriter) -> Result<MutexGuard<'_, Store>> {
-        let completed = writer.wait();
+        writer.wait()?;
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(pending) = store.spilling.as_ref() else {
-            completed?;
-            return Ok(store);
-        };
-        let mut failure = match completed {
-            Err(error) if crate::object::is_cancelled(&error) => return Err(error),
-            Err(error) => error,
-            Ok(()) => io::Error::from_raw_os_error(libc::EFBIG).into(),
-        };
-
-        // Retry a failed write before making another admission. If a blob
-        // cannot fit on disk, keep it readable and try another resident.
-        let limit = Files::size_limit()?.unwrap_or(u64::MAX);
-        let alternatives = if spill_capacity_error(&failure) {
-            store.hot.len()
-        } else {
-            0
-        };
-        let candidates: Vec<_> = std::iter::once((pending.0, &pending.1))
-            .chain(
-                store
-                    .hot
-                    .iter()
-                    .rev()
-                    .take(alternatives)
-                    .map(|(&oid, bytes)| (oid, bytes)),
-            )
-            .filter(|(_, bytes)| bytes.len() as u64 <= limit)
-            .map(|(oid, bytes)| (oid, bytes.clone()))
-            .collect();
-        for (oid, bytes) in candidates {
-            let submitted = writer.submit(&self.state, &store, oid, bytes);
+        if let Some((oid, bytes)) = &store.spilling {
+            // Keep the verified victim readable after a failed spill and
+            // retry that write before allowing another eviction.
+            writer.submit(&self.state, &store, *oid, bytes.clone())?;
             drop(store);
-            let attempt = submitted.and_then(|()| writer.wait());
+            writer.wait()?;
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            match attempt {
-                Ok(()) => return Ok(store),
-                Err(error) => {
-                    if !spill_capacity_error(&error) {
-                        return Err(error);
-                    }
-                    failure = error;
-                }
-            }
         }
-        Err(failure)
+        Ok(store)
     }
 
     pub(crate) fn stop(&self) -> Result<()> {
@@ -1172,10 +1144,7 @@ impl RawBlobs {
                 .spilling
                 .as_ref()
                 .map_or(0, |(_, bytes)| bytes.capacity()),
-            store
-                .decoded
-                .as_ref()
-                .map_or(0, |(_, bytes)| bytes.capacity()),
+            store.decoded.values().map(|bytes| bytes.capacity()).sum(),
         )
     }
     pub(crate) fn disk_metrics(&self) -> (u64, u64) {
@@ -1243,13 +1212,6 @@ impl RawBlobs {
         Ok(value)
     }
 }
-fn spill_capacity_error(error: &anyhow::Error) -> bool {
-    let errno = error
-        .downcast_ref::<io::Error>()
-        .and_then(io::Error::raw_os_error);
-    matches!(errno, Some(libc::EFBIG | libc::ENOSPC | libc::EDQUOT))
-}
-
 struct Store {
     directory: RawDirectory,
     objects: HashMap<Oid, Descriptor>,
@@ -1258,7 +1220,8 @@ struct Store {
     memory: lru::LruCache<Oid, Resident>,
     hot: lru::LruCache<Oid, Arc<Vec<u8>>>,
     spilling: Option<(Oid, Arc<Vec<u8>>)>,
-    decoded: Option<(Oid, Arc<Vec<u8>>)>,
+    decoded: HashMap<Oid, Arc<Vec<u8>>>,
+    forecasts: HashMap<Oid, Arc<Vec<u8>>>,
     hot_limit: usize,
     memory_bytes: usize,
     memory_limit: usize,
@@ -1273,15 +1236,19 @@ struct Store {
     authenticated_bytes: u64,
 }
 impl Store {
+    fn can_publish_decoded(&self, oid: Oid) -> bool {
+        self.hot_limit != 0 && self.failure.is_none() && !self.objects.contains_key(&oid)
+    }
+
+    fn publish_decoded(&mut self, oid: Oid, bytes: Arc<Vec<u8>>) {
+        self.publish_blob(oid, bytes.len(), false);
+        self.decoded.insert(oid, bytes);
+    }
+
     fn hot_payload(&mut self, oid: Oid) -> Option<&Arc<Vec<u8>>> {
         self.hot
             .get(&oid)
-            .or_else(|| {
-                self.decoded
-                    .as_ref()
-                    .filter(|(pending, _)| *pending == oid)
-                    .map(|(_, bytes)| bytes)
-            })
+            .or_else(|| self.decoded.get(&oid))
             .or_else(|| {
                 self.spilling
                     .as_ref()
@@ -1902,6 +1869,18 @@ mod tests {
                 "failed staging files leaked"
             );
         }
+        let large = vec![b'x'; BLOCK + 1];
+        let expected = Oid::hash_object(ObjectType::Blob, &large).unwrap();
+        let wrong = vec![b'y'; large.len()];
+        assert!(store
+            .insert(expected, wrong.len(), wrong.as_slice())
+            .is_err());
+        assert!(store.get(expected).unwrap().is_none());
+        assert_eq!(
+            store.write_metrics(),
+            writes,
+            "wrong large OID reached disk"
+        );
         let reader = store.insert(next, 4, b"next".as_slice()).unwrap();
         reader.corrupt_for_test().unwrap();
         assert!(reader.read(0, 1).is_err());
@@ -2071,7 +2050,7 @@ mod tests {
         let oid = Oid::hash_object(ObjectType::Blob, &forecast).unwrap();
         let mut notified = false;
         assert!(store
-            .insert_verified_bytes(oid, forecast, false, || notified = true)
+            .insert_verified_bytes(oid, forecast, true, || false, || notified = true)
             .is_err());
         assert_eq!(store.failure(), None);
         assert!(!store.available(oid));
@@ -2107,10 +2086,13 @@ mod tests {
         let observer = store.clone();
         let (entered, wait_for_spill) = mpsc::channel();
         let (resume, wait_for_resume) = mpsc::channel();
-        let (ready, wait_for_ready) = mpsc::channel();
         let (decoded, wait_for_decoded) = mpsc::channel();
         let (additional, wait_for_additional) = mpsc::channel();
         let mut another_decoder = store.clone();
+        let last_decoder = store.clone();
+        let _active: Vec<_> = (2..HOT_BLOBS)
+            .map(|_| store.reserve_pack_decode().unwrap())
+            .collect();
         let writes = store.state.lock().unwrap().directory.writes.clone();
         let first = AtomicBool::new(true);
         *writes.on_spill.lock().unwrap() = Some(Box::new(move || {
@@ -2127,20 +2109,9 @@ mod tests {
             if spill_started.is_ok() {
                 let bytes = received.clone();
                 scope.spawn(move || {
+                    let _decode = decoder.reserve_pack_decode().unwrap();
                     decoder
-                        .insert_blob(
-                            received_oid,
-                            bytes.len(),
-                            false,
-                            Some(move || {
-                                let fetched = observer
-                                    .get(received_oid)
-                                    .and_then(|blob| blob.context("verified blob is unavailable"))
-                                    .and_then(|blob| blob.read_all());
-                                let _ = ready.send((fetched, observer.hot_metrics().3));
-                            }),
-                            || Ok(bytes),
-                        )
+                        .insert_verified_bytes(received_oid, bytes, true, || false, || {})
                         .unwrap();
                 });
                 scope.spawn(move || {
@@ -2153,22 +2124,39 @@ mod tests {
                 });
             }
             let outcome = wait_for_read.recv_timeout(Duration::from_secs(3));
-            let streamed = wait_for_ready.recv_timeout(Duration::from_secs(3));
-            let premature = if streamed.is_ok() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while spill_started.is_ok()
+                && !observer
+                    .state
+                    .lock()
+                    .unwrap()
+                    .preparing
+                    .contains(&received_oid)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let was_forecast = !observer.available(received_oid);
+            let streamed = observer.claim_forecast(received_oid).then(|| {
+                let fetched = observer.get(received_oid).unwrap().unwrap().read_all();
+                (fetched, observer.hot_metrics().3)
+            });
+            let second_ready = if streamed.is_some() {
                 scope.spawn(move || {
+                    let _decode = another_decoder.reserve_pack_decode().unwrap();
                     let bytes = vec![HOT_BLOBS as u8 + 2; BLOCK + 1];
                     let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
                     another_decoder
-                        .insert_blob(
+                        .insert_verified_bytes(
                             oid,
-                            bytes.len(),
+                            bytes,
                             false,
-                            Some(move || {
-                                let _ = additional.send(());
-                            }),
                             || {
-                                decoded.send(())?;
-                                Ok(bytes)
+                                let _ = decoded.send(());
+                                true
+                            },
+                            move || {
+                                let _ = additional.send(());
                             },
                         )
                         .unwrap();
@@ -2182,6 +2170,23 @@ mod tests {
             } else {
                 false
             };
+            let active_bytes = observer.hot_metrics().3;
+            let (started, wait_for_start) = mpsc::channel();
+            let (reserved, wait_for_slot) = mpsc::channel();
+            let waits_before_decoding = if second_ready {
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let _decode = last_decoder.reserve_pack_decode().unwrap();
+                    reserved.send(()).unwrap();
+                });
+                wait_for_start.recv_timeout(Duration::from_secs(3)).is_ok()
+                    && matches!(
+                        wait_for_slot.recv_timeout(Duration::from_millis(100)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    )
+            } else {
+                false
+            };
             let _ = resume.send(());
             spill_started.expect("eviction must attempt a spill");
             let (first, second, (hot_bytes, hot_entries, spill_bytes, _)) =
@@ -2191,17 +2196,21 @@ mod tests {
             assert_eq!(hot_entries, HOT_BLOBS);
             assert_eq!(hot_bytes, HOT_BLOBS * (BLOCK + 1));
             assert_eq!(spill_bytes, BLOCK + 1);
+            assert!(was_forecast, "unused prediction was published");
             let (fetched, decode_bytes) =
                 streamed.expect("a verified pack blob waited for an unrelated spill");
             assert_eq!(fetched.unwrap(), received);
             assert_eq!(decode_bytes, BLOCK + 1);
             assert!(
-                !premature,
-                "another early publication accumulated behind the paused spill"
+                second_ready,
+                "a second verified decoder waited for the paused spill"
             );
-            wait_for_additional
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap();
+            assert_eq!(active_bytes, 2 * (BLOCK + 1));
+            assert!(
+                waits_before_decoding,
+                "large decode started without a buffer slot"
+            );
+            wait_for_slot.recv_timeout(Duration::from_secs(3)).unwrap();
         });
     }
 
