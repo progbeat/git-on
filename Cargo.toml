@@ -1,6 +1,6 @@
 [package]
 name = "git-on"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2021"
 rust-version = "1.89"
 description = "Run commands on immutable Git trees with ignored-only temporary writes"
@@ -35,7 +35,7 @@ signal-hook = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 tempfile = "3"
-curl = { version = "0.4.50", features = ["http2", "static-curl", "static-ssl"] }
+curl = { version = "0.4.50", default-features = false }
 url = "2.5"
 
 [profile.release]

@@ -1,0 +1,12 @@
+# Link the platform libcurl.
+[target.aarch64-apple-darwin.curl]
+rustc-link-lib = ["dylib=curl"]
+
+[target.x86_64-apple-darwin.curl]
+rustc-link-lib = ["dylib=curl"]
+
+[target.x86_64-unknown-linux-gnu.curl]
+rustc-link-lib = ["dylib=curl"]
+
+[target.aarch64-unknown-linux-gnu.curl]
+rustc-link-lib = ["dylib=curl"]

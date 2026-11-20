@@ -37,13 +37,15 @@ impl Configuration {
     pub(crate) fn new(url: &OsStr, credential: Command) -> Option<Self> {
         let url = url.to_str()?;
         let parsed = url::Url::parse(url).ok()?;
+        let version = curl::Version::get();
         if parsed.scheme() != "https"
             || parsed.as_str() != url
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.query().is_some()
             || parsed.fragment().is_some()
-            || !curl::Version::get().feature_http2()
+            || !version.feature_ssl()
+            || !version.feature_http2()
         {
             return None;
         }
