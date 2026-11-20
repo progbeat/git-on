@@ -2,7 +2,7 @@
 use crate::{
     git::Git,
     object, pack_stream,
-    raw_blob::RawBlobs,
+    raw_blob::{DemandLookup, RawBlobs},
     spool::Spool,
     transport::{BranchQuery, Connection, Session, StartingSession},
 };
@@ -77,21 +77,22 @@ struct Flight {
 #[derive(Default)]
 struct FlightState {
     batch: Option<Arc<Batch>>,
+    counted: bool,
     #[cfg(target_os = "macos")]
     notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Demand {
     fn complete(&self, batch: Arc<Batch>) {
-        self.complete_with(batch, || {});
+        self.complete_with(batch, |_| {});
     }
 
-    fn complete_with(&self, batch: Arc<Batch>, record: impl FnOnce()) {
+    fn complete_with(&self, batch: Arc<Batch>, record: impl FnOnce(&mut FlightState)) {
         let mut state = self.0.state.lock().unwrap();
+        record(&mut state);
         if state.batch.is_some() {
             return;
         }
-        record();
         state.batch = Some(batch);
         self.0.ready.notify_all();
         #[cfg(target_os = "macos")]
@@ -148,16 +149,27 @@ struct Work {
 
 impl Work {
     fn take(queue: &mut VecDeque<QueuedDemand>, speculative: bool) -> Option<Self> {
+        // Cache publication can satisfy a demand while it is still queued.
+        let first = loop {
+            let item = queue.pop_front()?;
+            if !item.demand.ready() {
+                break item;
+            }
+        };
         let limit = if speculative {
-            queue.front()?.prefetch_width
+            first.prefetch_width
         } else {
             MAX_WANTS
         };
-        let count = queue.len().min(limit);
-        (count != 0).then(|| Self {
-            items: queue.drain(..count).collect(),
-            speculative,
-        })
+        let mut items = Vec::with_capacity((queue.len() + 1).min(limit));
+        items.push(first);
+        while items.len() < limit {
+            let Some(item) = queue.pop_front() else { break };
+            if !item.demand.ready() {
+                items.push(item);
+            }
+        }
+        Some(Self { items, speculative })
     }
 
     fn wants(&self) -> Vec<Oid> {
@@ -571,6 +583,14 @@ impl Pool {
     }
 
     pub(crate) fn request(&self, oid: Oid) -> Result<Demand> {
+        self.request_with_lookup(oid, || self.scratch.lookup_demand(oid))
+    }
+
+    fn request_with_lookup(
+        &self,
+        oid: Oid,
+        lookup: impl FnOnce() -> DemandLookup,
+    ) -> Result<Demand> {
         object::check_transfer()?;
         let mut queue = self.shared.queue.lock().unwrap();
         if self.shared.stop.load(Ordering::Relaxed) {
@@ -581,17 +601,24 @@ impl Pool {
         }
         // Publication can race a caller's first cache lookup. See the pending
         // flight or the stored object under the same lock that retires flights.
-        if !queue.pending.contains_key(&oid) && self.scratch.available(oid) {
-            let demand = Demand::default();
-            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+        let pending = queue
+            .pending
+            .contains_key(&oid)
+            .then(|| queue.foreground(oid));
+        let lookup = lookup();
+        if lookup == DemandLookup::Missing {
+            let demand = pending.unwrap_or_else(|| queue.foreground(oid));
+            self.wake();
             return Ok(demand);
         }
-        let demand = queue.foreground(oid);
-        if self.scratch.claim_forecast(oid) {
+        let joins_flight = pending.is_some();
+        let demand = pending.unwrap_or_default();
+        if joins_flight && lookup == DemandLookup::ClaimedForecast {
             self.shared
                 .complete_object(oid, &demand, true, Acquired::Stored);
+        } else {
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
         }
-        self.wake();
         Ok(demand)
     }
 
@@ -709,10 +736,13 @@ impl Drop for Pool {
 
 impl Shared {
     fn complete_object(&self, oid: Oid, demand: &Demand, speculative: bool, acquired: Acquired) {
-        demand.complete_with(Batch::new(vec![oid], Ok(acquired)), || {
-            self.oids.fetch_add(1, Ordering::Relaxed);
-            if speculative {
-                self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+        demand.complete_with(Batch::new(vec![oid], Ok(acquired)), |state| {
+            if !state.counted {
+                state.counted = true;
+                self.oids.fetch_add(1, Ordering::Relaxed);
+                if speculative {
+                    self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -1417,6 +1447,66 @@ mod tests {
             assert_eq!(queue.failure.as_deref(), Some("Git pack checksum mismatch"));
             assert!(queue.waiting.is_empty());
         }
+    }
+
+    #[test]
+    fn ready_forecasts_are_not_submitted_with_waiting_work() {
+        let mut queue = Queue::default();
+        let cached = Oid::from_bytes(&[1; 20]).unwrap();
+        let missing = Oid::from_bytes(&[2; 20]).unwrap();
+        // A foreground request can claim verified bytes from a retiring
+        // forecast after its own item entered the wait queue.
+        let demand = queue.foreground(cached);
+        demand.complete(Batch::new(vec![cached], Ok(Acquired::Stored)));
+        queue.foreground(missing);
+        let work = Work::take(&mut queue.waiting, false).unwrap();
+        assert_eq!(work.wants(), [missing]);
+        assert!(queue.waiting.is_empty());
+        assert!(queue.pending[&cached].ready());
+    }
+
+    #[test]
+    fn pending_demand_reuses_a_blob_admitted_before_its_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool {
+            shared: Arc::default(),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            git: Arc::new(Git::capture(directory.path()).unwrap()),
+            workers: Mutex::default(),
+            wake: None,
+        };
+        let data = vec![b'x'; crate::raw_blob::BLOCK + 1];
+        let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
+        let flight = {
+            let mut queue = pool.shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            let flight = item.demand.clone();
+            queue.ahead.push_back(item);
+            flight
+        };
+        pool.scratch
+            .clone()
+            .insert_fetched(oid, data.len(), &data[..])
+            .unwrap();
+        let mut required_during_lookup = false;
+        let demand = pool
+            .request_with_lookup(oid, || {
+                required_during_lookup = flight.required();
+                pool.scratch.lookup_demand(oid)
+            })
+            .unwrap();
+        assert!(
+            required_during_lookup,
+            "the decoder must see the joining reader before lookup"
+        );
+        assert!(demand.ready());
+        assert!(Work::take(&mut pool.shared.queue.lock().unwrap().waiting, false).is_none());
+        assert_eq!(pool.metrics().oids, 0);
+        for _ in 0..2 {
+            pool.shared
+                .complete_object(oid, &flight, true, Acquired::Stored);
+        }
+        assert_eq!(pool.metrics().oids, 1);
     }
 
     #[test]

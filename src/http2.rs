@@ -20,7 +20,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex,
+        Arc,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -131,7 +131,7 @@ struct Decoder {
     input: Option<SyncSender<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     buffered: Arc<AtomicUsize>,
-    transport: Arc<Mutex<Option<Result<()>>>>,
+    complete_body: Arc<AtomicBool>,
     report_failure: Option<ReportFailure>,
     result: Receiver<Result<pack_stream::Received>>,
     thread: Option<JoinHandle<()>>,
@@ -150,9 +150,9 @@ impl Decoder {
         let buffered = Arc::new(AtomicUsize::new(0));
         let decoder_stop = Arc::new(AtomicBool::new(false));
         pack.set_stop(Some(decoder_stop.clone()));
-        let transport = Arc::new(Mutex::new(None::<Result<()>>));
+        let complete_body = Arc::new(AtomicBool::new(false));
         let pending = buffered.clone();
-        let outcome = transport.clone();
+        let body_finished = complete_body.clone();
         let report = report_failure.clone();
         let thread = thread::Builder::new()
             .name("git-on-http-pack".into())
@@ -167,22 +167,12 @@ impl Decoder {
                         }
                         pack.write_http(&chunk)?;
                     }
-                    outcome
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .unwrap_or_else(|| Err(OperationCancelled.into()))?;
+                    if !body_finished.load(Ordering::Acquire) {
+                        return Err(OperationCancelled.into());
+                    }
                     pack.finish_http()
                 })();
                 note_failure(report.as_ref(), &received);
-                let received = received.map_err(|error| {
-                    if crate::object::is_cancelled(&error) {
-                        if let Some(Err(transport)) = outcome.lock().unwrap().take() {
-                            return transport;
-                        }
-                    }
-                    error
-                });
                 let _ = complete.send(received);
                 crate::demand::signal_http2(&wake);
             })?;
@@ -190,7 +180,7 @@ impl Decoder {
             input: Some(input),
             stop: decoder_stop,
             buffered,
-            transport,
+            complete_body,
             report_failure,
             result,
             thread: Some(thread),
@@ -229,15 +219,15 @@ impl Decoder {
         }
     }
 
-    fn end(&mut self, outcome: Result<()>) {
+    fn end(&mut self, outcome: Result<()>) -> Result<()> {
         note_failure(self.report_failure.as_ref(), &outcome);
-        let failed = outcome.is_err();
-        *self.transport.lock().unwrap() = Some(outcome);
-        if failed {
-            self.cancel();
-        } else {
+        if outcome.is_ok() {
+            self.complete_body.store(true, Ordering::Release);
             drop(self.input.take());
+        } else {
+            self.cancel();
         }
+        outcome
     }
 
     fn result(&self) -> Option<Result<pack_stream::Received>> {
@@ -344,6 +334,7 @@ pub(crate) struct Client {
     multi: Multi,
     active: HashMap<usize, Easy2Handle<Response>>,
     decoding: HashMap<usize, Decoder>,
+    retiring: Vec<Decoder>,
     stop: Arc<AtomicBool>,
 }
 
@@ -354,7 +345,7 @@ impl Drop for Client {
                 decoder.cancel();
             }
         }
-        for decoder in self.decoding.values_mut() {
+        for decoder in self.decoding.values_mut().chain(&mut self.retiring) {
             decoder.cancel();
         }
     }
@@ -378,6 +369,7 @@ impl Client {
             multi,
             active: HashMap::new(),
             decoding: HashMap::new(),
+            retiring: Vec::new(),
             stop,
         };
         let mut credential = Some(config.credential);
@@ -568,6 +560,7 @@ impl Client {
                 true
             }
         });
+        self.retiring.retain(|decoder| decoder.result().is_none());
         Ok(finished)
     }
 
@@ -585,10 +578,22 @@ impl Client {
         let network = self.check_response(&mut response, outcome);
         let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
         match body {
-            Body::Reply(mut decoder) => {
-                decoder.end(network);
-                self.decoding.insert(token, decoder);
-            }
+            Body::Reply(mut decoder) => match decoder.end(network) {
+                Ok(()) => {
+                    self.decoding.insert(token, decoder);
+                }
+                Err(error) => {
+                    // Report the terminal error before retiring the worker. A
+                    // local cache spill can still be finishing in this decoder.
+                    let result = decoder.result().filter(|result| {
+                        result
+                            .as_ref()
+                            .is_err_and(|error| !crate::object::is_cancelled(error))
+                    });
+                    finished.push((token, result.unwrap_or(Err(error))));
+                    self.retiring.push(decoder);
+                }
+            },
             Body::PendingReply { pack, .. } => {
                 finished.push((token, network.and_then(|()| pack.finish_http())));
             }
@@ -635,7 +640,11 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, sync::mpsc, thread};
+    use std::{
+        io::Write,
+        sync::{mpsc, Mutex},
+        thread,
+    };
 
     fn framed_blob() -> (Oid, Vec<u8>, Vec<u8>) {
         use sha1_checked::{Digest, Sha1};
@@ -707,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_transport_failure_survives_decoder_cancellation() {
+    fn terminal_transport_failure_reaches_the_reader_before_the_decoder_retires() {
         let (oid, frame, _) = framed_blob();
         let directory = tempfile::tempdir().unwrap();
         let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
@@ -718,7 +727,7 @@ mod tests {
             vec![oid],
             Box::new(move |_| {
                 publish.send(())?;
-                resumed.recv()?;
+                resumed.recv_timeout(Duration::from_secs(3))?;
                 Ok(())
             }),
         );
@@ -737,17 +746,47 @@ mod tests {
         .unwrap();
         decoder.feed(&frame).unwrap();
         published.recv_timeout(Duration::from_secs(3)).unwrap();
-        decoder.feed(b"0000").unwrap();
-        decoder.end(Err(anyhow::anyhow!("required transfer was reset")));
-        stop.store(true, Ordering::Relaxed);
+        let multi = Multi::new();
+        let handle = multi
+            .add2(Easy2::new(Response {
+                body: Body::Reply(decoder),
+                error: Some(io::Error::other("required transfer was reset")),
+                stop: stop.clone(),
+                h2: true,
+                ok: true,
+                git_pack: true,
+                basic: false,
+            }))
+            .unwrap();
+        let mut client = Client {
+            base: String::new(),
+            ca: None,
+            auth: None,
+            multi,
+            active: HashMap::from([(1, handle)]),
+            decoding: HashMap::new(),
+            retiring: Vec::new(),
+            stop,
+        };
+        let mut finished = Vec::new();
+        let result = client.end_transfer(1, Ok(()), &mut finished);
         release.send(()).unwrap();
-        let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
+        result.unwrap();
+        let (token, result) = finished
+            .pop()
+            .expect("transport failure waited for local publication");
+        assert_eq!(token, 1);
         assert_eq!(
             result.err().unwrap().to_string(),
             "required transfer was reset"
         );
-        drop(decoder);
         assert_eq!(reported.try_recv().unwrap(), "required transfer was reset");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !client.retiring.is_empty() {
+            assert!(client.progress().unwrap().is_empty());
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
     }
 
     #[test]
@@ -780,11 +819,10 @@ mod tests {
             let (finished, wait_for_finish) = mpsc::channel();
             let join = thread::spawn(move || {
                 if let Some(failure) = failure {
-                    decoder.end(Err(anyhow::anyhow!(failure)));
+                    let failure = decoder.end(Err(anyhow::anyhow!(failure))).unwrap_err();
                     let result = decoder.result.recv().unwrap();
-                    finished
-                        .send(result.err().map(|error| error.to_string()))
-                        .unwrap();
+                    assert!(result.as_ref().is_err_and(crate::object::is_cancelled));
+                    finished.send(Some(failure.to_string())).unwrap();
                 } else {
                     drop(decoder);
                     finished.send(None).unwrap();
@@ -875,7 +913,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(1));
                 }
                 assert_eq!(decoder.feed(replay).unwrap(), replay.len());
-                decoder.end(Ok(()));
+                decoder.end(Ok(())).unwrap();
                 let received = decoder
                     .result
                     .recv_timeout(Duration::from_secs(3))

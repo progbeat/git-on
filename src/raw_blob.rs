@@ -665,6 +665,13 @@ struct PackDecodes {
 
 pub(crate) struct PackDecode(Arc<PackDecodes>);
 
+#[derive(PartialEq, Eq)]
+pub(crate) enum DemandLookup {
+    Missing,
+    Available,
+    ClaimedForecast,
+}
+
 impl Drop for PackDecode {
     fn drop(&mut self) {
         let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -934,17 +941,20 @@ impl RawBlobs {
         result.map(|_| ())
     }
 
-    pub(crate) fn claim_forecast(&self, oid: Oid) -> bool {
+    pub(crate) fn lookup_demand(&self, oid: Oid) -> DemandLookup {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if store.objects.contains_key(&oid) || store.packed.contains_key(&oid) {
+            return DemandLookup::Available;
+        }
         let Some(payload) = store.forecasts.get(&oid) else {
-            return false;
+            return DemandLookup::Missing;
         };
         if !store.can_publish_decoded(oid) {
-            return false;
+            return DemandLookup::Missing;
         }
         let payload = payload.clone();
         store.publish_decoded(oid, payload);
-        true
+        DemandLookup::ClaimedForecast
     }
 
     pub(crate) fn insert_prefetched_odb_blob(
@@ -2218,10 +2228,11 @@ mod tests {
                 std::thread::yield_now();
             }
             let was_forecast = !observer.available(received_oid);
-            let streamed = observer.claim_forecast(received_oid).then(|| {
-                let fetched = observer.get(received_oid).unwrap().unwrap().read_all();
-                (fetched, observer.hot_metrics().3)
-            });
+            let streamed = (observer.lookup_demand(received_oid) == DemandLookup::ClaimedForecast)
+                .then(|| {
+                    let fetched = observer.get(received_oid).unwrap().unwrap().read_all();
+                    (fetched, observer.hot_metrics().3)
+                });
             let second_ready = if streamed.is_some() {
                 scope.spawn(move || {
                     let _decode = another_decoder
