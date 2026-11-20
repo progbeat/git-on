@@ -1,11 +1,29 @@
-# 1.5.0
-<!-- Bump: minor -->
+# 1.5.1
+<!-- Bump: patch -->
 
-- Run commands on lazy Git snapshots on macOS 26 and later with any of the four
-  write policies. Git-on serves the snapshot over a private Unix socket to the
-  built-in NFSv4.1 client. The mount needs no elevated privileges or extensions.
-- macOS 13 through 15 continue to support explicit `--write-policy=all`
-  through a temporary copy. Auto can use the same fallback when the NFS mount
-  is unavailable and git-on successfully cleans up any partial mount.
-- Select a backend with `--backend=auto|fuse|nfs|copy`. Explicit `fuse` and
-  `nfs` require a mount. Explicit `copy` requires `--write-policy=all`.
+- Reuse HTTP(S) Git connections for lazy reads from an interactive
+  `git on` command.
+- Overlap exact directory-tree and file-size requests on FUSE and NFS over
+  independent HTTP(S) connections.
+- Expand the HTTPS connection pool on slower sources and batch overlapping
+  requests for objects the command has already accessed.
+- Allow more independent requests on NFS mounts with parallel HTTP(S) reads
+  within the existing per-session replay memory limit.
+- Let short NFS attribute and lookup calls proceed while another slot waits
+  for a Git object, including calls under a different UID in the same session.
+- Multiplex Git object fetches on one HTTP/2 connection where the HTTPS
+  source and caller configuration support it.
+- Reuse authenticated channels during startup for exact object IDs and
+  unambiguous remote branches.
+- Preserve native Git selection for force-prefixed fetch refspecs.
+- Wake promptly when a native Git subprocess exits on macOS, reducing polling
+  delays during snapshot preparation and pack decoding.
+- Open spare SSH channels while the initial one negotiates Git and during
+  slow root fetches. Let ready channels serve queued reads during setup.
+- Resolve an unambiguous SSH branch while object channels open, allowing a
+  ready channel to fetch the commit while another waits for its ref reply.
+- Prefetch upcoming blobs from already opened directories on both transports.
+  Grow the fetch batch after confirmed reads, with earlier expansion when
+  overlapping reads already wait on a slow source.
+- Decode Git packs as they arrive and make verified objects readable before
+  the rest of the pack finishes downloading.

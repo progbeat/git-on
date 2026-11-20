@@ -241,6 +241,11 @@ pub struct SnapshotMetrics {
     pub remote_session_fetch_operations: u64,
     pub remote_session_decode_operations: u64,
     pub remote_session_starts: u64,
+    pub remote_http2_fetch_operations: u64,
+    pub remote_http2_peak_requests: u64,
+    pub remote_streamed_packs: u64,
+    pub remote_prefetch_packs: u64,
+    pub remote_prefetched_blobs: u64,
     /// Native Git's retained received packs, possibly normalized by index-pack.
     pub remote_native_pack_bytes: u64,
     /// Exact received Git pack payloads on invocation-owned demand sessions.
@@ -624,6 +629,35 @@ pub struct Snapshot {
     pub pin_ref: String,
     inner: Arc<Inner>,
 }
+
+pub(crate) struct PendingObject {
+    snapshot: Snapshot,
+    demand: crate::demand::Demand,
+}
+
+impl PendingObject {
+    pub(crate) fn finish(self) {
+        let batch = self.demand.wait();
+        if let Ok(mut state) = self.snapshot.state() {
+            let State { repo, remote, .. } = &mut *state;
+            if let Some(remote) = remote {
+                // The normal filesystem operation returns its usual error
+                // and the snapshot retains any transport/import failure.
+                let _ = remote.finish_demand(repo, &batch);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready(&self) -> bool {
+        self.demand.ready()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn notify_when_ready(&self, notify: &Arc<tokio::sync::Notify>) {
+        self.demand.notify_when_ready(notify);
+    }
+}
 impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
@@ -803,6 +837,33 @@ impl Snapshot {
             .ok()
             .and_then(|s| s.remote.as_ref().and_then(|r| r.failure()))
     }
+    pub(crate) fn reusable_remote_transport(&self) -> bool {
+        self.state().is_ok_and(|state| {
+            state
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.reusable_transport())
+        })
+    }
+    pub(crate) fn start_remote_demand<I: Iterator<Item = Oid>>(
+        &self,
+        oid: Oid,
+        candidates: Option<impl FnOnce(bool) -> I>,
+    ) -> Option<PendingObject> {
+        let mut state = self.state().ok()?;
+        if state.headers.contains_key(&oid) {
+            return None;
+        }
+        let State { repo, remote, .. } = &mut *state;
+        let demand = remote
+            .as_mut()?
+            .start_demand(repo, oid, candidates)
+            .ok()??;
+        Some(PendingObject {
+            snapshot: self.clone(),
+            demand,
+        })
+    }
     fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
         let kind = match mode {
             0o040000 => EntryKind::Directory,
@@ -903,6 +964,19 @@ impl Snapshot {
     /// The caller already resolved the parent's identity from a verified tree.
     pub(crate) fn directory_by_oid(&self, oid: Oid) -> Result<Arc<Directory>> {
         self.state()?.tree(oid)
+    }
+
+    pub(crate) fn directory_by_oid_if_available(&self, oid: Oid) -> Result<Option<Arc<Directory>>> {
+        let mut state = self.state()?;
+        if let Some((tree, first)) = state.raw_store().and_then(|raw| raw.directory(oid)) {
+            state.metrics.tree_reads += u64::from(first);
+            state.metrics.cache_hits += u64::from(!first);
+            return Ok(Some(tree));
+        }
+        if state.repo.odb()?.exists(oid) {
+            return state.tree(oid).map(Some);
+        }
+        Ok(None)
     }
     /// Enumerate one directory without reading child tree objects or blob headers.
     pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
@@ -1024,7 +1098,7 @@ impl Snapshot {
         if let Some(remote) = state
             .remote
             .as_mut()
-            .filter(|remote| remote.has_received_blob(oid))
+            .filter(|remote| remote.has_packed_object(oid))
         {
             let (size, streamed) =
                 remote.copy_materialized_blob(oid, output, State::validate_blob)?;
@@ -1162,6 +1236,15 @@ impl Snapshot {
                 metrics.remote_session_starts,
             ) = remote.session_operations();
             (
+                metrics.remote_http2_fetch_operations,
+                metrics.remote_http2_peak_requests,
+            ) = remote.http2_metrics();
+            (
+                metrics.remote_streamed_packs,
+                metrics.remote_prefetch_packs,
+                metrics.remote_prefetched_blobs,
+            ) = remote.response_metrics();
+            (
                 metrics.remote_native_pack_bytes,
                 metrics.remote_session_pack_bytes,
             ) = remote.received_pack_bytes();
@@ -1233,7 +1316,7 @@ impl Snapshot {
         }
         if let Some(remote) = &state.remote {
             objects.extend(remote.raw_blobs.oids()?);
-            objects.extend(remote.received_blob_oids());
+            objects.extend(remote.packed_object_oids());
         }
         objects.sort_unstable();
         objects.dedup();

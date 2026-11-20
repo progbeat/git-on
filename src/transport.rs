@@ -1,28 +1,50 @@
-//! Invocation-owned native transports. Git still resolves the source/refspec;
-//! protocol v2 permits successive exact-object requests on an existing channel.
+//! Invocation-owned native transports. Protocol v2 permits branch selection
+//! and successive exact-object requests on the same channel.
 use crate::spool::Spool;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
-use sha1_checked::{Digest, Sha1};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{
+            fs::{FileTypeExt, MetadataExt},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
+    path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
-struct Input(UnixStream);
+type Stop = Option<Arc<AtomicBool>>;
+
+fn check_transfer(stop: &Stop) -> io::Result<()> {
+    if stop
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Err(io::Error::other(
+            anyhow::Error::new(crate::object::OperationCancelled)
+                .context("owned HTTPS transport stopped"),
+        ));
+    }
+    crate::object::check_transfer().map_err(io::Error::other)
+}
+
+struct Input(UnixStream, Stop);
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            check_transfer(&self.1)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
@@ -37,11 +59,11 @@ impl Read for Input {
         }
     }
 }
-struct Output(UnixStream);
+struct Output(UnixStream, Stop);
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         loop {
-            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            check_transfer(&self.1)?;
             let mut poll = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLOUT,
@@ -88,6 +110,93 @@ impl Drop for Owner {
     }
 }
 
+pub(crate) struct SshSocket {
+    pub(crate) path: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl SshSocket {
+    pub(crate) fn check(&self) -> Result<()> {
+        ensure!(
+            fs::symlink_metadata(&self.path).is_ok_and(|metadata| metadata.file_type().is_socket()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode),
+            "owned SSH control connection is unavailable; reconnection is forbidden"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Connection {
+    command: Arc<Command>,
+    helper: bool,
+    ssh: Option<Arc<SshSocket>>,
+}
+
+impl Connection {
+    pub(crate) fn new(command: Command, helper: bool, ssh: Option<SshSocket>) -> Self {
+        Self {
+            command: Arc::new(command),
+            helper,
+            ssh: ssh.map(Arc::new),
+        }
+    }
+
+    pub(crate) fn is_ssh(&self) -> bool {
+        self.ssh.is_some()
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if let Some(socket) = &self.ssh {
+            socket.check()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connect(&self, stop: Stop) -> Result<Option<Session>> {
+        self.open(stop, false)
+    }
+
+    pub(crate) fn connect_additional(&self, stop: Arc<AtomicBool>) -> Result<Option<Session>> {
+        self.open(Some(stop), true)
+    }
+
+    pub(crate) fn start_additional(&self) -> Result<StartingSession> {
+        StartingSession::spawn(self.command(true)?, self.helper, None)
+    }
+
+    fn open(&self, stop: Stop, additional: bool) -> Result<Option<Session>> {
+        Session::connect_with_stop(self.command(additional)?, self.helper, stop)
+    }
+
+    fn command(&self, additional: bool) -> Result<Command> {
+        self.check()?;
+        let mut command = copy_command(&self.command);
+        if additional && self.is_ssh() {
+            command.env("GIT_ON_SSH_ADDITIONAL", "1");
+        }
+        Ok(command)
+    }
+}
+
+pub(crate) fn copy_command(template: &Command) -> Command {
+    let mut command = Command::new(template.get_program());
+    command.args(template.get_args());
+    if let Some(directory) = template.get_current_dir() {
+        command.current_dir(directory);
+    }
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 pub(crate) struct Session {
     owner: Owner,
     input: Output,
@@ -95,23 +204,12 @@ pub(crate) struct Session {
     errors: File,
     stateless: bool,
 }
-#[derive(Debug, PartialEq)]
-enum Packet {
-    Flush,
-    Delimiter,
-    End,
-    Data(Vec<u8>),
-}
-// Git text pkt-lines accept an optional terminal LF. Never apply this to
-// sideband pack payloads, which remain byte-exact binary data.
-fn packet_text(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
-}
-impl Session {
-    /// A missing protocol/helper capability is an optional optimization miss,
-    /// before any fetch. Errors after a fetch request must never retry it.
-    pub(crate) fn connect(mut command: Command, helper: bool) -> Result<Option<Self>> {
-        crate::object::check_transfer()?;
+
+pub(crate) struct StartingSession(Session);
+
+impl StartingSession {
+    pub(crate) fn spawn(mut command: Command, helper: bool, stop: Stop) -> Result<Self> {
+        check_transfer(&stop)?;
         let (input, to_child) = UnixStream::pair()?;
         input.set_nonblocking(true)?;
         let (output, from_child) = UnixStream::pair()?;
@@ -122,7 +220,10 @@ impl Session {
             .stderr(errors.try_clone()?);
         unsafe {
             command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
+                // Credential helpers must not be able to read the command's
+                // terminal through /dev/tty. The session ID also owns a new
+                // process group for transport cancellation and reaping.
+                if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -134,15 +235,60 @@ impl Session {
         // Command retains its Stdio descriptors after spawn. Close the
         // parent's copies so an exited helper produces EOF during handshake.
         drop(command);
-        let mut session = Self {
+        Ok(Self(Session {
             owner: Owner(Mutex::new(Some(child))),
-            input: Output(input),
-            output: BufReader::with_capacity(64 * 1024, Input(output)),
+            input: Output(input, stop.clone()),
+            output: BufReader::with_capacity(64 * 1024, Input(output, stop)),
             errors,
             stateless: helper,
+        }))
+    }
+
+    pub(crate) fn wait_for_advertisement(sessions: &[Self]) -> io::Result<Option<usize>> {
+        check_transfer(&None)?;
+        let mut sockets: Vec<_> = sessions
+            .iter()
+            .map(|session| libc::pollfd {
+                fd: session.0.output.get_ref().0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        if unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, 10) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        Ok(sockets.iter().position(|socket| socket.revents != 0))
+    }
+
+    pub(crate) fn advertised_branch(mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        let selected = read_selected_branch(&mut self.0.output, Some(query), true)?;
+        let _ = self.0.input.write_all(b"0000");
+        Ok(selected)
+    }
+
+    /// An optional spare must have a complete handshake before it can take
+    /// over from an in-flight ref query on another channel.
+    pub(crate) fn filtered_v2_ready(&self) -> bool {
+        let mut preview = [0; 4096];
+        let read = unsafe {
+            libc::recv(
+                self.0.output.get_ref().0.as_raw_fd(),
+                preview.as_mut_ptr().cast(),
+                preview.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
         };
-        match session.handshake(helper) {
-            Ok(true) => Ok(Some(session)),
+        read > 0 && read_v2_capabilities(&mut &preview[..read as usize]).unwrap_or(false)
+    }
+
+    pub(crate) fn negotiate(mut self) -> Result<Option<Session>> {
+        let session = &mut self.0;
+        match session.handshake(session.stateless) {
+            Ok(true) => Ok(Some(self.0)),
             Ok(false) => Ok(None),
             Err(error) => {
                 let diagnostic = session.error_text();
@@ -150,6 +296,42 @@ impl Session {
                     .with_context(|| format!("open native demand channel: {}", diagnostic.trim()))
             }
         }
+    }
+
+    pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.0.set_stop(stop);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Packet {
+    Flush,
+    Delimiter,
+    End,
+    Data(Vec<u8>),
+}
+// Git text pkt-lines accept an optional terminal LF. Never apply this to
+// sideband pack payloads, which remain byte-exact binary data.
+pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+impl Session {
+    /// A missing protocol/helper capability is an optional optimization miss,
+    /// before any fetch. Errors after a fetch request must never retry it.
+    #[cfg(test)]
+    pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
+        Self::connect_with_stop(command, helper, None)
+    }
+    pub(crate) fn connect_with_stop(
+        command: Command,
+        helper: bool,
+        stop: Stop,
+    ) -> Result<Option<Self>> {
+        StartingSession::spawn(command, helper, stop)?.negotiate()
+    }
+    pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
+        self.input.1 = Some(stop.clone());
+        self.output.get_mut().1 = Some(stop);
     }
     fn handshake(&mut self, helper: bool) -> Result<bool> {
         if helper {
@@ -176,34 +358,7 @@ impl Session {
                 "native helper rejected protocol connection"
             );
         }
-        if !matches!(self.packet()?, Packet::Data(version) if packet_text(&version) == b"version 2")
-        {
-            return Ok(false);
-        }
-        let mut fetch = false;
-        let mut filter = false;
-        loop {
-            match self.packet()? {
-                Packet::Flush => break,
-                Packet::Data(capability) => {
-                    if let Some(values) = capability.strip_prefix(b"fetch=") {
-                        fetch = true;
-                        filter |= values
-                            .split(u8::is_ascii_whitespace)
-                            .any(|value| value == b"filter");
-                    }
-                    if let Some(format) = capability.strip_prefix(b"object-format=") {
-                        ensure!(
-                            packet_text(format) == b"sha1",
-                            "SHA-256 repositories unsupported"
-                        );
-                    }
-                }
-                _ => bail!("invalid demand capability advertisement"),
-            }
-        }
-        ensure!(fetch && filter, "demand transport lacks object filtering");
-        Ok(true)
+        read_v2_capabilities(&mut self.output)
     }
     fn line(&mut self) -> Result<Vec<u8>> {
         let mut line = Vec::new();
@@ -219,94 +374,88 @@ impl Session {
         line.pop();
         Ok(line)
     }
-    fn packet(&mut self) -> Result<Packet> {
-        let mut header = [0; 4];
-        self.output
-            .read_exact(&mut header)
-            .context("read demand packet header")?;
-        ensure!(
-            header.iter().all(u8::is_ascii_hexdigit),
-            "invalid demand packet length"
-        );
-        let length = u16::from_str_radix(std::str::from_utf8(&header)?, 16)?;
-        Ok(match length {
-            0 => Packet::Flush,
-            1 => Packet::Delimiter,
-            2 => Packet::End,
-            4..=65520 => {
-                let mut bytes = vec![0; usize::from(length) - 4];
-                self.output.read_exact(&mut bytes)?;
-                if let Some(error) = bytes.strip_prefix(b"ERR ") {
-                    bail!(
-                        "remote exact-object request rejected: {}",
-                        String::from_utf8_lossy(error)
-                    );
-                }
-                Packet::Data(bytes)
-            }
-            _ => return Err(invalid("invalid demand packet length")),
-        })
+    pub(crate) fn select_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        self.request_branch(query)?;
+        self.read_branch(query)
     }
-    fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-        write!(output, "{:04x}", bytes.len() + 4)?;
-        output.extend_from_slice(bytes);
+
+    pub(crate) fn request_branch(&mut self, query: &BranchQuery) -> Result<()> {
+        self.input.write_all(&reference_request(Some(query))?)?;
         Ok(())
     }
-    pub(crate) fn fetch(&mut self, oid: Oid, pack: &Spool) -> Result<()> {
+
+    pub(crate) fn branch_ready(&self) -> io::Result<bool> {
+        check_transfer(&self.output.get_ref().1)?;
+        if !self.output.buffer().is_empty() {
+            return Ok(true);
+        }
+        let mut socket = libc::pollfd {
+            fd: self.output.get_ref().0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut socket, 1, 5) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => Ok(false),
+            -1 => Err(io::Error::last_os_error()),
+            ready => Ok(ready != 0),
+        }
+    }
+
+    pub(crate) fn read_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
+        read_selected_branch(&mut self.output, Some(query), false)
+    }
+    pub(crate) fn fetch_stream(
+        &mut self,
+        oids: &[Oid],
+        response: crate::pack_stream::Response,
+    ) -> Result<crate::pack_stream::Received> {
+        let result = (|| {
+            self.errors.set_len(0)?;
+            self.errors.rewind()?;
+            self.input.write_all(&exact_request(oids)?)?;
+            let pack = response.read(&mut self.output)?;
+            self.check_helper_end()?;
+            Ok(pack)
+        })();
+        self.with_fetch_context(oids, result)
+    }
+
+    pub(crate) fn fetch_exact(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
+        let result = self.fetch(oids, pack);
+        self.with_fetch_context(oids, result)
+    }
+
+    fn with_fetch_context<T>(&mut self, oids: &[Oid], result: Result<T>) -> Result<T> {
+        result.with_context(|| {
+            let diagnostic = self.error_text();
+            let wanted = if let [oid] = oids {
+                format!("object {oid}")
+            } else {
+                format!("objects ({} requests, first {})", oids.len(), oids[0])
+            };
+            format!(
+                "remote fetch of exact {wanted} failed: {}",
+                diagnostic.trim()
+            )
+        })
+    }
+    pub(crate) fn fetch(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
         // The completed previous response has no diagnostics to retain. A
         // shared regular-file offset is reset only between transactions.
         self.errors.set_len(0)?;
         self.errors.rewind()?;
-        // One small exact-demand request, not one syscall/signal-status read
-        // for every pkt-line header and body. No future objects are prefetched.
-        let mut request = Vec::with_capacity(256);
-        Self::request_packet(&mut request, b"command=fetch\n")?;
-        request.extend_from_slice(b"0001");
-        Self::request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
-        for value in [
-            b"deepen 1\n".as_slice(),
-            b"filter tree:0\n",
-            b"no-progress\n",
-            b"done\n",
-        ] {
-            Self::request_packet(&mut request, value)?;
-        }
-        request.extend_from_slice(b"0000");
-        self.input.write_all(&request)?;
-        loop {
-            match self.packet()? {
-                Packet::Data(section) if packet_text(&section) == b"packfile" => break,
-                Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
-                    match self.packet()? {
-                        Packet::Delimiter => break,
-                        Packet::Data(value)
-                            if value.starts_with(b"shallow ")
-                                || value.starts_with(b"unshallow ") => {}
-                        _ => return Err(invalid("invalid demand shallow section")),
-                    }
-                },
-                _ => return Err(invalid("invalid demand response section")),
-            }
-        }
-        let mut output = PackWriter::new(pack);
-        loop {
-            match self.packet()? {
-                Packet::Flush => break,
-                Packet::Data(data) => match data.split_first() {
-                    Some((1, payload)) => output.write_all(payload)?,
-                    Some((2, _)) => {} // optional progress is not application data
-                    Some((3, error)) => {
-                        bail!("remote pack failed: {}", String::from_utf8_lossy(error))
-                    }
-                    _ => return Err(invalid("invalid demand pack sideband")),
-                },
-                _ => return Err(invalid("invalid demand pack termination")),
-            }
-        }
+        self.input.write_all(&exact_request(oids)?)?;
+        read_pack(&mut self.output, pack)?;
+        self.check_helper_end()
+    }
+
+    fn check_helper_end(&mut self) -> Result<()> {
         if self.stateless {
-            ensure!(self.packet()? == Packet::End, "missing helper response end");
+            ensure!(
+                read_packet(&mut self.output)? == Packet::End,
+                "missing helper response end"
+            );
         }
-        output.finish()?;
         Ok(())
     }
     pub(crate) fn stop(&self) -> Result<()> {
@@ -325,43 +474,302 @@ impl Session {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+pub(crate) fn packet_length(header: &[u8; 4]) -> Result<usize> {
+    ensure!(
+        header.iter().all(u8::is_ascii_hexdigit),
+        "invalid demand packet length"
+    );
+    Ok(usize::from_str_radix(std::str::from_utf8(header)?, 16)?)
+}
+
+fn read_packet(input: &mut impl Read) -> Result<Packet> {
+    let mut header = [0; 4];
+    input
+        .read_exact(&mut header)
+        .context("read demand packet header")?;
+    Ok(match packet_length(&header)? {
+        0 => Packet::Flush,
+        1 => Packet::Delimiter,
+        2 => Packet::End,
+        length @ 4..=65520 => {
+            let mut bytes = vec![0; length - 4];
+            input.read_exact(&mut bytes)?;
+            check_packet_error(&bytes)?;
+            Packet::Data(bytes)
+        }
+        _ => return Err(invalid("invalid demand packet length")),
+    })
+}
+pub(crate) fn check_packet_error(bytes: &[u8]) -> Result<()> {
+    if let Some(error) = bytes.strip_prefix(b"ERR ") {
+        bail!(
+            "remote exact-object request rejected: {}",
+            String::from_utf8_lossy(error)
+        );
+    }
+    Ok(())
+}
+
+fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    write!(output, "{:04x}", bytes.len() + 4)?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn read_v2_capabilities(input: &mut impl Read) -> Result<bool> {
+    if !matches!(read_packet(input)?, Packet::Data(version) if packet_text(&version) == b"version 2")
+    {
+        return Ok(false);
+    }
+    let mut fetch = false;
+    let mut filter = false;
+    loop {
+        match read_packet(input)? {
+            Packet::Flush => break,
+            Packet::Data(capability) => {
+                if let Some(values) = capability.strip_prefix(b"fetch=") {
+                    fetch = true;
+                    filter |= values
+                        .split(u8::is_ascii_whitespace)
+                        .any(|value| value == b"filter");
+                }
+                if let Some(format) = capability.strip_prefix(b"object-format=") {
+                    ensure!(
+                        packet_text(format) == b"sha1",
+                        "SHA-256 repositories unsupported"
+                    );
+                }
+            }
+            _ => bail!("invalid demand capability advertisement"),
+        }
+    }
+    ensure!(fetch && filter, "demand transport lacks object filtering");
+    Ok(true)
+}
+
+#[derive(Clone)]
+pub(crate) struct BranchQuery {
+    wanted: String,
+    alternatives: Vec<String>,
+}
+
+impl BranchQuery {
+    pub(crate) fn new(revision: &std::ffi::OsStr) -> Option<Self> {
+        let revision = revision.to_str()?;
+        if revision.is_empty()
+            || revision.len() > 1024
+            || revision.starts_with('-')
+            || revision.starts_with('+')
+            || revision == "HEAD"
+        {
+            return None;
+        }
+        let wanted = if revision.starts_with("refs/heads/") {
+            revision.to_owned()
+        } else {
+            if revision.starts_with("refs/") {
+                return None;
+            }
+            format!("refs/heads/{revision}")
+        };
+        git2::Reference::is_valid_name(&wanted).then(|| {
+            // Match Git's DWIM rules conservatively. Any competing ref leaves
+            // the selection to native Git.
+            let mut alternatives = vec![
+                revision.to_owned(),
+                format!("refs/{revision}"),
+                format!("refs/heads/{revision}"),
+                format!("refs/tags/{revision}"),
+                format!("refs/remotes/{revision}"),
+                format!("refs/remotes/{revision}/HEAD"),
+            ];
+            alternatives.retain(|other| *other != wanted);
+            Self {
+                wanted,
+                alternatives,
+            }
+        })
+    }
+
+    fn prefixes(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.wanted.as_str()).chain(self.alternatives.iter().map(String::as_str))
+    }
+}
+
+pub(crate) fn reference_request(query: Option<&BranchQuery>) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    request_packet(&mut request, b"command=ls-refs\n")?;
+    request.extend_from_slice(b"0001");
+    if let Some(query) = query {
+        for prefix in query.prefixes() {
+            request_packet(&mut request, format!("ref-prefix {prefix}\n").as_bytes())?;
+        }
+    } else {
+        request_packet(&mut request, b"ref-prefix refs/git-on/probe/\n")?;
+    }
+    request.extend_from_slice(b"0000");
+    Ok(request)
+}
+
+pub(crate) fn read_http_branch(
+    mut input: &[u8],
+    query: Option<&BranchQuery>,
+) -> Result<Option<Oid>> {
+    let selected = read_selected_branch(&mut input, query, false)?;
+    check_http_end(input)?;
+    Ok(selected)
+}
+
+fn read_selected_branch(
+    input: &mut impl Read,
+    query: Option<&BranchQuery>,
+    full_advertisement: bool,
+) -> Result<Option<Oid>> {
+    let mut selected = None;
+    let mut ambiguous = false;
+    let mut advertised_size = 0;
+    loop {
+        match read_packet(input)? {
+            Packet::Data(line) => {
+                if let Some(query) = query {
+                    let mut reference = line.as_slice();
+                    if full_advertisement {
+                        let first = advertised_size == 0;
+                        advertised_size += 4 + line.len();
+                        if advertised_size > 128 * 1024 {
+                            return Ok(None);
+                        }
+                        if first {
+                            reference = reference.split(|&byte| byte == 0).next().unwrap();
+                        }
+                    }
+                    let mut fields = packet_text(reference).split(|&byte| byte == b' ');
+                    let id = fields.next().unwrap_or_default();
+                    let name = fields.next().unwrap_or_default();
+                    if name == query.wanted.as_bytes() {
+                        ambiguous |= selected.is_some();
+                        ensure!(
+                            id.len() == 40 && id.iter().all(u8::is_ascii_hexdigit),
+                            "invalid Git reference object ID"
+                        );
+                        selected = Some(Oid::from_str(std::str::from_utf8(id)?)?);
+                    } else if query
+                        .alternatives
+                        .iter()
+                        .any(|other| other.as_bytes() == name)
+                    {
+                        ambiguous = true;
+                    }
+                }
+            }
+            Packet::Flush => return Ok(selected.filter(|_| !ambiguous)),
+            _ => return Err(invalid("invalid Git reference response")),
+        }
+    }
+}
+
+pub(crate) fn read_http_capabilities(mut input: &[u8]) -> Result<bool> {
+    let mut body = input;
+    if matches!(
+        read_packet(&mut body)?,
+        Packet::Data(service) if packet_text(&service) == b"# service=git-upload-pack"
+    ) {
+        ensure!(
+            read_packet(&mut body)? == Packet::Flush,
+            "invalid Git HTTP service announcement"
+        );
+        input = body;
+    }
+    read_v2_capabilities(&mut input)
+}
+
+pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
+    // One small exact-demand request, not one syscall/signal-status read
+    // for every pkt-line header and body. Every wanted OID is explicit.
+    let mut request = Vec::with_capacity(256);
+    request_packet(&mut request, b"command=fetch\n")?;
+    request.extend_from_slice(b"0001");
+    for oid in oids {
+        request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
+    }
+    for value in [
+        b"deepen 1\n".as_slice(),
+        b"filter tree:0\n",
+        b"no-progress\n",
+        b"done\n",
+    ] {
+        request_packet(&mut request, value)?;
+    }
+    request.extend_from_slice(b"0000");
+    Ok(request)
+}
+
+fn read_pack(input: &mut impl Read, pack: &Spool) -> Result<()> {
+    loop {
+        crate::object::check_transfer()?;
+        match read_packet(input)? {
+            Packet::Data(section) if packet_text(&section) == b"packfile" => break,
+            Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
+                match read_packet(input)? {
+                    Packet::Delimiter => break,
+                    Packet::Data(value)
+                        if value.starts_with(b"shallow ") || value.starts_with(b"unshallow ") => {}
+                    _ => return Err(invalid("invalid demand shallow section")),
+                }
+            },
+            _ => return Err(invalid("invalid demand response section")),
+        }
+    }
+    let mut output = PackWriter::new(pack);
+    loop {
+        crate::object::check_transfer()?;
+        match read_packet(input)? {
+            Packet::Flush => break,
+            Packet::Data(data) => match data.split_first() {
+                Some((1, payload)) => output.write_all(payload)?,
+                Some((2, _)) => {} // optional progress is not application data
+                Some((3, error)) => {
+                    bail!("remote pack failed: {}", String::from_utf8_lossy(error))
+                }
+                _ => return Err(invalid("invalid demand pack sideband")),
+            },
+            _ => return Err(invalid("invalid demand pack termination")),
+        }
+    }
+    output.finish()
+}
+
+fn check_http_end(input: impl Read) -> Result<()> {
+    let mut trailer = Vec::new();
+    input.take(5).read_to_end(&mut trailer)?;
+    ensure!(
+        trailer.is_empty() || trailer == b"0002",
+        "unexpected data after the Git HTTP response"
+    );
+    Ok(())
+}
+
 // Keep the trailer out of the checksum without retaining the pack in RAM.
 struct PackWriter<'a> {
     output: BufWriter<&'a Spool>,
-    hash: Sha1,
-    tail: Vec<u8>,
+    checksum: crate::pack_stream::Checksum,
 }
 impl<'a> PackWriter<'a> {
     fn new(file: &'a Spool) -> Self {
         Self {
             output: BufWriter::with_capacity(64 * 1024, file),
-            hash: Sha1::new(),
-            tail: Vec::with_capacity(20),
+            checksum: crate::pack_stream::Checksum::default(),
         }
     }
     fn finish(mut self) -> Result<()> {
         self.output.flush()?;
-        ensure!(
-            self.tail.len() == 20 && crate::object::finish_sha1(self.hash)?.as_slice() == self.tail,
-            "received pack checksum mismatch"
-        );
-        Ok(())
+        self.checksum.finish()
     }
 }
 impl Write for PackWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.output.write_all(bytes)?;
-        if bytes.len() >= 20 {
-            self.hash.update(&self.tail);
-            self.hash.update(&bytes[..bytes.len() - 20]);
-            self.tail.clear();
-            self.tail.extend_from_slice(&bytes[bytes.len() - 20..]);
-        } else {
-            let excess = (self.tail.len() + bytes.len()).saturating_sub(20);
-            self.hash.update(&self.tail[..excess]);
-            self.tail.drain(..excess);
-            self.tail.extend_from_slice(bytes);
-        }
+        self.checksum.update(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -485,6 +893,7 @@ impl Read for ObjectReader<'_> {
 mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
+    use sha1_checked::{Digest, Sha1};
     fn pack(payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
         let mut size = payload.len();
@@ -525,8 +934,8 @@ mod tests {
         source.shutdown(std::net::Shutdown::Write).unwrap();
         let session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input),
-            output: BufReader::new(Input(output)),
+            input: Output(input, None),
+            output: BufReader::new(Input(output, None)),
             errors: tempfile::tempfile().unwrap(),
             stateless: false,
         };
@@ -539,6 +948,32 @@ mod tests {
             output.push(b'\n');
         }
     }
+    #[test]
+    fn branch_selection_ignores_longer_prefixes_and_leaves_ambiguities_to_git() {
+        let query = BranchQuery::new(std::ffi::OsStr::new("release/candidate")).unwrap();
+        let mut response = Vec::new();
+        let selected = Oid::from_bytes(&[3; 20]).unwrap();
+        let other = Oid::from_bytes(&[4; 20]).unwrap();
+        for (oid, name) in [
+            (selected, "refs/heads/release/candidate"),
+            (other, "refs/heads/release/candidate-next"),
+        ] {
+            text_packet(&mut response, format!("{oid} {name}").as_bytes(), true);
+        }
+        assert_eq!(
+            read_http_branch(&[response.as_slice(), b"00000002"].concat(), Some(&query)).unwrap(),
+            Some(selected)
+        );
+        text_packet(
+            &mut response,
+            format!("{other} refs/tags/release/candidate").as_bytes(),
+            true,
+        );
+        response.extend_from_slice(b"0000");
+        let (mut session, _peer) = peer_response(&response);
+        assert_eq!(session.select_branch(&query).unwrap(), None);
+    }
+
     #[test]
     fn text_handshake_accepts_optional_lf() {
         for version_lf in [false, true] {
@@ -587,7 +1022,7 @@ mod tests {
                 bytes.extend_from_slice(b"0000");
                 let file = spool(root.path(), &[]);
                 let (mut session, _request_peer) = peer_response(&bytes);
-                session.fetch(Oid::zero(), &file).unwrap();
+                session.fetch(&[Oid::zero()], &file).unwrap();
                 let mut actual = vec![0; good.len()];
                 file.read_exact_at(&mut actual, 0).unwrap();
                 assert_eq!(actual, good);
@@ -669,13 +1104,13 @@ mod tests {
             source.shutdown(std::net::Shutdown::Write).unwrap();
             let mut session = Session {
                 owner: Owner(Mutex::new(None)),
-                input: Output(input),
-                output: BufReader::new(Input(output)),
+                input: Output(input, None),
+                output: BufReader::new(Input(output, None)),
                 errors: tempfile::tempfile().unwrap(),
                 stateless: false,
             };
             let file = spool(root.path(), &[]);
-            assert!(session.fetch(Oid::zero(), &file).is_err());
+            assert!(session.fetch(&[Oid::zero()], &file).is_err());
             assert_eq!(file.len().unwrap(), 0);
         }
     }
@@ -728,8 +1163,8 @@ mod tests {
         errors.write_all(b"actual failure").unwrap();
         let mut session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input),
-            output: BufReader::new(Input(output)),
+            input: Output(input, None),
+            output: BufReader::new(Input(output, None)),
             errors,
             stateless: false,
         };
@@ -760,4 +1195,18 @@ mod tests {
             assert!(ObjectReader::single(&file).unwrap().is_none());
         }
     }
+}
+#[test]
+fn http_advertisement_accepts_the_version_two_service_preamble() {
+    let mut capabilities = Vec::new();
+    request_packet(&mut capabilities, b"version 2\n").unwrap();
+    request_packet(&mut capabilities, b"fetch=shallow filter\n").unwrap();
+    capabilities.extend_from_slice(b"0000");
+    assert!(read_http_capabilities(&capabilities).unwrap());
+
+    let mut announced = Vec::new();
+    request_packet(&mut announced, b"# service=git-upload-pack\n").unwrap();
+    announced.extend_from_slice(b"0000");
+    announced.extend_from_slice(&capabilities);
+    assert!(read_http_capabilities(&announced).unwrap());
 }

@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Git {
     pub cwd: PathBuf,
     config: Vec<(OsString, Option<OsString>)>,
@@ -132,24 +132,70 @@ impl Git {
         }
         command
     }
-    pub(crate) fn demand_session_compatible(&self) -> bool {
+    pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
         // Keep caller-defined server programs, server options and fsck policy
-        // on native fetch's complete compatibility path. A controlling TTY
-        // also needs that supervisor: arbitrary credential helpers can read it
-        // even with redirected stdio and GIT_TERMINAL_PROMPT=0.
-        controlling_terminal().is_none()
-            && std::env::var_os("GIT_EXEC_PATH").is_none()
-            && !self.config.iter().any(|(key, value)| {
+        // on native fetch's complete compatibility path.
+        if self.config.iter().any(|(key, value)| {
+            let key = key.as_bytes();
+            key.ends_with(b".uploadpack")
+                || key.ends_with(b".vcs")
+                || key.ends_with(b".serveroption")
+                || key.starts_with(b"fsck.")
+                || key == b"fetch.fsckobjects"
+                || key == b"transfer.fsckobjects"
+                || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+        }) {
+            return Ok(false);
+        }
+
+        let Some(inherited) = std::env::var_os("GIT_EXEC_PATH") else {
+            return Ok(true);
+        };
+        // Git exports its standard helper directory to external subcommands.
+        // A genuinely custom directory still selects the compatibility path.
+        let mut command = self.command(None);
+        command
+            .arg("--exec-path")
+            .env_remove("GIT_EXEC_PATH")
+            .stdin(Stdio::null());
+        let result = run(command, true)?;
+        Ok(result.status.success()
+            && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
+    }
+    pub(crate) fn http2_compatible(&self) -> bool {
+        // Native Git remains responsible for explicit HTTP configuration
+        // and transport policy. Apply this before any libcurl discovery.
+        self.transport_policy_is_default("https")
+            && !self.config.iter().any(|(key, _)| {
                 let key = key.as_bytes();
-                key.ends_with(b".uploadpack")
-                    || key.ends_with(b".vcs")
-                    || key.ends_with(b".serveroption")
-                    || key.starts_with(b"fsck.")
-                    || key == b"fetch.fsckobjects"
-                    || key == b"transfer.fsckobjects"
-                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+                key.starts_with(b"http.")
+                    || key.starts_with(b"remote.")
+                        && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
+            })
+            && !std::env::vars_os().any(|(key, _)| {
+                let key = key.as_bytes();
+                key.starts_with(b"GIT_HTTP_")
+                    || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
+                    || matches!(
+                        key,
+                        b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
+                    )
             })
     }
+    pub(crate) fn transport_policy_is_default(&self, protocol: &str) -> bool {
+        let key = format!("protocol.{protocol}.allow");
+        !self
+            .config
+            .iter()
+            .any(|(configured, _)| configured == "protocol.allow" || configured == key.as_str())
+            && std::env::var_os("GIT_ALLOW_PROTOCOL").is_none()
+            && std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none()
+    }
+
+    pub(crate) fn sets_protocol_version(&self) -> bool {
+        self.config.iter().any(|(key, _)| key == "protocol.version")
+    }
+
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());
@@ -405,7 +451,7 @@ impl<R: std::io::Read, F: FnOnce(&mut R) -> std::io::Result<()>> std::io::Read
     }
 }
 
-fn controlling_terminal() -> Option<std::fs::File> {
+pub(crate) fn controlling_terminal() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -613,7 +659,7 @@ impl<'a> NativeInput<'a> {
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
 struct ChildExitWakeup {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: Option<std::os::fd::OwnedFd>,
 }
 impl ChildExitWakeup {
@@ -626,16 +672,41 @@ impl ChildExitWakeup {
                 fd: (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::FromRawFd;
+
+            // Darwin creates the descriptor close-on-exec. Poll wakes when
+            // the notification arrives; the existing try_wait reaps the child.
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Self { fd: None };
+            }
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+            let exit = libc::kevent {
+                ident: pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let registered =
+                unsafe { libc::kevent(queue, &exit, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            Self {
+                fd: (registered == 0).then_some(fd),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = pid;
             Self {}
         }
     }
     fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let exit = -1;
         if exit >= 0 || input.is_some() {
             let mut descriptors = [
@@ -771,6 +842,45 @@ impl SplitByte for [u8] {
             None => (self, None),
         }
     }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_transport_policy_keeps_http2_on_native_git() {
+        for key in ["protocol.allow", "protocol.https.allow"] {
+            let git = Git {
+                cwd: PathBuf::new(),
+                config: vec![(key.into(), Some("never".into()))],
+                original_dir: None,
+            };
+            assert!(!git.http2_compatible(), "{key}");
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn darwin_child_exit_notifies_the_wait_loop() {
+    use std::os::fd::AsRawFd;
+
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let wakeup = ChildExitWakeup::new(child.id());
+    drop(child.stdin.take());
+    let mut event = libc::pollfd {
+        fd: wakeup.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let notified = event.fd >= 0 && unsafe { libc::poll(&mut event, 1, 5000) } == 1;
+    assert!(child.wait().unwrap().success());
+    assert!(notified && event.revents & libc::POLLIN != 0);
 }
 
 #[cfg(all(test, target_os = "linux"))]

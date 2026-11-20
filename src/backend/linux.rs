@@ -1,7 +1,7 @@
 //! Thin Linux FUSE adapter. The registry dependency owns the kernel protocol;
 //! this module only converts typed callbacks and holds Linux backing handles.
 use super::{FileAttr, FileType, SetAttributes, TimeOrNow};
-use crate::filesystem::{FsResult, Overlay};
+use crate::filesystem::{FsResult, Overlay, SourceLookup};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -25,11 +25,13 @@ const TTL: Duration = Duration::ZERO;
 // generated children or mutable directory streams. A fully readonly namespace
 // may also cache directory pages. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const REMOTE_WORKERS: usize = 8;
 // TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
 // interrupted without a blocked dispatcher. Do not emulate it by polling
 // caller /proc status on ordinary filesystem operations.
 pub struct Fuse {
     state: Mutex<State>,
+    parallel_reads: bool,
 }
 struct State {
     core: Overlay,
@@ -50,6 +52,7 @@ struct State {
 }
 impl Fuse {
     pub fn new(core: Overlay) -> Self {
+        let parallel_reads = core.parallel_remote_reads();
         Self {
             state: Mutex::new(State {
                 core,
@@ -64,6 +67,7 @@ impl Fuse {
                 #[cfg(target_os = "linux")]
                 handles: HashMap::new(),
             }),
+            parallel_reads,
         }
     }
     fn state(&self) -> MutexGuard<'_, State> {
@@ -193,6 +197,11 @@ impl Filesystem for Fuse {
         #[cfg(target_os = "linux")]
         {
             let state = self.state.get_mut().expect("filesystem state poisoned");
+            if self.parallel_reads {
+                // The overlay still serializes namespace changes. Allow the
+                // kernel to submit distinct lookups under the same parent.
+                let _ = config.add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS);
+            }
             state.cache_directories =
                 state.core.read_only() && config.kernel_abi() >= fuser::Version(7, 28);
             #[cfg(feature = "test-metrics")]
@@ -222,7 +231,33 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("lookup");
-        match state.core.lookup_entry(parent.0, name) {
+        let prepared = loop {
+            let Some(lookup) = self
+                .parallel_reads
+                .then(|| state.core.probe_source_lookup(parent.0, name))
+                .flatten()
+            else {
+                break None;
+            };
+            let (inode, oid) = match lookup {
+                SourceLookup::Inode(ino) => (Some(ino), state.core.pending_source_size(ino)),
+                SourceLookup::Tree(oid) => (None, Some(oid)),
+            };
+            let Some(pending) = oid.and_then(|oid| state.core.start_remote_demand(oid, inode))
+            else {
+                break inode;
+            };
+            drop(state);
+            pending.finish();
+            state = self.state();
+            // Directory release or FORGET can reclaim the inode while the
+            // lookup is suspended. Resolve it again from the verified source.
+        };
+        let result = match prepared {
+            Some(ino) => state.core.lookup_prepared_entry(ino),
+            None => state.core.lookup_entry(parent.0, name),
+        };
+        match result {
             Ok(a) => {
                 let (attr_ttl, entry_ttl) = state.cache_ttls(&a);
                 reply.entry_with_ttls(&attr_ttl, &entry_ttl, &attr(a), Generation(0));
@@ -600,6 +635,16 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("opendir");
+        if let Some(pending) = self
+            .parallel_reads
+            .then(|| state.core.pending_source_tree(ino.0))
+            .flatten()
+            .and_then(|oid| state.core.start_remote_demand(oid, None))
+        {
+            drop(state);
+            pending.finish();
+            state = self.state();
+        }
         match state.core.open_directory(ino.0, flags.0) {
             Ok(fh) => reply.opened(
                 FileHandle(fh),

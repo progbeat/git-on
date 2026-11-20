@@ -138,5 +138,8 @@ pub fn mount(
     if policy == crate::policy::WritePolicy::None {
         config.mount_options.push(fuser::MountOption::RO);
     }
+    if overlay.parallel_remote_reads() {
+        config.n_threads = Some(linux::REMOTE_WORKERS);
+    }
     fuser::spawn_mount(linux::Fuse::new(overlay), path, &config).map(Session::Linux)
 }

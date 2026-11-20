@@ -52,21 +52,92 @@ depth; ordinary reads, writable opens and metadata changes do not build that ind
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
-Where protocol v2 and the caller's policy permit, exact demands share one
-invocation-owned channel. Native Git still resolves the original repository and
-refspec. Its optional `fetch-pack --diag-url` diagnostics supply decoded file/
-SSH path and port bytes; unknown formats retain native fetch. HTTPS uses native
-Git's HTTP helper, preserving configured credentials, proxies and TLS policy.
-Callers with a controlling terminal use native fetch with job-control supervision.
-During preparation, Git-on owns that terminal and presents standard Git/OpenSSH
-askpass requests. Git and its helpers have no controlling terminal; helpers that
-need terminal interaction must use `GIT_ASKPASS` or `SSH_ASKPASS` instead of opening
-`/dev/tty` directly. Configured askpass programs retain their selection policy
-and original environment.
-SSH reuses only the existing identity-checked owned master. Protocol v0/v1,
-custom server/vcs/server-option settings, explicit fsck policy or GIT_EXEC_PATH
-retain the native compatibility path. No fetched object is retried merely to
-change decoders, and no unrelated future OID is requested.
+Where protocol v2 and the caller's policy permit, exact demands reuse
+invocation-owned channels. Native Git resolves the original repository.
+Its optional `fetch-pack --diag-url` diagnostics supply decoded file/SSH path
+and port bytes. Unknown formats retain native fetch. A full SHA-1 object ID
+or unambiguous branch can use the reusable HTTPS channel for the initial fetch
+after validating filtering and authentication. An SSH identity that
+authenticates without a prompt can select the branch or exact object ID and
+fetch the root tree over one owned channel. Other refspecs use native Git's
+selection with the caller's credentials, proxies and TLS policy.
+Interactive preparation uses native fetch with job-control supervision. Git-on
+owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
+request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
+programs retain their selection policy and original environment. Once the
+command starts, HTTP(S) helpers run in their own sessions without a controlling
+terminal.
+SSH reuses only the existing identity-checked owned master. Explicit protocol v0/v1,
+custom server/vcs/server-option settings, explicit fsck policy, or a custom
+`GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
+helper path supports reuse. The decoder reuses the bytes already received when
+a pack requires the fallback decoder.
+
+On FUSE and NFS, protected directory and file lookups can wait for an exact
+object independently of the filesystem worker. A cold pathname lookup can
+wait for its parent tree, then resolve the name and wait for its file size.
+Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
+an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
+It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
+the peer govern the active streams. After eight consistently slow replies,
+the loader can briefly wait for overlapping demands to share a fetch.
+Each foreground fetch can group up to 64 already pending OIDs.
+Explicit Git HTTP configuration, authentication outside the supported exchange,
+and servers without HTTP/2 or filtered protocol v2 use the native helper.
+Transport selection completes before any object demand is sent.
+
+Native helpers start with four available channels. If each of the first eight
+successful transfers takes at least 64 milliseconds, the pool can use up to
+16 channels. It can expand earlier if a scan confirms its forecasts while the
+connection is still being measured. SSH opens its channels through the same
+owned master and uses fewer when the server refuses an additional channel.
+On a slow SSH startup, up to two spare channels can begin negotiating protocol
+v2 as soon as the authenticated, owned socket exists. When the caller leaves
+the protocol version unconfigured, an unambiguous named branch can use a Git
+v0 ref advertisement while filtered protocol v2 channels negotiate on the
+same master. A ready channel
+can fetch the selected commit while another channel awaits an `ls-refs` reply.
+Object requests on this path use filtered protocol v2.
+If fetching the selected object also takes at least 64 milliseconds, up to two
+more SSH channels can start negotiating while the root tree is fetched.
+Ready startup channels can serve exact demands while other channels are still
+negotiating and the pool is measuring its first replies.
+When another channel opens during execution, pending requests stay eligible
+on the existing channels until one is available to send them.
+Beyond the initial SSH pool, actual demands open additional channels.
+Prefetch can use those channels after they connect.
+An idle pool starts an ordinary request immediately. While a transfer is active,
+the queue can wait up to two milliseconds on a slow source. A dense scan can
+wait up to twelve milliseconds to combine overlapping requests.
+
+A first access to a regular file in a directory opened for enumeration finds
+uncached and previously unscheduled blob OIDs in Git's depth-first order
+through already opened directories. It skips previously considered ranges
+and examines at most 512 remaining entries. The same planner serves FUSE and
+NFS. Speculative packs start with up to four OIDs. On slower connections,
+confirmed first accesses to predicted objects can expand this to 64, 128 or
+256. The first confirmation can expand the window to 64 after a slow reply
+when two or more required objects are still pending. Consecutive misses reduce
+the window. During a dense scan
+the planner groups remaining OIDs from the current and recently opened
+directories. The predictor tracks at most 512 OIDs ahead of actual accesses.
+When the window fills on a slower connection, completed predictions age out
+after unrelated accesses. Ordinary demands take precedence and can join an
+active speculative request without duplicating its fetch. If that
+speculation fails, only waiting ordinary demands reenter the request queue.
+These paths require a reusable transport and an unrestricted per-file size
+limit.
+
+The HTTPS and SSH receivers share the same incremental Git framing and pack
+decoder. It inflates ordinary entries in memory and verifies the canonical Git
+OID against the requested OIDs before notifying a waiting read. It can publish
+a verified object while the rest of its pack is still arriving. The receiver
+also verifies the complete pack's checksum and framing. Deltas and entries
+or packs larger than the in-memory decoder's working buffers use the existing
+pack decoder. HTTP/2 continues processing other streams while a worker decodes
+the remaining objects in a speculative pack. Blob payloads enter the same
+authenticated, run-local store. Unrequested objects in a verified pack remain
+available in compressed form for later demands.
 
 Explicit-all eager materialization needs the entire selected tree. When no
 per-file resource limit is in effect, fetch the selected revision once with
@@ -80,8 +151,8 @@ transfers rather than aggregating otherwise readable objects into an oversized
 pack. At most 256 known object IDs from the current directory share one
 native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
 run-local availability and deduplicated before requesting it; all use `tree:0`.
-The same batching applies to metadata required by the FUSE ownership index;
-readonly FUSE demands remain exact. Neither path requests unknown descendants. The batch
+The same batching applies to metadata required by the FUSE ownership index.
+All paths request only known objects. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
 fetch/decode operations; full-process tracing checks those operation counts.
@@ -248,8 +319,10 @@ non-OpenSSH variants are unsupported and fail before authentication. The runner
 owns control options, including short `-M`/`-S`; caller `-O` control commands
 are rejected. Expanding the owned socket path in caller options cannot bypass
 control-option sanitization. Its master remains available for the run lifetime,
-and lazy reads require the existing socket through OpenSSH mux proxy mode. Normal completion
-and busy-mount retention close the owned master. Recovery records the socket's
+and lazy reads use that socket. Extra SSH channels ask the master to open a
+session. When the master refuses, its existing channels stay available and a
+replacement network connection is blocked. Normal completion and busy-mount
+retention close the owned master. Recovery records the socket's
 exact device/inode and only closes a matching real socket; changed or symbolic
 paths and absent or invalid records are skipped. Uncatchable termination before
 initial advertisement finishes can leave an unrecorded connection; stale cleanup

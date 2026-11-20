@@ -9,7 +9,7 @@ use crate::policy::{Policy, WritePolicy};
 use crate::snapshot::{BlobReader, Entry, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
@@ -17,6 +17,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+const PREFETCH_SCAN_LIMIT: usize = 512;
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
@@ -59,7 +61,116 @@ struct Handle {
 struct SourceDirectory {
     tree: Arc<crate::tree::Directory>,
     base: u64,
+    opened: bool,
+    considered: BTreeMap<usize, usize>,
+    dense_offset: usize,
 }
+
+impl SourceDirectory {
+    fn next_candidate(&self, index: usize) -> usize {
+        self.considered
+            .range(..=index)
+            .next_back()
+            .map_or(index, |(_, end)| index.max(*end))
+    }
+
+    fn consider(&mut self, index: usize) {
+        let end = self.considered.remove(&(index + 1)).unwrap_or(index + 1);
+        if let Some((_, previous)) = self.considered.range_mut(..index).next_back() {
+            if *previous == index {
+                *previous = end;
+                return;
+            }
+        }
+        self.considered.insert(index, end);
+    }
+}
+
+struct DfsFrame {
+    path: PathBuf,
+    key: usize,
+    next: usize,
+}
+
+/// Walk the already-open source view in Git tree order. Each frame borrows
+/// the parsed tree rather than building a second index of the directory's files.
+struct OpenedFiles<'a> {
+    directories: &'a mut [SourceDirectory],
+    keys: &'a HashMap<PathBuf, usize>,
+    frontier: &'a mut VecDeque<usize>,
+    stack: Vec<DfsFrame>,
+    remaining: usize,
+    dense: bool,
+    anchor: Option<usize>,
+}
+
+impl OpenedFiles<'_> {
+    fn prioritize(mut self, dense: bool) -> Self {
+        self.dense = dense;
+        self
+    }
+
+    fn next_dense(&mut self) -> Option<Oid> {
+        while self.remaining != 0 {
+            let key = self.anchor.or_else(|| self.frontier.back().copied())?;
+            let directory = &mut self.directories[key];
+            let index = directory.next_candidate(directory.dense_offset);
+            let Some((mode, oid)) = directory.tree.metadata_at(index) else {
+                if self.anchor.take().is_none() {
+                    self.frontier.pop_back();
+                }
+                continue;
+            };
+            self.remaining -= 1;
+            directory.dense_offset = index + 1;
+            if matches!(mode, 0o100644 | 0o100755) {
+                directory.consider(index);
+                return Some(oid);
+            }
+        }
+        None
+    }
+}
+
+impl Iterator for OpenedFiles<'_> {
+    type Item = Oid;
+
+    fn next(&mut self) -> Option<Oid> {
+        if self.dense {
+            return self.next_dense();
+        }
+        while self.remaining != 0 {
+            let frame = self.stack.last_mut()?;
+            let directory = &mut self.directories[frame.key];
+            let index = directory.next_candidate(frame.next);
+            let Some((mode, oid)) = directory.tree.metadata_at(index) else {
+                self.stack.pop();
+                continue;
+            };
+            frame.next = index + 1;
+            self.remaining -= 1;
+            match mode {
+                0o100644 | 0o100755 if directory.opened => {
+                    // The queue considers each yielded OID before asking for
+                    // the next. Coalesce visited indices into runs so warm or
+                    // reverse reads can skip them without rescanning names.
+                    directory.consider(index);
+                    return Some(oid);
+                }
+                0o040000 => {
+                    let (name, _) = directory.tree.at(index)?;
+                    let path = frame.path.join(name);
+                    if let Some(&key) = self.keys.get(&path) {
+                        self.stack.push(DfsFrame { path, key, next: 0 });
+                    }
+                }
+                _ => (),
+            }
+        }
+        None
+    }
+}
+
 enum DirectoryEntries {
     Source(usize),
     Merged(DirectoryVersion),
@@ -122,6 +233,7 @@ pub struct Overlay {
     dirty_directories: HashSet<u64>,
     source_directories: Vec<SourceDirectory>,
     source_directory_keys: HashMap<PathBuf, usize>,
+    prefetch_frontier: VecDeque<usize>,
     #[cfg(test)]
     directory_prepared_rows: usize,
     next_ino: u64,
@@ -155,7 +267,6 @@ impl Overlay {
                 && node.attr.kind == FileType::RegularFile
         })
     }
-    #[cfg(target_os = "linux")]
     pub(crate) fn protected_source(&self, ino: u64) -> bool {
         self.write_policy != WritePolicy::All
             && self
@@ -234,6 +345,7 @@ impl Overlay {
             dirty_directories: HashSet::new(),
             source_directories: Vec::new(),
             source_directory_keys: HashMap::new(),
+            prefetch_frontier: VecDeque::new(),
             #[cfg(test)]
             directory_prepared_rows: 0,
             next_ino: 2,
@@ -467,7 +579,13 @@ impl Overlay {
             .checked_add(u64::try_from(tree.len()).map_err(|_| libc::ENOSPC)?)
             .ok_or(libc::ENOSPC)?;
         let key = self.source_directories.len();
-        self.source_directories.push(SourceDirectory { tree, base });
+        self.source_directories.push(SourceDirectory {
+            tree,
+            base,
+            opened: false,
+            considered: BTreeMap::new(),
+            dense_offset: 0,
+        });
         self.source_directory_keys.insert(source, key);
         Ok(key)
     }
@@ -554,6 +672,13 @@ impl Overlay {
             .clone()
             .map(|source| self.source_directory(&source))
             .transpose()?;
+        if let Some(key) = source {
+            let directory = &mut self.source_directories[key];
+            if !directory.opened {
+                directory.opened = true;
+                self.prefetch_frontier.push_back(key);
+            }
+        }
         let mut rows = None;
         let entries = if let Some(key) = source.filter(|_| !self.dirty_directories.contains(&ino)) {
             DirectoryEntries::Source(key)
@@ -1002,10 +1127,15 @@ impl Overlay {
     fn ensure_size(&mut self, ino: u64) -> FsResult<()> {
         let node = self.node(ino)?;
         if node.size_pending {
-            let size = self
-                ._snapshot
-                .blob_size(node.oid.ok_or(libc::EIO)?)
-                .map_err(snapshot_errno)?;
+            let oid = node.oid.ok_or(libc::EIO)?;
+            // First access can also come through a filesystem operation
+            // that cannot be suspended independently in the backend.
+            if node.attr.kind == FileType::RegularFile && self.parallel_remote_reads() {
+                if let Some(demand) = self.start_remote_demand(oid, Some(ino)) {
+                    demand.finish();
+                }
+            }
+            let size = self._snapshot.blob_size(oid).map_err(snapshot_errno)?;
             let node = self.node_mut(ino)?;
             node.attr.size = size;
             node.attr.blocks = size.div_ceil(512);
@@ -1548,7 +1678,129 @@ impl Overlay {
     }
 }
 
+pub(crate) enum SourceLookup {
+    Inode(u64),
+    Tree(Oid),
+}
+
 impl Overlay {
+    pub(crate) fn parallel_remote_reads(&self) -> bool {
+        self.write_policy != WritePolicy::All && self._snapshot.reusable_remote_transport()
+    }
+
+    pub(crate) fn start_remote_demand(
+        &mut self,
+        oid: Oid,
+        inode: Option<u64>,
+    ) -> Option<crate::snapshot::PendingObject> {
+        let snapshot = self._snapshot.clone();
+        let files = inode.and_then(|ino| self.opened_files_after(ino));
+        snapshot.start_remote_demand(oid, files.map(|files| move |dense| files.prioritize(dense)))
+    }
+
+    fn opened_files_after(&mut self, ino: u64) -> Option<OpenedFiles<'_>> {
+        let node = self.nodes.get(&ino)?;
+        if node.attr.kind != FileType::RegularFile {
+            return None;
+        }
+        let mut source = node.snapshot_path.as_deref()?;
+        let parent_key = *self.source_directory_keys.get(source.parent()?)?;
+        if !self.source_directories[parent_key].opened {
+            return None;
+        }
+        let mut stack = Vec::new();
+        while let (Some(parent), Some(name)) = (source.parent(), source.file_name()) {
+            if let Some(&key) = self.source_directory_keys.get(parent) {
+                if let Some(index) = self.source_directories[key].tree.index(name) {
+                    stack.push(DfsFrame {
+                        path: parent.to_owned(),
+                        key,
+                        next: index + 1,
+                    });
+                }
+            }
+            source = parent;
+        }
+        stack.reverse();
+        Some(OpenedFiles {
+            directories: &mut self.source_directories,
+            keys: &self.source_directory_keys,
+            frontier: &mut self.prefetch_frontier,
+            stack,
+            remaining: PREFETCH_SCAN_LIMIT,
+            dense: false,
+            anchor: Some(parent_key),
+        })
+    }
+
+    pub(crate) fn pending_source_tree(&self, ino: u64) -> Option<Oid> {
+        let node = self.nodes.get(&ino)?;
+        let source = node.snapshot_path.as_ref()?;
+        if node.attr.kind == FileType::Directory
+            && self.protected_source(ino)
+            && !self.source_directory_keys.contains_key(source)
+        {
+            node.oid
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn pending_source_size(&self, ino: u64) -> Option<Oid> {
+        let node = self.nodes.get(&ino)?;
+        if node.size_pending && self.protected_source(ino) {
+            node.oid
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a protected pathname using local metadata, or identify the
+    /// exact parent tree that its lookup still requires.
+    pub(crate) fn probe_source_lookup(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+    ) -> Option<SourceLookup> {
+        if !self.protected_source(parent) {
+            return None;
+        }
+        let path = self.child(parent, name).ok()?;
+        if let Some(&ino) = self
+            .paths
+            .get(&path)
+            .filter(|ino| self.nodes.contains_key(ino))
+        {
+            return Some(SourceLookup::Inode(ino));
+        }
+        let source = self.lower_path(&path)?;
+        let source_parent = source.parent()?;
+        if !self.source_directory_keys.contains_key(source_parent) {
+            let node = self.nodes.get(&parent)?;
+            if node.snapshot_path.as_deref()? != source_parent {
+                return None;
+            }
+            let oid = node.oid?;
+            let Some(tree) = self._snapshot.directory_by_oid_if_available(oid).ok()? else {
+                return Some(SourceLookup::Tree(oid));
+            };
+            self.insert_source_directory(source_parent.to_owned(), tree)
+                .ok()?;
+        }
+        self.lookup_inode(parent, name)
+            .ok()
+            .map(SourceLookup::Inode)
+    }
+
+    pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
+        if self.read_only() {
+            self.ensure_readonly_child(parent, name, false)
+        } else {
+            let path = self.child(parent, name)?;
+            self.ensure_entry(&path, false)
+        }
+    }
+
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> FsResult<FileAttr> {
         let ino = if self.read_only() {
@@ -1557,6 +1809,15 @@ impl Overlay {
             let p = self.child(parent, name)?;
             self.ensure(&p)?
         };
+        self.lookup_attr(ino)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_prepared_entry(&mut self, ino: u64) -> FsResult<FileAttr> {
+        self.ensure_size(ino)?;
+        self.lookup_attr(ino)
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn lookup_attr(&mut self, ino: u64) -> FsResult<FileAttr> {
         self.refresh_backing_attr(ino)?;
         let node = self.node_mut(ino)?;
         node.lookups = node.lookups.saturating_add(1);
@@ -1902,15 +2163,6 @@ impl Overlay {
         self.preserve_linked_inodes = true;
     }
 
-    pub(crate) fn lookup_inode(&mut self, parent: u64, name: &OsStr) -> FsResult<u64> {
-        if self.read_only() {
-            self.ensure_readonly_child(parent, name, false)
-        } else {
-            let path = self.child(parent, name)?;
-            self.ensure_entry(&path, false)
-        }
-    }
-
     pub(crate) fn nfs_parent(&mut self, ino: u64) -> FsResult<u64> {
         if self.node(ino)?.attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
@@ -2058,6 +2310,64 @@ mod tests {
         })
         .unwrap();
         rows
+    }
+
+    #[test]
+    fn opened_dfs_does_not_search_past_a_long_run_of_skipped_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let blob = repo.blob(b"anchor").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("a", blob, 0o100644).unwrap();
+        for index in 0..PREFETCH_SCAN_LIMIT {
+            tree.insert(format!("b-{index:02}"), blob, 0o120000)
+                .unwrap();
+        }
+        tree.insert("z", blob, 0o100644).unwrap();
+        let oid = tree.write().unwrap();
+        let snapshot =
+            Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "prefetch").unwrap();
+        let mut overlay = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        overlay.open_directory(1, libc::O_RDONLY).unwrap();
+        let anchor = overlay.ensure(Path::new("a")).unwrap();
+        assert_eq!(overlay.opened_files_after(anchor).unwrap().next(), None);
+    }
+
+    #[test]
+    fn dense_forecast_consumes_only_opened_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path().join("repo")).unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        let mut blobs = Vec::new();
+        for name in ["current", "recent", "unopened"] {
+            let blob = repo.blob(name.as_bytes()).unwrap();
+            blobs.push(blob);
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("file", blob, 0o100644).unwrap();
+            root.insert(name, tree.write().unwrap(), 0o040000).unwrap();
+        }
+        let root = root.write().unwrap();
+        let snapshot = Snapshot::load(repo.path(), OsStr::new(&root.to_string()), "dense").unwrap();
+        let mut overlay = Overlay::new(snapshot, temp.path().join("upper")).unwrap();
+        for name in ["current", "recent"] {
+            let inode = overlay.ensure(Path::new(name)).unwrap();
+            overlay.open_directory(inode, libc::O_RDONLY).unwrap();
+        }
+        // A lookup can already have decoded the tree of an unopened directory.
+        overlay.ensure(Path::new("unopened/file")).unwrap();
+        let anchor = overlay.ensure(Path::new("current/file")).unwrap();
+        let forecast = |overlay: &mut Overlay| {
+            overlay
+                .opened_files_after(anchor)
+                .unwrap()
+                .prioritize(true)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(forecast(&mut overlay), blobs[..2]);
+        assert!(forecast(&mut overlay).is_empty());
+        let third = overlay.ensure(Path::new("unopened")).unwrap();
+        overlay.open_directory(third, libc::O_RDONLY).unwrap();
+        assert_eq!(forecast(&mut overlay), blobs[2..]);
     }
 
     fn fixture() -> (TempDir, Overlay) {

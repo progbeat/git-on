@@ -16,6 +16,19 @@ const SIZE: u32 = 4;
 const USED: u32 = 45;
 const RDATTR_ERROR: u32 = 11;
 
+pub(super) fn get_mask(requested: Bitmap, readdir: bool) -> Result<Bitmap, Status> {
+    if [48, 54].into_iter().any(|bit| requested.contains(bit))
+        || (!readdir && requested.contains(RDATTR_ERROR))
+    {
+        return Err(INVAL);
+    }
+    Ok(requested.intersection(Bitmap::from_indices(GET)))
+}
+
+pub(super) fn includes_size(mask: Bitmap) -> bool {
+    mask.contains(SIZE) || mask.contains(USED)
+}
+
 pub(super) fn file_type(kind: FileType) -> u32 {
     match kind {
         FileType::RegularFile => 1,
@@ -116,13 +129,8 @@ impl Server {
         readdir: bool,
         w: &mut Writer,
     ) -> Result<(), Status> {
-        if [48, 54].into_iter().any(|bit| requested.contains(bit))
-            || (!readdir && requested.contains(RDATTR_ERROR))
-        {
-            return Err(INVAL);
-        }
-        let mut mask = requested.intersection(Bitmap::from_indices(GET));
-        let has_size = mask.contains(SIZE) || mask.contains(USED);
+        let mut mask = get_mask(requested, readdir)?;
+        let has_size = includes_size(mask);
         let (stat, size_known) = self
             .core
             .nfs_attributes(ino, has_size && !readdir)
