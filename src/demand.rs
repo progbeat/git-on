@@ -726,12 +726,13 @@ impl Shared {
         let shared = self.clone();
         let mut cache = scratch.clone();
         let speculative = work.speculative;
-        let tasks: Vec<_> = work
+        let tasks: Arc<[_]> = work
             .items
             .iter()
             .map(|item| (item.oid, item.demand.clone()))
             .collect();
-        pack_stream::Response::new(
+        let forecast = speculative.then(|| tasks.clone());
+        let mut response = pack_stream::Response::new(
             scratch.clone(),
             oids.to_vec(),
             Box::new(move |object| {
@@ -757,7 +758,15 @@ impl Shared {
                     Ok(())
                 }
             }),
-        )
+        );
+        if let Some(forecast) = forecast {
+            response.set_required(move |remaining| {
+                forecast
+                    .iter()
+                    .any(|(oid, demand)| demand.required() && remaining.contains(oid))
+            });
+        }
+        response
     }
 
     fn resolve_pack_remainder(

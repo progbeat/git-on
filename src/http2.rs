@@ -175,6 +175,14 @@ impl Decoder {
                     pack.finish_http()
                 })();
                 note_failure(report.as_ref(), &received);
+                let received = received.map_err(|error| {
+                    if crate::object::is_cancelled(&error) {
+                        if let Some(Err(transport)) = outcome.lock().unwrap().take() {
+                            return transport;
+                        }
+                    }
+                    error
+                });
                 let _ = complete.send(received);
                 crate::demand::signal_http2(&wake);
             })?;
@@ -223,8 +231,13 @@ impl Decoder {
 
     fn end(&mut self, outcome: Result<()>) {
         note_failure(self.report_failure.as_ref(), &outcome);
+        let failed = outcome.is_err();
         *self.transport.lock().unwrap() = Some(outcome);
-        drop(self.input.take());
+        if failed {
+            self.cancel();
+        } else {
+            drop(self.input.take());
+        }
     }
 
     fn result(&self) -> Option<Result<pack_stream::Received>> {
@@ -729,42 +742,65 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         release.send(()).unwrap();
         let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(result.as_ref().is_err_and(crate::object::is_cancelled));
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "required transfer was reset"
+        );
         drop(decoder);
         assert_eq!(reported.try_recv().unwrap(), "required transfer was reset");
     }
 
     #[test]
-    fn dropping_a_decoder_releases_its_wait_for_a_pack_buffer() {
-        let directory = tempfile::tempdir().unwrap();
-        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
-        let occupied: Vec<_> = (0..8)
-            .map(|_| scratch.reserve_pack_decode(check_transfer).unwrap())
-            .collect();
-        let pack = pack_stream::Response::new(scratch, vec![], Box::new(|_| unreachable!()));
-        let (_read, wake) = UnixStream::pair().unwrap();
-        let mut decoder =
-            Decoder::start(Box::new(pack), Arc::default(), Arc::new(wake), None).unwrap();
-        // A pack header and the entry header for a 65537-byte blob.
-        decoder
-            .feed(b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20")
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while decoder.buffered.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline
-        {
-            thread::yield_now();
+    fn a_pack_buffer_wait_ends_on_reset_or_drop() {
+        for failure in [None, Some("required transfer was reset")] {
+            let directory = tempfile::tempdir().unwrap();
+            let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+            let occupied: Vec<_> = (0..8)
+                .map(|_| {
+                    scratch
+                        .reserve_pack_decode(|| true, check_transfer)
+                        .unwrap()
+                })
+                .collect();
+            let pack = pack_stream::Response::new(scratch, vec![], Box::new(|_| unreachable!()));
+            let (_read, wake) = UnixStream::pair().unwrap();
+            let mut decoder =
+                Decoder::start(Box::new(pack), Arc::default(), Arc::new(wake), None).unwrap();
+            // A pack header and the entry header for a 65537-byte blob.
+            decoder
+                .feed(b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20")
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while decoder.buffered.load(Ordering::Acquire) != 0
+                && std::time::Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            let entered = decoder.buffered.load(Ordering::Acquire) == 0;
+            let (finished, wait_for_finish) = mpsc::channel();
+            let join = thread::spawn(move || {
+                if let Some(failure) = failure {
+                    decoder.end(Err(anyhow::anyhow!(failure)));
+                    let result = decoder.result.recv().unwrap();
+                    finished
+                        .send(result.err().map(|error| error.to_string()))
+                        .unwrap();
+                } else {
+                    drop(decoder);
+                    finished.send(None).unwrap();
+                }
+            });
+            let cancelled = wait_for_finish.recv_timeout(Duration::from_secs(1));
+            drop(occupied);
+            join.join().unwrap();
+            assert!(entered, "decoder did not start consuming the pack");
+            assert_eq!(
+                cancelled
+                    .expect("decoder waited for a different stream's buffer")
+                    .as_deref(),
+                failure
+            );
         }
-        let entered = decoder.buffered.load(Ordering::Acquire) == 0;
-        let (finished, wait_for_finish) = mpsc::channel();
-        let join = thread::spawn(move || {
-            drop(decoder);
-            finished.send(()).unwrap();
-        });
-        let cancelled = wait_for_finish.recv_timeout(Duration::from_secs(1));
-        drop(occupied);
-        join.join().unwrap();
-        assert!(entered, "decoder did not start consuming the pack");
-        cancelled.expect("HTTP/2 decoder shutdown waited for a different stream's buffer");
     }
 
     #[test]

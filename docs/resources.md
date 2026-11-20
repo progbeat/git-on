@@ -12,7 +12,8 @@ buffer without writing a raw file.
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. Another large
 admission can wait for that spill once the hot cache is full. HTTPS and SSH
-decoders reserve one of eight active buffers before inflating a large blob.
+decoders reserve an active buffer before inflating a large blob. One of the
+eight buffers stays available for required reads when prefetches occupy the rest.
 A read can use its verified buffer while placement waits, including after
 joining an in-progress prefetch. Network requests can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without

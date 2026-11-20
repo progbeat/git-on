@@ -40,6 +40,7 @@ impl VerifiedObject {
 }
 
 pub(crate) type Publish = Box<dyn FnMut(VerifiedObject) -> Result<()> + Send>;
+type Required = Box<dyn Fn(&[Oid]) -> bool + Send>;
 
 pub(crate) struct Received {
     pub(crate) fallback: Option<Spool>,
@@ -74,6 +75,7 @@ impl Response {
                 stop: None,
                 wants,
                 publish,
+                required: None,
                 bytes: 0,
                 compressed: Vec::new(),
                 spool: None,
@@ -97,6 +99,10 @@ impl Response {
 
     pub(crate) fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
         self.pack.stop = stop;
+    }
+
+    pub(crate) fn set_required(&mut self, required: impl Fn(&[Oid]) -> bool + Send + 'static) {
+        self.pack.required = Some(Box::new(required));
     }
 
     fn done(&self) -> bool {
@@ -255,6 +261,7 @@ struct Pack {
     stop: Option<Arc<AtomicBool>>,
     wants: Vec<Oid>,
     publish: Publish,
+    required: Option<Required>,
     bytes: u64,
     compressed: Vec<u8>,
     spool: Option<Spool>,
@@ -360,7 +367,16 @@ impl Pack {
                     return self.use_fallback();
                 };
                 let decode = (kind == ObjectType::Blob && size > crate::raw_blob::BLOCK)
-                    .then(|| self.scratch.reserve_pack_decode(|| self.check_transfer()))
+                    .then(|| {
+                        self.scratch.reserve_pack_decode(
+                            || {
+                                self.required
+                                    .as_ref()
+                                    .is_none_or(|required| required(&self.wants))
+                            },
+                            || self.check_transfer(),
+                        )
+                    })
                     .transpose()?;
                 self.position += length;
                 self.entry = Some(Entry {

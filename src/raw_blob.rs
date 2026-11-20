@@ -669,7 +669,7 @@ impl Drop for PackDecode {
     fn drop(&mut self) {
         let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
         *active -= 1;
-        self.0.ready.notify_one();
+        self.0.ready.notify_all();
     }
 }
 
@@ -721,14 +721,20 @@ impl RawBlobs {
         })
     }
 
-    pub(crate) fn reserve_pack_decode(&self, check: impl Fn() -> Result<()>) -> Result<PackDecode> {
+    pub(crate) fn reserve_pack_decode(
+        &self,
+        required: impl Fn() -> bool,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<PackDecode> {
         let slots = &self.pack_decodes;
         let mut active = slots.active.lock().unwrap_or_else(|e| e.into_inner());
         // Apply backpressure before a complete buffer is allocated. Check
         // cancellation while waiting so an interrupted fetch can unwind.
         loop {
             check()?;
-            if *active < HOT_BLOBS {
+            // Speculative streams may pause mid-object. Leave one buffer for
+            // a real read, including a read that joins a running forecast.
+            if *active < HOT_BLOBS - 1 || (*active < HOT_BLOBS && required()) {
                 break;
             }
             (active, _) = slots
@@ -2085,6 +2091,48 @@ mod tests {
     }
 
     #[test]
+    fn forecasts_leave_a_decode_buffer_for_required_reads() {
+        use crate::object::check_transfer;
+        use std::sync::atomic::AtomicBool;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RawBlobs::new(directory.path()).unwrap();
+        let busy: Vec<_> = (1..HOT_BLOBS)
+            .map(|_| cache.reserve_pack_decode(|| false, check_transfer).unwrap())
+            .collect();
+        let required = AtomicBool::new(false);
+        let (forecast, pending) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        let (foreground, demanded) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                started.send(()).unwrap();
+                let permit = cache
+                    .reserve_pack_decode(|| required.load(Ordering::Relaxed), check_transfer)
+                    .unwrap();
+                forecast.send(permit).unwrap();
+            });
+            let entered = running.recv_timeout(Duration::from_secs(3)).is_ok();
+            if let Ok(permit) = pending.recv_timeout(Duration::from_millis(100)) {
+                drop(permit);
+                drop(busy);
+                panic!("a forecast used the reserved foreground buffer");
+            }
+            scope.spawn(|| {
+                let permit = cache.reserve_pack_decode(|| true, check_transfer).unwrap();
+                foreground.send(permit).unwrap();
+            });
+            let independent = demanded.recv_timeout(Duration::from_secs(3));
+            let served = independent.is_ok();
+            drop(independent);
+            required.store(true, Ordering::Relaxed);
+            let promoted = pending.recv_timeout(Duration::from_secs(3)).is_ok();
+            drop(busy);
+            assert!(entered && served && promoted);
+        });
+    }
+
+    #[test]
     fn hot_eviction_allows_verified_reads_during_a_spill() {
         use std::{
             sync::{atomic::AtomicBool, mpsc},
@@ -2120,7 +2168,7 @@ mod tests {
         let _active: Vec<_> = (2..HOT_BLOBS)
             .map(|_| {
                 store
-                    .reserve_pack_decode(crate::object::check_transfer)
+                    .reserve_pack_decode(|| true, crate::object::check_transfer)
                     .unwrap()
             })
             .collect();
@@ -2141,7 +2189,7 @@ mod tests {
                 let bytes = received.clone();
                 scope.spawn(move || {
                     let _decode = decoder
-                        .reserve_pack_decode(crate::object::check_transfer)
+                        .reserve_pack_decode(|| true, crate::object::check_transfer)
                         .unwrap();
                     decoder
                         .insert_verified_bytes(received_oid, bytes, true, || false, || {})
@@ -2177,7 +2225,7 @@ mod tests {
             let second_ready = if streamed.is_some() {
                 scope.spawn(move || {
                     let _decode = another_decoder
-                        .reserve_pack_decode(crate::object::check_transfer)
+                        .reserve_pack_decode(|| true, crate::object::check_transfer)
                         .unwrap();
                     let bytes = vec![HOT_BLOBS as u8 + 2; BLOCK + 1];
                     let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
@@ -2212,7 +2260,7 @@ mod tests {
                 scope.spawn(move || {
                     started.send(()).unwrap();
                     let _decode = last_decoder
-                        .reserve_pack_decode(crate::object::check_transfer)
+                        .reserve_pack_decode(|| true, crate::object::check_transfer)
                         .unwrap();
                     reserved.send(()).unwrap();
                 });
