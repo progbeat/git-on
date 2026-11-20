@@ -123,6 +123,7 @@ When the window fills on a slower connection, completed predictions age out
 after unrelated accesses. Ordinary demands take precedence and can join an
 active speculative request without duplicating its fetch. If that
 speculation fails, only waiting ordinary demands reenter the request queue.
+A diagnosed pack failure after serving a required read fails the invocation.
 These paths require a reusable transport and an unrestricted per-file size
 limit.
 

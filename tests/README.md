@@ -138,8 +138,8 @@ open-handle coherence, disposable overlay cleanup, command errors and SIGINT cle
 Its dirty-index/working-copy fixture verifies that `untracked` means absent from
 the selected commit. Source checks include ignored host files to catch leaks.
 
-The shared mount suite checks that a corrupt spilled source fails copy-up
-before exposing a writable file. The Linux fault shim injects one backing
+The shared mount suite checks first-write isolation and detects altered spilled
+blocks on reads of the immutable file. The Linux fault shim injects one backing
 unlink failure to verify that an open unlinked inode stays usable.
 
 | Path / operation | `none` | `ignored` | `untracked` | `all` |

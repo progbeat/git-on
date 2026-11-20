@@ -636,8 +636,10 @@ os.close(fd)
         self.assert_success(result)
         self.assert_no_runtime_files()
 
-    def test_copy_up_rejects_corrupted_spilled_source_before_writing(self):
-        (self.repo/'large').write_bytes(b'x'*(3*65536+17))
+    def test_copy_up_and_reads_of_the_immutable_source(self):
+        data=b'x'*(3*65536+17)
+        for name in ('large','original'):
+            (self.repo/name).write_bytes(data)
         self.add_spill_blobs(self.repo)
         git(self.repo,'add','.');git(self.repo,'commit','-qm','copy-up integrity')
         oid=git(self.repo,'rev-parse','HEAD:large')
@@ -655,20 +657,26 @@ for index in range(9):
  with open(Path('spill')/str(index),'rb') as other:assert other.read(1)==bytes([index])
 with raw.open('r+b',buffering=0) as original:
  assert os.pwrite(original.fileno(),b'!',2*65536+7)==1
-try:
- os.pwrite(fd,b'y',0)
- os.fsync(fd)
-except OSError as error:assert error.errno==errno.EIO,error
-else:raise AssertionError('copy-up accepted a corrupt source')
-assert not (root/'backing'/str(os.fstat(fd).st_ino)).exists()
+assert os.pwrite(fd,b'y',0)==1
+os.fsync(fd)
+assert os.pread(fd,2,0)==b'yx'
+assert os.pread(fd,1,2*65536+7)==b'!'
+with raw.open('rb') as original:
+ assert original.read(2)==b'xx'
 os.close(fd)
-print('copy-up rejected corrupted source')
+fd=os.open('original',os.O_RDONLY)
+try:
+ os.pread(fd,1,2*65536+7)
+except OSError as error:assert error.errno==errno.EIO,error
+else:raise AssertionError('immutable read accepted a changed block')
+os.close(fd)
+print('private write and immutable read verified')
 ''',oid]
         for source in ([],[self.repo.as_uri()]):
             with self.subTest(source=source):
                 result,_=self.invoke_argv([*source,'HEAD','--write-policy=all','--',*command])
-                self.assertEqual(result.returncode,125 if source or OPTIONS.require_nfs else 0,result.stderr)
-                self.assertEqual(result.stdout,b'copy-up rejected corrupted source\n')
+                self.assertEqual(result.returncode,125 if source else 0,result.stderr)
+                self.assertEqual(result.stdout,b'private write and immutable read verified\n')
                 self.assert_no_runtime_files()
 
     @fuse_only
@@ -1443,30 +1451,6 @@ os.close(fd)
                                 cwd=self.repo, env=self.environment(), capture_output=True,
                                 timeout=30,
                                 preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
-        self.assert_success(result)
-        self.assert_no_runtime_files()
-
-    def test_truncate_spilled_source_copies_only_the_retained_prefix(self):
-        (self.repo/'large').write_bytes(b'x'*(3*65536+17))
-        self.add_spill_blobs(self.repo)
-        git(self.repo,'add','.');git(self.repo,'commit','-qm','shrink spilled source')
-        oid=git(self.repo,'rev-parse','HEAD:large')
-        command=[sys.executable,'-I','-S','-c',r'''
-import os,sys
-from pathlib import Path
-fd=os.open('large',os.O_RDWR)
-assert os.pread(fd,1,0)==b'x'
-for index in range(9):
- with open(Path('spill')/str(index),'rb') as filler:assert filler.read(1)==bytes([index])
-raw=next(Path.cwd().parent.glob('raw-objects-*'))/sys.argv[1]
-with raw.open('r+b',buffering=0) as source:
- assert os.pwrite(source.fileno(),b'!',2*65536+7)==1
-os.ftruncate(fd,4096)
-assert os.fstat(fd).st_size==4096
-assert os.pread(fd,4100,0)==b'x'*4096
-os.close(fd)
-''',oid]
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
         self.assert_success(result)
         self.assert_no_runtime_files()
 

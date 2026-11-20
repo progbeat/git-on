@@ -407,8 +407,9 @@ impl Session {
     pub(crate) fn fetch_stream(
         &mut self,
         oids: &[Oid],
-        response: crate::pack_stream::Response,
+        mut response: crate::pack_stream::Response,
     ) -> Result<crate::pack_stream::Received> {
+        response.set_stop(self.input.1.clone());
         let result = (|| {
             self.errors.set_len(0)?;
             self.errors.rewind()?;

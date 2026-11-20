@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fs::{File, Metadata},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::{
         fd::AsRawFd,
         unix::{
@@ -260,33 +260,29 @@ impl RawBlob {
         } else {
             None
         };
-        let clone_source = input.as_deref().filter(|_| retain == self.size);
-        let (mut output, cloned) = open_copy(&parent, &name, clone_source)?;
+        let (mut output, cloned) = open_copy(&parent, &name, input.as_deref())?;
         let copied = (|| -> Result<()> {
             if let Some(input) = input {
-                let object = &store.objects[&self.oid];
-                let source = if cloned {
+                if cloned {
                     RawDirectory::validate_size(&private_file_metadata(&output)?, Some(self.size))?;
-                    &output
-                } else {
-                    &input
-                };
-                let blocks = retain.div_ceil(BLOCK as u64);
-                let verified_len = self.size.min(blocks * BLOCK as u64);
-                let mut bytes = vec![0; verified_len.min(COPY_BUFFER as u64) as usize];
-                let digests = &object.blocks[..blocks as usize];
-                for (index, digests) in digests.chunks(COPY_BUFFER / BLOCK).enumerate() {
-                    crate::object::check_transfer()?;
-                    let offset = index as u64 * COPY_BUFFER as u64;
-                    let count = (verified_len - offset).min(COPY_BUFFER as u64) as usize;
-                    let chunk = &mut bytes[..count];
-                    source.read_exact_at(chunk, offset)?;
-                    for (block, digest) in chunk.chunks(BLOCK).zip(digests) {
-                        check_block(block, digest)?;
+                    if retain < self.size {
+                        output.set_len(retain).map_err(BackingError)?;
                     }
-                    if !cloned {
-                        let kept = (retain - offset).min(count as u64) as usize;
-                        (&output).write_all(&chunk[..kept]).map_err(BackingError)?;
+                } else {
+                    // Raw reads are positional. The store serializes copy-up
+                    // while the filesystem copies from this descriptor.
+                    let mut source = &*input;
+                    source.rewind()?;
+                    let mut remaining = retain;
+                    while remaining != 0 {
+                        crate::object::check_transfer()?;
+                        let limit = remaining.min(COPY_BUFFER as u64);
+                        let count =
+                            io::copy(&mut source.take(limit), &mut output).map_err(BackingError)?;
+                        if count != limit {
+                            return Err(invalid("verified raw blob length was modified"));
+                        }
+                        remaining -= count;
                     }
                 }
             } else if retain != 0 {
@@ -310,6 +306,10 @@ impl RawBlob {
         if let Err(error) = copied {
             drop(output);
             return Err(discard_copy(&parent, &name, error));
+        }
+        #[cfg(test)]
+        if cloned {
+            store.cloned_copies += 1;
         }
         Ok(output)
     }
@@ -712,6 +712,8 @@ impl RawBlobs {
                 disk_bytes: 0,
                 #[cfg(test)]
                 authenticated_bytes: 0,
+                #[cfg(test)]
+                cloned_copies: 0,
             })),
             prepared: Arc::default(),
             hot_writer: Arc::default(),
@@ -719,13 +721,16 @@ impl RawBlobs {
         })
     }
 
-    pub(crate) fn reserve_pack_decode(&self) -> Result<PackDecode> {
+    pub(crate) fn reserve_pack_decode(&self, check: impl Fn() -> Result<()>) -> Result<PackDecode> {
         let slots = &self.pack_decodes;
         let mut active = slots.active.lock().unwrap_or_else(|e| e.into_inner());
         // Apply backpressure before a complete buffer is allocated. Check
         // cancellation while waiting so an interrupted fetch can unwind.
-        while *active == HOT_BLOBS {
-            crate::object::check_transfer()?;
+        loop {
+            check()?;
+            if *active < HOT_BLOBS {
+                break;
+            }
             (active, _) = slots
                 .ready
                 .wait_timeout(active, Duration::from_millis(50))
@@ -749,6 +754,15 @@ impl RawBlobs {
     pub(crate) fn available(&self, oid: Oid) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.objects.contains_key(&oid) || state.packed.contains_key(&oid)
+    }
+
+    pub(crate) fn was_read(&self, oid: Oid) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objects
+            .get(&oid)
+            .is_some_and(|object| object.used)
     }
 
     pub(crate) fn has_packed(&self, oid: Oid) -> bool {
@@ -1234,6 +1248,8 @@ struct Store {
     disk_bytes: u64,
     #[cfg(test)]
     authenticated_bytes: u64,
+    #[cfg(test)]
+    cloned_copies: u64,
 }
 impl Store {
     fn can_publish_decoded(&self, oid: Oid) -> bool {
@@ -1355,34 +1371,35 @@ impl Store {
     }
 }
 #[cfg(test)]
+pub(crate) fn under_descriptor_limit(name: &str) -> bool {
+    const CHILD: &str = "GIT_ON_TEST_RAW_NOFILE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+            0
+        );
+        let mut limit = unsafe { limit.assume_init() };
+        limit.rlim_cur = limit.rlim_cur.min(64);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+#[cfg(test)]
 mod tests {
     use super::*;
-    fn under_descriptor_limit(name: &str) -> bool {
-        const CHILD: &str = "GIT_ON_TEST_RAW_NOFILE_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
-                0
-            );
-            let mut limit = unsafe { limit.assume_init() };
-            limit.rlim_cur = limit.rlim_cur.min(64);
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-            return true;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--test-threads=1"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
     fn stored_bytes(path: &Path) -> u64 {
         std::fs::read_dir(path)
             .unwrap()
@@ -1463,32 +1480,38 @@ mod tests {
         let data = vec![b'x'; BLOCK + 3];
         let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
         let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
-        let source_inode = store
+        let source = store
             .state
             .lock()
             .unwrap()
             .directory
             .open(oid, false, data.len() as u64)
-            .unwrap()
-            .metadata()
-            .unwrap()
-            .ino();
+            .unwrap();
+        let source_inode = source.metadata().unwrap().ino();
+        let parent = File::open(directory.path()).unwrap();
+        let (_, supports_clone) = open_copy(&parent, c"probe", Some(&source)).unwrap();
         let first = original
             .copy_up(&directory.path().join("first"), original.len())
             .unwrap();
         first.write_all_at(b"y", 0).unwrap();
+        let retained = data.len() - 1;
         let second = original
-            .copy_up(&directory.path().join("second"), original.len())
+            .copy_up(&directory.path().join("second"), retained as u64)
             .unwrap();
         assert_ne!(first.metadata().unwrap().ino(), source_inode);
         assert_ne!(
             second.metadata().unwrap().ino(),
             first.metadata().unwrap().ino()
         );
-        let mut bytes = vec![0; data.len()];
+        assert_eq!(second.metadata().unwrap().len(), retained as u64);
+        let mut bytes = vec![0; retained];
         second.read_exact_at(&mut bytes, 0).unwrap();
-        assert_eq!(bytes, data);
+        assert_eq!(bytes, data[..retained]);
         assert_eq!(original.read_all().unwrap(), data);
+        assert_eq!(
+            store.state.lock().unwrap().cloned_copies,
+            2 * u64::from(supports_clone)
+        );
         assert_eq!(store.disk_metrics(), (data.len() as u64, 1));
     }
 
@@ -1508,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_up_rejects_corrupted_source_and_cleans_up() {
+    fn copy_up_leaves_block_checks_with_the_immutable_source() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let data = vec![b'x'; BLOCK + 3];
@@ -1516,8 +1539,12 @@ mod tests {
         let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
         original.corrupt_for_test().unwrap();
         let destination = directory.path().join("mutable");
-        assert!(original.copy_up(&destination, original.len()).is_err());
-        assert!(!destination.exists());
+        let private = original.copy_up(&destination, original.len()).unwrap();
+        private.write_all_at(b"y", 1).unwrap();
+        let mut head = [0; 3];
+        private.read_exact_at(&mut head, 0).unwrap();
+        assert_eq!(&head, b"!yx");
+        assert!(original.read(0, 1).is_err());
         assert!(store.failure().is_some());
     }
     #[test]
@@ -2091,7 +2118,11 @@ mod tests {
         let mut another_decoder = store.clone();
         let last_decoder = store.clone();
         let _active: Vec<_> = (2..HOT_BLOBS)
-            .map(|_| store.reserve_pack_decode().unwrap())
+            .map(|_| {
+                store
+                    .reserve_pack_decode(crate::object::check_transfer)
+                    .unwrap()
+            })
             .collect();
         let writes = store.state.lock().unwrap().directory.writes.clone();
         let first = AtomicBool::new(true);
@@ -2109,7 +2140,9 @@ mod tests {
             if spill_started.is_ok() {
                 let bytes = received.clone();
                 scope.spawn(move || {
-                    let _decode = decoder.reserve_pack_decode().unwrap();
+                    let _decode = decoder
+                        .reserve_pack_decode(crate::object::check_transfer)
+                        .unwrap();
                     decoder
                         .insert_verified_bytes(received_oid, bytes, true, || false, || {})
                         .unwrap();
@@ -2143,7 +2176,9 @@ mod tests {
             });
             let second_ready = if streamed.is_some() {
                 scope.spawn(move || {
-                    let _decode = another_decoder.reserve_pack_decode().unwrap();
+                    let _decode = another_decoder
+                        .reserve_pack_decode(crate::object::check_transfer)
+                        .unwrap();
                     let bytes = vec![HOT_BLOBS as u8 + 2; BLOCK + 1];
                     let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
                     another_decoder
@@ -2176,7 +2211,9 @@ mod tests {
             let waits_before_decoding = if second_ready {
                 scope.spawn(move || {
                     started.send(()).unwrap();
-                    let _decode = last_decoder.reserve_pack_decode().unwrap();
+                    let _decode = last_decoder
+                        .reserve_pack_decode(crate::object::check_transfer)
+                        .unwrap();
                     reserved.send(()).unwrap();
                 });
                 wait_for_start.recv_timeout(Duration::from_secs(3)).is_ok()

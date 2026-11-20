@@ -118,6 +118,11 @@ impl Demand {
         self.0.required.load(Ordering::Relaxed)
     }
 
+    fn served_reader(&self, oid: Oid, cache: &RawBlobs) -> bool {
+        // A reader can use an admitted forecast without joining its flight.
+        (self.required() && self.ready()) || cache.was_read(oid)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn notify_when_ready(&self, notify: &Arc<tokio::sync::Notify>) {
         let mut state = self.0.state.lock().unwrap();
@@ -857,6 +862,12 @@ impl Shared {
         if let Some(index) = lane {
             queue.busy[index] = false;
         }
+        let required = !work.speculative
+            || result.is_err()
+                && work
+                    .items
+                    .iter()
+                    .any(|item| item.demand.served_reader(item.oid, scratch));
         // Retire a speculative success from the queue once its verified blob
         // is visible in the raw store. A foreground waiter still holds a clone.
         work.items.retain(|item| {
@@ -874,7 +885,7 @@ impl Shared {
                 payload.map(Ok)
             }
             Err(error)
-                if work.speculative
+                if !required
                     && !self.stop.load(Ordering::Relaxed)
                     && queue.failure.is_none()
                     && !object::is_cancelled(&error) =>
@@ -886,7 +897,7 @@ impl Shared {
                 return;
             }
             Err(error) => {
-                if !work.speculative && !object::is_cancelled(&error) {
+                if required && !object::is_cancelled(&error) {
                     queue.failure.get_or_insert_with(|| format!("{error:#}"));
                 }
                 Some(Err(error))
@@ -900,6 +911,31 @@ impl Shared {
             }
         }
         self.work.notify_all();
+    }
+
+    fn report_http2_failure(
+        self: &Arc<Self>,
+        work: &Work,
+        cache: &RawBlobs,
+    ) -> crate::http2::ReportFailure {
+        let forecast = work.speculative.then(|| {
+            work.items
+                .iter()
+                .map(|item| (item.oid, item.demand.clone()))
+                .collect::<Vec<_>>()
+        });
+        let shared = self.clone();
+        let cache = cache.clone();
+        Arc::new(move |error| {
+            let mut queue = shared.queue.lock().unwrap();
+            if forecast.as_ref().is_none_or(|items| {
+                items
+                    .iter()
+                    .any(|(oid, demand)| demand.served_reader(*oid, &cache))
+            }) {
+                queue.failure.get_or_insert_with(|| format!("{error:#}"));
+            }
+        })
     }
 
     fn run_http2(
@@ -1000,26 +1036,12 @@ impl Shared {
                             token = token
                                 .checked_add(1)
                                 .context("Git HTTP/2 request ID overflow")?;
-                            let report_failure: Option<crate::http2::ReportFailure> = if speculative
-                            {
-                                None
-                            } else {
-                                let shared = self.clone();
-                                Some(Arc::new(move |error| {
-                                    shared
-                                        .queue
-                                        .lock()
-                                        .unwrap()
-                                        .failure
-                                        .get_or_insert_with(|| format!("{error:#}"));
-                                }))
-                            };
                             client.start(
                                 token,
                                 &oids,
                                 self.response(&work, &oids, scratch),
                                 decoder_wake,
-                                report_failure,
+                                Some(self.report_http2_failure(&work, scratch)),
                             )
                         }
                     };
@@ -1338,6 +1360,54 @@ mod tests {
         assert_eq!(queue.waiting[0].oid, used);
         assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
         assert!(!demand.ready());
+    }
+
+    #[test]
+    fn failed_prefetch_reports_pack_errors_after_a_real_read() {
+        for joins_request in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut scratch = RawBlobs::new(directory.path()).unwrap();
+            let shared = Arc::<Shared>::default();
+            let data = vec![b'x'; crate::raw_blob::BLOCK + 1];
+            let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
+            let work = {
+                let mut queue = shared.queue.lock().unwrap();
+                let item = queue.insert(oid);
+                queue.ahead.push_back(item);
+                let work = Work::take(&mut queue.ahead, true).unwrap();
+                if joins_request {
+                    queue.foreground(oid);
+                }
+                work
+            };
+            let report = shared.report_http2_failure(&work, &scratch);
+            scratch.insert_fetched(oid, data.len(), &data[..]).unwrap();
+            if joins_request {
+                shared.complete_object(oid, &work.items[0].demand, true, Acquired::Stored);
+            } else {
+                let (blob, first) = scratch.for_read(oid).unwrap().unwrap();
+                assert!(first);
+                assert_eq!(blob.read(0, 1).unwrap(), b"x");
+            }
+            let error = anyhow::anyhow!("Git pack checksum mismatch");
+            report(&error);
+            assert_eq!(
+                shared.queue.lock().unwrap().failure.take().as_deref(),
+                Some("Git pack checksum mismatch")
+            );
+            shared.complete_object(oid, &work.items[0].demand, true, Acquired::Stored);
+            shared.finish(
+                work,
+                Err(error),
+                Instant::now(),
+                None,
+                &scratch,
+                &Git::capture(directory.path()).unwrap(),
+            );
+            let queue = shared.queue.lock().unwrap();
+            assert_eq!(queue.failure.as_deref(), Some("Git pack checksum mismatch"));
+            assert!(queue.waiting.is_empty());
+        }
     }
 
     #[test]

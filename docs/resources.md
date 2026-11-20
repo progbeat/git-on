@@ -73,12 +73,11 @@ execution tree. Lazy FUSE reads retain the invocation-owned verified raw store.
 On native mounts, metadata and namespace changes preserve the source OID.
 Writable opens, empty writes and unchanged-size truncation leave the source
 payload untouched. The first content change installs a private file after
-the change succeeds. Copy-up authenticates the Git bytes it carries forward
-using a filesystem clone when available or copying from checked buffers.
-Truncating to zero starts empty.
-All handles of the inode then see its private data through ordinary I/O.
-Eligible Linux FUSE opens can use passthrough after copy-up. Source-block
-authentication continues to apply to the immutable cache entry.
+the change succeeds. Copy-up uses a filesystem clone when available and copies
+the retained bytes otherwise. Truncating to zero starts empty. All handles of
+the inode then see its private data through ordinary I/O. Eligible Linux FUSE
+opens can use passthrough after copy-up. Block authentication applies when
+reading the immutable cache entry.
 
 Unlink preserves open or looked-up inodes until their last reference is
 released. The immutable source remains reusable from the cache for the

@@ -129,6 +129,7 @@ enum Body {
 
 struct Decoder {
     input: Option<SyncSender<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
     buffered: Arc<AtomicUsize>,
     transport: Arc<Mutex<Option<Result<()>>>>,
     report_failure: Option<ReportFailure>,
@@ -147,6 +148,8 @@ impl Decoder {
         let (input, chunks) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CHUNKS);
         let (complete, result) = mpsc::channel();
         let buffered = Arc::new(AtomicUsize::new(0));
+        let decoder_stop = Arc::new(AtomicBool::new(false));
+        pack.set_stop(Some(decoder_stop.clone()));
         let transport = Arc::new(Mutex::new(None::<Result<()>>));
         let pending = buffered.clone();
         let outcome = transport.clone();
@@ -177,6 +180,7 @@ impl Decoder {
             })?;
         Ok(Self {
             input: Some(input),
+            stop: decoder_stop,
             buffered,
             transport,
             report_failure,
@@ -232,11 +236,16 @@ impl Decoder {
             }
         }
     }
+
+    fn cancel(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        drop(self.input.take());
+    }
 }
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        drop(self.input.take());
+        self.cancel();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -323,6 +332,19 @@ pub(crate) struct Client {
     active: HashMap<usize, Easy2Handle<Response>>,
     decoding: HashMap<usize, Decoder>,
     stop: Arc<AtomicBool>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        for handle in self.active.values_mut() {
+            if let Body::Reply(decoder) = &mut handle.get_mut().body {
+                decoder.cancel();
+            }
+        }
+        for decoder in self.decoding.values_mut() {
+            decoder.cancel();
+        }
+    }
 }
 
 impl Client {
@@ -710,6 +732,39 @@ mod tests {
         assert!(result.as_ref().is_err_and(crate::object::is_cancelled));
         drop(decoder);
         assert_eq!(reported.try_recv().unwrap(), "required transfer was reset");
+    }
+
+    #[test]
+    fn dropping_a_decoder_releases_its_wait_for_a_pack_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let occupied: Vec<_> = (0..8)
+            .map(|_| scratch.reserve_pack_decode(check_transfer).unwrap())
+            .collect();
+        let pack = pack_stream::Response::new(scratch, vec![], Box::new(|_| unreachable!()));
+        let (_read, wake) = UnixStream::pair().unwrap();
+        let mut decoder =
+            Decoder::start(Box::new(pack), Arc::default(), Arc::new(wake), None).unwrap();
+        // A pack header and the entry header for a 65537-byte blob.
+        decoder
+            .feed(b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20")
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while decoder.buffered.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        let entered = decoder.buffered.load(Ordering::Acquire) == 0;
+        let (finished, wait_for_finish) = mpsc::channel();
+        let join = thread::spawn(move || {
+            drop(decoder);
+            finished.send(()).unwrap();
+        });
+        let cancelled = wait_for_finish.recv_timeout(Duration::from_secs(1));
+        drop(occupied);
+        join.join().unwrap();
+        assert!(entered, "decoder did not start consuming the pack");
+        cancelled.expect("HTTP/2 decoder shutdown waited for a different stream's buffer");
     }
 
     #[test]

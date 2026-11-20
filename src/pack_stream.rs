@@ -4,7 +4,13 @@ use anyhow::{bail, ensure, Result};
 use flate2::{Decompress, FlushDecompress, Status};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 const MEMORY_PACK: usize = 1024 * 1024;
 const TRAILER: usize = 20;
@@ -65,6 +71,7 @@ impl Response {
         Self {
             pack: Pack {
                 scratch,
+                stop: None,
                 wants,
                 publish,
                 bytes: 0,
@@ -88,6 +95,10 @@ impl Response {
         }
     }
 
+    pub(crate) fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
+        self.pack.stop = stop;
+    }
+
     fn done(&self) -> bool {
         matches!(self.phase, Phase::Done)
     }
@@ -97,7 +108,7 @@ impl Response {
     fn feed(&mut self, mut input: &[u8]) -> Result<usize> {
         let len = input.len();
         while !input.is_empty() && !self.done() {
-            object::check_transfer()?;
+            self.pack.check_transfer()?;
             if self.remaining == 0 {
                 let count = (4 - self.header_len).min(input.len());
                 let (part, rest) = input.split_at(count);
@@ -241,6 +252,7 @@ pub(crate) fn index(odb: &git2::Odb<'_>, pack: &Spool) -> Result<()> {
 
 struct Pack {
     scratch: RawBlobs,
+    stop: Option<Arc<AtomicBool>>,
     wants: Vec<Oid>,
     publish: Publish,
     bytes: u64,
@@ -264,6 +276,17 @@ struct Entry {
 }
 
 impl Pack {
+    fn check_transfer(&self) -> Result<()> {
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return Err(object::OperationCancelled.into());
+        }
+        object::check_transfer()
+    }
+
     fn spool_pack(&mut self) -> Result<()> {
         if self.spool.is_none() {
             let file = self.scratch.scratch_file()?;
@@ -327,7 +350,7 @@ impl Pack {
         };
         let mut output = [0; 32768];
         while self.entries < count {
-            object::check_transfer()?;
+            self.check_transfer()?;
             if self.entry.is_none() {
                 let Some((kind, size, length)) = entry_header(&self.compressed[self.position..])?
                 else {
@@ -337,7 +360,7 @@ impl Pack {
                     return self.use_fallback();
                 };
                 let decode = (kind == ObjectType::Blob && size > crate::raw_blob::BLOCK)
-                    .then(|| self.scratch.reserve_pack_decode())
+                    .then(|| self.scratch.reserve_pack_decode(|| self.check_transfer()))
                     .transpose()?;
                 self.position += length;
                 self.entry = Some(Entry {

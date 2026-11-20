@@ -252,8 +252,8 @@ and complete in-memory copies of the selected tree.
    Active reads and unavoidable object decoding are accounted for separately.
 7. Account for the block LRU, hot whole blobs, active operations and metadata
    separately. Keep prepared Git objects immutable and create private backing
-   on the first content change. Verify the source bytes carried into that file.
-   Subsequent I/O on the private file follows ordinary writable-file semantics.
+   on the first content change. Reading an unchanged Git object verifies its
+   bytes. Copy-up and I/O on the private file use ordinary filesystem operations.
    If the same command can finish with two checked-out copies of the selected
    revision on disk, Git-on must be able to run it too.
 8. Failures discovered in objects reached on demand must be reported through

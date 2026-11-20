@@ -1169,24 +1169,27 @@ impl Overlay {
         Ok(())
     }
     fn refresh_backing_attr(&mut self, ino: u64) -> FsResult<()> {
-        {
-            if self.node(ino)?.external_io {
-                let metadata = self.disk_file(ino)?.metadata().map_err(errno)?;
-                let node = self.node_mut(ino)?;
-                node.attr.size = metadata.len();
-                node.attr.blocks = metadata.blocks();
-                node.attr.atime = metadata.accessed().map_err(errno)?;
-                node.attr.mtime = metadata.modified().map_err(errno)?;
-                let backing_ctime = SystemTime::UNIX_EPOCH
-                    .checked_add(Duration::new(
-                        metadata.ctime().max(0) as u64,
-                        metadata.ctime_nsec() as u32,
-                    ))
-                    .ok_or(libc::EOVERFLOW)?;
-                // The numeric backing path does not change for overlay links
-                // and renames. Preserve their later logical namespace changes.
-                node.attr.ctime = node.attr.ctime.max(backing_ctime);
+        let node = self.node(ino)?;
+        if node.external_io {
+            let metadata = match &node.file {
+                Some(file) => file.metadata(),
+                None => self.disk_file(ino)?.metadata(),
             }
+            .map_err(errno)?;
+            let node = self.node_mut(ino)?;
+            node.attr.size = metadata.len();
+            node.attr.blocks = metadata.blocks();
+            node.attr.atime = metadata.accessed().map_err(errno)?;
+            node.attr.mtime = metadata.modified().map_err(errno)?;
+            let backing_ctime = SystemTime::UNIX_EPOCH
+                .checked_add(Duration::new(
+                    metadata.ctime().max(0) as u64,
+                    metadata.ctime_nsec() as u32,
+                ))
+                .ok_or(libc::EOVERFLOW)?;
+            // The numeric backing path does not change for overlay links
+            // and renames. Preserve their later logical namespace changes.
+            node.attr.ctime = node.attr.ctime.max(backing_ctime);
         }
         Ok(())
     }
@@ -3189,6 +3192,36 @@ mod tests {
         assert_eq!(overlay.node(ino).unwrap().attr.size, 3);
         assert_eq!(overlay.read_data(ino, handle, 0, 100).unwrap(), [0; 3]);
         assert_eq!(overlay.node(ino).unwrap().attr.perm, 0o751);
+    }
+
+    #[test]
+    fn passthrough_metadata_uses_the_open_copy_up_file() {
+        if !crate::raw_blob::under_descriptor_limit(
+            "filesystem::tests::passthrough_metadata_uses_the_open_copy_up_file",
+        ) {
+            return;
+        }
+        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
+        let ino = overlay.ensure(Path::new("tracked.tmp")).unwrap();
+        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
+        overlay
+            .write_data(ino, handle, 0, b"private", 0, 0)
+            .unwrap();
+        let node = overlay.node_mut(ino).unwrap();
+        node.external_io = true;
+        node.file.as_ref().unwrap().write_at(b"x", 4096).unwrap();
+        let mut fillers = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => fillers.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let attr = overlay.attributes(ino, Some(handle)).unwrap();
+        assert_eq!(attr.size, 4097);
     }
 
     #[test]
