@@ -1,29 +1,7 @@
-# 1.5.1
+# 1.5.2
 <!-- Bump: patch -->
 
-- Reuse HTTP(S) Git connections for lazy reads from an interactive
-  `git on` command.
-- Overlap exact directory-tree and file-size requests on FUSE and NFS over
-  independent HTTP(S) connections.
-- Expand the HTTPS connection pool on slower sources and batch overlapping
-  requests for objects the command has already accessed.
-- Allow more independent requests on NFS mounts with parallel HTTP(S) reads
-  within the existing per-session replay memory limit.
-- Let short NFS attribute and lookup calls proceed while another slot waits
-  for a Git object, including calls under a different UID in the same session.
-- Multiplex Git object fetches on one HTTP/2 connection where the HTTPS
-  source and caller configuration support it.
-- Reuse authenticated channels during startup for exact object IDs and
-  unambiguous remote branches.
-- Preserve native Git selection for force-prefixed fetch refspecs.
-- Wake promptly when a native Git subprocess exits on macOS, reducing polling
-  delays during snapshot preparation and pack decoding.
-- Open spare SSH channels while the initial one negotiates Git and during
-  slow root fetches. Let ready channels serve queued reads during setup.
-- Resolve an unambiguous SSH branch while object channels open, allowing a
-  ready channel to fetch the commit while another waits for its ref reply.
-- Prefetch upcoming blobs from already opened directories on both transports.
-  Grow the fetch batch after confirmed reads, with earlier expansion when
-  overlapping reads already wait on a slow source.
-- Decode Git packs as they arrive and make verified objects readable before
-  the rest of the pack finishes downloading.
+- Use the operating system's libcurl for HTTPS on macOS and Linux. This reduces
+  the download size and lets the platform supply updates for its TLS stack.
+- Linux binaries require `libcurl.so.4` from the distribution. On Ubuntu the
+  `curl` package installs it. macOS supplies libcurl with the system.

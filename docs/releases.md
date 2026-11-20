@@ -168,4 +168,6 @@ cargo install --path . --locked
 
 Mac builds use the operating system's NFS client for native mounts on macOS 26
 and later. They also support explicit-all materialization on macOS 13 and later.
-Linux uses registry fuser 0.18.
+Linux uses registry fuser 0.18. Linux builds need a libcurl development
+package such as `libcurl4-openssl-dev` on Ubuntu. macOS builds use libcurl from
+the system SDK.

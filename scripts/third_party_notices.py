@@ -25,8 +25,7 @@ def collect(metadata):
         paths={f for f in root.iterdir() if f.is_file() and f.name.lower().startswith(('license','copying','copyright','notice'))}
         if p['license_file']:paths.add(root/p['license_file'])
         bundled={'libgit2-sys':['libgit2/COPYING','libgit2/deps/*/LICENSE*','libgit2/deps/*/COPYING*'],
-                 'libz-sys':['src/zlib/LICENSE'], 'libssh2-sys':['libssh2/COPYING'], 'curl-sys':['curl/COPYING'],
-                 'libnghttp2-sys':['nghttp2/COPYING'], 'openssl-src':['openssl/LICENSE.txt']}
+                 'libz-sys':['src/zlib/LICENSE'], 'libssh2-sys':['libssh2/COPYING']}
         for pattern in bundled.get(p['name'],[]):paths.update(root.glob(pattern))
         if not paths:raise ValueError('missing license text: '+p['name'])
         sections.append('\n## '+p['name']+' '+p['version']+'\nDeclared license: '+str(p['license'])+'\n')
