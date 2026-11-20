@@ -75,6 +75,15 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
     let oid = repo.blob(&vec![b'v'; 128 * 1024]).unwrap();
     let mut builder = repo.treebuilder(None).unwrap();
     builder.insert("file", oid, 0o100644).unwrap();
+    let fillers: Vec<_> = (0..9)
+        .map(|value| {
+            let filler = repo.blob(&vec![value; 64 * 1024 + 1]).unwrap();
+            builder
+                .insert(format!("filler-{value}"), filler, 0o100644)
+                .unwrap();
+            filler
+        })
+        .collect();
     let tree = builder.write().unwrap();
     let sig = Signature::now("Test", "test@example.invalid").unwrap();
     repo.commit(
@@ -90,6 +99,10 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
         let snap = load(temp.path(), "HEAD", false).unwrap();
         let entry = snap.entry(Path::new("file")).unwrap().unwrap();
         let reader = retained_reader.then(|| snap.open(entry.oid).unwrap());
+        assert_eq!(snap.read(oid, 0, 1).unwrap(), b"v");
+        for (value, filler) in fillers.iter().enumerate() {
+            assert_eq!(snap.read(*filler, 0, 1).unwrap(), [value as u8]);
+        }
         let store = std::fs::read_dir(snap.git_dir.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().path())

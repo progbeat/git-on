@@ -45,10 +45,8 @@ object and root tree before mounting. Each subsequent missing tree or blob is
 explicitly fetched by OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
 Git also receives `GIT_NO_LAZY_FETCH=1`. Never request `blob:none`, perform a full
 checkout or recursively walk unvisited trees for readonly operations. Subtree
-selection reads only ancestor trees. The first destructive source operation in
-`all` indexes original inode ownership across tree metadata, including unopened
-same-OID paths, without loading their blob contents. Tree demands are batched by
-depth; ordinary reads, writable opens and metadata changes do not build that index. Packs may contain necessary tag/commit ancestry or delta bases;
+selection reads only ancestor trees. Writes in `all` prepare private copies of
+the affected files. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
@@ -132,10 +130,10 @@ The HTTPS and SSH receivers share the same incremental Git framing and pack
 decoder. It inflates ordinary entries in memory and verifies the canonical Git
 OID against the requested OIDs before notifying a waiting read. It can publish
 a verified object while the rest of its pack is still arriving. The receiver
-also verifies the complete pack's checksum and framing. Deltas and entries
-or packs larger than the in-memory decoder's working buffers use the existing
-pack decoder. HTTP/2 continues processing other streams while a worker decodes
-the remaining objects in a speculative pack. Blob payloads enter the same
+also verifies the complete pack's checksum and framing. Large compressed packs
+can spill to bounded staging while ordinary entries continue to decode. Delta
+entries use the native pack decoder. HTTPS decodes response bodies off the
+connection driver, with per-stream backpressure. Blob payloads enter the same
 authenticated, run-local store. Unrequested objects in a verified pack remain
 available in compressed form for later demands.
 
@@ -151,7 +149,6 @@ transfers rather than aggregating otherwise readable objects into an oversized
 pack. At most 256 known object IDs from the current directory share one
 native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
 run-local availability and deduplicated before requesting it; all use `tree:0`.
-The same batching applies to metadata required by the FUSE ownership index.
 All paths request only known objects. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
@@ -216,54 +213,25 @@ and blobs. Git-on does not read, modify, migrate or delete historical
 object cache; native Git's normal configuration and authentication environment
 still applies. No daemon or background cache service is started.
 
-Received session packs are checksum-verified in bounded private parts. A
-single non-delta object then streams through zlib and canonical OID verification
-into raw storage, without a per-object fetch or decoder client. Complex packs
-use the existing Git/libgit2 import path without another network request.
-Native fetch packs likewise decode requested blobs into raw storage. Unrequested
-blob delta bases remain compressed; a later explicit demand uses that received
-pack without refetching. A pack is released when no unpublished blob still needs
-it. Prepared blobs are not decoded again or recompressed into loose copies; commit/tree/tag metadata remains in the native verification ODB. Pack
-discovery does not enumerate earlier per-object packs. Large non-delta blobs
-stream during import; Git still performs required delta decoding. The snapshot
-reuses its Repository and available objects do not trigger unconditional ODB
-refreshes. Canonical OID verification completes before raw bytes become readable.
-Local loose objects stream in 64 KiB chunks with cancellation checks.
+Reusable HTTPS and SSH sessions decode full non-delta objects as the pack
+arrives. Each blob becomes readable after verification of its canonical Git OID.
+The pack trailer is checked independently. Compressed packs use bounded private
+parts when staging is needed. Delta and other complex packs use the native
+Git/libgit2 path without another network request. Unrequested delta bases stay
+compressed until demanded.
 
-Prepared bytes needed by original source inodes survive close/reopen and
-bounded-memory-cache eviction in private temporary storage. When the last
-original inode becomes writable, its authenticated raw file is transferred into
-the writable backing; when the last original inode is deleted and released, its
-raw file is removed. Unopened same-OID paths and open-unlinked inodes keep their
-original data without repeat decoding. Each spilled original object has one raw file, opened relative to the owned directory with no symlink
-following. Trusted RAM retains its Git OID, length and packed ordered SHA-256
-hashes of 64 KiB blocks, published only after full canonical OID verification.
-Range reads hash the same owned buffer returned to the caller; neither a disk
-index nor a disk authentication-tag file is trusted. Small resident objects
-spill only on eviction. The byte-accounted 16 MiB data LRU retains one entry per
-original OID: a whole small object or one large-file block. Active buffers and
-retained verification/parsed-directory metadata are accounted for separately;
-this is not a fixed total-RAM bound.
+Prepared blobs remain reusable across close/reopen and eviction. Native decoder
+stdout feeds OID verification into a private RAM buffer. A failed consumer
+stops and reaps the decoder, and an unsuccessful native exit fails the import.
+Local loose objects feed the same store in chunks. Libgit2 still decodes
+packed/delta objects as required.
 
-The raw store retains one directory descriptor and one last-read object
-descriptor, independent of object count or open child handles. Each disk-read
-range rechecks file type, owner, link count and trusted length, even on descriptor
-reuse, then authenticates its blocks. A different object replaces the single
-read slot. Active import/spill writes need an additional temporary descriptor.
-Blob readers hold object descriptors rather than cached payloads or open files.
-Compressed transport packs and decoder requests use bounded logical parts capped
-by inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
-Native decoder stdout is consumed directly: each object's canonical OID is
-verified while its bytes enter RAM or its sole raw file. No complete decoded
-output file is retained between decoding and publication. A failed consumer
-stops and reaps the decoder; unsuccessful native exit still fails the import.
-The private files stay outside the execution view and are removed with their
-owning store/readers during invocation cleanup. Retained-raw disk metrics are
-separate from active-reader and bounded payload-memory metrics. No cross-run
-reuse is introduced. libgit2's local
-pack backend still requires object/delta decoding, and its loose reader maps the
-compressed source file. Neither mapped OS page cache nor necessary packed decode
-is reported as a retained application payload cache.
+[Resources and integrity](resources.md) describes the whole-blob and block LRUs,
+disk-block authentication, and private writable copies. Raw disk files are
+opened relative to the owned directory, with type, owner, link count and length
+checks. The store retains one last-read descriptor independent of object count
+or open child handles. Compressed staging, retained raw files and active reader
+buffers are accounted separately and released with the invocation.
 
 Retained libgit2 pack descriptors are capped before threads start: at most 32,
 and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack
@@ -274,8 +242,8 @@ through the lazy operation and runner failure as applicable. No failure reruns
 a started child or silently changes write policy.
 
 Active temporary objects and normal ignored writes have no runner disk quota;
-ordinary system disk limits apply. Payload-cache accounting includes entry
-overhead without an arbitrary object-count cap. Completion removes the temporary remote repository and owned
+ordinary system disk limits apply. The block cache budget includes entry
+overhead. Completion removes the temporary remote repository and owned
 SSH connection. Write required results to explicit external paths. Busy mounts
 preserve recovery state for stale-run cleanup. Explicit-all materialization
 eagerly fetches every selected tree entry; it never bypasses authentication,

@@ -7,7 +7,6 @@ use sha1_checked::{Digest, Sha1};
 use std::io::{BufRead, Write};
 
 const MEMORY_PACK: usize = 1024 * 1024;
-const MEMORY_OBJECT: usize = 1024 * 1024;
 const TRAILER: usize = 20;
 
 pub(crate) struct VerifiedObject {
@@ -27,6 +26,10 @@ impl VerifiedObject {
 
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    pub(crate) fn into_data(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -66,7 +69,8 @@ impl Response {
                 publish,
                 bytes: 0,
                 compressed: Vec::new(),
-                fallback: None,
+                spool: None,
+                native_fallback: false,
                 checksum: Checksum::default(),
                 position: 0,
                 count: None,
@@ -241,7 +245,8 @@ struct Pack {
     publish: Publish,
     bytes: u64,
     compressed: Vec<u8>,
-    fallback: Option<Spool>,
+    spool: Option<Spool>,
+    native_fallback: bool,
     checksum: Checksum,
     position: usize,
     count: Option<usize>,
@@ -258,24 +263,45 @@ struct Entry {
 }
 
 impl Pack {
+    fn spool_pack(&mut self) -> Result<()> {
+        if self.spool.is_none() {
+            let file = self.scratch.scratch_file()?;
+            (&file).write_all(&self.compressed)?;
+            self.spool = Some(file);
+        }
+        Ok(())
+    }
+
     fn use_fallback(&mut self) -> Result<()> {
-        let file = self.scratch.scratch_file()?;
-        (&file).write_all(&self.compressed)?;
+        self.spool_pack()?;
         self.compressed = Vec::new();
         self.entry = None;
-        self.fallback = Some(file);
+        self.native_fallback = true;
         Ok(())
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.native_fallback && self.count == Some(self.entries) {
+            let unread = self.compressed.len() - self.position;
+            ensure!(
+                bytes.len() <= TRAILER - unread,
+                "oversized Git pack trailer"
+            );
+        }
         self.bytes += bytes.len() as u64;
         self.checksum.update(bytes);
-        if self.fallback.is_none() && bytes.len() > MEMORY_PACK - self.compressed.len() {
-            self.use_fallback()?;
+        if self.spool.is_none() && bytes.len() > MEMORY_PACK - self.compressed.len() {
+            self.spool_pack()?;
         }
-        if let Some(file) = &self.fallback {
+        if let Some(file) = &self.spool {
             (&*file).write_all(bytes)?;
-            return Ok(());
+            if self.native_fallback {
+                return Ok(());
+            }
+            // Keep the full compressed pack available for delta fallback.
+            // After spilling the prefix, only unread bytes feed the inflater.
+            self.compressed.drain(..self.position);
+            self.position = 0;
         }
         self.compressed.extend_from_slice(bytes);
         self.inflate_entries()
@@ -306,7 +332,7 @@ impl Pack {
                 else {
                     break;
                 };
-                let Some(kind) = kind.filter(|_| size <= MEMORY_OBJECT) else {
+                let Some(kind) = kind else {
                     return self.use_fallback();
                 };
                 self.position += length;
@@ -333,6 +359,7 @@ impl Pack {
                 used <= entry.size - entry.data.len(),
                 "oversized Git pack object"
             );
+            entry.data.try_reserve(used)?;
             entry.hash.update(&output[..used]);
             entry.data.extend_from_slice(&output[..used]);
             if status == Status::StreamEnd {
@@ -355,12 +382,16 @@ impl Pack {
                 break;
             }
         }
+        ensure!(
+            self.entries < count || self.compressed.len() - self.position <= TRAILER,
+            "oversized Git pack trailer"
+        );
         Ok(())
     }
 
     fn finish(self) -> Result<Received> {
         self.checksum.finish()?;
-        if self.fallback.is_none() {
+        if !self.native_fallback {
             ensure!(
                 self.count == Some(self.entries)
                     && self.compressed.len() == self.position + TRAILER,
@@ -371,7 +402,11 @@ impl Pack {
             }
         }
         Ok(Received {
-            fallback: self.fallback,
+            fallback: if self.native_fallback {
+                self.spool
+            } else {
+                None
+            },
             bytes: self.bytes,
         })
     }
@@ -444,6 +479,72 @@ fn entry_header(bytes: &[u8]) -> Result<Option<(Option<ObjectType>, usize, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_full_object_is_published_before_the_staged_pack_trailer() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let data = vec![3; MEMORY_PACK + 1024];
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let mut packet = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        let mut remaining = data.len() >> 4;
+        let mut byte = 0x30 | (data.len() & 15) as u8;
+        while remaining != 0 {
+            packet.push(byte | 0x80);
+            byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+        }
+        packet.push(byte);
+        let mut encoder = flate2::write::ZlibEncoder::new(packet, flate2::Compression::none());
+        encoder.write_all(&data).unwrap();
+        let packet = encoder.finish().unwrap();
+        assert!(packet.len() > MEMORY_PACK);
+        let trailer = Sha1::digest(&packet);
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published = delivered.clone();
+        let mut response = Response::new(
+            scratch,
+            vec![oid],
+            Box::new(move |object| {
+                assert_eq!(object.oid(), oid);
+                assert_eq!(object.data(), data);
+                published.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+        for chunk in packet.chunks(4096) {
+            response.pack.write(chunk).unwrap();
+        }
+        assert!(delivered.load(std::sync::atomic::Ordering::Relaxed));
+        response.pack.write(&trailer).unwrap();
+        assert!(response.pack.finish().unwrap().fallback.is_none());
+    }
+
+    #[test]
+    fn rejects_excess_pack_trailer_before_finish() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(temporary.path()).unwrap();
+        let wanted = Oid::hash_object(ObjectType::Blob, b"x").unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            b"PACK\0\0\0\x02\0\0\0\x01\x31".to_vec(),
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(b"x").unwrap();
+        let entry = encoder.finish().unwrap();
+        for separate in [false, true] {
+            let mut response = Response::new(scratch.clone(), vec![wanted], Box::new(|_| Ok(())));
+            let extra_trailer = [0; TRAILER + 1];
+            let error = if separate {
+                response.pack.write(&entry).unwrap();
+                response.pack.write(&extra_trailer)
+            } else {
+                response
+                    .pack
+                    .write(&[entry.as_slice(), &extra_trailer].concat())
+            };
+            assert!(error.unwrap_err().to_string().contains("trailer"));
+        }
+    }
 
     #[test]
     fn streaming_fetch_keeps_server_rejection_diagnostic() {

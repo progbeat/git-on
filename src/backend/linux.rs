@@ -105,10 +105,15 @@ impl State {
         if !self.enabled {
             return None;
         }
-        let file = self.core.eligible_backing(ino)?;
         let id = if let Some(id) = self.backings.get(&ino).and_then(Weak::upgrade) {
             id
         } else {
+            // An older ordinary handle or mmap can still use the FUSE page
+            // cache. Start passthrough only after those handles are released.
+            if self.core.has_multiple_open_handles(ino) {
+                return None;
+            }
+            let file = self.core.eligible_backing(ino)?;
             let id = Arc::new(register(file).ok()?);
             self.backings.insert(ino, Arc::downgrade(&id));
             id
@@ -572,7 +577,10 @@ impl Filesystem for Fuse {
         let result = i64::try_from(offset)
             .map_err(|_| libc::EINVAL)
             .and_then(|offset| {
-                self.state()
+                let mut state = self.state();
+                #[cfg(feature = "test-metrics")]
+                state.core.record_fuse_request("write");
+                state
                     .core
                     .write_data(ino.0, fh.0, offset, data, write_flags.bits(), flags.0)
             });

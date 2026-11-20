@@ -250,16 +250,12 @@ and complete in-memory copies of the selected tree.
    decoding the same objects. Decoded memory caching must have an explicit bounded retention
    policy; walking many files must not retain every payload indefinitely.
    Active reads and unavoidable object decoding are accounted for separately.
-7. Do not keep duplicate full source payloads merely to transfer data between
-   snapshot and filesystem layers. Memory use should reflect demanded objects,
-   active operations, and bounded caches, not the whole repository's contents.
-   A writable source inode must not retain an additional complete immutable
-   decoded backing merely for reuse. The last original inode transfers its
-   backing; other original same-OID inodes, including unopened paths and
-   open-unlinked references, retain their prepared bytes without repeated
-   decoding. Ownership accounting may inspect selected-tree metadata when the
-   first destructive source operation requires it; it must not preload blobs
-   or become a launch, read or policy-check prerequisite.
+7. Account for the block LRU, hot whole blobs, active operations and metadata
+   separately. Keep prepared Git objects immutable and create private backing
+   on the first content change. Verify the source bytes carried into that file.
+   Subsequent I/O on the private file follows ordinary writable-file semantics.
+   If the same command can finish with two checked-out copies of the selected
+   revision on disk, Git-on must be able to run it too.
 8. Failures discovered in objects reached on demand must be reported through
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
@@ -369,10 +365,10 @@ not replace them or establish proof for all possible sequences.
 ## Implementation and verification
 
 The implementation uses a shared pinned object store, demand-only metadata/blob
-access, a byte-budgeted content LRU and deferred inode creation. The LRU retains
-at most one entry per original OID across all readers: a complete small object
-or one large-file block. Trusted descriptors/block hashes and parsed directories
-remain in RAM for touched unique objects outside that payload budget. Raw tree
+access and deferred inode creation. A byte-budgeted LRU retains complete small
+objects and individual blocks of spilled files. A separate LRU holds whole hot
+blobs. Trusted descriptors, block hashes and parsed directories remain in RAM
+outside the block budget. Raw tree
 bytes and disk object/name indexes are not retained. The FUSE layer retains no
 duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail

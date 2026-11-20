@@ -1,7 +1,11 @@
-# 1.5.2
+# 1.5.3
 <!-- Bump: patch -->
 
-- Use the system libcurl and its TLS and HTTP/2 libraries on macOS and Linux
-  to reduce the download size.
-- Linux binaries need `libcurl.so.4`. On Ubuntu the `curl` package installs
-  this dependency. Native Git handles HTTPS when libcurl lacks TLS or HTTP/2.
+- Serve recently read large Git blobs from RAM and spill them on eviction.
+  Verify bytes read back from disk by block using BLAKE3.
+- Make verified blobs readable while their Git pack is still arriving in
+  streaming HTTPS and SSH sessions.
+- When a tracked file first changes, verify the Git bytes carried into the
+  private copy. Later reads and writes use ordinary file I/O, including Linux
+  FUSE passthrough on eligible opens. The immutable cached source keeps its
+  block authentication.

@@ -25,6 +25,7 @@ with tempfile.TemporaryDirectory() as scratch:
     git('init','-q')
     (repo/'.gitignore').write_text('out/\n')
     (repo/'program.c').write_text('#include <stdio.h>\nint main(void) { puts("compiled"); return 0; }\n')
+    (repo/'tracked-data').write_bytes(b't' * (128 * 1024))
     git('add','.'); git('commit','-qm','fixture')
     code=r'''
 import mmap,os,subprocess,time
@@ -115,12 +116,20 @@ subprocess.run(['cc','program.c','-o','out/program'],check=True)
 assert subprocess.check_output(['./out/program'])==b'compiled\n'
 print('ordinary child UID/zero capabilities, metadata, reopen, truncate, modes, rename/unlink, mmap and compiled executable verified')
 '''
-    read_fd,write_fd=os.pipe()
-    try:
-        result=subprocess.run([str(args.binary.resolve()),'HEAD','--',os.sys.executable,'-c',code],cwd=repo,env=dict(env,GIT_ON_TEST_METRICS_FD=str(write_fd)),pass_fds=[write_fd],capture_output=True,timeout=90)
-    finally: os.close(write_fd)
-    with os.fdopen(read_fd) as f: metrics=json.load(f)
-    assert result.returncode==0,(result.stdout,result.stderr)
+    def run_mount(code, policy):
+        read_fd,write_fd=os.pipe()
+        try:
+            result=subprocess.run([str(args.binary.resolve()),'HEAD','--write-policy='+policy,'--',os.sys.executable,'-c',code],
+                                  cwd=repo,env=dict(env,GIT_ON_TEST_METRICS_FD=str(write_fd)),pass_fds=[write_fd],
+                                  capture_output=True,timeout=90)
+        finally:
+            os.close(write_fd)
+        with os.fdopen(read_fd) as stream:
+            assert result.returncode==0,(result.stdout,result.stderr)
+            metrics=json.load(stream)
+        return result.stdout,metrics
+
+    output,metrics=run_mount(code,'ignored')
     if args.expect=='enabled':
         assert metrics['passthrough_handles']>0,metrics
         assert metrics['generated_read_callbacks']==0,metrics
@@ -130,4 +139,42 @@ print('ordinary child UID/zero capabilities, metadata, reopen, truncate, modes, 
         assert metrics['generated_write_callbacks']>0,metrics
     assert list(tmp.iterdir())==[],list(tmp.iterdir())
     assert subprocess.check_output(['git','status','--porcelain'],cwd=repo)==b''
-    print(result.stdout.decode(),json.dumps(metrics,sort_keys=True))
+    print(output.decode(),json.dumps(metrics,sort_keys=True))
+
+    copied=r'''
+import os,time
+from pathlib import Path
+atime=946684800000000000
+os.utime('tracked-data',ns=(atime,atime))
+# Copy up through an existing ordinary handle and read before releasing it.
+fd=os.open('tracked-data',os.O_RDWR)
+try:
+    os.ftruncate(fd,65540)
+    assert os.pread(fd,1,65536)==b't'
+finally:
+    os.close(fd)
+before=os.stat('tracked-data')
+backing=Path.cwd().parent / 'backing' / str(before.st_ino)
+assert backing.stat().st_atime_ns==before.st_atime_ns==atime
+time.sleep(.02)
+fd=os.open('tracked-data',os.O_RDWR)
+try:
+    after=os.fstat(fd)
+    assert after.st_atime_ns==before.st_atime_ns==atime
+    assert after.st_mtime_ns==before.st_mtime_ns
+    assert after.st_ctime_ns==before.st_ctime_ns
+    assert os.pwrite(fd,b'copied',65530)==6
+    assert os.pread(fd,12,65528)==b'ttcopiedtttt'
+finally:
+    os.close(fd)
+'''
+    _,metrics=run_mount(copied,'all')
+    if args.expect=='enabled':
+        assert metrics['passthrough_handles']>0,metrics
+        assert metrics['fuse_requests'].get('write',0)==0,metrics
+    else:
+        assert metrics['passthrough_handles']==0,metrics
+        assert metrics['fuse_requests'].get('write',0)>0,metrics
+    assert (repo/'tracked-data').read_bytes()==b't'*(128*1024)
+    assert list(tmp.iterdir())==[],list(tmp.iterdir())
+    print('copied-up tracked file',json.dumps(metrics,sort_keys=True))

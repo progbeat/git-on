@@ -217,19 +217,13 @@ enumerate the source. Lookup loads ancestor directory metadata and the requested
 header, directory listing loads only that directory, and read loads the requested
 content. Write checks load only applicable pinned ignore files.
 
-Decoded content retention is bounded: 8 MiB / 128 blob entries, 4 MiB / 256 tree
-entries, 4,096 blob headers, and 4 MiB / 128 compiled ignore-rule entries. Idle open
-file descriptors do not pin evicted small payloads. Kernel inode references and active
-directory listings retain their necessary metadata until released. libgit2 also has its
-own internal object cache with a default 256 MiB soft target; its default blob caching
-is disabled.
+The 16 MiB block cache holds small blobs and individual blocks of spilled
+files. A separate cache retains the eight most recently used large blobs
+whole in RAM. Git-on can reuse spilled data until the invocation finishes.
+Git encoding can require an entire blob or its delta bases to be decoded.
+See [resources and integrity](resources.md) for cache accounting and copy-up.
 
-Git encoding can require decoding an entire requested blob or its delta bases. Large
-blobs use an immediately unlinked spool in the private backing directory, shared by
-simultaneous readers and removed after their final close; subsequent ranges in that open
-file do not repeatedly decode the object. A first read still needs the memory to decode
-that object. These limits are retained-cache budgets, not a bound on total RSS, kernel
-cache, active metadata, or temporary large-object decoding.
+Applicable ignore rules have a separate cache of 4 MiB / 128 compiled ignore-rule entries.
 
 The [benchmark](../tests/benchmark.md) checks exact output and demand counts on a
 million distinct files using a separate, opt-in instrumented test build. Its counters

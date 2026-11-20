@@ -587,9 +587,7 @@ impl Remote {
         })();
         self.record_result(outcome)
     }
-    /// The caller establishes that every supplied object is already needed:
-    /// eager destinations or metadata proving original source ownership.
-    /// Ordinary lazy lookup/read retains its exact one-demand behavior.
+    /// Batch only object IDs needed for known eager destinations.
     pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         let outcome = (|| {
             let missing = self.missing_demands(repo, oids)?;

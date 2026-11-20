@@ -1176,15 +1176,12 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         size,stat=f.operation(process,'stat large')
         self.assertEqual(size['size'],len(payload)); self.assertEqual(stat['metrics']['blob_loads'],0)
         request_count=len(f.requests)
-        writes=None
         for offset in (0,len(payload)-4096,512,512):
             value,report=f.operation(process,f'range {offset} 4096 large')
             self.assertEqual(bytes(value['bytes']),payload[offset:offset+4096])
             self.assertEqual(report['metrics']['blob_loads'],1)
-            self.assertGreater(report['metrics']['spool_writes'],0)
-            self.assertEqual(report['metrics']['spool_bytes'],len(payload))
-            if writes is None:writes=report['metrics']['spool_writes']
-            self.assertEqual(report['metrics']['spool_writes'],writes)
+            self.assertEqual(report['metrics']['spool_writes'],0)
+            self.assertEqual(report['metrics']['hot_blob_cache_entries'],1)
             self.assertNotIn(f.other,report['objects'])
         self.assertEqual(len(f.requests),request_count)
         _,report=f.operation(process,'release'); self.assertEqual(report['metrics']['active_spool_bytes'],0)
@@ -1353,11 +1350,17 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
     def test_real_mount_caught_verified_raw_storage_failure_is_sticky(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
         f=self.f;blob=f.git('hash-object','-w','--stdin',data=b'v'*(128*1024))
-        tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
+        rows=[f'100644 blob {blob}\tfile\n']
+        for index in range(9):
+            filler=f.git('hash-object','-w','--stdin',data=bytes([index])*(64*1024+1))
+            rows.append(f'100644 blob {filler}\tfiller-{index}\n')
+        tree=f.git('mktree',data=''.join(rows).encode())
         commit=f.git('commit-tree',tree,data=b'raw integrity failure\n');f.git('update-ref','refs/heads/main',commit)
         code=f"""import errno,os
 from pathlib import Path
 os.stat('file')
+for index in range(9):
+ with open(f'filler-{{index}}','rb') as filler:assert filler.read(1)==bytes([index])
 raw=next(Path.cwd().parent.glob('raw-objects-*/{blob}'))
 with raw.open('r+b') as output:output.write(b'!')
 try:
@@ -1400,8 +1403,7 @@ print('caught-EIO-and-returned-success')
         f.env=original
 
     def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
-        # Exceed raw-streaming and native-import thresholds. The range reads
-        # retain one 64 KiB block per object, so this is not an eviction test.
+        # Read a working set that fits the whole-blob cache without spilling.
         f=self.f; ids=[];object_mib=16
         for byte in b'abc':
             with tempfile.TemporaryFile() as output:
@@ -1416,12 +1418,12 @@ print('caught-EIO-and-returned-success')
             value,last=f.operation(process,f'range 13 16 {name}')
             self.assertEqual(bytes(value['bytes']),name.encode()*16)
         self.assertEqual(last['metrics']['remote_fetches'],5)
-        self.assertEqual(last['metrics']['spool_bytes'],3*object_mib*1024*1024)
-        writes=last['metrics']['spool_writes'];self.assertGreater(writes,0)
+        self.assertEqual(last['metrics']['hot_blob_cache_entries'],3)
+        self.assertEqual(last['metrics']['spool_bytes'],0)
         requests=len(f.requests)
         value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
         self.assertEqual(len(f.requests),requests,'available run object fetched again')
-        self.assertEqual(last['metrics']['spool_writes'],writes,'closed blob was written again')
+        self.assertEqual(last['metrics']['spool_writes'],0,'closed hot blob was written')
         f.finish(process)
         # A separate invocation streams a newly fetched loose object again.
         requests=len(f.requests);process=f.probe(url);f.line(process)
@@ -2404,7 +2406,7 @@ os.execv(native,[native,*args])
         print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
-    def test_first_large_loose_range_streams_without_retaining_full_payload(self):
+    def test_first_large_loose_range_stays_hot_without_spilling(self):
         f=self.f
         for mib in (16,64,128):
             with tempfile.TemporaryFile() as output:
@@ -2419,8 +2421,10 @@ os.execv(native,[native,*args])
                 self.assertEqual(bytes(value['bytes']),b'x'*16)
                 repeated,again=f.operation(process,'range 4321 16 large')
                 self.assertEqual(repeated,value)
-                self.assertEqual(report['metrics']['spool_bytes'],mib*1024*1024)
-                self.assertGreater(report['metrics']['spool_writes'],0)
+                if binary==OPTIONS.probe:
+                    self.assertEqual(report['metrics']['spool_bytes'],0)
+                    self.assertEqual(report['metrics']['hot_blob_cache_entries'],1)
+                    self.assertGreaterEqual(report['metrics']['hot_blob_cache_bytes'],mib*1024*1024)
                 self.assertEqual(again['metrics']['spool_writes'],report['metrics']['spool_writes'])
                 status=Path(f'/proc/{process.pid}/status').read_text()
                 peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
@@ -2859,11 +2863,14 @@ signal.pause()
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_review_real_mount_caught_run_odb_fault_forces_runner_failure(self):
         f = self.f
-        # Use a file that spills to the authenticated raw store. An ordinary
-        # small fetch can now complete without any temporary pack file.
+        # Keep the target hot, then force its spill when raw storage is faulty.
         blob = f.git('hash-object', '-w', '--stdin', data=b'x' * (128 * 1024))
         subtree = f.git('mktree', data=f'100644 blob {blob}\tfile\n'.encode())
-        tree = f.git('mktree', data=f'040000 tree {subtree}\tdeep\n'.encode())
+        rows=[f'040000 tree {subtree}\tdeep\n']
+        for index in range(8):
+            filler=f.git('hash-object','-w','--stdin',data=bytes([index])*(64*1024+1))
+            rows.append(f'100644 blob {filler}\tfiller-{index}\n')
+        tree=f.git('mktree',data=''.join(rows).encode())
         commit = f.git('commit-tree', tree, data=b'raw publication fault\n')
         f.git('update-ref', 'refs/heads/main', commit)
         url = f.https()
@@ -2875,13 +2882,16 @@ signal.pause()
                     env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
                 code = "import errno,os; from pathlib import Path\n"
                 if fault == 'raw':
-                    code += (f"raw = next(Path.cwd().parent.glob('raw-objects-*'))\n"
+                    code += ("assert Path('deep/file').read_bytes()[:1] == b'x'\n"
+                             "raw = next(Path.cwd().parent.glob('raw-objects-*'))\n"
                              f"target = raw / {blob!r}\ntarget.mkdir()\n")
+                    operation = " for i in range(8):assert Path(f'filler-{i}').read_bytes()[0] == i\n"
                 else:
                     code += private_storage_fault(fault)
-                code+="try:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
+                    operation = " open('deep/file').read()\n"
+                code+="try:\n"+operation+"except OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
                 if fault == 'raw':
-                    code += "assert target.is_dir()\n"
+                    code += "assert target.is_dir() and not list(target.iterdir())\n"
                 result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=env,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,125,result.stderr)
                 self.assertIn(b'remote object loading failed',result.stderr)

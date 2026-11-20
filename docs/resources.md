@@ -2,29 +2,26 @@
 
 ## Payload cache
 
-Each invocation owns its prepared objects and temporary storage. The decoded
-payload LRU has a 16 MiB budget, charged by allocation capacity plus 512 bytes
-per retained entry. There is at most one retained entry per original Git OID
-across all readers: a complete object up to 64 KiB or one block of a larger
-object. Replacing that block does not invalidate an active read's owned buffer.
-Active read buffers and necessary decoder allocations are accounted separately.
+Each invocation owns its prepared objects and temporary storage. A 16 MiB
+block LRU charges allocation capacity plus 512 bytes per retained entry. It
+holds whole blobs up to 64 KiB and at most one recently read block per spilled
+blob. A separate LRU retains the eight most recently used larger blobs whole.
+A hot read uses the verified buffer without writing a raw file.
 
-Small objects stay in RAM until eviction. Eviction saves their verified decoded
-bytes in private raw storage before releasing them. Large objects stream to one
-raw file per original OID and retain at most their most recently read 64 KiB
-block. Prepared objects remain reusable after close/reopen and cache eviction
-without another fetch or decode. Separate invocations have separate storage.
-If caching an authenticated disk block would require a spill that fails with an
-I/O error, the read returns its checked bytes without admitting that block.
-The unbacked resident remains in RAM; the payload budget is not increased.
+Eviction spills verified data to private backing when needed. One large spill
+can run in the background while readers use verified buffers. Another large
+admission can wait for that spill once the hot cache is full. Prepared objects
+remain reusable across close/reopen and RAM eviction without another fetch or
+decode. If an optional disk-block admission needs a spill that fails, return the
+checked bytes and keep the unbacked resident.
 
 ## Metadata and source decoding
 
-Original OIDs, exact lengths and ordered SHA-256 block hashes remain in trusted
-process memory. Touched unique directories are parsed once into shared immutable
-structures; raw tree bytes are released. Parsed directories, object descriptors,
-header sizes, proofs for partially modified source files and filesystem namespace
-state grow with demand outside the payload LRU. The 16 MiB payload budget is not a total-RSS limit.
+Trusted RAM retains object IDs, exact lengths and a 32-byte BLAKE3 digest per
+64 KiB block of each spilled object. Full-block digests cost 1/2048 of the
+payload size. Touched trees are parsed once into shared immutable structures.
+The whole-blob cache, active reads, full-object decoding buffers, verification
+metadata and namespace state are accounted for outside the 16 MiB block budget.
 
 Libgit2 uses 8 MiB source-pack mapping windows and a 16 MiB soft mapped-byte
 budget. Retained pack descriptors are limited to
@@ -40,12 +37,10 @@ cover enumerated directories and do not preload leaf contents or subtrees.
 
 ## Files and temporary disk space
 
-Raw backing uses one file per prepared original object. Readers share a retained
-raw descriptor rather than keeping an open file for each object. Disk usage
-grows with prepared data, including evicted small objects and streamed large
-objects. Compressed protocol packs and decoder requests can also require transient
-bounded-part staging. Native decoder output streams through OID verification
-into the raw object; it has no complete decoded staging file.
+Each spilled object has one raw file. The store retains one last-read file
+descriptor shared by its readers. Compressed protocol packs and decoder requests
+can need transient bounded staging. Lazy decoding collects bytes in RAM and
+verifies the full Git OID before serving or spilling them.
 Temporary files obey inherited file-size and descriptor
 limits. All invocation-owned storage is released by successful cleanup; failed
 cleanup follows the documented recovery contract.
@@ -71,47 +66,26 @@ native Git through the same OID verifier into their destination, without a
 decoded raw spool. Repeated OIDs reuse verified files or symlink targets in the
 execution tree. Lazy FUSE reads retain the invocation-owned verified raw store.
 
-In FUSE, metadata and namespace changes preserve the source OID without loading
-or copying its payload. Read handles, hard links and unlinked inodes retain
-access to that source. Writable opens, empty writes and unchanged-size truncation
-leave source data intact. The first nonempty write or content-changing truncation
-prepares private data; all handles then observe changes through the same inode.
-Before the first destructive source operation, an ownership index counts original
-file and symlink inodes in the selected tree, including unopened paths. Shared
-trees are counted by multiplicity. This reads tree metadata, never blob contents;
-remote tree demands are batched by depth. It is not startup or readonly work.
+On native mounts, metadata and namespace changes preserve the source OID.
+Writable opens, empty writes and unchanged-size truncation leave the source
+payload untouched. The first content change installs a private file after
+the change succeeds. Copy-up authenticates the Git bytes it carries forward
+using a filesystem clone when available or copying from checked buffers.
+Truncating to zero starts empty.
+All handles of the inode then see its private data through ordinary I/O.
+Eligible Linux FUSE opens can use passthrough after copy-up. Source-block
+authentication continues to apply to the immutable cache entry.
 
-A mutation retains authentication of source bytes not overwritten by the command.
-If another original inode still needs them, its shared raw file stays intact and
-the mutated inode receives its own backing. For the last original inode, the raw
-file is renamed into the writable layer with its existing descriptor and trusted
-block hashes. Ownership commitment performs no additional opening or fallible
-I/O after the rename. There is no payload copy or full-file verification pass
-for this transfer. Resident bytes are written once. Truncation to zero releases
-that inode's original reference without loading its bytes. Unlink releases data
-after the last kernel lookup/open reference; directory-stream metadata alone
-does not retain deleted payloads. Truncation followed by extension exposes zeros.
-
-Reads of remaining source blocks return bytes from authenticated buffers, also
-after close/reopen. Before modifying a protected block, preserve its checked
-bytes in a bounded buffer and update its digest using only bytes actually
-accepted by the write. Short writes retain the proof of their untouched suffix.
-Shrinking a partial block updates the proof from the checked prefix before
-truncation; extension does not restore discarded source bytes. Fully overwritten
-or truncated blocks release their proofs. Source inodes remain ineligible for
-kernel passthrough, which would bypass these checks.
-
-There is at most one decoded backing per live source inode, with unchanged
-same-OID inodes sharing a single backing. No extra immutable full copy is retained
-for an inode that has become writable. Prepared bytes still needed by any
-original inode survive eviction and close/reopen without refetch or repeat
-decoding. Necessary delta bases that are not requested source files remain in
-compressed Git storage rather than becoming additional decoded raw files.
+Unlink preserves open or looked-up inodes until their last reference is
+released. The immutable source remains reusable from the cache for the
+invocation. The disk-space acceptance case allows two checked-out copies of the
+selected revision and enough space for the same command to finish.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that
 is later discarded. Transport/metadata staging and durability work are excluded.
 The separate retained-raw counters describe current storage, not cumulative I/O.
+`hot_blob_spill_bytes` measures the whole buffer held by an unfinished eviction.
 
 ## Integrity
 

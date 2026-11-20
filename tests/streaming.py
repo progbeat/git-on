@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import zlib
 
@@ -95,6 +96,17 @@ def ssh_branch_pack(root):
             git.stdin.close()
 
 
+def pack_entry(kind, data):
+    size = len(data)
+    header = bytearray([(kind << 4) | (size & 15)])
+    size >>= 4
+    while size:
+        header[-1] |= 128
+        header.append(size & 127)
+        size >>= 7
+    return bytes(header) + zlib.compress(data)
+
+
 class SplitPack:
     def __init__(self, root, wanted, contents, base_oid, base_data):
         self.wants = {oid.encode() for oid in wanted}
@@ -102,10 +114,9 @@ class SplitPack:
         self.release = root / 'release-pack'
         # Encode the second blob as a REF_DELTA. Its base is a file in a
         # directory the command will only visit after consuming the forecast.
-        entries = [bytes([0x30 | len(data)]) + zlib.compress(data)
-                   for data in [*contents, base_data]]
+        entries = [pack_entry(3, data) for data in [*contents, base_data]]
         delta = bytes([len(base_data), len(contents[1]), len(contents[1])]) + contents[1]
-        assert len(delta) < 16 and all(len(data) < 16 for data in [*contents, base_data])
+        assert len(delta) < 16
         entries[1] = bytes([0x70 | len(delta)]) + bytes.fromhex(base_oid) + zlib.compress(delta)
         header = b'PACK' + struct.pack('>II', 2, len(entries))
         pack = header + b''.join(entries)
@@ -177,6 +188,8 @@ class StreamingTests(unittest.TestCase):
                 names = ['a', 'b/first', 'b/second', 'd', 'e', 'f', 'g', 'h', 'i',
                          'j', 'k', 'hidden/no']
                 data = [f'payload-{index}\n'.encode() for index, _ in enumerate(names)]
+                data[1] = b'prefetched\n' * (192 * 1024)
+                first_digest = hashlib.sha256(data[1]).hexdigest()
                 oids = [fixture.git('hash-object', '-w', '--stdin', data=payload) for payload in data]
                 b = fixture.git('mktree', data=f'100644 blob {oids[1]}\tfirst\n100644 blob {oids[2]}\tsecond\n'.encode())
                 hidden = fixture.git('mktree', data=f'100644 blob {oids[-1]}\tno\n'.encode())
@@ -216,6 +229,7 @@ class StreamingTests(unittest.TestCase):
                 ready = fixture.root / 'first-read'
                 script = f"""
 from pathlib import Path
+import hashlib
 import os
 import time
 os.listdir('.')
@@ -225,8 +239,8 @@ deadline = time.monotonic() + 12
 while not Path({str(split.started)!r}).exists():
     assert time.monotonic() < deadline, 'prefetch did not start'
     time.sleep(.01)
-assert Path('b/first').read_bytes() == {data[1]!r}
-assert Path('b/first').read_bytes() == {data[1]!r}
+assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
+assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
 Path({str(ready)!r}).touch()
 while not Path({str(split.release)!r}).exists():
     assert time.monotonic() < deadline, 'the test did not release the pack'
@@ -318,6 +332,20 @@ with ThreadPoolExecutor(12) as pool:
         self.addCleanup(fixture.server.shutdown)
         basic = base64.b64encode(b'fixture:example-password').decode()
         proxy = Multiplexer(fixture, backend, 'Basic ' + basic)
+        # An unsolicited leading entry forces native handling even though a
+        # large full entry by itself can now be streamed directly.
+        entries = pack_entry(3, b'extra object') + pack_entry(3, b'x' * size)
+        pack = b'PACK' + struct.pack('>II', 2, 2) + entries
+        packet = pack + hashlib.sha1(pack).digest()
+        release_pack = fixture.root / 'release-pack'
+        release_pack.touch()
+        proxy.split_pack = SimpleNamespace(
+            wants={large.encode()},
+            prefix=b'000dpackfile\n' + f'{len(packet)+5:04x}'.encode() + b'\1' + packet,
+            tail=b'0000',
+            started=fixture.root / 'pack-started',
+            release=release_pack,
+        )
         self.addCleanup(proxy.server_close)
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         self.addCleanup(proxy.shutdown)
@@ -382,7 +410,7 @@ assert Path('b').stat().st_size == {size}
         self.assertEqual(process.returncode, 0, errors)
         self.assertTrue(decoding, 'the speculative object did not use the native decoder')
         self.assertTrue(overlapped, 'the unrelated read waited for the large pack decoder')
-        self.assertEqual(sum(large in request['wants'] for request in fixture.requests), 1)
+        self.assertEqual(sum(large.encode() in wants for _, wants in proxy.records), 1)
 
 
 if __name__ == '__main__':

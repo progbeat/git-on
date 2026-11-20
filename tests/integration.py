@@ -443,9 +443,17 @@ print(size)
 
     source_mutations=('read','write','truncate','read-write','read-truncate','read-rewrite','read-truncate-extend','read-replace')
 
-    def writable_open_fixture(self,mutation='read',source='local'):
+    def add_spill_blobs(self, directory):
+        spill=directory/'spill'
+        spill.mkdir()
+        # Load one more than the hot-cache size so the spill has completed.
+        for index in range(9):
+            (spill/str(index)).write_bytes(bytes([index])*(64*1024+1))
+
+    def writable_open_fixture(self,mutation='read',source='local',spill=False):
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','writable open disk budget')
+        if spill:self.add_spill_blobs(self.repo)
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','writable open disk budget')
         from filesystem_quota import STORAGE_OBSERVATION
         return [sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
 import sys
@@ -465,6 +473,11 @@ expected=b'x'*(6*1024*1024)
 if mutation!='read':
  fd=os.open(source,os.O_RDWR)
  if mutation.startswith('read-'):assert os.pread(fd,1,0)==b'x'
+ if Path('spill').is_dir():
+  for index in range(9):
+   with open(Path('spill')/str(index),'rb') as other:assert other.read(1)==bytes([index])
+  if root!=Path.cwd():
+   assert any(raw.stat().st_size==len(expected) for raw in root.glob('raw-objects-*/*'))
  if mutation in ('write','read-write'):os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
  elif mutation=='read-rewrite':
   expected=b'y'*len(expected);assert os.pwrite(fd,expected,0)==len(expected)
@@ -476,7 +489,8 @@ if mutation!='read':
  else:os.ftruncate(fd,1024);expected=expected[:1024]
  if fd is not None:os.close(fd)
 assert source.read_bytes()==expected
-assert allocated()<9*1024*1024,('content mutation disk allocation',allocated())
+budget=14 if Path('spill').is_dir() else 9
+assert allocated()<budget*1024*1024,('content mutation disk allocation',allocated())
 print('writable lifecycle verified')
 ''',source,mutation]
 
@@ -496,14 +510,11 @@ print('writable lifecycle verified')
                 self.assert_no_runtime_files()
 
     @fuse_only
-    def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
+    def test_spilled_copy_up_fits_two_checkouts(self):
         from filesystem_quota import compare_on_tmpfs
-        command=self.writable_open_fixture()
-        # The allocation matrix covers every lifecycle; actual quota adds
-        # capacity failures for partial preservation and complete replacement.
-        for mutation in ('read-write','read-rewrite'):
-            with self.subTest(mutation=mutation):
-                compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
+        command=self.writable_open_fixture(spill=True)
+        compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],'read-write'],
+                         size_mib=14,checkout_copies=2)
         self.assert_no_runtime_files()
 
     def test_remote_mutations_fit_checkout_disk_budget(self):
@@ -589,53 +600,82 @@ print('independent aliases and unlinked reader verified')
                 self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
                 self.assert_no_runtime_files()
 
-    def transfer_fault(self, mode):
+    def unlink_fault(self, variable='GIT_ON_TEST_UNLINK_FAULT'):
         compiler=shutil.which('cc')
         self.assertIsNotNone(compiler,'C compiler is required for filesystem fault injection')
         library=self.root/'transfer-fault.so'
         if not library.is_file():
             subprocess.run([compiler,'-shared','-fPIC','-o',str(library),
                             str(ROOT/'tests/support/transfer_fault.c'),'-ldl'],check=True,capture_output=True)
-        return {'LD_PRELOAD':str(library),'GIT_ON_TEST_TRANSFER_FAULT':mode}
+        return {'LD_PRELOAD':str(library),variable:'1'}
 
     @fuse_only
-    def test_copy_up_authenticates_source_after_transfer_race(self):
+    def test_failed_copy_up_can_retry_after_cleanup_error(self):
+        (self.repo/'large').write_bytes(b'x'*(128*1024))
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','copy-up rollback')
+        env=self.unlink_fault('GIT_ON_TEST_COPY_ROLLBACK_FAULT')
+        command=[sys.executable,'-I','-S','-c',r'''
+import errno,os,resource
+fd=os.open('large',os.O_RDWR)
+assert os.pread(fd,2,0)==b'xx'
+runner=os.getppid()
+limits=resource.prlimit(runner,resource.RLIMIT_FSIZE)
+try:
+ resource.prlimit(runner,resource.RLIMIT_FSIZE,(3,limits[1]))
+ try:os.pwrite(fd,b'y',0)
+ except OSError as error:assert error.errno==errno.EFBIG,error
+ else:raise AssertionError('copy-up unexpectedly succeeded')
+finally:
+ resource.prlimit(runner,resource.RLIMIT_FSIZE,limits)
+assert os.pread(fd,2,0)==b'xx'
+assert os.pwrite(fd,b'z',0)==1
+assert os.pread(fd,2,0)==b'zx'
+os.close(fd)
+''']
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    def test_copy_up_rejects_corrupted_spilled_source_before_writing(self):
         (self.repo/'large').write_bytes(b'x'*(3*65536+17))
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','transfer integrity')
+        self.add_spill_blobs(self.repo)
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','copy-up integrity')
+        oid=git(self.repo,'rev-parse','HEAD:large')
         git(self.repo,'config','uploadpack.allowFilter','true')
         git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
         command=[sys.executable,'-I','-S','-c',r'''
 import errno,os,sys
 from pathlib import Path
 fd=os.open('large',os.O_RDWR)
+assert os.pread(fd,1,0)==b'x'
+root=Path.cwd().parent
+raw=next(root.glob('raw-objects-*'))/sys.argv[1]
+assert not raw.exists()
+for index in range(9):
+ with open(Path('spill')/str(index),'rb') as other:assert other.read(1)==bytes([index])
+with raw.open('r+b',buffering=0) as original:
+ assert os.pwrite(original.fileno(),b'!',2*65536+7)==1
 try:
- if sys.argv[2]=='truncate':os.ftruncate(fd,4096)
- else:os.pwrite(fd,b'y',0)
+ os.pwrite(fd,b'y',0)
+ os.fsync(fd)
 except OSError as error:assert error.errno==errno.EIO,error
-assert Path(sys.argv[1]).exists(),'transfer race was not exercised'
-try:
- data=os.pread(fd,1,(2*65536+7) if sys.argv[2]=='rename' else 7)
- assert data==b'x',('unverified source bytes escaped copy-up',data)
-except OSError as error:assert error.errno==errno.EIO,error
+else:raise AssertionError('copy-up accepted a corrupt source')
+assert not (root/'backing'/str(os.fstat(fd).st_ino)).exists()
 os.close(fd)
-print('checked bytes or EIO')
-''']
-        for mode,remote in [('rename',False),('write',False),('truncate',False),('rename',True)]:
-            with self.subTest(mode=mode,remote=remote):
-                marker=self.root/f'tampered-{mode}-{remote}'
-                env=dict(self.transfer_fault(mode),GIT_ON_TEST_TRANSFER_MARKER=str(marker))
-                source=[self.repo.as_uri()] if remote else []
-                result,_=self.invoke_argv([*source,'HEAD','--write-policy=all','--',*command,str(marker),mode],extra_env=env)
-                self.assertEqual(result.returncode,125 if remote else 0,result.stderr.decode(errors='replace'))
-                if remote:self.assertIn(b'verified source bytes were modified',result.stderr)
-                self.assertEqual(result.stdout,b'checked bytes or EIO\n')
+print('copy-up rejected corrupted source')
+''',oid]
+        for source in ([],[self.repo.as_uri()]):
+            with self.subTest(source=source):
+                result,_=self.invoke_argv([*source,'HEAD','--write-policy=all','--',*command])
+                self.assertEqual(result.returncode,125 if source or OPTIONS.require_nfs else 0,result.stderr)
+                self.assertEqual(result.stdout,b'copy-up rejected corrupted source\n')
                 self.assert_no_runtime_files()
 
     @fuse_only
     def test_unlinked_source_survives_backing_unlink_failure_without_redecode(self):
-        # Inject an OS failure after transferring the raw inode. All later I/O
-        # must keep using that inode, even if the original Git object is gone.
-        env=self.transfer_fault('unlink')
+        # Fail before installing the private backing. The verified cache still
+        # serves the open inode and allows a retry after removing the Git object.
+        env=self.unlink_fault()
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','source transfer failure')
         oid=git(self.repo,'rev-parse','HEAD:large')
@@ -1307,15 +1347,19 @@ assert not Path('out/final-hard').exists()
 
     def test_raw_file_limit_with_default_signal_cleans_mount_and_pin(self):
         (self.repo / 'large-raw').write_bytes(b'x' * (1024 * 1024))
-        git(self.repo, 'add', 'large-raw')
+        self.add_spill_blobs(self.repo)
+        git(self.repo, 'add', 'large-raw', 'spill')
         git(self.repo, 'commit', '--quiet', '-m', 'raw file limit')
         git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
         git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
         code = """
 import errno, sys
+with open('large-raw', 'rb', buffering=0) as source:
+    assert source.read(1) == b'x'
 try:
-    with open('large-raw', 'rb', buffering=0) as source:
-        source.read(1)
+    for index in range(9):
+        with open('spill/%d' % index, 'rb', buffering=0) as source:
+            assert source.read(1) == bytes([index])
 except OSError as error:
     assert error.errno in (errno.EIO, errno.EFBIG), error
     print('handled raw file limit')
@@ -1342,6 +1386,7 @@ raise AssertionError('raw write unexpectedly exceeded the file limit')
         directory = self.repo / 'cache-spill'
         directory.mkdir()
         (directory / 'large').write_bytes(b'x' * (2 * 1024 * 1024))
+        self.add_spill_blobs(directory)
         # 254 complete 64 KiB payloads plus entry charges fill the 16 MiB
         # resident budget and displace the already-backed large-file block.
         for index in range(254):
@@ -1354,6 +1399,9 @@ raise AssertionError('raw write unexpectedly exceeded the file limit')
 import errno, os, resource
 with open('cache-spill/large', 'rb', buffering=0) as large:
     assert large.read(1) == b'x'
+    for index in range(9):
+        with open('cache-spill/spill/%d' % index, 'rb', buffering=0) as filler:
+            assert filler.read(1) == bytes([index])
     for index in range(254):
         with open('cache-spill/f%04d' % index, 'rb', buffering=0) as small:
             assert small.read(4) == index.to_bytes(4, 'little')
@@ -1435,14 +1483,44 @@ os.close(fd)
         self.assert_no_runtime_files()
 
     @fuse_only
+    def test_truncate_spilled_source_copies_only_the_retained_prefix(self):
+        size=2*1024*1024
+        (self.repo/'large').write_bytes(b'x'*size)
+        self.add_spill_blobs(self.repo)
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','shrink spilled source')
+        command=[sys.executable,'-I','-S','-c',r'''
+import os,resource,sys
+from pathlib import Path
+size=int(sys.argv[1])
+fd=os.open('large',os.O_RDWR)
+assert os.pread(fd,1,0)==b'x'
+for index in range(9):
+ with open(Path('spill')/str(index),'rb') as filler:assert filler.read(1)==bytes([index])
+assert any(raw.stat().st_size==size for raw in Path.cwd().parent.glob('raw-objects-*/*'))
+runner=os.getppid()
+limits=resource.prlimit(runner,resource.RLIMIT_FSIZE)
+try:
+ resource.prlimit(runner,resource.RLIMIT_FSIZE,(4096,limits[1]))
+ os.ftruncate(fd,4096)
+finally:
+ resource.prlimit(runner,resource.RLIMIT_FSIZE,limits)
+assert os.fstat(fd).st_size==4096
+assert os.pread(fd,4100,0)==b'x'*4096
+os.close(fd)
+''',str(size)]
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+        self.assert_success(result)
+        self.assert_no_runtime_files()
+
+    @fuse_only
     def test_short_source_write_preserves_unwritten_bytes_after_reopen(self):
         (self.repo/'large').write_bytes(b'x'*(2*65536+17))
         git(self.repo,'add','large');git(self.repo,'commit','-qm','short source write')
         command=[sys.executable,'-I','-S','-c',r'''
-import errno,os,resource
+import os,resource
 from pathlib import Path
 fd=os.open('large',os.O_RDWR)
-# Prepare/adopt before lowering the runner's write limit.
+# Copy up before lowering the runner's write limit.
 assert os.pwrite(fd,b'y',65536)==1
 runner=os.getppid()
 original=resource.prlimit(runner,resource.RLIMIT_FSIZE)
@@ -1458,16 +1536,11 @@ assert os.pwrite(fd,b'abcd',65534)==4
 os.ftruncate(fd,65537);os.ftruncate(fd,65570)
 assert os.pread(fd,40,65532)==b'xxabc'+b'\0'*33
 os.close(fd)
-# A reopened, partially overwritten/truncated source still authenticates the
-# untouched prefix; the overwritten/truncated suffix does not retain payload.
+# Subsequent I/O uses the private file, including bytes carried through copy-up.
 backing=Path.cwd().parent/'backing'/str(Path('large').stat().st_ino)
 with backing.open('r+b',buffering=0) as out:out.seek(10);out.write(b'!')
-fd=os.open('large',os.O_RDONLY)
-try:
- data=os.pread(fd,1,10)
- assert data==b'x',('unchecked prefix after reopen',data)
-except OSError as error:assert error.errno==errno.EIO,error
-os.close(fd)
+with open('large','rb',buffering=0) as reopened:
+ assert os.pread(reopened.fileno(),1,10)==b'!'
 ''']
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
         self.assert_success(result);self.assert_no_runtime_files()

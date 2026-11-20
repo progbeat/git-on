@@ -719,7 +719,7 @@ impl Shared {
                     .expect("known want")
                     .1;
                 let acquired = if object.kind() == git2::ObjectType::Blob {
-                    cache.insert_verified_blob(&object)?;
+                    cache.insert_verified_blob(object)?;
                     if speculative {
                         shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
                     }
@@ -891,6 +891,7 @@ impl Shared {
         git: &Git,
     ) {
         let decoding = AtomicBool::new(true);
+        let decoder_wake = signal.clone();
         thread::scope(|scope| {
             let (defer, fallback) = mpsc::channel::<FallbackPack>();
             let running = &decoding;
@@ -906,12 +907,15 @@ impl Shared {
                     }
                 });
             let outcome = match decoder {
-                Ok(_) => self.drive_http2(&mut client, &mut wake, &defer, scratch, git),
+                Ok(_) => {
+                    self.drive_http2(&mut client, &mut wake, &decoder_wake, &defer, scratch, git)
+                }
                 Err(error) => Err(error).context("start Git pack fallback decoder"),
             };
             decoding.store(false, Ordering::Relaxed);
             drop(defer);
             self.finish_http2(outcome.err().filter(|error| !object::is_cancelled(error)));
+            drop(client);
         });
     }
 
@@ -939,6 +943,7 @@ impl Shared {
         self: &Arc<Self>,
         client: &mut crate::http2::Client,
         wake: &mut UnixStream,
+        decoder_wake: &Arc<UnixStream>,
         defer: &mpsc::Sender<FallbackPack>,
         scratch: &RawBlobs,
         git: &Git,
@@ -975,7 +980,12 @@ impl Shared {
                             token = token
                                 .checked_add(1)
                                 .context("Git HTTP/2 request ID overflow")?;
-                            client.start(token, &oids, self.response(&work, &oids, scratch))
+                            client.start(
+                                token,
+                                &oids,
+                                self.response(&work, &oids, scratch),
+                                decoder_wake,
+                            )
                         }
                     };
                     match submitted {
@@ -1115,7 +1125,7 @@ impl Shared {
     }
 }
 
-fn signal_http2(mut wake: &UnixStream) {
+pub(crate) fn signal_http2(mut wake: &UnixStream) {
     // A full signal socket is already readable.
     let _ = wake.write(&[1]);
 }

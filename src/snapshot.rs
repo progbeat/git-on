@@ -260,6 +260,9 @@ pub struct SnapshotMetrics {
     pub cache_hits: u64,
     pub blob_cache_bytes: usize,
     pub blob_cache_entries: usize,
+    pub hot_blob_cache_bytes: usize,
+    pub hot_blob_cache_entries: usize,
+    pub hot_blob_spill_bytes: usize,
     pub blob_cache_limit: usize,
     pub tree_cache_bytes: usize,
     pub tree_cache_entries: usize,
@@ -308,8 +311,8 @@ impl Drop for ActiveBlob {
         }
     }
 }
-/// A live source-file reader. Large objects decode once into unlinked run-local
-/// storage, reused even after every reader has closed.
+/// A live reader of immutable run-local objects. Closing a reader does not
+/// release the object's verified contents.
 #[derive(Clone)]
 pub struct BlobReader(Arc<ActiveBlob>);
 impl BlobReader {
@@ -328,7 +331,6 @@ struct State {
     headers: HashMap<Oid, u64>,
     readers: Arc<ReaderRegistry>,
     raw_blobs: Option<crate::raw_blob::RawBlobs>,
-    source_counts: Option<HashMap<Oid, u64>>,
     metrics: SnapshotMetrics,
     #[cfg(test)]
     ancestor_tree_lookups: u64,
@@ -347,88 +349,6 @@ impl State {
             .as_ref()
             .map(|remote| &remote.raw_blobs)
             .or(self.raw_blobs.as_ref())
-    }
-    /// Count source inodes, including unopened aliases, without reading file
-    /// headers or payloads. Run only when ownership changes require the counts.
-    /// Propagate tree multiplicities through the DAG; repeated subtrees need no
-    /// repeated traversal or pathname allocation.
-    fn source_count(&mut self, root: Oid, oid: Oid) -> Result<u64> {
-        if self.source_counts.is_none() {
-            // Ownership needs unopened aliases as well. Batch each level of
-            // remote tree metadata with the existing tree:0 filter; no blob
-            // payload is requested and no new server capability is required.
-            if self.remote.is_some() {
-                let mut frontier = vec![root];
-                let mut seen = std::collections::HashSet::from([root]);
-                while !frontier.is_empty() {
-                    let State { repo, remote, .. } = self;
-                    remote.as_mut().unwrap().ensure_batch_in(repo, &frontier)?;
-                    let mut next = Vec::new();
-                    for oid in frontier {
-                        let tree = self.tree(oid)?;
-                        for index in 0..tree.len() {
-                            let (mode, child) =
-                                tree.metadata_at(index).context("source tree entry")?;
-                            if mode == 0o040000 && seen.insert(child) {
-                                next.push(child);
-                            }
-                        }
-                    }
-                    frontier = next;
-                }
-            }
-            let mut seen = std::collections::HashSet::new();
-            let mut pending = vec![(root, false)];
-            let mut order = Vec::new();
-            while let Some((oid, expanded)) = pending.pop() {
-                if expanded {
-                    order.push(oid);
-                } else if seen.insert(oid) {
-                    let tree = self.tree(oid)?;
-                    pending.push((oid, true));
-                    for index in 0..tree.len() {
-                        let (mode, child) = tree.metadata_at(index).context("source tree entry")?;
-                        if mode == 0o040000 {
-                            pending.push((child, false));
-                        }
-                    }
-                }
-            }
-            let mut weights = HashMap::<Oid, u64>::from([(root, 1)]);
-            let mut counts = HashMap::<Oid, u64>::new();
-            for oid in order.into_iter().rev() {
-                let weight = weights.remove(&oid).context("source tree multiplicity")?;
-                let tree = self.tree(oid)?;
-                for index in 0..tree.len() {
-                    let (mode, child) = tree.metadata_at(index).context("source tree entry")?;
-                    let counter = match mode {
-                        0o040000 => weights.entry(child).or_default(),
-                        0o100644 | 0o100755 | 0o120000 => counts.entry(child).or_default(),
-                        _ => continue,
-                    };
-                    *counter = counter.saturating_add(weight);
-                }
-            }
-            self.source_counts = Some(counts);
-        }
-        Ok(self
-            .source_counts
-            .as_ref()
-            .unwrap()
-            .get(&oid)
-            .copied()
-            .unwrap_or(0))
-    }
-    fn consume_source(&mut self, root: Oid, oid: Oid) -> Result<()> {
-        let count = self.source_count(root, oid)?;
-        anyhow::ensure!(count > 0, "source reference accounting");
-        if count == 1 {
-            if let Some(raw) = self.raw_store() {
-                raw.discard(oid)?;
-            }
-        }
-        *self.source_counts.as_mut().unwrap().get_mut(&oid).unwrap() = count - 1;
-        Ok(())
     }
     fn tree(&mut self, oid: Oid) -> Result<Arc<Directory>> {
         if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
@@ -807,7 +727,6 @@ impl Snapshot {
                     headers: HashMap::new(),
                     readers: Arc::new(Mutex::new(HashMap::new())),
                     raw_blobs: None,
-                    source_counts: None,
                     metrics: SnapshotMetrics::default(),
                     #[cfg(test)]
                     ancestor_tree_lookups: 0,
@@ -827,10 +746,12 @@ impl Snapshot {
     pub fn stop_remote_transport(&self) -> Result<()> {
         crate::git::stop_operations();
         let state = self.state()?;
-        if let Some(remote) = &state.remote {
-            remote.stop_transport()?;
-        }
-        Ok(())
+        let transport = state
+            .remote
+            .as_ref()
+            .map_or(Ok(()), |remote| remote.stop_transport());
+        let cache = state.raw_store().map_or(Ok(()), |raw| raw.stop());
+        transport.and(cache)
     }
     pub fn remote_failure(&self) -> Option<String> {
         self.state()
@@ -1147,36 +1068,15 @@ impl Snapshot {
         }
         Ok(size as u64)
     }
-    /// End one original inode's lifetime. An open-unlinked inode retains its
-    /// reference until the kernel releases it. Forgetting a linked cache entry
-    /// does not consume a source reference.
-    pub(crate) fn consume_source(&self, oid: Oid) -> Result<()> {
-        self.state()?.consume_source(self.tree_oid, oid)
-    }
-    pub(crate) fn prepare_source_removal(&self, oid: Oid) -> Result<()> {
-        anyhow::ensure!(
-            self.state()?.source_count(self.tree_oid, oid)? > 0,
-            "source reference accounting"
-        );
-        Ok(())
-    }
-    pub(crate) fn promote_source(
+    pub(crate) fn copy_up(
         &self,
         oid: Oid,
         path: &Path,
-    ) -> Result<crate::raw_blob::PromotedSource> {
-        let mut state = self.state()?;
-        let count = state.source_count(self.tree_oid, oid)?;
-        anyhow::ensure!(count > 0, "source reference accounting");
-        state.prepare_blob(oid)?;
-        let file = state
-            .raw_store()
-            .context("missing source storage")?
-            .promote(oid, path, count == 1)?;
-        // Preparation established this entry; ownership commitment performs
-        // no fallible I/O after the last raw inode has moved.
-        *state.source_counts.as_mut().unwrap().get_mut(&oid).unwrap() = count - 1;
-        Ok(file)
+        retain: Option<u64>,
+    ) -> Result<std::fs::File> {
+        let raw = self.state()?.prepare_blob(oid)?;
+        let size = retain.unwrap_or(raw.len()).min(raw.len());
+        raw.copy_up(path, size)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
@@ -1266,6 +1166,11 @@ impl Snapshot {
             metrics.tree_cache_bytes = bytes;
             metrics.tree_cache_entries = count;
             metrics.verification_metadata_bytes = raw.verification_bytes();
+            (
+                metrics.hot_blob_cache_bytes,
+                metrics.hot_blob_cache_entries,
+                metrics.hot_blob_spill_bytes,
+            ) = raw.hot_metrics();
         }
         // Parsed metadata is invocation-local and retained for touched OIDs;
         // it is not part of the byte-budgeted payload LRU.
@@ -1427,15 +1332,11 @@ mod tests {
         // Native verification only authenticates the owned import buffer.
         // A later disk read must still reject changed bytes against its
         // trusted block digests, even when the original OID was checked in C.
-        let raw = snapshot
-            .state()
-            .unwrap()
-            .raw_blobs
-            .as_ref()
-            .unwrap()
-            .get(oid)
-            .unwrap()
-            .unwrap();
+        let mut state = snapshot.state().unwrap();
+        let store = state.raw_blobs.as_mut().unwrap();
+        store.evict_all_for_test().unwrap();
+        let raw = store.get(oid).unwrap().unwrap();
+        drop(state);
         raw.corrupt_for_test().unwrap();
         assert!(snapshot.read(oid, 0, 1).is_err());
     }
@@ -2094,7 +1995,8 @@ mod tests {
         assert_eq!(snap.read(large, 1000, 5).unwrap(), b"xxxxx");
         assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
         assert!(snap.metrics().blob_cache_bytes <= retained + crate::raw_blob::BLOCK + 512);
-        assert!(snap.open(large).unwrap().0.data.on_disk());
+        assert!(!snap.open(large).unwrap().0.data.on_disk());
+        assert_eq!(snap.metrics().hot_blob_cache_entries, 1);
     }
     #[test]
     fn touched_directories_stay_prepared_without_an_entry_cap() {
@@ -2172,7 +2074,15 @@ mod tests {
             };
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
         }
-        assert!(snap.open(oid).is_err());
+        assert_eq!(snap.open(oid).unwrap().read(0, 1).unwrap(), b"x");
+        assert!(snap
+            .state()
+            .unwrap()
+            .raw_blobs
+            .as_mut()
+            .unwrap()
+            .evict_all_for_test()
+            .is_err());
         let metrics = snap.metrics();
         assert_eq!(metrics.retained_raw_blob_bytes, 0);
         assert_eq!(metrics.spool_bytes, 3);
@@ -2196,7 +2106,16 @@ mod tests {
         }
         assert_eq!(second.read(size as u64 - 2, 100).unwrap(), b"xx");
         assert_eq!(snap.metrics().blob_loads, 1);
-        assert!(snap.metrics().spool_writes > 0);
+        assert_eq!(snap.metrics().spool_bytes, 0);
+        assert_eq!(snap.metrics().active_spool_bytes, 0);
+        snap.state()
+            .unwrap()
+            .raw_blobs
+            .as_mut()
+            .unwrap()
+            .evict_all_for_test()
+            .unwrap();
+        assert_eq!(reader.read(size as u64 - 2, 2).unwrap(), b"xx");
         assert_eq!(snap.metrics().spool_bytes, size as u64);
         assert_eq!(snap.metrics().active_spool_bytes, size as u64);
         assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
@@ -2220,6 +2139,16 @@ mod tests {
             drop(reader);
             assert_eq!(snap.metrics().active_blob_readers, 0);
             assert!(snap.metrics().blob_cache_bytes <= BLOB_CACHE_BYTES);
+            if offset == 0 {
+                assert_eq!(snap.metrics().spool_bytes, 0);
+                snap.state()
+                    .unwrap()
+                    .raw_blobs
+                    .as_mut()
+                    .unwrap()
+                    .evict_all_for_test()
+                    .unwrap();
+            }
             let metrics = snap.metrics();
             assert!(metrics.spool_writes > 0);
             assert_eq!(metrics.spool_bytes, size as u64);
