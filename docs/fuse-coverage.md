@@ -135,7 +135,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | symlink | implemented | P-create | I-links | Real callback creates a symlink; mounted exact target, write-through, dangling link and namespace/policy denial assertions. Embedded NUL is not representable in a well-formed wire pathname. |
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
 | link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. `passthrough_link_reply_refreshes_backing_metadata_without_stat` checks size/blocks/mtime in the LINK reply after bypass writes, before GETATTR or close. |
-| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Mutable handles use ordinary behavior. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
+| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Opened private regular files can use passthrough after copy-up. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
 | read | implemented | P-io, P-bounds, P-partial, P-sparse, P-no-open | I-file, I-large, I-partial, I-readonly | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
 | write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
 | flush | implemented | P-io, P-bounds, P-no-open | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. The kernel may skip close-flush for readonly protected source with NOFLUSH; mutable handles and explicit fsync retain their callbacks. Negotiated readonly no-open uses fh=0 and returns ENOSYS once, allowing the kernel to omit further flush requests. Flush is not a persistence/fsync guarantee. |
@@ -207,9 +207,10 @@ macOS uses the [separate NFSv4.1 protocol adapter](nfs.md). Linux FUSE
 acceptance runs on a host with a real FUSE device.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
-FOPEN_PASSTHROUGH for command-created regular files only, after policy and access
-checks. Create/open handles share one BackingId per inode, retained through
-release. Git-backed and copied-up tracked inodes never qualify. getattr refreshes
+FOPEN_PASSTHROUGH for physically backed regular files, after policy and access
+checks. This includes private copies of tracked files after the ordinary handles
+are released. Create/open handles share one BackingId per inode, retained
+through release. getattr refreshes
 size, blocks and data timestamps from the backing descriptor without replacing
 logical overlay mode, uid, gid or link count. Lack of the kernel capability,
 CAP_SYS_ADMIN or a successful registration retains userspace I/O on this same

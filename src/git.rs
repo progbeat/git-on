@@ -21,7 +21,7 @@ impl Git {
             .current_dir(cwd)
             .args(["config", "--null", "--list", "--includes"])
             .stdin(Stdio::null());
-        let output = run(command, true).map_err(|error| {
+        let output = run_builtin(command).map_err(|error| {
             if error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
@@ -59,7 +59,7 @@ impl Git {
                     .current_dir(cwd)
                     .args(["rev-parse", "--absolute-git-dir"])
                     .stdin(Stdio::null());
-                run(command, true)
+                run_builtin(command)
                     .ok()
                     .filter(|x| x.status.success())
                     .map(|x| {
@@ -158,7 +158,7 @@ impl Git {
             .arg("--exec-path")
             .env_remove("GIT_EXEC_PATH")
             .stdin(Stdio::null());
-        let result = run(command, true)?;
+        let result = run_builtin(command)?;
         Ok(result.status.success()
             && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
@@ -199,7 +199,11 @@ impl Git {
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());
-        let out = run(command, true)?;
+        let out = if local_query(args) {
+            run_builtin(command)
+        } else {
+            run(command, true)
+        }?;
         if !out.status.success() {
             bail!(
                 "Git {} failed: {}",
@@ -277,6 +281,21 @@ impl Git {
         })
     }
 }
+
+fn local_query(args: &[&OsStr]) -> bool {
+    match args {
+        // Resolving an index operand with rev-parse can invoke core.fsmonitor.
+        [operation, option] if *operation == "rev-parse" => matches!(
+            option.as_bytes(),
+            b"--show-prefix" | b"--show-cdup" | b"--local-env-vars"
+        ),
+        // Later options can negate --get-url and turn it into a transport call.
+        [operation, option, separator, _] => {
+            *operation == "ls-remote" && *option == "--get-url" && *separator == "--"
+        }
+        _ => false,
+    }
+}
 trait SplitByte {
     fn split_once_byte(&self, b: u8) -> (&[u8], Option<&[u8]>);
 }
@@ -324,8 +343,8 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
         .map(|_| ())
         .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
 }
-/// Wait for owned transport/verifier groups without trapping cancellation in
-/// blocking pipe reads. Temporary capture files have no application quota.
+/// Wait for owned transport/verifier groups while draining their output and
+/// servicing cancellation.
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
     let managed = crate::terminal_ui::owns_terminal();
     let mut output = run_captured(
@@ -335,6 +354,7 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
         None,
         None,
         false,
+        CaptureMode::MayDetach,
     )?;
     if managed && !capture {
         use std::io::Write;
@@ -346,12 +366,41 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
     }
     Ok(output)
 }
+
+/// Capture a Git builtin that does not invoke caller-configured helpers.
+pub(crate) fn run_builtin(command: Command) -> Result<std::process::Output> {
+    run_captured(command, true, true, None, None, false, CaptureMode::Channel)
+}
+
+pub(crate) fn run_ref_advertisement(mut command: Command) -> Result<std::process::Output> {
+    // The capability check uses the packet trace. Native Git's listing of
+    // every advertised ref has no consumer here.
+    command.stdout(Stdio::null());
+    run_captured(
+        command,
+        false,
+        true,
+        None,
+        None,
+        false,
+        CaptureMode::MayDetach,
+    )
+}
+
 pub(crate) fn run_fetch(
     command: Command,
     input: Option<&mut dyn std::io::Read>,
 ) -> Result<std::process::Output> {
     let progress = crate::terminal_ui::progress_enabled();
-    let mut output = run_captured(command, true, true, None, input, true)?;
+    let mut output = run_captured(
+        command,
+        true,
+        true,
+        None,
+        input,
+        true,
+        CaptureMode::MayDetach,
+    )?;
     if progress {
         output.stderr = crate::terminal_ui::progress_diagnostics(&output.stderr);
     }
@@ -388,7 +437,15 @@ pub(crate) fn run_with_output<T: Send>(
                 failed.store(result.is_err(), Ordering::Release);
                 result
             })?;
-        let result = run_captured(command, false, true, Some(&failed), input, false);
+        let result = run_captured(
+            command,
+            false,
+            true,
+            Some(&failed),
+            input,
+            false,
+            CaptureMode::MayDetach,
+        );
         finished.store(true, Ordering::Release);
         let value = transfer
             .join()
@@ -466,9 +523,9 @@ fn run_captured(
     failed_output: Option<&std::sync::atomic::AtomicBool>,
     input: Option<&mut dyn std::io::Read>,
     progress: bool,
+    mode: CaptureMode,
 ) -> Result<std::process::Output> {
     use std::{
-        io::{Read, Seek},
         os::unix::{io::AsRawFd, process::CommandExt},
         time::Duration,
     };
@@ -484,16 +541,22 @@ fn run_captured(
     let mut input = input
         .map(|source| NativeInput::new(&mut command, source))
         .transpose()?;
-    let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
-    let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
+    let mut stdout = if capture_stdout {
+        let (capture, writer) = NativeCapture::new(mode)?;
+        command.stdout(writer);
+        Some(capture)
+    } else {
+        None
+    };
+    let mut stderr = if capture_stderr {
+        let (capture, writer) = NativeCapture::new(mode)?;
+        command.stderr(writer);
+        Some(capture)
+    } else {
+        None
+    };
     let mut progress = (progress && crate::terminal_ui::progress_enabled())
         .then(crate::terminal_ui::NativeProgress::new);
-    if let Some(stdout) = &stdout {
-        command.stdout(stdout.try_clone()?);
-    }
-    if let Some(stderr) = &stderr {
-        command.stderr(stderr.try_clone()?);
-    }
     let managed = crate::terminal_ui::owns_terminal();
     crate::terminal_ui::configure(&mut command);
     if managed && input.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -529,10 +592,17 @@ fn run_captured(
             return Err(error).context("start native Git operation");
         }
     };
+    drop(command);
     let _operation = crate::terminal_ui::NativeOperation::new(child.id());
     let wakeup = ChildExitWakeup::new(child.id());
-    let outcome = loop {
-        if let (Some(progress), Some(stderr)) = (&mut progress, &stderr) {
+    let outcome = 'wait: loop {
+        for capture in [&mut stdout, &mut stderr].into_iter().flatten() {
+            if let Err(error) = capture.drain(64 * 1024) {
+                break 'wait stop_request_operation(&mut child)
+                    .and(Err(error).context("read native Git output"));
+            }
+        }
+        if let (Some(progress), Some(NativeCapture::File(stderr))) = (&mut progress, &stderr) {
             progress.poll(stderr);
         }
         match crate::terminal_ui::try_wait(&mut child) {
@@ -578,6 +648,10 @@ fn run_captured(
         wakeup.wait(
             Duration::from_millis(10),
             input.as_ref().map(|input| input.pipe.as_raw_fd()),
+            [
+                stdout.as_ref().and_then(NativeCapture::fd),
+                stderr.as_ref().and_then(NativeCapture::fd),
+            ],
         );
     };
     drop(progress);
@@ -594,22 +668,113 @@ fn run_captured(
         // group, so the runner's own signal handler may never receive them.
         cancel_by_signal(signal);
     }
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    if let Some(stdout) = &mut stdout {
-        stdout.rewind()?;
-        stdout.read_to_end(&mut out)?;
-    }
-    if let Some(stderr) = &mut stderr {
-        stderr.rewind()?;
-        stderr.read_to_end(&mut err)?;
-    }
     Ok(std::process::Output {
         status,
-        stdout: out,
-        stderr: err,
+        stdout: stdout
+            .map(NativeCapture::finish)
+            .transpose()?
+            .unwrap_or_default(),
+        stderr: stderr
+            .map(NativeCapture::finish)
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
+
+#[derive(Clone, Copy)]
+enum CaptureMode {
+    Channel,
+    MayDetach,
+}
+
+enum NativeCapture {
+    Channel {
+        pipe: Option<std::os::unix::net::UnixStream>,
+        bytes: Vec<u8>,
+    },
+    File(std::fs::File),
+}
+
+pub(crate) fn capture_file() -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        // Some configured helpers keep writing after Git exits. A memfd
+        // preserves a regular file's lifetime and seeking without disk I/O.
+        let fd = unsafe { libc::memfd_create(c"git-on-output".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd >= 0 {
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+    tempfile::tempfile()
+}
+
+impl NativeCapture {
+    fn new(mode: CaptureMode) -> std::io::Result<(Self, Stdio)> {
+        if matches!(mode, CaptureMode::MayDetach) {
+            // Native Git can leave a configured hook or a persistent SSH
+            // proxy writing to its inherited descriptors after Git exits.
+            // A capture channel would return EPIPE when its reader closes.
+            let file = capture_file()?;
+            let writer = file.try_clone()?.into();
+            return Ok((Self::File(file), writer));
+        }
+        let (pipe, child) = std::os::unix::net::UnixStream::pair()?;
+        pipe.set_nonblocking(true)?;
+        Ok((
+            Self::Channel {
+                pipe: Some(pipe),
+                bytes: Vec::new(),
+            },
+            Stdio::from(std::os::fd::OwnedFd::from(child)),
+        ))
+    }
+
+    fn fd(&self) -> Option<i32> {
+        match self {
+            Self::Channel { pipe, .. } => pipe.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+            Self::File(_) => None,
+        }
+    }
+
+    fn drain(&mut self, limit: u64) -> std::io::Result<()> {
+        use std::io::{ErrorKind, Read};
+
+        if let Self::Channel { pipe, bytes } = self {
+            if let Some(reader) = pipe.as_ref() {
+                match reader.take(limit).read_to_end(bytes) {
+                    Ok(count) if (count as u64) < limit => *pipe = None,
+                    Ok(_) => (),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        if let Some(fd) = self.fd() {
+            // Read bytes queued between the last drain and the child's exit.
+            let mut available: libc::c_int = 0;
+            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.drain(available as u64)?;
+        }
+        match self {
+            Self::Channel { bytes, .. } => Ok(bytes),
+            Self::File(mut file) => {
+                use std::io::{Read, Seek};
+                let mut bytes = Vec::new();
+                file.rewind()?;
+                file.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+        }
+    }
+}
+
 struct NativeInput<'a> {
     source: &'a mut dyn std::io::Read,
     pipe: std::os::unix::net::UnixStream,
@@ -649,6 +814,9 @@ impl<'a> NativeInput<'a> {
                 Ok(count) => self.pending.start += count,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                // A helper can reject a request before consuming stdin. Let
+                // supervision collect its exit status and diagnostic output.
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => return Ok(true),
                 Err(error) => return Err(error),
             }
         }
@@ -658,12 +826,13 @@ impl<'a> NativeInput<'a> {
 /// Exit notification removes the artificial polling floor for short native
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
-struct ChildExitWakeup {
+/// Pollable child exit notification for native helpers.
+pub struct ChildExitWakeup {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: Option<std::os::fd::OwnedFd>,
 }
 impl ChildExitWakeup {
-    fn new(pid: u32) -> Self {
+    pub fn new(pid: u32) -> Self {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::FromRawFd;
@@ -703,34 +872,37 @@ impl ChildExitWakeup {
             Self {}
         }
     }
-    fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
+    pub fn wait(
+        &self,
+        duration: std::time::Duration,
+        input: Option<i32>,
+        output: [Option<i32>; 2],
+    ) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let exit = -1;
-        if exit >= 0 || input.is_some() {
-            let mut descriptors = [
-                libc::pollfd {
-                    fd: exit,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: input.unwrap_or(-1),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                },
-            ];
-            let result =
-                unsafe { libc::poll(descriptors.as_mut_ptr(), 2, duration.as_millis() as i32) };
-            if result < 0
-                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                std::thread::sleep(duration);
-            }
-            return;
+        let mut descriptors = [
+            (exit, libc::POLLIN),
+            (input.unwrap_or(-1), libc::POLLOUT),
+            (output[0].unwrap_or(-1), libc::POLLIN),
+            (output[1].unwrap_or(-1), libc::POLLIN),
+        ]
+        .map(|(fd, events)| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        });
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                duration.as_millis() as i32,
+            )
+        };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            std::thread::sleep(duration);
         }
-        std::thread::sleep(duration);
     }
 }
 /// Native Git owns a separate group while authenticating/verifying. Observe
@@ -847,6 +1019,190 @@ impl SplitByte for [u8] {
 #[cfg(test)]
 mod transport_policy_tests {
     use super::*;
+
+    #[test]
+    fn url_query_channels_require_the_exact_local_command() {
+        let local = ["ls-remote", "--get-url", "--", "source"].map(OsStr::new);
+        let remote = ["ls-remote", "--get-url", "--no-get-url", "source"].map(OsStr::new);
+        assert!(local_query(&local));
+        assert!(!local_query(&remote));
+    }
+
+    #[test]
+    fn revision_resolution_preserves_configured_fsmonitor_output() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{Duration, Instant},
+        };
+
+        const FIXTURE_ENV: &str = "GIT_ON_TEST_FSMONITOR_FIXTURE";
+        if std::env::var_os(FIXTURE_ENV).is_none() {
+            let mut test = Command::new(std::env::current_exe().unwrap());
+            for (key, _) in std::env::vars_os() {
+                if key.as_bytes().starts_with(b"GIT_") {
+                    test.env_remove(key);
+                }
+            }
+            let result = test
+                .env(FIXTURE_ENV, "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["--exact", "git::transport_policy_tests::revision_resolution_preserves_configured_fsmonitor_output"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let repo = git2::Repository::init(root).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("Git-on tests", "test@example.invalid").unwrap();
+        let commit = repo
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{commit},view")
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let hook = root.join("fsmonitor");
+        std::fs::write(
+            &hook,
+            br#"#!/bin/sh
+(
+    trap '' PIPE
+    attempts=0
+    while ! test -e helper-ready; do
+        test "$attempts" -lt 300 || exit 1
+        attempts=$((attempts + 1))
+        sleep .01
+    done
+    if printf 'late stderr\n' >&2; then printf y; else printf n; fi >helper-done
+) >/dev/null &
+printf 'clock\000'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.fsmonitor", hook.to_str().unwrap())
+            .unwrap();
+        let selected = Git::capture(root).unwrap().resolve(OsStr::new(":view"));
+        std::fs::write(root.join("helper-ready"), b"").unwrap();
+        assert_eq!(selected.unwrap(), commit);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let outcome = std::fs::read(root.join("helper-done")).ok();
+            if let Some(outcome) = outcome.filter(|bytes| !bytes.is_empty()) {
+                assert_eq!(outcome, b"y");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fsmonitor helper did not write its result"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn native_capture_keeps_exit_status_after_child_closes_input() {
+        use std::{
+            io::{Read, Write},
+            os::{fd::OwnedFd, unix::net::UnixStream},
+            time::Duration,
+        };
+
+        let (sync, child_sync) = UnixStream::pair().unwrap();
+        sync.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "read -r ready <&1; printf 'cannot read request\\n' >&2; exec 0<&-; printf x; exit 42",
+            ])
+            .stdout(Stdio::from(OwnedFd::from(child_sync)));
+        struct RequestAfterInputCloses(Option<UnixStream>);
+        impl Read for RequestAfterInputCloses {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let Some(mut sync) = self.0.take() else {
+                    return Ok(0);
+                };
+                sync.write_all(b"ready\n")?;
+                sync.read_exact(&mut [0])?;
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        let output = run_captured(
+            command,
+            false,
+            true,
+            None,
+            Some(&mut RequestAfterInputCloses(Some(sync))),
+            false,
+            CaptureMode::Channel,
+        )
+        .expect("preserve the outcome of a child that closes stdin");
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(output.stderr, b"cannot read request\n");
+    }
+
+    #[test]
+    fn native_capture_drains_both_streams_without_files() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=65536 count=4 2>/dev/null; cat >&2",
+        ]);
+        unsafe {
+            command.pre_exec(|| {
+                for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if libc::fstat(fd, metadata.as_mut_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if metadata.assume_init().st_mode & libc::S_IFMT == libc::S_IFREG {
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                    }
+                }
+                Ok(())
+            });
+        }
+        let bytes = vec![b'x'; 1024 * 1024];
+        let output = run_captured(
+            command,
+            true,
+            true,
+            None,
+            Some(&mut bytes.as_slice()),
+            false,
+            CaptureMode::Channel,
+        )
+        .expect("capture Git output without regular files");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![0; 4 * 65536]);
+        assert_eq!(output.stderr, bytes);
+    }
 
     #[test]
     fn explicit_transport_policy_keeps_http2_on_native_git() {

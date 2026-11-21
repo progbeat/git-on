@@ -19,6 +19,11 @@ publishing the commit, obtain a separate cold review of the actual PR, emphasizi
 regressions and test minimality. Findings restart this cycle. Deliver a
 ready-to-merge PR; do not merge it without an explicit request.
 
+Apply the [resource assumptions](docs/specification.md#resource-assumptions)
+in reviews. Workloads that exceed available RAM or require adapting to
+an inherited process limit are outside acceptance. Fault injection can
+exercise general I/O contracts that apply to supported workloads.
+
 docs/interview.md records the author's intent; keep the implementation consistent
 with it. Read the project documentation and interview before asking questions.
 If the documentation leaves a material ambiguity about the author's intent or

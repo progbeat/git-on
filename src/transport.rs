@@ -1,11 +1,10 @@
 //! Invocation-owned native transports. Protocol v2 permits branch selection
 //! and successive exact-object requests on the same channel.
-use crate::spool::Spool;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
+    io::{self, BufRead, BufReader, Read, Seek, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::{
@@ -213,7 +212,7 @@ impl StartingSession {
         let (input, to_child) = UnixStream::pair()?;
         input.set_nonblocking(true)?;
         let (output, from_child) = UnixStream::pair()?;
-        let errors = tempfile::tempfile()?;
+        let errors = crate::git::capture_file()?;
         command
             .stdin(Stdio::from(OwnedFd::from(to_child)))
             .stdout(Stdio::from(OwnedFd::from(from_child)))
@@ -407,8 +406,9 @@ impl Session {
     pub(crate) fn fetch_stream(
         &mut self,
         oids: &[Oid],
-        response: crate::pack_stream::Response,
+        mut response: crate::pack_stream::Response<'_>,
     ) -> Result<crate::pack_stream::Received> {
+        response.set_stop(self.input.1.clone());
         let result = (|| {
             self.errors.set_len(0)?;
             self.errors.rewind()?;
@@ -417,11 +417,6 @@ impl Session {
             self.check_helper_end()?;
             Ok(pack)
         })();
-        self.with_fetch_context(oids, result)
-    }
-
-    pub(crate) fn fetch_exact(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
-        let result = self.fetch(oids, pack);
         self.with_fetch_context(oids, result)
     }
 
@@ -439,16 +434,6 @@ impl Session {
             )
         })
     }
-    pub(crate) fn fetch(&mut self, oids: &[Oid], pack: &Spool) -> Result<()> {
-        // The completed previous response has no diagnostics to retain. A
-        // shared regular-file offset is reset only between transactions.
-        self.errors.set_len(0)?;
-        self.errors.rewind()?;
-        self.input.write_all(&exact_request(oids)?)?;
-        read_pack(&mut self.output, pack)?;
-        self.check_helper_end()
-    }
-
     fn check_helper_end(&mut self) -> Result<()> {
         if self.stateless {
             ensure!(
@@ -704,41 +689,6 @@ pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
     Ok(request)
 }
 
-fn read_pack(input: &mut impl Read, pack: &Spool) -> Result<()> {
-    loop {
-        crate::object::check_transfer()?;
-        match read_packet(input)? {
-            Packet::Data(section) if packet_text(&section) == b"packfile" => break,
-            Packet::Data(section) if packet_text(&section) == b"shallow-info" => loop {
-                match read_packet(input)? {
-                    Packet::Delimiter => break,
-                    Packet::Data(value)
-                        if value.starts_with(b"shallow ") || value.starts_with(b"unshallow ") => {}
-                    _ => return Err(invalid("invalid demand shallow section")),
-                }
-            },
-            _ => return Err(invalid("invalid demand response section")),
-        }
-    }
-    let mut output = PackWriter::new(pack);
-    loop {
-        crate::object::check_transfer()?;
-        match read_packet(input)? {
-            Packet::Flush => break,
-            Packet::Data(data) => match data.split_first() {
-                Some((1, payload)) => output.write_all(payload)?,
-                Some((2, _)) => {} // optional progress is not application data
-                Some((3, error)) => {
-                    bail!("remote pack failed: {}", String::from_utf8_lossy(error))
-                }
-                _ => return Err(invalid("invalid demand pack sideband")),
-            },
-            _ => return Err(invalid("invalid demand pack termination")),
-        }
-    }
-    output.finish()
-}
-
 fn check_http_end(input: impl Read) -> Result<()> {
     let mut trailer = Vec::new();
     input.take(5).read_to_end(&mut trailer)?;
@@ -747,146 +697,6 @@ fn check_http_end(input: impl Read) -> Result<()> {
         "unexpected data after the Git HTTP response"
     );
     Ok(())
-}
-
-// Keep the trailer out of the checksum without retaining the pack in RAM.
-struct PackWriter<'a> {
-    output: BufWriter<&'a Spool>,
-    checksum: crate::pack_stream::Checksum,
-}
-impl<'a> PackWriter<'a> {
-    fn new(file: &'a Spool) -> Self {
-        Self {
-            output: BufWriter::with_capacity(64 * 1024, file),
-            checksum: crate::pack_stream::Checksum::default(),
-        }
-    }
-    fn finish(mut self) -> Result<()> {
-        self.output.flush()?;
-        self.checksum.finish()
-    }
-}
-impl Write for PackWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.output.write_all(bytes)?;
-        self.checksum.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.output.flush()
-    }
-}
-
-pub(crate) struct ObjectReader<'a> {
-    file: &'a Spool,
-    position: u64,
-    end: u64,
-    input: Box<[u8; 65536]>,
-    from: usize,
-    to: usize,
-    decoder: flate2::Decompress,
-    finished: bool,
-}
-impl<'a> ObjectReader<'a> {
-    /// Complex/multi-object packs remain on the existing Git/libgit2 decoder.
-    pub(crate) fn single(file: &'a Spool) -> Result<Option<(Self, usize, git2::ObjectType)>> {
-        let length = file.len()?;
-        ensure!(length >= 32, "truncated received pack");
-        let mut header = [0; 12];
-        file.read_exact_at(&mut header, 0)?;
-        ensure!(
-            &header[..4] == b"PACK"
-                && matches!(u32::from_be_bytes(header[4..8].try_into()?), 2 | 3),
-            "invalid pack header/version"
-        );
-        if u32::from_be_bytes(header[8..12].try_into()?) != 1 {
-            return Ok(None);
-        }
-        let mut position = 12;
-        let mut byte = [0];
-        file.read_exact_at(&mut byte, position)?;
-        position += 1;
-        let kind = match (byte[0] >> 4) & 7 {
-            1 => git2::ObjectType::Commit,
-            2 => git2::ObjectType::Tree,
-            3 => git2::ObjectType::Blob,
-            4 => git2::ObjectType::Tag,
-            6 | 7 => return Ok(None),
-            _ => return Err(invalid("invalid pack object type")),
-        };
-        let mut size = usize::from(byte[0] & 15);
-        let mut shift = 4;
-        while byte[0] & 128 != 0 {
-            ensure!(position < length - 20, "truncated pack object header");
-            file.read_exact_at(&mut byte, position)?;
-            position += 1;
-            let value = usize::from(byte[0] & 127);
-            ensure!(
-                shift < usize::BITS && value <= usize::MAX >> shift,
-                "pack object size overflow"
-            );
-            size |= value << shift;
-            shift += 7;
-        }
-        ensure!(position < length - 20, "missing pack object data");
-        Ok(Some((
-            Self {
-                file,
-                position,
-                end: length - 20,
-                input: Box::new([0; 65536]),
-                from: 0,
-                to: 0,
-                decoder: flate2::Decompress::new(true),
-                finished: false,
-            },
-            size,
-            kind,
-        )))
-    }
-}
-impl Read for ObjectReader<'_> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() || self.finished {
-            return Ok(0);
-        }
-        loop {
-            crate::object::check_transfer().map_err(std::io::Error::other)?;
-            if self.from == self.to && self.position < self.end {
-                let count = (self.end - self.position).min(self.input.len() as u64) as usize;
-                self.file
-                    .read_exact_at(&mut self.input[..count], self.position)?;
-                self.position += count as u64;
-                self.from = 0;
-                self.to = count;
-            }
-            let before = (self.decoder.total_in(), self.decoder.total_out());
-            let status = self.decoder.decompress(
-                &self.input[self.from..self.to],
-                output,
-                if self.position == self.end {
-                    flate2::FlushDecompress::Finish
-                } else {
-                    flate2::FlushDecompress::None
-                },
-            )?;
-            let read = (self.decoder.total_in() - before.0) as usize;
-            let wrote = (self.decoder.total_out() - before.1) as usize;
-            self.from += read;
-            if status == flate2::Status::StreamEnd {
-                if self.from != self.to || self.position != self.end {
-                    return Err(io::Error::other("trailing bytes after pack object"));
-                }
-                self.finished = true;
-            }
-            if wrote != 0 || self.finished {
-                return Ok(wrote);
-            }
-            if read == 0 && self.position == self.end {
-                return Err(io::Error::other("truncated pack zlib stream"));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -920,12 +730,6 @@ mod tests {
         let hash = Sha1::digest(&bytes);
         bytes.extend(hash);
         bytes
-    }
-    fn spool(root: &std::path::Path, bytes: &[u8]) -> Spool {
-        let files = crate::spool::Files::with_limit(root, Some(97)).unwrap();
-        let file = files.file(root).unwrap();
-        (&file).write_all(bytes).unwrap();
-        file
     }
     fn peer_response(bytes: &[u8]) -> (Session, UnixStream) {
         let (input, peer) = UnixStream::pair().unwrap();
@@ -1001,10 +805,16 @@ mod tests {
     fn fetch_sections_accept_optional_lf_without_changing_binary() {
         let root = tempfile::tempdir().unwrap();
         // Include a binary trailing LF: only text labels may be normalized.
-        let good = (0..65536)
-            .map(|index| pack(format!("binary payload {index}").as_bytes()))
-            .find(|bytes| bytes.last() == Some(&b'\n'))
+        let (payload, good) = (0..65536)
+            .map(|index| {
+                let payload = format!("binary payload {index}");
+                let pack = pack(payload.as_bytes());
+                (payload, pack)
+            })
+            .find(|(_, bytes)| bytes.last() == Some(&b'\n'))
             .unwrap();
+        let cache = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
+        let oid = Oid::hash_object(git2::ObjectType::Blob, payload.as_bytes()).unwrap();
         for shallow_lf in [false, true] {
             for pack_lf in [false, true] {
                 let mut bytes = Vec::new();
@@ -1020,98 +830,88 @@ mod tests {
                 bytes.push(1);
                 bytes.extend_from_slice(&good);
                 bytes.extend_from_slice(b"0000");
-                let file = spool(root.path(), &[]);
                 let (mut session, _request_peer) = peer_response(&bytes);
-                session.fetch(&[Oid::zero()], &file).unwrap();
-                let mut actual = vec![0; good.len()];
-                file.read_exact_at(&mut actual, 0).unwrap();
-                assert_eq!(actual, good);
+                let response = crate::pack_stream::Response::new(
+                    cache.clone(),
+                    vec![oid],
+                    Box::new(|object| {
+                        assert_eq!(object.data(), payload.as_bytes());
+                        Ok(())
+                    }),
+                );
+                let received = session.fetch_stream(&[oid], response).unwrap();
+                assert_eq!(received.bytes, good.len() as u64);
             }
         }
     }
     #[test]
     fn pack_trailer_is_checked_across_all_short_chunk_boundaries() {
-        let root = tempfile::tempdir().unwrap();
         let good = pack(b"payload");
         for step in 1..=good.len() {
-            let file = spool(root.path(), &[]);
-            let mut writer = PackWriter::new(&file);
+            let mut checksum = crate::pack_stream::Checksum::default();
             for bytes in good.chunks(step) {
-                writer.write_all(bytes).unwrap();
+                checksum.update(bytes);
             }
-            writer.finish().unwrap();
-            let mut actual = vec![0; good.len()];
-            file.read_exact_at(&mut actual, 0).unwrap();
-            assert_eq!(actual, good);
+            checksum.finish().unwrap();
         }
-        let file = spool(root.path(), &[]);
-        let mut writer = PackWriter::new(&file);
         let mut bad = good.clone();
         bad[15] ^= 1;
-        writer.write_all(&bad).unwrap();
-        assert!(writer.finish().is_err());
-        let file = spool(root.path(), &[]);
-        let mut writer = PackWriter::new(&file);
-        writer.write_all(&good[..19]).unwrap();
-        assert!(writer.finish().is_err());
+        for truncated_or_bad in [&good[..19], &bad[..]] {
+            let mut checksum = crate::pack_stream::Checksum::default();
+            checksum.update(truncated_or_bad);
+            assert!(checksum.finish().is_err());
+        }
     }
     #[test]
     fn direct_pack_bytes_require_oid_zlib_end_and_no_hidden_tail() {
         let root = tempfile::tempdir().unwrap();
-        let data = vec![b'x'; 1024 * 1024];
-        let good = pack(&data);
-        let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
-        let file = spool(root.path(), &good);
-        let (reader, size, kind) = ObjectReader::single(&file).unwrap().unwrap();
-        assert_eq!(size, data.len());
-        assert_eq!(kind, git2::ObjectType::Blob);
-        let mut raw = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
-        let blob = raw.insert_fetched(oid, size, reader).unwrap();
-        assert_eq!(blob.read(999999, 17).unwrap(), vec![b'x'; 17]);
-        assert!(raw.for_read(oid).unwrap().unwrap().1);
-        assert!(!raw.for_read(oid).unwrap().unwrap().1);
-        for mutation in [0, 1, 2] {
-            let mut bytes = good[..good.len() - 20].to_vec();
-            if mutation == 0 {
-                bytes.truncate(bytes.len() - 2);
-            }
-            if mutation == 1 {
-                bytes.extend(b"trailing");
-            }
-            let file = spool(root.path(), &checksum(bytes));
-            let (reader, size, _) = ObjectReader::single(&file).unwrap().unwrap();
-            let mut raw = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
-            let wanted = if mutation == 2 { Oid::zero() } else { oid };
-            assert!(raw.insert_fetched(wanted, size, reader).is_err());
-            assert!(
-                raw.get(wanted).unwrap().is_none(),
-                "invalid object was published"
+        let cache = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
+        let receive = |pack: &[u8], oid: Oid| {
+            let mut bytes = b"000dpackfile\n".to_vec();
+            write!(bytes, "{:04x}", pack.len() + 5).unwrap();
+            bytes.push(1);
+            bytes.extend_from_slice(pack);
+            bytes.extend_from_slice(b"0000");
+            let mut published = None;
+            let response = crate::pack_stream::Response::new(
+                cache.clone(),
+                vec![oid],
+                Box::new(|object| {
+                    assert_eq!(object.kind(), git2::ObjectType::Blob);
+                    assert_eq!(object.oid(), oid);
+                    published = Some(Arc::unwrap_or_clone(object.into_data()));
+                    Ok(())
+                }),
             );
+            let (mut session, _peer) = peer_response(&bytes);
+            session
+                .fetch_stream(&[oid], response)
+                .map(|_| published.unwrap())
+        };
+        for data in [Vec::new(), vec![b'x'; 1024 * 1024]] {
+            let good = pack(&data);
+            let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
+            assert_eq!(receive(&good, oid).unwrap(), data);
+            assert!(receive(&good, Oid::zero()).is_err());
+            let body = &good[..good.len() - 20];
+            let truncated = checksum(body[..body.len() - 2].to_vec());
+            assert!(receive(&truncated, oid).is_err());
+            let trailing = checksum([body, b"trailing"].concat());
+            assert!(receive(&trailing, oid).is_err());
         }
     }
     #[test]
     fn malformed_packet_and_pack_fail_closed() {
         let root = tempfile::tempdir().unwrap();
-        for response in [
-            b"-001".to_vec(),
-            b"ffff".to_vec(),
-            b"0003".to_vec(),
-            b"00".to_vec(),
-        ] {
-            let (input, _peer) = UnixStream::pair().unwrap();
-            let (output, mut source) = UnixStream::pair().unwrap();
-            source.write_all(&response).unwrap();
-            source.shutdown(std::net::Shutdown::Write).unwrap();
-            let mut session = Session {
-                owner: Owner(Mutex::new(None)),
-                input: Output(input, None),
-                output: BufReader::new(Input(output, None)),
-                errors: tempfile::tempfile().unwrap(),
-                stateless: false,
-            };
-            let file = spool(root.path(), &[]);
-            assert!(session.fetch(&[Oid::zero()], &file).is_err());
-            assert_eq!(file.len().unwrap(), 0);
+        let cache = crate::raw_blob::RawBlobs::new(root.path()).unwrap();
+        for malformed in [b"-001".as_slice(), b"ffff", b"0003", b"00"] {
+            let (mut session, _peer) = peer_response(malformed);
+            let response = crate::pack_stream::Response::new(
+                cache.clone(),
+                vec![Oid::zero()],
+                Box::new(|_| panic!("malformed response published an object")),
+            );
+            assert!(session.fetch_stream(&[Oid::zero()], response).is_err());
         }
     }
     #[test]
@@ -1175,25 +975,6 @@ mod tests {
             message.len()
         );
         assert!(message.ends_with("actual failure"));
-    }
-    #[test]
-    fn empty_blob_stream_and_complex_pack_classification() {
-        let root = tempfile::tempdir().unwrap();
-        let bytes = pack(b"");
-        let file = spool(root.path(), &bytes);
-        let (mut reader, size, _) = ObjectReader::single(&file).unwrap().unwrap();
-        assert_eq!(size, 0);
-        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-        for mutation in [0, 1] {
-            let mut bytes = pack(b"payload");
-            if mutation == 0 {
-                bytes[11] = 2;
-            } else {
-                bytes[12] = 6 << 4;
-            }
-            let file = spool(root.path(), &bytes);
-            assert!(ObjectReader::single(&file).unwrap().is_none());
-        }
     }
 }
 #[test]

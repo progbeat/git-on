@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read},
-    os::unix::ffi::OsStringExt,
+    os::unix::ffi::OsStrExt,
     sync::Arc,
 };
 fn invalid(message: &str) -> anyhow::Error {
@@ -32,14 +32,31 @@ pub(crate) struct Directory {
 impl Directory {
     pub(crate) fn verified(oid: Oid, size: usize, input: impl Read) -> Result<Self> {
         let mut input = Checked::new(input, size);
-        let mut parser = Parser::new(&mut input);
+        let directory = Self::parse(BufReader::with_capacity(64 * 1024, &mut input))?;
+        // Parsing and hashing consume exactly the same stream. Neither entries
+        // nor negative lookup results become observable before full OID trust.
+        input.finish(oid)?;
+        Ok(directory)
+    }
+    pub(crate) fn from_verified(object: &crate::pack_stream::VerifiedObject) -> Result<Self> {
+        anyhow::ensure!(
+            object.kind() == git2::ObjectType::Tree,
+            "streamed object is not a tree"
+        );
+        Self::parse(VerifiedBytes {
+            remaining: object.data(),
+            available: 0,
+        })
+    }
+    fn parse(input: impl BufRead) -> Result<Self> {
+        let mut parser = Parser::new(input);
         let mut entries = Vec::new();
         let mut names = HashMap::new();
         while let Some(item) = parser.next()? {
             if entries.len().is_multiple_of(256) {
                 crate::object::check_transfer()?;
             }
-            let name: Arc<OsStr> = Arc::from(OsString::from_vec(item.name.to_vec()));
+            let name: Arc<OsStr> = Arc::from(OsStr::from_bytes(item.name));
             if names.insert(name.clone(), entries.len()).is_some() {
                 return Err(invalid("duplicate path in Git tree"));
             }
@@ -49,10 +66,6 @@ impl Directory {
                 oid: item.oid,
             });
         }
-        drop(parser);
-        // Parsing and hashing consume exactly the same stream. Neither entries
-        // nor negative lookup results become observable before full OID trust.
-        input.finish(oid)?;
         let weight = std::mem::size_of::<Self>()
             + entries.capacity() * std::mem::size_of::<Node>()
             + entries
@@ -103,6 +116,33 @@ impl Directory {
         Ok(self.entries.iter().map(Self::owned).collect())
     }
 }
+// Parse the verified buffer directly while retaining the cancellation cadence
+// of the streaming reader, including within a long mode or name.
+struct VerifiedBytes<'a> {
+    remaining: &'a [u8],
+    available: usize,
+}
+impl Read for VerifiedBytes<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.fill_buf()?.read(output)?;
+        self.consume(count);
+        Ok(count)
+    }
+}
+impl BufRead for VerifiedBytes<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.available == 0 {
+            crate::object::check_transfer().map_err(std::io::Error::other)?;
+            self.available = self.remaining.len().min(64 * 1024);
+        }
+        Ok(&self.remaining[..self.available])
+    }
+    fn consume(&mut self, count: usize) {
+        self.remaining = &self.remaining[count..];
+        self.available -= count;
+    }
+}
+
 struct Checked<R> {
     input: R,
     remaining: usize,
@@ -147,7 +187,7 @@ impl<R: Read> Read for Checked<R> {
     }
 }
 struct Parser<R> {
-    input: BufReader<R>,
+    input: R,
     name: Vec<u8>,
 }
 struct Item<'a> {
@@ -155,10 +195,10 @@ struct Item<'a> {
     mode: u32,
     oid: Oid,
 }
-impl<R: Read> Parser<R> {
+impl<R: BufRead> Parser<R> {
     fn new(input: R) -> Self {
         Self {
-            input: BufReader::with_capacity(64 * 1024, input),
+            input,
             name: Vec::new(),
         }
     }

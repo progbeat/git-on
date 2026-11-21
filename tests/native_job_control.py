@@ -141,6 +141,12 @@ class NativeJobControlTests(unittest.TestCase):
         git, = children(runner)
         self.runner, self.native_group = runner, os.getpgid(git)
         shell.groups.update((runner, self.native_group))
+        if not native_terminal:
+            run, = remote.run_directories(self.f.root)
+            self.assertEqual(run.parent, self.f.root / 'git-on')
+            socket, = run.glob('t???/socket')
+            self.assertTrue(socket.is_socket())
+            self.assertFalse(list(self.f.root.glob('.git-on-terminal-*')))
         self.assertEqual(os.getpgid(runner), runner)
         self.assertEqual(self.native_group, git)
         self.assertNotEqual(self.native_group, runner)
@@ -188,7 +194,7 @@ class NativeJobControlTests(unittest.TestCase):
         shell.expect(f'native-job-status={expected}\r\n'.encode())
         shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
-        self.assertEqual(list(self.f.root.glob('git-on-*')), [], 'runner leaked recovery state')
+        self.assertEqual(remote.run_directories(self.f.root), [], 'runner leaked recovery state')
         self.assertEqual(list(self.f.root.glob('*/ssh-control')), [], 'runner leaked SSH socket')
         if expected == 125:
             self.assertIn(b'native Git verify-commit failed', output)
@@ -258,7 +264,7 @@ class NativeJobControlTests(unittest.TestCase):
                     shell.groups.clear()
                     self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
                     self.assertNotIn(b"identity': ",output)
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(remote.run_directories(f.root),[])
                     if backend=='materialized':self.assertIn(b'Permission denied',output)
 
 
@@ -286,9 +292,9 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         shell.send((shlex.join(command)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
         output=shell.expect(shell.prompt,timeout=20)
         self.assertIn(b'\r\nASKPASS-STATUS:0\r\n',output)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(remote.run_directories(f.root),[])
 
-    def test_repeated_managed_credentials_keep_foreground_and_finish_materialization(self):
+    def test_repeated_managed_credentials_keep_runner_in_foreground(self):
         import base64
         f=remote.Fixture(); self.addCleanup(f.close)
         # Fork the shell before starting the fixture's HTTPS server thread.
@@ -311,23 +317,17 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                           ' token=subprocess.check_output([os.environ["GIT_ASKPASS"],"https-helper-token: "])\n'
                           ' sys.stdout.write("username=fixture\\npassword="+token.decode().strip()+"\\n")\n')
         helper.chmod(0o700)
-        # Hide the FUSE helper, retaining actual HTTPS and an actual terminal.
+        # Lazy HTTPS preparation authenticates separate native Git processes.
+        # Hide the FUSE helper so the test can stop before mounting.
         programs=f.root/'programs'; programs.mkdir()
         (programs/'git').symlink_to(shutil.which('git'))
         environment=dict(PATH=str(programs),GIT_CONFIG_COUNT='1',GIT_SSL_CAINFO=f.env['GIT_SSL_CAINFO'],
                          GIT_CONFIG_KEY_0='credential.helper',GIT_CONFIG_VALUE_0=str(helper))
         command=[shutil.which('env'),*[key+'='+value for key,value in environment.items()],
-                 str(remote.OPTIONS.binary),url,'HEAD','--write-policy=all','--',
-                 sys.executable,'-I','-S','-c',
-                 "from pathlib import Path; assert Path('deep/file').read_bytes()==b'expected\\n'; print('https-helper-command-ok')"]
-        # A finite per-file limit retains bounded object transfers, so this
-        # scenario continues to exercise authentication on subsequent fetches.
-        command=[sys.executable,'-c',
-                 'import os,resource,sys; resource.setrlimit(resource.RLIMIT_FSIZE,(1048576,1048576)); os.execv(sys.argv[1],sys.argv[1:])',
-                 *command]
-        shell.send((shlex.join(command)+'\n').encode())
-        prompts=0; deadline=time.monotonic()+20
-        while b'\r\nhttps-helper-command-ok\r\n' not in shell.pending:
+                 str(remote.OPTIONS.binary),url,'HEAD','--backend=fuse','--','/bin/false']
+        shell.send((shlex.join(command)+'; printf "https-helper-status=%d\\n" "$?"\n').encode())
+        native_groups=set(); deadline=time.monotonic()+20
+        while shell.prompt not in shell.pending:
             self.assertLess(time.monotonic(),deadline,'HTTPS credential flow did not finish: '+repr(bytes(shell.transcript)))
             if b'https-helper-token: ' in shell.pending:
                 shell.expect(b'https-helper-token: ')
@@ -337,15 +337,16 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                 shell.groups={runner,group}
                 self.assertEqual(os.tcgetpgrp(shell.fd),runner,
                                  'credential helper took the terminal from git-on')
-                shell.send(b'fixture-token\n'); prompts+=1
+                native_groups.add(group)
+                shell.send(b'fixture-token\n')
             else: shell.read()
-        self.assertGreaterEqual(prompts,2,'fixture did not exercise authentication after initial fetch')
-        shell.expect(shell.prompt)
+        output=shell.expect(shell.prompt)
         shell.groups.clear()
-        shell.send(b'printf "https-helper-status=%s\\n" "$?"\n')
-        shell.expect(b'https-helper-status=0\r\n'); shell.expect(shell.prompt)
+        self.assertIn(b'FUSE unavailable',output)
+        self.assertIn(b'\r\nhttps-helper-status=125\r\n',output)
+        self.assertGreaterEqual(len(native_groups),2,'expected credentials in separate native processes')
         self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-        self.assertEqual(list(f.root.glob('git-on-*')),[],'HTTPS run leaked temporary storage')
+        self.assertEqual(remote.run_directories(f.root),[],'HTTPS run leaked temporary storage')
 
 
 def replay_baseline():

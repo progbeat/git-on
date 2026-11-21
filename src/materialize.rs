@@ -164,17 +164,11 @@ impl PreparedBlob {
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
     snapshot.set_spool_directory(root)?;
     snapshot.begin_materialization()?;
-    let batch_size = if crate::spool::Files::size_limit()?.is_some() {
-        1
-    } else {
-        256
-    };
     directory(
         snapshot,
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
-        batch_size,
     )
 }
 fn directory(
@@ -182,12 +176,11 @@ fn directory(
     relative: &Path,
     root: &Path,
     prepared: &mut std::collections::HashMap<git2::Oid, PreparedBlob>,
-    batch_size: usize,
 ) -> Result<()> {
     let mut children = snapshot.children(relative)?.into_iter();
     let mut expected = std::collections::HashSet::new();
     loop {
-        let batch: Vec<_> = children.by_ref().take(batch_size).collect();
+        let batch: Vec<_> = children.by_ref().take(256).collect();
         if batch.is_empty() {
             break;
         }
@@ -217,7 +210,7 @@ fn directory(
                 match entry.kind {
                     EntryKind::Directory => {
                         fs::create_dir(&path)?;
-                        directory(snapshot, &relative, root, prepared, batch_size)?;
+                        directory(snapshot, &relative, root, prepared)?;
                         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
                         ensure!(
                             fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,

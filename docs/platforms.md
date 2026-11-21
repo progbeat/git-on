@@ -32,9 +32,11 @@ binary. Both jobs test the revision under review.
 
 Passthrough requires Linux6.9+/FUSE7.40 and CAP_SYS_ADMIN for registration. It is
 optional: ordinary users or unsupported kernels retain FUSE userspace I/O, never
-materialization solely because this optimization is unavailable. Only physically
-backed command-generated regular files qualify; Git blobs and tracked copy-up do
-not. The child receives no new privileges; never recommend sudo git on for this.
+materialization solely because this optimization is unavailable. Physically
+backed command-generated files and private copies of tracked files can qualify.
+The regular file must already have writable backing when opened. Ordinary
+handles and mappings must be released before starting passthrough on that inode.
+The child receives no new privileges.
 
 ```sh
 cargo build --locked --features test-metrics

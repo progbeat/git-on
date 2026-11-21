@@ -41,7 +41,9 @@ fn main() -> Result<()> {
     let snapshot = match loaded {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(cleanup) = git_on::remote::stop_connection(&run.path().join("ssh-control")) {
+            if let Err(cleanup) =
+                git_on::remote::stop_connection(&git_on::platform::ssh_control_path(run.path()))
+            {
                 let retained = run.keep();
                 return Err(anyhow::anyhow!(
                     "{error:#}; shutdown: {cleanup:#}; probe recovery retained at {}",
@@ -95,6 +97,9 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::json!({"names": entries.iter().map(|x| x.0.to_string_lossy()).collect::<Vec<_>>()})
             );
+        } else if let Some(path) = operation.strip_prefix("materialize ") {
+            git_on::materialize::materialize(&snapshot, Path::new(path))?;
+            println!("{}", serde_json::json!({"materialized": true}));
         } else if operation != "report" {
             anyhow::bail!("unknown probe operation");
         }

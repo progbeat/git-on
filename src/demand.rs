@@ -1,9 +1,7 @@
 //! One request queue for HTTP/2, native HTTPS helpers and owned SSH channels.
 use crate::{
-    git::Git,
     object, pack_stream,
-    raw_blob::RawBlobs,
-    spool::Spool,
+    raw_blob::{DemandLookup, RawBlobs},
     transport::{BranchQuery, Connection, Session, StartingSession},
 };
 use anyhow::{bail, Context, Result};
@@ -28,7 +26,6 @@ const MAX_READ_AHEAD: usize = 256;
 const MAX_UNCONSUMED_PREDICTIONS: usize = 512;
 const MIN_PREDICTION_AGE: usize = 8;
 const MAX_FORECAST_SCORE: u8 = 24;
-const NATIVE_BLOB_STREAM_THRESHOLD: usize = 8 * 1024 * 1024;
 const REPLY_SAMPLES: u8 = 8;
 pub(crate) const SLOW_REPLY: Duration = Duration::from_millis(64);
 const BATCH_TARGET: usize = 4;
@@ -40,12 +37,14 @@ const DENSE_BATCH_WINDOW: Duration = Duration::from_millis(12);
 
 pub(crate) enum Acquired {
     Stored,
+    ValidatedExtra,
     Object(pack_stream::VerifiedObject),
-    Pack(Spool),
 }
 
 pub(crate) struct Batch {
     pub(crate) oids: Vec<Oid>,
+    succeeded: bool,
+    from_validated_extra: bool,
     result: Mutex<Option<Result<Acquired>>>,
 }
 
@@ -53,6 +52,8 @@ impl Batch {
     fn new(oids: Vec<Oid>, result: Result<Acquired>) -> Arc<Self> {
         Arc::new(Self {
             oids,
+            succeeded: result.is_ok(),
+            from_validated_extra: matches!(&result, Ok(Acquired::ValidatedExtra)),
             result: Mutex::new(Some(result)),
         })
     }
@@ -77,13 +78,19 @@ struct Flight {
 #[derive(Default)]
 struct FlightState {
     batch: Option<Arc<Batch>>,
+    counted: bool,
     #[cfg(target_os = "macos")]
     notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Demand {
     fn complete(&self, batch: Arc<Batch>) {
+        self.complete_with(batch, |_| {});
+    }
+
+    fn complete_with(&self, batch: Arc<Batch>, record: impl FnOnce(&mut FlightState)) {
         let mut state = self.0.state.lock().unwrap();
+        record(&mut state);
         if state.batch.is_some() {
             return;
         }
@@ -113,6 +120,29 @@ impl Demand {
         self.0.required.load(Ordering::Relaxed)
     }
 
+    fn needs_pack(
+        &self,
+        oid: Oid,
+        cache: &RawBlobs,
+        transfer: &Arc<()>,
+        speculative: bool,
+    ) -> bool {
+        let state = self.0.state.lock().unwrap();
+        if !speculative
+            && !state
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.from_validated_extra)
+        {
+            return true;
+        }
+        // A reader can use a cached object without joining this transfer.
+        let delivered =
+            self.required() && state.batch.as_ref().is_some_and(|batch| batch.succeeded);
+        drop(state);
+        cache.was_served(oid, transfer, delivered)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn notify_when_ready(&self, notify: &Arc<tokio::sync::Notify>) {
         let mut state = self.0.state.lock().unwrap();
@@ -133,29 +163,51 @@ struct QueuedDemand {
 
 struct Work {
     items: Vec<QueuedDemand>,
+    readers: Arc<[(Oid, Demand)]>,
+    extras: Arc<Mutex<Option<Vec<QueuedDemand>>>>,
+    // A different pack can satisfy an exact request while it is in flight.
+    // Attribute early reads to the transfer whose bytes actually served them.
+    transfer: Arc<()>,
     speculative: bool,
 }
 
 impl Work {
     fn take(queue: &mut VecDeque<QueuedDemand>, speculative: bool) -> Option<Self> {
+        // Cache publication can satisfy a demand while it is still queued.
+        let first = loop {
+            let item = queue.pop_front()?;
+            if !item.demand.ready() {
+                break item;
+            }
+        };
         let limit = if speculative {
-            queue.front()?.prefetch_width
+            first.prefetch_width
         } else {
             MAX_WANTS
         };
-        let count = queue.len().min(limit);
-        (count != 0).then(|| Self {
-            items: queue.drain(..count).collect(),
+        let mut items = Vec::with_capacity((queue.len() + 1).min(limit));
+        items.push(first);
+        while items.len() < limit {
+            let Some(item) = queue.pop_front() else { break };
+            if !item.demand.ready() {
+                items.push(item);
+            }
+        }
+        let readers = items
+            .iter()
+            .map(|item| (item.oid, item.demand.clone()))
+            .collect();
+        Some(Self {
+            items,
+            readers,
+            extras: Arc::new(Mutex::new(Some(Vec::new()))),
+            transfer: Arc::new(()),
             speculative,
         })
     }
 
     fn wants(&self) -> Vec<Oid> {
         self.items.iter().map(|item| item.oid).collect()
-    }
-
-    fn cache_remainder(&self) -> bool {
-        self.speculative || self.items.iter().all(|item| item.demand.ready())
     }
 }
 
@@ -202,6 +254,7 @@ struct Queue {
     forecast_step: u64,
     forecast_score: u8,
     forecast_misses: u8,
+    forecast_expanded: bool,
     busy: [bool; CONNECTIONS],
     initial_channels: usize,
     starting: [bool; CONNECTIONS],
@@ -253,6 +306,7 @@ impl Queue {
         if !self.dense() {
             return READ_AHEAD;
         }
+        self.forecast_expanded = true;
         match self.forecast_score {
             2..=3 => 64,
             4..=5 => 128,
@@ -261,12 +315,14 @@ impl Queue {
     }
 
     fn dense(&self) -> bool {
-        self.forecast_score >= DENSE_SCORE && !matches!(self.mode, ConnectionMode::Standard)
+        self.forecast_score >= DENSE_SCORE
     }
 
     fn prediction_room(&mut self, width: usize) -> usize {
         let capacity = (4 * width).min(MAX_UNCONSUMED_PREDICTIONS);
-        if self.predicted.len() >= capacity && !matches!(self.mode, ConnectionMode::Standard) {
+        if self.predicted.len() >= capacity
+            && (self.forecast_expanded || !matches!(self.mode, ConnectionMode::Standard))
+        {
             // Completed guesses from an earlier part of a scan can occupy
             // the whole window while callers move through another subtree.
             // Give their slots back without dropping a flight in progress.
@@ -310,7 +366,12 @@ impl Queue {
                 .chain(self.ahead.front())
                 .map(|item| item.queued_at)
                 .min()?;
-            (first, DENSE_BATCH_WINDOW)
+            let window = if matches!(self.mode, ConnectionMode::Standard) {
+                BATCH_WINDOW
+            } else {
+                DENSE_BATCH_WINDOW
+            };
+            (first, window)
         } else if matches!(self.mode, ConnectionMode::Wide) && self.waiting.len() < BATCH_TARGET {
             (self.waiting.front()?.queued_at, BATCH_WINDOW)
         } else {
@@ -321,10 +382,18 @@ impl Queue {
             .filter(|remaining| !remaining.is_zero())
     }
 
+    fn wait_for_http2_event(&self, delay: Option<Duration>, transfer_active: bool) -> bool {
+        if delay.is_some() {
+            transfer_active || !matches!(self.mode, ConnectionMode::Standard)
+        } else {
+            self.waiting.is_empty()
+        }
+    }
+
     fn native_work(&mut self, index: usize, needs_ssh_channel: bool) -> Option<NativeWork> {
         let speculative = self.waiting.is_empty();
         let ready_for_exact = !speculative && !needs_ssh_channel;
-        let channels = if self.dense() {
+        let channels = if matches!(self.mode, ConnectionMode::Probing(_)) && self.dense() {
             CONNECTIONS
         } else {
             self.mode.channels()
@@ -379,6 +448,21 @@ impl Queue {
         }
     }
 
+    fn join_extra(&mut self, oid: Oid) -> Option<QueuedDemand> {
+        for requests in [&mut self.waiting, &mut self.ahead] {
+            if let Some(index) = requests.iter().position(|item| item.oid == oid) {
+                return requests.remove(index);
+            }
+        }
+        (!self.pending.contains_key(&oid)).then(|| self.insert(oid))
+    }
+
+    fn complete_extra(&mut self, oid: Oid) {
+        if let Some(demand) = self.pending.remove(&oid) {
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::ValidatedExtra)));
+        }
+    }
+
     fn prune_prefetch(&mut self) {
         if self.native_ceiling == Some(1) {
             for item in self.ahead.drain(..) {
@@ -419,8 +503,6 @@ struct Http2Batch {
     started: Instant,
 }
 
-type FallbackPack = (Http2Batch, pack_stream::Received);
-
 enum NativeWork {
     Connect,
     Fetch(Work, Option<String>),
@@ -429,19 +511,13 @@ enum NativeWork {
 pub(crate) struct Pool {
     shared: Arc<Shared>,
     scratch: RawBlobs,
-    git: Arc<Git>,
     workers: Mutex<Vec<JoinHandle<Result<()>>>>,
     wake: Option<Arc<UnixStream>>,
 }
 
 impl Pool {
-    pub(crate) fn new(
-        first: Session,
-        connection: Connection,
-        scratch: &RawBlobs,
-        git: &Git,
-    ) -> Result<Self> {
-        let mut pool = Self::prepare_native(&connection, scratch, git, Vec::new())?;
+    pub(crate) fn new(first: Session, connection: Connection, scratch: &RawBlobs) -> Result<Self> {
+        let mut pool = Self::prepare_native(&connection, scratch, Vec::new())?;
         pool.attach_primary(first, connection)?;
         Ok(pool)
     }
@@ -449,13 +525,11 @@ impl Pool {
     pub(crate) fn prepare_native(
         connection: &Connection,
         scratch: &RawBlobs,
-        git: &Git,
         standby: Vec<StartingSession>,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
             scratch: scratch.clone(),
-            git: Arc::new(git.clone()),
             workers: Mutex::default(),
             wake: None,
         };
@@ -485,7 +559,6 @@ impl Pool {
         configuration: crate::http2::Configuration,
         branch: Option<BranchQuery>,
         scratch: &RawBlobs,
-        git: &Git,
     ) -> Result<Option<(Self, Option<Oid>)>> {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
@@ -495,8 +568,6 @@ impl Pool {
         let shared = Arc::<Shared>::default();
         let worker_state = shared.clone();
         let worker_scratch = scratch.clone();
-        let git = Arc::new(git.clone());
-        let worker_git = git.clone();
         let (ready, result) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("git-on-http2".into())
@@ -512,20 +583,13 @@ impl Pool {
                     return Ok(());
                 };
                 if ready.send(Some(selected)).is_ok() {
-                    worker_state.run_http2(
-                        client,
-                        read,
-                        worker_signal,
-                        &worker_scratch,
-                        &worker_git,
-                    );
+                    worker_state.run_http2(client, read, worker_signal, &worker_scratch);
                 }
                 Ok(())
             })?;
         let pool = Self {
             shared,
             scratch: scratch.clone(),
-            git,
             workers: Mutex::new(vec![worker]),
             wake: Some(signal),
         };
@@ -552,15 +616,22 @@ impl Pool {
     ) -> Result<()> {
         let shared = self.shared.clone();
         let scratch = self.scratch.clone();
-        let git = self.git.clone();
         let worker = thread::Builder::new()
             .name(format!("git-on-native-{index}"))
-            .spawn(move || shared.worker(index, session, connection, &scratch, &git, standby))?;
+            .spawn(move || shared.worker(index, session, connection, &scratch, standby))?;
         self.workers.get_mut().unwrap().push(worker);
         Ok(())
     }
 
     pub(crate) fn request(&self, oid: Oid) -> Result<Demand> {
+        self.request_with_lookup(oid, || self.scratch.lookup_demand(oid))
+    }
+
+    fn request_with_lookup(
+        &self,
+        oid: Oid,
+        lookup: impl FnOnce() -> DemandLookup,
+    ) -> Result<Demand> {
         object::check_transfer()?;
         let mut queue = self.shared.queue.lock().unwrap();
         if self.shared.stop.load(Ordering::Relaxed) {
@@ -571,13 +642,24 @@ impl Pool {
         }
         // Publication can race a caller's first cache lookup. See the pending
         // flight or the stored object under the same lock that retires flights.
-        if !queue.pending.contains_key(&oid) && self.scratch.available(oid) {
-            let demand = Demand::default();
-            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+        let pending = queue
+            .pending
+            .contains_key(&oid)
+            .then(|| queue.foreground(oid));
+        let lookup = lookup();
+        if lookup == DemandLookup::Missing {
+            let demand = pending.unwrap_or_else(|| queue.foreground(oid));
+            self.wake();
             return Ok(demand);
         }
-        let demand = queue.foreground(oid);
-        self.wake();
+        let joins_flight = pending.is_some();
+        let demand = pending.unwrap_or_default();
+        if joins_flight && lookup == DemandLookup::ClaimedForecast {
+            self.shared
+                .complete_object(oid, &demand, true, Acquired::Stored);
+        } else {
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+        }
         Ok(demand)
     }
 
@@ -602,7 +684,8 @@ impl Pool {
             return;
         }
         let mut accepted = 0;
-        for oid in candidates(queue.dense()) {
+        let prioritize_opened = !matches!(queue.mode, ConnectionMode::Standard) && queue.dense();
+        for oid in candidates(prioritize_opened) {
             if queue.pending.contains_key(&oid)
                 || queue.predicted.contains_key(&oid)
                 || self.scratch.available(oid)
@@ -694,21 +777,31 @@ impl Drop for Pool {
 }
 
 impl Shared {
+    fn complete_object(&self, oid: Oid, demand: &Demand, speculative: bool, acquired: Acquired) {
+        demand.complete_with(Batch::new(vec![oid], Ok(acquired)), |state| {
+            if !state.counted {
+                state.counted = true;
+                self.oids.fetch_add(1, Ordering::Relaxed);
+                if speculative {
+                    self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     fn response(
         self: &Arc<Self>,
         work: &Work,
         oids: &[Oid],
         scratch: &RawBlobs,
-    ) -> pack_stream::Response {
+    ) -> pack_stream::Response<'static> {
         let shared = self.clone();
         let mut cache = scratch.clone();
+        let transfer = work.transfer.clone();
         let speculative = work.speculative;
-        let tasks: Vec<_> = work
-            .items
-            .iter()
-            .map(|item| (item.oid, item.demand.clone()))
-            .collect();
-        pack_stream::Response::new(
+        let tasks = work.readers.clone();
+        let forecast = speculative.then(|| tasks.clone());
+        let mut response = pack_stream::Response::new(
             scratch.clone(),
             oids.to_vec(),
             Box::new(move |object| {
@@ -718,88 +811,61 @@ impl Shared {
                     .find(|(wanted, _)| *wanted == oid)
                     .expect("known want")
                     .1;
-                let acquired = if object.kind() == git2::ObjectType::Blob {
-                    cache.insert_verified_blob(&object)?;
-                    if speculative {
-                        shared.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Acquired::Stored
+                let publish = |acquired| {
+                    shared.complete_object(oid, demand, speculative, acquired);
+                };
+                if object.kind() == git2::ObjectType::Blob {
+                    cache.insert_verified_blob(
+                        object,
+                        Some(Arc::downgrade(&transfer)),
+                        speculative,
+                        || !speculative || demand.required(),
+                        |already_stored| {
+                            // An existing blob can have been exposed by a
+                            // verified extra whose flight completion still
+                            // holds the queue. Let that completion win before
+                            // reporting the duplicate's successful decode.
+                            let _publication = already_stored.then(|| shared.queue.lock().unwrap());
+                            publish(Acquired::Stored);
+                        },
+                    )
                 } else {
                     anyhow::ensure!(!speculative, "prefetched object is not a blob");
-                    Acquired::Object(object)
-                };
-                shared.oids.fetch_add(1, Ordering::Relaxed);
-                demand.complete(Batch::new(vec![oid], Ok(acquired)));
-                Ok(())
+                    // A validated extra can supply a tree before this
+                    // duplicate response finishes decoding it.
+                    let _publication = shared.queue.lock().unwrap();
+                    publish(Acquired::Object(object));
+                    Ok(())
+                }
             }),
-        )
+        );
+        let shared = self.clone();
+        let extras = work.extras.clone();
+        response.on_pending_extra(move |oid| shared.join_pack_extra(&extras, oid));
+        if let Some(forecast) = forecast {
+            let extras = work.extras.clone();
+            response.set_required(move |remaining| {
+                forecast.iter().any(|(oid, demand)| {
+                    demand.required() && remaining.contains(oid) && !demand.ready()
+                }) || extras.lock().unwrap().as_deref().is_some_and(|extras| {
+                    extras
+                        .iter()
+                        .any(|item| item.demand.required() && !item.demand.ready())
+                })
+            });
+        }
+        response
     }
 
-    fn resolve_pack_remainder(
-        &self,
-        work: &Work,
-        scratch: &RawBlobs,
-        git: &Git,
-        pack: Spool,
-    ) -> Result<()> {
-        let directory = Arc::new(scratch.index_directory()?);
-        let mut options = git2::RepositoryInitOptions::new();
-        options.bare(true).external_template(false);
-        let repository = git2::Repository::init_opts(directory.path(), &options)?;
-        let odb = repository.odb()?;
-        pack_stream::index(&odb, &pack)?;
-        // Keep unrequested bases compressed until they are needed. A
-        // later demand can then import them without another network fetch.
-        let mut cancelled = None;
-        let indexed = odb.foreach(|oid| {
-            if let Err(error) = object::check_transfer() {
-                cancelled = Some(error);
-                return false;
-            }
-            if !work.items.iter().any(|item| item.oid == *oid) {
-                scratch.remember_packed(*oid, &directory);
-            }
-            true
-        });
-        if let Some(cancelled) = cancelled {
-            return Err(cancelled);
+    fn join_pack_extra(&self, extras: &Mutex<Option<Vec<QueuedDemand>>>, oid: Oid) {
+        let mut queue = self.queue.lock().unwrap();
+        let mut extras = extras.lock().unwrap();
+        let Some(extras) = extras.as_mut() else {
+            return;
+        };
+        if let Some(item) = queue.join_extra(oid) {
+            extras.push(item);
         }
-        indexed?;
-        let mut cache = scratch.clone();
-        for item in work.items.iter().filter(|item| !item.demand.ready()) {
-            let (size, kind) = odb.read_header(item.oid)?;
-            anyhow::ensure!(
-                kind == git2::ObjectType::Blob,
-                "prefetched object is not a blob"
-            );
-            if size > NATIVE_BLOB_STREAM_THRESHOLD {
-                let mut command = git.command(Some(repository.path()));
-                command
-                    .args(["-c", "core.bigFileThreshold=8m", "cat-file", "blob"])
-                    .arg(item.oid.to_string())
-                    .stdin(std::process::Stdio::null());
-                let (output, ()) = crate::git::run_with_output(command, None, |input| {
-                    cache.insert_fetched(item.oid, size, input)?;
-                    Ok(())
-                })
-                .context("stream large prefetched Git blob")?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "cannot decode prefetched Git blob: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            } else {
-                let object = odb.read(item.oid)?;
-                cache.insert_prefetched_odb_blob(item.oid, &object)?;
-            }
-            if work.speculative {
-                self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
-            }
-            self.oids.fetch_add(1, Ordering::Relaxed);
-            item.demand
-                .complete(Batch::new(vec![item.oid], Ok(Acquired::Stored)));
-        }
-        Ok(())
     }
 
     fn finish(
@@ -809,9 +875,13 @@ impl Shared {
         started: Instant,
         lane: Option<usize>,
         scratch: &RawBlobs,
-        git: &Git,
     ) {
-        let result = result.and_then(|pack| {
+        // Treat a validated extra and the completion of its existing flight
+        // as one publication with respect to requests and failure reporting.
+        let mut queue = self.queue.lock().unwrap();
+        let mut validated = Vec::new();
+        let result = result.map(|mut pack| {
+            pack.cache_extras(scratch, |oid| validated.push(oid));
             self.packs.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(pack.bytes, Ordering::Relaxed);
             if lane.is_none() {
@@ -820,22 +890,30 @@ impl Shared {
             if work.speculative {
                 self.prefetches.fetch_add(1, Ordering::Relaxed);
             }
-            match pack.fallback {
-                Some(file) if work.cache_remainder() => {
-                    self.resolve_pack_remainder(&work, scratch, git, file)?;
-                    Ok(None)
-                }
-                Some(file) => Ok(Some(Acquired::Pack(file))),
-                None => {
-                    self.streamed_packs.fetch_add(1, Ordering::Relaxed);
-                    Ok(None)
-                }
-            }
+            self.streamed_packs.fetch_add(1, Ordering::Relaxed);
         });
 
-        let mut queue = self.queue.lock().unwrap();
         if let Some(index) = lane {
             queue.busy[index] = false;
+        }
+        let required = result.is_err()
+            && work.items.iter().any(|item| {
+                item.demand
+                    .needs_pack(item.oid, scratch, &work.transfer, work.speculative)
+            });
+        // libcurl can finish a failed transfer while its decoder processes the
+        // last packet. Close registration under the queue lock before leaving
+        // any waiters for another request.
+        let extras = work.extras.lock().unwrap().take().expect("pack is active");
+        if result.is_ok() {
+            // A different pack can validate the base while the pack that
+            // reserved its flight is still waiting for its trailer.
+            for oid in validated {
+                queue.complete_extra(oid);
+            }
+        } else {
+            work.items
+                .extend(extras.into_iter().filter(|item| !item.demand.ready()));
         }
         // Retire a speculative success from the queue once its verified blob
         // is visible in the raw store. A foreground waiter still holds a clone.
@@ -849,12 +927,12 @@ impl Shared {
             false
         });
         let result = match result {
-            Ok(payload) => {
+            Ok(()) => {
                 queue.mode.record_reply(started.elapsed());
-                payload.map(Ok)
+                None
             }
             Err(error)
-                if work.speculative
+                if !required
                     && !self.stop.load(Ordering::Relaxed)
                     && queue.failure.is_none()
                     && !object::is_cancelled(&error) =>
@@ -866,7 +944,7 @@ impl Shared {
                 return;
             }
             Err(error) => {
-                if !work.speculative && !object::is_cancelled(&error) {
+                if required && !object::is_cancelled(&error) {
                     queue.failure.get_or_insert_with(|| format!("{error:#}"));
                 }
                 Some(Err(error))
@@ -882,37 +960,36 @@ impl Shared {
         self.work.notify_all();
     }
 
+    fn report_http2_failure(
+        self: &Arc<Self>,
+        work: &Work,
+        cache: &RawBlobs,
+    ) -> crate::http2::ReportFailure {
+        let readers = work.readers.clone();
+        let transfer = work.transfer.clone();
+        let speculative = work.speculative;
+        let shared = self.clone();
+        let cache = cache.clone();
+        Arc::new(move |error| {
+            let mut queue = shared.queue.lock().unwrap();
+            if readers
+                .iter()
+                .any(|(oid, demand)| demand.needs_pack(*oid, &cache, &transfer, speculative))
+            {
+                queue.failure.get_or_insert_with(|| format!("{error:#}"));
+            }
+        })
+    }
+
     fn run_http2(
         self: &Arc<Self>,
         mut client: crate::http2::Client,
         mut wake: UnixStream,
         signal: Arc<UnixStream>,
         scratch: &RawBlobs,
-        git: &Git,
     ) {
-        let decoding = AtomicBool::new(true);
-        thread::scope(|scope| {
-            let (defer, fallback) = mpsc::channel::<FallbackPack>();
-            let running = &decoding;
-            let decoder = thread::Builder::new()
-                .name("git-on-pack-fallback".into())
-                .spawn_scoped(scope, move || {
-                    for (batch, pack) in fallback {
-                        if self.stop.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        self.finish(batch.work, Ok(pack), batch.started, None, scratch, git);
-                        signal_http2(&signal);
-                    }
-                });
-            let outcome = match decoder {
-                Ok(_) => self.drive_http2(&mut client, &mut wake, &defer, scratch, git),
-                Err(error) => Err(error).context("start Git pack fallback decoder"),
-            };
-            decoding.store(false, Ordering::Relaxed);
-            drop(defer);
-            self.finish_http2(outcome.err().filter(|error| !object::is_cancelled(error)));
-        });
+        let outcome = self.drive_http2(&mut client, &mut wake, &signal, scratch);
+        self.finish_http2(outcome.err().filter(|error| !object::is_cancelled(error)));
     }
 
     fn finish_http2(&self, failure: Option<anyhow::Error>) {
@@ -939,9 +1016,8 @@ impl Shared {
         self: &Arc<Self>,
         client: &mut crate::http2::Client,
         wake: &mut UnixStream,
-        defer: &mpsc::Sender<FallbackPack>,
+        decoder_wake: &Arc<UnixStream>,
         scratch: &RawBlobs,
-        git: &Git,
     ) -> Result<()> {
         let mut active = HashMap::<usize, Http2Batch>::new();
         let mut token = 0_usize;
@@ -975,14 +1051,20 @@ impl Shared {
                             token = token
                                 .checked_add(1)
                                 .context("Git HTTP/2 request ID overflow")?;
-                            client.start(token, &oids, self.response(&work, &oids, scratch))
+                            client.start(
+                                token,
+                                &oids,
+                                self.response(&work, &oids, scratch),
+                                decoder_wake,
+                                Some(self.report_http2_failure(&work, scratch)),
+                            )
                         }
                     };
                     match submitted {
                         Ok(()) => {
                             active.insert(token, Http2Batch { work, started });
                         }
-                        Err(error) => self.finish(work, Err(error), started, None, scratch, git),
+                        Err(error) => self.finish(work, Err(error), started, None, scratch),
                     }
                     self.http2_peak
                         .fetch_max(active.len() as u64, Ordering::Relaxed);
@@ -992,20 +1074,18 @@ impl Shared {
                 let batch = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
-                match pack {
-                    Ok(pack) if pack.fallback.is_some() && batch.work.cache_remainder() => {
-                        defer
-                            .send((batch, pack))
-                            .map_err(|_| anyhow::anyhow!("Git pack fallback decoder stopped"))?;
-                    }
-                    pack => self.finish(batch.work, pack, batch.started, None, scratch, git),
-                }
+                self.finish(batch.work, pack, batch.started, None, scratch);
             }
             let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
                 remaining.max(Duration::from_millis(1))
             });
             // A failed prefetch can enqueue an exact retry from this thread.
-            if delay.is_some() || self.queue.lock().unwrap().waiting.is_empty() {
+            let wait = self
+                .queue
+                .lock()
+                .unwrap()
+                .wait_for_http2_event(delay, !active.is_empty());
+            if wait {
                 client.wait(wake, timeout)?;
             }
         }
@@ -1018,7 +1098,6 @@ impl Shared {
         mut session: Option<Session>,
         connection: Connection,
         scratch: &RawBlobs,
-        git: &Git,
         standby: Option<StartingSession>,
     ) -> Result<()> {
         if let Some(mut standby) = standby {
@@ -1090,7 +1169,7 @@ impl Shared {
                         session = Some(new);
                     }
                     Err(error) => {
-                        self.finish(work, Err(error), started, Some(index), scratch, git);
+                        self.finish(work, Err(error), started, Some(index), scratch);
                         continue;
                     }
                 }
@@ -1110,12 +1189,12 @@ impl Shared {
                 // fetch_stream reaps a channel with an incomplete response.
                 session = None;
             }
-            self.finish(work, result, started, Some(index), scratch, git);
+            self.finish(work, result, started, Some(index), scratch);
         }
     }
 }
 
-fn signal_http2(mut wake: &UnixStream) {
+pub(crate) fn signal_http2(mut wake: &UnixStream) {
     // A full signal socket is already readable.
     let _ = wake.write(&[1]);
 }
@@ -1135,6 +1214,21 @@ fn drain_wake(wake: &mut UnixStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_validated_pack_completes_an_existing_base_flight() {
+        let mut queue = Queue::default();
+        let oid = Oid::from_bytes(&[23; 20]).unwrap();
+        let first = queue.join_extra(oid).unwrap();
+        let reader = queue.foreground(oid);
+        assert!(!reader.ready());
+        assert!(queue.waiting.is_empty());
+        assert!(queue.join_extra(oid).is_none());
+        queue.complete_extra(oid);
+        assert!(reader.ready());
+        assert!(first.demand.ready());
+        assert!(!queue.pending.contains_key(&oid));
+    }
 
     #[test]
     fn startup_exact_demand_uses_a_prepared_channel() {
@@ -1186,33 +1280,69 @@ mod tests {
 
     #[test]
     fn forecast_grows_with_distinct_hits_and_shrinks_on_misses() {
-        let mut queue = Queue::default();
-        for index in 0..6 {
-            let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid, queue.forecast_step);
-            let expected = match index {
-                0 => 4,
-                1..=2 => 64,
-                3..=4 => 128,
-                _ => 256,
+        for mode in [ConnectionMode::Probing(0), ConnectionMode::Standard] {
+            let mut queue = Queue {
+                mode,
+                ..Queue::default()
             };
-            assert_eq!(queue.forecast_width(oid), expected);
-        }
-        let mut previous = MAX_READ_AHEAD;
-        for width in [128, 128, 64, 64, 4] {
-            for _ in 1..FORECAST_MISSES {
-                assert_eq!(queue.forecast_width(Oid::zero()), previous);
+            for index in 0..6 {
+                let oid = Oid::from_bytes(&[index; 20]).unwrap();
+                queue.predicted.insert(oid, queue.forecast_step);
+                let expected = match index {
+                    0 => 4,
+                    1..=2 => 64,
+                    3..=4 => 128,
+                    _ => 256,
+                };
+                assert_eq!(queue.forecast_width(oid), expected);
             }
-            assert_eq!(queue.forecast_width(Oid::zero()), width);
-            previous = width;
+            let mut previous = MAX_READ_AHEAD;
+            for width in [128, 128, 64, 64, 4] {
+                for _ in 1..FORECAST_MISSES {
+                    assert_eq!(queue.forecast_width(Oid::zero()), previous);
+                }
+                assert_eq!(queue.forecast_width(Oid::zero()), width);
+                previous = width;
+            }
         }
+    }
 
-        queue.mode = ConnectionMode::Standard;
-        for index in 0..6 {
-            let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid, queue.forecast_step);
-            assert_eq!(queue.forecast_width(oid), READ_AHEAD);
-        }
+    #[test]
+    fn fast_scan_batches_files_after_its_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = Oid::from_bytes(&[1; 20]).unwrap();
+        let earlier = Oid::from_bytes(&[2; 20]).unwrap();
+        let following: [Oid; 5] =
+            std::array::from_fn(|index| Oid::from_bytes(&[index as u8 + 3; 20]).unwrap());
+        let mut queue = Queue {
+            mode: ConnectionMode::Standard,
+            forecast_score: DENSE_SCORE - 1,
+            ..Queue::default()
+        };
+        queue.predicted.insert(anchor, 0);
+        let pool = Pool {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(queue),
+                ..Shared::default()
+            }),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            workers: Mutex::default(),
+            wake: None,
+        };
+        pool.prefetch(
+            anchor,
+            |prioritize_opened| {
+                following
+                    .into_iter()
+                    .map(move |oid| if prioritize_opened { earlier } else { oid })
+            },
+            |_| false,
+        );
+        let wants = {
+            let mut queue = pool.shared.queue.lock().unwrap();
+            Work::take(&mut queue.ahead, true).unwrap().wants()
+        };
+        assert_eq!(wants, following);
     }
 
     #[test]
@@ -1262,6 +1392,31 @@ mod tests {
     }
 
     #[test]
+    fn fast_forecasts_can_restart_after_a_widened_scan_misses() {
+        let mut queue = Queue {
+            mode: ConnectionMode::Standard,
+            forecast_score: DENSE_SCORE - 1,
+            ..Queue::default()
+        };
+        let anchor = Oid::from_bytes(&[1; 20]).unwrap();
+        queue.predicted.insert(anchor, queue.forecast_step);
+        assert_eq!(queue.forecast_width(anchor), 64);
+        for value in 2..=24 {
+            let oid = Oid::from_bytes(&[value; 20]).unwrap();
+            queue.predicted.insert(oid, queue.forecast_step);
+        }
+        let active = Oid::from_bytes(&[2; 20]).unwrap();
+        queue.pending.insert(active, Demand::default());
+        for index in 0..=MIN_PREDICTION_AGE {
+            queue.forecast_width(Oid::from_bytes(&[100 + index as u8; 20]).unwrap());
+        }
+        assert!(!queue.dense());
+        assert_eq!(queue.prediction_room(READ_AHEAD), READ_AHEAD);
+        assert_eq!(queue.predicted.len(), 1);
+        assert!(queue.predicted.contains_key(&active));
+    }
+
+    #[test]
     fn failed_speculation_requeues_the_live_waiter() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
@@ -1284,7 +1439,6 @@ mod tests {
             Instant::now(),
             None,
             &scratch,
-            &Git::capture(directory.path()).unwrap(),
         );
         let queue = shared.queue.lock().unwrap();
         assert!(queue.failure.is_none());
@@ -1293,6 +1447,452 @@ mod tests {
         assert_eq!(queue.waiting[0].oid, used);
         assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
         assert!(!demand.ready());
+    }
+
+    #[test]
+    fn retired_prefetch_cannot_claim_an_ordinary_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Shared::default();
+        let forecast = Oid::from_bytes(&[1; 20]).unwrap();
+        let extra = Oid::from_bytes(&[2; 20]).unwrap();
+        let (work, demand) = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(forecast);
+            queue.ahead.push_back(item);
+            (
+                Work::take(&mut queue.ahead, true).unwrap(),
+                queue.foreground(extra),
+            )
+        };
+        let extras = work.extras.clone();
+        shared.finish(
+            work,
+            Err(anyhow::anyhow!("HTTP/2 request ended")),
+            Instant::now(),
+            None,
+            &scratch,
+        );
+        // A decoder already processing an entry may discover its OID after
+        // curl reports the failure and the request has been retired.
+        shared.join_pack_extra(&extras, extra);
+
+        let queue = shared.queue.lock().unwrap();
+        assert!(queue.failure.is_none());
+        assert_eq!(queue.waiting.len(), 1);
+        assert_eq!(queue.waiting[0].oid, extra);
+        assert!(Arc::ptr_eq(&queue.waiting[0].demand.0, &demand.0));
+    }
+
+    #[test]
+    fn failed_prefetch_ignores_reads_supplied_by_another_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Arc::<Shared>::default();
+        let data = b"blob from another pack";
+        let oid = Oid::hash_object(git2::ObjectType::Blob, data).unwrap();
+        let work = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            Work::take(&mut queue.ahead, true).unwrap()
+        };
+        scratch
+            .insert_fetched(oid, data.len(), &data[..], None)
+            .unwrap();
+        assert!(scratch.for_read(oid).unwrap().is_some());
+        let error = anyhow::anyhow!("unused forecast transfer failed");
+        shared.report_http2_failure(&work, &scratch)(&error);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+        shared.finish(work, Err(error), Instant::now(), None, &scratch);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+    }
+
+    fn pack_reply(entries: &[(git2::ObjectType, &[u8])], complete: bool) -> Vec<u8> {
+        use sha1_checked::Digest;
+
+        let mut pack = b"PACK\0\0\0\x02".to_vec();
+        pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (kind, data) in entries {
+            assert!(data.len() < 16);
+            pack.push((*kind as u8) << 4 | data.len() as u8);
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(&mut pack, flate2::Compression::fast());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap();
+        }
+        if complete {
+            let checksum = sha1_checked::Sha1::digest(&pack);
+            pack.extend_from_slice(&checksum);
+        }
+        let mut reply = format!("000dpackfile\n{:04x}\x01", pack.len() + 5).into_bytes();
+        reply.extend_from_slice(&pack);
+        if complete {
+            reply.extend_from_slice(b"0000");
+        }
+        reply
+    }
+
+    #[test]
+    fn failed_exact_transfer_checks_which_pack_served_the_read() {
+        use git2::ObjectType::Blob;
+
+        #[derive(Debug)]
+        enum Completion {
+            Extra,
+            CachedDecode,
+            FreshDecode,
+            RetiredForecast,
+        }
+        for completion in [
+            Completion::Extra,
+            Completion::CachedDecode,
+            Completion::FreshDecode,
+            Completion::RetiredForecast,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut scratch = RawBlobs::new(directory.path()).unwrap();
+            let shared = Arc::<Shared>::default();
+            let data = b"stored bytes";
+            let oid = Oid::hash_object(Blob, data).unwrap();
+            let retired = if matches!(completion, Completion::RetiredForecast) {
+                let forecast = {
+                    let mut queue = shared.queue.lock().unwrap();
+                    let item = queue.insert(oid);
+                    queue.ahead.push_back(item);
+                    Work::take(&mut queue.ahead, true).unwrap()
+                };
+                let response = shared.response(&forecast, &[oid], &scratch);
+                let report = shared.report_http2_failure(&forecast, &scratch);
+                let old = forecast.readers[0].1.clone();
+                shared.finish(
+                    forecast,
+                    Err(anyhow::anyhow!("unused forecast reset")),
+                    Instant::now(),
+                    None,
+                    &scratch,
+                );
+                Some((old, response, report))
+            } else {
+                None
+            };
+            let (work, demand) = {
+                let mut queue = shared.queue.lock().unwrap();
+                let demand = queue.foreground(oid);
+                let work = Work::take(&mut queue.waiting, false).unwrap();
+                (work, demand)
+            };
+            let reads_exact = matches!(completion, Completion::FreshDecode);
+            if let Some((old, mut response, report)) = retired {
+                assert!(!Arc::ptr_eq(&old.0, &demand.0));
+                response
+                    .write_http(&pack_reply(&[(Blob, data)], false))
+                    .unwrap();
+                report(&anyhow::anyhow!("unused forecast reset"));
+                assert!(shared.queue.lock().unwrap().failure.is_none());
+            } else {
+                let other = b"alternate";
+                let other_oid = Oid::hash_object(Blob, other).unwrap();
+                let alternate = {
+                    let mut queue = shared.queue.lock().unwrap();
+                    queue.foreground(other_oid);
+                    Work::take(&mut queue.waiting, false).unwrap()
+                };
+                let mut response = shared.response(&alternate, &[other_oid], &scratch);
+                response
+                    .write_http(&pack_reply(&[(Blob, other), (Blob, data)], true))
+                    .unwrap();
+                shared.finish(
+                    alternate,
+                    response.finish_http(),
+                    Instant::now(),
+                    None,
+                    &scratch,
+                );
+                assert!(demand.ready());
+                let Some(crate::raw_blob::ReceivedObject::Verified(extra)) = scratch.received(oid)
+                else {
+                    panic!("validated pack did not publish its extra");
+                };
+                // Leave the extra unhydrated when the exact decoder is
+                // supposed to supply the raw blob before the read.
+                if !reads_exact {
+                    scratch
+                        .insert_verified_blob(extra, None, false, || false, |_| {})
+                        .unwrap();
+                }
+            }
+            if !matches!(completion, Completion::Extra) {
+                shared
+                    .response(&work, &[oid], &scratch)
+                    .write_http(&pack_reply(&[(Blob, data)], false))
+                    .unwrap();
+                assert!(demand.ready());
+            }
+            let acquired = demand.wait().take().unwrap().unwrap();
+            assert_eq!(
+                matches!(acquired, Acquired::ValidatedExtra),
+                !matches!(completion, Completion::RetiredForecast),
+                "{completion:?}"
+            );
+            let (blob, _) = scratch.for_read(oid).unwrap().unwrap();
+            assert_eq!(blob.read(0, data.len() as u32).unwrap(), data);
+
+            const RESET: &str = "exact response was reset";
+            let error = anyhow::anyhow!(RESET);
+            shared.report_http2_failure(&work, &scratch)(&error);
+            let early = shared.queue.lock().unwrap().failure.take();
+            shared.finish(work, Err(error), Instant::now(), None, &scratch);
+            let finished = shared.queue.lock().unwrap().failure.take();
+            let expected =
+                (reads_exact || matches!(completion, Completion::RetiredForecast)).then_some(RESET);
+            assert_eq!(early.as_deref(), expected, "{completion:?}");
+            assert_eq!(finished.as_deref(), expected, "{completion:?}");
+        }
+    }
+
+    #[test]
+    fn exact_tree_delivery_waits_for_validated_extra_publication() {
+        use git2::ObjectType::{Blob, Tree};
+
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Arc::<Shared>::default();
+        let tree = Oid::hash_object(Tree, b"").unwrap();
+        let blob = Oid::hash_object(Blob, b"other").unwrap();
+        let (exact, demand, alternate) = {
+            let mut queue = shared.queue.lock().unwrap();
+            let demand = queue.foreground(tree);
+            let exact = Work::take(&mut queue.waiting, false).unwrap();
+            queue.foreground(blob);
+            let alternate = Work::take(&mut queue.waiting, false).unwrap();
+            (exact, demand, alternate)
+        };
+        let mut response = shared.response(&alternate, &[blob], &scratch);
+        response
+            .write_http(&pack_reply(&[(Blob, b"other"), (Tree, b"")], true))
+            .unwrap();
+        let mut pack = response.finish_http().unwrap();
+        let mut response = shared.response(&exact, &[tree], &scratch);
+        let mut queue = shared.queue.lock().unwrap();
+        let mut validated = Vec::new();
+        pack.cache_extras(&scratch, |oid| validated.push(oid));
+        assert_eq!(validated, [tree]);
+        thread::scope(|scope| {
+            let (started, start) = mpsc::sync_channel(0);
+            let (finished, finish) = mpsc::channel();
+            let worker = scope.spawn(move || {
+                let body = pack_reply(&[(Tree, b"")], false);
+                started.send(()).unwrap();
+                let result = response.write_http(&body);
+                finished.send(()).unwrap();
+                result
+            });
+            start.recv().unwrap();
+            let _ = finish.recv_timeout(Duration::from_millis(100));
+            queue.complete_extra(tree);
+            drop(queue);
+            worker.join().unwrap().unwrap();
+        });
+        assert!(matches!(
+            demand.wait().take(),
+            Some(Ok(Acquired::ValidatedExtra))
+        ));
+        let error = anyhow::anyhow!("redundant tree transfer reset");
+        shared.report_http2_failure(&exact, &scratch)(&error);
+        shared.finish(exact, Err(error), Instant::now(), None, &scratch);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn failed_prefetch_does_not_treat_a_cancelled_waiter_as_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Arc::<Shared>::default();
+        let data = b"late but no reader";
+        let oid = Oid::hash_object(git2::ObjectType::Blob, data).unwrap();
+        let (work, demand) = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            let work = Work::take(&mut queue.ahead, true).unwrap();
+            (work, queue.foreground(oid))
+        };
+        let report = shared.report_http2_failure(&work, &scratch);
+        let error = anyhow::anyhow!("unused forecast transfer failed");
+        report(&error);
+        demand.complete(Batch::new(
+            vec![oid],
+            Err(object::OperationCancelled.into()),
+        ));
+        scratch
+            .insert_fetched(
+                oid,
+                data.len(),
+                &data[..],
+                Some(Arc::downgrade(&work.transfer)),
+            )
+            .unwrap();
+        shared.complete_object(oid, &demand, true, Acquired::Stored);
+        report(&error);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn failed_prefetch_reports_pack_errors_after_a_real_read() {
+        for joins_request in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut scratch = RawBlobs::new(directory.path()).unwrap();
+            let shared = Arc::<Shared>::default();
+            let data = vec![b'x'; crate::raw_blob::BLOCK + 1];
+            let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
+            let work = {
+                let mut queue = shared.queue.lock().unwrap();
+                let item = queue.insert(oid);
+                queue.ahead.push_back(item);
+                let work = Work::take(&mut queue.ahead, true).unwrap();
+                if joins_request {
+                    queue.foreground(oid);
+                }
+                work
+            };
+            let report = shared.report_http2_failure(&work, &scratch);
+            scratch
+                .insert_fetched(
+                    oid,
+                    data.len(),
+                    &data[..],
+                    Some(Arc::downgrade(&work.transfer)),
+                )
+                .unwrap();
+            if joins_request {
+                let demand = &work.items[0].demand;
+                shared.complete_object(oid, demand, true, Acquired::Stored);
+                assert!(matches!(demand.wait().take(), Some(Ok(Acquired::Stored))));
+            } else {
+                let (blob, first) = scratch.for_read(oid).unwrap().unwrap();
+                assert!(first);
+                assert_eq!(blob.read(0, 1).unwrap(), b"x");
+            }
+            let error = anyhow::anyhow!("Git pack checksum mismatch");
+            report(&error);
+            assert_eq!(
+                shared.queue.lock().unwrap().failure.take().as_deref(),
+                Some("Git pack checksum mismatch")
+            );
+            shared.complete_object(oid, &work.items[0].demand, true, Acquired::Stored);
+            shared.finish(work, Err(error), Instant::now(), None, &scratch);
+            let queue = shared.queue.lock().unwrap();
+            assert_eq!(queue.failure.as_deref(), Some("Git pack checksum mismatch"));
+            assert!(queue.waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn ready_forecasts_are_not_submitted_with_waiting_work() {
+        let mut queue = Queue::default();
+        let cached = Oid::from_bytes(&[1; 20]).unwrap();
+        let missing = Oid::from_bytes(&[2; 20]).unwrap();
+        // A foreground request can claim verified bytes from a retiring
+        // forecast after its own item entered the wait queue.
+        let demand = queue.foreground(cached);
+        demand.complete(Batch::new(vec![cached], Ok(Acquired::Stored)));
+        queue.foreground(missing);
+        let work = Work::take(&mut queue.waiting, false).unwrap();
+        assert_eq!(work.wants(), [missing]);
+        assert!(queue.waiting.is_empty());
+        assert!(queue.pending[&cached].ready());
+    }
+
+    #[test]
+    fn pending_demand_reuses_a_blob_admitted_before_its_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool {
+            shared: Arc::default(),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            workers: Mutex::default(),
+            wake: None,
+        };
+        let data = vec![b'x'; crate::raw_blob::BLOCK + 1];
+        let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
+        let flight = {
+            let mut queue = pool.shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            let flight = item.demand.clone();
+            queue.ahead.push_back(item);
+            flight
+        };
+        pool.scratch
+            .clone()
+            .insert_fetched(oid, data.len(), &data[..], None)
+            .unwrap();
+        let mut required_during_lookup = false;
+        let demand = pool
+            .request_with_lookup(oid, || {
+                required_during_lookup = flight.required();
+                pool.scratch.lookup_demand(oid)
+            })
+            .unwrap();
+        assert!(
+            required_during_lookup,
+            "the decoder must see the joining reader before lookup"
+        );
+        assert!(demand.ready());
+        assert!(Work::take(&mut pool.shared.queue.lock().unwrap().waiting, false).is_none());
+        assert_eq!(pool.metrics().oids, 0);
+        for _ in 0..2 {
+            pool.shared
+                .complete_object(oid, &flight, true, Acquired::Stored);
+        }
+        assert_eq!(pool.metrics().oids, 1);
+    }
+
+    #[test]
+    fn a_satisfied_forecast_leaves_the_foreground_decode_buffer_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RawBlobs::new(directory.path()).unwrap();
+        let held: Vec<_> = (0..7)
+            .map(|_| {
+                cache
+                    .reserve_pack_decode(|| false, object::check_transfer)
+                    .unwrap()
+            })
+            .collect();
+        let shared = Arc::<Shared>::default();
+        let oid = Oid::from_bytes(&[1; 20]).unwrap();
+        let work = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            let work = Work::take(&mut queue.ahead, true).unwrap();
+            let demand = queue.foreground(oid);
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+            work
+        };
+        let mut pack = shared.response(&work, &[oid], &cache);
+        let (start, started) = mpsc::channel();
+        let (write, written) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                start.send(()).unwrap();
+                write
+                    .send(
+                        pack.write_http(
+                            b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20",
+                        ),
+                    )
+                    .unwrap();
+            });
+            let began = started.recv_timeout(Duration::from_secs(3));
+            let attempted = written.recv_timeout(Duration::from_millis(150));
+            drop(held);
+            began.unwrap();
+            assert!(matches!(attempted, Err(mpsc::RecvTimeoutError::Timeout)));
+            written
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[test]
@@ -1356,5 +1956,15 @@ mod tests {
             });
         }
         assert_eq!(queue.batch_wait(now, true), None);
+
+        queue.mode = ConnectionMode::Standard;
+        queue.waiting.truncate(1);
+        assert_eq!(queue.batch_wait(now, true), None);
+        queue.forecast_score = DENSE_SCORE;
+        let delay = queue.batch_wait(now, true);
+        assert_eq!(delay, Some(BATCH_WINDOW));
+        assert!(queue.wait_for_http2_event(delay, true));
+        assert!(!queue.wait_for_http2_event(delay, false));
+        assert_eq!(queue.batch_wait(now, false), None);
     }
 }

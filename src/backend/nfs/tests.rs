@@ -14,9 +14,13 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
+    fixture_with_content(policy, b"tracked bytes")
+}
+
+fn fixture_with_content(policy: WritePolicy, content: &[u8]) -> (tempfile::TempDir, Server) {
     let directory = tempfile::tempdir().unwrap();
     let repo = git2::Repository::init(directory.path()).unwrap();
-    let blob = repo.blob(b"tracked bytes").unwrap();
+    let blob = repo.blob(content).unwrap();
     let mut tree = repo.treebuilder(None).unwrap();
     tree.insert("tracked", blob, 0o100644).unwrap();
     let tree = tree.write().unwrap().to_string();
@@ -97,6 +101,18 @@ pub(super) fn session_with(
     server: &mut Server,
     call: impl Fn(u32, u32, &[u8]) -> Vec<u8>,
 ) -> [u8; 16] {
+    let create = create_session_request(server, &call, MAX_RECORD as u32);
+    let reply = server.rpc(&call(2, 1, &create)).unwrap();
+    let mut r = results(&reply, OK, 1);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (43, OK));
+    r.fixed().unwrap()
+}
+
+fn create_session_request(
+    server: &mut Server,
+    call: impl Fn(u32, u32, &[u8]) -> Vec<u8>,
+    reply_limit: u32,
+) -> Vec<u8> {
     let exchange = xdr(|w| {
         w.u32(42);
         w.fixed(&[7; 8]);
@@ -110,7 +126,7 @@ pub(super) fn session_with(
     assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (42, OK));
     let client = r.u64().unwrap();
     let sequence = r.u32().unwrap();
-    let create = xdr(|w| {
+    xdr(|w| {
         w.u32(43);
         w.u64(client);
         w.u32(sequence);
@@ -119,8 +135,8 @@ pub(super) fn session_with(
             for n in [
                 0,
                 MAX_RECORD as u32,
-                MAX_RECORD as u32,
-                MAX_RECORD as u32,
+                reply_limit,
+                reply_limit,
                 MAX_OPS as u32,
                 4,
                 0,
@@ -130,11 +146,43 @@ pub(super) fn session_with(
         }
         w.u32(0);
         w.u32(0);
-    });
+    })
+}
+
+#[test]
+fn create_session_replay_keeps_only_the_operation_payload() {
+    let (_dir, mut server) = fixture(WritePolicy::None);
+    let request = create_session_request(&mut server, call, MAX_RECORD as u32);
+    let original = server.rpc(&call(2, 1, &request)).unwrap();
+    let replay = server.rpc(&call(3, 1, &request)).unwrap();
+    assert_eq!(original[4..], replay[4..]);
+}
+
+#[test]
+fn cached_read_reply_fits_the_negotiated_slot_budget() {
+    const COUNT: usize = 600 * 1024;
+    const LIMIT: usize = 1024 * 1024;
+    let (_dir, mut server) = fixture_with_content(WritePolicy::None, &vec![b'x'; COUNT]);
+    let create = create_session_request(&mut server, call, LIMIT as u32);
     let reply = server.rpc(&call(2, 1, &create)).unwrap();
-    let mut r = results(&reply, OK, 1);
-    assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (43, OK));
-    r.fixed().unwrap()
+    let mut response = results(&reply, OK, 1);
+    stat(&mut response, 43, OK);
+    let session = response.fixed().unwrap();
+    let ops = xdr(|w| {
+        sequence(w, &session, 1, 0, 0);
+        lookup_tracked(w);
+        w.u32(25); // READ
+        StateId::ANONYMOUS.encode(w);
+        w.u64(0);
+        w.u32(COUNT as u32);
+        w.u32(10); // GETFH
+    });
+    let reply = server.rpc_reply(&call(3, 5, &ops)).unwrap();
+    let body = reply.body.unwrap();
+    assert!(body.len() > COUNT);
+    assert!(body.capacity() + reply.header.len() <= LIMIT);
+    let replay = server.rpc_reply(&call(4, 5, &ops)).unwrap().body.unwrap();
+    assert!(Arc::ptr_eq(&body, &replay));
 }
 
 pub(super) fn sequence(w: &mut Writer, session: &[u8; 16], sequence: u32, slot: u32, highest: u32) {

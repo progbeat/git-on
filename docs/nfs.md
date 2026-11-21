@@ -4,8 +4,8 @@ On macOS 26 and later, git-on exports one pinned Git tree and an invocation-loca
 writable layer to the built-in Darwin client. The Rust server uses the shared
 Overlay for Git object verification, inode identity, copy-on-write and all four
 write policies. The server opens a Unix stream socket in a short 0700 directory
-under `/private/tmp`. The writable backing stays under `TMPDIR`. Only the
-mounting user and the kernel can access the local endpoint. The process uses
+under `/private/tmp/git-on`. The writable backing stays under `TMPDIR/git-on`.
+Only the mounting user and the kernel can access the local endpoint. The process uses
 `mount_nfs` with NFSv4.1 and `AUTH_SYS`; it needs neither a TCP listener nor
 rpcbind. Symlink targets and component names are handled as bytes.
 
@@ -51,8 +51,8 @@ consumes an error while flushing buffered writes.
 ## Cleanup
 
 Git-on normally unmounts while the listener and worker still serve the client.
-It then stops the listener, connections and worker before releasing the Git pin
-and deleting the temporary data. If cleanup fails, it reports the retained run
+It then stops the listener, connections and worker before releasing any private
+remote pin and deleting the temporary data. If cleanup fails, it reports the retained run
 directory. Stop processes using the mount, then run
 `git on --cleanup <temporary-directory>`. Cleanup checks recovered run identity
 against the system's NFS mount entries and refuses to delete a directory that

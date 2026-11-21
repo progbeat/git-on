@@ -87,6 +87,91 @@ pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {
         .expect("SHA-1 output size"))
 }
 
+/// Read the next object link from verified commit or tag bytes. Only the
+/// headers needed to validate and resolve that link are visited.
+pub(crate) fn selected_child(kind: ObjectType, data: &[u8]) -> Result<Oid> {
+    let child = match kind {
+        ObjectType::Commit => commit_tree(data),
+        ObjectType::Tag => tag_target(data),
+        _ => None,
+    };
+    child.ok_or_else(|| InvalidObject(format!("invalid Git {} headers", kind.str())).into())
+}
+
+fn header<'a>(fields: &mut &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let end = fields.iter().position(|&byte| byte == b'\n')?;
+    let value = fields[..end].strip_prefix(prefix)?;
+    *fields = &fields[end + 1..];
+    Some(value)
+}
+
+fn oid_header(fields: &mut &[u8], prefix: &[u8]) -> Option<Oid> {
+    let value = header(fields, prefix)?;
+    if value.len() != 40 {
+        return None;
+    }
+    Oid::from_str(std::str::from_utf8(value).ok()?).ok()
+}
+
+fn identity_header(fields: &mut &[u8], prefix: &[u8]) -> Option<()> {
+    let value = header(fields, prefix)?;
+    let email_start = value.iter().rposition(|&byte| byte == b'<')?;
+    let email_end = value.iter().rposition(|&byte| byte == b'>')?;
+    if email_end <= email_start {
+        return None;
+    }
+    // Match libgit2's acceptance of a missing timestamp and trailing
+    // timezone text. The timestamp itself must fit in a signed 64-bit value.
+    if let Some(timestamp) = value.get(email_end + 2..).filter(|value| !value.is_empty()) {
+        let start = timestamp
+            .iter()
+            .position(|&byte| !matches!(byte, b' ' | b'\t'..=b'\r'))?;
+        let timestamp = &timestamp[start..];
+        let sign = usize::from(matches!(timestamp[0], b'+' | b'-'));
+        let digits = timestamp[sign..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        std::str::from_utf8(&timestamp[..sign + digits])
+            .ok()?
+            .parse::<i64>()
+            .ok()?;
+    }
+    Some(())
+}
+
+fn commit_tree(mut fields: &[u8]) -> Option<Oid> {
+    let tree = oid_header(&mut fields, b"tree ")?;
+    while fields.starts_with(b"parent ") {
+        oid_header(&mut fields, b"parent ")?;
+    }
+    identity_header(&mut fields, b"author ")?;
+    while fields.starts_with(b"author ") {
+        identity_header(&mut fields, b"author ")?;
+    }
+    identity_header(&mut fields, b"committer ")?;
+    Some(tree)
+}
+
+fn tag_target(mut fields: &[u8]) -> Option<Oid> {
+    let target = oid_header(&mut fields, b"object ")?;
+    match header(&mut fields, b"type ")? {
+        b"commit" | b"tree" | b"blob" | b"tag" => {}
+        _ => return None,
+    }
+    header(&mut fields, b"tag ")?;
+    if !fields.is_empty() && !fields.starts_with(b"\n") {
+        identity_header(&mut fields, b"tagger ")?;
+    }
+    if !fields.is_empty()
+        && !fields.starts_with(b"\n")
+        && !fields.windows(2).any(|bytes| bytes == b"\n\n")
+    {
+        return None;
+    }
+    Some(target)
+}
+
 pub(crate) struct TeeRead<R, W> {
     pub(crate) input: R,
     pub(crate) output: W,
@@ -120,14 +205,6 @@ pub(crate) fn copy_verified(
         if count == 0 {
             return Err(InvalidObject(format!("truncated Git object {oid}")).into());
         }
-        #[cfg(test)]
-        HASH_PROBE.with(|probe| {
-            if let Some((tracked, bytes)) = probe.get() {
-                if tracked == oid {
-                    probe.set(Some((tracked, bytes + count)));
-                }
-            }
-        });
         output
             .write_all(&buffer[..count])
             .context("write Git object stream")?;
@@ -178,6 +255,14 @@ impl<W: Write> Write for VerifiedWriter<W> {
         }
         let count = self.output.write(bytes)?;
         self.hash.update(&bytes[..count]);
+        #[cfg(test)]
+        HASH_PROBE.with(|probe| {
+            if let Some((tracked, total)) = probe.get() {
+                if tracked == self.oid {
+                    probe.set(Some((tracked, total + count)));
+                }
+            }
+        });
         self.remaining -= count;
         Ok(count)
     }
@@ -188,26 +273,32 @@ impl<W: Write> Write for VerifiedWriter<W> {
 
 /// The owned ODB buffer was verified before libgit2 returned it. Only the
 /// audited startup policy establishes that fact; arbitrary streams never use
-/// this route. Block digests are still formed from these same copied bytes.
-pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write) -> Result<()> {
+/// this route. Embedders without that policy verify this same borrowed buffer.
+pub(crate) fn copy_odb_blob(
+    object: &git2::OdbObject<'_>,
+    output: impl Write,
+    validate: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<()> {
     anyhow::ensure!(
         object.kind() == ObjectType::Blob,
         "ODB object is not a blob"
     );
     if !NATIVE_OID_VERIFICATION.load(Ordering::Acquire) {
-        return copy_verified(
-            object.data(),
-            output,
-            ObjectType::Blob,
-            object.len(),
-            object.id(),
-        );
+        let mut hash =
+            VerifiedWriter::new(std::io::sink(), ObjectType::Blob, object.len(), object.id());
+        write_verified_buffer(object.data(), &mut hash)?;
+        hash.finish()?;
     }
-    for bytes in object.data().chunks(64 * 1024) {
+    validate(object.data())?;
+    write_verified_buffer(object.data(), output)
+}
+
+pub(crate) fn write_verified_buffer(bytes: &[u8], mut output: impl Write) -> Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
         check_transfer()?;
         output
-            .write_all(bytes)
-            .context("copy verified ODB buffer")?;
+            .write_all(chunk)
+            .context("write verified Git object")?;
     }
     check_transfer()
 }
@@ -219,16 +310,10 @@ pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write
 /// this initializer must preserve its policy; without it the importer keeps
 /// independent Rust verification.
 pub unsafe fn configure_pack_descriptors() -> Result<usize> {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("read descriptor limit");
-    }
-    // Retained pack descriptors use at most a quarter of the soft limit, capped
-    // at 32. The remaining descriptors serve Git startup, mounts, active files,
-    // cache transfers and caller-inherited descriptors. No OS limit is changed.
-    let budget = (unsafe { limit.assume_init() }.rlim_cur / 4).clamp(1, 32) as usize;
+    // Pack reuse must not make the descriptor cache grow with repository size.
+    const PACK_DESCRIPTORS: usize = 32;
     unsafe {
-        git2::opts::set_mwindow_file_limit(budget)?;
+        git2::opts::set_mwindow_file_limit(PACK_DESCRIPTORS)?;
         // A long-lived source repository otherwise keeps 1 GiB windows under
         // libgit2's 8 GiB mapped-byte default (on 64-bit hosts), independently
         // of our decoded-data LRU. Size each window as well as the soft total:
@@ -249,12 +334,83 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
             && version.crate_version() == "0.20.4",
         Ordering::Release,
     );
-    Ok(budget)
+    Ok(PACK_DESCRIPTORS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn borrowed_commit_and_tag_headers_match_native_object_selection() {
+        let odb = git2::Odb::new().unwrap();
+        odb.add_new_mempack_backend(1).unwrap();
+        let repo = git2::Repository::from_odb(odb).unwrap();
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let author = "author Someone <a@example.test> 123 +0000\n";
+        let committer = "committer Someone <a@example.test> 123 +0000\n";
+        let commit = format!("tree {oid}\nparent {oid}\n{author}");
+        let tag = format!("object {oid}\ntype commit\ntag release\n");
+        let cases = [
+            (
+                ObjectType::Commit,
+                format!("{commit}{committer}\nmessage\n"),
+            ),
+            (ObjectType::Commit, format!("{commit}{author}{committer}")),
+            (
+                ObjectType::Commit,
+                format!("{commit}committer Someone <a@example.test>\n"),
+            ),
+            (
+                ObjectType::Commit,
+                format!(
+                    "{commit}committer Someone <a@example.test> -9223372036854775808 unknown\n"
+                ),
+            ),
+            (
+                ObjectType::Commit,
+                format!("{commit}committer Someone <a@example.test> 9223372036854775808 +0000\n"),
+            ),
+            (
+                ObjectType::Commit,
+                format!("tree {oid}\nparent abbreviated\n{author}{committer}"),
+            ),
+            (
+                ObjectType::Commit,
+                format!("{commit}committer malformed> <\n"),
+            ),
+            (
+                ObjectType::Tag,
+                format!("{tag}tagger Someone <a@example.test> 123 +0000\n\nmessage\n"),
+            ),
+            (ObjectType::Tag, tag.clone()),
+            (
+                ObjectType::Tag,
+                format!("{tag}tagger Someone <a@example.test>\nmissing separator"),
+            ),
+            (
+                ObjectType::Tag,
+                format!("{tag}tagger Someone <a@example.test>\nextra header\n\nmessage"),
+            ),
+            (
+                ObjectType::Tag,
+                format!("object {oid}\ntype invalid\ntag release\n"),
+            ),
+        ];
+        for (kind, data) in cases {
+            let stored = repo.odb().unwrap().write(kind, data.as_bytes()).unwrap();
+            let expected = match kind {
+                ObjectType::Commit => repo.find_commit(stored).map(|commit| commit.tree_id()),
+                ObjectType::Tag => repo.find_tag(stored).map(|tag| tag.target_id()),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                selected_child(kind, data.as_bytes()).ok(),
+                expected.ok(),
+                "{kind:?} {data:?}"
+            );
+        }
+    }
+
     #[test]
     fn cancellation_identity_survives_io_wrapping_without_hiding_real_faults() {
         let cancelled = anyhow::Error::new(std::io::Error::other(

@@ -93,6 +93,8 @@ for phase in ('first','repeat'):
 
 
 def directory_cache_case(f,binary,record):
+    from remote import run_directories
+
     # Missing leaf data and an unvisited missing subtree make accidental
     # preloading observable without timing assertions or a large fixture.
     count=640
@@ -115,7 +117,7 @@ def directory_cache_case(f,binary,record):
         metrics=result['metrics']
         assert metrics['blob_loads']==0 and metrics['header_reads']==0,metrics
         assert metrics['tree_reads']==3,metrics
-        assert not list(f.root.glob('git-on-*')),'directory run leaked'
+        assert not run_directories(f.root),'directory run leaked'
         assert f.git('show-ref')==original,'directory source refs changed'
         value=dict(mode='uncached-readonly-directory' if uncached else 'cached-readonly-directory',files=count,distinct_objects=6,**result)
         observations.append(value);record(value)
@@ -125,7 +127,7 @@ def directory_cache_case(f,binary,record):
 
 
 def run(options):
-    from remote import Fixture
+    from remote import Fixture, run_directories
     from scalability import fixture
     assert sys.platform=='linux','Linux required'
     assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'
@@ -153,7 +155,7 @@ def run(options):
                 # Compare delivered callbacks with and without source caching;
                 # both executions validate the same complete namespace/bytes.
                 record(dict(mode='uncached-source' if uncached else 'cached-source',**capture(argv,f.repo,env,f.root,metrics=True)))
-                assert not list(f.root.glob('git-on-*')),'private run leaked'
+                assert not run_directories(f.root),'private run leaked'
                 assert f.git('show-ref')==original,'source refs changed'
             off=next(r for r in observations if r['mode']=='uncached-source')
             on=next(r for r in observations if r['mode']=='cached-source')
@@ -163,7 +165,7 @@ def run(options):
                         unchanged_payload_and_namespace=True))
             directory_cache_case(f,options.binary,record)
     finally:
-        for directory in f.root.glob('git-on-*'):
+        for directory in run_directories(f.root):
             subprocess.run([str(options.binary.resolve()),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=20)
         f.close()
 

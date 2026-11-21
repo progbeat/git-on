@@ -1,11 +1,11 @@
 # Remote execution and native verification
 
 `git on REV [OPTIONS] -- COMMAND [ARGS...]` resolves one local revision through
-native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` passes its
-two positional operands unchanged to native `git fetch`, then selects the fetched
-object. git-on parses its own options and command separator; Git parses the
-repository and revision/refspec. No runner URL, ref-name or object-ID syntax
-check is applied to those operands.
+native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` uses the
+reusable protocol v2 path described below or passes both operands unchanged
+to native `git fetch` and selects the fetched object. Git-on parses its own
+options and command separator. Native Git supplies repository resolution and
+handles refspecs outside the reusable path.
 Runner options may appear anywhere before the first `--`, interspersed with
 the two operands; the command tail stays literal. URLs work
 outside a checkout. A configured remote name requires its local repository.
@@ -31,9 +31,9 @@ Git tree selection.
 
 Git decides which object-ID abbreviations and revision expressions are valid:
 local revision resolution and fetching do not necessarily accept the same forms.
-A full commit ID pins the source even if an upstream branch later moves. git-on
-uses the single distinct object selected by the fetch's `FETCH_HEAD`, and
-subsequent reads request exact OIDs rather than resolving the ref again. A fetch
+A full commit ID selects a fixed revision even if an upstream branch later
+moves. With native fetch, Git-on uses the single distinct object selected by
+`FETCH_HEAD`. Subsequent reads request exact OIDs. A fetch
 that selects multiple distinct objects cannot define one snapshot and fails
 before mounting.
 SHA-256 object storage, submodules and Git LFS remain unsupported.
@@ -45,17 +45,16 @@ object and root tree before mounting. Each subsequent missing tree or blob is
 explicitly fetched by OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
 Git also receives `GIT_NO_LAZY_FETCH=1`. Never request `blob:none`, perform a full
 checkout or recursively walk unvisited trees for readonly operations. Subtree
-selection reads only ancestor trees. The first destructive source operation in
-`all` indexes original inode ownership across tree metadata, including unopened
-same-OID paths, without loading their blob contents. Tree demands are batched by
-depth; ordinary reads, writable opens and metadata changes do not build that index. Packs may contain necessary tag/commit ancestry or delta bases;
+selection reads only ancestor trees. Writes in `all` prepare private copies of
+the affected files. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
 Where protocol v2 and the caller's policy permit, exact demands reuse
-invocation-owned channels. Native Git resolves the original repository.
-Its optional `fetch-pack --diag-url` diagnostics supply decoded file/SSH path
-and port bytes. Unknown formats retain native fetch. A full SHA-1 object ID
+invocation-owned channels. Native Git resolves the original repository and
+prepares the OpenSSH arguments. Its `fetch-pack --diag-url` diagnostics supply
+decoded paths for the local file transport. Unknown formats retain native fetch.
+A full SHA-1 object ID
 or unambiguous branch can use the reusable HTTPS channel for the initial fetch
 after validating filtering and authentication. An SSH identity that
 authenticates without a prompt can select the branch or exact object ID and
@@ -70,8 +69,7 @@ terminal.
 SSH reuses only the existing identity-checked owned master. Explicit protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy, or a custom
 `GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
-helper path supports reuse. The decoder reuses the bytes already received when
-a pack requires the fallback decoder.
+helper path supports reuse.
 
 On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
@@ -79,8 +77,9 @@ wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
 an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
 It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
-the peer govern the active streams. After eight consistently slow replies,
-the loader can briefly wait for overlapping demands to share a fetch.
+the peer govern the active streams. The loader can briefly wait for
+overlapping demands after confirming a scan or observing consistently slow
+replies.
 Each foreground fetch can group up to 64 already pending OIDs.
 Explicit Git HTTP configuration, authentication outside the supported exchange,
 and servers without HTTP/2 or filtered protocol v2 use the native helper.
@@ -107,51 +106,62 @@ on the existing channels until one is available to send them.
 Beyond the initial SSH pool, actual demands open additional channels.
 Prefetch can use those channels after they connect.
 An idle pool starts an ordinary request immediately. While a transfer is active,
-the queue can wait up to two milliseconds on a slow source. A dense scan can
-wait up to twelve milliseconds to combine overlapping requests.
+the queue can wait up to two milliseconds on a slow source or during a confirmed
+scan. For a confirmed scan, the wait can reach twelve milliseconds while the
+source is slow or still being measured.
 
 A first access to a regular file in a directory opened for enumeration finds
 uncached and previously unscheduled blob OIDs in Git's depth-first order
 through already opened directories. It skips previously considered ranges
 and examines at most 512 remaining entries. The same planner serves FUSE and
-NFS. Speculative packs start with up to four OIDs. On slower connections,
-confirmed first accesses to predicted objects can expand this to 64, 128 or
-256. The first confirmation can expand the window to 64 after a slow reply
-when two or more required objects are still pending. Consecutive misses reduce
-the window. During a dense scan
-the planner groups remaining OIDs from the current and recently opened
-directories. The predictor tracks at most 512 OIDs ahead of actual accesses.
-When the window fills on a slower connection, completed predictions age out
-after unrelated accesses. Ordinary demands take precedence and can join an
-active speculative request without duplicating its fetch. If that
-speculation fails, only waiting ordinary demands reenter the request queue.
-These paths require a reusable transport and an unrestricted per-file size
-limit.
+NFS. Speculative packs start with up to four OIDs. Confirmed first accesses to
+predicted objects can expand this to 64, 128 or 256 at any connection speed.
+The first confirmation can expand the window to 64 after a slow reply when two
+or more required objects are still pending. Consecutive misses reduce the
+window. On a fast source, batches follow the file being read in depth-first
+order. While measuring a connection or on a slow source, a dense scan can
+group remaining OIDs from the current and recently opened directories.
+The predictor tracks at most 512 OIDs ahead of actual accesses.
+When the window fills after read-ahead has expanded or on a slower connection,
+completed predictions can age out after unrelated accesses. Ordinary demands
+take precedence and can join an active speculative request without duplicating
+its fetch. If that speculation fails, only waiting ordinary demands reenter
+the request queue.
+A diagnosed pack failure after serving a required read fails the invocation.
+An exact transfer can fail independently of the invocation when validated
+extras from another pack complete every demand and supply the requested data.
+These paths require a reusable transport. The specification's
+[resource assumptions](specification.md#resource-assumptions) apply to remote
+execution.
 
 The HTTPS and SSH receivers share the same incremental Git framing and pack
 decoder. It inflates ordinary entries in memory and verifies the canonical Git
 OID against the requested OIDs before notifying a waiting read. It can publish
 a verified object while the rest of its pack is still arriving. The receiver
-also verifies the complete pack's checksum and framing. Deltas and entries
-or packs larger than the in-memory decoder's working buffers use the existing
-pack decoder. HTTP/2 continues processing other streams while a worker decodes
-the remaining objects in a speculative pack. Blob payloads enter the same
-authenticated, run-local store. Unrequested objects in a verified pack remain
-available in compressed form for later demands.
+also verifies the complete pack's checksum and framing. The receiver
+applies deltas to verified bases in memory from the first fetch, including
+when preparing the selected revision. If a delta precedes its base, the receiver
+keeps its decoded instructions until the base arrives.
+HTTPS decodes response bodies off the connection driver, with per-stream
+backpressure. Requested blobs enter the authenticated, run-local store.
+Delta reconstruction borrows verified bases from the active pack. Extra
+objects retain those buffers for later access and become readable after the
+pack is verified. A demand for a known entry can wait for validation without
+another fetch. Eager materialization writes a verified extra directly into
+its destination.
+The native Git compatibility path can use temporary pack files.
 
-Explicit-all eager materialization needs the entire selected tree. When no
-per-file resource limit is in effect, fetch the selected revision once with
-depth one and without an object filter. Retain the compressed pack and decode
-file contents directly into their destination paths, reusing already prepared
-objects. This does not fetch the repository's complete history. This path does
-not require server-side filtering or a separate capability advertisement.
+Explicit-all eager materialization needs the entire selected tree. Fetch the
+selected revision once with depth one and without an object filter. Retain the
+compressed pack and decode file contents directly into their destination
+paths, reusing already prepared objects. This does not fetch the repository's
+complete history. This path does not require server-side filtering or a
+separate capability advertisement.
 
-Under finite per-file limits, materialization retains individual-object
-transfers rather than aggregating otherwise readable objects into an oversized
-pack. At most 256 known object IDs from the current directory share one
-native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
-run-local availability and deduplicated before requesting it; all use `tree:0`.
-The same batching applies to metadata required by the FUSE ownership index.
+When materialization fetches missing objects by OID, at most 256 known object
+IDs from the current directory can share one native `fetch --stdin` and
+decoder operation. Each object is checked for existing run-local availability
+and deduplicated before requesting it. These requests use `tree:0`.
 All paths request only known objects. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
@@ -160,9 +170,9 @@ Session request/decode counts and transport process starts are separate from
 native fetch/cat-file counters. Server-side Git subprocesses remain real work,
 included in waited CPU for local source fixtures.
 
-For filtered lazy or resource-limited execution, the server must advertise
-filtering before any object transfer. Rejection of a requested unadvertised OID
-names the OID and includes Git's server diagnostic.
+For filtered lazy execution, the server must advertise filtering before any
+object transfer. Rejection of a requested unadvertised OID names the OID and
+includes Git's server diagnostic.
 
 Two-operand local-path and `file://` sources use upload-pack and require the same
 capabilities. Ordinary local repositories do not enable them by default. When
@@ -205,9 +215,15 @@ payloads. Applicable `.gitignore` blobs are fetched on demand in default
 write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
 local and remote snapshots.
 
-Each remote invocation owns a private temporary bare repository. Demanded
-objects remain there until that run is cleaned up, so repeated access does not
-fetch an available object again, including after decoded memory-cache eviction.
+Each remote invocation owns an invocation-local object store. The direct
+reusable HTTPS and SSH startup paths keep the selected commit or tag and its
+root tree in memory. Native fetch, signature verification, native interactive
+preparation and eager copy fallback can use a private temporary bare repository.
+When HTTPS challenges for credentials, Git's helper runs in its usual private
+repository context. Reusable fetches still keep their verified Git objects in
+memory.
+Demanded objects remain available until cleanup,
+including after decoded memory-cache eviction.
 There is no global persistent object cache or cross-run reuse. A later invocation
 resolves its operand through native Git again and fetches its own demanded trees
 and blobs. Git-on does not read, modify, migrate or delete historical
@@ -216,66 +232,27 @@ and blobs. Git-on does not read, modify, migrate or delete historical
 object cache; native Git's normal configuration and authentication environment
 still applies. No daemon or background cache service is started.
 
-Received session packs are checksum-verified in bounded private parts. A
-single non-delta object then streams through zlib and canonical OID verification
-into raw storage, without a per-object fetch or decoder client. Complex packs
-use the existing Git/libgit2 import path without another network request.
-Native fetch packs likewise decode requested blobs into raw storage. Unrequested
-blob delta bases remain compressed; a later explicit demand uses that received
-pack without refetching. A pack is released when no unpublished blob still needs
-it. Prepared blobs are not decoded again or recompressed into loose copies; commit/tree/tag metadata remains in the native verification ODB. Pack
-discovery does not enumerate earlier per-object packs. Large non-delta blobs
-stream during import; Git still performs required delta decoding. The snapshot
-reuses its Repository and available objects do not trigger unconditional ODB
-refreshes. Canonical OID verification completes before raw bytes become readable.
-Local loose objects stream in 64 KiB chunks with cancellation checks.
+Prepared blobs remain reusable across close/reopen and eviction. Native decoder
+stdout feeds OID verification into a private RAM buffer. A failed consumer
+stops and reaps the decoder, and an unsuccessful native exit fails the import.
+Local loose objects feed the same store in chunks. Libgit2 still decodes
+packed/delta objects as required.
 
-Prepared bytes needed by original source inodes survive close/reopen and
-bounded-memory-cache eviction in private temporary storage. When the last
-original inode becomes writable, its authenticated raw file is transferred into
-the writable backing; when the last original inode is deleted and released, its
-raw file is removed. Unopened same-OID paths and open-unlinked inodes keep their
-original data without repeat decoding. Each spilled original object has one raw file, opened relative to the owned directory with no symlink
-following. Trusted RAM retains its Git OID, length and packed ordered SHA-256
-hashes of 64 KiB blocks, published only after full canonical OID verification.
-Range reads hash the same owned buffer returned to the caller; neither a disk
-index nor a disk authentication-tag file is trusted. Small resident objects
-spill only on eviction. The byte-accounted 16 MiB data LRU retains one entry per
-original OID: a whole small object or one large-file block. Active buffers and
-retained verification/parsed-directory metadata are accounted for separately;
-this is not a fixed total-RAM bound.
+[Resources and integrity](resources.md) describes the whole-blob and block LRUs,
+disk-block authentication, and private writable copies. Raw disk files are
+opened relative to the owned directory, with type, owner, link count and length
+checks. The store retains one last-read descriptor independent of object count
+or open child handles. Compressed staging, retained raw files and active reader
+buffers are accounted separately and released with the invocation.
 
-The raw store retains one directory descriptor and one last-read object
-descriptor, independent of object count or open child handles. Each disk-read
-range rechecks file type, owner, link count and trusted length, even on descriptor
-reuse, then authenticates its blocks. A different object replaces the single
-read slot. Active import/spill writes need an additional temporary descriptor.
-Blob readers hold object descriptors rather than cached payloads or open files.
-Compressed transport packs and decoder requests use bounded logical parts capped
-by inherited `RLIMIT_FSIZE`; these are separate from the per-object raw files.
-Native decoder stdout is consumed directly: each object's canonical OID is
-verified while its bytes enter RAM or its sole raw file. No complete decoded
-output file is retained between decoding and publication. A failed consumer
-stops and reaps the decoder; unsuccessful native exit still fails the import.
-The private files stay outside the execution view and are removed with their
-owning store/readers during invocation cleanup. Retained-raw disk metrics are
-separate from active-reader and bounded payload-memory metrics. No cross-run
-reuse is introduced. libgit2's local
-pack backend still requires object/delta decoding, and its loose reader maps the
-compressed source file. Neither mapped OS page cache nor necessary packed decode
-is reported as a retained application payload cache.
-
-Retained libgit2 pack descriptors are capped before threads start: at most 32,
-and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack
-window). This leaves descriptors for native Git startup, the mount and active
-files; it does not raise OS limits or reserve a quota for the child. Active
-operations can still encounter ordinary OS limits, reported before launch or
-through the lazy operation and runner failure as applicable. No failure reruns
-a started child or silently changes write policy.
+Libgit2's pack descriptor cache retains up to 32 descriptors. Operating system
+errors propagate before launch or through the lazy operation and runner
+failure as applicable. No failure reruns a started child or silently changes
+write policy.
 
 Active temporary objects and normal ignored writes have no runner disk quota;
-ordinary system disk limits apply. Payload-cache accounting includes entry
-overhead without an arbitrary object-count cap. Completion removes the temporary remote repository and owned
+ordinary system disk limits apply. The block cache budget includes entry
+overhead. Completion removes any temporary remote repository and owned
 SSH connection. Write required results to explicit external paths. Busy mounts
 preserve recovery state for stale-run cleanup. Explicit-all materialization
 eagerly fetches every selected tree entry; it never bypasses authentication,
@@ -359,9 +336,9 @@ transport subprocesses and follows the normal unmount/cleanup path.
 
 All runs use native Git to interpret positional operands. Local execution resolves
 the unchanged revision in the caller's repository, then the object loader reads
-that pinned object through bundled libgit2. Remote execution fetches the unchanged
-repository/refspec pair and pins its selected object. `--verify` adds native Git's
-signature check to either mode.
+that pinned object through bundled libgit2. Remote execution resolves the selected
+object using the [transport rules above](#object-demand-and-cache-lifetime).
+`--verify` adds native Git's signature check to either mode.
 
 `--verify` resolves one commit or annotated tag OID, then calls native
 `git verify-commit OID` or `git verify-tag OID`. Native Git's exit status decides

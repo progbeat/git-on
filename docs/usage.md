@@ -158,9 +158,12 @@ selected tree ID. The rest of the caller's environment is inherited. No `GIT_ON_
 `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed. If callers already
 set those names, they remain ordinary inherited variables.
 
-Generated and copied-up modified files use a private directory in the system temporary location, respecting
-`TMPDIR`. Storage uses ordinary filesystem-backed files, not a private memory
-filesystem, and there is no git-on disk quota. If the system's temporary location is
+Each run keeps its generated files, copy-on-write data and temporary state in
+its own private directory under `TMPDIR/git-on`. With no `TMPDIR`, it uses the
+system temporary directory. Git-on uses ordinary filesystem-backed storage
+without a separate quota. On a shared temporary filesystem, a run uses a
+hidden private group if another unprivileged user owns the usual name.
+If the system's temporary location is
 itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesystem
 capacity and operating-system resource limits still apply. Temporary directories are
 private to the current user.
@@ -185,20 +188,23 @@ git-on does not drain or wait for captured-output pipes because it creates none.
 detached process outside the managed group can still retain inherited descriptors;
 git-on is a foreground runner, not a service daemonizer or host process sandbox.
 
-Git trees are pinned under `refs/git-on/<id>` while in use. Normal completion unmounts,
-releases the pin, and removes temporary state. A busy mount or abrupt termination can leave a temporary
-directory, mount, and pin; minimal private recovery metadata allows checked cleanup
-without keeping execution logs or a run manifest:
+Local runs keep the selected tree ID in memory and read the source repository.
+If external maintenance deletes an object needed later, git-on reports the read
+failure. Remote runs can hold a reference in their private temporary repository.
+Normal completion unmounts and removes temporary state. A busy mount or abrupt
+termination can leave a temporary directory or mount. Minimal recovery metadata
+allows checked cleanup.
 
 ```sh
 git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run, will only
-unmount a matching git-on filesystem, and checks the pin's exact target before deleting
-it. A busy stale mount requires stopping processes using it first. Cleanup does not kill
-processes by stale PID. A surviving pin intentionally prevents garbage collection until
-cleanup releases it.
+Pass the individual run directory. Cleanup also accepts run directories
+from older versions. It refuses an active locked run, unmounts only a
+matching git-on filesystem,
+and checks the exact target of any pin recorded by this release or an older one
+before releasing it. A busy stale mount requires stopping processes using it first.
+Cleanup does not kill processes by stale PID.
 
 SIGKILL is uncatchable and does not forward a signal to the command. The command
 may keep running in its own process group. git-on does not enable FUSE
@@ -212,24 +218,19 @@ not stop surviving commands or infer process ownership from old PIDs.
 ## Lazy access and performance
 
 The [behavioral and performance specification](specification.md) defines the contract.
-Startup resolves and pins the selected tree and mounts its root; it does not recursively
-enumerate the source. Lookup loads ancestor directory metadata and the requested blob
-header, directory listing loads only that directory, and read loads the requested
-content. Write checks load only applicable pinned ignore files.
+Native mounts start from the selected tree OID and load metadata on demand.
+Lookup loads ancestor directory metadata and the requested blob header. A
+directory listing loads only that directory. Reads load the requested content.
+Write checks load only applicable pinned ignore files.
 
-Decoded content retention is bounded: 8 MiB / 128 blob entries, 4 MiB / 256 tree
-entries, 4,096 blob headers, and 4 MiB / 128 compiled ignore-rule entries. Idle open
-file descriptors do not pin evicted small payloads. Kernel inode references and active
-directory listings retain their necessary metadata until released. libgit2 also has its
-own internal object cache with a default 256 MiB soft target; its default blob caching
-is disabled.
+The 16 MiB block cache holds small blobs and individual blocks of spilled
+files. Newly verified large blobs enter a separate eight-entry LRU whole
+in RAM. Spilled data stays available in the backing file until the
+invocation finishes, with rereads cached by block.
+Git encoding can require an entire blob or its delta bases to be decoded.
+See [resources and integrity](resources.md) for cache accounting and copy-up.
 
-Git encoding can require decoding an entire requested blob or its delta bases. Large
-blobs use an immediately unlinked spool in the private backing directory, shared by
-simultaneous readers and removed after their final close; subsequent ranges in that open
-file do not repeatedly decode the object. A first read still needs the memory to decode
-that object. These limits are retained-cache budgets, not a bound on total RSS, kernel
-cache, active metadata, or temporary large-object decoding.
+Applicable ignore rules have a separate cache of 4 MiB / 128 compiled ignore-rule entries.
 
 The [benchmark](../tests/benchmark.md) checks exact output and demand counts on a
 million distinct files using a separate, opt-in instrumented test build. Its counters

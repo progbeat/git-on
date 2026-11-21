@@ -11,7 +11,7 @@ from collections import Counter
 import os
 from process_capture import capture
 from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
-from remote import Fixture
+from remote import Fixture, run_directories
 
 
 CHILD=r'''
@@ -87,7 +87,7 @@ def run(options):
                 result['native_commands']=native_commands(log)
                 validate_runner(result,count,options.blob_bytes,stat_bytes,options.backend)
                 record(dict(type='runner',files=count,blob_bytes=options.blob_bytes,stat_abi_bytes=stat_bytes,**result))
-                assert not list(f.root.glob('git-on-*')),'private invocation leaked'
+                assert not run_directories(f.root),'private invocation leaked'
             finally:f.close()
 
 
@@ -107,7 +107,9 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
         assert metrics['remote_fetch_operations']+session_fetches==operations,metrics
         streamed=metrics.get('streamed_blob_loads',0)
         assert 0<=streamed<=count,metrics
-        decodes=streamed if backend=='materialized' else operations
+        # Native commit and tree metadata is imported in-process. The reusable
+        # session also records its full root tree as a streaming decode.
+        decodes=streamed if backend=='materialized' else count+int(session_fetches>0)
         assert metrics['remote_decode_operations']+session_decodes==decodes,metrics
         if session_fetches:assert metrics['remote_session_starts']==1,metrics
     if backend:

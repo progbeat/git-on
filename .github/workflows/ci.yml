@@ -466,7 +466,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
       - run: cargo test --locked --all-targets --features test-metrics
-      - run: cargo build --locked --features test-metrics
+      - run: cargo build --locked --features test-metrics --bin git-on --example source-probe
       - run: python3 tests/integration.py --binary target/debug/git-on --require-nfs CliTests
       - run: python3 tests/materialized.py target/debug/git-on
       - name: Require real user-owned NFSv4.1 mounts
@@ -475,6 +475,7 @@ jobs:
           python3 tests/integration.py --binary target/debug/git-on --require-nfs MountTests
           python3 tests/fsync_contract.py --binary target/debug/git-on --require-nfs
           python3 tests/remote.py --binary target/debug/git-on --require-nfs \
+            RemoteTests.test_local_common_directory_reads_without_changing_native_repository_refs \
             RemoteTests.test_materialized_remote_fetches_the_selected_tree_once \
             RemoteTests.test_git_on_in_a_terminal_reuses_the_https_demand_session \
             RemoteTests.test_cancel_concurrent_https_demands \

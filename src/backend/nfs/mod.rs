@@ -7,13 +7,12 @@ mod server;
 mod status;
 mod xdr;
 
-use self::server::Server;
+use self::server::{RpcReply, Server};
 use crate::{filesystem::Overlay, platform, policy::WritePolicy};
 use std::{
-    fs::{self, DirBuilder},
-    io,
-    os::unix::{fs::DirBuilderExt, net::UnixListener as StdListener},
-    path::Path,
+    io::{self, IoSlice},
+    os::unix::net::UnixListener as StdListener,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
@@ -42,6 +41,7 @@ pub(super) struct FilesystemFailures {
 }
 
 pub struct Session {
+    socket: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<io::Result<()>>>,
     failed: Arc<AtomicBool>,
@@ -49,60 +49,58 @@ pub struct Session {
 }
 
 impl Session {
-    pub(super) fn start(overlay: Overlay, id: &str) -> io::Result<Self> {
+    pub(super) fn start(overlay: Overlay, id: &str, socket: PathBuf) -> io::Result<Self> {
         let run = uuid::Uuid::parse_str(id).map_err(io::Error::other)?;
-        let socket = platform::nfs_socket(id).ok_or(io::ErrorKind::InvalidInput)?;
-        let directory = socket.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        DirBuilder::new().mode(0o700).create(directory)?;
-        let setup = (|| {
-            let listener = StdListener::bind(&socket)?;
-            listener.set_nonblocking(true)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .max_blocking_threads(1)
-                .build()?;
-            let (shutdown, stop) = oneshot::channel();
-            let failed = Arc::new(AtomicBool::new(false));
-            let failures = Arc::new(FilesystemFailures::default());
-            let thread_failed = Arc::clone(&failed);
-            let filesystem_error = Arc::clone(&failures);
-            let server = thread::Builder::new()
-                .name("git-on-nfs".into())
-                .spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(async {
-                            let listener = UnixListener::from_std(listener)?;
-                            serve(
-                                listener,
-                                Server::new(overlay, run, filesystem_error),
-                                stop,
-                                &thread_failed,
-                            )
-                            .await
-                        })
-                    }))
-                    .unwrap_or_else(|_| Err(io::Error::other("NFS server panicked")));
-                    if result.is_err() {
-                        notify_failure(&thread_failed);
-                    }
-                    result
-                })?;
-            Ok(Self {
-                shutdown: Some(shutdown),
-                server: Some(server),
-                failed,
-                failures,
-            })
-        })();
-        if setup.is_err() {
-            let _ = fs::remove_file(&socket);
-            let _ = fs::remove_dir(directory);
+        if run.to_string() != id {
+            return Err(io::ErrorKind::InvalidInput.into());
         }
-        setup
+        let listener = StdListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        let (shutdown, stop) = oneshot::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failures = Arc::new(FilesystemFailures::default());
+        let thread_failed = Arc::clone(&failed);
+        let filesystem_error = Arc::clone(&failures);
+        let server = thread::Builder::new()
+            .name("git-on-nfs".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(async {
+                        let listener = UnixListener::from_std(listener)?;
+                        serve(
+                            listener,
+                            Server::new(overlay, run, filesystem_error),
+                            stop,
+                            &thread_failed,
+                        )
+                        .await
+                    })
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("NFS server panicked")));
+                if result.is_err() {
+                    notify_failure(&thread_failed);
+                }
+                result
+            })?;
+        Ok(Self {
+            socket,
+            shutdown: Some(shutdown),
+            server: Some(server),
+            failed,
+            failures,
+        })
     }
 
-    pub fn mount_command(path: &Path, id: &str, policy: WritePolicy) -> io::Result<Command> {
-        let source = platform::nfs_mount_source(id).ok_or(io::ErrorKind::InvalidInput)?;
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+
+    pub fn mount_command(&self, path: &Path, policy: WritePolicy) -> Command {
+        let source = platform::nfs_mount_source(&self.socket);
         let mut options = String::from(
             "vers=4.1,proto=ticotsord,sec=sys,nocallback,nolocallocks,noquota,retrycnt=1,hard,intr,nodev,nosuid,nobrowse,nonfc,nonamedattr,noacl,nordirplus",
         );
@@ -113,7 +111,7 @@ impl Session {
         }
         let mut cmd = Command::new("/sbin/mount_nfs");
         cmd.args(["-o", &options, &source]).arg(path);
-        Ok(cmd)
+        cmd
     }
 
     pub fn failed(&self) -> bool {
@@ -166,7 +164,7 @@ fn notify_failure(failed: &AtomicBool) {
 }
 
 enum Job {
-    Call(Vec<u8>, oneshot::Sender<Option<Vec<u8>>>),
+    Call(Vec<u8>, oneshot::Sender<Option<RpcReply>>),
     Sweep,
 }
 
@@ -176,7 +174,7 @@ impl Job {
             Self::Call(data, reply) => {
                 // Once admitted, finish the compound even after disconnect
                 // so a retransmit can use the session slot's cached result.
-                let _ = reply.send(server.rpc(&data));
+                let _ = reply.send(server.rpc_reply(&data));
             }
             Self::Sweep => server.sweep(Instant::now()),
         }
@@ -299,20 +297,33 @@ async fn connection(socket: UnixStream, queue: mpsc::Sender<Job>, limit: usize) 
 
 async fn write_response(
     output: &mut OwnedWriteHalf,
-    response: Option<Vec<u8>>,
+    response: Option<RpcReply>,
     idle: Duration,
 ) -> io::Result<()> {
-    let Some(response) = response else {
+    let Some(RpcReply { header, body }) = response else {
         return Ok(());
     };
-    if response.len() > MAX_RECORD {
+    let body = body.as_deref().map_or(&[][..], Vec::as_slice);
+    let size = header.len() + body.len();
+    if size > MAX_RECORD {
         return Err(io::Error::other("NFS response exceeds record limit"));
     }
+    let record = (0x8000_0000 | size as u32).to_be_bytes();
     tokio::time::timeout(idle, async {
-        output
-            .write_all(&(0x8000_0000 | response.len() as u32).to_be_bytes())
-            .await?;
-        output.write_all(&response).await
+        let mut buffers = [
+            IoSlice::new(&record),
+            IoSlice::new(&header),
+            IoSlice::new(body),
+        ];
+        let mut pending = &mut buffers[..if body.is_empty() { 2 } else { 3 }];
+        while !pending.is_empty() {
+            let written = output.write_vectored(pending).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut pending, written);
+        }
+        Ok(())
     })
     .await?
 }

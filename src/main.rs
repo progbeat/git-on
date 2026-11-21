@@ -3,7 +3,10 @@ use git_on::{
     backend::Backend,
     filesystem::Overlay,
     git::set_foreground as foreground,
-    platform::{ensure_unmounted, mount_is_ours},
+    platform::{
+        create_temporary_entry, ensure_unmounted, grouped_run, mount_is_ours,
+        remove_empty_temporary_group, ssh_control_path,
+    },
     policy::WritePolicy,
     snapshot::Snapshot,
 };
@@ -18,7 +21,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, OpenOptionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -37,6 +40,9 @@ struct Recovery {
     git_dir: Option<PathBuf>,
     tree_oid: Option<String>,
     pin_ref: Option<String>,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nfs_socket: Option<PathBuf>,
 }
 fn private_dir(path: &Path) -> Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -225,9 +231,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            bail!(
-                "mount is busy or unmount failed; transient data and pin preserved for --cleanup"
-            );
+            bail!("mount is busy or unmount failed; recovery state preserved for --cleanup");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -247,18 +251,25 @@ impl Mounted {
 
     fn finish(&mut self) -> Result<()> {
         if let Some(session) = self.session.take() {
-            let result =
-                mount_is_ours(self.mountpoint.parent().unwrap(), &self.id).and_then(|mounted| {
-                    if mounted {
-                        #[cfg(target_os = "macos")]
-                        if session.failed() {
-                            return unmount_dead_server(&self.mountpoint);
-                        }
-                        clean_unmount(&self.mountpoint)
-                    } else {
-                        Ok(())
+            #[cfg(target_os = "macos")]
+            let git_on::backend::Session::Macos(nfs) = &session;
+            let result = mount_is_ours(
+                self.mountpoint.parent().unwrap(),
+                &self.id,
+                #[cfg(target_os = "macos")]
+                Some(nfs.socket_path()),
+            )
+            .and_then(|mounted| {
+                if mounted {
+                    #[cfg(target_os = "macos")]
+                    if session.failed() {
+                        return unmount_dead_server(&self.mountpoint);
                     }
-                });
+                    clean_unmount(&self.mountpoint)
+                } else {
+                    Ok(())
+                }
+            });
             #[cfg(target_os = "linux")]
             if let Err(error) = result {
                 // Do not invoke fuser's lazy-unmount fallback on a busy mount.
@@ -289,20 +300,44 @@ impl Drop for Mounted {
 }
 #[cfg(target_os = "macos")]
 fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> Result<()> {
-    use std::io::{Read, Seek};
+    use std::{
+        io::{ErrorKind, Read},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+    };
     #[cfg(feature = "test-metrics")]
     if env::var_os("GIT_ON_TEST_NFS_MOUNT_ERROR").as_deref() == Some(std::ffi::OsStr::new("1")) {
         bail!("test NFS mount failure");
     }
-    let mut diagnostic = tempfile::tempfile_in(mounted.mountpoint.parent().unwrap())?;
-    let mut helper =
-        git_on::backend::nfs::Session::mount_command(&mounted.mountpoint, &mounted.id, policy)?
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(diagnostic.try_clone()?)
-            .spawn()
-            .context("start mount_nfs")?;
+    let (mut diagnostic, writer) = UnixStream::pair()?;
+    diagnostic.set_nonblocking(true)?;
+    let mut message = Vec::new();
+    let fd = diagnostic.as_raw_fd();
+    let mut drain = || -> std::io::Result<bool> {
+        let mut buffer = [0; 4096];
+        for _ in 0..16 {
+            match diagnostic.read(&mut buffer) {
+                Ok(0) => return Ok(false),
+                Ok(count) => message.extend_from_slice(&buffer[..count.min(4096 - message.len())]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(true),
+                Err(error) if error.kind() == ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    };
+    let Some(git_on::backend::Session::Macos(session)) = mounted.session.as_ref() else {
+        bail!("NFS server is unavailable");
+    };
+    let mut helper = session
+        .mount_command(&mounted.mountpoint, policy)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .context("start mount_nfs")?;
+    let wakeup = git_on::git::ChildExitWakeup::new(helper.id());
+    let mut diagnostic_open = true;
     let status = loop {
         if git_on::git::cancelled_signal().is_some() || mounted.failed() {
             kill_group(helper.id(), libc::SIGKILL);
@@ -312,7 +347,22 @@ fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> 
         match helper.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                signals.wait().for_each(drop);
+                if diagnostic_open {
+                    match drain() {
+                        Ok(open) => diagnostic_open = open,
+                        Err(error) => {
+                            kill_group(helper.id(), libc::SIGKILL);
+                            let _ = helper.wait();
+                            return Err(error).context("read mount_nfs diagnostics");
+                        }
+                    }
+                }
+                signals.pending().for_each(drop);
+                wakeup.wait(
+                    Duration::from_millis(25),
+                    None,
+                    [diagnostic_open.then_some(fd), None],
+                );
             }
             Err(error) => {
                 kill_group(helper.id(), libc::SIGKILL);
@@ -322,16 +372,28 @@ fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> 
         }
     };
     if !status.success() {
-        let mut message = Vec::new();
-        diagnostic.rewind()?;
-        diagnostic.take(4096).read_to_end(&mut message)?;
+        drain().context("read mount_nfs diagnostics")?;
         bail!(
             "mount_nfs returned {status}: {}",
             String::from_utf8_lossy(&message).trim()
         );
     }
-    if !mount_is_ours(mounted.mountpoint.parent().unwrap(), &mounted.id)? {
+    if !mount_is_ours(
+        mounted.mountpoint.parent().unwrap(),
+        &mounted.id,
+        Some(session.socket_path()),
+    )? {
         bail!("NFS mount did not become ready");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_partial_nfs(dir: &Path, state: &mut Recovery) -> Result<()> {
+    if let Some(socket) = &state.nfs_socket {
+        git_on::platform::cleanup_nfs_socket(&state.id, Some(socket))?;
+        state.nfs_socket = None;
+        save(dir, state)?;
     }
     Ok(())
 }
@@ -344,8 +406,21 @@ fn mount_overlay(
     policy: WritePolicy,
     allow_fallback: bool,
     signals: &mut Signals,
+    state: &mut Recovery,
 ) -> Result<Option<Mounted>> {
-    let session = match git_on::backend::start_nfs(overlay, id) {
+    let start = (|| -> std::io::Result<_> {
+        let socket = git_on::platform::reserve_nfs_socket(id, |socket| {
+            if state.nfs_socket.as_deref() != Some(socket) {
+                // Stale recovery needs the selected path even if the runner
+                // dies between creating its directory and binding the socket.
+                state.nfs_socket = Some(socket.into());
+                save(dir, state).map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        })?;
+        git_on::backend::start_nfs(overlay, id, socket)
+    })();
+    let session = match start {
         Ok(session) => session,
         Err(error)
             if allow_fallback
@@ -354,6 +429,7 @@ fn mount_overlay(
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
                 ) =>
         {
+            remove_partial_nfs(dir, state)?;
             return Ok(None);
         }
         Err(error) => return Err(error).context("start private NFS server"),
@@ -374,7 +450,7 @@ fn mount_overlay(
                 return Err(anyhow::anyhow!("{attach:#}; cleanup: {cleanup:#}"));
             }
             ensure_unmounted(dir)?;
-            git_on::platform::cleanup_nfs_socket(id)?;
+            remove_partial_nfs(dir, state)?;
             if allow_fallback && !filesystem_failed && git_on::git::cancelled_signal().is_none() {
                 Ok(None)
             } else {
@@ -481,19 +557,28 @@ fn cleanup(dir: &Path) -> Result<()> {
     if state.format != "git-on-temp-v1" {
         bail!("unrecognized temporary directory");
     }
-    if mount_is_ours(&dir, &state.id)? {
+    if mount_is_ours(
+        &dir,
+        &state.id,
+        #[cfg(target_os = "macos")]
+        state.nfs_socket.as_deref(),
+    )? {
         #[cfg(target_os = "linux")]
         clean_unmount(&dir.join("mount"))?;
         #[cfg(target_os = "macos")]
         unmount_dead_server(&dir.join("mount"))?;
     }
     ensure_unmounted(&dir)?;
-    git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+    git_on::remote::stop_connection(&ssh_control_path(&dir))?;
     #[cfg(target_os = "macos")]
-    git_on::platform::cleanup_nfs_socket(&state.id)?;
+    git_on::platform::cleanup_nfs_socket(&state.id, state.nfs_socket.as_deref())?;
     git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
     release_pin(&state)?;
-    fs::remove_dir_all(dir)?;
+    fs::remove_dir_all(&dir)?;
+    if grouped_run(&dir) {
+        remove_empty_temporary_group(dir.parent().unwrap())
+            .context("remove temporary git-on group")?;
+    }
     Ok(())
 }
 fn supervise(
@@ -559,6 +644,74 @@ fn report_metrics(snapshot: &Snapshot, backend: Option<&str>) -> Result<()> {
     Ok(())
 }
 fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
+    let mut signals = subscribe_signals()?;
+    #[cfg(target_os = "macos")]
+    let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
+    if let Some(signal) = git_on::git::cancelled_signal() {
+        return Ok(ExitStatus::from_raw(signal));
+    }
+
+    let temporary = env::temp_dir();
+    let temporary = if temporary.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        &temporary
+    };
+    let explain_temp_error = || {
+        format!(
+            "cannot create a private snapshot in {}. Check the directory's write/search permissions and available space, or choose another TMPDIR",
+            temporary.display()
+        )
+    };
+    let parent = fs::canonicalize(temporary).with_context(explain_temp_error)?;
+    let (temp, id) = loop {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Keep the same Unix socket path length as the previous flat layout.
+        match create_temporary_entry(&parent, &id[..6]) {
+            Ok(temp) => break (temp, id),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(explain_temp_error),
+        }
+    };
+    let group = temp.parent().unwrap();
+    let initialized = (|| -> Result<_> {
+        let dir = fs::canonicalize(&temp)?;
+        let lock = lock(&dir, true)?;
+        let state = Recovery {
+            format: "git-on-temp-v1".into(),
+            id,
+            git_dir: None,
+            tree_oid: None,
+            pin_ref: None,
+            #[cfg(target_os = "macos")]
+            nfs_socket: None,
+        };
+        save(&dir, &state)?;
+        Ok((dir, lock, state))
+    })();
+    let result = match initialized {
+        Ok((dir, _lock, state)) => execute_in_group(invoked, run, dir, state, &mut signals),
+        Err(error) => {
+            if fs::remove_dir(&temp).is_err() {
+                let _ = fs::remove_dir_all(&temp);
+            }
+            Err(error)
+        }
+    };
+    let cleanup = remove_empty_temporary_group(group)
+        .with_context(|| format!("remove temporary git-on group {}", group.display()));
+    let status = result?;
+    cleanup?;
+    Ok(status)
+}
+
+fn execute_in_group(
+    invoked: Instant,
+    run: cli::RunArgs<'_>,
+    dir: PathBuf,
+    mut state: Recovery,
+    signals: &mut Signals,
+) -> Result<ExitStatus> {
     let cli::RunArgs {
         tree,
         repository: source,
@@ -567,33 +720,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         write_policy,
         backend,
     } = run;
-    let mut signals = subscribe_signals()?;
-    #[cfg(target_os = "macos")]
-    let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
-    let mut progress = git_on::terminal_ui::StartupProgress::start(invoked, &tree)?;
-    if let Some(signal) = git_on::git::cancelled_signal() {
-        return Ok(ExitStatus::from_raw(signal));
-    }
-    let temp = tempfile::Builder::new()
-        .prefix("git-on-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .with_context(|| {
-            format!("cannot create a private snapshot in {}; check the directory's write/search permissions and available space, or choose another TMPDIR", env::temp_dir().display())
-        })?;
-    let dir = fs::canonicalize(temp.path())?;
-    let held_lock = lock(&dir, true)?;
-    let _retained = temp.keep();
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut state = Recovery {
-        format: "git-on-temp-v1".into(),
-        id: id.clone(),
-        git_dir: None,
-        tree_oid: None,
-        pin_ref: None,
-    };
-    let _lock = held_lock;
+    let id = state.id.clone();
     let mut observed = None;
+    let mut progress = None;
     #[cfg(feature = "test-metrics")]
     let mut measured_backend = None;
     let mut result = (|| -> Result<ExitStatus> {
@@ -604,7 +733,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
                 bail!("invalid test metrics descriptor");
             }
         }
-        save(&dir, &state)?;
+        let progress = progress.insert(git_on::terminal_ui::StartupProgress::start(
+            invoked, &tree, &dir,
+        )?);
 
         let native = Backend::native();
         let selected = if backend == Backend::Auto {
@@ -659,7 +790,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
                 &id,
                 write_policy,
                 allow_fallback,
-                &mut signals,
+                signals,
+                #[cfg(target_os = "macos")]
+                &mut state,
             )?
         };
         if session.is_none() {
@@ -684,7 +817,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .env("GIT_ON_TREE_OID", state.tree_oid.as_ref().unwrap());
+            .env("GIT_ON_TREE_OID", snapshot.tree_oid.to_string());
         let mut terminal = Terminal::capture();
         let tty_fd = terminal.descriptor();
         let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() });
@@ -735,7 +868,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
 
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
-        let outcome = supervise(&mut child, &mut signals, &terminal, session.as_ref());
+        let outcome = supervise(&mut child, signals, &terminal, session.as_ref());
 
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
@@ -759,7 +892,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })();
-    progress.finish();
+    if let Some(progress) = &mut progress {
+        progress.finish();
+    }
     // Also cover errors before the child could start. State inspection below
     // must never wait behind an owned operation that the run no longer needs.
     git_on::git::stop_operations();
@@ -789,7 +924,12 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
                 )
             });
         }
-        if mount_is_ours(&dir, &id)? {
+        if mount_is_ours(
+            &dir,
+            &id,
+            #[cfg(target_os = "macos")]
+            state.nfs_socket.as_deref(),
+        )? {
             bail!(
                 "temporary mount remains at {}; use --cleanup after stopping its users",
                 dir.display()
@@ -797,9 +937,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         }
         ensure_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
-        git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+        git_on::remote::stop_connection(&ssh_control_path(&dir))?;
         #[cfg(target_os = "macos")]
-        git_on::platform::cleanup_nfs_socket(&id)?;
+        git_on::platform::cleanup_nfs_socket(&id, state.nfs_socket.as_deref())?;
         git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
         release_pin(&state)?;
         if dir.join("remote-repository").exists() {
@@ -840,19 +980,6 @@ fn subscribe_signals() -> std::io::Result<Signals> {
         libc::SIGCONT,
     ])
 }
-fn handle_file_size_errors() -> std::io::Result<()> {
-    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
-    if unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), action.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { action.assume_init() }.sa_sigaction == libc::SIG_DFL {
-        // Catch daemon write-limit signals so EFBIG reaches normal cleanup.
-        // Exec resets caught handlers to default; an inherited SIG_IGN remains
-        // unchanged, preserving the caller's choice in Git and the command.
-        unsafe { signal_hook::low_level::register(libc::SIGXFSZ, || {}) }?;
-    }
-    Ok(())
-}
 fn main() {
     let invoked = Instant::now();
     if let Some(status) = git_on::terminal_ui::invoke_askpass() {
@@ -862,7 +989,6 @@ fn main() {
     let result = (|| -> Result<ExitStatus> {
         // main has not created signal handlers, worker threads or Git handles.
         unsafe { git_on::object::configure_pack_descriptors() }?;
-        handle_file_size_errors()?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
                 cleanup(Path::new(&directory))?;
@@ -903,7 +1029,7 @@ fn main() {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

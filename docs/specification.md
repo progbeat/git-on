@@ -56,9 +56,12 @@ is part of this bug fix; it does not require a major version increment.
   `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
   including abbreviations, ancestry, reflogs and `HEAD:path`. Native Git is
   required for local resolution as well as remote operations.
-- With two operands, pass the exact repository and revision/refspec arguments
-  to native `git fetch` in a private temporary Git repository. Git resolves
-  configured remotes, URLs, local paths, ref names, refspecs and their precedence.
+- With two operands, native Git resolves configured remotes, URLs and local
+  paths. The [reusable transport](remote.md#object-demand-and-cache-lifetime)
+  can select an unambiguous branch or full object ID. The compatibility path
+  passes the exact repository and revision/refspec arguments to native
+  `git fetch` in a private temporary Git repository for ref selection and
+  precedence.
   A colon in this second operand is fetch syntax; git-on must not reinterpret
   it as a remote subtree selector or strip a `+` prefix.
 - Do not implement an additional repository/revision grammar, reject operands
@@ -77,6 +80,10 @@ is part of this bug fix; it does not require a major version increment.
   are confined to the private repository. Existing object-demand, filter,
   cancellation, SSH ownership, cache and filesystem contracts still apply;
   materialization cannot bypass any Git resolution, verification or object error.
+- Git-on accesses the caller's local object database read-only and retains the
+  selected tree OID in memory for the invocation. If external repository
+  maintenance removes an unread object, the operation that needs it reports the
+  source error.
 - Native operations use the caller's Git configuration and object-location
   environment. Resolve local revisions and read the objects from the same
   Git-selected object database, including object directories and alternates.
@@ -125,10 +132,13 @@ The native mount and write-policy contracts apply to local and remote runs.
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
 - The writable layer is fresh for each run. It uses private filesystem-backed
-  storage under the system temporary location and respects `TMPDIR`; git-on
-  creates no private memory filesystem and imposes no disk quota. The underlying
-  temporary filesystem's capacity and operating-system limits still apply.
-- Completion unmounts (when mounted) and deletes the private execution tree.
+  storage in a per-run directory under `TMPDIR/git-on` (or the system temporary
+  location's `git-on` directory). If another unprivileged user owns that group,
+  git-on uses a private group for the current user. Git-on creates no private memory filesystem
+  and imposes no disk quota. The underlying temporary filesystem's capacity and
+  operating-system limits apply.
+- Completion unmounts the snapshot and removes the run's temporary files.
+  The last run removes its empty group.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
 - Handle recoverable resource errors through ordinary operation or runner
@@ -136,12 +146,20 @@ The native mount and write-policy contracts apply to local and remote runs.
   does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, releasing the exact Git pin and identifying the owned SSH socket;
+  locking, releasing a recorded Git pin and identifying the owned SSH socket;
   it is not a run manifest or log.
   `git on --cleanup <temporary-directory>` must refuse active directories, avoid unrelated mounts and changed pin targets, and
   never terminate processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
+
+### Resource assumptions
+
+Supported workloads fit in available RAM, including the aggregate data
+needed to decode and retain a pack. Git-on leaves inherited process
+limits, including `RLIMIT_FSIZE`, to the host. It follows its own cache
+policy independently of those limits. The two-checkout budget concerns
+available filesystem space for Git-on and the command.
 
 ## Backend selection and materialization
 
@@ -175,12 +193,11 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset.
 The lazy startup and performance requirements below apply to both native mounts.
 
-Remote materialization obtains the selected revision in one shallow transfer
-when host per-file limits permit it. A mount fallback reuses the original
-selection and fetches the full snapshot in one additional shallow transfer.
-Compressed objects are decoded into their final paths;
-already prepared contents are reused for repeated OIDs. Finite per-file limits
-retain bounded transfers rather than creating a pack that exceeds that limit.
+Remote materialization obtains the selected revision in one shallow transfer.
+A mount fallback reuses the original selection and fetches the full snapshot
+in one additional shallow transfer.
+Compressed objects are decoded into their final paths, and already prepared
+contents are reused for repeated OIDs.
 
 ## FUSE operation coverage requirement
 
@@ -220,7 +237,7 @@ affected behavior is claimed verified.
 
 The objective is minimal launch overhead and demand-driven work, including for
 repositories with millions of paths. Native mounts must avoid full checkouts
-and complete in-memory copies of the selected tree.
+and eager in-memory materialization of the revision's file contents.
 
 1. Before launching the child, git-on must not recursively enumerate the entire
    selected tree, load every blob, or materialize all source files. Resolving and
@@ -239,27 +256,25 @@ and complete in-memory copies of the selected tree.
    A lookup in an
    unopened directory may load only the necessary blob headers, applicable
    ignore files, and required Git object decoding.
-4. Git storage encoding may require decoding a whole object or its delta bases,
-   even for a partial read. Remote read-ahead uses the already parsed directory
+4. Assume individual Git objects fit in RAM. A lazy read may decode and verify
+   a whole object even for a partial read. Git storage encoding may also require
+   decoding delta bases. Remote read-ahead uses the already parsed directory
    view and does not open additional trees. Measurements distinguish requested
    objects, speculative transfers, and necessary storage-level decoding.
 5. Write-policy checks must load applicable pinned ignore rules on demand and
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.
 6. Repeated operations should reuse useful decoded data instead of repeatedly
-   decoding the same objects. Decoded memory caching must have an explicit bounded retention
-   policy; walking many files must not retain every payload indefinitely.
-   Active reads and unavoidable object decoding are accounted for separately.
-7. Do not keep duplicate full source payloads merely to transfer data between
-   snapshot and filesystem layers. Memory use should reflect demanded objects,
-   active operations, and bounded caches, not the whole repository's contents.
-   A writable source inode must not retain an additional complete immutable
-   decoded backing merely for reuse. The last original inode transfers its
-   backing; other original same-OID inodes, including unopened paths and
-   open-unlinked references, retain their prepared bytes without repeated
-   decoding. Ownership accounting may inspect selected-tree metadata when the
-   first destructive source operation requires it; it must not preload blobs
-   or become a launch, read or policy-check prerequisite.
+   decoding the same objects. Bound the block LRU by bytes and the hot whole-blob
+   LRU by object count. Account for active reads, decoding, and metadata
+   separately from those caches.
+7. Keep prepared Git objects immutable and verify the bytes served from them.
+   The first successful content change switches the file to private writable
+   backing. Copy-up uses an ordinary filesystem copy or clone. The entire
+   private file uses ordinary filesystem I/O, including bytes retained from
+   the source. Block authentication is confined to immutable source reads.
+   If the same command can finish with two checked-out copies of the selected
+   revision on disk, Git-on must be able to run it too.
 8. Failures discovered in objects reached on demand must be reported through
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
@@ -300,6 +315,28 @@ measured real overhead also remains required.
 No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
 hardware, software, storage, cache state, fixture shape, and the tested revision.
+
+## Storage and buffer requirements for the target design
+
+1. When Git-on or a helper writes data that Git-on owns and keeps internal,
+   it may write to disk only to spill blob contents evicted from the LRU
+   cache. Git-on may read existing repositories from disk. The user-visible
+   execution tree from `copy` may reside on disk, including when `auto`
+   selects `copy`. User writes may use disk, including copy-up and backing
+   files on native mounts.
+2. Immutable data already in RAM is used without copying on every execution
+   path. Components borrow existing buffers or transfer ownership of them
+   without copying their contents.
+3. Keep the revision's loaded directory metadata and other internal metadata
+   in RAM. Native mounts follow the lazy access requirements when loading
+   metadata.
+4. Remove redundant passes over data when the performance gain justifies the
+   complexity. Where practical, compute and cache needed results as the data
+   is processed, taking into account the capabilities of the libraries in use.
+
+The preceding sections describe the current behavior contract. The target
+design must reconcile snapshot pin writes, temporary Git repositories,
+pack staging, and crash recovery with these requirements.
 
 ## Acceptance evidence
 
@@ -369,12 +406,12 @@ not replace them or establish proof for all possible sequences.
 ## Implementation and verification
 
 The implementation uses a shared pinned object store, demand-only metadata/blob
-access, a byte-budgeted content LRU and deferred inode creation. The LRU retains
-at most one entry per original OID across all readers: a complete small object
-or one large-file block. Trusted descriptors/block hashes and parsed directories
-remain in RAM for touched unique objects outside that payload budget. Raw tree
-bytes and disk object/name indexes are not retained. The FUSE layer retains no
-duplicate snapshot payloads. Source
+access and deferred inode creation. A byte-budgeted LRU retains complete small
+objects and individual blocks of spilled files. A separate LRU holds whole hot
+blobs. Trusted descriptors, block hashes and parsed directories remain in RAM
+outside the block budget. Extra objects from reusable packs retain their
+verified bytes in RAM until use. Parsing a demanded tree releases its raw
+bytes. The FUSE layer retains no duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail
 metadata access, LFS pointers fail content reads, and unrelated entries remain
 usable. Listing a directory may report a submodule name without following it.

@@ -4,7 +4,7 @@ use crate::{
     object::{check_transfer, OperationCancelled},
     pack_stream, transport,
 };
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use curl::{
     easy::{Auth, Easy2, Handler, HttpVersion, List, WriteError},
     multi::{Easy2Handle, Multi, WaitFd},
@@ -18,23 +18,30 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 const ADVERTISEMENT: &[u8] = b"application/x-git-upload-pack-advertisement";
 const PACK_RESULT: &[u8] = b"application/x-git-upload-pack-result";
 
+type CredentialProvider = Box<dyn FnOnce(&str) -> Result<Option<Credentials>> + Send>;
+
 pub(crate) struct Configuration {
     base: String,
     ca: Option<PathBuf>,
-    credential: Command,
+    credential: CredentialProvider,
 }
 
 impl Configuration {
-    pub(crate) fn new(url: &OsStr, credential: Command) -> Option<Self> {
+    pub(crate) fn new(
+        url: &OsStr,
+        credential: impl FnOnce(&str) -> Result<Option<Credentials>> + Send + 'static,
+    ) -> Option<Self> {
         let url = url.to_str()?;
         let parsed = url::Url::parse(url).ok()?;
         let version = curl::Version::get();
@@ -52,17 +59,17 @@ impl Configuration {
         Some(Self {
             base: url.trim_end_matches('/').to_owned(),
             ca: std::env::var_os("GIT_SSL_CAINFO").map(PathBuf::from),
-            credential,
+            credential: Box::new(credential),
         })
     }
 }
 
-struct Credentials {
+pub(crate) struct Credentials {
     user: String,
     password: String,
 }
 
-fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
+pub(crate) fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
     command
         .args(["-c", "credential.interactive=false", "credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -101,9 +108,169 @@ fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
     }))
 }
 
+// Bound queued wire bytes per receiving stream independently of the number
+// of requests libcurl can multiplex. A full queue pauses only that transfer.
+const QUEUE_CHUNKS: usize = 8;
+
+pub(crate) type ReportFailure = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
+
+fn note_failure<T>(report: Option<&ReportFailure>, result: &Result<T>) {
+    if let (Some(report), Err(error)) = (report, result) {
+        if !crate::object::is_cancelled(error) {
+            report(error);
+        }
+    }
+}
+
 enum Body {
     Discovery(Vec<u8>),
-    Reply(Box<pack_stream::Response>),
+    PendingReply {
+        pack: Box<pack_stream::Response<'static>>,
+        wake: Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
+    },
+    Reply(Decoder),
+}
+
+struct Decoder {
+    input: Option<SyncSender<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    buffered: Arc<AtomicUsize>,
+    complete_body: Arc<AtomicBool>,
+    report_failure: Option<ReportFailure>,
+    terminal_error: Option<String>,
+    result: Receiver<Result<pack_stream::Received>>,
+    thread: Option<JoinHandle<()>>,
+    paused: bool,
+}
+
+impl Decoder {
+    fn start(
+        mut pack: Box<pack_stream::Response<'static>>,
+        stop: Arc<AtomicBool>,
+        wake: Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
+    ) -> io::Result<Self> {
+        let (input, chunks) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CHUNKS);
+        let (complete, result) = mpsc::channel();
+        let buffered = Arc::new(AtomicUsize::new(0));
+        let decoder_stop = Arc::new(AtomicBool::new(false));
+        pack.set_stop(Some(decoder_stop.clone()));
+        let complete_body = Arc::new(AtomicBool::new(false));
+        let pending = buffered.clone();
+        let body_finished = complete_body.clone();
+        let report = report_failure.clone();
+        let thread = thread::Builder::new()
+            .name("git-on-http-pack".into())
+            .spawn(move || {
+                let received = (|| {
+                    for chunk in &chunks {
+                        if pending.fetch_sub(1, Ordering::AcqRel) >= QUEUE_CHUNKS {
+                            crate::demand::signal_http2(&wake);
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            return Err(OperationCancelled.into());
+                        }
+                        pack.write_http(&chunk)?;
+                    }
+                    if !body_finished.load(Ordering::Acquire) {
+                        return Err(OperationCancelled.into());
+                    }
+                    pack.finish_http()
+                })();
+                note_failure(report.as_ref(), &received);
+                let _ = complete.send(received);
+                crate::demand::signal_http2(&wake);
+            })?;
+        Ok(Self {
+            input: Some(input),
+            stop: decoder_stop,
+            buffered,
+            complete_body,
+            report_failure,
+            terminal_error: None,
+            result,
+            thread: Some(thread),
+            paused: false,
+        })
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        self.buffered.fetch_add(1, Ordering::AcqRel);
+        match self
+            .input
+            .as_ref()
+            .expect("active HTTP reply")
+            .try_send(data.to_vec())
+        {
+            Ok(()) => Ok(data.len()),
+            Err(error) => {
+                self.buffered.fetch_sub(1, Ordering::AcqRel);
+                match error {
+                    TrySendError::Full(_) => {
+                        self.paused = true;
+                        Err(WriteError::Pause)
+                    }
+                    TrySendError::Disconnected(_) => Ok(0),
+                }
+            }
+        }
+    }
+
+    fn can_resume(&mut self) -> bool {
+        if self.paused && self.buffered.load(Ordering::Acquire) < QUEUE_CHUNKS {
+            self.paused = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn end(&mut self, outcome: Result<()>) -> Result<()> {
+        note_failure(self.report_failure.as_ref(), &outcome);
+        if outcome.is_ok() {
+            self.complete_body.store(true, Ordering::Release);
+            drop(self.input.take());
+        } else {
+            if self.report_failure.is_some() {
+                self.terminal_error = outcome
+                    .as_ref()
+                    .err()
+                    .filter(|error| !crate::object::is_cancelled(error))
+                    .map(|error| format!("{error:#}"));
+            }
+            self.cancel();
+        }
+        outcome
+    }
+
+    fn result(&self) -> Option<Result<pack_stream::Received>> {
+        match self.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("Git HTTPS decoder stopped")))
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        drop(self.input.take());
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        // A publication already in progress can finish after the first report.
+        if let (Some(report), Some(error)) = (&self.report_failure, self.terminal_error.take()) {
+            report(&anyhow::Error::msg(error));
+        }
+    }
 }
 
 struct Response {
@@ -118,23 +285,35 @@ struct Response {
 
 impl Handler for Response {
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        let result = match &mut self.body {
+        if self.h2 && self.ok && self.git_pack && matches!(self.body, Body::PendingReply { .. }) {
+            let body = std::mem::replace(&mut self.body, Body::Discovery(Vec::new()));
+            let Body::PendingReply {
+                pack,
+                wake,
+                report_failure,
+            } = body
+            else {
+                unreachable!()
+            };
+            match Decoder::start(pack, self.stop.clone(), wake, report_failure) {
+                Ok(decoder) => self.body = Body::Reply(decoder),
+                Err(error) => {
+                    self.error = Some(error);
+                    return Ok(0);
+                }
+            }
+        }
+        match &mut self.body {
             Body::Discovery(bytes) if bytes.len() + data.len() <= 256 * 1024 => {
                 bytes.extend_from_slice(data);
-                Ok(())
+                Ok(data.len())
             }
-            Body::Discovery(_) => Err(io::Error::other("Git HTTP discovery response is oversized")),
-            Body::Reply(stream) if self.h2 && self.ok && self.git_pack => {
-                stream.write_http(data).map_err(io::Error::other)
-            }
-            Body::Reply(_) => Ok(()),
-        };
-        match result {
-            Ok(()) => Ok(data.len()),
-            Err(error) => {
-                self.error = Some(error);
+            Body::Discovery(_) => {
+                self.error = Some(io::Error::other("Git HTTP discovery response is oversized"));
                 Ok(0)
             }
+            Body::Reply(decoder) if self.h2 && self.ok && self.git_pack => decoder.feed(data),
+            Body::Reply(_) | Body::PendingReply { .. } => Ok(data.len()),
         }
     }
 
@@ -172,7 +351,22 @@ pub(crate) struct Client {
     auth: Option<Credentials>,
     multi: Multi,
     active: HashMap<usize, Easy2Handle<Response>>,
+    decoding: HashMap<usize, Decoder>,
+    retiring: Vec<Decoder>,
     stop: Arc<AtomicBool>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        for handle in self.active.values_mut() {
+            if let Body::Reply(decoder) = &mut handle.get_mut().body {
+                decoder.cancel();
+            }
+        }
+        for decoder in self.decoding.values_mut().chain(&mut self.retiring) {
+            decoder.cancel();
+        }
+    }
 }
 
 impl Client {
@@ -192,6 +386,8 @@ impl Client {
             auth: None,
             multi,
             active: HashMap::new(),
+            decoding: HashMap::new(),
+            retiring: Vec::new(),
             stop,
         };
         let mut credential = Some(config.credential);
@@ -266,12 +462,12 @@ impl Client {
         &mut self,
         service: &str,
         request: Option<Vec<u8>>,
-        credential: &mut Option<Command>,
+        credential: &mut Option<CredentialProvider>,
     ) -> Result<Easy2<Response>> {
         let response = self.metadata(service, request.clone())?;
         if response.response_code()? == 401 && response.get_ref().h2 && response.get_ref().basic {
-            if let Some(command) = credential.take() {
-                self.auth = credentials(command, &self.base)?;
+            if let Some(fetch) = credential.take() {
+                self.auth = fetch(&self.base)?;
                 if self.auth.is_some() {
                     return self.metadata(service, request);
                 }
@@ -307,11 +503,17 @@ impl Client {
         &mut self,
         token: usize,
         oids: &[Oid],
-        response: pack_stream::Response,
+        response: pack_stream::Response<'static>,
+        wake: &Arc<UnixStream>,
+        report_failure: Option<ReportFailure>,
     ) -> Result<()> {
         let easy = self.easy(
             "git-upload-pack",
-            Body::Reply(Box::new(response)),
+            Body::PendingReply {
+                pack: Box::new(response),
+                wake: wake.clone(),
+                report_failure,
+            },
             Some(transport::exact_request(oids)?),
         )?;
         let mut handle = self.multi.add2(easy)?;
@@ -321,33 +523,112 @@ impl Client {
     }
 
     pub(crate) fn progress(&mut self) -> Result<Vec<(usize, Result<pack_stream::Received>)>> {
-        self.multi.perform()?;
+        let mut failed_resume = Vec::new();
+        for (&token, handle) in &mut self.active {
+            if let Body::Reply(decoder) = &mut handle.get_mut().body {
+                if decoder.can_resume() {
+                    // libcurl can call the body callback during unpause. A
+                    // decoder rejection here belongs to this stream alone.
+                    if let Err(error) = handle.unpause_write() {
+                        failed_resume.push((token, error));
+                    }
+                }
+            }
+        }
+
         let mut finished = Vec::new();
+        for (token, error) in failed_resume {
+            self.end_transfer(token, Err(error), &mut finished)?;
+        }
+        self.multi.perform()?;
+        let mut transfers = Vec::new();
         self.multi.messages(|message| {
             if let Some(result) = message.result() {
-                finished.push((message.token(), result));
+                transfers.push((message.token(), result));
             }
         });
-        finished
-            .into_iter()
-            .map(|(token, outcome)| {
-                let token = token?;
-                let handle = self
-                    .active
-                    .remove(&token)
-                    .context("unknown Git HTTP/2 request")?;
-                let mut response = self.multi.remove2(handle)?;
-                let result = self.finish(&mut response, outcome);
-                Ok((token, result))
+        for (token, outcome) in transfers {
+            self.end_transfer(token?, outcome, &mut finished)?;
+        }
+
+        // A decoder can reject a reply while its peer is still sending.
+        // Drop only that transfer and deliver the decoder's diagnostic.
+        let rejected: Vec<_> = self
+            .active
+            .iter()
+            .filter_map(|(&token, handle)| match &handle.get_ref().body {
+                Body::Reply(decoder) => decoder.result().map(|result| (token, result)),
+                _ => None,
             })
-            .collect()
+            .collect();
+        for (token, result) in rejected {
+            let handle = self
+                .active
+                .remove(&token)
+                .expect("active Git HTTP/2 request");
+            self.multi.remove2(handle)?;
+            finished.push((token, result));
+        }
+
+        self.decoding.retain(|&token, decoder| {
+            if let Some(result) = decoder.result() {
+                finished.push((token, result));
+                false
+            } else {
+                true
+            }
+        });
+        self.retiring.retain(|decoder| decoder.result().is_none());
+        Ok(finished)
     }
 
-    fn finish(
+    fn end_transfer(
+        &mut self,
+        token: usize,
+        outcome: Result<(), curl::Error>,
+        finished: &mut Vec<(usize, Result<pack_stream::Received>)>,
+    ) -> Result<()> {
+        let handle = self
+            .active
+            .remove(&token)
+            .context("unknown Git HTTP/2 request")?;
+        let mut response = self.multi.remove2(handle)?;
+        let network = self.check_response(&mut response, outcome);
+        let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
+        match body {
+            Body::Reply(mut decoder) => match decoder.end(network) {
+                Ok(()) => {
+                    self.decoding.insert(token, decoder);
+                }
+                Err(error) => {
+                    // Report the terminal error before retiring the worker. A
+                    // local cache spill can still be finishing in this decoder.
+                    let result = decoder.result().filter(|result| {
+                        result
+                            .as_ref()
+                            .is_err_and(|error| !crate::object::is_cancelled(error))
+                    });
+                    finished.push((token, result.unwrap_or(Err(error))));
+                    self.retiring.push(decoder);
+                }
+            },
+            Body::PendingReply { pack, .. } => {
+                finished.push((token, network.and_then(|()| pack.finish_http())));
+            }
+            Body::Discovery(_) => {
+                let result =
+                    network.and_then(|()| Err(anyhow::anyhow!("missing Git HTTP/2 fetch body")));
+                finished.push((token, result));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_response(
         &self,
         response: &mut Easy2<Response>,
         outcome: Result<(), curl::Error>,
-    ) -> Result<pack_stream::Received> {
+    ) -> Result<()> {
         if let Some(error) = response.get_mut().error.take() {
             return Err(error.into());
         }
@@ -362,11 +643,7 @@ impl Client {
             response.get_ref().h2 && response.content_type_bytes()? == Some(PACK_RESULT),
             "invalid Git HTTP/2 fetch response"
         );
-        let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
-        let Body::Reply(stream) = body else {
-            bail!("missing Git HTTP/2 fetch body");
-        };
-        stream.finish_http()
+        Ok(())
     }
 
     pub(crate) fn wait(&self, wake: &UnixStream, timeout: Duration) -> Result<()> {
@@ -375,5 +652,305 @@ impl Client {
         fd.poll_on_read(true);
         self.multi.wait(&mut [fd], timeout)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::{mpsc, Mutex},
+        thread,
+    };
+
+    fn framed_blob() -> (Oid, Vec<u8>, Vec<u8>) {
+        use sha1_checked::{Digest, Sha1};
+
+        let oid = Oid::hash_object(git2::ObjectType::Blob, b"x").unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            b"PACK\0\0\0\x02\0\0\0\x01\x31".to_vec(),
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(b"x").unwrap();
+        let pack = encoder.finish().unwrap();
+        let mut frame = format!("000dpackfile\n{:04x}\x01", pack.len() + 5).into_bytes();
+        frame.extend_from_slice(&pack);
+        let trailer = Sha1::digest(&pack);
+        let mut tail = format!("{:04x}\x01", trailer.len() + 5).into_bytes();
+        tail.extend_from_slice(&trailer);
+        tail.extend_from_slice(b"0000");
+        (oid, frame, tail)
+    }
+
+    #[test]
+    fn decoded_pack_failure_is_reported_without_another_dispatch_pass() {
+        let (oid, frame, _) = framed_blob();
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (publish, published) = mpsc::channel();
+        let pack = pack_stream::Response::new(
+            scratch,
+            vec![oid],
+            Box::new(move |object| {
+                assert_eq!(object.oid(), oid);
+                publish.send(())?;
+                Ok(())
+            }),
+        );
+        let (_read, wake) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let (report, reported) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Mutex::new(resume);
+        let mut decoder = Decoder::start(
+            Box::new(pack),
+            Arc::default(),
+            Arc::new(wake),
+            Some(Arc::new(move |error| {
+                let _ = report.send(error.to_string());
+                resume.lock().unwrap().recv().unwrap();
+            })),
+        )
+        .unwrap();
+        decoder.feed(&frame).unwrap();
+        published.recv_timeout(Duration::from_secs(3)).unwrap();
+        decoder.feed(b"zzzz").unwrap();
+        let diagnostic = reported.recv_timeout(Duration::from_secs(3));
+        let accepted = decoder.feed(b"0000");
+        let _ = release.send(());
+        let result = decoder.result.recv_timeout(Duration::from_secs(3)).unwrap();
+        let expected = result.err().expect("malformed packet").to_string();
+        drop(decoder);
+        assert_eq!(
+            diagnostic.expect("decoder discarded a diagnosed error"),
+            expected
+        );
+        assert_eq!(
+            accepted.unwrap(),
+            4,
+            "libcurl saw a write error before the decoder's report finished"
+        );
+    }
+
+    #[test]
+    fn terminal_transport_failure_reaches_the_reader_before_the_decoder_retires() {
+        let (oid, frame, _) = framed_blob();
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (publish, published) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let exposed = Arc::new(AtomicBool::new(false));
+        let expose = exposed.clone();
+        let pack = pack_stream::Response::new(
+            scratch,
+            vec![oid],
+            Box::new(move |_| {
+                publish.send(())?;
+                resumed.recv_timeout(Duration::from_secs(3))?;
+                expose.store(true, Ordering::Release);
+                Ok(())
+            }),
+        );
+        let (_read, wake) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (report, reported) = mpsc::channel();
+        let mut decoder = Decoder::start(
+            Box::new(pack),
+            stop.clone(),
+            Arc::new(wake),
+            Some(Arc::new(move |error| {
+                let _ = report.send((error.to_string(), exposed.load(Ordering::Acquire)));
+            })),
+        )
+        .unwrap();
+        decoder.feed(&frame).unwrap();
+        published.recv_timeout(Duration::from_secs(3)).unwrap();
+        let multi = Multi::new();
+        let handle = multi
+            .add2(Easy2::new(Response {
+                body: Body::Reply(decoder),
+                error: Some(io::Error::other("required transfer was reset")),
+                stop: stop.clone(),
+                h2: true,
+                ok: true,
+                git_pack: true,
+                basic: false,
+            }))
+            .unwrap();
+        let mut client = Client {
+            base: String::new(),
+            ca: None,
+            auth: None,
+            multi,
+            active: HashMap::from([(1, handle)]),
+            decoding: HashMap::new(),
+            retiring: Vec::new(),
+            stop,
+        };
+        let mut finished = Vec::new();
+        let result = client.end_transfer(1, Ok(()), &mut finished);
+        release.send(()).unwrap();
+        result.unwrap();
+        let (token, result) = finished
+            .pop()
+            .expect("transport failure waited for local publication");
+        assert_eq!(token, 1);
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "required transfer was reset"
+        );
+        let expected = "required transfer was reset".to_owned();
+        assert_eq!(reported.try_recv().unwrap(), (expected.clone(), false));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !client.retiring.is_empty() {
+            assert!(client.progress().unwrap().is_empty());
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(reported.try_recv().unwrap(), (expected, true));
+    }
+
+    #[test]
+    fn a_pack_buffer_wait_ends_on_reset_or_drop() {
+        for failure in [None, Some("required transfer was reset")] {
+            let directory = tempfile::tempdir().unwrap();
+            let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+            let occupied: Vec<_> = (0..8)
+                .map(|_| {
+                    scratch
+                        .reserve_pack_decode(|| true, check_transfer)
+                        .unwrap()
+                })
+                .collect();
+            let pack = pack_stream::Response::new(scratch, vec![], Box::new(|_| unreachable!()));
+            let (_read, wake) = UnixStream::pair().unwrap();
+            let mut decoder =
+                Decoder::start(Box::new(pack), Arc::default(), Arc::new(wake), None).unwrap();
+            // A pack header and the entry header for a 65537-byte blob.
+            decoder
+                .feed(b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20")
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while decoder.buffered.load(Ordering::Acquire) != 0
+                && std::time::Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            let entered = decoder.buffered.load(Ordering::Acquire) == 0;
+            let (finished, wait_for_finish) = mpsc::channel();
+            let join = thread::spawn(move || {
+                if let Some(failure) = failure {
+                    let failure = decoder.end(Err(anyhow::anyhow!(failure))).unwrap_err();
+                    let result = decoder.result.recv().unwrap();
+                    assert!(result.as_ref().is_err_and(crate::object::is_cancelled));
+                    finished.send(Some(failure.to_string())).unwrap();
+                } else {
+                    drop(decoder);
+                    finished.send(None).unwrap();
+                }
+            });
+            let cancelled = wait_for_finish.recv_timeout(Duration::from_secs(1));
+            drop(occupied);
+            join.join().unwrap();
+            assert!(entered, "decoder did not start consuming the pack");
+            assert_eq!(
+                cancelled
+                    .expect("decoder waited for a different stream's buffer")
+                    .as_deref(),
+                failure
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_decode_does_not_hold_an_independent_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
+        let (oid, frame, tail) = framed_blob();
+        let (started, wait_for_start) = mpsc::channel();
+        let (release, wait_for_release) = mpsc::channel();
+        let (published, wait_for_publication) = mpsc::channel();
+        let (paused, wait_for_pause) = mpsc::channel();
+        let (_read, wake) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let wake = Arc::new(wake);
+        let handler = |publish| Response {
+            body: Body::PendingReply {
+                pack: Box::new(pack_stream::Response::new(
+                    scratch.clone(),
+                    vec![oid],
+                    publish,
+                )),
+                wake: wake.clone(),
+                report_failure: None,
+            },
+            error: None,
+            stop: Arc::default(),
+            h2: true,
+            ok: true,
+            git_pack: true,
+            basic: false,
+        };
+        let mut slow = handler(Box::new(move |_| {
+            started.send(())?;
+            wait_for_release.recv()?;
+            Ok(())
+        }));
+        let mut independent = handler(Box::new(move |object| {
+            assert_eq!(object.oid(), oid);
+            let _ = published.send(());
+            Ok(())
+        }));
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                assert_eq!(slow.write(&frame).unwrap(), frame.len());
+                let Body::Reply(decoder) = &mut slow.body else {
+                    unreachable!();
+                };
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while decoder.buffered.load(Ordering::Acquire) != 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "decoder never started"
+                    );
+                    thread::yield_now();
+                }
+                // The callback is still blocked on the first object. Fill its
+                // wire queue, then replay the refused bytes after it drains.
+                for byte in &tail[..QUEUE_CHUNKS] {
+                    assert_eq!(decoder.feed(std::slice::from_ref(byte)).unwrap(), 1);
+                }
+                let replay = &tail[QUEUE_CHUNKS..];
+                assert!(matches!(decoder.feed(replay), Err(WriteError::Pause)));
+                assert!(!decoder.can_resume());
+                let _ = paused.send(());
+                assert_eq!(independent.write(&frame).unwrap(), frame.len());
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !decoder.can_resume() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "decoder stayed paused"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(decoder.feed(replay).unwrap(), replay.len());
+                decoder.end(Ok(())).unwrap();
+                let received = decoder
+                    .result
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(received.bytes, 0);
+            });
+            let entered = wait_for_start.recv_timeout(Duration::from_secs(3));
+            let bounded = wait_for_pause.recv_timeout(Duration::from_secs(3));
+            let outcome = wait_for_publication.recv_timeout(Duration::from_secs(3));
+            let _ = release.send(());
+            entered.expect("the first HTTP response did not reach its decoder");
+            bounded.expect("the blocked stream did not reach its queue limit");
+            outcome.expect("a blocked pack decoder held an independent HTTP response");
+        });
     }
 }
