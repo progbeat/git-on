@@ -228,7 +228,7 @@ affected behavior is claimed verified.
 
 The objective is minimal launch overhead and demand-driven work, including for
 repositories with millions of paths. Native mounts must avoid full checkouts
-and complete in-memory copies of the selected tree.
+and eager in-memory materialization of the revision's file contents.
 
 1. Before launching the child, git-on must not recursively enumerate the entire
    selected tree, load every blob, or materialize all source files. Resolving and
@@ -312,10 +312,13 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
 1. The user-visible execution tree materialized by `copy` may reside on disk,
    whether `copy` is selected explicitly or by `auto`. For all other work,
    Git-on and its helper processes use disk only to write, read, or delete
-   objects evicted from the LRU cache.
+   blob contents evicted from the LRU cache.
 2. Immutable data already in RAM is used without copying on every execution
    path. Components borrow existing buffers or transfer ownership of them
    without copying their contents.
+3. Keep the revision's loaded directory metadata and other internal metadata
+   in RAM. Native mounts follow the lazy access requirements when loading
+   metadata.
 
 The preceding sections describe the current behavior contract. The target
 design must reconcile local Git storage, native Git staging, the writable
