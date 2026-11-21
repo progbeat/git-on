@@ -224,6 +224,7 @@ struct Queue {
     forecast_step: u64,
     forecast_score: u8,
     forecast_misses: u8,
+    forecast_expanded: bool,
     busy: [bool; CONNECTIONS],
     initial_channels: usize,
     starting: [bool; CONNECTIONS],
@@ -275,6 +276,7 @@ impl Queue {
         if !self.dense() {
             return READ_AHEAD;
         }
+        self.forecast_expanded = true;
         match self.forecast_score {
             2..=3 => 64,
             4..=5 => 128,
@@ -283,12 +285,14 @@ impl Queue {
     }
 
     fn dense(&self) -> bool {
-        self.forecast_score >= DENSE_SCORE && !matches!(self.mode, ConnectionMode::Standard)
+        self.forecast_score >= DENSE_SCORE
     }
 
     fn prediction_room(&mut self, width: usize) -> usize {
         let capacity = (4 * width).min(MAX_UNCONSUMED_PREDICTIONS);
-        if self.predicted.len() >= capacity && !matches!(self.mode, ConnectionMode::Standard) {
+        if self.predicted.len() >= capacity
+            && (self.forecast_expanded || !matches!(self.mode, ConnectionMode::Standard))
+        {
             // Completed guesses from an earlier part of a scan can occupy
             // the whole window while callers move through another subtree.
             // Give their slots back without dropping a flight in progress.
@@ -332,7 +336,12 @@ impl Queue {
                 .chain(self.ahead.front())
                 .map(|item| item.queued_at)
                 .min()?;
-            (first, DENSE_BATCH_WINDOW)
+            let window = if matches!(self.mode, ConnectionMode::Standard) {
+                BATCH_WINDOW
+            } else {
+                DENSE_BATCH_WINDOW
+            };
+            (first, window)
         } else if matches!(self.mode, ConnectionMode::Wide) && self.waiting.len() < BATCH_TARGET {
             (self.waiting.front()?.queued_at, BATCH_WINDOW)
         } else {
@@ -343,10 +352,18 @@ impl Queue {
             .filter(|remaining| !remaining.is_zero())
     }
 
+    fn wait_for_http2_event(&self, delay: Option<Duration>, transfer_active: bool) -> bool {
+        if delay.is_some() {
+            transfer_active || !matches!(self.mode, ConnectionMode::Standard)
+        } else {
+            self.waiting.is_empty()
+        }
+    }
+
     fn native_work(&mut self, index: usize, needs_ssh_channel: bool) -> Option<NativeWork> {
         let speculative = self.waiting.is_empty();
         let ready_for_exact = !speculative && !needs_ssh_channel;
-        let channels = if self.dense() {
+        let channels = if matches!(self.mode, ConnectionMode::Probing(_)) && self.dense() {
             CONNECTIONS
         } else {
             self.mode.channels()
@@ -643,7 +660,8 @@ impl Pool {
             return;
         }
         let mut accepted = 0;
-        for oid in candidates(queue.dense()) {
+        let prioritize_opened = !matches!(queue.mode, ConnectionMode::Standard) && queue.dense();
+        for oid in candidates(prioritize_opened) {
             if queue.pending.contains_key(&oid)
                 || queue.predicted.contains_key(&oid)
                 || self.scratch.available(oid)
@@ -1111,7 +1129,12 @@ impl Shared {
                 remaining.max(Duration::from_millis(1))
             });
             // A failed prefetch can enqueue an exact retry from this thread.
-            if delay.is_some() || self.queue.lock().unwrap().waiting.is_empty() {
+            let wait = self
+                .queue
+                .lock()
+                .unwrap()
+                .wait_for_http2_event(delay, !active.is_empty());
+            if wait {
                 client.wait(wake, timeout)?;
             }
         }
@@ -1292,33 +1315,70 @@ mod tests {
 
     #[test]
     fn forecast_grows_with_distinct_hits_and_shrinks_on_misses() {
-        let mut queue = Queue::default();
-        for index in 0..6 {
-            let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid, queue.forecast_step);
-            let expected = match index {
-                0 => 4,
-                1..=2 => 64,
-                3..=4 => 128,
-                _ => 256,
+        for mode in [ConnectionMode::Probing(0), ConnectionMode::Standard] {
+            let mut queue = Queue {
+                mode,
+                ..Queue::default()
             };
-            assert_eq!(queue.forecast_width(oid), expected);
-        }
-        let mut previous = MAX_READ_AHEAD;
-        for width in [128, 128, 64, 64, 4] {
-            for _ in 1..FORECAST_MISSES {
-                assert_eq!(queue.forecast_width(Oid::zero()), previous);
+            for index in 0..6 {
+                let oid = Oid::from_bytes(&[index; 20]).unwrap();
+                queue.predicted.insert(oid, queue.forecast_step);
+                let expected = match index {
+                    0 => 4,
+                    1..=2 => 64,
+                    3..=4 => 128,
+                    _ => 256,
+                };
+                assert_eq!(queue.forecast_width(oid), expected);
             }
-            assert_eq!(queue.forecast_width(Oid::zero()), width);
-            previous = width;
+            let mut previous = MAX_READ_AHEAD;
+            for width in [128, 128, 64, 64, 4] {
+                for _ in 1..FORECAST_MISSES {
+                    assert_eq!(queue.forecast_width(Oid::zero()), previous);
+                }
+                assert_eq!(queue.forecast_width(Oid::zero()), width);
+                previous = width;
+            }
         }
+    }
 
-        queue.mode = ConnectionMode::Standard;
-        for index in 0..6 {
-            let oid = Oid::from_bytes(&[index; 20]).unwrap();
-            queue.predicted.insert(oid, queue.forecast_step);
-            assert_eq!(queue.forecast_width(oid), READ_AHEAD);
-        }
+    #[test]
+    fn fast_scan_batches_files_after_its_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = Oid::from_bytes(&[1; 20]).unwrap();
+        let earlier = Oid::from_bytes(&[2; 20]).unwrap();
+        let following: [Oid; 5] =
+            std::array::from_fn(|index| Oid::from_bytes(&[index as u8 + 3; 20]).unwrap());
+        let mut queue = Queue {
+            mode: ConnectionMode::Standard,
+            forecast_score: DENSE_SCORE - 1,
+            ..Queue::default()
+        };
+        queue.predicted.insert(anchor, 0);
+        let pool = Pool {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(queue),
+                ..Shared::default()
+            }),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            git: Arc::new(Git::capture(directory.path()).unwrap()),
+            workers: Mutex::default(),
+            wake: None,
+        };
+        pool.prefetch(
+            anchor,
+            |prioritize_opened| {
+                following
+                    .into_iter()
+                    .map(move |oid| if prioritize_opened { earlier } else { oid })
+            },
+            |_| false,
+        );
+        let wants = {
+            let mut queue = pool.shared.queue.lock().unwrap();
+            Work::take(&mut queue.ahead, true).unwrap().wants()
+        };
+        assert_eq!(wants, following);
     }
 
     #[test]
@@ -1365,6 +1425,31 @@ mod tests {
         assert_eq!(queue.predicted.len(), 2);
         assert!(queue.predicted.contains_key(&active));
         assert!(queue.predicted.contains_key(&recent));
+    }
+
+    #[test]
+    fn fast_forecasts_can_restart_after_a_widened_scan_misses() {
+        let mut queue = Queue {
+            mode: ConnectionMode::Standard,
+            forecast_score: DENSE_SCORE - 1,
+            ..Queue::default()
+        };
+        let anchor = Oid::from_bytes(&[1; 20]).unwrap();
+        queue.predicted.insert(anchor, queue.forecast_step);
+        assert_eq!(queue.forecast_width(anchor), 64);
+        for value in 2..=24 {
+            let oid = Oid::from_bytes(&[value; 20]).unwrap();
+            queue.predicted.insert(oid, queue.forecast_step);
+        }
+        let active = Oid::from_bytes(&[2; 20]).unwrap();
+        queue.pending.insert(active, Demand::default());
+        for index in 0..=MIN_PREDICTION_AGE {
+            queue.forecast_width(Oid::from_bytes(&[100 + index as u8; 20]).unwrap());
+        }
+        assert!(!queue.dense());
+        assert_eq!(queue.prediction_room(READ_AHEAD), READ_AHEAD);
+        assert_eq!(queue.predicted.len(), 1);
+        assert!(queue.predicted.contains_key(&active));
     }
 
     #[test]
@@ -1618,5 +1703,15 @@ mod tests {
             });
         }
         assert_eq!(queue.batch_wait(now, true), None);
+
+        queue.mode = ConnectionMode::Standard;
+        queue.waiting.truncate(1);
+        assert_eq!(queue.batch_wait(now, true), None);
+        queue.forecast_score = DENSE_SCORE;
+        let delay = queue.batch_wait(now, true);
+        assert_eq!(delay, Some(BATCH_WINDOW));
+        assert!(queue.wait_for_http2_event(delay, true));
+        assert!(!queue.wait_for_http2_event(delay, false));
+        assert_eq!(queue.batch_wait(now, false), None);
     }
 }

@@ -77,8 +77,9 @@ wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
 an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
 It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
-the peer govern the active streams. After eight consistently slow replies,
-the loader can briefly wait for overlapping demands to share a fetch.
+the peer govern the active streams. The loader can briefly wait for
+overlapping demands after confirming a scan or observing consistently slow
+replies.
 Each foreground fetch can group up to 64 already pending OIDs.
 Explicit Git HTTP configuration, authentication outside the supported exchange,
 and servers without HTTP/2 or filtered protocol v2 use the native helper.
@@ -105,24 +106,27 @@ on the existing channels until one is available to send them.
 Beyond the initial SSH pool, actual demands open additional channels.
 Prefetch can use those channels after they connect.
 An idle pool starts an ordinary request immediately. While a transfer is active,
-the queue can wait up to two milliseconds on a slow source. A dense scan can
-wait up to twelve milliseconds to combine overlapping requests.
+the queue can wait up to two milliseconds on a slow source or during a confirmed
+scan. For a confirmed scan, the wait can reach twelve milliseconds while the
+source is slow or still being measured.
 
 A first access to a regular file in a directory opened for enumeration finds
 uncached and previously unscheduled blob OIDs in Git's depth-first order
 through already opened directories. It skips previously considered ranges
 and examines at most 512 remaining entries. The same planner serves FUSE and
-NFS. Speculative packs start with up to four OIDs. On slower connections,
-confirmed first accesses to predicted objects can expand this to 64, 128 or
-256. The first confirmation can expand the window to 64 after a slow reply
-when two or more required objects are still pending. Consecutive misses reduce
-the window. During a dense scan
-the planner groups remaining OIDs from the current and recently opened
-directories. The predictor tracks at most 512 OIDs ahead of actual accesses.
-When the window fills on a slower connection, completed predictions age out
-after unrelated accesses. Ordinary demands take precedence and can join an
-active speculative request without duplicating its fetch. If that
-speculation fails, only waiting ordinary demands reenter the request queue.
+NFS. Speculative packs start with up to four OIDs. Confirmed first accesses to
+predicted objects can expand this to 64, 128 or 256 at any connection speed.
+The first confirmation can expand the window to 64 after a slow reply when two
+or more required objects are still pending. Consecutive misses reduce the
+window. On a fast source, batches follow the file being read in depth-first
+order. While measuring a connection or on a slow source, a dense scan can
+group remaining OIDs from the current and recently opened directories.
+The predictor tracks at most 512 OIDs ahead of actual accesses.
+When the window fills after read-ahead has expanded or on a slower connection,
+completed predictions can age out after unrelated accesses. Ordinary demands
+take precedence and can join an active speculative request without duplicating
+its fetch. If that speculation fails, only waiting ordinary demands reenter
+the request queue.
 A diagnosed pack failure after serving a required read fails the invocation.
 These paths require a reusable transport and an unrestricted per-file size
 limit.

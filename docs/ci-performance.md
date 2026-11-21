@@ -61,9 +61,9 @@ SDK/dependency bootstrap is bypassed using
 
 The gate bounds the pinned workload's demand: at most 32 decoded trees, 4,096
 prepared entries, 128 blob/header loads, 1 MiB decoded payload and 1 MiB received
-Git pack payload. It requires real FUSE reads, accounts for up to four unused
-blob imports per prefetch pack, and checks the imported payload against the
-payload used across both passes. It also requires correct upstream output
+Git pack payload. It requires real FUSE reads, uses the observed prefetch
+counts to account for unused blob imports, and checks the imported payload
+against the payload used across both passes. It also requires correct upstream output
 without skips, complete invocation timing and waited descendant CPU accounting.
 These budgets constrain the test's small command.
 The shared integration-command timeout also makes stalled public-network access

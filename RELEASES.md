@@ -5,6 +5,8 @@
   Verify bytes read back from disk by block using BLAKE3.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
+- Use larger fetch batches when reads confirm a scan, including on fast
+  HTTPS and SSH connections.
 - Create a private file on the first content change, using filesystem cloning
   when available. Private files use ordinary I/O, including Linux FUSE
   passthrough on eligible opens. Reads of immutable cached data keep their
