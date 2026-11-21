@@ -269,8 +269,7 @@ impl Remote {
             failed: None,
             // Eager execution needs the whole selected tree. Keep its blobs
             // compressed until decoding directly into their final paths.
-            // Finite per-file limits retain individual-object transfers.
-            materializing: materialized && crate::spool::Files::size_limit()?.is_none(),
+            materializing: materialized,
             active_materialized_pack: None,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
@@ -280,9 +279,7 @@ impl Remote {
             let oid = remote.fetch_selected(revision, true, false)?;
             return Ok((remote, oid));
         }
-        let unrestricted = crate::spool::Files::size_limit()?.is_none();
-        let exact = (unrestricted
-            && revision.as_bytes().len() == 40
+        let exact = (revision.as_bytes().len() == 40
             && revision.as_bytes().iter().all(u8::is_ascii_hexdigit))
         .then(|| {
             revision
@@ -292,7 +289,8 @@ impl Remote {
         .flatten();
         // Select an exact ID or unambiguous branch on the same channel used
         // for mounting and later demands. Other refspecs use native Git.
-        let branch = (unrestricted && exact.is_none())
+        let branch = exact
+            .is_none()
             .then(|| crate::transport::BranchQuery::new(revision))
             .flatten();
         if exact.is_some() || branch.is_some() {
@@ -485,12 +483,10 @@ impl Remote {
     }
     pub(crate) fn fetch_copy_objects(&mut self, selected: Oid) -> Result<()> {
         self.session = None;
-        if crate::spool::Files::size_limit()?.is_none() {
-            // The revision has already been resolved and possibly verified.
-            // Request that exact object again without the lazy fetch filter.
-            let fetched = self.fetch_selected(OsStr::new(&selected.to_string()), false, true)?;
-            anyhow::ensure!(fetched == selected, "remote changed the selected snapshot");
-        }
+        // The revision has already been resolved and possibly verified.
+        // Request that exact object again without the lazy fetch filter.
+        let fetched = self.fetch_selected(OsStr::new(&selected.to_string()), false, true)?;
+        anyhow::ensure!(fetched == selected, "remote changed the selected snapshot");
         Ok(())
     }
     pub(crate) fn begin_materialization(&mut self) {
@@ -594,20 +590,7 @@ impl Remote {
             if missing.is_empty() {
                 return Ok(());
             }
-            // The want count bounds .promisor metadata, but not the resulting
-            // pack: object sizes/compression are unknown until fetched. Under
-            // a finite per-file limit, do not aggregate individually readable
-            // objects into an oversized native pack. Unrestricted runs retain
-            // batching; exact-object requests can reuse the streaming session.
-            let limit = if crate::spool::Files::size_limit()?.is_some() {
-                1
-            } else {
-                missing.len()
-            };
-            for batch in missing.chunks(limit) {
-                self.fetch(repo, batch)?;
-            }
-            Ok(())
+            self.fetch(repo, &missing)
         })();
         self.record_result(outcome)
     }
@@ -641,10 +624,7 @@ impl Remote {
         candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Result<Option<crate::demand::Demand>> {
         let outcome = (|| {
-            if !self.reusable_transport()
-                || self.failure().is_some()
-                || crate::spool::Files::size_limit()?.is_some()
-            {
+            if !self.reusable_transport() || self.failure().is_some() {
                 return Ok(None);
             }
             let odb = repo.odb()?;

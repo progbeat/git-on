@@ -69,110 +69,26 @@ class MaterializedTests(unittest.TestCase):
                 self.assertIn(backend + b' unavailable', result.stderr)
             self.clean()
 
-    def test_small_files_respect_individual_fsize_limits_without_aggregate_ceiling(self):
+    def test_small_files_materialize_with_a_reduced_descriptor_limit(self):
         import hashlib
         import resource
-        limit=65536
-        def limits():
-            signal.signal(signal.SIGXFSZ,signal.SIG_IGN)
-            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+        def limit_descriptors():
             resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
         for index in range(80):
-            # Compressible but distinct objects keep both the ordinary local
-            # clone and native file:// pack below the same per-file limit.
             (self.repo/f'f{index:05d}').write_bytes(hashlib.sha256(str(index).encode()).digest()+b'\0'*(8192-32))
-        self.git('add','.');self.git('commit','-qm','small-file FSIZE regression')
+        self.git('add','.');self.git('commit','-qm','small-file descriptor regression')
         self.before=self.git('status','--porcelain')
-        self.git('config','uploadpack.allowFilter','true')
-        self.git('config','uploadpack.allowAnySHA1InWant','true')
         code="""
-import hashlib,os
+import hashlib
 from pathlib import Path
-assert not any(p.name.startswith('raw-parts-') for p in Path('.').iterdir())
-for _ in range(2):
- for index in range(80):
-  expected=hashlib.sha256(str(index).encode()).digest()+b'\\0'*(8192-32)
-  assert Path(f'f{index:05d}').read_bytes()==expected
+for index in range(80):
+ expected=hashlib.sha256(str(index).encode()).digest()+b'\\0'*(8192-32)
+ assert Path(f'f{index:05d}').read_bytes()==expected
 """
-        for label,source,operands in [('local',str(self.repo),['HEAD']),('remote','file://'+str(self.repo),['file://'+str(self.repo),'HEAD'])]:
+        for label,operands in [('local',['HEAD']),('remote',[self.repo.as_uri(),'HEAD'])]:
             with self.subTest(source=label):
-                clone=self.root/f'clone-{label}'
-                result=subprocess.run(['git','clone','--quiet',source,str(clone)],env=self.env,preexec_fn=limits,capture_output=True,timeout=20)
+                result=subprocess.run([str(BINARY),*COPY_ARGS,*operands,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],cwd=self.repo,env=self.env,preexec_fn=limit_descriptors,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(len(list(clone.glob('f*'))),80)
-                result=subprocess.run([str(BINARY),*COPY_ARGS,*operands,'--write-policy=all','--',sys.executable,'-I','-S','-c',code],cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
-                self.assertEqual(result.returncode,0,result.stderr)
-                self.clean()
-
-    def test_oid_batch_respects_fsize_when_clone_and_command_succeed(self):
-        import resource
-        entries=[]
-        for index in range(32):
-            oid=self.git('hash-object','-w','--stdin',data=bytes([index])).decode().strip()
-            entries.append(f'100644 blob {oid}\tf{index:03d}\n')
-        empty=self.git('mktree',data=b'').decode().strip()
-        for index in range(224):
-            tree=self.git('mktree',data=f'040000 tree {empty}\te{index:03d}\n'.encode()).decode().strip()
-            entries.append(f'040000 tree {tree}\td{index:03d}\n')
-        tree=self.git('mktree',data=''.join(entries).encode()).decode().strip()
-        commit=self.git('commit-tree',tree,data=b'bounded OID input\n').decode().strip()
-        self.git('update-ref','HEAD',commit)
-        self.git('config','uploadpack.allowFilter','true')
-        self.git('config','uploadpack.allowAnySHA1InWant','true')
-        self.before=self.git('status','--porcelain')
-        def limits():
-            signal.signal(signal.SIGXFSZ,signal.SIG_DFL)
-            resource.setrlimit(resource.RLIMIT_FSIZE,(10240,10240))
-            resource.setrlimit(resource.RLIMIT_CORE,(0,0))
-        command=[sys.executable,'-I','-S','-c',
-                 "from pathlib import Path; assert all(Path(f'f{i:03d}').read_bytes()==bytes([i]) for i in range(32)); print('small files verified')"]
-        clone=self.root/'clone'
-        result=subprocess.run(['git','clone','--quiet',str(self.repo),str(clone)],env=self.env,
-                              preexec_fn=limits,capture_output=True,timeout=20)
-        self.assertEqual(result.returncode,0,result.stderr)
-        direct=subprocess.run(command,cwd=clone,env=self.env,preexec_fn=limits,capture_output=True,timeout=10)
-        self.assertEqual(direct.returncode,0,direct.stderr)
-        result=subprocess.run([str(BINARY),*COPY_ARGS,str(self.repo),'HEAD','--write-policy=all','--',*command],
-                              cwd=self.repo,env=self.env,preexec_fn=limits,capture_output=True,timeout=30)
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(result.stdout,direct.stdout)
-        self.clean()
-
-    def test_incompressible_objects_respect_fsize_when_clone_and_command_succeed(self):
-        import hashlib
-        import resource
-        import zlib
-        with (self.repo/'.gitattributes').open('a') as attributes:
-            attributes.write('random-* -text\n')
-        for index in range(16):
-            payload=hashlib.shake_256(str(index).encode()).digest(8192)
-            self.assertGreater(len(zlib.compress(payload)),8192)
-            (self.repo/f'random-{index:02d}').write_bytes(payload)
-        self.git('add','.')
-        self.git('commit','-qm','incompressible file-size regression')
-        self.git('config','uploadpack.allowFilter','true')
-        self.git('config','uploadpack.allowAnySHA1InWant','true')
-        self.before=self.git('status','--porcelain')
-        def limits():
-            signal.signal(signal.SIGXFSZ,signal.SIG_DFL)
-            resource.setrlimit(resource.RLIMIT_FSIZE,(16384,16384))
-            resource.setrlimit(resource.RLIMIT_CORE,(0,0))
-        command=[sys.executable,'-I','-S','-c',
-                 "import hashlib; from pathlib import Path; assert all(Path(f'random-{i:02d}').read_bytes()==hashlib.shake_256(str(i).encode()).digest(8192) for i in range(16)); print('incompressible files verified')"]
-        for label,policy in [('streaming',{}),('native-fsck',dict(GIT_CONFIG_COUNT='1',
-                             GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='true'))]:
-            with self.subTest(transport=label):
-                env=dict(self.env,**policy)
-                clone=self.root/f'clone-{label}'
-                result=subprocess.run(['git','clone','--quiet',str(self.repo),str(clone)],env=env,
-                                      preexec_fn=limits,capture_output=True,timeout=20)
-                self.assertEqual(result.returncode,0,result.stderr)
-                direct=subprocess.run(command,cwd=clone,env=env,preexec_fn=limits,capture_output=True,timeout=10)
-                self.assertEqual(direct.returncode,0,direct.stderr)
-                result=subprocess.run([str(BINARY),*COPY_ARGS,str(self.repo),'HEAD','--write-policy=all','--',*command],
-                                      cwd=self.repo,env=env,preexec_fn=limits,capture_output=True,timeout=30)
-                self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(result.stdout,direct.stdout)
                 self.clean()
 
     def test_bytes_links_modes_argv_identity_freshness_and_source_isolation(self):

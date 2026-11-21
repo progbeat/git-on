@@ -63,17 +63,11 @@ Each spilled object has one raw file. The store retains one last-read file
 descriptor shared by its readers. Compressed protocol packs and decoder requests
 can need transient bounded staging. Lazy decoding collects bytes in RAM and
 verifies the full Git OID before serving or spilling them.
-Temporary files obey inherited file-size and descriptor
-limits. All invocation-owned storage is released by successful cleanup; failed
-cleanup follows the documented recovery contract.
-Git-on catches `SIGXFSZ` from its own writes so `EFBIG` follows normal error
-handling and cleanup. Executed commands retain the caller's default or ignored
-signal disposition.
-With a finite inherited file-size limit, the current implementation uses
-individual exact-object requests during eager materialization. The
-[resource assumptions](specification.md#resource-assumptions) define the
-supported workload. Request stdin is streamed through a channel, and decoder
-request staging uses bounded parts.
+The host enforces inherited process file-size limits. See the
+[resource assumptions](specification.md#resource-assumptions) for the
+supported workload. Decoder request staging uses bounded parts.
+Successful cleanup releases all invocation-owned storage. Failed cleanup
+follows the documented recovery contract.
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects

@@ -58,21 +58,8 @@ pub(crate) struct Directory {
     next: AtomicU64,
 }
 impl Files {
-    pub(crate) fn size_limit() -> io::Result<Option<u64>> {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, limit.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let limit = unsafe { limit.assume_init() }.rlim_cur;
-        Ok((limit != libc::RLIM_INFINITY).then_some(limit))
-    }
     pub(crate) fn new(path: &Path) -> io::Result<Self> {
-        // Part size is an implementation detail, never a total-storage limit.
-        // Also avoid aggregating a huge run into the host's maximum file size.
-        Self::with_limit(
-            path,
-            Some(Self::size_limit()?.unwrap_or(u64::MAX).min(1 << 30)),
-        )
+        Self::with_limit(path, Some(1 << 30))
     }
     pub(crate) fn with_limit(path: &Path, limit: Option<u64>) -> io::Result<Self> {
         let parts = if let Some(bytes) = limit {

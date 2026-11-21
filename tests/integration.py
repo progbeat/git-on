@@ -40,14 +40,6 @@ def git(repo, *args, **kwargs):
                           stderr=subprocess.PIPE, **kwargs).stdout.decode().strip()
 
 
-def file_size_limits(size=None, action=signal.SIG_DFL):
-    import resource
-    signal.signal(signal.SIGXFSZ, action)
-    if size is not None:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-
 class RepositoryTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="git-on-test-")).resolve()
@@ -100,7 +92,7 @@ class RepositoryTest(unittest.TestCase):
         return self.invoke_argv([tree, "--", *map(str, command)],
                                 input=input, timeout=timeout, extra_env=extra_env)
 
-    def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
+    def invoke_argv(self, args, input=None, timeout=60, extra_env=None, preexec_fn=None):
         before = set(self.system_tmp.glob("git-on-*"))
         argv = [str(BINARY), *args]
         env = dict(self.environment(), **(extra_env or {}))
@@ -108,7 +100,7 @@ class RepositoryTest(unittest.TestCase):
             # Give an interrupted native test time to unmount its own share.
             # subprocess.run's timeout sends SIGKILL and can leave a hard mount.
             with subprocess.Popen(argv, cwd=self.repo, env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=preexec_fn) as process:
                 try:
                     stdout, stderr = process.communicate(input, timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -121,7 +113,8 @@ class RepositoryTest(unittest.TestCase):
             result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
         else:
             result = subprocess.run(argv, cwd=self.repo, env=env, input=input,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                                    preexec_fn=preexec_fn)
         created = set(self.system_tmp.glob("git-on-*")) - before
         self.assertLessEqual(len(created), 1, created)
         return result, next(iter(created), None)
@@ -185,28 +178,6 @@ class CliTests(RepositoryTest):
                     finally:
                         if runner.poll() is None:runner.kill()
                         runner.communicate(timeout=10)
-
-    def test_file_limit_during_run_setup_reports_error_and_cleans_up(self):
-        try:
-            result = subprocess.run([str(BINARY), 'HEAD', '--', 'true'],
-                                    cwd=self.repo, env=self.environment(), capture_output=True,
-                                    preexec_fn=lambda: file_size_limits(0), timeout=30)
-            self.assertEqual(result.returncode, 125, result.stderr.decode(errors='replace'))
-            self.assertIn(b'File too large', result.stderr)
-            self.assert_no_runtime_files()
-        finally:
-            for run in self.system_tmp.glob('git-on-*'):
-                self.cleanup_run(run)
-
-    def test_child_inherits_default_or_ignored_file_limit_signal(self):
-        for action, expected in ((signal.SIG_DFL, -signal.SIGXFSZ), (signal.SIG_IGN, 0)):
-            with self.subTest(action=action):
-                result = subprocess.run([str(BINARY), 'HEAD', '--write-policy=all', '--',
-                                         'sh', '-c', f'kill -{int(signal.SIGXFSZ)} $$; exit 0'],
-                                        cwd=self.repo, env=self.environment(), capture_output=True,
-                                        preexec_fn=lambda: file_size_limits(action=action), timeout=30)
-                self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
-                self.assert_no_runtime_files()
 
     def test_help_and_version(self):
         for arg in ("--help", "-h", "--version"):
@@ -632,7 +603,8 @@ assert os.pwrite(fd,b'z',0)==1
 assert os.pread(fd,2,0)==b'zx'
 os.close(fd)
 ''']
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env,
+                                  preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
         self.assert_success(result)
         self.assert_no_runtime_files()
 
@@ -1484,7 +1456,8 @@ with backing.open('r+b',buffering=0) as out:out.seek(10);out.write(b'!')
 with open('large','rb',buffering=0) as reopened:
  assert os.pread(reopened.fileno(),1,10)==b'!'
 ''']
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],
+                                  preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
         self.assert_success(result);self.assert_no_runtime_files()
 
     @fuse_only
