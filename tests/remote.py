@@ -2498,16 +2498,19 @@ os.execv(native,[native,*args])
         f.finish(process)
         print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
 
-    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
     def test_first_large_loose_range_stays_hot_without_spilling(self):
         f=self.f
-        for mib in (16,64,128):
+        mib = 1024 * 1024
+        before = OPTIONS.before_resource_probe if sys.platform == 'linux' else None
+        sizes = (16 * mib, 64 * mib, 128 * mib) if before else (128 * 1024,)
+        for size in sizes:
+            chunk = b'x' * min(size, mib)
             with tempfile.TemporaryFile() as output:
                 writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
-                for _ in range(mib): writer.stdin.write(b'x'*(1024*1024))
+                for _ in range(size//len(chunk)): writer.stdin.write(chunk)
                 writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); blob=output.read().decode().strip()
             tree=f.git('mktree',data=f'100644 blob {blob}\tlarge\n'.encode())
-            for binary in ([OPTIONS.before_resource_probe] if OPTIONS.before_resource_probe else [])+[OPTIONS.probe]:
+            for binary in ([before] if before else [])+[OPTIONS.probe]:
                 process=subprocess.Popen([str(binary),'local',tree],cwd=f.repo,env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
                 f.children.append(process); f.line(process)
                 value,report=f.operation(process,'range 1234 16 large')
@@ -2517,12 +2520,13 @@ os.execv(native,[native,*args])
                 if binary==OPTIONS.probe:
                     self.assertEqual(report['metrics']['spool_bytes'],0)
                     self.assertEqual(report['metrics']['hot_blob_cache_entries'],1)
-                    self.assertGreaterEqual(report['metrics']['hot_blob_cache_bytes'],mib*1024*1024)
+                    self.assertGreaterEqual(report['metrics']['hot_blob_cache_bytes'],size)
+                    self.assertEqual(report['metrics']['streamed_blob_loads'],1)
                 self.assertEqual(again['metrics']['spool_writes'],report['metrics']['spool_writes'])
-                status=Path(f'/proc/{process.pid}/status').read_text()
-                peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
-                if binary==OPTIONS.probe: self.assertEqual(report['metrics']['streamed_blob_loads'],1)
-                print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
+                if before:
+                    status=Path(f'/proc/{process.pid}/status').read_text()
+                    peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
+                    print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=size//mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
                 f.finish(process)
 
     def test_million_distinct_file_remote_fresh_runs_bounded_fetch(self):

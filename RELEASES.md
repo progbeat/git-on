@@ -14,6 +14,8 @@
 - Leave inherited process resource limits to the host. Git-on assumes the
   working set fits in available RAM.
 - Read local repositories without creating temporary references in them.
+  If external Git maintenance removes an unread object, the operation that
+  needs it reports a source read error.
 - Create a private file on the first content change, using filesystem cloning
   when available. Private files use ordinary I/O, including Linux FUSE
   passthrough on eligible opens. Reads of immutable cached data keep their
