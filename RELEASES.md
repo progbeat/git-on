@@ -6,6 +6,9 @@
   background spill when the next large blob enters the cache.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
+- Decode single full-object packs without disk staging. Inflate streamed objects
+  directly into their retained buffers, stream native decoder requests, and
+  borrow cached blob ranges when serving reads.
 - Use larger fetch batches when reads confirm a scan, including on fast
   HTTPS and SSH connections.
 - Leave process file-size limits and their signal handling to the host.

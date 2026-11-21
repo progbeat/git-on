@@ -207,9 +207,9 @@ payloads. Applicable `.gitignore` blobs are fetched on demand in default
 write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
 local and remote snapshots.
 
-Each remote invocation owns a private temporary bare repository. Demanded
-objects remain there until that run is cleaned up, so repeated access does not
-fetch an available object again, including after decoded memory-cache eviction.
+Each remote invocation owns a private temporary bare repository and an
+invocation-local object store. Demanded objects remain available until cleanup,
+including after decoded memory-cache eviction.
 There is no global persistent object cache or cross-run reuse. A later invocation
 resolves its operand through native Git again and fetches its own demanded trees
 and blobs. Git-on does not read, modify, migrate or delete historical

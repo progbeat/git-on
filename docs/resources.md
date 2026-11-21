@@ -60,12 +60,20 @@ cover enumerated directories and do not preload leaf contents or subtrees.
 ## Files and temporary disk space
 
 Each spilled object has one raw file. The store retains one last-read file
-descriptor shared by its readers. Compressed protocol packs and decoder requests
-can need transient bounded staging. Lazy decoding collects bytes in RAM and
-verifies the full Git OID before serving or spilling them.
+descriptor shared by its readers. A reusable session receiving a single full
+object decodes it without a pack file. Multi-object packs and delta fallback
+can still use transient disk staging. Native decoder requests and output from
+Git's configuration and discovery queries pass through streams. Capture for
+operations that can invoke detached hooks or SSH proxies uses files so inherited
+output remains writable after the native Git process exits. Lazy decoding fills
+the object buffer in RAM and verifies the full Git OID before serving or
+spilling it. Reads contained in a resident blob or one authenticated block share
+its buffer with the filesystem backend.
+After the root is pinned, remote subtrees are retained as parsed directory
+metadata without writing loose tree objects.
 The host enforces inherited process file-size limits. See the
 [resource assumptions](specification.md#resource-assumptions) for the
-supported workload. Decoder request staging uses bounded parts.
+supported workload.
 Successful cleanup releases all invocation-owned storage. Failed cleanup
 follows the documented recovery contract.
 

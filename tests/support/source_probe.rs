@@ -89,6 +89,16 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::json!({"data": String::from_utf8_lossy(&data)})
             );
+        } else if let Some(path) = operation.strip_prefix("read-error ") {
+            let result = snapshot.entry(Path::new(path)).and_then(|entry| {
+                let entry = entry.context("missing probe path")?;
+                snapshot.read(entry.oid, 0, 1)
+            });
+            let error = result.err().context("probe read unexpectedly succeeded")?;
+            println!(
+                "{}",
+                serde_json::json!({"error": format!("{error:#}"), "latched": snapshot.remote_failure()})
+            );
         } else if let Some(path) = operation.strip_prefix("list ") {
             let entries = snapshot.children(Path::new(path))?;
             println!(

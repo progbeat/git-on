@@ -5,7 +5,8 @@ use flate2::{Decompress, FlushDecompress, Status};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
 use std::{
-    io::{BufRead, Write},
+    io::{BufRead, BufWriter, Write},
+    mem::MaybeUninit,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -14,6 +15,7 @@ use std::{
 
 const MEMORY_PACK: usize = 1024 * 1024;
 const TRAILER: usize = 20;
+const INFLATE_CHUNK: usize = 32 * 1024;
 
 pub(crate) struct VerifiedObject {
     oid: Oid,
@@ -39,7 +41,7 @@ impl VerifiedObject {
     }
 }
 
-pub(crate) type Publish = Box<dyn FnMut(VerifiedObject) -> Result<()> + Send>;
+type Publish<'a> = Box<dyn FnMut(VerifiedObject) -> Result<()> + Send + 'a>;
 type Required = Box<dyn Fn(&[Oid]) -> bool + Send>;
 
 pub(crate) struct Received {
@@ -47,8 +49,8 @@ pub(crate) struct Received {
     pub(crate) bytes: u64,
 }
 
-pub(crate) struct Response {
-    pack: Pack,
+pub(crate) struct Response<'a> {
+    pack: Pack<'a>,
     phase: Phase,
     header: [u8; 4],
     header_len: usize,
@@ -67,8 +69,8 @@ enum Phase {
     Done,
 }
 
-impl Response {
-    pub(crate) fn new(scratch: RawBlobs, wants: Vec<Oid>, publish: Publish) -> Self {
+impl<'a> Response<'a> {
+    pub(crate) fn new(scratch: RawBlobs, wants: Vec<Oid>, publish: Publish<'a>) -> Self {
         Self {
             pack: Pack {
                 scratch,
@@ -80,6 +82,7 @@ impl Response {
                 compressed: Vec::new(),
                 spool: None,
                 native_fallback: false,
+                native_multi_object: false,
                 checksum: Checksum::default(),
                 position: 0,
                 count: None,
@@ -99,6 +102,10 @@ impl Response {
 
     pub(crate) fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
         self.pack.stop = stop;
+    }
+
+    pub(crate) fn use_native_for_multi_object_packs(&mut self) {
+        self.pack.native_multi_object = true;
     }
 
     pub(crate) fn set_required(&mut self, required: impl Fn(&[Oid]) -> bool + Send + 'static) {
@@ -256,16 +263,17 @@ pub(crate) fn index(odb: &git2::Odb<'_>, pack: &Spool) -> Result<()> {
     failure.map_or(result, Err)
 }
 
-struct Pack {
+struct Pack<'a> {
     scratch: RawBlobs,
     stop: Option<Arc<AtomicBool>>,
     wants: Vec<Oid>,
-    publish: Publish,
+    publish: Publish<'a>,
     required: Option<Required>,
     bytes: u64,
     compressed: Vec<u8>,
-    spool: Option<Spool>,
+    spool: Option<BufWriter<Spool>>,
     native_fallback: bool,
+    native_multi_object: bool,
     checksum: Checksum,
     position: usize,
     count: Option<usize>,
@@ -282,7 +290,7 @@ struct Entry {
     _decode: Option<crate::raw_blob::PackDecode>,
 }
 
-impl Pack {
+impl Pack<'_> {
     fn check_transfer(&self) -> Result<()> {
         if self
             .stop
@@ -297,7 +305,8 @@ impl Pack {
     fn spool_pack(&mut self) -> Result<()> {
         if self.spool.is_none() {
             let file = self.scratch.scratch_file()?;
-            (&file).write_all(&self.compressed)?;
+            let mut file = BufWriter::with_capacity(64 * 1024, file);
+            file.write_all(&self.compressed)?;
             self.spool = Some(file);
         }
         Ok(())
@@ -321,21 +330,29 @@ impl Pack {
         }
         self.bytes += bytes.len() as u64;
         self.checksum.update(bytes);
-        if self.spool.is_none() && bytes.len() > MEMORY_PACK - self.compressed.len() {
-            self.spool_pack()?;
-        }
-        if let Some(file) = &self.spool {
-            (&*file).write_all(bytes)?;
+        if let Some(file) = &mut self.spool {
+            file.write_all(bytes)?;
             if self.native_fallback {
                 return Ok(());
             }
-            // Keep the full compressed pack available for delta fallback.
-            // After spilling the prefix, only unread bytes feed the inflater.
+        }
+        self.compressed.extend_from_slice(bytes);
+        self.inflate_entries()?;
+        if self.native_fallback {
+            return Ok(());
+        }
+        // After the final entry, or when a pack has one known full entry,
+        // no further entry can require a native replay.
+        let can_discard_prefix =
+            self.count == Some(self.entries) || (self.count == Some(1) && self.entry.is_some());
+        if self.spool.is_none() && !can_discard_prefix && self.compressed.len() > MEMORY_PACK {
+            self.spool_pack()?;
+        }
+        if can_discard_prefix || self.spool.is_some() {
             self.compressed.drain(..self.position);
             self.position = 0;
         }
-        self.compressed.extend_from_slice(bytes);
-        self.inflate_entries()
+        Ok(())
     }
 
     fn inflate_entries(&mut self) -> Result<()> {
@@ -350,12 +367,14 @@ impl Pack {
                     "invalid Git pack header"
                 );
                 let count = u32::from_be_bytes(header[8..].try_into()?) as usize;
+                if self.native_multi_object && count > 1 {
+                    return self.use_fallback();
+                }
                 self.count = Some(count);
                 self.position = 12;
                 count
             }
         };
-        let mut output = [0; 32768];
         while self.entries < count {
             self.check_transfer()?;
             if self.entry.is_none() {
@@ -378,40 +397,56 @@ impl Pack {
                         )
                     })
                     .transpose()?;
+                let mut data = Vec::new();
+                // The pack header gives the final size. Reserve without
+                // initializing it so later chunks never move decoded bytes.
+                data.try_reserve_exact(size)?;
                 self.position += length;
                 self.entry = Some(Entry {
                     kind,
                     size,
                     inflater: Decompress::new(true),
                     hash: object::object_hash(kind, size),
-                    data: Vec::new(),
+                    data,
                     _decode: decode,
                 });
             }
             let entry = self.entry.as_mut().expect("entry initialized");
             let before_in = entry.inflater.total_in();
             let before_out = entry.inflater.total_out();
-            let status = entry.inflater.decompress(
+            let initialized = entry.data.len();
+            let output_len = (entry.size - initialized).min(INFLATE_CHUNK);
+            // Give zlib room to consume its end marker once the declared
+            // output is complete. Any further output is an invalid object.
+            let mut overflow = [MaybeUninit::uninit()];
+            let output = if output_len == 0 {
+                &mut overflow[..]
+            } else {
+                &mut entry.data.spare_capacity_mut()[..output_len]
+            };
+            let status = entry.inflater.decompress_uninit(
                 &self.compressed[self.position..],
-                &mut output,
+                output,
                 FlushDecompress::None,
             )?;
             let consumed = (entry.inflater.total_in() - before_in) as usize;
             let used = (entry.inflater.total_out() - before_out) as usize;
             self.position += consumed;
-            ensure!(
-                used <= entry.size - entry.data.len(),
-                "oversized Git pack object"
-            );
-            entry.data.try_reserve(used)?;
-            entry.hash.update(&output[..used]);
-            entry.data.extend_from_slice(&output[..used]);
+            ensure!(used <= output_len, "oversized Git pack object");
+            if used != 0 {
+                // zlib initialized these bytes in the reserved output slice.
+                unsafe { entry.data.set_len(initialized + used) };
+                entry.hash.update(&entry.data[initialized..]);
+            }
             if status == Status::StreamEnd {
                 let entry = self.entry.take().expect("entry initialized");
                 ensure!(entry.data.len() == entry.size, "truncated Git pack object");
                 self.entries += 1;
                 let oid = Oid::from_bytes(&object::finish_sha1(entry.hash)?)?;
                 let Some(want) = self.wants.iter().position(|&item| item == oid) else {
+                    if count == 1 {
+                        bail!("remote supplied unexpected object {oid} in a single-entry pack");
+                    }
                     // Preserve bases or other extra entries through the pack
                     // decoder instead of discarding a received object.
                     return self.use_fallback();
@@ -445,12 +480,17 @@ impl Pack {
                 bail!("remote did not supply requested object {oid}");
             }
         }
+        let fallback = if self.native_fallback {
+            self.spool
+                .map(|file| file.into_inner().map_err(|error| error.into_error()))
+                .transpose()?
+        } else {
+            // The fully decoded response has no use for the last staged bytes.
+            let _ = self.spool.map(BufWriter::into_parts);
+            None
+        };
         Ok(Received {
-            fallback: if self.native_fallback {
-                self.spool
-            } else {
-                None
-            },
+            fallback,
             bytes: self.bytes,
         })
     }
@@ -524,22 +564,60 @@ fn entry_header(bytes: &[u8]) -> Result<Option<(Option<ObjectType>, usize, usize
 mod tests {
     use super::*;
 
-    #[test]
-    fn large_full_object_is_published_before_the_staged_pack_trailer() {
-        let directory = tempfile::tempdir().unwrap();
-        let scratch = RawBlobs::new(directory.path()).unwrap();
-        let data = vec![3; MEMORY_PACK + 1024];
-        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+    fn blob_pack_header(size: usize) -> Vec<u8> {
         let mut packet = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
-        let mut remaining = data.len() >> 4;
-        let mut byte = 0x30 | (data.len() & 15) as u8;
+        let mut remaining = size >> 4;
+        let mut byte = 0x30 | (size & 15) as u8;
         while remaining != 0 {
             packet.push(byte | 0x80);
             byte = (remaining & 0x7f) as u8;
             remaining >>= 7;
         }
         packet.push(byte);
-        let mut encoder = flate2::write::ZlibEncoder::new(packet, flate2::Compression::none());
+        packet
+    }
+
+    #[test]
+    fn split_pack_entry_keeps_the_blob_within_its_declared_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let data = vec![3; INFLATE_CHUNK + 1];
+        let wanted = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            blob_pack_header(data.len()),
+            flate2::Compression::fast(),
+        );
+        let first_chunk = 20_000;
+        encoder.write_all(&data[..first_chunk]).unwrap();
+        encoder.flush().unwrap();
+        let split = encoder.get_ref().len();
+        encoder.write_all(&data[first_chunk..]).unwrap();
+        let pack = encoder.finish().unwrap();
+        let mut response = Response::new(
+            scratch,
+            vec![wanted],
+            Box::new(move |object| {
+                assert_eq!(object.data(), data);
+                assert!(object.data.capacity() <= data.len());
+                Ok(())
+            }),
+        );
+        response.pack.write(&pack[..split]).unwrap();
+        response.pack.write(&pack[split..]).unwrap();
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        response.pack.finish().unwrap();
+    }
+
+    #[test]
+    fn large_full_object_is_published_before_the_trailer_without_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let data = vec![3; MEMORY_PACK + 1024];
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            blob_pack_header(data.len()),
+            flate2::Compression::none(),
+        );
         encoder.write_all(&data).unwrap();
         let packet = encoder.finish().unwrap();
         assert!(packet.len() > MEMORY_PACK);
@@ -560,6 +638,7 @@ mod tests {
             response.pack.write(chunk).unwrap();
         }
         assert!(delivered.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(response.pack.spool.is_none());
         response.pack.write(&trailer).unwrap();
         assert!(response.pack.finish().unwrap().fallback.is_none());
     }

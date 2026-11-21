@@ -10,7 +10,7 @@ def pack_scaling_rows(head):
 def object_reuse_row(head,backend):
     count=160 if backend=='fuse' else 32
     operations=count+2 if backend=='fuse' else 1
-    decodes=operations if backend=='fuse' else 0
+    decodes=count if backend=='fuse' else 0
     raw_count=count if backend=='fuse' else 0
     return dict(head=head,working_tree_dirty=False,backend=backend,type='runner',files=count,
         blob_bytes=8192,stat_abi_bytes=144,

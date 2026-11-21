@@ -120,7 +120,7 @@ fn note_failure<T>(report: Option<&ReportFailure>, result: &Result<T>) {
 enum Body {
     Discovery(Vec<u8>),
     PendingReply {
-        pack: Box<pack_stream::Response>,
+        pack: Box<pack_stream::Response<'static>>,
         wake: Arc<UnixStream>,
         report_failure: Option<ReportFailure>,
     },
@@ -141,7 +141,7 @@ struct Decoder {
 
 impl Decoder {
     fn start(
-        mut pack: Box<pack_stream::Response>,
+        mut pack: Box<pack_stream::Response<'static>>,
         stop: Arc<AtomicBool>,
         wake: Arc<UnixStream>,
         report_failure: Option<ReportFailure>,
@@ -498,7 +498,7 @@ impl Client {
         &mut self,
         token: usize,
         oids: &[Oid],
-        response: pack_stream::Response,
+        response: pack_stream::Response<'static>,
         wake: &Arc<UnixStream>,
         report_failure: Option<ReportFailure>,
     ) -> Result<()> {

@@ -320,6 +320,9 @@ impl BlobReader {
     pub fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
         self.0.data.read(offset, size)
     }
+    pub(crate) fn read_shared(&self, offset: u64, size: u32) -> Result<crate::raw_blob::ReadData> {
+        self.0.data.read_shared(offset, size)
+    }
     pub(crate) fn len(&self) -> u64 {
         self.0.data.len()
     }
@@ -710,6 +713,9 @@ impl Snapshot {
         record(&pin_git_dir, &pin_ref, tree_oid)?;
         repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
             .context("pin snapshot tree against garbage collection")?;
+        if let Some(remote) = &mut remote {
+            remote.root_pinned();
+        }
         let git_dir = repo.path().to_path_buf();
         let pin = Pin {
             git_dir: pin_git_dir,
@@ -1005,14 +1011,14 @@ impl Snapshot {
             let size = reader.len();
             let mut offset = 0;
             while offset < size {
-                let data = reader.read(offset, (size - offset).min(64 * 1024) as u32)?;
+                let data = reader.read_shared(offset, (size - offset).min(64 * 1024) as u32)?;
                 anyhow::ensure!(!data.is_empty(), "truncated Git blob");
                 crate::object::check_transfer()?;
                 output.write_all(&data)?;
                 offset += data.len() as u64;
             }
             if size == 0 {
-                reader.read(0, 1)?;
+                reader.read_shared(0, 1)?;
             }
             return Ok(size);
         }
@@ -1080,10 +1086,19 @@ impl Snapshot {
         raw.copy_up(path, size)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_shared(oid, offset, size)
+            .map(crate::raw_blob::ReadData::into_vec)
+    }
+    pub(crate) fn read_shared(
+        &self,
+        oid: Oid,
+        offset: u64,
+        size: u32,
+    ) -> Result<crate::raw_blob::ReadData> {
         // Release Snapshot's lock before I/O, retaining the invocation-owned
         // verified store without allocating/registering a temporary ActiveBlob.
         let raw = self.state()?.prepare_blob(oid)?;
-        raw.read(offset, size)
+        raw.read_shared(offset, size)
     }
     pub fn read_link(&self, oid: Oid) -> Result<Vec<u8>> {
         self.state()?.with_blob(oid, |bytes| {

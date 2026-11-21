@@ -86,13 +86,9 @@ def git_on_environment(binary, environment, tools):
     (tools / 'git-on').symlink_to(binary.resolve())
     return dict(environment, PATH=str(tools)+os.pathsep+environment['PATH'])
 
-def private_storage_fault(fault, root="Path.cwd().parent"):
-    """Corrupt the storage used by the selected import path, before a demand."""
-    if fault=='odb':
-        return f"packs={root}/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
-    assert fault=='raw'
-    return (f"parts=next(({root}).glob('raw-parts-*')); target={root}/'unexpected-target'\n"
-            "for index in range(256):\n path=parts/f'{index:x}-0'\n if not os.path.lexists(path): path.symlink_to(target)\n")
+def private_odb_fault(root="Path.cwd().parent"):
+    """Block the pack directory before a native object demand."""
+    return f"packs={root}/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
 
 def exec_fixture_child(argv, cwd, env):
     try:
@@ -1991,7 +1987,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         fetches=[args for args in starts if 'fetch' in args]
         decoders=[args for args in starts if 'cat-file' in args]
         self.assertEqual(len(fetches),1,'one native fetch process per lazy object returned')
-        self.assertEqual(len(decoders),1,'one native decoder process per lazy object returned')
+        self.assertEqual(decoders,[],'full-object sessions should decode in-process')
         self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
         self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)
         self.assertEqual(again['metrics']['remote_session_starts'],1)
@@ -2077,24 +2073,23 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         self.assertNotEqual(process.wait(timeout=10),0)
         self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
 
-    def test_session_storage_fault_targets_the_active_parts_instead_of_unused_packs(self):
+    def test_session_reads_full_objects_without_pack_staging(self):
         f=self.f
         process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
-            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,start_new_session=True)
         f.children.append(process);f.line(process)
         root=next(f.root.glob('*/remote-repository')).parent
         selected=f"Path({str(root)!r})"
-        exec(private_storage_fault('odb',selected),{'Path':Path})
+        exec(private_odb_fault(selected),{'Path':Path})
         value,report=f.operation(process,'read deep/file')
         self.assertEqual(value['data'],'expected\n')
         self.assertEqual(report['metrics']['remote_session_starts'],1)
-        exec(private_storage_fault('raw',selected),{'Path':Path,'os':os})
-        with self.assertRaisesRegex(AssertionError,'Too many levels of symbolic links'):
-            f.operation(process,'read other')
-        self.assertNotEqual(process.wait(timeout=10),0)
-        self.assertFalse((root/'unexpected-target').exists())
+        subtree=f.git('rev-parse','HEAD:deep')
+        self.assertFalse((root/'remote-repository/objects'/subtree[:2]/subtree[2:]).exists())
+        self.assertFalse(list(root.glob('raw-parts-*')))
+        f.finish(process)
 
-    def delta_session_fixture(self, prefix_size=20000, include_base=False):
+    def delta_session_fixture(self, prefix_size=20000, include_base=False, extra_in_root_pack=False):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
         base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
@@ -2117,7 +2112,8 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         data+=entry(3,len(base))+zlib.compress(base)
         data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
         data+=hashlib.sha1(data).digest()
-        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],input=(tree+'\n').encode(),env=f.env)
+        root_oids=[tree,base_oid] if extra_in_root_pack else [tree]
+        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],input=('\n'.join(root_oids)+'\n').encode(),env=f.env)
         trace=f.root/'delta-demands'
         tools=f.root/'delta-tools';tools.mkdir();wrapper=tools/'git'
         wrapper.write_text(f'''#!{sys.executable}
@@ -2160,10 +2156,33 @@ while True:
             self.assertEqual(first['metrics'][field],again['metrics'][field])
         self.assertEqual(again['metrics']['remote_fetch_operations'],1)
         self.assertEqual(again['metrics']['remote_session_fetch_operations'],2)
-        self.assertEqual(again['metrics']['remote_decode_operations'],2,'generic decoder did not run')
+        self.assertEqual(again['metrics']['remote_decode_operations'],1,'generic decoder did not run')
         self.assertEqual(set(again['objects']),{commit,tree,base_oid,wanted_oid})
         destination=next(f.root.rglob('remote-repository'))
         self.assertEqual(list((destination/'objects/pack').iterdir()),[])
+        f.finish(process)
+
+    def test_session_delta_staging_failure_stays_latched_after_repair(self):
+        f=self.f
+        _,_,wanted,tree,_,trace=self.delta_session_fixture(extra_in_root_pack=True)
+        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,start_new_session=True)
+        f.children.append(process);f.line(process)
+        parts=next(f.root.glob('*/raw-parts-*'))
+        target=parts.parent/'unexpected-target'
+        substituted=[]
+        for index in range(256):
+            path=parts/f'{index:x}-0'
+            if not os.path.lexists(path):
+                path.symlink_to(target)
+                substituted.append(path)
+        first,_=f.operation(process,'read-error file')
+        self.assertIn('Too many levels of symbolic links',first['latched'])
+        for path in substituted:path.unlink()
+        second,_=f.operation(process,'read-error file')
+        self.assertEqual(second['latched'],first['latched'])
+        self.assertEqual(trace.read_text().splitlines(),[tree,wanted])
+        self.assertFalse(target.exists())
         f.finish(process)
 
     def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
@@ -2882,7 +2901,7 @@ signal.pause()
                              f"target = raw / {blob!r}\ntarget.mkdir()\n")
                     operation = " for i in range(9):assert Path(f'filler-{i}').read_bytes()[0] == i\n"
                 else:
-                    code += private_storage_fault(fault)
+                    code += private_odb_fault()
                     operation = " open('deep/file').read()\n"
                 code+="try:\n"+operation+"except OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('private storage fault not observed')\n"
                 if fault == 'raw':
@@ -2907,18 +2926,16 @@ signal.pause()
         f=self.f; url=self.ignore_policy_fixture()
         cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
         for binary,expected in cases:
-            faults=('transport','odb') if binary==OPTIONS.before_policy_binary else ('transport','odb','raw')
-            for fault in faults:
+            for fault in ('transport','odb'):
                 for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
                     with self.subTest(binary=str(binary),fault=fault,operation=operation):
                         shutil.rmtree(f.root/'cache',ignore_errors=True)
                         f.requests.clear(); f.denied_oids={f.ignore} if fault=='transport' else set()
                         code="import json,os,sys; from pathlib import Path\n"
-                        if fault!='transport':code+=private_storage_fault(fault)
+                        if fault=='odb':code+=private_odb_fault()
                         code+="try:\n"
                         code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
                         code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
-                        if fault=='raw':code+="assert not target.exists()\n"
                         env=dict(f.env)
                         if fault=='odb':env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
                         result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,capture_output=True,timeout=30)

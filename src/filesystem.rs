@@ -6,6 +6,7 @@ use crate::directory_view::{
     Cursor as DirectoryCursor, Rows as DirectoryRows, Version as DirectoryVersion,
 };
 use crate::policy::{Policy, WritePolicy};
+use crate::raw_blob::ReadData;
 use crate::snapshot::{BlobReader, Entry, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
@@ -1269,7 +1270,7 @@ impl Overlay {
         fh: u64,
         offset: i64,
         size: u32,
-    ) -> FsResult<Vec<u8>> {
+    ) -> FsResult<ReadData> {
         let h = self.handle(ino, fh)?;
         if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(libc::EBADF);
@@ -1282,7 +1283,7 @@ impl Overlay {
         ino: u64,
         offset: i64,
         size: u32,
-    ) -> FsResult<Vec<u8>> {
+    ) -> FsResult<ReadData> {
         self.readonly_file_attributes(ino)?;
         self.read_data_inner(ino, None, offset, size)
     }
@@ -1292,7 +1293,7 @@ impl Overlay {
         fh: Option<u64>,
         offset: i64,
         size: u32,
-    ) -> FsResult<Vec<u8>> {
+    ) -> FsResult<ReadData> {
         if offset < 0 {
             return Err(libc::EINVAL);
         }
@@ -1319,9 +1320,9 @@ impl Overlay {
                 }
             }
             data.truncate(done);
-            Ok(data)
+            Ok(ReadData::Owned(data))
         } else if count == 0 {
-            Ok(Vec::new())
+            Ok(ReadData::Owned(Vec::new()))
         } else {
             let oid = n.oid.ok_or(libc::EIO)?;
             // Small payload ownership stays exclusively in the bounded LRU;
@@ -1329,7 +1330,7 @@ impl Overlay {
             if n.attr.size <= BLOB_CACHE_BYTES as u64 || fh.is_none() {
                 return self
                     ._snapshot
-                    .read(oid, offset as u64, count as u32)
+                    .read_shared(oid, offset as u64, count as u32)
                     .map_err(snapshot_errno);
             }
             let fh = fh.unwrap();
@@ -1341,7 +1342,7 @@ impl Overlay {
                 .reader
                 .as_ref()
                 .ok_or(libc::EIO)?
-                .read(offset as u64, count as u32)
+                .read_shared(offset as u64, count as u32)
                 .map_err(snapshot_errno)
         }
     }

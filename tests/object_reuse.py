@@ -107,7 +107,9 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
         assert metrics['remote_fetch_operations']+session_fetches==operations,metrics
         streamed=metrics.get('streamed_blob_loads',0)
         assert 0<=streamed<=count,metrics
-        decodes=streamed if backend=='materialized' else operations
+        # Native commit and tree metadata is imported in-process. The reusable
+        # session also records its full root tree as a streaming decode.
+        decodes=streamed if backend=='materialized' else count+int(session_fetches>0)
         assert metrics['remote_decode_operations']+session_decodes==decodes,metrics
         if session_fetches:assert metrics['remote_session_starts']==1,metrics
     if backend:

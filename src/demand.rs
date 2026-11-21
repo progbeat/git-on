@@ -785,7 +785,7 @@ impl Shared {
         work: &Work,
         oids: &[Oid],
         scratch: &RawBlobs,
-    ) -> pack_stream::Response {
+    ) -> pack_stream::Response<'static> {
         let shared = self.clone();
         let mut cache = scratch.clone();
         let transfer = work.speculative.clone();

@@ -189,7 +189,7 @@ impl<W: Write> Write for VerifiedWriter<W> {
 /// The owned ODB buffer was verified before libgit2 returned it. Only the
 /// audited startup policy establishes that fact; arbitrary streams never use
 /// this route. Block digests are still formed from these same copied bytes.
-pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write) -> Result<()> {
+pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, output: impl Write) -> Result<()> {
     anyhow::ensure!(
         object.kind() == ObjectType::Blob,
         "ODB object is not a blob"
@@ -203,11 +203,15 @@ pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write
             object.id(),
         );
     }
-    for bytes in object.data().chunks(64 * 1024) {
+    write_verified_buffer(object.data(), output)
+}
+
+pub(crate) fn write_verified_buffer(bytes: &[u8], mut output: impl Write) -> Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
         check_transfer()?;
         output
-            .write_all(bytes)
-            .context("copy verified ODB buffer")?;
+            .write_all(chunk)
+            .context("write verified Git object")?;
     }
     check_transfer()
 }

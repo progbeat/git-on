@@ -85,7 +85,43 @@ impl Descriptor {
 }
 struct Resident {
     block: usize,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
+}
+#[derive(Debug)]
+pub(crate) enum ReadData {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>, std::ops::Range<usize>),
+}
+impl AsRef<[u8]> for ReadData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes, range) => &bytes[range.clone()],
+        }
+    }
+}
+impl std::ops::Deref for ReadData {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+impl ReadData {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes, range) if range.start == 0 && range.end == bytes.len() => {
+                Arc::unwrap_or_clone(bytes)
+            }
+            Self::Shared(bytes, range) => bytes[range].to_vec(),
+        }
+    }
+}
+#[cfg(test)]
+impl<T: AsRef<[u8]>> PartialEq<T> for ReadData {
+    fn eq(&self, other: &T) -> bool {
+        self.as_ref() == other.as_ref()
+    }
 }
 #[derive(Clone)]
 pub(crate) struct RawBlob {
@@ -102,12 +138,15 @@ impl RawBlob {
         self.size
     }
     pub(crate) fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_shared(offset, size).map(ReadData::into_vec)
+    }
+    pub(crate) fn read_shared(&self, offset: u64, size: u32) -> Result<ReadData> {
         self.range(
             offset,
             self.size.saturating_sub(offset).min(u64::from(size)),
         )
     }
-    pub(crate) fn read_all(&self) -> Result<Vec<u8>> {
+    pub(crate) fn read_all(&self) -> Result<ReadData> {
         self.range(0, self.size)
     }
     pub(crate) fn check_content_once(&self, check: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
@@ -144,7 +183,7 @@ impl RawBlob {
             .get(&self.oid)
             .is_some_and(|object| object.file)
     }
-    fn range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+    fn range(&self, offset: u64, length: u64) -> Result<ReadData> {
         let result = self.checked_range(offset, length);
         if let Err(error) = &result {
             // Reads can outlive the Snapshot lock through an active reader.
@@ -160,63 +199,73 @@ impl RawBlob {
             store.failure.get_or_insert_with(|| format!("{error:#}"));
         }
     }
-    fn checked_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+    fn checked_range(&self, offset: u64, length: u64) -> Result<ReadData> {
         if length == 0 {
-            return Ok(Vec::new());
+            return Ok(ReadData::Owned(Vec::new()));
         }
         anyhow::ensure!(self.kind == ObjectType::Blob, "tree bytes are not retained");
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let end = offset.checked_add(length).context("raw range end")?;
         if let Some(bytes) = store.hot_payload(self.oid) {
             crate::object::check_transfer()?;
-            return Ok(bytes[usize::try_from(offset)?..usize::try_from(end)?].to_vec());
+            return Ok(ReadData::Shared(
+                bytes.clone(),
+                usize::try_from(offset)?..usize::try_from(end)?,
+            ));
         }
-        let mut result = Vec::with_capacity(usize::try_from(length)?);
+        let first = usize::try_from(offset / BLOCK as u64)?;
+        let last = usize::try_from((end - 1) / BLOCK as u64)?;
+        let mut result = if first == last {
+            None
+        } else {
+            Some(Vec::with_capacity(usize::try_from(length)?))
+        };
         let mut file = None;
-        for block in
-            usize::try_from(offset / BLOCK as u64)?..=usize::try_from((end - 1) / BLOCK as u64)?
-        {
+        for block in first..=last {
             crate::object::check_transfer()?;
             let start = block as u64 * BLOCK as u64;
             let from = usize::try_from(offset.saturating_sub(start))?;
             let to = usize::try_from((end - start).min(BLOCK as u64))?;
-            if store
+            let bytes = if store
                 .memory
                 .peek(&self.oid)
                 .is_some_and(|resident| resident.block == block)
             {
-                let resident = store.memory.get(&self.oid).unwrap();
-                result.extend_from_slice(&resident.bytes[from..to]);
-                continue;
-            }
-            let size = usize::try_from((self.size - start).min(BLOCK as u64))?;
-            let object = store
-                .objects
-                .get(&self.oid)
-                .context("missing verified object descriptor")?;
-            anyhow::ensure!(object.file, "missing prepared object block");
-            let expected = object.blocks[block];
-            if file.is_none() {
-                file = Some(store.directory.reader(self.oid, self.size)?);
-            }
-            let mut bytes = vec![0; size];
-            read_checked_block(file.as_ref().unwrap(), start, &mut bytes, &expected)?;
-            #[cfg(test)]
-            {
-                store.authenticated_bytes += size as u64;
-            }
-            // Copy only from this checked buffer, never reopen/reread after trust.
-            result.extend_from_slice(&bytes[from..to]);
-            if let Err(error) = store.admit(self.oid, block, bytes) {
-                // Optional admission can spill a different resident object.
-                // A failed write preserves that resident; return the checked
-                // bytes without caching this block. Accounting errors still fail.
-                if error.downcast_ref::<io::Error>().is_none() {
-                    return Err(error);
+                store.memory.get(&self.oid).unwrap().bytes.clone()
+            } else {
+                let size = usize::try_from((self.size - start).min(BLOCK as u64))?;
+                let object = store
+                    .objects
+                    .get(&self.oid)
+                    .context("missing verified object descriptor")?;
+                anyhow::ensure!(object.file, "missing prepared object block");
+                let expected = object.blocks[block];
+                if file.is_none() {
+                    file = Some(store.directory.reader(self.oid, self.size)?);
                 }
+                let mut bytes = vec![0; size];
+                read_checked_block(file.as_ref().unwrap(), start, &mut bytes, &expected)?;
+                #[cfg(test)]
+                {
+                    store.authenticated_bytes += size as u64;
+                }
+                let bytes = Arc::new(bytes);
+                if let Err(error) = store.admit(self.oid, block, bytes.clone()) {
+                    // Optional admission can spill a different resident object.
+                    // A failed write preserves that resident and the checked bytes.
+                    if error.downcast_ref::<io::Error>().is_none() {
+                        return Err(error);
+                    }
+                }
+                bytes
+            };
+            if let Some(result) = &mut result {
+                result.extend_from_slice(&bytes[from..to]);
+            } else {
+                return Ok(ReadData::Shared(bytes, from..to));
             }
         }
-        Ok(result)
+        Ok(ReadData::Owned(result.expect("multi-block read")))
     }
     pub(crate) fn copy_up(&self, path: &Path, retain: u64) -> Result<File> {
         let result = self.copy_to(path, retain);
@@ -1169,11 +1218,27 @@ impl RawBlobs {
         size: usize,
         input: impl Read,
     ) -> Result<RawBlob> {
+        self.cache_directory(oid, size, || Directory::verified(oid, size, input))
+    }
+    pub(crate) fn insert_verified_tree(
+        &mut self,
+        object: &crate::pack_stream::VerifiedObject,
+    ) -> Result<RawBlob> {
+        self.cache_directory(object.oid(), object.data().len(), || {
+            Directory::from_verified(object)
+        })
+    }
+    fn cache_directory(
+        &mut self,
+        oid: Oid,
+        size: usize,
+        prepare: impl FnOnce() -> Result<Directory>,
+    ) -> Result<RawBlob> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(object) = store.objects.get(&oid) {
             return Ok(self.blob(oid, object));
         }
-        let directory = Arc::new(Directory::verified(oid, size, input)?);
+        let directory = Arc::new(prepare()?);
         store.objects.insert(
             oid,
             Descriptor {
@@ -1420,7 +1485,8 @@ impl Store {
         }
         Ok(())
     }
-    fn admit(&mut self, oid: Oid, block: usize, bytes: Vec<u8>) -> Result<()> {
+    fn admit(&mut self, oid: Oid, block: usize, bytes: impl Into<Arc<Vec<u8>>>) -> Result<()> {
+        let bytes = bytes.into();
         let weight = bytes
             .capacity()
             .checked_add(ENTRY_CHARGE)
@@ -1841,6 +1907,21 @@ mod tests {
         }
         assert_eq!(readers[1].read_all().unwrap(), b"second");
     }
+    #[test]
+    fn resident_range_reads_share_verified_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        for size in [32, BLOCK + 1] {
+            let data = vec![7; size];
+            let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+            let blob = store.insert(oid, size, data.as_slice()).unwrap();
+            let head = blob.read_shared(0, 16).unwrap();
+            let next = blob.read_shared(4, 8).unwrap();
+            assert_eq!(next.as_ref(), &data[4..12]);
+            assert_eq!(head.as_ptr().wrapping_add(4), next.as_ptr());
+        }
+    }
+
     #[test]
     fn repeated_spilled_ranges_reuse_one_bounded_descriptor_and_check_metadata() {
         let directory = tempfile::tempdir().unwrap();

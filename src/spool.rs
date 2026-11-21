@@ -313,6 +313,15 @@ impl Seek for &Spool {
         }
     }
 }
+impl Write for Spool {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        (&*self).write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
 impl Write for &Spool {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {

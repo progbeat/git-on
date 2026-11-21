@@ -185,9 +185,9 @@ fn empty(reply: ReplyEmpty, result: FsResult<()>) {
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
-fn data(reply: ReplyData, result: FsResult<Vec<u8>>) {
+fn data(reply: ReplyData, result: FsResult<impl AsRef<[u8]>>) {
     match result {
-        Ok(data) => reply.data(&data),
+        Ok(data) => reply.data(data.as_ref()),
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
