@@ -1033,15 +1033,23 @@ impl RawBlobs {
         &mut self,
         object: crate::pack_stream::VerifiedObject,
         transfer: Option<Weak<()>>,
+        speculative: bool,
         waiting: impl FnOnce() -> bool,
-        ready: impl FnOnce(),
+        ready: impl FnOnce(bool),
     ) -> Result<()> {
         anyhow::ensure!(
             object.kind() == ObjectType::Blob,
             "streamed object is not a blob"
         );
         let oid = object.oid();
-        self.insert_verified_bytes(oid, object.into_data(), transfer, waiting, ready)
+        self.insert_verified_bytes(
+            oid,
+            object.into_data(),
+            transfer,
+            speculative,
+            waiting,
+            ready,
+        )
     }
 
     fn insert_verified_bytes(
@@ -1049,15 +1057,16 @@ impl RawBlobs {
         oid: Oid,
         bytes: impl Into<Arc<Vec<u8>>>,
         transfer: Option<Weak<()>>,
+        speculative: bool,
         waiting: impl FnOnce() -> bool,
-        ready: impl FnOnce(),
+        ready: impl FnOnce(bool),
     ) -> Result<()> {
         let payload = bytes.into();
         let _preparation;
         let mut store = self.wait_for_preparation(oid);
         if store.objects.contains_key(&oid) {
             drop(store);
-            ready();
+            ready(true);
             return Ok(());
         }
         if payload.len() <= BLOCK {
@@ -1067,7 +1076,7 @@ impl RawBlobs {
                 crate::object::check_transfer()?;
                 return Err(error);
             }
-            ready();
+            ready(false);
             return Ok(());
         }
         if let Some(error) = &store.failure {
@@ -1075,7 +1084,7 @@ impl RawBlobs {
         }
         store.preparing.insert(oid);
         _preparation = BlobPreparation { blobs: self, oid };
-        if let Some(transfer) = &transfer {
+        if let Some(transfer) = transfer.as_ref().filter(|_| speculative) {
             store
                 .forecasts
                 .insert(oid, (payload.clone(), transfer.clone()));
@@ -1086,7 +1095,7 @@ impl RawBlobs {
         if waiting() && store.can_publish_decoded(oid) {
             store.publish_decoded(oid, payload.clone(), transfer.clone());
             drop(store);
-            ready.take().unwrap()();
+            ready.take().unwrap()(false);
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
@@ -1105,7 +1114,7 @@ impl RawBlobs {
             return Err(error);
         }
         if let Some(ready) = ready {
-            ready();
+            ready(false);
         }
         Ok(())
     }
@@ -2302,8 +2311,9 @@ mod tests {
                 oid,
                 forecast,
                 Some(Weak::new()),
+                true,
                 || false,
-                || notified = true
+                |_| notified = true
             )
             .is_err());
         assert_eq!(store.failure(), None);
@@ -2457,7 +2467,7 @@ mod tests {
                     .insert_fetched(oid, bytes.len(), bytes.as_slice(), None)
                     .map(|_| ())
             } else {
-                store.insert_verified_bytes(oid, bytes, None, || true, || {})
+                store.insert_verified_bytes(oid, bytes, None, false, || true, |_| {})
             }
         };
         admit(&mut store, b'a').unwrap();
@@ -2535,8 +2545,9 @@ mod tests {
                             received_oid,
                             bytes,
                             Some(Weak::new()),
+                            true,
                             || false,
-                            || {},
+                            |_| {},
                         )
                         .unwrap();
                 });
@@ -2580,11 +2591,12 @@ mod tests {
                             oid,
                             bytes,
                             None,
+                            false,
                             || {
                                 let _ = decoded.send(());
                                 true
                             },
-                            move || {
+                            move |_| {
                                 let _ = additional.send(());
                             },
                         )

@@ -127,6 +127,8 @@ take precedence and can join an active speculative request without duplicating
 its fetch. If that speculation fails, only waiting ordinary demands reenter
 the request queue.
 A diagnosed pack failure after serving a required read fails the invocation.
+An exact transfer can fail independently of the invocation when validated
+extras from another pack complete every demand and supply the requested data.
 These paths require a reusable transport. The specification's
 [resource assumptions](specification.md#resource-assumptions) apply to remote
 execution.

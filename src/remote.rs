@@ -745,7 +745,7 @@ impl Remote {
             return Ok(());
         };
         let outcome = acquired.and_then(|acquired| match acquired {
-            crate::demand::Acquired::Stored => {
+            crate::demand::Acquired::Stored | crate::demand::Acquired::ValidatedExtra => {
                 // An already received delta base can become known between
                 // the snapshot's first cache lookup and queue admission.
                 for &oid in &batch.oids {
@@ -1475,7 +1475,7 @@ impl Remote {
         if kind == git2::ObjectType::Blob {
             return self
                 .raw_blobs
-                .insert_verified_blob(object, None, || false, || {});
+                .insert_verified_blob(object, None, false, || false, |_| {});
         }
         if kind == git2::ObjectType::Tree {
             self.raw_blobs.insert_verified_tree(&object)?;
