@@ -319,6 +319,9 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
 3. Keep the revision's loaded directory metadata and other internal metadata
    in RAM. Native mounts follow the lazy access requirements when loading
    metadata.
+4. Remove redundant passes over data when the performance gain justifies the
+   complexity. Where practical, compute and cache needed results as the data
+   is processed, taking into account the capabilities of the libraries in use.
 
 The preceding sections describe the current behavior contract. The target
 design must reconcile local Git storage, native Git staging, the writable
