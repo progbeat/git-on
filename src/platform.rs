@@ -29,11 +29,17 @@ fn private_group(name: &[u8]) -> bool {
         })
 }
 
-fn temporary_group_handle(group: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
+fn temporary_group_handle(group: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    #[cfg(test)]
+    if let Some(error) = temporary_group_tests::OPEN_ERROR.take() {
+        return Err(io::Error::from_raw_os_error(error));
+    }
+    let directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(group)
+        .open(group)?;
+    let metadata = directory.metadata()?;
+    Ok((directory, metadata))
 }
 
 fn same_group(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -89,7 +95,12 @@ fn create_temporary_entry_before(
         let metadata = match fs::symlink_metadata(&group) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if created {
+                    let _ = remove_empty_temporary_group(&group);
+                }
+                return Err(error);
+            }
         };
         if !usable_group(&metadata, uid, 0o700) {
             if created && metadata.is_dir() && metadata.uid() == uid {
@@ -107,12 +118,16 @@ fn create_temporary_entry_before(
                 "temporary git-on group must be a real directory with trusted ownership and permissions",
             ));
         }
-        let directory = match temporary_group_handle(&group) {
-            Ok(directory) => directory,
+        let (directory, opened) = match temporary_group_handle(&group) {
+            Ok(opened) => opened,
             Err(_) if group_changed(&group, &metadata) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if created {
+                    let _ = remove_empty_temporary_group(&group);
+                }
+                return Err(error);
+            }
         };
-        let opened = directory.metadata()?;
         if !same_group(&opened, &metadata) {
             continue;
         }
@@ -503,6 +518,21 @@ pub fn has_sys_admin() -> bool {
 mod temporary_group_tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static OPEN_ERROR: std::cell::Cell<Option<i32>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
+
+    #[test]
+    fn group_open_error_removes_the_new_empty_group() {
+        let temporary = tempfile::tempdir().unwrap();
+        OPEN_ERROR.set(Some(libc::EIO));
+        let error = create_temporary_entry(temporary.path(), "123456").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+    }
+
     #[test]
     fn a_sticky_group_is_shared_only_if_system_owned() {
         let directory = tempfile::tempdir().unwrap();
@@ -519,8 +549,7 @@ mod temporary_group_tests {
         let temporary = tempfile::tempdir().unwrap();
         let group = temporary.path().join(TEMP_GROUP);
         fs::create_dir(&group).unwrap();
-        let original = temporary_group_handle(&group).unwrap();
-        let metadata = original.metadata().unwrap();
+        let (_original, metadata) = temporary_group_handle(&group).unwrap();
         assert!(!group_changed(&group, &metadata));
         fs::remove_dir(&group).unwrap();
         assert!(group_changed(&group, &metadata));
