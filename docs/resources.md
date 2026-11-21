@@ -5,10 +5,11 @@
 Each invocation owns its prepared objects and temporary storage. A 16 MiB
 block LRU charges allocation capacity plus 512 bytes per retained entry. It
 holds whole blobs up to 64 KiB and at most one recently read block per spilled
-blob. A separate LRU retains the eight most recently used larger blobs whole.
-Newly verified larger blobs enter this cache so the first read can use the
-decoded buffer without writing and rereading a raw file. Even a partial read
-can require a whole blob in RAM.
+blob. Newly verified larger blobs enter a separate whole-blob LRU with room
+for eight entries. Reads update recency while an entry stays in that cache.
+The first read can use the decoded buffer without writing and rereading a
+raw file. After a spill, reads use the backing file and the block LRU.
+Even a partial read can require a whole blob in RAM.
 
 The count limit targets source repositories where a few whole blobs fit
 comfortably in RAM. The payload bytes in the hot LRU are bounded by the

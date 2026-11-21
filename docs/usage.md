@@ -218,8 +218,9 @@ header, directory listing loads only that directory, and read loads the requeste
 content. Write checks load only applicable pinned ignore files.
 
 The 16 MiB block cache holds small blobs and individual blocks of spilled
-files. A separate cache retains the eight most recently used large blobs
-whole in RAM. Git-on can reuse spilled data until the invocation finishes.
+files. Newly verified large blobs enter a separate eight-entry LRU whole
+in RAM. Spilled data stays available in the backing file until the
+invocation finishes, with rereads cached by block.
 Git encoding can require an entire blob or its delta bases to be decoded.
 See [resources and integrity](resources.md) for cache accounting and copy-up.
 
