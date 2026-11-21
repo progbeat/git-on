@@ -22,7 +22,6 @@ and 120.97 MiB for Linux. [CPython `de54cf5`](https://github.com/python/cpython/
 On trees with blob sizes like these, keeping a few verified buffers whole
 avoids temporary writes and disk reads when a command revisits them. A
 pending spill and active decoding buffers are additional memory costs.
-Several unusually large blobs can exhaust a tight process memory limit.
 
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. If that write
@@ -30,7 +29,7 @@ fails, the blob stays readable in RAM and the next large-blob admission
 retries it before starting another eviction. Incremental HTTPS and SSH pack
 decoders reserve a decode slot before inflating a large blob. One of the
 eight slots stays available for required reads when prefetches occupy the
-rest. Native pack fallback can allocate whole-blob buffers outside those slots.
+rest. Native Git decoding can allocate whole-blob buffers outside those slots.
 A read can use its verified buffer while placement waits, including after
 joining an in-progress prefetch. Network requests can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without
@@ -46,8 +45,7 @@ The whole-blob cache, active reads, full-object decoding buffers, verification
 metadata and namespace state are accounted for outside the 16 MiB block budget.
 
 Libgit2 uses 8 MiB source-pack mapping windows and a 16 MiB soft mapped-byte
-budget. Retained pack descriptors are limited to
-`clamp(floor(RLIMIT_NOFILE / 4), 1, 32)`. Git-on does not raise OS limits.
+budget. The pack descriptor cache retains up to 32 descriptors.
 Active windows and necessary packed-object/delta decoding can exceed retained
 cache budgets. Libgit2 can retain decoded delta bases up to 1 MiB each and
 16 MiB per pack. Packed/delta decoding can require a complete decoded object;
@@ -60,18 +58,21 @@ cover enumerated directories and do not preload leaf contents or subtrees.
 ## Files and temporary disk space
 
 Each spilled object has one raw file. The store retains one last-read file
-descriptor shared by its readers. A reusable session receiving a single full
-object decodes it without a pack file. Multi-object packs and delta fallback
-can still use transient disk staging. Native decoder requests and output from
-Git's configuration and discovery queries pass through streams. Capture for
-operations that can invoke detached hooks or SSH proxies uses files so inherited
-output remains writable after the native Git process exits. Lazy decoding fills
-the object buffer in RAM and verifies the full Git OID before serving or
-spilling it. Reads contained in a resident blob or one authenticated block share
-its buffer with the filesystem backend.
+descriptor shared by its readers. Reusable HTTPS and SSH sessions decode full
+objects and deltas in RAM from the first pack.
+Readers can receive a verified object while the rest of the pack is still in
+flight. Native Git fetches can use temporary pack files. Native decoder
+requests, Git's configuration and discovery output,
+and `mount_nfs` diagnostics pass through streams. Capture for
+operations that can invoke detached hooks or SSH proxies uses a seekable handle
+so inherited output remains writable after the native Git process exits.
+On Linux the handle uses an anonymous memory file when available. Lazy
+decoding fills the object buffer in RAM and verifies the full Git OID before
+serving or spilling it. Reads contained in a resident blob or one authenticated
+block share its buffer with the filesystem backend.
 After the root is pinned, remote subtrees are retained as parsed directory
 metadata without writing loose tree objects.
-The host enforces inherited process file-size limits. See the
+The host enforces inherited process resource limits. See the
 [resource assumptions](specification.md#resource-assumptions) for the
 supported workload.
 Successful cleanup releases all invocation-owned storage. Failed cleanup

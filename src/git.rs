@@ -680,13 +680,27 @@ enum NativeCapture {
     File(std::fs::File),
 }
 
+pub(crate) fn capture_file() -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        // Some configured helpers keep writing after Git exits. A memfd
+        // preserves a regular file's lifetime and seeking without disk I/O.
+        let fd = unsafe { libc::memfd_create(c"git-on-output".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd >= 0 {
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+    tempfile::tempfile()
+}
+
 impl NativeCapture {
     fn new(mode: CaptureMode) -> std::io::Result<(Self, Stdio)> {
         if matches!(mode, CaptureMode::MayDetach) {
             // Native Git can leave a configured hook or a persistent SSH
             // proxy writing to its inherited descriptors after Git exits.
             // A capture channel would return EPIPE when its reader closes.
-            let file = tempfile::tempfile()?;
+            let file = capture_file()?;
             let writer = file.try_clone()?.into();
             return Ok((Self::File(file), writer));
         }
@@ -797,12 +811,13 @@ impl<'a> NativeInput<'a> {
 /// Exit notification removes the artificial polling floor for short native
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
-struct ChildExitWakeup {
+/// Pollable child exit notification for native helpers.
+pub struct ChildExitWakeup {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: Option<std::os::fd::OwnedFd>,
 }
 impl ChildExitWakeup {
-    fn new(pid: u32) -> Self {
+    pub fn new(pid: u32) -> Self {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::FromRawFd;
@@ -842,7 +857,12 @@ impl ChildExitWakeup {
             Self {}
         }
     }
-    fn wait(&self, duration: std::time::Duration, input: Option<i32>, output: [Option<i32>; 2]) {
+    pub fn wait(
+        &self,
+        duration: std::time::Duration,
+        input: Option<i32>,
+        output: [Option<i32>; 2],
+    ) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

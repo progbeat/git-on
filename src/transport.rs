@@ -212,7 +212,7 @@ impl StartingSession {
         let (input, to_child) = UnixStream::pair()?;
         input.set_nonblocking(true)?;
         let (output, from_child) = UnixStream::pair()?;
-        let errors = tempfile::tempfile()?;
+        let errors = crate::git::capture_file()?;
         command
             .stdin(Stdio::from(OwnedFd::from(to_child)))
             .stdout(Stdio::from(OwnedFd::from(from_child)))
@@ -841,7 +841,6 @@ mod tests {
                 );
                 let received = session.fetch_stream(&[oid], response).unwrap();
                 assert_eq!(received.bytes, good.len() as u64);
-                assert!(received.fallback.is_none());
             }
         }
     }
@@ -880,15 +879,14 @@ mod tests {
                 Box::new(|object| {
                     assert_eq!(object.kind(), git2::ObjectType::Blob);
                     assert_eq!(object.oid(), oid);
-                    published = Some(object.into_data());
+                    published = Some(Arc::unwrap_or_clone(object.into_data()));
                     Ok(())
                 }),
             );
             let (mut session, _peer) = peer_response(&bytes);
-            session.fetch_stream(&[oid], response).map(|received| {
-                assert!(received.fallback.is_none());
-                published.unwrap()
-            })
+            session
+                .fetch_stream(&[oid], response)
+                .map(|_| published.unwrap())
         };
         for data in [Vec::new(), vec![b'x'; 1024 * 1024]] {
             let good = pack(&data);

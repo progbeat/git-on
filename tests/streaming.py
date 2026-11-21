@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 import zlib
 
@@ -108,7 +107,7 @@ def pack_entry(kind, data):
 
 
 class SplitPack:
-    def __init__(self, root, wanted, contents, base_oid, base_data):
+    def __init__(self, root, wanted, contents, base_oid, base_data, hold_trailer=False):
         self.wants = {oid.encode() for oid in wanted}
         self.started = root / 'pack-started'
         self.release = root / 'release-pack'
@@ -122,8 +121,14 @@ class SplitPack:
         pack = header + b''.join(entries)
         # Open one sideband pkt-line, then pause it immediately after the
         # first blob. Several objects and the PACK trailer are still unsent.
-        self.prefix = b'000dpackfile\n' + f'{len(pack) + 25:04x}'.encode() + b'\1' + header + entries[0]
-        self.tail = b''.join(entries[1:]) + hashlib.sha1(pack).digest() + b'0000'
+        head = pack if hold_trailer else header + entries[0]
+        tail = (b'' if hold_trailer else b''.join(entries[1:])) + hashlib.sha1(pack).digest()
+        chunks = [head[index:index+60000] for index in range(0, len(head), 60000)]
+        framed = b''.join(f'{len(chunk)+5:04x}'.encode() + b'\1' + chunk for chunk in chunks[:-1])
+        last = chunks[-1]
+        assert len(last) + len(tail) + 5 <= 65520
+        self.prefix = b'000dpackfile\n' + framed + f'{len(last)+len(tail)+5:04x}'.encode() + b'\1' + last
+        self.tail = tail + b'0000'
 
 
 def fixture_in_short_tmp():
@@ -188,7 +193,7 @@ class StreamingTests(unittest.TestCase):
                 names = ['a', 'b/first', 'b/second', 'd', 'e', 'f', 'g', 'h', 'i',
                          'j', 'k', 'hidden/no']
                 data = [f'payload-{index}\n'.encode() for index, _ in enumerate(names)]
-                data[1] = b'prefetched\n' * (192 * 1024)
+                data[1] = hashlib.shake_256(b'prefetched pack fixture').digest(2 * 1024 * 1024)
                 first_digest = hashlib.sha256(data[1]).hexdigest()
                 oids = [fixture.git('hash-object', '-w', '--stdin', data=payload) for payload in data]
                 b = fixture.git('mktree', data=f'100644 blob {oids[1]}\tfirst\n100644 blob {oids[2]}\tsecond\n'.encode())
@@ -241,6 +246,7 @@ while not Path({str(split.started)!r}).exists():
     time.sleep(.01)
 assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
 assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
+assert not list(Path.cwd().parent.glob('raw-parts-*/*')), 'received pack was staged on disk'
 Path({str(ready)!r}).touch()
 while not Path({str(split.release)!r}).exists():
     assert time.monotonic() < deadline, 'the test did not release the pack'
@@ -257,7 +263,8 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
                 def requests():
                     if transport == 'https':
                         return [set(group) for _, group in proxy.records]
-                    return [set(line.split()) for line in (fixture.root / 'ssh-wants').read_bytes().splitlines()]
+                    log = fixture.root / 'ssh-wants'
+                    return [set(line.split()) for line in log.read_bytes().splitlines()] if log.exists() else []
 
                 try:
                     started = await_file(split.started, 12, process)
@@ -266,16 +273,17 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
                     deadline = time.monotonic() + 5
                     while early and refill not in requests() and time.monotonic() < deadline:
                         time.sleep(.01)
-                    self.assertIn(refill, requests())
-                    fetched = set().union(*requests())
-                    self.assertNotIn(hidden.encode(), fetched)
-                    self.assertFalse(fetched & {oid.encode() for oid in oids[9:-1]})
+                    before_release = requests()
                 finally:
                     split.release.touch()
                 _, errors = process.communicate(timeout=15)
                 self.assertTrue(started, f'separate four-object prefetch did not reach the server: {errors!r}')
                 self.assertTrue(early, f'the first file waited for the rest of its pkt-line: {errors!r}')
                 self.assertEqual(process.returncode, 0, errors)
+                self.assertIn(refill, before_release)
+                fetched = set().union(*before_release)
+                self.assertNotIn(hidden.encode(), fetched)
+                self.assertFalse(fetched & {oid.encode() for oid in oids[9:-1]})
                 wants = requests()
                 if transport == 'ssh':
                     self.assertTrue(all(wants), 'exact SSH startup made a separate ref query')
@@ -283,6 +291,49 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
                 self.assertEqual(wants.count(split.wants), 1)
                 self.assertIn({hidden.encode()}, wants)
                 self.assertNotIn(oids[-1].encode(), set().union(*wants))
+
+    def test_a_base_read_joins_the_pack_that_supplied_an_early_delta(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        upstream = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        basic = base64.b64encode(b'fixture:example-password').decode()
+        proxy = Multiplexer(fixture, upstream, 'Basic ' + basic)
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        split = SplitPack(fixture.root, [fixture.blob], [b'out/\n', b'expected\n'],
+                          fixture.other, b'unrelated payload\n', hold_trailer=True)
+        proxy.split_pack = split
+        self.addCleanup(split.release.touch)
+        fixture.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='credential.helper',
+                           GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f")
+        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        starting = fixture.root / 'starting-base'
+        done = fixture.root / 'base-read'
+        script = f"""
+from pathlib import Path
+assert Path('deep/file').read_bytes() == b'expected\\n'
+Path({str(starting)!r}).touch()
+assert Path('other').read_bytes() == b'unrelated payload\\n'
+Path({str(done)!r}).touch()
+"""
+        process = subprocess.Popen(
+            [OPTIONS.binary, url, fixture.commit, mount_flag(), '--write-policy=none',
+             '--', sys.executable, '-I', '-S', '-c', script],
+            cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        fixture.children.append(process)
+        try:
+            early = await_file(starting, 8, process)
+            read_before_trailer = early and await_file(done, .5, process)
+        finally:
+            split.release.touch()
+        _, errors = process.communicate(timeout=15)
+        self.assertTrue(early, f'the verified delta was not readable before the trailer: {errors!r}')
+        self.assertFalse(read_before_trailer, 'the base was fetched independently of its held pack')
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertNotIn(fixture.other.encode(), {oid for _, wants in proxy.records for oid in wants})
 
     def test_ssh_channel_rejection_preserves_the_owned_master(self):
         fixture = fixture_in_short_tmp()
@@ -317,100 +368,6 @@ with ThreadPoolExecutor(12) as pool:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
-    def test_large_speculative_blob_uses_the_native_streaming_decoder(self):
-        fixture = fixture_in_short_tmp()
-        self.addCleanup(fixture.close)
-        size = 9 * 1024 * 1024
-        large = fixture.git('hash-object', '-w', '--stdin', data=b'x' * size)
-        hidden = fixture.git('mktree', data=f'100644 blob {fixture.other}\tfile\n'.encode())
-        tree = fixture.git('mktree', data=(
-            f'100644 blob {fixture.blob}\ta\n100644 blob {large}\tb\n040000 tree {hidden}\thidden\n'
-        ).encode())
-        commit = fixture.git('commit-tree', tree, data=b'large speculative blob\n')
-        fixture.git('update-ref', 'refs/heads/main', commit)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
-        basic = base64.b64encode(b'fixture:example-password').decode()
-        proxy = Multiplexer(fixture, backend, 'Basic ' + basic)
-        # An unsolicited leading entry forces native handling even though a
-        # large full entry by itself can now be streamed directly.
-        entries = pack_entry(3, b'extra object') + pack_entry(3, b'x' * size)
-        pack = b'PACK' + struct.pack('>II', 2, 2) + entries
-        packet = pack + hashlib.sha1(pack).digest()
-        release_pack = fixture.root / 'release-pack'
-        release_pack.touch()
-        proxy.split_pack = SimpleNamespace(
-            wants={large.encode()},
-            prefix=b'000dpackfile\n' + f'{len(packet)+5:04x}'.encode() + b'\1' + packet,
-            tail=b'0000',
-            started=fixture.root / 'pack-started',
-            release=release_pack,
-        )
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
-        fixture.env.update(
-            GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='credential.helper',
-            GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f",
-        )
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
-        started = fixture.root / 'decode-started'
-        release = fixture.root / 'release-decoder'
-        independent = fixture.root / 'independent-read'
-        tools = fixture.root / 'tools'
-        tools.mkdir()
-        wrapper = tools / 'git'
-        wrapper.write_text(f"""#!{sys.executable}
-import os, shutil, subprocess, sys, time
-from pathlib import Path
-native = {shutil.which('git')!r}
-args = sys.argv[1:]
-if args[-3:] != ['cat-file', 'blob', {large!r}]:
-    os.execv(native, [native, *args])
-with subprocess.Popen([native, *args], stdout=subprocess.PIPE) as child:
-    first = child.stdout.read(1)
-    assert first
-    sys.stdout.buffer.write(first)
-    sys.stdout.buffer.flush()
-    Path({str(started)!r}).touch()
-    deadline = time.monotonic() + 12
-    while not Path({str(release)!r}).exists():
-        assert time.monotonic() < deadline, 'decoder was never released'
-        time.sleep(.01)
-    shutil.copyfileobj(child.stdout, sys.stdout.buffer)
-    sys.exit(child.wait())
-""")
-        wrapper.chmod(0o700)
-        fixture.env['PATH'] = str(tools) + os.pathsep + fixture.env['PATH']
-        script = f"""
-import os, time
-from pathlib import Path
-assert sorted(os.listdir('.')) == ['a', 'b', 'hidden']
-assert Path('a').read_bytes() == b'expected\\n'
-deadline = time.monotonic() + 12
-while not Path({str(started)!r}).exists():
-    assert time.monotonic() < deadline, 'the prefetched blob did not reach the native decoder'
-    time.sleep(.01)
-assert Path('hidden/file').read_bytes() == b'unrelated payload\\n'
-Path({str(independent)!r}).touch()
-assert Path('b').stat().st_size == {size}
-"""
-        process = subprocess.Popen(
-            [OPTIONS.binary, url, commit, mount_flag(), '--write-policy=none', '--',
-             sys.executable, '-I', '-S', '-c', script],
-            cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        fixture.children.append(process)
-        try:
-            decoding = await_file(started, 8, process)
-            overlapped = decoding and await_file(independent, 4, process)
-        finally:
-            release.touch()
-        _, errors = process.communicate(timeout=15)
-        self.assertEqual(process.returncode, 0, errors)
-        self.assertTrue(decoding, 'the speculative object did not use the native decoder')
-        self.assertTrue(overlapped, 'the unrelated read waited for the large pack decoder')
-        self.assertEqual(sum(large.encode() in wants for _, wants in proxy.records), 1)
 
 
 if __name__ == '__main__':

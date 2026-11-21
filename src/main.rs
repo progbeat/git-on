@@ -289,20 +289,41 @@ impl Drop for Mounted {
 }
 #[cfg(target_os = "macos")]
 fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> Result<()> {
-    use std::io::{Read, Seek};
+    use std::{
+        io::{ErrorKind, Read},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+    };
     #[cfg(feature = "test-metrics")]
     if env::var_os("GIT_ON_TEST_NFS_MOUNT_ERROR").as_deref() == Some(std::ffi::OsStr::new("1")) {
         bail!("test NFS mount failure");
     }
-    let mut diagnostic = tempfile::tempfile_in(mounted.mountpoint.parent().unwrap())?;
+    let (mut diagnostic, writer) = UnixStream::pair()?;
+    diagnostic.set_nonblocking(true)?;
+    let mut message = Vec::new();
+    let fd = diagnostic.as_raw_fd();
+    let mut drain = || -> std::io::Result<bool> {
+        let mut buffer = [0; 4096];
+        for _ in 0..16 {
+            match diagnostic.read(&mut buffer) {
+                Ok(0) => return Ok(false),
+                Ok(count) => message.extend_from_slice(&buffer[..count.min(4096 - message.len())]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(true),
+                Err(error) if error.kind() == ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    };
     let mut helper =
         git_on::backend::nfs::Session::mount_command(&mounted.mountpoint, &mounted.id, policy)?
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(diagnostic.try_clone()?)
+            .stderr(Stdio::from(OwnedFd::from(writer)))
             .spawn()
             .context("start mount_nfs")?;
+    let wakeup = git_on::git::ChildExitWakeup::new(helper.id());
+    let mut diagnostic_open = true;
     let status = loop {
         if git_on::git::cancelled_signal().is_some() || mounted.failed() {
             kill_group(helper.id(), libc::SIGKILL);
@@ -312,7 +333,22 @@ fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> 
         match helper.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                signals.wait().for_each(drop);
+                if diagnostic_open {
+                    match drain() {
+                        Ok(open) => diagnostic_open = open,
+                        Err(error) => {
+                            kill_group(helper.id(), libc::SIGKILL);
+                            let _ = helper.wait();
+                            return Err(error).context("read mount_nfs diagnostics");
+                        }
+                    }
+                }
+                signals.pending().for_each(drop);
+                wakeup.wait(
+                    Duration::from_millis(25),
+                    None,
+                    [diagnostic_open.then_some(fd), None],
+                );
             }
             Err(error) => {
                 kill_group(helper.id(), libc::SIGKILL);
@@ -322,9 +358,7 @@ fn attach_nfs(mounted: &Mounted, policy: WritePolicy, signals: &mut Signals) -> 
         }
     };
     if !status.success() {
-        let mut message = Vec::new();
-        diagnostic.rewind()?;
-        diagnostic.take(4096).read_to_end(&mut message)?;
+        drain().context("read mount_nfs diagnostics")?;
         bail!(
             "mount_nfs returned {status}: {}",
             String::from_utf8_lossy(&message).trim()

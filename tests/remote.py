@@ -2089,7 +2089,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         self.assertFalse(list(root.glob('raw-parts-*')))
         f.finish(process)
 
-    def delta_session_fixture(self, prefix_size=20000, include_base=False, extra_in_root_pack=False):
+    def delta_session_fixture(self, prefix_size=20000, include_base=False, root_extras=None):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
         base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
@@ -2097,6 +2097,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
         entries=f'100644 blob {wanted_oid}\tfile\n'
         if include_base:entries+=f'100644 blob {base_oid}\tbase\n'
+        extra_oids=[]
+        for name, content in (root_extras or {}).items():
+            oid=f.git('hash-object','-w','--stdin',data=content)
+            entries+=f'100644 blob {oid}\t{name}\n'
+            extra_oids.append(oid)
         tree=f.git('mktree',data=entries.encode())
         commit=f.git('commit-tree',tree,data=b'delta session\n');f.git('update-ref','refs/heads/main',commit)
         def integer(value):
@@ -2112,8 +2117,8 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         data+=entry(3,len(base))+zlib.compress(base)
         data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
         data+=hashlib.sha1(data).digest()
-        root_oids=[tree,base_oid] if extra_in_root_pack else [tree]
-        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],input=('\n'.join(root_oids)+'\n').encode(),env=f.env)
+        tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],
+                      input=''.join(f'{oid}\n' for oid in [tree, *extra_oids]).encode(),env=f.env)
         trace=f.root/'delta-demands'
         tools=f.root/'delta-tools';tools.mkdir();wrapper=tools/'git'
         wrapper.write_text(f'''#!{sys.executable}
@@ -2156,33 +2161,12 @@ while True:
             self.assertEqual(first['metrics'][field],again['metrics'][field])
         self.assertEqual(again['metrics']['remote_fetch_operations'],1)
         self.assertEqual(again['metrics']['remote_session_fetch_operations'],2)
-        self.assertEqual(again['metrics']['remote_decode_operations'],1,'generic decoder did not run')
+        self.assertEqual(again['metrics']['remote_decode_operations'],0)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'],2)
         self.assertEqual(set(again['objects']),{commit,tree,base_oid,wanted_oid})
         destination=next(f.root.rglob('remote-repository'))
         self.assertEqual(list((destination/'objects/pack').iterdir()),[])
-        f.finish(process)
-
-    def test_session_delta_staging_failure_stays_latched_after_repair(self):
-        f=self.f
-        _,_,wanted,tree,_,trace=self.delta_session_fixture(extra_in_root_pack=True)
-        process=subprocess.Popen([str(OPTIONS.probe),'file://'+str(f.repo),'HEAD','--metrics-only'],cwd=f.cwd,
-            env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,start_new_session=True)
-        f.children.append(process);f.line(process)
-        parts=next(f.root.glob('*/raw-parts-*'))
-        target=parts.parent/'unexpected-target'
-        substituted=[]
-        for index in range(256):
-            path=parts/f'{index:x}-0'
-            if not os.path.lexists(path):
-                path.symlink_to(target)
-                substituted.append(path)
-        first,_=f.operation(process,'read-error file')
-        self.assertIn('Too many levels of symbolic links',first['latched'])
-        for path in substituted:path.unlink()
-        second,_=f.operation(process,'read-error file')
-        self.assertEqual(second['latched'],first['latched'])
-        self.assertEqual(trace.read_text().splitlines(),[tree,wanted])
-        self.assertFalse(target.exists())
+        self.assertFalse(list(destination.parent.glob('raw-parts-*')))
         f.finish(process)
 
     def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
@@ -2199,6 +2183,25 @@ while True:
         self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
         for field in ('remote_fetch_operations','remote_decode_operations','blob_loads'):
             self.assertEqual(prepared['metrics'][field],reopened['metrics'][field])
+        f.finish(process)
+
+    def test_copy_reuses_an_unopened_base_received_by_a_lazy_read(self):
+        f=self.f
+        # More than eight large extras would spill if copy first admitted
+        # their verified bytes to the lazy read cache.
+        extras={f'extra-{index}':bytes([index])*65537 for index in range(10)}
+        wanted,base_oid,_,tree,_,trace=self.delta_session_fixture(include_base=True,root_extras=extras)
+        process=f.probe(f.repo.as_uri());f.line(process)
+        f.operation(process,'range 0 1 file')
+        f.operation(process,'release')
+        destination=f.root/'copy-snapshot';destination.mkdir()
+        _, report=f.operation(process,'materialize '+str(destination))
+        self.assertEqual((destination/'file').read_bytes(),wanted)
+        self.assertEqual((destination/'base').read_bytes(),f.git('cat-file','blob',base_oid).encode())
+        for name, content in extras.items():
+            self.assertEqual((destination/name).read_bytes(),content)
+        self.assertEqual(report['metrics']['spool_bytes'],0)
+        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
         f.finish(process)
 
     def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):

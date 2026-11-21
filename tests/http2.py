@@ -75,7 +75,8 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
         self.request.settimeout(.02)
         pending = {}
         responses = {}
-        held = set()
+        sending = {}
+        split_positions = {}
         with ThreadPoolExecutor() as workers:
             while True:
                 try:
@@ -96,24 +97,22 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                         response = responses.pop(stream, None)
                         if response is not None:
                             response.cancel()
-                        held.discard(stream)
+                        sending.pop(stream, None)
+                        split_positions.pop(stream, None)
                     elif isinstance(event, StreamEnded):
                         headers, body = pending.pop(stream)
                         wants = re.findall(rb'want ([0-9a-f]{40})', body)
-                        if wants:
+                        authorized = headers.get('authorization') == self.server.authorization
+                        if wants and authorized:
                             self.server.records.append((self.client_address, wants))
                         split = self.server.split_pack
-                        if (split is not None and set(wants) == split.wants
-                                and headers.get('authorization') == self.server.authorization):
+                        if split is not None and set(wants) == split.wants and authorized:
                             h2.send_headers(stream, [
                                 (':status', '200'),
                                 ('content-type', 'application/x-git-upload-pack-result'),
                                 ('content-length', str(len(split.prefix) + len(split.tail))),
                             ])
-                            h2.send_data(stream, split.prefix)
-                            self.request.sendall(h2.data_to_send())
-                            split.started.touch()
-                            held.add(stream)
+                            split_positions[stream] = 0
                             continue
                         forwarded = {key: value for key, value in headers.items() if not key.startswith(':')}
                         responses[stream] = workers.submit(
@@ -123,22 +122,52 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                     if not result.done():
                         continue
                     status, headers, body = responses.pop(stream).result()
-                    # This fixture serves small packs, so each reply fits in
-                    # one frame and its initial flow-control window.
-                    assert len(body) <= h2.max_outbound_frame_size
                     headers = [(':status', str(status)), *(
                         (key.lower(), value) for key, value in headers if key.lower() != 'connection'
                     )]
                     h2.send_headers(stream, headers, end_stream=not body)
                     if body:
-                        h2.send_data(stream, body, end_stream=True)
-                if held and self.server.split_pack.release.exists():
-                    for stream in held:
-                        h2.send_data(stream, self.server.split_pack.tail, end_stream=True)
-                    held.clear()
+                        sending[stream] = (body, 0)
+                for stream, (body, offset) in list(sending.items()):
+                    offset = self.send_body(h2, stream, body, offset, end=True)
+                    if offset == len(body):
+                        sending.pop(stream)
+                    else:
+                        sending[stream] = (body, offset)
+                for stream, position in list(split_positions.items()):
+                    split = self.server.split_pack
+                    prefix_end = len(split.prefix)
+                    if position < prefix_end:
+                        position = self.send_body(h2, stream, split.prefix, position)
+                        split_positions[stream] = position
+                        if position == prefix_end:
+                            split.started.touch()
+                    if position >= prefix_end and split.release.exists():
+                        offset = self.send_body(h2, stream, split.tail, position - prefix_end, end=True)
+                        if offset == len(split.tail):
+                            split_positions.pop(stream)
+                        else:
+                            split_positions[stream] = prefix_end + offset
                 outgoing = h2.data_to_send()
                 if outgoing:
-                    self.request.sendall(outgoing)
+                    # The short receive timeout polls upstream futures. A
+                    # large TLS write can take longer under backpressure.
+                    self.request.settimeout(5)
+                    try:
+                        self.request.sendall(outgoing)
+                    finally:
+                        self.request.settimeout(.02)
+
+    @staticmethod
+    def send_body(h2, stream, data, offset, end=False):
+        while offset < len(data):
+            count = min(len(data) - offset, h2.max_outbound_frame_size, h2.local_flow_control_window(stream))
+            if count <= 0:
+                break
+            next_offset = offset + count
+            h2.send_data(stream, data[offset:next_offset], end_stream=end and next_offset == len(data))
+            offset = next_offset
+        return offset
 
     def handle_http1(self):
         # Native Git can bootstrap using either version of HTTP.

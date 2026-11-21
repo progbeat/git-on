@@ -7,11 +7,11 @@ mod server;
 mod status;
 mod xdr;
 
-use self::server::Server;
+use self::server::{RpcReply, Server};
 use crate::{filesystem::Overlay, platform, policy::WritePolicy};
 use std::{
     fs::{self, DirBuilder},
-    io,
+    io::{self, IoSlice},
     os::unix::{fs::DirBuilderExt, net::UnixListener as StdListener},
     path::Path,
     process::Command,
@@ -166,7 +166,7 @@ fn notify_failure(failed: &AtomicBool) {
 }
 
 enum Job {
-    Call(Vec<u8>, oneshot::Sender<Option<Vec<u8>>>),
+    Call(Vec<u8>, oneshot::Sender<Option<RpcReply>>),
     Sweep,
 }
 
@@ -176,7 +176,7 @@ impl Job {
             Self::Call(data, reply) => {
                 // Once admitted, finish the compound even after disconnect
                 // so a retransmit can use the session slot's cached result.
-                let _ = reply.send(server.rpc(&data));
+                let _ = reply.send(server.rpc_reply(&data));
             }
             Self::Sweep => server.sweep(Instant::now()),
         }
@@ -299,20 +299,33 @@ async fn connection(socket: UnixStream, queue: mpsc::Sender<Job>, limit: usize) 
 
 async fn write_response(
     output: &mut OwnedWriteHalf,
-    response: Option<Vec<u8>>,
+    response: Option<RpcReply>,
     idle: Duration,
 ) -> io::Result<()> {
-    let Some(response) = response else {
+    let Some(RpcReply { header, body }) = response else {
         return Ok(());
     };
-    if response.len() > MAX_RECORD {
+    let body = body.as_deref().map_or(&[][..], Vec::as_slice);
+    let size = header.len() + body.len();
+    if size > MAX_RECORD {
         return Err(io::Error::other("NFS response exceeds record limit"));
     }
+    let record = (0x8000_0000 | size as u32).to_be_bytes();
     tokio::time::timeout(idle, async {
-        output
-            .write_all(&(0x8000_0000 | response.len() as u32).to_be_bytes())
-            .await?;
-        output.write_all(&response).await
+        let mut buffers = [
+            IoSlice::new(&record),
+            IoSlice::new(&header),
+            IoSlice::new(body),
+        ];
+        let mut pending = &mut buffers[..if body.is_empty() { 2 } else { 3 }];
+        while !pending.is_empty() {
+            let written = output.write_vectored(pending).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut pending, written);
+        }
+        Ok(())
     })
     .await?
 }

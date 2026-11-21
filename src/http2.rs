@@ -937,7 +937,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(3))
                     .unwrap()
                     .unwrap();
-                assert!(received.fallback.is_none());
+                assert_ne!(received.bytes, 0);
             });
             let entered = wait_for_start.recv_timeout(Duration::from_secs(3));
             let bounded = wait_for_pause.recv_timeout(Duration::from_secs(3));

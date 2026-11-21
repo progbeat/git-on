@@ -6,14 +6,13 @@
   background spill when the next large blob enters the cache.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
-- Decode single full-object packs without disk staging. Inflate streamed objects
-  directly into their retained buffers, stream native decoder requests, and
-  borrow cached blob ranges when serving reads.
+- Decode full objects and deltas from reusable HTTPS and SSH sessions in
+  memory from the first fetch. Stream native decoder requests and borrow cached
+  blob ranges when serving reads.
 - Use larger fetch batches when reads confirm a scan, including on fast
   HTTPS and SSH connections.
-- Leave process file-size limits and their signal handling to the host.
-  Git-on assumes unlimited `RLIMIT_FSIZE`. A finite limit can cause the
-  operating system to terminate the run before cleanup.
+- Leave inherited process resource limits to the host. Git-on assumes the
+  working set fits in available RAM.
 - Create a private file on the first content change, using filesystem cloning
   when available. Private files use ordinary I/O, including Linux FUSE
   passthrough on eligible opens. Reads of immutable cached data keep their

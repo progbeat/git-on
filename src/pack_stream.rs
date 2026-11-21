@@ -1,11 +1,12 @@
 //! Incremental pkt-line and PACK decoding for the reusable fetch transports.
-use crate::{object, raw_blob::RawBlobs, spool::Spool};
-use anyhow::{bail, ensure, Result};
+use crate::{object, raw_blob::RawBlobs};
+use anyhow::{bail, ensure, Context, Result};
 use flate2::{Decompress, FlushDecompress, Status};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
 use std::{
-    io::{BufRead, BufWriter, Write},
+    collections::HashMap,
+    io::BufRead,
     mem::MaybeUninit,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,14 +14,21 @@ use std::{
     },
 };
 
-const MEMORY_PACK: usize = 1024 * 1024;
+mod delta;
+
 const TRAILER: usize = 20;
 const INFLATE_CHUNK: usize = 32 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static DELTA_APPLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone)]
 pub(crate) struct VerifiedObject {
     oid: Oid,
     kind: ObjectType,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
 }
 
 impl VerifiedObject {
@@ -36,17 +44,28 @@ impl VerifiedObject {
         &self.data
     }
 
-    pub(crate) fn into_data(self) -> Vec<u8> {
+    pub(crate) fn into_data(self) -> Arc<Vec<u8>> {
         self.data
     }
 }
 
 type Publish<'a> = Box<dyn FnMut(VerifiedObject) -> Result<()> + Send + 'a>;
 type Required = Box<dyn Fn(&[Oid]) -> bool + Send>;
+type PendingExtra = Box<dyn FnMut(Oid) + Send>;
 
 pub(crate) struct Received {
-    pub(crate) fallback: Option<Spool>,
     pub(crate) bytes: u64,
+    extras: Vec<VerifiedObject>,
+}
+
+impl Received {
+    pub(crate) fn cache_extras(&mut self, scratch: &RawBlobs, mut record: impl FnMut(Oid)) {
+        let extras = std::mem::take(&mut self.extras);
+        for entry in &extras {
+            record(entry.oid);
+        }
+        scratch.remember_extras(extras);
+    }
 }
 
 pub(crate) struct Response<'a> {
@@ -77,17 +96,17 @@ impl<'a> Response<'a> {
                 stop: None,
                 wants,
                 publish,
+                pending_extra: None,
                 required: None,
                 bytes: 0,
-                compressed: Vec::new(),
-                spool: None,
-                native_fallback: false,
-                native_multi_object: false,
+                pending: Vec::new(),
                 checksum: Checksum::default(),
-                position: 0,
+                consumed: 0,
                 count: None,
                 entries: 0,
                 entry: None,
+                accepts_surplus: false,
+                bases: None,
             },
             phase: Phase::Section,
             header: [0; 4],
@@ -104,12 +123,12 @@ impl<'a> Response<'a> {
         self.pack.stop = stop;
     }
 
-    pub(crate) fn use_native_for_multi_object_packs(&mut self) {
-        self.pack.native_multi_object = true;
-    }
-
     pub(crate) fn set_required(&mut self, required: impl Fn(&[Oid]) -> bool + Send + 'static) {
         self.pack.required = Some(Box::new(required));
+    }
+
+    pub(crate) fn on_pending_extra(&mut self, pending: impl FnMut(Oid) + Send + 'static) {
+        self.pack.pending_extra = Some(Box::new(pending));
     }
 
     fn done(&self) -> bool {
@@ -235,263 +254,442 @@ impl<'a> Response<'a> {
     }
 }
 
-pub(crate) fn index(odb: &git2::Odb<'_>, pack: &Spool) -> Result<()> {
-    let mut failure = None;
-    let mut writer = odb.packwriter()?;
-    writer.progress(|_| match object::check_transfer() {
-        Ok(()) => true,
-        Err(error) => {
-            failure = Some(error);
-            false
-        }
-    });
-    let result = (|| {
-        let mut offset = 0;
-        let mut bytes = [0; 65536];
-        let size = pack.len()?;
-        while offset < size {
-            object::check_transfer()?;
-            let count = (size - offset).min(bytes.len() as u64) as usize;
-            pack.read_exact_at(&mut bytes[..count], offset)?;
-            writer.write_all(&bytes[..count])?;
-            offset += count as u64;
-        }
-        writer.commit()?;
-        Ok(())
-    })();
-    drop(writer);
-    failure.map_or(result, Err)
-}
-
 struct Pack<'a> {
     scratch: RawBlobs,
     stop: Option<Arc<AtomicBool>>,
     wants: Vec<Oid>,
     publish: Publish<'a>,
+    pending_extra: Option<PendingExtra>,
     required: Option<Required>,
     bytes: u64,
-    compressed: Vec<u8>,
-    spool: Option<BufWriter<Spool>>,
-    native_fallback: bool,
-    native_multi_object: bool,
+    pending: Vec<u8>,
     checksum: Checksum,
-    position: usize,
+    consumed: usize,
     count: Option<usize>,
     entries: usize,
     entry: Option<Entry>,
+    accepts_surplus: bool,
+    bases: Option<PackBases>,
 }
 
 struct Entry {
-    kind: ObjectType,
+    offset: usize,
+    content: EntryContent,
     size: usize,
     inflater: Decompress,
-    hash: Sha1,
+    hash: Option<Sha1>,
     data: Vec<u8>,
-    _decode: Option<crate::raw_blob::PackDecode>,
+    decode: Option<crate::raw_blob::PackDecode>,
+}
+
+#[derive(Clone, Copy)]
+enum PackedKind {
+    Full(ObjectType),
+    OffsetDelta,
+    RefDelta,
+}
+
+#[derive(Clone, Copy)]
+enum EntryContent {
+    Full(ObjectType),
+    Delta(BaseReference),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BaseReference {
+    Offset(usize),
+    Oid(Oid),
+}
+
+struct PendingDelta {
+    offset: usize,
+    instructions: Vec<u8>,
+}
+
+struct ReadyEntry {
+    offset: usize,
+    object: VerifiedObject,
+    decode: Option<crate::raw_blob::PackDecode>,
+}
+
+#[derive(Default)]
+struct PackBases {
+    offsets: HashMap<usize, Oid>,
+    objects: HashMap<Oid, VerifiedObject>,
+    pending: HashMap<BaseReference, Vec<PendingDelta>>,
+    extras: Vec<VerifiedObject>,
+}
+
+impl PackBases {
+    fn resolve(&self, reference: BaseReference) -> Option<Oid> {
+        let oid = match reference {
+            BaseReference::Offset(offset) => *self.offsets.get(&offset)?,
+            BaseReference::Oid(oid) => oid,
+        };
+        self.objects.contains_key(&oid).then_some(oid)
+    }
+}
+
+fn check_transfer(stop: Option<&AtomicBool>) -> Result<()> {
+    if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        return Err(object::OperationCancelled.into());
+    }
+    object::check_transfer()
+}
+
+impl Entry {
+    fn inflate(&mut self, input: &[u8], stop: Option<&AtomicBool>) -> Result<(usize, bool)> {
+        inflate_buffer(
+            &mut self.inflater,
+            self.size,
+            &mut self.data,
+            self.hash.as_mut(),
+            input,
+            stop,
+        )
+    }
+}
+
+fn inflate_buffer(
+    inflater: &mut Decompress,
+    size: usize,
+    data: &mut Vec<u8>,
+    mut hash: Option<&mut Sha1>,
+    mut input: &[u8],
+    stop: Option<&AtomicBool>,
+) -> Result<(usize, bool)> {
+    let length = input.len();
+    loop {
+        check_transfer(stop)?;
+        let before_in = inflater.total_in();
+        let before_out = inflater.total_out();
+        let initialized = data.len();
+        let output_len = (size - initialized).min(INFLATE_CHUNK);
+        // Give zlib room to consume its end marker after the declared
+        // output. Any further output means the object is invalid.
+        let mut overflow = [MaybeUninit::uninit()];
+        let output = if output_len == 0 {
+            &mut overflow[..]
+        } else {
+            &mut data.spare_capacity_mut()[..output_len]
+        };
+        let status = inflater.decompress_uninit(input, output, FlushDecompress::None)?;
+        let consumed = (inflater.total_in() - before_in) as usize;
+        let used = (inflater.total_out() - before_out) as usize;
+        input = &input[consumed..];
+        ensure!(used <= output_len, "oversized Git pack object");
+        if used != 0 {
+            // zlib initialized these bytes in the reserved output slice.
+            unsafe { data.set_len(initialized + used) };
+            if let Some(hash) = hash.as_deref_mut() {
+                hash.update(&data[initialized..]);
+            }
+        }
+        if status == Status::StreamEnd || (consumed == 0 && used == 0) {
+            return Ok((length - input.len(), status == Status::StreamEnd));
+        }
+    }
+}
+
+fn reconstruct(
+    delta: delta::Delta<'_>,
+    base: &[u8],
+    hash: &mut Sha1,
+    stop: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    DELTA_APPLICATIONS.set(DELTA_APPLICATIONS.get() + 1);
+    let mut data = Vec::new();
+    data.try_reserve_exact(delta.target_size())?;
+    delta.apply(base.len(), |part| {
+        check_transfer(stop)?;
+        let bytes = match part {
+            delta::Part::Bytes(literal) => literal,
+            delta::Part::Copy(range) => &base[range],
+        };
+        hash.update(bytes);
+        data.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok(data)
 }
 
 impl Pack<'_> {
     fn check_transfer(&self) -> Result<()> {
-        if self
-            .stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::Relaxed))
-        {
-            return Err(object::OperationCancelled.into());
-        }
-        object::check_transfer()
-    }
-
-    fn spool_pack(&mut self) -> Result<()> {
-        if self.spool.is_none() {
-            let file = self.scratch.scratch_file()?;
-            let mut file = BufWriter::with_capacity(64 * 1024, file);
-            file.write_all(&self.compressed)?;
-            self.spool = Some(file);
-        }
-        Ok(())
-    }
-
-    fn use_fallback(&mut self) -> Result<()> {
-        self.spool_pack()?;
-        self.compressed = Vec::new();
-        self.entry = None;
-        self.native_fallback = true;
-        Ok(())
+        check_transfer(self.stop.as_deref())
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        if !self.native_fallback && self.count == Some(self.entries) {
-            let unread = self.compressed.len() - self.position;
+        if self.count == Some(self.entries) {
             ensure!(
-                bytes.len() <= TRAILER - unread,
+                bytes.len() <= TRAILER - self.pending.len(),
                 "oversized Git pack trailer"
             );
         }
         self.bytes += bytes.len() as u64;
         self.checksum.update(bytes);
-        if let Some(file) = &mut self.spool {
-            file.write_all(bytes)?;
-            if self.native_fallback {
-                return Ok(());
-            }
-        }
-        self.compressed.extend_from_slice(bytes);
-        self.inflate_entries()?;
-        if self.native_fallback {
-            return Ok(());
-        }
-        // After the final entry, or when a pack has one known full entry,
-        // no further entry can require a native replay.
-        let can_discard_prefix =
-            self.count == Some(self.entries) || (self.count == Some(1) && self.entry.is_some());
-        if self.spool.is_none() && !can_discard_prefix && self.compressed.len() > MEMORY_PACK {
-            self.spool_pack()?;
-        }
-        if can_discard_prefix || self.spool.is_some() {
-            self.compressed.drain(..self.position);
-            self.position = 0;
+        // Take complete headers and compressed data from the transport's slice.
+        // Carry the remainder only if a field straddled two writes or the
+        // pack trailer has arrived.
+        if self.pending.is_empty() {
+            let used = self.inflate_entries(bytes)?;
+            self.pending.extend_from_slice(&bytes[used..]);
+            self.consumed += used;
+        } else {
+            let mut pending = std::mem::take(&mut self.pending);
+            pending.extend_from_slice(bytes);
+            let used = self.inflate_entries(&pending)?;
+            pending.drain(..used);
+            self.pending = pending;
+            self.consumed += used;
         }
         Ok(())
     }
 
-    fn inflate_entries(&mut self) -> Result<()> {
+    fn inflate_entries(&mut self, input: &[u8]) -> Result<usize> {
+        let mut position = 0;
         let count = match self.count {
             Some(count) => count,
-            None if self.compressed.len() < 12 => return Ok(()),
+            None if input.len() < 12 => return Ok(0),
             None => {
-                let header = &self.compressed[..12];
+                let header = &input[..12];
                 ensure!(
                     &header[..4] == b"PACK"
                         && matches!(u32::from_be_bytes(header[4..8].try_into()?), 2 | 3),
                     "invalid Git pack header"
                 );
                 let count = u32::from_be_bytes(header[8..].try_into()?) as usize;
-                if self.native_multi_object && count > 1 {
-                    return self.use_fallback();
-                }
                 self.count = Some(count);
-                self.position = 12;
+                self.accepts_surplus = count > self.wants.len();
+                position = 12;
+                if count > 1 {
+                    self.bases = Some(PackBases::default());
+                }
                 count
             }
         };
         while self.entries < count {
             self.check_transfer()?;
             if self.entry.is_none() {
-                let Some((kind, size, length)) = entry_header(&self.compressed[self.position..])?
-                else {
+                let Some((kind, size, length)) = entry_header(&input[position..])? else {
                     break;
                 };
-                let Some(kind) = kind else {
-                    return self.use_fallback();
-                };
-                let decode = (kind == ObjectType::Blob && size > crate::raw_blob::BLOCK)
-                    .then(|| {
-                        self.scratch.reserve_pack_decode(
-                            || {
-                                self.required
-                                    .as_ref()
-                                    .is_none_or(|required| required(&self.wants))
-                            },
-                            || self.check_transfer(),
+                let offset = self.consumed + position;
+                let base_header = &input[position + length..];
+                let (content, extra_length) = match kind {
+                    PackedKind::Full(kind) => (EntryContent::Full(kind), 0),
+                    PackedKind::OffsetDelta => {
+                        let Some((base, length)) = offset_base(base_header, offset)? else {
+                            break;
+                        };
+                        (EntryContent::Delta(BaseReference::Offset(base)), length)
+                    }
+                    PackedKind::RefDelta => {
+                        let Some(oid) = base_header.get(..20) else {
+                            break;
+                        };
+                        (
+                            EntryContent::Delta(BaseReference::Oid(Oid::from_bytes(oid)?)),
+                            20,
                         )
-                    })
-                    .transpose()?;
+                    }
+                };
+                let decode = self.reserve_decode(
+                    !matches!(content, EntryContent::Full(kind) if kind != ObjectType::Blob)
+                        && size > crate::raw_blob::BLOCK,
+                )?;
                 let mut data = Vec::new();
                 // The pack header gives the final size. Reserve without
                 // initializing it so later chunks never move decoded bytes.
                 data.try_reserve_exact(size)?;
-                self.position += length;
+                position += length + extra_length;
                 self.entry = Some(Entry {
-                    kind,
+                    offset,
+                    content,
                     size,
                     inflater: Decompress::new(true),
-                    hash: object::object_hash(kind, size),
+                    hash: match content {
+                        EntryContent::Full(kind) => Some(object::object_hash(kind, size)),
+                        EntryContent::Delta(_) => None,
+                    },
                     data,
-                    _decode: decode,
+                    decode,
                 });
             }
             let entry = self.entry.as_mut().expect("entry initialized");
-            let before_in = entry.inflater.total_in();
-            let before_out = entry.inflater.total_out();
-            let initialized = entry.data.len();
-            let output_len = (entry.size - initialized).min(INFLATE_CHUNK);
-            // Give zlib room to consume its end marker once the declared
-            // output is complete. Any further output is an invalid object.
-            let mut overflow = [MaybeUninit::uninit()];
-            let output = if output_len == 0 {
-                &mut overflow[..]
-            } else {
-                &mut entry.data.spare_capacity_mut()[..output_len]
-            };
-            let status = entry.inflater.decompress_uninit(
-                &self.compressed[self.position..],
-                output,
-                FlushDecompress::None,
-            )?;
-            let consumed = (entry.inflater.total_in() - before_in) as usize;
-            let used = (entry.inflater.total_out() - before_out) as usize;
-            self.position += consumed;
-            ensure!(used <= output_len, "oversized Git pack object");
-            if used != 0 {
-                // zlib initialized these bytes in the reserved output slice.
-                unsafe { entry.data.set_len(initialized + used) };
-                entry.hash.update(&entry.data[initialized..]);
-            }
-            if status == Status::StreamEnd {
-                let entry = self.entry.take().expect("entry initialized");
-                ensure!(entry.data.len() == entry.size, "truncated Git pack object");
-                self.entries += 1;
-                let oid = Oid::from_bytes(&object::finish_sha1(entry.hash)?)?;
-                let Some(want) = self.wants.iter().position(|&item| item == oid) else {
-                    if count == 1 {
-                        bail!("remote supplied unexpected object {oid} in a single-entry pack");
-                    }
-                    // Preserve bases or other extra entries through the pack
-                    // decoder instead of discarding a received object.
-                    return self.use_fallback();
-                };
-                self.wants.swap_remove(want);
-                (self.publish)(VerifiedObject {
-                    oid,
-                    kind: entry.kind,
-                    data: entry.data,
-                })?;
-            } else if consumed == 0 && used == 0 {
+            let (consumed, finished) = entry.inflate(&input[position..], self.stop.as_deref())?;
+            position += consumed;
+            if !finished {
                 break;
             }
+            if self.entries + 1 == count {
+                ensure!(
+                    input.len() - position <= TRAILER,
+                    "oversized Git pack trailer"
+                );
+            }
+            self.publish_entry()?;
         }
         ensure!(
-            self.entries < count || self.compressed.len() - self.position <= TRAILER,
+            self.entries < count || input.len() - position <= TRAILER,
             "oversized Git pack trailer"
         );
+        Ok(position)
+    }
+
+    fn publish_entry(&mut self) -> Result<()> {
+        let entry = self.entry.take().expect("entry initialized");
+        ensure!(
+            entry.inflater.total_out() == entry.size as u64,
+            "truncated Git pack object"
+        );
+        self.entries += 1;
+        match entry.content {
+            EntryContent::Full(kind) => {
+                let hash = entry.hash.expect("canonical object hash");
+                let object = VerifiedObject {
+                    oid: Oid::from_bytes(&object::finish_sha1(hash)?)?,
+                    kind,
+                    data: Arc::new(entry.data),
+                };
+                self.publish_objects(ReadyEntry {
+                    offset: entry.offset,
+                    object,
+                    decode: entry.decode,
+                })
+            }
+            EntryContent::Delta(reference) => {
+                let delta = PendingDelta {
+                    offset: entry.offset,
+                    instructions: entry.data,
+                };
+                let bases = self
+                    .bases
+                    .as_mut()
+                    .context("Git delta pack has no base entries")?;
+                let Some(base) = bases.resolve(reference) else {
+                    bases.pending.entry(reference).or_default().push(delta);
+                    return Ok(());
+                };
+                let entry = self.apply_delta(delta, base, entry.decode)?;
+                self.publish_objects(entry)
+            }
+        }
+    }
+
+    fn publish_objects(&mut self, entry: ReadyEntry) -> Result<()> {
+        let mut runnable = Vec::new();
+        let mut next = Some(entry);
+        while let Some(ReadyEntry {
+            offset,
+            object,
+            decode,
+        }) = next
+        {
+            let oid = object.oid;
+            let wanted = self.wants.iter().position(|&item| item == oid);
+            if let Some(want) = wanted {
+                self.wants.swap_remove(want);
+                if self.bases.is_none() {
+                    return (self.publish)(object);
+                }
+                (self.publish)(object.clone())?;
+            } else if self.bases.is_none() {
+                bail!("remote supplied unexpected object {oid} in a single-entry pack");
+            } else if !self.accepts_surplus {
+                bail!("remote supplied unexpected object {oid} instead of a requested object");
+            }
+            let bases = self.bases.as_mut().expect("multi-object stream");
+            if let std::collections::hash_map::Entry::Vacant(slot) = bases.objects.entry(oid) {
+                if wanted.is_none() && self.scratch.get(oid)?.is_none() {
+                    bases.extras.push(object.clone());
+                    if let Some(pending) = &mut self.pending_extra {
+                        pending(oid);
+                    }
+                }
+                // Later deltas in this pack borrow the same verified buffer
+                // even if the lazy read cache spills this object in parallel.
+                slot.insert(object);
+            }
+            bases.offsets.insert(offset, oid);
+            for reference in [BaseReference::Offset(offset), BaseReference::Oid(oid)] {
+                if let Some(pending) = bases.pending.remove(&reference) {
+                    runnable.extend(pending.into_iter().map(|delta| (delta, oid)));
+                }
+            }
+            drop(decode);
+            next = if let Some((delta, oid)) = runnable.pop() {
+                Some(self.apply_delta(delta, oid, None)?)
+            } else {
+                None
+            };
+        }
         Ok(())
     }
 
-    fn finish(self) -> Result<Received> {
-        self.checksum.finish()?;
-        if !self.native_fallback {
-            ensure!(
-                self.count == Some(self.entries)
-                    && self.compressed.len() == self.position + TRAILER,
-                "incomplete Git pack entries"
-            );
-            if let Some(oid) = self.wants.first() {
-                bail!("remote did not supply requested object {oid}");
+    fn apply_delta(
+        &self,
+        entry: PendingDelta,
+        oid: Oid,
+        decode: Option<crate::raw_blob::PackDecode>,
+    ) -> Result<ReadyEntry> {
+        let delta = delta::Delta::parse(&entry.instructions)?;
+        let size = delta.target_size();
+        let decode = match decode {
+            Some(held) => Some(held),
+            None => {
+                self.reserve_decode(size.max(entry.instructions.len()) > crate::raw_blob::BLOCK)?
             }
+        };
+        let bases = self.bases.as_ref().expect("known delta base");
+        let base = &bases.objects[&oid];
+        let kind = base.kind();
+        let mut hash = object::object_hash(kind, size);
+        let data = reconstruct(delta, base.data(), &mut hash, self.stop.as_deref())?;
+        Ok(ReadyEntry {
+            offset: entry.offset,
+            object: VerifiedObject {
+                oid: Oid::from_bytes(&object::finish_sha1(hash)?)?,
+                kind,
+                data: Arc::new(data),
+            },
+            decode,
+        })
+    }
+
+    fn reserve_decode(&self, large: bool) -> Result<Option<crate::raw_blob::PackDecode>> {
+        large
+            .then(|| {
+                self.scratch.reserve_pack_decode(
+                    || {
+                        self.required
+                            .as_ref()
+                            .is_none_or(|required| required(&self.wants))
+                    },
+                    || self.check_transfer(),
+                )
+            })
+            .transpose()
+    }
+
+    fn finish(mut self) -> Result<Received> {
+        self.checksum.finish()?;
+        ensure!(
+            self.count == Some(self.entries) && self.pending.len() == TRAILER,
+            "incomplete Git pack entries"
+        );
+        if let Some(oid) = self.wants.first() {
+            bail!("remote did not supply requested object {oid}");
         }
-        let fallback = if self.native_fallback {
-            self.spool
-                .map(|file| file.into_inner().map_err(|error| error.into_error()))
-                .transpose()?
+        let extras = if let Some(bases) = self.bases.take() {
+            ensure!(bases.pending.is_empty(), "Git pack omitted a delta base");
+            bases.extras
         } else {
-            // The fully decoded response has no use for the last staged bytes.
-            let _ = self.spool.map(BufWriter::into_parts);
-            None
+            Vec::new()
         };
         Ok(Received {
-            fallback,
             bytes: self.bytes,
+            extras,
         })
     }
 }
@@ -528,16 +726,17 @@ impl Checksum {
     }
 }
 
-fn entry_header(bytes: &[u8]) -> Result<Option<(Option<ObjectType>, usize, usize)>> {
+fn entry_header(bytes: &[u8]) -> Result<Option<(PackedKind, usize, usize)>> {
     let Some((&first, rest)) = bytes.split_first() else {
         return Ok(None);
     };
     let kind = match (first >> 4) & 7 {
-        1 => Some(ObjectType::Commit),
-        2 => Some(ObjectType::Tree),
-        3 => Some(ObjectType::Blob),
-        4 => Some(ObjectType::Tag),
-        6 | 7 => None,
+        1 => PackedKind::Full(ObjectType::Commit),
+        2 => PackedKind::Full(ObjectType::Tree),
+        3 => PackedKind::Full(ObjectType::Blob),
+        4 => PackedKind::Full(ObjectType::Tag),
+        6 => PackedKind::OffsetDelta,
+        7 => PackedKind::RefDelta,
         _ => bail!("invalid Git pack object type"),
     };
     let mut size = usize::from(first & 15);
@@ -560,9 +759,64 @@ fn entry_header(bytes: &[u8]) -> Result<Option<(Option<ObjectType>, usize, usize
     Ok(None)
 }
 
+fn offset_base(bytes: &[u8], offset: usize) -> Result<Option<(usize, usize)>> {
+    let Some((&first, remaining)) = bytes.split_first() else {
+        return Ok(None);
+    };
+    let mut distance = usize::from(first & 127);
+    let mut latest = first;
+    let mut length = 1;
+    for &byte in remaining {
+        if latest & 128 == 0 {
+            break;
+        }
+        distance = distance
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(128))
+            .context("Git delta offset overflow")?
+            | usize::from(byte & 127);
+        latest = byte;
+        length += 1;
+    }
+    if latest & 128 != 0 {
+        return Ok(None);
+    }
+    ensure!(
+        distance != 0 && distance <= offset.saturating_sub(12),
+        "invalid Git delta base offset"
+    );
+    Ok(Some((offset - distance, length)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw_blob::ReceivedObject;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    fn verified_extra(store: &RawBlobs, oid: Oid) -> VerifiedObject {
+        match store.received(oid) {
+            Some(ReceivedObject::Verified(object)) => object,
+            _ => panic!("expected a verified extra Git object"),
+        }
+    }
+
+    fn pack_entry(kind: u8, base: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut header = Vec::new();
+        let mut size = data.len() >> 4;
+        let mut byte = kind << 4 | (data.len() & 15) as u8;
+        while size != 0 {
+            header.push(byte | 128);
+            byte = (size & 127) as u8;
+            size >>= 7;
+        }
+        header.push(byte);
+        header.extend_from_slice(base);
+        let mut encoder = ZlibEncoder::new(header, Compression::fast());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
 
     fn blob_pack_header(size: usize) -> Vec<u8> {
         let mut packet = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
@@ -578,27 +832,278 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_delta_in_the_first_pack_uses_the_verified_base_without_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let base = vec![b'x'; 258];
+        let expected = [&base[..200], b"!"].concat();
+        let wanted = Oid::hash_object(ObjectType::Blob, &expected).unwrap();
+        let base_oid = Oid::hash_object(ObjectType::Blob, &base).unwrap();
+        let mut header = blob_pack_header(base.len());
+        header[11] = 2;
+        let mut encoder = flate2::write::ZlibEncoder::new(header, flate2::Compression::none());
+        encoder.write_all(&base).unwrap();
+        let mut pack = encoder.finish().unwrap();
+        let distance = pack.len() - 12;
+        assert!((128..16_512).contains(&distance));
+        let instructions = [0x82, 2, 0xc9, 1, 0x90, 200, 1, b'!'];
+        pack.extend_from_slice(&[
+            0x60 | instructions.len() as u8,
+            0x80 | ((distance >> 7) - 1) as u8,
+            (distance & 127) as u8,
+        ]);
+        let mut encoder = flate2::write::ZlibEncoder::new(pack, flate2::Compression::fast());
+        encoder.write_all(&instructions).unwrap();
+        let pack = encoder.finish().unwrap();
+        let published = AtomicBool::new(false);
+        let mut response = Response::new(
+            scratch.clone(),
+            vec![wanted],
+            Box::new(|object| {
+                assert_eq!(object.data(), expected);
+                published.store(true, Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+        let base_end = distance + 12;
+        for fragment in pack[..base_end].chunks(1) {
+            response.pack.write(fragment).unwrap();
+        }
+        for fragment in pack[base_end..].chunks(1) {
+            response.pack.write(fragment).unwrap();
+        }
+        // The wanted delta can be read before the trailer. Its unsolicited
+        // base must stay private until the whole response passes validation.
+        assert!(published.load(Ordering::Relaxed));
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "only the raw cache directory should exist"
+        );
+        assert!(scratch.get(base_oid).unwrap().is_none());
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        let mut received = response.pack.finish().unwrap();
+        received.cache_extras(&scratch, |_| {});
+        assert_eq!(verified_extra(&scratch, base_oid).data(), base);
+    }
+
+    #[test]
+    fn a_pack_carried_base_reuses_its_freshly_verified_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scratch = RawBlobs::new(directory.path()).unwrap();
+        let base = b"verified";
+        let base_oid = Oid::hash_object(ObjectType::Blob, base).unwrap();
+        scratch
+            .insert_fetched(base_oid, base.len(), base.as_slice(), None)
+            .unwrap();
+        scratch.evict_all_for_test().unwrap();
+        let backing = std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join(base_oid.to_string());
+        std::fs::write(backing, b"tampered").unwrap();
+        let wanted = Oid::hash_object(ObjectType::Blob, b"verified!").unwrap();
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+        pack.extend_from_slice(&pack_entry(3, &[], base));
+        pack.extend_from_slice(&pack_entry(
+            7,
+            base_oid.as_bytes(),
+            &[8, 9, 0x90, 8, 1, b'!'],
+        ));
+        let mut response = Response::new(
+            scratch,
+            vec![wanted],
+            Box::new(|object| {
+                assert_eq!(object.data(), b"verified!");
+                Ok(())
+            }),
+        );
+        response.pack.write(&pack).unwrap();
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        response.pack.finish().unwrap();
+    }
+
+    #[test]
+    fn forward_deltas_wait_for_their_base_without_holding_decode_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let base = vec![b'x'; 65_537];
+        let base_oid = Oid::hash_object(ObjectType::Blob, &base).unwrap();
+        let wanted = Oid::hash_object(ObjectType::Blob, b"ok").unwrap();
+        let mut response = Response::new(
+            scratch.clone(),
+            vec![wanted],
+            Box::new(|object| {
+                assert_eq!(object.data(), b"ok");
+                Ok(())
+            }),
+        );
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x0c".to_vec();
+        response.pack.write(&pack).unwrap();
+        for byte in 0..10 {
+            let mut instructions = vec![0x81, 0x80, 4, 0x81, 0x80, 4];
+            let output = vec![byte; base.len()];
+            for literal in output.chunks(127) {
+                instructions.push(literal.len() as u8);
+                instructions.extend_from_slice(literal);
+            }
+            let entry = pack_entry(7, base_oid.as_bytes(), &instructions);
+            pack.extend_from_slice(&entry);
+            response.pack.write(&entry).unwrap();
+        }
+        let pending = &response.pack.bases.as_ref().unwrap().pending[&BaseReference::Oid(base_oid)];
+        assert_eq!(pending.len(), 10);
+        assert_eq!(scratch.active_pack_decodes(), 0);
+        for entry in [pack_entry(3, &[], &base), pack_entry(3, &[], b"ok")] {
+            pack.extend_from_slice(&entry);
+            response.pack.write(&entry).unwrap();
+        }
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        let mut received = response.pack.finish().unwrap();
+        assert_eq!(received.extras.len(), 11);
+        received.cache_extras(&scratch, |_| {});
+        let surplus = Oid::hash_object(ObjectType::Blob, &vec![9; base.len()]).unwrap();
+        assert!(scratch.get(surplus).unwrap().is_none());
+        assert_eq!(
+            verified_extra(&scratch, surplus).data(),
+            vec![9; base.len()]
+        );
+        assert_eq!(scratch.disk_metrics(), (0, 0));
+    }
+
+    #[test]
+    fn interleaved_delta_chains_apply_each_entry_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let size = 256 * 1024;
+        let depth = 4;
+        let mut bases = [vec![b'a'; size], vec![b'b'; size]];
+        let mut oids = bases
+            .each_ref()
+            .map(|data| Oid::hash_object(ObjectType::Blob, data).unwrap());
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x0a".to_vec();
+        for base in &bases {
+            pack.extend_from_slice(&pack_entry(3, &[], base));
+        }
+        for byte in 0..depth {
+            for (base, oid) in bases.iter_mut().zip(&mut oids) {
+                let instructions = [
+                    0x80, 0x80, 0x10, 0x80, 0x80, 0x10, 1, byte, 0xf1, 1, 0xff, 0xff, 3,
+                ];
+                pack.extend_from_slice(&pack_entry(7, oid.as_bytes(), &instructions));
+                base[0] = byte;
+                *oid = Oid::hash_object(ObjectType::Blob, base).unwrap();
+            }
+        }
+        DELTA_APPLICATIONS.set(0);
+        let mut response = Response::new(
+            scratch.clone(),
+            vec![oids[0]],
+            Box::new(|object| {
+                assert_eq!(object.data(), bases[0]);
+                Ok(())
+            }),
+        );
+        response.pack.write(&pack).unwrap();
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        let mut received = response.pack.finish().unwrap();
+        received.cache_extras(&scratch, |_| {});
+        assert_eq!(verified_extra(&scratch, oids[1]).data(), bases[1]);
+        assert_eq!(DELTA_APPLICATIONS.get(), usize::from(depth) * 2);
+    }
+
+    #[test]
+    fn publishing_a_verified_extra_preserves_an_already_selected_pack() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(root.path()).unwrap();
+        let base = b"base";
+        let oid = Oid::hash_object(ObjectType::Blob, base).unwrap();
+        let directory = Arc::new(tempfile::tempdir_in(root.path()).unwrap());
+        let packed = directory.path().join("pack");
+        std::fs::write(&packed, base).unwrap();
+        scratch.remember_packed(oid, &directory);
+        drop(directory);
+        let Some(ReceivedObject::Packed(selected)) = scratch.received(oid) else {
+            panic!("expected a native pack source");
+        };
+
+        let wanted = Oid::hash_object(ObjectType::Blob, b"wanted").unwrap();
+        let mut response = Response::new(scratch.clone(), vec![wanted], Box::new(|_| Ok(())));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+        pack.extend_from_slice(&pack_entry(3, &[], base));
+        pack.extend_from_slice(&pack_entry(3, &[], b"wanted"));
+        response.pack.write(&pack).unwrap();
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        response
+            .pack
+            .finish()
+            .unwrap()
+            .cache_extras(&scratch, |_| {});
+
+        assert_eq!(verified_extra(&scratch, oid).data(), base);
+        assert_eq!(std::fs::read(selected.path().join("pack")).unwrap(), base);
+        drop(selected);
+        assert!(!packed.exists());
+    }
+
+    #[test]
+    fn expanded_instructions_hold_a_slot_even_for_a_small_delta_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let base = Oid::hash_object(ObjectType::Blob, b"x").unwrap();
+        let expected = vec![b'y'; 40 * 1024];
+        let wanted = Oid::hash_object(ObjectType::Blob, &expected).unwrap();
+        let mut program = vec![1, 0x80, 0xc0, 2]; // Base size 1 and result size 40 KiB.
+        program.extend([1, b'y'].repeat(expected.len()));
+        assert!(program.len() > crate::raw_blob::BLOCK);
+        let mut response = Response::new(
+            scratch.clone(),
+            vec![wanted],
+            Box::new(|object| {
+                assert_eq!(object.data(), expected);
+                assert_eq!(scratch.active_pack_decodes(), 1);
+                Ok(())
+            }),
+        );
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+        pack.extend_from_slice(&pack_entry(3, &[], b"x"));
+        pack.extend_from_slice(&pack_entry(7, base.as_bytes(), &program));
+        response.pack.write(&pack).unwrap();
+        assert_eq!(scratch.active_pack_decodes(), 0);
+        response.pack.write(&Sha1::digest(&pack)).unwrap();
+        response.pack.finish().unwrap();
+    }
+
+    #[test]
     fn split_pack_entry_keeps_the_blob_within_its_declared_capacity() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
         let data = vec![3; INFLATE_CHUNK + 1];
         let wanted = Oid::hash_object(ObjectType::Blob, &data).unwrap();
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            blob_pack_header(data.len()),
-            flate2::Compression::fast(),
-        );
+        let later = Oid::hash_object(ObjectType::Blob, b"later").unwrap();
+        let mut header = blob_pack_header(data.len());
+        header[11] = 2;
+        let mut encoder = flate2::write::ZlibEncoder::new(header, flate2::Compression::fast());
         let first_chunk = 20_000;
         encoder.write_all(&data[..first_chunk]).unwrap();
         encoder.flush().unwrap();
         let split = encoder.get_ref().len();
         encoder.write_all(&data[first_chunk..]).unwrap();
-        let pack = encoder.finish().unwrap();
+        let mut pack = encoder.finish().unwrap();
+        pack.extend_from_slice(&pack_entry(3, &[], b"later"));
         let mut response = Response::new(
             scratch,
-            vec![wanted],
+            vec![wanted, later],
             Box::new(move |object| {
-                assert_eq!(object.data(), data);
-                assert!(object.data.capacity() <= data.len());
+                if object.oid() == wanted {
+                    assert_eq!(object.data(), data);
+                    assert!(object.data.capacity() <= data.len());
+                } else {
+                    assert_eq!(object.data(), b"later");
+                }
                 Ok(())
             }),
         );
@@ -612,15 +1117,12 @@ mod tests {
     fn large_full_object_is_published_before_the_trailer_without_staging() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
-        let data = vec![3; MEMORY_PACK + 1024];
+        let data = vec![3; 1025 * 1024];
         let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            blob_pack_header(data.len()),
-            flate2::Compression::none(),
-        );
+        let header = blob_pack_header(data.len());
+        let mut encoder = flate2::write::ZlibEncoder::new(header, flate2::Compression::none());
         encoder.write_all(&data).unwrap();
         let packet = encoder.finish().unwrap();
-        assert!(packet.len() > MEMORY_PACK);
         let trailer = Sha1::digest(&packet);
         let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let published = delivered.clone();
@@ -637,10 +1139,10 @@ mod tests {
         for chunk in packet.chunks(4096) {
             response.pack.write(chunk).unwrap();
         }
+        assert_eq!(response.pack.pending.capacity(), 0);
         assert!(delivered.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(response.pack.spool.is_none());
         response.pack.write(&trailer).unwrap();
-        assert!(response.pack.finish().unwrap().fallback.is_none());
+        response.pack.finish().unwrap();
     }
 
     #[test]

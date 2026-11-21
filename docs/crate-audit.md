@@ -8,7 +8,7 @@
 | Temporary-storage authentication | `blake3` | Ordered BLAKE3 block expectations and exact lengths stay in protected RAM. Authenticate the actual reloaded buffer before returning bytes. |
 | Payload and ignore-rule retention | `lru` | A byte-accounted 16 MiB payload LRU with one entry per original OID; an eight-entry hot blob LRU and a separate 4 MiB / 128-entry compiled-rule LRU. Metadata and active decoder/read allocations are accounted separately. |
 | Directory metadata | Standard maps, shared immutable structures and scoped merged views | Parse demanded trees once, support direct name lookup and stable active enumeration versions, and retain only issued inode references. |
-| Pack inflation | `flate2` with zlib | Incremental decoding requires stream completion, exact framing and canonical OID verification. Necessary delta dependencies retain native handling. |
+| Pack inflation | `flate2` with zlib | Reusable HTTPS and SSH sessions reconstruct deltas from verified bases in RAM. Each published object passes canonical OID verification. The receiver verifies zlib completion, pack framing and the trailer. |
 | Temporary files | `tempfile` and anchored no-follow file operations | Invocation ownership, descriptor limits, and cleanup apply to temporary files. Block authentication protects immutable source reads. Private backing uses ordinary filesystem I/O. |
 | Cancellation and children | `signal-hook` and scoped native process ownership | Signals and shutdown preserve owned-child cleanup and documented recovery behavior. |
 | Remote sessions | Native Git upload-pack, HTTP helper and SSH transport with bounded protocol framing | Reuse invocation-owned sessions and prepared objects. Unsupported protocols or native policy settings use the compatibility path. |
@@ -17,6 +17,6 @@ The exact dependency versions and sources are recorded in `Cargo.lock`.
 Native verification assumptions are tied to that locked build. Changes to the
 Git/hash dependency closure require checking those assumptions again.
 
-[Resource limits and integrity invariants](resources.md) apply across these
+[Resource use and integrity invariants](resources.md) apply across these
 boundaries. Rust 1.89 checks, platform builds, license notices and observable
 behavior are validated by the repository's required test and packaging jobs.

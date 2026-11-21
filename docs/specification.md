@@ -145,11 +145,11 @@ The native mount and write-policy contracts apply to local and remote runs.
 
 ### Resource assumptions
 
-Acceptance assumes an unlimited inherited `RLIMIT_FSIZE`. A finite
-`RLIMIT_FSIZE` is a host-imposed limit on how large the process may create
-or extend an individual file. Adapting to that limit is outside Git-on's
-supported workload. The two-checkout budget concerns available filesystem
-space for Git-on and the command.
+Supported workloads fit in available RAM, including the aggregate data
+needed to decode and retain a pack. Git-on leaves inherited process
+limits, including `RLIMIT_FSIZE`, to the host. It follows its own cache
+policy independently of those limits. The two-checkout budget concerns
+available filesystem space for Git-on and the command.
 
 ## Backend selection and materialization
 
@@ -183,10 +183,9 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset.
 The lazy startup and performance requirements below apply to both native mounts.
 
-Remote materialization obtains the selected revision in one shallow transfer
-when the filesystem supports the resulting pack file size. A mount fallback
-reuses the original selection and fetches the full snapshot in one additional
-shallow transfer.
+Remote materialization obtains the selected revision in one shallow transfer.
+A mount fallback reuses the original selection and fetches the full snapshot
+in one additional shallow transfer.
 Compressed objects are decoded into their final paths, and already prepared
 contents are reused for repeated OIDs.
 
@@ -400,9 +399,9 @@ The implementation uses a shared pinned object store, demand-only metadata/blob
 access and deferred inode creation. A byte-budgeted LRU retains complete small
 objects and individual blocks of spilled files. A separate LRU holds whole hot
 blobs. Trusted descriptors, block hashes and parsed directories remain in RAM
-outside the block budget. Raw tree
-bytes and disk object/name indexes are not retained. The FUSE layer retains no
-duplicate snapshot payloads. Source
+outside the block budget. Extra objects from reusable packs retain their
+verified bytes in RAM until use. Parsing a demanded tree releases its raw
+bytes. The FUSE layer retains no duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail
 metadata access, LFS pointers fail content reads, and unrelated entries remain
 usable. Listing a directory may report a submodule name without following it.

@@ -1,7 +1,7 @@
 //! Invocation-local verified contents. Only payload bytes spill to disk;
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
-    spool::{open_private_file, private_file_metadata, Files, Spool},
+    spool::{open_private_file, private_file_metadata},
     tree::Directory,
 };
 use anyhow::{Context, Result};
@@ -20,7 +20,7 @@ use std::{
     },
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard, Weak,
     },
     thread,
@@ -740,6 +740,7 @@ pub(crate) struct RawBlobs {
     prepared: Arc<Condvar>,
     hot_writer: Arc<Mutex<HotWriter>>,
     pack_decodes: Arc<PackDecodes>,
+    root_pinned: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -755,6 +756,12 @@ pub(crate) enum DemandLookup {
     Missing,
     Available,
     ClaimedForecast,
+}
+
+#[derive(Clone)]
+pub(crate) enum ReceivedObject {
+    Verified(crate::pack_stream::VerifiedObject),
+    Packed(Arc<tempfile::TempDir>),
 }
 
 impl Drop for PackDecode {
@@ -786,7 +793,7 @@ impl RawBlobs {
                 directory: RawDirectory::new(directory)?,
                 objects: HashMap::new(),
                 preparing: HashSet::new(),
-                packed: HashMap::new(),
+                received: HashMap::new(),
                 memory: lru::LruCache::unbounded(),
                 hot: lru::LruCache::unbounded(),
                 spilling: None,
@@ -796,7 +803,6 @@ impl RawBlobs {
                 memory_bytes: 0,
                 memory_limit: MEMORY_BUDGET,
                 memory_high_water: 0,
-                scratch: None,
                 failure: None,
                 blob_entries: 0,
                 blob_bytes: 0,
@@ -810,7 +816,21 @@ impl RawBlobs {
             prepared: Arc::default(),
             hot_writer: Arc::default(),
             pack_decodes: Arc::default(),
+            root_pinned: Arc::default(),
         })
+    }
+
+    pub(crate) fn record_root_pin(&self) {
+        self.root_pinned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn root_is_pinned(&self) -> bool {
+        self.root_pinned.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_pack_decodes(&self) -> usize {
+        *self.pack_decodes.active.lock().unwrap()
     }
 
     pub(crate) fn reserve_pack_decode(
@@ -851,7 +871,41 @@ impl RawBlobs {
     }
     pub(crate) fn available(&self, oid: Oid) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.objects.contains_key(&oid) || state.packed.contains_key(&oid)
+        state.available(oid)
+    }
+
+    pub(crate) fn remember_extras(&self, extras: Vec<crate::pack_stream::VerifiedObject>) {
+        if extras.is_empty() {
+            return;
+        }
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for extra in extras {
+            let oid = extra.oid();
+            if !store.objects.contains_key(&oid)
+                && !matches!(store.received.get(&oid), Some(ReceivedObject::Verified(_)))
+            {
+                store.received.insert(oid, ReceivedObject::Verified(extra));
+            }
+        }
+    }
+
+    pub(crate) fn has_received(&self, oid: Oid) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .received
+            .contains_key(&oid)
+    }
+
+    pub(crate) fn received(&self, oid: Oid) -> Option<ReceivedObject> {
+        // Keep the selected source alive if another transfer publishes the
+        // same OID before its consumer begins decoding.
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .received
+            .get(&oid)
+            .cloned()
     }
 
     pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<()>, delivered: bool) -> bool {
@@ -869,43 +923,22 @@ impl RawBlobs {
             })
     }
 
-    pub(crate) fn has_packed(&self, oid: Oid) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .packed
-            .contains_key(&oid)
-    }
-
-    pub(crate) fn packed_directory(&self, oid: Oid) -> Option<Arc<tempfile::TempDir>> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.packed.get(&oid).cloned()
-    }
-
     pub(crate) fn remember_packed(&self, oid: Oid, directory: &Arc<tempfile::TempDir>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.objects.contains_key(&oid) {
-            state.packed.entry(oid).or_insert_with(|| directory.clone());
+            state
+                .received
+                .entry(oid)
+                .or_insert_with(|| ReceivedObject::Packed(directory.clone()));
         }
     }
 
-    pub(crate) fn forget_packed(&self, oid: Oid) {
+    pub(crate) fn forget_received(&self, oid: Oid) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .packed
+            .received
             .remove(&oid);
-    }
-
-    #[cfg(feature = "test-metrics")]
-    pub(crate) fn packed_oids(&self) -> Vec<Oid> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .packed
-            .keys()
-            .copied()
-            .collect()
     }
 
     pub(crate) fn for_read(&mut self, oid: Oid) -> Result<Option<(RawBlob, bool)>> {
@@ -983,18 +1016,12 @@ impl RawBlobs {
     fn insert_verified_bytes(
         &mut self,
         oid: Oid,
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<Vec<u8>>>,
         transfer: Option<Weak<()>>,
         waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(),
     ) -> Result<()> {
-        let size = bytes.len();
-        if size <= BLOCK {
-            self.insert_blob(oid, size, false, transfer, || Ok(bytes))?;
-            ready();
-            return Ok(());
-        }
-
+        let payload = bytes.into();
         let _preparation;
         let mut store = self.wait_for_preparation(oid);
         if store.objects.contains_key(&oid) {
@@ -1002,10 +1029,19 @@ impl RawBlobs {
             ready();
             return Ok(());
         }
+        if payload.len() <= BLOCK {
+            if let Err(error) =
+                self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer)
+            {
+                crate::object::check_transfer()?;
+                return Err(error);
+            }
+            ready();
+            return Ok(());
+        }
         if let Some(error) = &store.failure {
             anyhow::bail!("verified object storage previously failed: {error}");
         }
-        let payload = Arc::new(bytes);
         store.preparing.insert(oid);
         _preparation = BlobPreparation { blobs: self, oid };
         if let Some(transfer) = &transfer {
@@ -1045,7 +1081,7 @@ impl RawBlobs {
 
     pub(crate) fn lookup_demand(&self, oid: Oid) -> DemandLookup {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if store.objects.contains_key(&oid) || store.packed.contains_key(&oid) {
+        if store.available(oid) {
             return DemandLookup::Available;
         }
         let Some((payload, transfer)) = store.forecasts.get(&oid) else {
@@ -1060,20 +1096,6 @@ impl RawBlobs {
         DemandLookup::ClaimedForecast
     }
 
-    pub(crate) fn insert_prefetched_odb_blob(
-        &mut self,
-        oid: Oid,
-        object: &git2::OdbObject<'_>,
-        transfer: Option<Weak<()>>,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            object.id() == oid && object.kind() == ObjectType::Blob,
-            "prefetched ODB object identity/type changed"
-        );
-        self.insert_odb(oid, object, false, transfer)?;
-        Ok(())
-    }
-
     fn insert_odb(
         &mut self,
         oid: Oid,
@@ -1084,16 +1106,9 @@ impl RawBlobs {
         self.insert_blob(oid, object.len(), used, transfer, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(object.len())?;
-            crate::object::copy_odb_blob(object, &mut bytes)?;
+            crate::object::copy_odb_blob(object, &mut bytes, |_| Ok(()))?;
             Ok(bytes)
         })
-    }
-
-    pub(crate) fn index_directory(&self) -> io::Result<tempfile::TempDir> {
-        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        tempfile::Builder::new()
-            .prefix("index-")
-            .tempdir_in(store.directory._owner.path())
     }
 
     fn insert_blob(
@@ -1170,7 +1185,7 @@ impl RawBlobs {
             store.publish_blob(oid, size, used, transfer);
         }
         if resident {
-            store.admit(oid, 0, bytes)?;
+            store.admit(oid, 0, shared.unwrap_or_else(|| Arc::new(bytes)))?;
         } else if hot {
             store
                 .hot
@@ -1251,24 +1266,16 @@ impl RawBlobs {
                 transfer: None,
             },
         );
-        store.packed.remove(&oid);
+        store.received.remove(&oid);
         Ok(self.blob(oid, store.objects.get(&oid).unwrap()))
-    }
-    // Scratch files belong to transport framing/decoding, never the object map.
-    pub(crate) fn scratch_file(&self) -> Result<Spool> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .scratch_file()
     }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
             .objects
             .keys()
+            .chain(state.received.keys())
             .copied()
             .collect())
     }
@@ -1376,7 +1383,7 @@ struct Store {
     directory: RawDirectory,
     objects: HashMap<Oid, Descriptor>,
     preparing: HashSet<Oid>,
-    packed: HashMap<Oid, Arc<tempfile::TempDir>>,
+    received: HashMap<Oid, ReceivedObject>,
     memory: lru::LruCache<Oid, Resident>,
     hot: lru::LruCache<Oid, Arc<Vec<u8>>>,
     spilling: Option<(Oid, Arc<Vec<u8>>)>,
@@ -1386,7 +1393,6 @@ struct Store {
     memory_bytes: usize,
     memory_limit: usize,
     memory_high_water: usize,
-    scratch: Option<Files>,
     failure: Option<String>,
     blob_entries: u64,
     blob_bytes: u64,
@@ -1398,6 +1404,10 @@ struct Store {
     cloned_copies: u64,
 }
 impl Store {
+    fn available(&self, oid: Oid) -> bool {
+        self.objects.contains_key(&oid) || self.received.contains_key(&oid)
+    }
+
     fn can_publish_decoded(&self, oid: Oid) -> bool {
         self.hot_limit != 0 && self.failure.is_none() && !self.objects.contains_key(&oid)
     }
@@ -1432,23 +1442,11 @@ impl Store {
                 transfer,
             },
         );
-        self.packed.remove(&oid);
+        self.received.remove(&oid);
         self.blob_entries += 1;
         self.blob_bytes += size as u64;
     }
 
-    fn scratch_file(&mut self) -> Result<Spool> {
-        let directory = self
-            .directory
-            ._owner
-            .path()
-            .parent()
-            .context("raw storage parent")?;
-        if self.scratch.is_none() {
-            self.scratch = Some(Files::new(directory)?);
-        }
-        Ok(self.scratch.as_ref().unwrap().file(directory)?)
-    }
     fn finish_spill(&mut self, oid: Oid, blocks: Box<[[u8; 32]]>) {
         let object = self.objects.get_mut(&oid).expect("resident object");
         object.file = true;

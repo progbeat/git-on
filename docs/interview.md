@@ -104,3 +104,11 @@ to Git-on's process memory are outside the threat model.
 selected revision on disk, Git-on must be able to run it too. This concerns
 available space on the filesystem. A finite process `RLIMIT_FSIZE` is outside
 the intended workload.
+
+**Question:** If a valid pack sends more extra objects than fit in RAM, what
+should give way: retaining every OID received or the RAM and disk limits?
+With arbitrarily much data, both conditions and the two-checkout promise
+cannot be met at the same time.
+
+**Answer:** Exceeding available RAM is outside the practical workloads Git-on
+should support. Git-on should leave process limits to the host.

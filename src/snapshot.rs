@@ -991,6 +991,15 @@ impl Snapshot {
         output: &mut (dyn std::io::Write + Send),
     ) -> Result<u64> {
         let mut state = self.state()?;
+        // An extra already has a verified buffer. Writing directly keeps an
+        // eager copy from filling the lazy cache and spilling it to disk.
+        if !state
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.has_received_object(oid))
+        {
+            state.ensure(oid)?;
+        }
         if state
             .remote
             .as_ref()
@@ -1022,11 +1031,10 @@ impl Snapshot {
             }
             return Ok(size);
         }
-        state.ensure(oid)?;
         if let Some(remote) = state
             .remote
             .as_mut()
-            .filter(|remote| remote.has_packed_object(oid))
+            .filter(|remote| remote.has_received_object(oid))
         {
             let (size, streamed) =
                 remote.copy_materialized_blob(oid, output, State::validate_blob)?;
@@ -1036,37 +1044,35 @@ impl Snapshot {
             return Ok(size);
         }
         let odb = state.repo.odb()?;
-        let (size, kind) = odb.read_header(oid)?;
-        anyhow::ensure!(
-            kind == ObjectType::Blob,
-            "snapshot file does not reference a blob"
-        );
-        let mut small = Vec::new();
-        let target: &mut dyn std::io::Write = if size < 1024 {
-            &mut small
-        } else {
-            &mut *output
-        };
-        let streamed = if let Ok((input, length, kind)) = odb.reader(oid) {
+        let (size, streamed) = if let Ok((input, size, kind)) = odb.reader(oid) {
             anyhow::ensure!(
-                length == size && kind == ObjectType::Blob,
-                "Git blob changed during transfer"
+                kind == ObjectType::Blob,
+                "snapshot file does not reference a blob"
             );
-            crate::object::copy_verified(input, target, ObjectType::Blob, size, oid)?;
-            true
+            if size < 1024 {
+                let mut small = Vec::with_capacity(size);
+                crate::object::copy_verified(input, &mut small, kind, size, oid)?;
+                State::validate_blob(&small)?;
+                output.write_all(&small)?;
+            } else {
+                crate::object::copy_verified(input, &mut *output, kind, size, oid)?;
+            }
+            (size, true)
         } else {
             let object = odb.read(oid).context("decode Git blob")?;
             anyhow::ensure!(
-                object.id() == oid && object.len() == size && object.kind() == ObjectType::Blob,
+                object.id() == oid && object.kind() == ObjectType::Blob,
                 "Git blob changed during transfer"
             );
-            crate::object::copy_odb_blob(&object, target)?;
-            false
+            let size = object.len();
+            crate::object::copy_odb_blob(&object, output, |bytes| {
+                if size < 1024 {
+                    State::validate_blob(bytes)?;
+                }
+                Ok(())
+            })?;
+            (size, false)
         };
-        if size < 1024 {
-            State::validate_blob(&small)?;
-            output.write_all(&small)?;
-        }
         drop(odb);
         state.metrics.blob_loads += 1;
         state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
@@ -1238,7 +1244,6 @@ impl Snapshot {
         }
         if let Some(remote) = &state.remote {
             objects.extend(remote.raw_blobs.oids()?);
-            objects.extend(remote.packed_object_oids());
         }
         objects.sort_unstable();
         objects.dedup();

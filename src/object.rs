@@ -120,14 +120,6 @@ pub(crate) fn copy_verified(
         if count == 0 {
             return Err(InvalidObject(format!("truncated Git object {oid}")).into());
         }
-        #[cfg(test)]
-        HASH_PROBE.with(|probe| {
-            if let Some((tracked, bytes)) = probe.get() {
-                if tracked == oid {
-                    probe.set(Some((tracked, bytes + count)));
-                }
-            }
-        });
         output
             .write_all(&buffer[..count])
             .context("write Git object stream")?;
@@ -178,6 +170,14 @@ impl<W: Write> Write for VerifiedWriter<W> {
         }
         let count = self.output.write(bytes)?;
         self.hash.update(&bytes[..count]);
+        #[cfg(test)]
+        HASH_PROBE.with(|probe| {
+            if let Some((tracked, total)) = probe.get() {
+                if tracked == self.oid {
+                    probe.set(Some((tracked, total + count)));
+                }
+            }
+        });
         self.remaining -= count;
         Ok(count)
     }
@@ -188,21 +188,23 @@ impl<W: Write> Write for VerifiedWriter<W> {
 
 /// The owned ODB buffer was verified before libgit2 returned it. Only the
 /// audited startup policy establishes that fact; arbitrary streams never use
-/// this route. Block digests are still formed from these same copied bytes.
-pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, output: impl Write) -> Result<()> {
+/// this route. Embedders without that policy verify this same borrowed buffer.
+pub(crate) fn copy_odb_blob(
+    object: &git2::OdbObject<'_>,
+    output: impl Write,
+    validate: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<()> {
     anyhow::ensure!(
         object.kind() == ObjectType::Blob,
         "ODB object is not a blob"
     );
     if !NATIVE_OID_VERIFICATION.load(Ordering::Acquire) {
-        return copy_verified(
-            object.data(),
-            output,
-            ObjectType::Blob,
-            object.len(),
-            object.id(),
-        );
+        let mut hash =
+            VerifiedWriter::new(std::io::sink(), ObjectType::Blob, object.len(), object.id());
+        write_verified_buffer(object.data(), &mut hash)?;
+        hash.finish()?;
     }
+    validate(object.data())?;
     write_verified_buffer(object.data(), output)
 }
 
@@ -223,16 +225,10 @@ pub(crate) fn write_verified_buffer(bytes: &[u8], mut output: impl Write) -> Res
 /// this initializer must preserve its policy; without it the importer keeps
 /// independent Rust verification.
 pub unsafe fn configure_pack_descriptors() -> Result<usize> {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("read descriptor limit");
-    }
-    // Retained pack descriptors use at most a quarter of the soft limit, capped
-    // at 32. The remaining descriptors serve Git startup, mounts, active files,
-    // cache transfers and caller-inherited descriptors. No OS limit is changed.
-    let budget = (unsafe { limit.assume_init() }.rlim_cur / 4).clamp(1, 32) as usize;
+    // Pack reuse must not make the descriptor cache grow with repository size.
+    const PACK_DESCRIPTORS: usize = 32;
     unsafe {
-        git2::opts::set_mwindow_file_limit(budget)?;
+        git2::opts::set_mwindow_file_limit(PACK_DESCRIPTORS)?;
         // A long-lived source repository otherwise keeps 1 GiB windows under
         // libgit2's 8 GiB mapped-byte default (on 64-bit hosts), independently
         // of our decoded-data LRU. Size each window as well as the soft total:
@@ -253,7 +249,7 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
             && version.crate_version() == "0.20.4",
         Ordering::Release,
     );
-    Ok(budget)
+    Ok(PACK_DESCRIPTORS)
 }
 
 #[cfg(test)]

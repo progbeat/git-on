@@ -1,5 +1,5 @@
 //! Explicit exact-object fetches. Git's promisor auto-fetch is never the loader.
-use crate::{git::Git, object::TeeRead, transport};
+use crate::{git::Git, object::TeeRead, raw_blob::ReceivedObject, transport};
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
@@ -163,7 +163,6 @@ pub struct Remote {
     control_client: Option<ControlClient>,
     failed: Option<String>,
     materializing: bool,
-    root_pinned: bool,
     active_materialized_pack: Option<ReceivedPack>,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
 }
@@ -271,7 +270,6 @@ impl Remote {
             // Eager execution needs the whole selected tree. Keep its blobs
             // compressed until decoding directly into their final paths.
             materializing: materialized,
-            root_pinned: false,
             active_materialized_pack: None,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
         };
@@ -473,7 +471,7 @@ impl Remote {
         if materializing {
             self.stage_materialization()?;
         } else {
-            self.import_received(true, &[oid])?;
+            self.import_received(&[oid])?;
         }
         let repo = Repository::open_bare(&self.dir)?;
         if !repo.odb()?.exists(oid) && self.raw_blobs.get(oid)?.is_none() {
@@ -496,10 +494,10 @@ impl Remote {
         self.session = None;
     }
     pub(crate) fn root_pinned(&mut self) {
-        self.root_pinned = true;
+        self.raw_blobs.record_root_pin();
     }
-    pub(crate) fn has_packed_object(&self, oid: Oid) -> bool {
-        self.raw_blobs.has_packed(oid)
+    pub(crate) fn has_received_object(&self, oid: Oid) -> bool {
+        self.raw_blobs.has_received(oid)
     }
     pub(crate) fn copy_materialized_blob(
         &mut self,
@@ -508,10 +506,23 @@ impl Remote {
         validate: impl FnOnce(&[u8]) -> Result<()>,
     ) -> Result<(u64, bool)> {
         let outcome = (|| {
-            let directory = self
+            let directory = match self
                 .raw_blobs
-                .packed_directory(oid)
-                .context("missing materialization blob")?;
+                .received(oid)
+                .context("missing materialization blob")?
+            {
+                ReceivedObject::Verified(object) => {
+                    anyhow::ensure!(
+                        object.kind() == git2::ObjectType::Blob,
+                        "materialized file is not a blob"
+                    );
+                    let data = object.data();
+                    validate(data)?;
+                    crate::object::write_verified_buffer(data, output)?;
+                    return Ok((data.len() as u64, false));
+                }
+                ReceivedObject::Packed(directory) => directory,
+            };
             if self
                 .active_materialized_pack
                 .as_ref()
@@ -552,13 +563,12 @@ impl Remote {
                     object.id() == oid && object.len() == size && object.kind() == kind,
                     "Git blob changed during transfer"
                 );
-                validate(object.data())?;
-                crate::object::copy_odb_blob(&object, output)?;
+                crate::object::copy_odb_blob(&object, output, validate)?;
             }
             Ok((size as u64, streamed))
         })();
         if outcome.is_ok() {
-            self.raw_blobs.forget_packed(oid);
+            self.raw_blobs.forget_received(oid);
             if self
                 .active_materialized_pack
                 .as_ref()
@@ -578,13 +588,14 @@ impl Remote {
             if self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid) {
                 return Ok(());
             }
-            if self.has_packed_object(oid) {
-                if !self.materializing {
-                    self.import_packed_object(oid)?;
+            match self.raw_blobs.received(oid) {
+                Some(ReceivedObject::Verified(object)) => self.publish_verified(repo, object),
+                Some(ReceivedObject::Packed(directory)) if !self.materializing => {
+                    self.import_packed_object(oid, directory.path())
                 }
-                return Ok(());
+                Some(ReceivedObject::Packed(_)) => Ok(()),
+                None => self.fetch(repo, &[oid]),
             }
-            self.fetch(repo, &[oid])
         })();
         self.record_result(outcome)
     }
@@ -604,11 +615,7 @@ impl Remote {
         let mut unique = HashSet::new();
         let mut missing = Vec::new();
         for oid in oids {
-            if unique.insert(*oid)
-                && !self.has_packed_object(*oid)
-                && self.raw_blobs.get(*oid)?.is_none()
-                && !odb.exists(*oid)
-            {
+            if unique.insert(*oid) && !self.raw_blobs.available(*oid) && !odb.exists(*oid) {
                 missing.push(*oid);
             }
         }
@@ -684,7 +691,6 @@ impl Remote {
             first,
             connection,
             &self.raw_blobs,
-            &self.git,
         )?);
         Ok(())
     }
@@ -716,7 +722,7 @@ impl Remote {
             return Ok(None);
         };
         let Some((pool, selected)) =
-            crate::demand::Pool::http2(configuration, branch, &self.raw_blobs, &self.git)?
+            crate::demand::Pool::http2(configuration, branch, &self.raw_blobs)?
         else {
             return Ok(None);
         };
@@ -743,16 +749,22 @@ impl Remote {
                 // An already received delta base can become known between
                 // the snapshot's first cache lookup and queue admission.
                 for &oid in &batch.oids {
-                    if self.raw_blobs.get(oid)?.is_none() && self.has_packed_object(oid) {
-                        self.import_packed_object(oid)?;
+                    if self.raw_blobs.get(oid)?.is_some() {
+                        continue;
+                    }
+                    match self.raw_blobs.received(oid) {
+                        Some(ReceivedObject::Verified(object)) => {
+                            self.publish_verified(repo, object)?;
+                        }
+                        Some(ReceivedObject::Packed(directory)) => {
+                            self.import_packed_object(oid, directory.path())?;
+                        }
+                        None => (),
                     }
                 }
                 Ok(())
             }
             crate::demand::Acquired::Object(object) => self.publish_verified(repo, object),
-            crate::demand::Acquired::Pack(pack) => {
-                self.publish_session_pack(repo, &batch.oids, pack)
-            }
         });
         self.demand_pool.as_ref().unwrap().retire(&batch.oids);
         self.record_result(outcome)
@@ -837,14 +849,11 @@ impl Remote {
         if self.materializing {
             self.stage_materialization()?;
         } else {
-            self.import_received(true, oids)?;
+            self.import_received(oids)?;
         }
         let odb = repo.odb()?;
         for oid in oids {
-            if !self.has_packed_object(*oid)
-                && self.raw_blobs.get(*oid)?.is_none()
-                && !odb.exists(*oid)
-            {
+            if !self.raw_blobs.available(*oid) && !odb.exists(*oid) {
                 bail!("filtered remote fetch did not supply requested object {oid}");
             }
         }
@@ -1012,6 +1021,8 @@ impl Remote {
                 let mut candidates = (0..=SSH_STANDBY_CHANNELS)
                     .filter_map(|_| connection.start_additional().ok())
                     .collect::<Vec<_>>();
+                let started = Instant::now();
+                let mut tried_replacement = false;
                 while !candidates.is_empty() {
                     if let Some(index) =
                         transport::StartingSession::wait_for_advertisement(&candidates)?
@@ -1024,6 +1035,18 @@ impl Remote {
                                 .ok()
                                 .flatten()
                                 .map(|(session, oid)| (connection, candidates, session, oid)));
+                        }
+                    } else if !tried_replacement
+                        && advertisement.is_finished()
+                        && started.elapsed() >= SSH_STANDBY_DELAY
+                    {
+                        // A v2 spare can reach the server ahead of the initial
+                        // advertisement and consume its only spare slot. The
+                        // initial channel has since closed, so retry once on
+                        // that slot without waiting for the stalled spare.
+                        tried_replacement = true;
+                        if let Ok(candidate) = connection.start_additional() {
+                            candidates.push(candidate);
                         }
                     }
                 }
@@ -1105,12 +1128,8 @@ impl Remote {
                     }
                 }
             }
-            let mut pool = crate::demand::Pool::prepare_native(
-                &connection,
-                &self.raw_blobs,
-                &self.git,
-                candidates,
-            )?;
+            let mut pool =
+                crate::demand::Pool::prepare_native(&connection, &self.raw_blobs, candidates)?;
             let primary = self
                 .session
                 .take()
@@ -1252,7 +1271,7 @@ impl Remote {
         // Decode directly from the reusable channel. Hold the object locally
         // until the reply is complete, including the pack's own checksum.
         let mut object = None;
-        let mut response = crate::pack_stream::Response::new(
+        let response = crate::pack_stream::Response::new(
             self.raw_blobs.clone(),
             vec![oid],
             Box::new(|received| {
@@ -1260,8 +1279,7 @@ impl Remote {
                 Ok(())
             }),
         );
-        response.use_native_for_multi_object_packs();
-        let received = match session.fetch_stream(&[oid], response) {
+        let mut received = match session.fetch_stream(&[oid], response) {
             Ok(received) => received,
             Err(error) => {
                 self.session = None;
@@ -1272,47 +1290,19 @@ impl Remote {
         self.session_received_pack_bytes = self
             .session_received_pack_bytes
             .saturating_add(received.bytes);
-        if let Some(pack) = received.fallback {
-            self.publish_session_pack(repo, &[oid], pack)?;
-        } else {
-            let object = object.context("stream did not publish requested Git object")?;
-            self.publish_verified(repo, object)?;
-            self.session_decode_operations += 1;
-            self.completed_fetches += 1;
-        }
+        let object = object.context("stream did not publish requested Git object")?;
+        self.publish_verified(repo, object)?;
+        received.cache_extras(&self.raw_blobs, |_| {});
+        self.session_decode_operations += 1;
+        self.completed_fetches += 1;
         Ok(true)
-    }
-    fn publish_session_pack(
-        &mut self,
-        repo: &Repository,
-        oids: &[Oid],
-        pack: crate::spool::Spool,
-    ) -> Result<()> {
-        // Deltas and unrequested pack entries still use the native decoder.
-        let target = Repository::open_bare(&self.dir)?;
-        let odb = target.odb()?;
-        crate::pack_stream::index(&odb, &pack)?;
-        drop(odb);
-        drop(target);
-        // Native storage now owns the compressed bytes. Release wire staging
-        // before allocating decoded payloads.
-        drop(pack);
-        self.import_received(false, oids)?;
-        for &oid in oids {
-            anyhow::ensure!(
-                self.raw_blobs.get(oid)?.is_some() || repo.odb()?.exists(oid),
-                "remote did not supply requested object {oid}"
-            );
-        }
-        self.completed_fetches += oids.len() as u64;
-        Ok(())
     }
     /// Native filtered fetches always retain promisor packs. Keeping one pack
     /// per demand makes later Git/libgit2 pack discovery grow with all previous
     /// demands. Decode only new received objects directly into raw run storage,
     /// then release their files/indexes before the next operation. The private
     /// repository has one serialized writer and no auto-maintenance.
-    fn take_received(&mut self, count_transfer: bool) -> Result<Option<ReceivedPack>> {
+    fn take_received(&mut self) -> Result<Option<ReceivedPack>> {
         let pack_directory = self.dir.join("objects/pack");
         let mut received = Vec::new();
         for entry in fs::read_dir(&pack_directory)? {
@@ -1347,10 +1337,9 @@ impl Remote {
         // demands. Companion indexes, including optional .rev, move together.
         for (name, path) in &received {
             crate::object::check_transfer()?;
-            if count_transfer
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "pack")
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pack")
             {
                 self.native_received_pack_bytes = self
                     .native_received_pack_bytes
@@ -1364,7 +1353,7 @@ impl Remote {
         }))
     }
     fn stage_materialization(&mut self) -> Result<()> {
-        let Some(received) = self.take_received(true)? else {
+        let Some(received) = self.take_received()? else {
             return Ok(());
         };
         let destination = Repository::open_bare(&self.dir)?;
@@ -1395,8 +1384,8 @@ impl Remote {
         iteration?;
         Ok(())
     }
-    fn import_received(&mut self, count_transfer: bool, wanted: &[Oid]) -> Result<()> {
-        let Some(received) = self.take_received(count_transfer)? else {
+    fn import_received(&mut self, wanted: &[Oid]) -> Result<()> {
+        let Some(received) = self.take_received()? else {
             return Ok(());
         };
         let destination = Repository::open_bare(&self.dir)?;
@@ -1441,27 +1430,15 @@ impl Remote {
         drop(destination);
         self.decode_received(received.directory.path(), &mut requests.as_slice())
     }
-    fn import_packed_object(&mut self, oid: Oid) -> Result<()> {
-        let Some(directory) = self.raw_blobs.packed_directory(oid) else {
-            // A transfer can publish the raw blob after the cache lookup.
-            anyhow::ensure!(
-                self.raw_blobs.get(oid)?.is_some(),
-                "missing received object {oid}"
-            );
-            return Ok(());
-        };
+    fn import_packed_object(&mut self, oid: Oid, directory: &Path) -> Result<()> {
         let request = format!("{oid}\n");
-        self.decode_received(directory.path(), &mut request.as_bytes())?;
+        self.decode_received(directory, &mut request.as_bytes())?;
         anyhow::ensure!(
             self.raw_blobs.get(oid)?.is_some()
                 || Repository::open_bare(&self.dir)?.odb()?.exists(oid),
             "received pack omitted requested object {oid}"
         );
         Ok(())
-    }
-    #[cfg(feature = "test-metrics")]
-    pub(crate) fn packed_object_oids(&self) -> impl Iterator<Item = Oid> + '_ {
-        self.raw_blobs.packed_oids().into_iter()
     }
     fn decode_received(&mut self, directory: &Path, requests: &mut dyn Read) -> Result<()> {
         let destination = Repository::open_bare(&self.dir)?;
@@ -1502,7 +1479,7 @@ impl Remote {
         }
         if kind == git2::ObjectType::Tree {
             self.raw_blobs.insert_verified_tree(&object)?;
-            if self.root_pinned {
+            if self.raw_blobs.root_is_pinned() {
                 return Ok(());
             }
         }
@@ -1511,7 +1488,7 @@ impl Remote {
         let mut writer = odb.writer(object.data().len(), kind)?;
         crate::object::write_verified_buffer(object.data(), &mut writer)?;
         anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
-        self.raw_blobs.forget_packed(oid);
+        self.raw_blobs.forget_received(oid);
         Ok(())
     }
     fn publish_received(
@@ -1524,7 +1501,7 @@ impl Remote {
     ) -> Result<()> {
         if kind == git2::ObjectType::Blob {
             self.raw_blobs.insert_fetched(oid, size, input, None)?;
-        } else if kind == git2::ObjectType::Tree && self.root_pinned {
+        } else if kind == git2::ObjectType::Tree && self.raw_blobs.root_is_pinned() {
             self.raw_blobs.insert_tree(oid, size, input)?;
         } else {
             // Native verification needs the selected commit or tag. Git also
@@ -1544,7 +1521,7 @@ impl Remote {
                 crate::object::copy_verified(input, &mut writer, kind, size, oid)?;
             }
             anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
-            self.raw_blobs.forget_packed(oid);
+            self.raw_blobs.forget_received(oid);
         }
         Ok(())
     }

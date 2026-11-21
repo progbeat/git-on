@@ -20,9 +20,9 @@ regressions and test minimality. Findings restart this cycle. Deliver a
 ready-to-merge PR; do not merge it without an explicit request.
 
 Apply the [resource assumptions](docs/specification.md#resource-assumptions)
-in reviews. Failures specific to a finite `RLIMIT_FSIZE` are outside
-acceptance. Fault injection can exercise general I/O contracts that apply
-to supported workloads.
+in reviews. Workloads that exceed available RAM or require adapting to
+an inherited process limit are outside acceptance. Fault injection can
+exercise general I/O contracts that apply to supported workloads.
 
 docs/interview.md records the author's intent; keep the implementation consistent
 with it. Read the project documentation and interview before asking questions.

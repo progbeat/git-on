@@ -68,8 +68,7 @@ terminal.
 SSH reuses only the existing identity-checked owned master. Explicit protocol v0/v1,
 custom server/vcs/server-option settings, explicit fsck policy, or a custom
 `GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
-helper path supports reuse. The decoder reuses the bytes already received when
-a pack requires the fallback decoder.
+helper path supports reuse.
 
 On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
@@ -136,12 +135,18 @@ The HTTPS and SSH receivers share the same incremental Git framing and pack
 decoder. It inflates ordinary entries in memory and verifies the canonical Git
 OID against the requested OIDs before notifying a waiting read. It can publish
 a verified object while the rest of its pack is still arriving. The receiver
-also verifies the complete pack's checksum and framing. Large compressed packs
-can spill to bounded staging while ordinary entries continue to decode. Delta
-entries use the native pack decoder. HTTPS decodes response bodies off the
-connection driver, with per-stream backpressure. Blob payloads enter the same
-authenticated, run-local store. Unrequested objects in a verified pack remain
-available in compressed form for later demands.
+also verifies the complete pack's checksum and framing. The receiver
+applies deltas to verified bases in memory from the first fetch, including
+when preparing the selected revision. If a delta precedes its base, the receiver
+keeps its decoded instructions until the base arrives.
+HTTPS decodes response bodies off the connection driver, with per-stream
+backpressure. Requested blobs enter the authenticated, run-local store.
+Delta reconstruction borrows verified bases from the active pack. Extra
+objects retain those buffers for later access and become readable after the
+pack is verified. A demand for a known entry can wait for validation without
+another fetch. Eager materialization writes a verified extra directly into
+its destination.
+The native Git compatibility path can use temporary pack files.
 
 Explicit-all eager materialization needs the entire selected tree. Fetch the
 selected revision once with depth one and without an object filter. Retain the
@@ -218,13 +223,6 @@ and blobs. Git-on does not read, modify, migrate or delete historical
 object cache; native Git's normal configuration and authentication environment
 still applies. No daemon or background cache service is started.
 
-Reusable HTTPS and SSH sessions decode full non-delta objects as the pack
-arrives. Each blob becomes readable after verification of its canonical Git OID.
-The pack trailer is checked independently. Compressed packs use bounded private
-parts when staging is needed. Delta and other complex packs use the native
-Git/libgit2 path without another network request. Unrequested delta bases stay
-compressed until demanded.
-
 Prepared blobs remain reusable across close/reopen and eviction. Native decoder
 stdout feeds OID verification into a private RAM buffer. A failed consumer
 stops and reaps the decoder, and an unsuccessful native exit fails the import.
@@ -238,13 +236,10 @@ checks. The store retains one last-read descriptor independent of object count
 or open child handles. Compressed staging, retained raw files and active reader
 buffers are accounted separately and released with the invocation.
 
-Retained libgit2 pack descriptors are capped before threads start: at most 32,
-and at most a quarter of the effective soft `RLIMIT_NOFILE` (minimum one pack
-window). This leaves descriptors for native Git startup, the mount and active
-files; it does not raise OS limits or reserve a quota for the child. Active
-operations can still encounter ordinary OS limits, reported before launch or
-through the lazy operation and runner failure as applicable. No failure reruns
-a started child or silently changes write policy.
+Libgit2's pack descriptor cache retains up to 32 descriptors. Operating system
+errors propagate before launch or through the lazy operation and runner
+failure as applicable. No failure reruns a started child or silently changes
+write policy.
 
 Active temporary objects and normal ignored writes have no runner disk quota;
 ordinary system disk limits apply. The block cache budget includes entry
