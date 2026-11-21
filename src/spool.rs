@@ -11,15 +11,18 @@ use std::{
 
 #[cfg(test)]
 std::thread_local! {
-    pub(crate) static NEXT_METADATA_ERROR: std::cell::Cell<Option<i32>> = const {
+    pub(crate) static METADATA_ERROR: std::cell::Cell<Option<(usize, i32)>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 pub(crate) fn private_file_metadata(file: &File) -> io::Result<Metadata> {
     #[cfg(test)]
-    if let Some(error) = NEXT_METADATA_ERROR.take() {
-        return Err(io::Error::from_raw_os_error(error));
+    if let Some((checks_before_error, error)) = METADATA_ERROR.take() {
+        if checks_before_error == 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        METADATA_ERROR.set(Some((checks_before_error - 1, error)));
     }
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }

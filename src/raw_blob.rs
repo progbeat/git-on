@@ -9,7 +9,7 @@ use git2::{ObjectType, Oid};
 use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
-    fs::{File, Metadata},
+    fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
@@ -316,11 +316,11 @@ impl RawBlob {
         // A writer can change any byte in the private copy, including retained
         // bytes. Keep block authentication on immutable reads so copy-up can
         // clone the source without reading its contents.
-        let (mut output, cloned) = open_copy(&parent, &name, input.as_deref())?;
+        let (mut output, cloned_size) = open_copy(&parent, &name, input.as_deref())?;
         let copied = (|| -> Result<()> {
             if let Some(input) = input {
-                if cloned {
-                    RawDirectory::validate_size(&private_file_metadata(&output)?, Some(self.size))?;
+                if let Some(size) = cloned_size {
+                    RawDirectory::validate_size(size, self.size)?;
                     if retain < self.size {
                         output.set_len(retain).map_err(BackingError)?;
                     }
@@ -352,7 +352,7 @@ impl RawBlob {
             return Err(discard_copy(&parent, &name, error));
         }
         #[cfg(test)]
-        if cloned {
+        if cloned_size.is_some() {
             store.cloned_copies += 1;
         }
         Ok(output)
@@ -445,14 +445,15 @@ fn remove_private(parent: &File, name: &CStr) -> io::Result<()> {
     Ok(())
 }
 
-fn open_copy(parent: &File, name: &CStr, source: Option<&File>) -> Result<(File, bool)> {
+// Include the checked length when a clone replaces the ordinary copy.
+fn open_copy(parent: &File, name: &CStr, source: Option<&File>) -> Result<(File, Option<u64>)> {
     #[cfg(target_os = "macos")]
     if let Some(source) = source {
         if unsafe { libc::fclonefileat(source.as_raw_fd(), parent.as_raw_fd(), name.as_ptr(), 0) }
             == 0
         {
             return match open_private_file(parent, name, libc::O_RDWR) {
-                Ok((file, _)) => Ok((file, true)),
+                Ok((file, metadata)) => Ok((file, Some(metadata.len()))),
                 Err(error) => Err(discard_copy(parent, name, BackingError(error).into())),
             };
         }
@@ -464,17 +465,21 @@ fn open_copy(parent: &File, name: &CStr, source: Option<&File>) -> Result<(File,
         libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | COPY_UP_OPEN_FLAGS,
     )
     .map_err(BackingError)?;
-    if let Err(error) = private_file_metadata(&file) {
-        drop(file);
-        return Err(discard_copy(parent, name, BackingError(error).into()));
-    }
     #[cfg(target_os = "linux")]
-    if let Some(source) = source {
-        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
-            return Ok((file, true));
+    let cloned = source.is_some_and(|source| {
+        // The exclusive open created this file. Check its metadata after
+        // FICLONE so the same lookup can also see the cloned length.
+        unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) == 0 }
+    });
+    #[cfg(not(target_os = "linux"))]
+    let cloned = false;
+    match private_file_metadata(&file) {
+        Ok(metadata) => Ok((file, cloned.then_some(metadata.len()))),
+        Err(error) => {
+            drop(file);
+            Err(discard_copy(parent, name, BackingError(error).into()))
         }
     }
-    Ok((file, false))
 }
 
 /// A descriptor for the owned directory anchors operations even after a path
@@ -513,13 +518,8 @@ impl RawDirectory {
             spill_error: None,
         })
     }
-    fn validate_size(metadata: &Metadata, size: Option<u64>) -> Result<()> {
-        if let Some(size) = size {
-            anyhow::ensure!(
-                metadata.len() == size,
-                "verified raw blob length was modified"
-            );
-        }
+    fn validate_size(length: u64, expected: u64) -> Result<()> {
+        anyhow::ensure!(length == expected, "verified raw blob length was modified");
         Ok(())
     }
     fn open(&self, oid: Oid, write: bool, size: u64) -> Result<File> {
@@ -535,7 +535,7 @@ impl RawDirectory {
             },
         )
         .context("open private raw object")?;
-        Self::validate_size(&metadata, Some(size))?;
+        Self::validate_size(metadata.len(), size)?;
         Ok(file)
     }
     fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<File>> {
@@ -543,7 +543,7 @@ impl RawDirectory {
             if *cached == oid {
                 let metadata =
                     private_file_metadata(file).context("validate private raw object")?;
-                Self::validate_size(&metadata, Some(size))?;
+                Self::validate_size(metadata.len(), size)?;
                 return Ok(file.clone());
             }
         }
@@ -1709,10 +1709,26 @@ mod tests {
             .unwrap();
         let source_inode = source.metadata().unwrap().ino();
         let parent = File::open(directory.path()).unwrap();
-        let (_, supports_clone) = open_copy(&parent, c"probe", Some(&source)).unwrap();
-        let first = original
-            .copy_up(&directory.path().join("first"), original.len())
-            .unwrap();
+        let (_, cloned_size) = open_copy(&parent, c"probe", Some(&source)).unwrap();
+        let supports_clone = cloned_size.is_some();
+        let first_path = directory.path().join("first");
+        if supports_clone {
+            crate::spool::METADATA_ERROR.set(Some((1, libc::EIO)));
+            let error = original.copy_up(&first_path, original.len()).unwrap_err();
+            assert!(error.downcast_ref::<BackingError>().is_some());
+            assert_eq!(store.failure(), None);
+            assert!(!first_path.exists());
+
+            // Fail a third metadata lookup. The source and destination
+            // have already been checked when the clone can be served.
+            crate::spool::METADATA_ERROR.set(Some((2, libc::EIO)));
+        }
+        let first = original.copy_up(&first_path, original.len());
+        let remaining_fault = crate::spool::METADATA_ERROR.take();
+        let first = first.unwrap();
+        if supports_clone {
+            assert_eq!(remaining_fault, Some((0, libc::EIO)));
+        }
         first.write_all_at(b"y", 0).unwrap();
         let retained = data.len() - 1;
         let second = original
@@ -2376,7 +2392,7 @@ mod tests {
         let raw = RawDirectory::new(directory.path()).unwrap();
         let bytes = b"verified bytes";
         let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
-        crate::spool::NEXT_METADATA_ERROR.set(Some(libc::EIO));
+        crate::spool::METADATA_ERROR.set(Some((0, libc::EIO)));
         let error = raw.spill(oid, bytes).unwrap_err();
         assert_eq!(
             error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
@@ -2393,7 +2409,7 @@ mod tests {
     fn copy_can_retry_after_validation_of_the_new_file_fails() {
         let directory = tempfile::tempdir().unwrap();
         let parent = File::open(directory.path()).unwrap();
-        crate::spool::NEXT_METADATA_ERROR.set(Some(libc::EIO));
+        crate::spool::METADATA_ERROR.set(Some((0, libc::EIO)));
         let error = open_copy(&parent, c"copy", None).unwrap_err();
         assert_eq!(
             error
