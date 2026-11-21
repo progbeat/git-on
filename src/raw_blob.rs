@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fs::{File, Metadata},
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
         unix::{
@@ -327,19 +327,7 @@ impl RawBlob {
                 } else {
                     // Raw reads are positional. The store serializes copy-up
                     // while the filesystem copies from this descriptor.
-                    let mut source = &*input;
-                    source.rewind()?;
-                    let mut remaining = retain;
-                    while remaining != 0 {
-                        crate::object::check_transfer()?;
-                        let limit = remaining.min(COPY_BUFFER as u64);
-                        let count =
-                            io::copy(&mut source.take(limit), &mut output).map_err(BackingError)?;
-                        if count != limit {
-                            return Err(invalid("verified raw blob length was modified"));
-                        }
-                        remaining -= count;
-                    }
+                    copy_spilled(&input, &mut output, retain)?;
                 }
             } else if retain != 0 {
                 let bytes = match store.hot_payload(self.oid) {
@@ -378,6 +366,49 @@ impl RawBlob {
             .write_all_at(b"!", 0)?;
         Ok(())
     }
+}
+
+fn copy_spilled(mut source: &File, output: &mut File, retain: u64) -> Result<()> {
+    source.rewind()?;
+    let mut remaining = retain;
+    while remaining != 0 {
+        crate::object::check_transfer()?;
+        let limit = remaining.min(COPY_BUFFER as u64);
+        let count = match io::copy(&mut source.take(limit), output) {
+            Ok(count) => count,
+            Err(_) => {
+                // The fast copy reports one error for both descriptors.
+                // Restart from the failed chunk to identify its source.
+                return copy_spilled_from(source, output, retain - remaining, retain);
+            }
+        };
+        if count != limit {
+            return Err(invalid("verified raw blob length was modified"));
+        }
+        remaining -= count;
+    }
+    Ok(())
+}
+
+fn copy_spilled_from(source: &File, output: &mut File, mut offset: u64, retain: u64) -> Result<()> {
+    crate::object::check_transfer()?;
+    output.seek(SeekFrom::Start(offset)).map_err(BackingError)?;
+    let mut bytes = vec![0; (retain - offset).min(COPY_BUFFER as u64) as usize];
+    while offset < retain {
+        crate::object::check_transfer()?;
+        let count = (retain - offset).min(bytes.len() as u64) as usize;
+        let chunk = &mut bytes[..count];
+        match source.read_exact_at(chunk, offset) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(invalid("verified raw blob length was modified"));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        output.write_all(chunk).map_err(BackingError)?;
+        offset += count as u64;
+    }
+    Ok(())
 }
 
 fn read_checked_block(
@@ -1618,6 +1649,33 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn a_spilled_copy_distinguishes_source_and_destination_io_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("source");
+        let destination_path = root.path().join("destination");
+        let mut write_only = File::create(&source_path).unwrap();
+        write_only.write_all(b"source").unwrap();
+        let mut destination = File::create(&destination_path).unwrap();
+        let error = copy_spilled(&write_only, &mut destination, 6).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let source = File::open(source_path).unwrap();
+        let mut read_only = File::open(destination_path).unwrap();
+        let error = copy_spilled(&source, &mut read_only, 6).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BackingError>()
+                .unwrap()
+                .0
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
     #[test]
     fn copy_up_keeps_spilled_source_and_private_aliases() {
         use std::os::unix::fs::MetadataExt;
