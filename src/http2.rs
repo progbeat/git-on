@@ -29,14 +29,19 @@ use std::{
 const ADVERTISEMENT: &[u8] = b"application/x-git-upload-pack-advertisement";
 const PACK_RESULT: &[u8] = b"application/x-git-upload-pack-result";
 
+type CredentialProvider = Box<dyn FnOnce(&str) -> Result<Option<Credentials>> + Send>;
+
 pub(crate) struct Configuration {
     base: String,
     ca: Option<PathBuf>,
-    credential: Command,
+    credential: CredentialProvider,
 }
 
 impl Configuration {
-    pub(crate) fn new(url: &OsStr, credential: Command) -> Option<Self> {
+    pub(crate) fn new(
+        url: &OsStr,
+        credential: impl FnOnce(&str) -> Result<Option<Credentials>> + Send + 'static,
+    ) -> Option<Self> {
         let url = url.to_str()?;
         let parsed = url::Url::parse(url).ok()?;
         let version = curl::Version::get();
@@ -54,17 +59,17 @@ impl Configuration {
         Some(Self {
             base: url.trim_end_matches('/').to_owned(),
             ca: std::env::var_os("GIT_SSL_CAINFO").map(PathBuf::from),
-            credential,
+            credential: Box::new(credential),
         })
     }
 }
 
-struct Credentials {
+pub(crate) struct Credentials {
     user: String,
     password: String,
 }
 
-fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
+pub(crate) fn credentials(mut command: Command, url: &str) -> Result<Option<Credentials>> {
     command
         .args(["-c", "credential.interactive=false", "credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -457,12 +462,12 @@ impl Client {
         &mut self,
         service: &str,
         request: Option<Vec<u8>>,
-        credential: &mut Option<Command>,
+        credential: &mut Option<CredentialProvider>,
     ) -> Result<Easy2<Response>> {
         let response = self.metadata(service, request.clone())?;
         if response.response_code()? == 401 && response.get_ref().h2 && response.get_ref().basic {
-            if let Some(command) = credential.take() {
-                self.auth = credentials(command, &self.base)?;
+            if let Some(fetch) = credential.take() {
+                self.auth = fetch(&self.base)?;
                 if self.auth.is_some() {
                     return self.metadata(service, request);
                 }

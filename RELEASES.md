@@ -9,6 +9,9 @@
 - Decode full objects and deltas from reusable HTTPS and SSH sessions in
   memory from the first fetch. Stream native decoder requests and borrow cached
   blob ranges when serving reads.
+- Keep direct reusable HTTPS and SSH startup metadata in verified in-memory
+  buffers. Native fetches and signature verification use a temporary Git
+  repository.
 - Use larger fetch batches when reads confirm a scan, including on fast
   HTTPS and SSH connections.
 - Leave inherited process resource limits to the host. Git-on assumes the

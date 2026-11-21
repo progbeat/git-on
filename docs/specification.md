@@ -56,9 +56,12 @@ is part of this bug fix; it does not require a major version increment.
   `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
   including abbreviations, ancestry, reflogs and `HEAD:path`. Native Git is
   required for local resolution as well as remote operations.
-- With two operands, pass the exact repository and revision/refspec arguments
-  to native `git fetch` in a private temporary Git repository. Git resolves
-  configured remotes, URLs, local paths, ref names, refspecs and their precedence.
+- With two operands, native Git resolves configured remotes, URLs and local
+  paths. The [reusable transport](remote.md#object-demand-and-cache-lifetime)
+  can select an unambiguous branch or full object ID. The compatibility path
+  passes the exact repository and revision/refspec arguments to native
+  `git fetch` in a private temporary Git repository for ref selection and
+  precedence.
   A colon in this second operand is fetch syntax; git-on must not reinterpret
   it as a remote subtree selector or strip a `+` prefix.
 - Do not implement an additional repository/revision grammar, reject operands

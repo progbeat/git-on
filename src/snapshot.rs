@@ -350,7 +350,7 @@ impl BlobReader {
 }
 
 struct State {
-    repo: Repository,
+    local_repo: Option<Repository>,
     remote: Option<crate::remote::Remote>,
     selected_oid: Oid,
     headers: HashMap<Oid, u64>,
@@ -363,9 +363,46 @@ struct State {
     _local_object_bridge: Option<tempfile::TempDir>,
 }
 impl State {
+    fn repository(&self) -> Option<&Repository> {
+        self.local_repo.as_ref().or_else(|| {
+            self.remote
+                .as_ref()
+                .and_then(|remote| remote.native_repository())
+        })
+    }
+    fn object_kind(&self, oid: Oid) -> Result<ObjectType> {
+        if let Some(remote) = &self.remote {
+            if let Some(raw) = remote.raw_blobs.get(oid)? {
+                return Ok(raw.kind());
+            }
+            if let Some(crate::raw_blob::ReceivedObject::Verified(object)) =
+                remote.raw_blobs.received(oid)
+            {
+                return Ok(object.kind());
+            }
+        }
+        let repo = self.repository().context("missing verified Git object")?;
+        Ok(repo.odb()?.read_header(oid)?.1)
+    }
+    fn selected_child(&self, oid: Oid, kind: ObjectType) -> Result<Oid> {
+        if let Some(repo) = self.repository() {
+            return match kind {
+                ObjectType::Commit => Ok(repo.find_commit(oid)?.tree_id()),
+                ObjectType::Tag => Ok(repo.find_tag(oid)?.target_id()),
+                _ => bail!("revision does not resolve to a tree"),
+            };
+        }
+        let remote = self.remote.as_ref().expect("in-memory remote snapshot");
+        let Some(crate::raw_blob::ReceivedObject::Verified(object)) =
+            remote.raw_blobs.received(oid)
+        else {
+            bail!("missing verified Git metadata {oid}");
+        };
+        crate::object::selected_child(kind, object.data())
+    }
     fn ensure(&mut self, oid: Oid) -> Result<()> {
         if let Some(remote) = &mut self.remote {
-            remote.ensure_in(&self.repo, oid)?;
+            remote.ensure(oid)?;
         }
         Ok(())
     }
@@ -392,29 +429,30 @@ impl State {
         if self.remote.is_none() && self.raw_blobs.is_none() {
             self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
         }
-        let odb = self.repo.odb()?;
-        let storage = if let Some(remote) = &mut self.remote {
-            &mut remote.raw_blobs
-        } else {
-            self.raw_blobs.as_mut().unwrap()
+        let (tree, first) = {
+            let odb = self
+                .repository()
+                .context("missing verified directory")?
+                .odb()?;
+            let storage = self.raw_store().expect("directory cache");
+            if let Ok((reader, size, kind)) = odb.reader(oid) {
+                anyhow::ensure!(
+                    kind == ObjectType::Tree,
+                    "snapshot directory does not reference a tree"
+                );
+                storage.insert_tree(oid, size, reader)?;
+            } else {
+                let object = odb.read(oid).context("decode snapshot tree")?;
+                anyhow::ensure!(
+                    object.kind() == ObjectType::Tree,
+                    "snapshot directory does not reference a tree"
+                );
+                storage.insert_tree(oid, object.len(), object.data())?;
+            }
+            storage
+                .directory(oid)
+                .context("verified directory missing")?
         };
-        if let Ok((reader, size, kind)) = odb.reader(oid) {
-            anyhow::ensure!(
-                kind == ObjectType::Tree,
-                "snapshot directory does not reference a tree"
-            );
-            storage.insert_tree(oid, size, reader)?;
-        } else {
-            let object = odb.read(oid).context("decode snapshot tree")?;
-            anyhow::ensure!(
-                object.kind() == ObjectType::Tree,
-                "snapshot directory does not reference a tree"
-            );
-            storage.insert_tree(oid, object.len(), object.data())?;
-        }
-        let (tree, first) = storage
-            .directory(oid)
-            .context("verified directory missing")?;
         self.metrics.tree_reads += u64::from(first);
         Ok(tree)
     }
@@ -447,7 +485,8 @@ impl State {
             return Ok(size);
         }
         let (size, kind) = self
-            .repo
+            .repository()
+            .context("missing verified Git blob")?
             .odb()?
             .read_header(oid)
             .context("read blob header")?;
@@ -485,7 +524,7 @@ impl State {
     /// Only callers retaining a BlobReader need active-reader registration.
     fn prepare_blob(&mut self, oid: Oid) -> Result<crate::raw_blob::RawBlob> {
         let raw = if let Some(remote) = &mut self.remote {
-            remote.ensure_in(&self.repo, oid)?;
+            remote.ensure(oid)?;
             let (raw, first) = remote
                 .raw_blobs
                 .for_read(oid)?
@@ -507,7 +546,8 @@ impl State {
             self.metrics.cache_hits += 1;
             raw
         } else {
-            let (size, kind) = self.repo.odb()?.read_header(oid)?;
+            let repo = self.local_repo.as_ref().unwrap();
+            let (size, kind) = repo.odb()?.read_header(oid)?;
             anyhow::ensure!(
                 kind == ObjectType::Blob,
                 "snapshot file does not reference a blob"
@@ -516,7 +556,7 @@ impl State {
                 self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
             }
             let raw = self.raw_blobs.as_mut().unwrap();
-            let odb = self.repo.odb()?;
+            let odb = repo.odb()?;
             let (blob, streamed) = if let Ok((reader, length, kind)) = odb.reader(oid) {
                 anyhow::ensure!(
                     kind == ObjectType::Blob && length == size,
@@ -583,11 +623,10 @@ impl PendingObject {
     pub(crate) fn finish(self) {
         let batch = self.demand.wait();
         if let Ok(mut state) = self.snapshot.state() {
-            let State { repo, remote, .. } = &mut *state;
-            if let Some(remote) = remote {
+            if let Some(remote) = &mut state.remote {
                 // The normal filesystem operation returns its usual error
                 // and the snapshot retains any transport/import failure.
-                let _ = remote.finish_demand(repo, &batch);
+                let _ = remote.finish_demand(&batch);
             }
         }
     }
@@ -624,8 +663,8 @@ impl Snapshot {
             |_, _, _| Ok(()),
         )
     }
-    /// Record a private remote pin before creating it so cleanup can recover it.
-    /// A local snapshot retains its tree OID in memory and reads the source as is.
+    /// Record a private Git pin before creating it so cleanup can recover it.
+    /// An in-memory snapshot keeps only its selected tree OID.
     #[allow(clippy::too_many_arguments)]
     pub fn load_source_with_pin_record<F>(
         repo_path: &Path,
@@ -640,21 +679,16 @@ impl Snapshot {
     where
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
-        let (repo, mut remote, oid, git, local_bridge) = if let Some(source) = source {
+        let (local_repo, remote, oid, git, local_bridge) = if let Some(source) = source {
             let (remote, oid) = crate::remote::Remote::open_for_execution(
                 repo_path,
                 source,
                 treeish,
                 run_directory,
                 materialized,
+                verify,
             )?;
-            (
-                Repository::open_bare(&remote.dir)?,
-                Some(remote),
-                oid,
-                None,
-                None,
-            )
+            (None, Some(remote), oid, None, None)
         } else {
             let git = crate::git::Git::capture(repo_path)?;
             let oid = git.resolve(treeish)?;
@@ -667,52 +701,56 @@ impl Snapshot {
             )
             .context("open selected Git repository and object environment")?;
             let bridge = configure_local_object_database(&git, &repo, run_directory)?;
-            (repo, None, oid, Some(git), bridge)
+            (Some(repo), None, oid, Some(git), bridge)
         };
-        let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {
-            if let Some(remote) = remote {
-                remote.ensure_in(&repo, oid)?;
-            }
-            Ok(())
-        };
-        let kind = |remote: &Option<crate::remote::Remote>, oid| -> Result<ObjectType> {
-            if let Some(raw) = remote
-                .as_ref()
-                .map(|remote| remote.raw_blobs.get(oid))
-                .transpose()?
-                .flatten()
-            {
-                return Ok(raw.kind());
-            }
-            Ok(repo.odb()?.read_header(oid)?.1)
+        let mut state = State {
+            local_repo,
+            remote,
+            selected_oid: oid,
+            headers: HashMap::new(),
+            readers: Arc::new(Mutex::new(HashMap::new())),
+            raw_blobs: None,
+            metrics: SnapshotMetrics::default(),
+            #[cfg(test)]
+            ancestor_tree_lookups: 0,
+            spool_directory: run_directory.to_path_buf(),
+            _local_object_bridge: local_bridge,
         };
         if verify {
-            let git = remote.as_ref().map(|r| &r.git).or(git.as_ref()).unwrap();
-            git.verify(repo.path(), oid, kind(&remote, oid)?)?;
+            let git = state
+                .remote
+                .as_ref()
+                .map(|r| r.git.as_ref())
+                .or(git.as_ref())
+                .unwrap();
+            let repo = state
+                .repository()
+                .context("native Git verification repository missing")?;
+            git.verify(repo.path(), oid, state.object_kind(oid)?)?;
         }
         let mut selected = oid;
         let tree_oid = loop {
-            ensure(&mut remote, selected)?;
-            match kind(&remote, selected)? {
+            state.ensure(selected)?;
+            match state.object_kind(selected)? {
                 ObjectType::Tree => break selected,
                 ObjectType::Commit => {
-                    let tree = repo.find_commit(selected)?.tree_id();
-                    if remote.is_none() {
-                        anyhow::ensure!(
-                            repo.odb()?.read_header(tree)?.1 == ObjectType::Tree,
-                            "snapshot root is not a Git tree"
-                        );
-                    }
+                    let tree = state.selected_child(selected, ObjectType::Commit)?;
+                    state.ensure(tree)?;
+                    anyhow::ensure!(
+                        state.object_kind(tree)? == ObjectType::Tree,
+                        "snapshot root is not a Git tree"
+                    );
                     break tree;
                 }
-                ObjectType::Tag => selected = repo.find_tag(selected)?.target_id(),
+                ObjectType::Tag => selected = state.selected_child(selected, ObjectType::Tag)?,
                 _ => bail!("revision does not resolve to a tree"),
             }
         };
-        let pin = if let Some(remote) = &mut remote {
-            // A private reference requires the root to exist. Fetch it alone
-            // so directory traversal can still wait for actual access.
-            remote.ensure_in(&repo, tree_oid)?;
+        let pin = if let Some(repo) = state
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.native_repository())
+        {
             let pin_ref = format!("refs/git-on/{run_id}");
             if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
                 bail!("invalid snapshot run ID");
@@ -724,7 +762,6 @@ impl Snapshot {
             record(&pin_git_dir, &pin_ref, tree_oid)?;
             repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
                 .context("pin snapshot in its private Git repository")?;
-            remote.root_pinned();
             Some(Pin {
                 git_dir: pin_git_dir,
                 name: pin_ref,
@@ -733,24 +770,17 @@ impl Snapshot {
         } else {
             None
         };
-        let git_dir = repo.path().to_path_buf();
+        let git_dir = if let Some(remote) = &mut state.remote {
+            remote.root_prepared();
+            remote.dir.clone()
+        } else {
+            state.local_repo.as_ref().unwrap().path().to_path_buf()
+        };
         Ok(Self {
             tree_oid,
             git_dir,
             inner: Arc::new(Inner {
-                state: Mutex::new(State {
-                    repo,
-                    remote,
-                    selected_oid: oid,
-                    headers: HashMap::new(),
-                    readers: Arc::new(Mutex::new(HashMap::new())),
-                    raw_blobs: None,
-                    metrics: SnapshotMetrics::default(),
-                    #[cfg(test)]
-                    ancestor_tree_lookups: 0,
-                    spool_directory: run_directory.to_path_buf(),
-                    _local_object_bridge: local_bridge,
-                }),
+                state: Mutex::new(state),
                 pin,
             }),
         })
@@ -793,10 +823,10 @@ impl Snapshot {
         if state.headers.contains_key(&oid) {
             return None;
         }
-        let State { repo, remote, .. } = &mut *state;
-        let demand = remote
+        let demand = state
+            .remote
             .as_mut()?
-            .start_demand(repo, oid, candidates)
+            .start_demand(oid, candidates)
             .ok()??;
         Some(PendingObject {
             snapshot: self.clone(),
@@ -912,8 +942,10 @@ impl Snapshot {
             state.metrics.cache_hits += u64::from(!first);
             return Ok(Some(tree));
         }
-        if state.repo.odb()?.exists(oid) {
-            return state.tree(oid).map(Some);
+        if let Some(repo) = state.repository() {
+            if repo.odb()?.exists(oid) {
+                return state.tree(oid).map(Some);
+            }
         }
         Ok(None)
     }
@@ -962,8 +994,9 @@ impl Snapshot {
         prepared: impl Fn(Oid) -> bool,
     ) -> Result<()> {
         let mut state = self.state()?;
-        let State { repo, remote, .. } = &mut *state;
-        let Some(remote) = remote else { return Ok(()) };
+        let Some(remote) = &mut state.remote else {
+            return Ok(());
+        };
         // The materializer supplies bounded batches and reuses completed
         // destinations across batches/directories instead of fetching again.
         let oids: Vec<_> = children
@@ -971,7 +1004,7 @@ impl Snapshot {
             .filter(|(_, entry)| entry.mode != 0o160000 && !prepared(entry.oid))
             .map(|(_, entry)| entry.oid)
             .collect();
-        remote.ensure_batch_in(repo, &oids)
+        remote.ensure_batch(&oids)
     }
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
@@ -1054,7 +1087,10 @@ impl Snapshot {
             state.metrics.streamed_blob_loads += u64::from(streamed);
             return Ok(size);
         }
-        let odb = state.repo.odb()?;
+        let odb = state
+            .repository()
+            .context("missing verified Git blob")?
+            .odb()?;
         let (size, streamed) = if let Ok((input, size, kind)) = odb.reader(oid) {
             anyhow::ensure!(
                 kind == ObjectType::Blob,
@@ -1246,10 +1282,12 @@ impl Snapshot {
     pub fn available_objects(&self) -> Result<Vec<Oid>> {
         let state = self.state()?;
         let mut objects = Vec::new();
-        state.repo.odb()?.foreach(|oid| {
-            objects.push(*oid);
-            true
-        })?;
+        if let Some(repo) = state.repository() {
+            repo.odb()?.foreach(|oid| {
+                objects.push(*oid);
+                true
+            })?;
+        }
         if let Some(raw) = &state.raw_blobs {
             objects.extend(raw.oids()?);
         }

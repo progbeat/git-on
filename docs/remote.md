@@ -1,11 +1,11 @@
 # Remote execution and native verification
 
 `git on REV [OPTIONS] -- COMMAND [ARGS...]` resolves one local revision through
-native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` passes its
-two positional operands unchanged to native `git fetch`, then selects the fetched
-object. git-on parses its own options and command separator; Git parses the
-repository and revision/refspec. No runner URL, ref-name or object-ID syntax
-check is applied to those operands.
+native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` uses the
+reusable protocol v2 path described below or passes both operands unchanged
+to native `git fetch` and selects the fetched object. Git-on parses its own
+options and command separator. Native Git supplies repository resolution and
+handles refspecs outside the reusable path.
 Runner options may appear anywhere before the first `--`, interspersed with
 the two operands; the command tail stays literal. URLs work
 outside a checkout. A configured remote name requires its local repository.
@@ -31,9 +31,9 @@ Git tree selection.
 
 Git decides which object-ID abbreviations and revision expressions are valid:
 local revision resolution and fetching do not necessarily accept the same forms.
-A full commit ID pins the source even if an upstream branch later moves. git-on
-uses the single distinct object selected by the fetch's `FETCH_HEAD`, and
-subsequent reads request exact OIDs rather than resolving the ref again. A fetch
+A full commit ID selects a fixed revision even if an upstream branch later
+moves. With native fetch, Git-on uses the single distinct object selected by
+`FETCH_HEAD`. Subsequent reads request exact OIDs. A fetch
 that selects multiple distinct objects cannot define one snapshot and fails
 before mounting.
 SHA-256 object storage, submodules and Git LFS remain unsupported.
@@ -51,9 +51,10 @@ tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
 Where protocol v2 and the caller's policy permit, exact demands reuse
-invocation-owned channels. Native Git resolves the original repository.
-Its optional `fetch-pack --diag-url` diagnostics supply decoded file/SSH path
-and port bytes. Unknown formats retain native fetch. A full SHA-1 object ID
+invocation-owned channels. Native Git resolves the original repository and
+prepares the OpenSSH arguments. Its `fetch-pack --diag-url` diagnostics supply
+decoded paths for the local file transport. Unknown formats retain native fetch.
+A full SHA-1 object ID
 or unambiguous branch can use the reusable HTTPS channel for the initial fetch
 after validating filtering and authentication. An SSH identity that
 authenticates without a prompt can select the branch or exact object ID and
@@ -214,8 +215,14 @@ payloads. Applicable `.gitignore` blobs are fetched on demand in default
 write decisions. The same [four policies](usage.md#filesystem-behavior) apply to
 local and remote snapshots.
 
-Each remote invocation owns a private temporary bare repository and an
-invocation-local object store. Demanded objects remain available until cleanup,
+Each remote invocation owns an invocation-local object store. The direct
+reusable HTTPS and SSH startup paths keep the selected commit or tag and its
+root tree in memory. Native fetch, signature verification, native interactive
+preparation and eager copy fallback can use a private temporary bare repository.
+When HTTPS challenges for credentials, Git's helper runs in its usual private
+repository context. Reusable fetches still keep their verified Git objects in
+memory.
+Demanded objects remain available until cleanup,
 including after decoded memory-cache eviction.
 There is no global persistent object cache or cross-run reuse. A later invocation
 resolves its operand through native Git again and fetches its own demanded trees
@@ -245,7 +252,7 @@ write policy.
 
 Active temporary objects and normal ignored writes have no runner disk quota;
 ordinary system disk limits apply. The block cache budget includes entry
-overhead. Completion removes the temporary remote repository and owned
+overhead. Completion removes any temporary remote repository and owned
 SSH connection. Write required results to explicit external paths. Busy mounts
 preserve recovery state for stale-run cleanup. Explicit-all materialization
 eagerly fetches every selected tree entry; it never bypasses authentication,
@@ -329,9 +336,9 @@ transport subprocesses and follows the normal unmount/cleanup path.
 
 All runs use native Git to interpret positional operands. Local execution resolves
 the unchanged revision in the caller's repository, then the object loader reads
-that pinned object through bundled libgit2. Remote execution fetches the unchanged
-repository/refspec pair and pins its selected object. `--verify` adds native Git's
-signature check to either mode.
+that pinned object through bundled libgit2. Remote execution resolves the selected
+object using the [transport rules above](#object-demand-and-cache-lifetime).
+`--verify` adds native Git's signature check to either mode.
 
 `--verify` resolves one commit or annotated tag OID, then calls native
 `git verify-commit OID` or `git verify-tag OID`. Native Git's exit status decides

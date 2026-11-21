@@ -64,7 +64,7 @@ impl Received {
         for entry in &extras {
             record(entry.oid);
         }
-        scratch.remember_extras(extras);
+        scratch.remember_verified(extras);
     }
 }
 

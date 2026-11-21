@@ -34,6 +34,7 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         self.records = []
         self.split_pack = None
         self.unauthenticated_wants = set()
+        self.unexpected_credential = False
         super().__init__(('127.0.0.1', 0), MultiplexedRequests)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(fixture.root / 'tls.crt', fixture.root / 'tls.key')
@@ -41,11 +42,12 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         self.socket = tls.wrap_socket(self.socket, server_side=True)
 
     def forward(self, method, path, headers, body):
-        if method == 'POST' and not any(
-            key.lower() == 'authorization' and value == self.authorization
-            for key, value in headers.items()
-        ):
+        authorization = next((value for key, value in headers.items()
+                              if key.lower() == 'authorization'), None)
+        if method == 'POST' and self.authorization is not None and authorization != self.authorization:
             self.unauthenticated_wants.update(re.findall(rb'want ([0-9a-f]{40})', body))
+            if authorization is not None:
+                self.unexpected_credential = True
             return 401, [('www-authenticate', 'Basic realm="git-on-fixture"'), ('content-length', '0')], b''
         upstream = http.client.HTTPSConnection(
             self.backend.hostname, self.backend.port, context=self.upstream_tls, timeout=30,
@@ -199,7 +201,11 @@ class Http2Tests(unittest.TestCase):
         fixture.env.update(
             GIT_CONFIG_COUNT='1',
             GIT_CONFIG_KEY_0='credential.helper',
-            GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f",
+            GIT_CONFIG_VALUE_0=(
+                "!f() { if git rev-parse --absolute-git-dir >/dev/null 2>&1; "
+                "then echo username=fixture; else echo username=other-fixture; fi; "
+                "echo password=example-password; }; f"
+            ),
         )
         fixture.stalled_oids.add(fixture.other)
         gate = fixture.root / 'send-independent'
@@ -208,6 +214,8 @@ class Http2Tests(unittest.TestCase):
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
+objects = Path.cwd().parent / 'remote-repository' / 'objects'
+assert objects.is_dir() and not any(path.is_file() for path in objects.rglob('*'))
 with ThreadPoolExecutor(1) as pool:
     held = pool.submit(Path('other').read_bytes)
     while not Path({str(gate)!r}).exists():
@@ -250,6 +258,7 @@ with ThreadPoolExecutor(1) as pool:
             _, errors = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 0, errors)
             report = json.load(metrics)
+        self.assertFalse(proxy.unexpected_credential)
         self.assertEqual(report['remote_native_pack_bytes'], 0, report)
         self.assertEqual(report['remote_http2_fetch_operations'], 5, report)
         self.assertGreaterEqual(report['remote_http2_peak_requests'], 2, report)

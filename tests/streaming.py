@@ -174,9 +174,19 @@ class StreamingTests(unittest.TestCase):
     def test_ssh_branch_respects_explicit_protocol_v2(self):
         fixture, url = self.ssh_branch_fixture()
         (fixture.root / 'release-branch-query').touch()
-        fixture.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.version', GIT_CONFIG_VALUE_0='2')
+        fixture.git('init', '--quiet', at=fixture.cwd)
+        remotes = fixture.cwd / '.git' / 'remotes'
+        remotes.mkdir()
+        (remotes / 'fixture').write_text('URL: fixture-source\n')
+        fixture.env.update(
+            GIT_CONFIG_COUNT='3',
+            GIT_CONFIG_KEY_0='protocol.version', GIT_CONFIG_VALUE_0='2',
+            GIT_CONFIG_KEY_1=f'url.{url}.insteadOf', GIT_CONFIG_VALUE_1='fixture-source',
+            GIT_CONFIG_KEY_2='url.ssh://127.0.0.1:1/unused.insteadOf', GIT_CONFIG_VALUE_2=url,
+        )
+        self.assertEqual(fixture.git('ls-remote', '--get-url', 'fixture', at=fixture.cwd), url)
         result = subprocess.run(
-            [OPTIONS.binary, url, 'main', mount_flag(), '--write-policy=none', '--', 'cat', 'deep/file'],
+            [OPTIONS.binary, 'fixture', 'main', mount_flag(), '--write-policy=none', '--', 'cat', 'deep/file'],
             cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -210,17 +220,11 @@ class StreamingTests(unittest.TestCase):
                 if transport == 'https':
                     upstream = fixture.https()
                     stack.callback(fixture.server.shutdown)
-                    basic = base64.b64encode(b'fixture:example-password').decode()
-                    proxy = Multiplexer(fixture, upstream, 'Basic ' + basic)
+                    proxy = Multiplexer(fixture, upstream, None)
                     proxy.split_pack = split
                     stack.callback(proxy.server_close)
                     threading.Thread(target=proxy.serve_forever, daemon=True).start()
                     stack.callback(proxy.shutdown)
-                    fixture.env.update(
-                        GIT_CONFIG_COUNT='1',
-                        GIT_CONFIG_KEY_0='credential.helper',
-                        GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f",
-                    )
                     url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
                 else:
                     url = fixture.ssh(protocol_v2=True)
@@ -247,6 +251,7 @@ while not Path({str(split.started)!r}).exists():
 assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
 assert hashlib.sha256(Path('b/first').read_bytes()).hexdigest() == {first_digest!r}
 assert not list(Path.cwd().parent.glob('raw-parts-*/*')), 'received pack was staged on disk'
+assert not (Path.cwd().parent / 'remote-repository').exists(), 'streamed metadata used an on-disk Git repository'
 Path({str(ready)!r}).touch()
 while not Path({str(split.release)!r}).exists():
     assert time.monotonic() < deadline, 'the test did not release the pack'

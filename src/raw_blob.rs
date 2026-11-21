@@ -771,7 +771,7 @@ pub(crate) struct RawBlobs {
     prepared: Arc<Condvar>,
     hot_writer: Arc<Mutex<HotWriter>>,
     pack_decodes: Arc<PackDecodes>,
-    root_pinned: Arc<AtomicBool>,
+    root_prepared: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -847,16 +847,16 @@ impl RawBlobs {
             prepared: Arc::default(),
             hot_writer: Arc::default(),
             pack_decodes: Arc::default(),
-            root_pinned: Arc::default(),
+            root_prepared: Arc::default(),
         })
     }
 
-    pub(crate) fn record_root_pin(&self) {
-        self.root_pinned.store(true, Ordering::Release);
+    pub(crate) fn record_root_prepared(&self) {
+        self.root_prepared.store(true, Ordering::Release);
     }
 
-    pub(crate) fn root_is_pinned(&self) -> bool {
-        self.root_pinned.load(Ordering::Acquire)
+    pub(crate) fn root_is_prepared(&self) -> bool {
+        self.root_prepared.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -905,12 +905,14 @@ impl RawBlobs {
         state.available(oid)
     }
 
-    pub(crate) fn remember_extras(&self, extras: Vec<crate::pack_stream::VerifiedObject>) {
-        if extras.is_empty() {
-            return;
-        }
+    pub(crate) fn remember_verified(
+        &self,
+        extras: impl IntoIterator<Item = crate::pack_stream::VerifiedObject>,
+    ) {
+        let mut extras = extras.into_iter();
+        let Some(first) = extras.next() else { return };
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        for extra in extras {
+        for extra in std::iter::once(first).chain(extras) {
             let oid = extra.oid();
             if !store.objects.contains_key(&oid)
                 && !matches!(store.received.get(&oid), Some(ReceivedObject::Verified(_)))
@@ -1267,16 +1269,11 @@ impl RawBlobs {
             .wait_while(store, |store| store.preparing.contains(&oid))
             .unwrap_or_else(|e| e.into_inner())
     }
-    pub(crate) fn insert_tree(
-        &mut self,
-        oid: Oid,
-        size: usize,
-        input: impl Read,
-    ) -> Result<RawBlob> {
+    pub(crate) fn insert_tree(&self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
         self.cache_directory(oid, size, || Directory::verified(oid, size, input))
     }
     pub(crate) fn insert_verified_tree(
-        &mut self,
+        &self,
         object: &crate::pack_stream::VerifiedObject,
     ) -> Result<RawBlob> {
         self.cache_directory(object.oid(), object.data().len(), || {
@@ -1284,7 +1281,7 @@ impl RawBlobs {
         })
     }
     fn cache_directory(
-        &mut self,
+        &self,
         oid: Oid,
         size: usize,
         prepare: impl FnOnce() -> Result<Directory>,
@@ -2721,7 +2718,7 @@ mod tests {
     #[test]
     fn parsed_tree_names_and_absence_do_not_depend_on_mutable_disk_indexes() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let store = RawBlobs::new(directory.path()).unwrap();
         let blob = Oid::hash_object(ObjectType::Blob, b"x").unwrap();
         let mut bytes = b"100644 tracked\0".to_vec();
         bytes.extend(blob.as_bytes());

@@ -75,8 +75,11 @@ The native ref capability check discards the ref listing and retains the
 separate packet trace for compatibility with detached helpers.
 Flat UTF-8 object database overrides configure libgit2 directly. Nested
 alternates and non-UTF-8 paths use temporary aliases for the git2 binding.
-After the root is pinned, remote subtrees are retained as parsed directory
-metadata without writing loose tree objects.
+The direct reusable HTTPS and SSH startup paths borrow verified commit or tag
+headers in memory. Native Git fetches, native preparation and signature
+verification can require a private temporary repository. Once the root is
+prepared, remote subtrees are kept as parsed directory metadata without
+writing loose tree objects.
 The host enforces inherited process resource limits. See the
 [resource assumptions](specification.md#resource-assumptions) for the
 supported workload.
