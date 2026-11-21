@@ -1,7 +1,7 @@
 //! Invocation-local verified contents. Only payload bytes spill to disk;
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
-    spool::{open_private_file, private_file_metadata},
+    spool::{open_private_descriptor, open_private_file, private_file_metadata},
     tree::Directory,
 };
 use anyhow::{Context, Result};
@@ -458,12 +458,16 @@ fn open_copy(parent: &File, name: &CStr, source: Option<&File>) -> Result<(File,
         }
     }
 
-    let (file, _) = open_private_file(
+    let file = open_private_descriptor(
         parent,
         name,
         libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | COPY_UP_OPEN_FLAGS,
     )
     .map_err(BackingError)?;
+    if let Err(error) = private_file_metadata(&file) {
+        drop(file);
+        return Err(discard_copy(parent, name, BackingError(error).into()));
+    }
     #[cfg(target_os = "linux")]
     if let Some(source) = source {
         if unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
@@ -518,24 +522,21 @@ impl RawDirectory {
         }
         Ok(())
     }
-    fn open_name(&self, name: &CString, flags: i32, size: Option<u64>) -> Result<File> {
+    fn open(&self, oid: Oid, write: bool, size: u64) -> Result<File> {
         #[cfg(test)]
         self.open_calls.set(self.open_calls.get() + 1);
-        let (file, metadata) =
-            open_private_file(&self.fd, name, flags).context("open private raw object")?;
-        Self::validate_size(&metadata, size)?;
-        Ok(file)
-    }
-    fn open(&self, oid: Oid, write: bool, size: u64) -> Result<File> {
-        self.open_name(
+        let (file, metadata) = open_private_file(
+            &self.fd,
             &CString::new(oid.to_string())?,
             if write {
                 libc::O_WRONLY
             } else {
                 libc::O_RDONLY
             },
-            Some(size),
         )
+        .context("open private raw object")?;
+        Self::validate_size(&metadata, Some(size))?;
+        Ok(file)
     }
     fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<File>> {
         if let Some((cached, file)) = &self.reader {
@@ -567,15 +568,24 @@ impl RawDirectory {
             remove_private(&self.fd, &name)?;
             incomplete.remove(&oid);
         }
-        let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, None)?;
-        Ok(Pending {
+        #[cfg(test)]
+        self.open_calls.set(self.open_calls.get() + 1);
+        let file =
+            open_private_descriptor(&self.fd, &name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+                .context("open private raw object")?;
+        drop(incomplete);
+        // The exclusive name already exists. Let Pending own it before fstat
+        // so an error during validation cannot block a later spill.
+        let pending = Pending {
             directory: self.fd.clone(),
             incomplete: self.incomplete.clone(),
             oid,
             name,
             file,
             committed: false,
-        })
+        };
+        private_file_metadata(&pending.file).context("validate private raw object")?;
+        Ok(pending)
     }
 
     fn spill(&self, oid: Oid, bytes: &[u8]) -> Result<Box<[[u8; 32]]>> {
@@ -2358,6 +2368,42 @@ mod tests {
             drop(busy);
             assert!(entered && served && promoted);
         });
+    }
+
+    #[test]
+    fn spill_can_retry_after_validation_of_the_new_file_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = RawDirectory::new(directory.path()).unwrap();
+        let bytes = b"verified bytes";
+        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        crate::spool::NEXT_METADATA_ERROR.set(Some(libc::EIO));
+        let error = raw.spill(oid, bytes).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EIO)
+        );
+        raw.spill(oid, bytes).unwrap();
+        let mut file = raw.open(oid, false, bytes.len() as u64).unwrap();
+        let mut retained = Vec::new();
+        file.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, bytes);
+    }
+
+    #[test]
+    fn copy_can_retry_after_validation_of_the_new_file_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = File::open(directory.path()).unwrap();
+        crate::spool::NEXT_METADATA_ERROR.set(Some(libc::EIO));
+        let error = open_copy(&parent, c"copy", None).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BackingError>()
+                .unwrap()
+                .0
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        open_copy(&parent, c"copy", None).unwrap();
     }
 
     #[test]
