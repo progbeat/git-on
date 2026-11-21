@@ -9,8 +9,9 @@ import sys
 source = Path(sys.argv[1]).resolve(strict=True)
 point = os.fsencode(os.getcwd())
 mounts = subprocess.check_output(["/sbin/mount"]).splitlines()
+prefixes = (b"</private/tmp/git-on/nfs-", f"</private/tmp/.go{os.geteuid():x}/nfs-".encode())
 mounted = next(line.split(b">:/", 1)[0][1:] for line in mounts
-               if line.startswith(b"</private/tmp/git-on-nfs-") and b" on " + point + b" (nfs" in line)
+               if line.startswith(prefixes) and b" on " + point + b" (nfs" in line)
 original_getaddrinfo = socket.getaddrinfo
 
 

@@ -132,10 +132,13 @@ The native mount and write-policy contracts apply to local and remote runs.
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
 - The writable layer is fresh for each run. It uses private filesystem-backed
-  storage under the system temporary location and respects `TMPDIR`; git-on
-  creates no private memory filesystem and imposes no disk quota. The underlying
-  temporary filesystem's capacity and operating-system limits still apply.
-- Completion unmounts (when mounted) and deletes the private execution tree.
+  storage in a per-run directory under `TMPDIR/git-on` (or the system temporary
+  location's `git-on` directory). If another unprivileged user owns that group,
+  git-on uses a private group for the current user. Git-on creates no private memory filesystem
+  and imposes no disk quota. The underlying temporary filesystem's capacity and
+  operating-system limits apply.
+- Completion unmounts the snapshot and removes the run's temporary files.
+  The last run removes its empty group.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
 - Handle recoverable resource errors through ordinary operation or runner

@@ -223,7 +223,7 @@ impl Remote {
                     .is_some_and(|colon| text.find('/').is_none_or(|slash| colon < slash)));
         let https_alternative = github_https_alternative(&text);
         let dir = run.join("remote-repository");
-        let socket = ssh_transport.then(|| run.join("ssh-control"));
+        let socket = ssh_transport.then(|| crate::platform::ssh_control_path(run));
         let ssh = socket
             .as_ref()
             .map(|_| git.ssh_command().unwrap_or_else(|| OsString::from("ssh")));

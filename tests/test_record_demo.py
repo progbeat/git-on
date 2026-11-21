@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import tempfile
 import unittest
@@ -49,7 +50,7 @@ class RecordingDestinationTests(unittest.TestCase):
         return patch.object(MOD.os, "listdir", side_effect=lambda fd:
                             names if fd == staging_fd else real_listdir(fd))
 
-    def attempt_recording(self, dependency_probe=None, recorder_failure=None, output_probe=None):
+    def attempt_recording(self, dependency_probe=None, recorder_failure=None):
         real_open = os.open
 
         def fixture_open(path, *args, **kwargs):
@@ -60,7 +61,7 @@ class RecordingDestinationTests(unittest.TestCase):
         with patch.object(MOD.shutil, "which", return_value="fixture-tool",
                           side_effect=dependency_probe) as dependencies, \
                 patch.object(MOD.os, "open", side_effect=fixture_open) as opened, \
-                patch.object(MOD, "output", return_value="fixture version", side_effect=output_probe), \
+                patch.object(MOD, "output", return_value="fixture version"), \
                 patch.object(MOD.platform, "node", return_value="fixture-host"), \
                 patch.object(MOD.platform, "platform", return_value="fixture-platform"), \
                 patch.object(MOD.subprocess, "Popen", side_effect=recorder_failure or RuntimeError(
@@ -79,12 +80,15 @@ class RecordingDestinationTests(unittest.TestCase):
             kwargs["stdout"].write("owned VHS diagnostics\n")
             kwargs["stdout"].flush()
             runtime = Path(kwargs["env"]["TMPDIR"])
-            run = runtime / "git-on-fixture"
+            wrapper = Path(kwargs["env"]["PATH"].split(os.pathsep)[0]) / "make"
+            self.assertIn(f'exec {shlex.quote(os.path.abspath("fixture-tool"))} "$@"',
+                          wrapper.read_text())
+            run = runtime / "git-on" / "rUn001"
             (run / "mount").mkdir(parents=True)
             executable = run / "mount/sl"
             executable.write_bytes(b"generated SL fixture")
             executable.chmod(0o755)
-            (run / ".state").write_text(json.dumps({"tree_oid": MOD.TREE}))
+            Path(kwargs["env"]["GIT_ON_DEMO_TREE"]).write_text(MOD.TREE + "\n")
 
             class SuccessfulVhs:
                 returncode = None
@@ -96,6 +100,7 @@ class RecordingDestinationTests(unittest.TestCase):
                         return None
                     if self.returncode is None:
                         shutil.rmtree(run)
+                        run.parent.rmdir()
                         Path(kwargs["env"]["GIT_ON_DEMO_STATUS"]).write_text("0\n0\n")
                         if replace_stage is not None:
                             replace_stage(stage)
@@ -105,9 +110,7 @@ class RecordingDestinationTests(unittest.TestCase):
             return SuccessfulVhs()
 
         with redirect_stdout(io.StringIO()):
-            return self.attempt_recording(
-                recorder_failure=successful_vhs,
-                output_probe=lambda *args: MOD.TREE if "rev-parse" in args else "fixture version")
+            return self.attempt_recording(recorder_failure=successful_vhs)
 
     def assert_rejected_before_probes(self, attempt):
         error, dependencies, opened, recorder = attempt

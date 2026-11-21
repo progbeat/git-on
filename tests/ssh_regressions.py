@@ -626,7 +626,7 @@ class SshRegressionTests(unittest.TestCase):
                     break
             self.assertTrue(reaped, 'terminal interrupt did not stop runner: ' + repr(output))
             self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGINT, output)
-            self.assertEqual(list(f.root.glob('git-on-*')), [])
+            self.assertEqual(remote.run_directories(f.root), [])
             transport = Path('/proc/' + pid_file.read_text().strip())
             self.assertTrue(not transport.exists() or (transport / 'stat').read_text().split()[2] == 'Z')
         finally:
@@ -700,9 +700,9 @@ class SshRegressionTests(unittest.TestCase):
         native_children = []
         try:
             deadline = time.monotonic() + 5
-            while not list(f.root.glob('git-on-*/.state')) and process.poll() is None and time.monotonic() < deadline:
+            while not any((run / '.state').is_file() for run in remote.run_directories(f.root)) and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
-            self.assertTrue(list(f.root.glob('git-on-*/.state')), 'runner state was never created')
+            self.assertTrue(any((run / '.state').is_file() for run in remote.run_directories(f.root)), 'runner state was never created')
             deadline = time.monotonic() + 5
             while not native_children and process.poll() is None and time.monotonic() < deadline:
                 for entry in Path('/proc').iterdir():
@@ -723,7 +723,7 @@ class SshRegressionTests(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 self.fail('effective native Git config capture ignored SIGTERM while reading a FIFO')
             self.assertEqual(process.returncode, -signal.SIGTERM, errors)
-            self.assertEqual(list(f.root.glob('git-on-*')), [])
+            self.assertEqual(remote.run_directories(f.root), [])
             for pid in native_children:
                 proc = Path('/proc') / str(pid)
                 self.assertTrue(not proc.exists() or (proc / 'stat').read_text().rpartition(')')[2].split()[0] == 'Z',

@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import stat
 import subprocess
@@ -172,10 +173,20 @@ def _record(binary, target):
         runtime = private / "runtime"
         runtime.mkdir()
         status = private / "shell-status"
+        recorded_tree = private / "tree-oid"
+        # Use the tree ID passed to the actual build. A streamed run may have
+        # no temporary Git repository or pin in its recovery record.
+        make = tools / "make"
+        make.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$GIT_ON_TREE_OID" > "$GIT_ON_DEMO_TREE"\n'
+            f'exec {shlex.quote(os.path.abspath(shutil.which("make")))} "$@"\n'
+        )
+        make.chmod(0o700)
         # The clean VHS Bash records its actual command status after each prompt.
         # This does not change the hero command or any of its terminal output.
         env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                    TMPDIR=str(runtime), GIT_ON_DEMO_STATUS=str(status),
+                   GIT_ON_DEMO_TREE=str(recorded_tree),
                    PROMPT_COMMAND='printf "%s\\n" "$?" >> "$GIT_ON_DEMO_STATUS"',
                    LC_ALL="C.UTF-8")
         observed = set()
@@ -192,17 +203,11 @@ def _record(binary, target):
                 while process.poll() is None:
                     if time.monotonic() > deadline:
                         raise RuntimeError("VHS recording exceeded four minutes")
-                    for state_path in runtime.glob("git-on-*/.state"):
-                        try:
-                            state = json.loads(state_path.read_text())
-                        except (FileNotFoundError, json.JSONDecodeError):
-                            continue
-                        run = state_path.parent
+                    for run in (*runtime.glob("git-on/??????"), *runtime.glob("git-on-*")):
                         if (run / "mount/sl").is_file():
                             if run not in observed:
-                                tree = output("git", "--git-dir=" + str(run / "remote-repository"),
-                                              "rev-parse", COMMIT + "^{tree}")
-                                if state["tree_oid"] != tree or tree != TREE:
+                                tree = recorded_tree.read_text().strip()
+                                if tree != TREE:
                                     raise RuntimeError("Running source differs from the reviewed upstream commit")
                                 info["upstream_tree"] = tree
                                 observed.add(run)

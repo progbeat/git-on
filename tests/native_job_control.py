@@ -141,6 +141,12 @@ class NativeJobControlTests(unittest.TestCase):
         git, = children(runner)
         self.runner, self.native_group = runner, os.getpgid(git)
         shell.groups.update((runner, self.native_group))
+        if not native_terminal:
+            run, = remote.run_directories(self.f.root)
+            self.assertEqual(run.parent, self.f.root / 'git-on')
+            socket, = run.glob('t???/socket')
+            self.assertTrue(socket.is_socket())
+            self.assertFalse(list(self.f.root.glob('.git-on-terminal-*')))
         self.assertEqual(os.getpgid(runner), runner)
         self.assertEqual(self.native_group, git)
         self.assertNotEqual(self.native_group, runner)
@@ -188,7 +194,7 @@ class NativeJobControlTests(unittest.TestCase):
         shell.expect(f'native-job-status={expected}\r\n'.encode())
         shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
-        self.assertEqual(list(self.f.root.glob('git-on-*')), [], 'runner leaked recovery state')
+        self.assertEqual(remote.run_directories(self.f.root), [], 'runner leaked recovery state')
         self.assertEqual(list(self.f.root.glob('*/ssh-control')), [], 'runner leaked SSH socket')
         if expected == 125:
             self.assertIn(b'native Git verify-commit failed', output)
@@ -258,7 +264,7 @@ class NativeJobControlTests(unittest.TestCase):
                     shell.groups.clear()
                     self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
                     self.assertNotIn(b"identity': ",output)
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(remote.run_directories(f.root),[])
                     if backend=='materialized':self.assertIn(b'Permission denied',output)
 
 
@@ -286,7 +292,7 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         shell.send((shlex.join(command)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
         output=shell.expect(shell.prompt,timeout=20)
         self.assertIn(b'\r\nASKPASS-STATUS:0\r\n',output)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(remote.run_directories(f.root),[])
 
     def test_repeated_managed_credentials_keep_runner_in_foreground(self):
         import base64
@@ -340,7 +346,7 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         self.assertIn(b'\r\nhttps-helper-status=125\r\n',output)
         self.assertGreaterEqual(len(native_groups),2,'expected credentials in separate native processes')
         self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-        self.assertEqual(list(f.root.glob('git-on-*')),[],'HTTPS run leaked temporary storage')
+        self.assertEqual(remote.run_directories(f.root),[],'HTTPS run leaked temporary storage')
 
 
 def replay_baseline():

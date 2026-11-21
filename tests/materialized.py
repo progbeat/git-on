@@ -176,8 +176,12 @@ print('large file verified')
         self.clean()
 
     def test_command_status_and_signal_cleanup(self):
-        result = self.invoke('import sys; sys.exit(23)', '--write-policy=all')
+        result = self.invoke('import sys; from pathlib import Path; print(Path.cwd().parent); sys.exit(23)',
+                             '--write-policy=all')
         self.assertEqual(result.returncode, 23, result.stderr)
+        run = Path(os.fsdecode(result.stdout).strip())
+        self.assertEqual(run.parent, self.tmp.resolve() / 'git-on')
+        self.assertFalse(run.exists())
         self.clean()
         result = self.invoke('import os,signal; os.kill(os.getpid(),signal.SIGTERM)', '--write-policy=all')
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)

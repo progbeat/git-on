@@ -78,9 +78,10 @@ uses that held directory for reading the animation and writing its metadata.
 If recording or publication fails, it preserves the incomplete staging directory
 and reports its actual path and `vhs.log` for inspection. Choose a fresh output
 directory for the next attempt; failed output is never deleted automatically.
-During execution it checks the live FUSE recovery
-state against the reviewed tree, observes the generated executable inside the
-mount, and records the shell's real exit status through a private prompt hook.
+During execution it checks the build's `GIT_ON_TREE_OID` against the reviewed
+tree, observes the generated executable inside the mount, and records the
+shell's real exit status through a private prompt hook. A private `make` wrapper
+captures the tree ID before running the build.
 Afterward it checks that the run and executable were removed. This status hook
 does not modify the displayed command or output. `demo.json` records the actual
 host, time, Git version, git-on binary hash, VHS version, tape hash, external

@@ -11,7 +11,7 @@ from collections import Counter
 import os
 from process_capture import capture
 from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
-from remote import Fixture
+from remote import Fixture, run_directories
 
 
 CHILD=r'''
@@ -87,7 +87,7 @@ def run(options):
                 result['native_commands']=native_commands(log)
                 validate_runner(result,count,options.blob_bytes,stat_bytes,options.backend)
                 record(dict(type='runner',files=count,blob_bytes=options.blob_bytes,stat_abi_bytes=stat_bytes,**result))
-                assert not list(f.root.glob('git-on-*')),'private invocation leaked'
+                assert not run_directories(f.root),'private invocation leaked'
             finally:f.close()
 
 

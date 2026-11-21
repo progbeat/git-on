@@ -158,9 +158,12 @@ selected tree ID. The rest of the caller's environment is inherited. No `GIT_ON_
 `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed. If callers already
 set those names, they remain ordinary inherited variables.
 
-Generated and copied-up modified files use a private directory in the system temporary location, respecting
-`TMPDIR`. Storage uses ordinary filesystem-backed files, not a private memory
-filesystem, and there is no git-on disk quota. If the system's temporary location is
+Each run keeps its generated files, copy-on-write data and temporary state in
+its own private directory under `TMPDIR/git-on`. With no `TMPDIR`, it uses the
+system temporary directory. Git-on uses ordinary filesystem-backed storage
+without a separate quota. On a shared temporary filesystem, a run uses a
+hidden private group if another unprivileged user owns the usual name.
+If the system's temporary location is
 itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesystem
 capacity and operating-system resource limits still apply. Temporary directories are
 private to the current user.
@@ -196,7 +199,9 @@ allows checked cleanup.
 git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run, unmounts only a matching git-on filesystem,
+Pass the individual run directory. Cleanup also accepts run directories
+from older versions. It refuses an active locked run, unmounts only a
+matching git-on filesystem,
 and checks the exact target of any pin recorded by this release or an older one
 before releasing it. A busy stale mount requires stopping processes using it first.
 Cleanup does not kill processes by stale PID.

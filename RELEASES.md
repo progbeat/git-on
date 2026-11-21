@@ -4,6 +4,8 @@
 - Serve recently read large Git blobs from RAM and spill them on eviction.
   Verify bytes read back from disk by block using BLAKE3. Retry a failed
   background spill when the next large blob enters the cache.
+- Group private run directories under `TMPDIR/git-on` and remove the empty
+  shared directory after the last run cleans up.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
 - Decode full objects and deltas from reusable HTTPS and SSH sessions in

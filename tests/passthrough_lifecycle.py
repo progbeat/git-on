@@ -124,8 +124,10 @@ def scenario(binary, expected, mode):
         # enabled scenario; validate the exact private run reported by our child.
         allowed_parents = [temporary]
         if expected == 'enabled': allowed_parents.append(Path(tempfile.gettempdir()).resolve())
-        assert run_directory.parent in allowed_parents and mount.name == 'mount', mount
-        assert run_directory.name.startswith('git-on-')
+        allowed_groups = {parent / group for parent in allowed_parents
+                          for group in ('git-on', f'.go{os.geteuid():x}')}
+        assert run_directory.parent in allowed_groups, mount
+        assert mount.name == 'mount'
         assert run_directory.stat().st_uid == os.getuid() and run_directory.stat().st_mode & 0o777 == 0o700
         state = json.loads((run_directory / '.state').read_text())
         assert state['format'] == 'git-on-temp-v1'

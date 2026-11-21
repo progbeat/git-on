@@ -51,6 +51,11 @@ for artifact in ('probe','binary','before_binary','before_lifecycle_binary','bef
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
+def run_directories(root):
+    # Red-before comparisons also run legacy binaries with a flat layout.
+    return [*root.glob('git-on/??????'), *root.glob(f'.go{os.geteuid():x}/??????'),
+            *root.glob('git-on-*')]
+
 def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
@@ -312,7 +317,7 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
         result = subprocess.run([str(OPTIONS.probe), source, 'HEAD'], cwd=self.root,
                                 env=self.env, capture_output=True, timeout=10)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(list(self.root.glob('git-on-*')), [])
+        self.assertEqual(run_directories(self.root), [])
         return result.stderr.decode()
 
     def test_missing_native_git_names_requirement_and_safe_next_step(self):
@@ -339,7 +344,7 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
         self.assertNotEqual(result.returncode, 0, result.stdout)
         for detail in ('native Git', 'not found on PATH', 'revision resolution', 'install'):
             self.assertIn(detail, result.stderr.decode())
-        self.assertEqual(list(self.root.glob('git-on-*')), [])
+        self.assertEqual(run_directories(self.root), [])
 
     def test_github_publickey_failure_offers_conditional_https_without_retry(self):
         for source in ('git@github.com:owner/repository.git',
@@ -554,7 +559,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(result.returncode,125,result.stderr)
                 self.assertNotIn(b'Usage:',result.stderr)
                 self.assertFalse(sentinel.exists())
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
     def test_fixture_exec_failure_exits_without_reentering_test_runner(self):
         f=self.f; pid,fd=pty.fork(); reaped=False; transcript=bytearray()
         if pid==0:
@@ -683,7 +688,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                                           cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,b'external object database\n')
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
     def test_local_namespace_environment_does_not_leave_snapshot_pins(self):
         f=self.f; f.cwd=f.repo; unscoped=dict(f.env)
         f.env['GIT_NAMESPACE']='snapshot-input-namespace'
@@ -703,7 +708,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout,b'expected\n')
             self.assertEqual(refs(),before)
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
+            self.assertEqual(run_directories(f.root),[])
     def test_local_common_directory_reads_without_changing_native_repository_refs(self):
         f=self.f; f.cwd=f.repo; unscoped=dict(f.env); common=f.root/'common.git'
         run(['git','clone','--bare','--no-local','--quiet',f.repo,common],env=f.env)
@@ -742,7 +747,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             deadline=time.monotonic()+10
             while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
             self.assertTrue(ready.exists(),'common-directory snapshot did not execute its command')
-            child=int(ready.read_text()); runs=list(f.root.glob('git-on-*'))
+            child=int(ready.read_text()); runs=run_directories(f.root)
             self.assertEqual(len(runs),1)
             live_refs={repository:refs(repository) for repository in before}
             process.kill(); process.wait(timeout=5)
@@ -778,7 +783,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                                   cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout,b'quoted alternate\n')
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
+            self.assertEqual(run_directories(f.root),[])
     def test_local_hash_prefixed_alternate_components_match_native_git(self):
         if not OPTIONS.require_fuse: self.skipTest('actual FUSE execution explicitly required')
         f=self.f; f.cwd=f.repo; original=dict(f.env)
@@ -820,7 +825,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=original),before_refs)
                 for directory in before_objects:
                     self.assertEqual(object_files(directory),before_objects[directory])
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
                 if accepted:
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,payload)
@@ -1101,7 +1106,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         # or depending on whether the container's PID 1 reaps adopted zombies.
         self.assertTrue(select.select([transport_fd],[],[],2)[0],
                         'owned stalled transport survived cancellation')
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
     def test_startup_transport_all_handled_signals(self):
         f=self.f; wrapper=f.root/'hanging-selected-ssh'; pid=f.root/'transport-pid'
         wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid}.new"\nmv "{pid}.new" "{pid}"\nexec sleep 300\n'); wrapper.chmod(0o700)
@@ -1124,7 +1129,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                     # death, including on loaded runners and unreaped zombies.
                     self.assertTrue(select.select([descriptor],[],[],2)[0],
                                     'owned startup transport survived cancellation')
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
                 finally:
                     if not select.select([descriptor],[],[],0)[0]:
                         with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGKILL)
@@ -1155,7 +1160,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertTrue(pidfile.exists(),'actual native Git did not start')
         native_pid=int(pidfile.read_text()); descriptor=os.pidfd_open(native_pid)
         self.assertEqual(os.getpgid(native_pid),native_pid)
-        directory,=f.root.glob('git-on-*')
+        directory,=run_directories(f.root)
         process.kill(); self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
         self.assertFalse(select.select([descriptor],[],[],.1)[0],'startup native operation unexpectedly stopped with runner death')
         state=json.loads((directory/'.state').read_text())
@@ -1216,7 +1221,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         result=subprocess.run(['git','-c','http.sslCAInfo='+f.env['GIT_SSL_CAINFO'],'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools'),capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sleep','30'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         f.children.append(process)
         deadline=time.monotonic()+10
@@ -1224,7 +1229,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertTrue(any('/mount' in x and 'git-on:' in x for x in Path('/proc/self/mountinfo').read_text().splitlines()),'remote run never mounted')
         process.send_signal(signal.SIGTERM); process.communicate(timeout=10)
         self.assertEqual(process.returncode,-signal.SIGTERM)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def test_named_https_remote_and_inherited_git_config_parameters(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
@@ -1381,7 +1386,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         self.assertNotIn(b'mount snapshot',result.stderr)
                         self.assertFalse(sentinel.exists(),'trust-rejected command executed')
                         self.assertEqual(result.stdout,b'')
-                        self.assertEqual(list(f.root.glob('git-on-*')),[])
+                        self.assertEqual(run_directories(f.root),[])
                         print('configured native trust rejection evidence:',json.dumps(dict(policy=policy,operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_executed=sentinel.exists())),flush=True)
 
     def test_real_mount_openpgp_default_policy_executes_unknown_trust_commit_and_tag(self):
@@ -1399,7 +1404,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                     result=subprocess.run([str(OPTIONS.binary),*operands,'--verify','--',sys.executable,'-c',code,str(sentinel)],cwd=f.repo,env=f.env,capture_output=True,timeout=30)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(sentinel.read_bytes(),b'expected\n')
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
                     print('native default trust execution evidence:',json.dumps(dict(operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_bytes=sentinel.stat().st_size)),flush=True)
 
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
@@ -1417,7 +1422,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,125,result.stderr)
         self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def test_real_mount_caught_verified_raw_storage_failure_is_sticky(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
@@ -1446,7 +1451,7 @@ print('caught-EIO-and-returned-success')
         self.assertIn(b'caught-EIO-and-returned-success',result.stdout)
         self.assertEqual(result.returncode,125,result.stderr)
         self.assertIn(b'bytes were modified',result.stderr);self.assertIn(b'execution incomplete',result.stderr)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def test_remote_never_requires_or_modifies_global_cache(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
@@ -1518,8 +1523,16 @@ print('caught-EIO-and-returned-success')
         commit=f.git('commit-tree',tree,'-p',ancestor,data=b'materialization transfer regression\n')
         f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
-        code=("import os,subprocess; from pathlib import Path; "
-              f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}; "
+        code=("import json,os,subprocess,sys\nfrom pathlib import Path\n"
+              f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}\n"
+              "state = json.loads((Path.cwd().parent / '.state').read_text())\n"
+              "assert not state.get('nfs_socket')\n"
+              "if sys.platform == 'darwin':\n"
+              "    for group in ('git-on', f'.go{os.geteuid():x}'):\n"
+              "        directory = Path('/private/tmp') / group / ('nfs-' + state['id'])\n"
+              "        try: directory.lstat()\n"
+              "        except (FileNotFoundError, PermissionError): continue\n"
+              "        raise AssertionError(f'partial NFS endpoint still exists at {directory}')\n"
               "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(12)); "
               f"assert subprocess.run(['git','--git-dir',str(Path.cwd().parent/'remote-repository'),'cat-file','-e',{ancestor!r}],"
               "env=dict(os.environ,GIT_NO_LAZY_FETCH='1'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0; "
@@ -1540,7 +1553,7 @@ print('caught-EIO-and-returned-success')
                 expected = [[commit], [tree], [commit]] if backend == 'auto' else [[commit]]
                 self.assertEqual(wants, expected,
                                  'eager preparation performs separate directory/object fetches')
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_git_on_in_a_terminal_reuses_the_https_demand_session(self):
@@ -1585,7 +1598,7 @@ print('caught-EIO-and-returned-success')
         self.assertLess(report['remote_session_starts'], report['remote_session_fetch_operations'], report)
         self.assertEqual({oid for request in f.requests for oid in request['wants']},
                          {f.commit, f.tree, f.subtree, f.blob, f.other})
-        self.assertFalse(list(f.root.glob('git-on-*')))
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_cancel_concurrent_https_demands(self):
@@ -1627,7 +1640,7 @@ with ThreadPoolExecutor(2) as pool:
         _, errors = process.communicate(timeout=12)
         self.assertEqual(process.returncode, -signal.SIGTERM, errors)
         self.assertNotIn(b'execution incomplete', errors)
-        self.assertFalse(list(f.root.glob('git-on-*')))
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_concurrent_https_lookups_combine_only_requested_objects(self):
@@ -1720,7 +1733,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
         self.assertCountEqual([oid for batch in batches for oid in batch],
                               [commit, tree, f.blob, *directories, *wanted])
         self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
-        self.assertFalse(list(f.root.glob('git-on-*')))
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_cold_directory_demand_overlaps_file_lookup(self):
@@ -1777,7 +1790,7 @@ with ThreadPoolExecutor(1) as pool:
                 self.assertTrue(overlapped, 'independent lookup waited for the cold tree')
                 self.assertCountEqual([oid for request in f.requests for oid in request['wants']],
                                       [f.commit, f.tree, f.subtree, f.other, *children])
-                self.assertFalse(list(f.root.glob('git-on-*')))
+                self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse, 'requires the FUSE directory reference lifecycle')
     def test_fuse_lookup_survives_directory_close_during_https_wait(self):
@@ -1906,7 +1919,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                     self.assertLess(transcript.rfind(b'\x1b[2K'),transcript.index(b'COMMAND-START'))
                     self.assertNotIn(b'git on',transcript[transcript.index(b'COMMAND-START'):])
                 else:self.assertEqual(errors,b'COMMAND-START\n')
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
     def test_preparation_progress_during_native_git_with_tostop(self):
@@ -1951,7 +1964,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                     for artifact in ('git on HEAD','Receiving objects','Compressing objects','━'):
                         self.assertNotIn(artifact,screen,'preparation left an indicator on screen')
                     self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
                     shell.groups.clear()
                 finally:f.resume.set()
         f.env=original
@@ -1996,7 +2009,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                     self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
                     self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
                     if outcome=='error': self.assertIn(b'native Git fetch failed',transcript)
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')
     def test_private_remote_objects_do_not_sync_disposable_payloads(self):
@@ -2322,7 +2335,7 @@ if sys.argv[1]=='untracked':
                     cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
                 self.assertEqual(f.git('cat-file','blob',wanted_oid).encode(),wanted)
 
     def large_delta_storage_fixture(self):
@@ -2360,7 +2373,7 @@ print('delta payload verified')
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,direct.stdout)
                 self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
 
     def test_delta_decode_and_rewrite_succeed_on_nine_mib_tmpfs(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
@@ -2686,7 +2699,7 @@ os.execv(native,[native,*args])
         self.assertFalse(mounted())
         self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertTrue(select.select([master_fd],[],[],5)[0],'recorded owned master survived stale recovery')
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def test_real_mount_all_handled_signals_close_owned_ssh_and_remove_state(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
@@ -2701,7 +2714,7 @@ os.execv(native,[native,*args])
                 deadline=time.monotonic()+20
                 while not ready.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.02)
                 self.assertTrue(ready.exists(),'mounted child never began')
-                child=int(ready.read_text()); directory,=f.root.glob('git-on-*')
+                child=int(ready.read_text()); directory,=run_directories(f.root)
                 control=['ssh','-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
                 self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
                 try:
@@ -2744,7 +2757,7 @@ os.execv(native,[native,*args])
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(helper_fd,signal.SIGKILL)
             process.communicate(timeout=10)
             if directory is None:
-                candidates=list(f.root.glob('git-on-*'))
+                candidates=run_directories(f.root)
                 if len(candidates)==1: directory=candidates[0]
             if directory is not None and directory.exists():
                 subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
@@ -2862,7 +2875,7 @@ os.execv(native,[native,*args])
             if directory is not None:
                 stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(stale.returncode,0,stale.stderr)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def stalled_mount_shutdown(self, binary, escaped, expect_old):
         f=self.f; url=self.stall_url
@@ -2993,7 +3006,7 @@ signal.pause()
                 self.assertEqual(result.returncode,125,result.stderr)
                 self.assertIn(b'remote object loading failed',result.stderr)
                 self.assertIn(b'execution incomplete',result.stderr)
-                self.assertEqual(list(f.root.glob('git-on-*')),[])
+                self.assertEqual(run_directories(f.root),[])
 
     def ignore_policy_fixture(self):
         f=self.f
@@ -3029,14 +3042,14 @@ signal.pause()
                             self.assertTrue(any(f.ignore in request['wants'] and request.get('status')==403 for request in f.requests),f.requests)
                             self.assertIn(f.ignore.encode(),result.stderr)
                         else: self.assertIn(b'remote object loading failed',result.stderr)
-                        self.assertEqual(list(f.root.glob('git-on-*')),[])
+                        self.assertEqual(run_directories(f.root),[])
                         print('ignore acquisition errno regression evidence:',json.dumps(dict(binary=str(binary),before=expected==errno.EROFS,fault=fault,operation=operation,errno=expected)),flush=True)
         # With healthy rules, policy denial retains its distinct EROFS meaning.
         f.denied_oids.clear(); shutil.rmtree(f.root/'cache',ignore_errors=True)
         code="import errno,os\nfor operation in (lambda: os.open('denied',os.O_CREAT|os.O_WRONLY,0o600),lambda: os.mkdir('denied-dir')):\n try: operation()\n except OSError as error: assert error.errno==errno.EROFS,error\n else: raise AssertionError('unignored mutation allowed')\nfd=os.open('created.tmp',os.O_CREAT|os.O_WRONLY,0o600); os.close(fd)\nos.mkdir('created-dir')\n"
         result=subprocess.run([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
     def test_real_mount_delayed_ignore_acquisition_preserves_policy(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
@@ -3068,7 +3081,7 @@ signal.pause()
                     self.assertTrue(handled.exists())
                     self.assertEqual(observed.read_text(),str(allowed))
                     self.assertNotIn(b'execution incomplete',errors)
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
                 finally:
                     f.resume.set();f.stalled_oids.clear()
                     if process.poll() is None:
@@ -3140,6 +3153,6 @@ signal.pause()
             self.assertEqual(result.returncode,125,result.stderr)
             self.assertTrue(b'execution forbidden' in result.stderr or b'raw trees' in result.stderr,result.stderr)
             self.assertFalse(sentinel.exists())
-            self.assertEqual(list(f.root.glob('git-on-*')),[])
+            self.assertEqual(run_directories(f.root),[])
 
 if __name__=='__main__': unittest.main(argv=[__file__,*ARGS])

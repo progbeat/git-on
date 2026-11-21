@@ -129,7 +129,7 @@ pub struct StartupProgress {
     _directory: Option<tempfile::TempDir>,
 }
 impl StartupProgress {
-    pub fn start(invoked: Instant, revision: &OsStr) -> Result<Self> {
+    pub fn start(invoked: Instant, revision: &OsStr, run: &Path) -> Result<Self> {
         PREPARING.store(true, Ordering::Release);
         let tty = OpenOptions::new()
             .read(true)
@@ -142,8 +142,10 @@ impl StartupProgress {
         let mut original_stop = None;
         if tty.is_some() {
             let private = tempfile::Builder::new()
-                .prefix(".git-on-terminal-")
-                .tempdir()?;
+                // Keep askpass paths within the old flat layout's length.
+                .prefix("t")
+                .rand_bytes(3)
+                .tempdir_in(run)?;
             let environment: Environment = ENVIRONMENT
                 .iter()
                 .map(|key| std::env::var_os(key).map(|value| value.as_bytes().to_vec()))
