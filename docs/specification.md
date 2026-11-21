@@ -239,21 +239,23 @@ and complete in-memory copies of the selected tree.
    A lookup in an
    unopened directory may load only the necessary blob headers, applicable
    ignore files, and required Git object decoding.
-4. Git storage encoding may require decoding a whole object or its delta bases,
-   even for a partial read. Remote read-ahead uses the already parsed directory
+4. Assume individual Git objects fit in RAM. A lazy read may decode and verify
+   a whole object even for a partial read. Git storage encoding may also require
+   decoding delta bases. Remote read-ahead uses the already parsed directory
    view and does not open additional trees. Measurements distinguish requested
    objects, speculative transfers, and necessary storage-level decoding.
 5. Write-policy checks must load applicable pinned ignore rules on demand and
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.
 6. Repeated operations should reuse useful decoded data instead of repeatedly
-   decoding the same objects. Decoded memory caching must have an explicit bounded retention
-   policy; walking many files must not retain every payload indefinitely.
-   Active reads and unavoidable object decoding are accounted for separately.
-7. Account for the block LRU, hot whole blobs, active operations and metadata
-   separately. Keep prepared Git objects immutable and create private backing
-   on the first content change. Reading an unchanged Git object verifies its
-   bytes. Copy-up and I/O on the private file use ordinary filesystem operations.
+   decoding the same objects. Bound the block LRU by bytes and the hot whole-blob
+   LRU by object count. Account for active reads, decoding, and metadata
+   separately from those caches.
+7. Keep prepared Git objects immutable and verify the bytes served from them.
+   The first successful content change switches the file to private writable
+   backing. Copy-up uses an ordinary filesystem copy or clone. The entire
+   private file uses ordinary filesystem I/O, including bytes retained from
+   the source. Block authentication is confined to immutable source reads.
    If the same command can finish with two checked-out copies of the selected
    revision on disk, Git-on must be able to run it too.
 8. Failures discovered in objects reached on demand must be reported through

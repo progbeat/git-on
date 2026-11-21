@@ -51,8 +51,9 @@ from an ordinary local copy of the repository?
 running a script from a large monorepo can happen almost instantly without
 materializing the whole repository before execution.
 
-Large files also need to be taken into account. Preferably, they should be read
-and written to the cache as streams rather than loaded entirely into RAM.
+Assume individual Git objects fit in RAM. A lazy read can decode and verify a
+whole blob, even for a partial read. Keeping a few large blobs in RAM lets the
+command read them before they have to be written to temporary storage.
 
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
@@ -89,7 +90,13 @@ deprecation practices so that users know what to expect.
 
 **Question:** What integrity guarantees must Git-on provide?
 
-**Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
+**Answer:** Verify each Git object against its OID before exposing its
+contents. Reads of an unchanged Git object must preserve this guarantee
+despite tampering with temporary storage by unprivileged processes. On a
+mount, the first successful content change switches the file to private
+writable storage. Copy-up and subsequent reads of that file use ordinary
+filesystem I/O, including for bytes retained from the source. Root and access
+to Git-on's process memory are outside the threat model.
 
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 

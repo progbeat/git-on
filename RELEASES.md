@@ -2,7 +2,8 @@
 <!-- Bump: patch -->
 
 - Serve recently read large Git blobs from RAM and spill them on eviction.
-  Verify bytes read back from disk by block using BLAKE3.
+  Verify bytes read back from disk by block using BLAKE3. Retry a failed
+  background spill when the next large blob enters the cache.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
 - Use larger fetch batches when reads confirm a scan, including on fast

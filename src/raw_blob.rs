@@ -261,6 +261,9 @@ impl RawBlob {
         } else {
             None
         };
+        // A writer can change any byte in the private copy, including retained
+        // bytes. Keep block authentication on immutable reads so copy-up can
+        // clone the source without reading its contents.
         let (mut output, cloned) = open_copy(&parent, &name, input.as_deref())?;
         let copied = (|| -> Result<()> {
             if let Some(input) = input {
@@ -503,6 +506,8 @@ struct WriteMetrics {
     bytes: AtomicU64,
     #[cfg(test)]
     on_spill: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    fail_write_after: Mutex<Option<usize>>,
 }
 
 struct RawWriter<'a> {
@@ -512,7 +517,22 @@ struct RawWriter<'a> {
 impl Write for RawWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.totals.calls.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        let mut allowance = self.totals.fail_write_after.lock().unwrap();
+        #[cfg(test)]
+        let bytes = match *allowance {
+            Some(0) => {
+                *allowance = None;
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            Some(remaining) => &bytes[..bytes.len().min(remaining)],
+            None => bytes,
+        };
         let count = self.file.write(bytes)?;
+        #[cfg(test)]
+        if let Some(remaining) = allowance.as_mut() {
+            *remaining -= count;
+        }
         self.totals.bytes.fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
     }
@@ -576,13 +596,12 @@ struct HotWriter {
 }
 
 impl HotWriter {
-    fn wait(&mut self) -> Result<()> {
-        if let Some(pending) = self.pending.take() {
-            pending
-                .recv()
-                .context("verified blob spill worker stopped")??;
+    // A stopped worker is distinct from a write failure that can be retried.
+    fn wait(&mut self) -> Result<Result<()>> {
+        match self.pending.take() {
+            Some(pending) => pending.recv().context("verified blob spill worker stopped"),
+            None => Ok(Ok(())),
         }
-        Ok(())
     }
 
     fn submit(
@@ -847,6 +866,9 @@ impl RawBlobs {
     }
     pub(crate) fn insert(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
         self.insert_blob(oid, size, true, None, || {
+            // Lazy reads assume each blob fits in RAM. Verifying the whole
+            // blob in memory lets even the first range read use that buffer
+            // before any spill. The hot cache limits retention by blob count.
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
@@ -1088,15 +1110,18 @@ impl RawBlobs {
     }
 
     fn complete_eviction(&self, writer: &mut HotWriter) -> Result<MutexGuard<'_, Store>> {
-        writer.wait()?;
+        let previous_write = writer.wait()?;
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((oid, bytes)) = &store.spilling {
             // Keep the verified victim readable after a failed spill and
             // retry that write before allowing another eviction.
+            crate::object::check_transfer()?;
             writer.submit(&self.state, &store, *oid, bytes.clone())?;
             drop(store);
-            writer.wait()?;
+            writer.wait()??;
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        } else {
+            previous_write?;
         }
         Ok(store)
     }
@@ -1245,7 +1270,7 @@ impl RawBlobs {
     }
     #[cfg(test)]
     fn wait_for_spill(&self) -> Result<()> {
-        self.hot_writer.lock().unwrap().wait()
+        self.hot_writer.lock().unwrap().wait()?
     }
     #[cfg(test)]
     fn disk_only(directory: &Path) -> Result<Self> {
@@ -2165,6 +2190,82 @@ mod tests {
             drop(busy);
             assert!(entered && served && promoted);
         });
+    }
+
+    #[test]
+    fn hot_spill_retries_a_partial_write_on_the_next_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let writes = {
+            let mut state = store.state.lock().unwrap();
+            state.hot_limit = 1;
+            state.directory.writes.clone()
+        };
+        let insert = |store: &mut RawBlobs, byte| {
+            let bytes = vec![byte; BLOCK + 1];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            store.insert(oid, bytes.len(), bytes.as_slice())
+        };
+        let victim = insert(&mut store, b'a').unwrap();
+        *writes.fail_write_after.lock().unwrap() = Some(3);
+
+        insert(&mut store, b'b').unwrap();
+        assert!(!victim.on_disk());
+        assert_eq!(victim.read(0, 1).unwrap(), b"a");
+
+        insert(&mut store, b'c').unwrap();
+        assert!(victim.on_disk());
+        assert_eq!(victim.read_all().unwrap(), vec![b'a'; BLOCK + 1]);
+        store.wait_for_spill().unwrap();
+        assert_eq!(
+            writes.bytes.load(Ordering::Relaxed),
+            (3 + 2 * (BLOCK + 1)) as u64
+        );
+    }
+
+    #[test]
+    fn cancelled_hot_spill_does_not_poison_the_store() {
+        const CHILD: &str = "GIT_ON_TEST_CANCELLED_SPILL_CHILD";
+        // The shutdown latch is process-wide.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "raw_blob::tests::cancelled_hot_spill_does_not_poison_the_store",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        {
+            let mut state = store.state.lock().unwrap();
+            state.hot_limit = 1;
+            *state.directory.writes.on_spill.lock().unwrap() =
+                Some(Box::new(crate::git::stop_operations));
+        }
+        let admit = |store: &mut RawBlobs, byte| {
+            let bytes = vec![byte; BLOCK + 1];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            store.insert_verified_bytes(oid, bytes, None, || true, || {})
+        };
+        admit(&mut store, b'a').unwrap();
+        admit(&mut store, b'b').unwrap();
+
+        // Reopening the file for a retry would mask the worker's cancellation.
+        store.state.lock().unwrap().directory.spill_error = Some(libc::EMFILE);
+        let error = admit(&mut store, b'c').unwrap_err();
+        assert!(crate::object::is_cancelled(&error), "{error:#}");
+        assert_eq!(store.failure(), None);
     }
 
     #[test]

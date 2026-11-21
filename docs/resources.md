@@ -6,14 +6,17 @@ Each invocation owns its prepared objects and temporary storage. A 16 MiB
 block LRU charges allocation capacity plus 512 bytes per retained entry. It
 holds whole blobs up to 64 KiB and at most one recently read block per spilled
 blob. A separate LRU retains the eight most recently used larger blobs whole.
-Newly verified larger blobs enter this cache. A hot read uses the verified
-buffer without writing a raw file.
+Newly verified larger blobs enter this cache so the first read can use the
+decoded buffer without writing and rereading a raw file. Even a partial read
+can require a whole blob in RAM. The hot cache bounds the number of retained
+blobs, so its memory use depends on their combined sizes.
 
 Eviction spills verified data to private backing when needed. One large spill
-can run in the background while readers use verified buffers. Another large
-admission can wait for that spill once the hot cache is full. HTTPS and SSH
-decoders reserve an active buffer before inflating a large blob. One of the
-eight buffers stays available for required reads when prefetches occupy the rest.
+can run in the background while readers use verified buffers. If that write
+fails, the blob stays readable in RAM and the next large-blob admission
+retries it before starting another eviction. HTTPS and SSH decoders reserve
+an active buffer before inflating a large blob. One of the eight buffers stays
+available for required reads when prefetches occupy the rest.
 A read can use its verified buffer while placement waits, including after
 joining an in-progress prefetch. Network requests can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without
@@ -75,10 +78,10 @@ On native mounts, metadata and namespace changes preserve the source OID.
 Writable opens, empty writes and unchanged-size truncation leave the source
 payload untouched. The first content change installs a private file after
 the change succeeds. Copy-up uses a filesystem clone when available and copies
-the retained bytes otherwise. Truncating to zero starts empty. All handles of
-the inode then see its private data through ordinary I/O. Eligible Linux FUSE
-opens can use passthrough after copy-up. Block authentication applies when
-reading the immutable cache entry.
+the retained bytes directly otherwise. Truncating to zero starts empty. An
+allowed writer can change any part of the private file, so all its bytes use
+ordinary I/O, including bytes retained from the source. All handles of the
+inode then see the private data. Eligible Linux FUSE opens can use passthrough.
 
 Unlink preserves open or looked-up inodes until their last reference is
 released. The immutable source remains reusable from the cache for the
@@ -100,17 +103,19 @@ strict native verification before Git work or threads. Only a typed owned ODB
 blob with matching identity/type can reuse that proof. Streams and builds
 without that policy use independent verification.
 
-Trusted block hashes are formed from the same verified bytes. A reload from
-mutable temporary storage checks complete intersecting 64 KiB blocks and returns
-bytes from those checked buffers. Length changes, reordering, substitution and
-same-UID disk tampering fail before changed bytes are served. Resident verified
-bytes are not hashed again on every read. Root access and interference with
-process memory are outside the threat model.
+Trusted block hashes are formed from the same verified bytes. When reading a
+spilled immutable Git object from disk, Git-on checks its length and the
+complete intersecting 64 KiB blocks and returns bytes from those checked
+buffers. Length changes, reordering, substitution and same-UID disk tampering
+fail before changed bytes are served. Resident verified bytes are reused
+directly. Root access and interference with process memory are outside the
+threat model.
 
 ## Verification requirements
 
 - Raw-store tests cover identity, length and block corruption, failed publication,
-  eviction, active readers, large-object streaming and inherited file-size limits.
+  eviction, active readers, retry after a partial background write and inherited
+  file-size limits.
 - Remote, SSH and lifecycle tests check transport reuse, cancellation, cleanup
   and reduced descriptor limits.
 - Object and metadata reuse tests check exact results, source demands, bounded
