@@ -26,9 +26,10 @@ Several unusually large blobs can exhaust a tight process memory limit.
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. If that write
 fails, the blob stays readable in RAM and the next large-blob admission
-retries it before starting another eviction. HTTPS and SSH decoders reserve
-an active buffer before inflating a large blob. One of the eight buffers stays
-available for required reads when prefetches occupy the rest.
+retries it before starting another eviction. Incremental HTTPS and SSH pack
+decoders reserve a decode slot before inflating a large blob. One of the
+eight slots stays available for required reads when prefetches occupy the
+rest. Native pack fallback can allocate whole-blob buffers outside those slots.
 A read can use its verified buffer while placement waits, including after
 joining an in-progress prefetch. Network requests can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without
