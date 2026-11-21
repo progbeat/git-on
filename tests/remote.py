@@ -1999,10 +1999,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor observation')
     def test_session_keeps_descriptors_bounded_after_raw_blobs_spill(self):
-        import hashlib,resource
-        f=self.f;count=140;size=65537;entries=[]
+        import resource
+        # Leave more than 64 on disk with eight hot blobs and one pending spill.
+        f=self.f;count=74;size=64*1024+1;entries=[]
         for index in range(count):
-            data=hashlib.shake_256(f'session-parts:{index}'.encode()).digest(size)
+            data=(index+1).to_bytes(4,'little')+bytes(size-4)
             oid=f.git('hash-object','-w','--stdin',data=data)
             entries.append(f'100644 blob {oid}\tf{index:04d}\n')
         tree=f.git('mktree',data=''.join(entries).encode())
@@ -2013,11 +2014,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
             env=f.env,preexec_fn=limit_descriptors,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         f.children.append(process);f.line(process)
         for index in range(count):
-            value,last=f.operation(process,f'range 0 32 f{index:04d}')
-            self.assertEqual(value['bytes'],list(hashlib.shake_256(f'session-parts:{index}'.encode()).digest(32)))
+            value,_=f.operation(process,f'range 0 4 f{index:04d}')
+            self.assertEqual(value['bytes'],list((index+1).to_bytes(4,'little')))
             f.operation(process,'release')
-        value,again=f.operation(process,'range 0 32 f0000')
-        self.assertEqual(value['bytes'],list(hashlib.shake_256(b'session-parts:0').digest(32)))
+        value,again=f.operation(process,'range 0 4 f0000')
+        self.assertEqual(value['bytes'],[1,0,0,0])
         self.assertEqual(again['metrics']['blob_loads'],count)
         self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+1)
         self.assertEqual(again['metrics']['remote_session_decode_operations'],count+1)

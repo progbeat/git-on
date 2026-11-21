@@ -307,6 +307,19 @@ No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
 hardware, software, storage, cache state, fixture shape, and the tested revision.
 
+## Storage and buffer requirements for the target design
+
+1. Disk is used exclusively for objects evicted from the LRU cache. Git-on
+   and its helper processes use disk only to write, read, or delete those
+   objects.
+2. Immutable data already in RAM is used without copying on every execution
+   path. Components borrow existing buffers or transfer ownership of them
+   without copying their contents.
+
+The preceding sections describe the current behavior contract. The target
+design must reconcile local Git storage, native Git staging, the writable
+layer, eager materialization, and crash recovery with these requirements.
+
 ## Acceptance evidence
 
 The following checks establish the lazy contract independently of ordinary

@@ -9,7 +9,7 @@
 | Payload and ignore-rule retention | `lru` | A byte-accounted 16 MiB payload LRU with one entry per original OID; an eight-entry hot blob LRU and a separate 4 MiB / 128-entry compiled-rule LRU. Metadata and active decoder/read allocations are accounted separately. |
 | Directory metadata | Standard maps, shared immutable structures and scoped merged views | Parse demanded trees once, support direct name lookup and stable active enumeration versions, and retain only issued inode references. |
 | Pack inflation | `flate2` with zlib | Incremental decoding requires stream completion, exact framing and canonical OID verification. Necessary delta dependencies retain native handling. |
-| Temporary files | `tempfile` and anchored no-follow file operations | Invocation ownership, inherited file/descriptor limits, failure cleanup and same-UID tamper protection apply to every storage path. |
+| Temporary files | `tempfile` and anchored no-follow file operations | Invocation ownership, descriptor limits, and cleanup apply to temporary files. Block authentication protects immutable source reads. Private backing uses ordinary filesystem I/O. |
 | Cancellation and children | `signal-hook` and scoped native process ownership | Signals and shutdown preserve owned-child cleanup and documented recovery behavior. |
 | Remote sessions | Native Git upload-pack, HTTP helper and SSH transport with bounded protocol framing | Reuse invocation-owned sessions and prepared objects. Unsupported protocols or native policy settings use the compatibility path. |
 
