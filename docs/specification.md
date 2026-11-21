@@ -77,6 +77,10 @@ is part of this bug fix; it does not require a major version increment.
   are confined to the private repository. Existing object-demand, filter,
   cancellation, SSH ownership, cache and filesystem contracts still apply;
   materialization cannot bypass any Git resolution, verification or object error.
+- Git-on accesses the caller's local object database read-only and retains the
+  selected tree OID in memory for the invocation. If external repository
+  maintenance removes an unread object, the operation that needs it reports the
+  source error.
 - Native operations use the caller's Git configuration and object-location
   environment. Resolve local revisions and read the objects from the same
   Git-selected object database, including object directories and alternates.
@@ -136,7 +140,7 @@ The native mount and write-policy contracts apply to local and remote runs.
   does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
   cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, releasing the exact Git pin and identifying the owned SSH socket;
+  locking, releasing a recorded Git pin and identifying the owned SSH socket;
   it is not a run manifest or log.
   `git on --cleanup <temporary-directory>` must refuse active directories, avoid unrelated mounts and changed pin targets, and
   never terminate processes based on stale PIDs.

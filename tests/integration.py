@@ -2745,6 +2745,7 @@ assert p.exists()
             self.assertIsNotNone(run)
             self.assertEqual(run, Path(runfile.read_text()))
             self.assertIn(os.fsencode(run), result.stderr)
+            self.assertNotIn(b"pin preserved", result.stderr)
             # A disconnected FUSE mount returns ENOTCONN to stat(), so
             # os.path.ismount misleadingly reports false. Inspect mountinfo.
             if sys.platform == "darwin":
@@ -2755,7 +2756,7 @@ assert p.exists()
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
             self.assertTrue((run / ".state").is_file())
-            self.assertTrue(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+            self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
             cleanup = self.cleanup_run(run)
             if sys.platform == "darwin":
                 self.assert_success(cleanup)  # The checked recovery detaches a dead server.

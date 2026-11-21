@@ -564,14 +564,13 @@ impl State {
 }
 struct Inner {
     state: Mutex<State>,
-    _pin: Pin,
+    pin: Option<Pin>,
 }
-/// Clones share the object caches and pin; there is no all-path index.
+/// Clones share the selected tree and its object caches.
 #[derive(Clone)]
 pub struct Snapshot {
     pub tree_oid: Oid,
     pub git_dir: PathBuf,
-    pub pin_ref: String,
     inner: Arc<Inner>,
 }
 
@@ -608,25 +607,12 @@ impl fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("tree_oid", &self.tree_oid)
             .field("git_dir", &self.git_dir)
-            .field("pin_ref", &self.pin_ref)
+            .field("pin_ref", &self.inner.pin.as_ref().map(|pin| &pin.name))
             .finish_non_exhaustive()
     }
 }
 impl Snapshot {
     pub fn load(repo_path: &Path, treeish: &OsStr, run_id: &str) -> Result<Self> {
-        Self::load_with_pin_record(repo_path, treeish, run_id, |_, _, _| Ok(()))
-    }
-    /// Persist the planned pin before creating it, so interrupted loads are recoverable.
-    /// Resolving/pinning the root is the only startup object work; no tree walk.
-    pub fn load_with_pin_record<F>(
-        repo_path: &Path,
-        treeish: &OsStr,
-        run_id: &str,
-        record: F,
-    ) -> Result<Self>
-    where
-        F: FnMut(&Path, &str, Oid) -> Result<()>,
-    {
         Self::load_source_with_pin_record(
             repo_path,
             None,
@@ -635,9 +621,11 @@ impl Snapshot {
             false,
             &std::env::temp_dir(),
             run_id,
-            record,
+            |_, _, _| Ok(()),
         )
     }
+    /// Record a private remote pin before creating it so cleanup can recover it.
+    /// A local snapshot retains its tree OID in memory and reads the source as is.
     #[allow(clippy::too_many_arguments)]
     pub fn load_source_with_pin_record<F>(
         repo_path: &Path,
@@ -678,11 +666,6 @@ impl Snapshot {
                 &[] as &[&OsStr],
             )
             .context("open selected Git repository and object environment")?;
-            // GIT_NAMESPACE scopes upload-pack/receive-pack refs in native Git,
-            // while libgit2 also applies it to ordinary reference operations.
-            // Keep the GC pin in the same ref namespace as native update-ref,
-            // so normal release and recorded stale cleanup find that pin.
-            repo.remove_namespace()?;
             let bridge = configure_local_object_database(&git, &repo, run_directory)?;
             (repo, None, oid, Some(git), bridge)
         };
@@ -712,41 +695,48 @@ impl Snapshot {
             ensure(&mut remote, selected)?;
             match kind(&remote, selected)? {
                 ObjectType::Tree => break selected,
-                ObjectType::Commit => break repo.find_commit(selected)?.tree_id(),
+                ObjectType::Commit => {
+                    let tree = repo.find_commit(selected)?.tree_id();
+                    if remote.is_none() {
+                        anyhow::ensure!(
+                            repo.odb()?.read_header(tree)?.1 == ObjectType::Tree,
+                            "snapshot root is not a Git tree"
+                        );
+                    }
+                    break tree;
+                }
                 ObjectType::Tag => selected = repo.find_tag(selected)?.target_id(),
                 _ => bail!("revision does not resolve to a tree"),
             }
         };
-        // libgit2 requires a reference target to exist. Fetch only the selected
-        // root tree, not its descendants, before installing the GC pin.
-        ensure(&mut remote, tree_oid)?;
-        let pin_ref = format!("refs/git-on/{run_id}");
-        if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
-            bail!("invalid snapshot run ID");
-        }
-        // Ordinary refs live in the common directory, including an explicit
-        // GIT_COMMON_DIR override. Record that actual owner so release/recovery
-        // do not require the original process environment to find the pin.
-        let pin_git_dir = repo
-            .commondir()
-            .canonicalize()
-            .context("resolve pin reference storage")?;
-        record(&pin_git_dir, &pin_ref, tree_oid)?;
-        repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
-            .context("pin snapshot tree against garbage collection")?;
-        if let Some(remote) = &mut remote {
+        let pin = if let Some(remote) = &mut remote {
+            // A private reference requires the root to exist. Fetch it alone
+            // so directory traversal can still wait for actual access.
+            remote.ensure_in(&repo, tree_oid)?;
+            let pin_ref = format!("refs/git-on/{run_id}");
+            if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
+                bail!("invalid snapshot run ID");
+            }
+            let pin_git_dir = repo
+                .commondir()
+                .canonicalize()
+                .context("resolve pin reference storage")?;
+            record(&pin_git_dir, &pin_ref, tree_oid)?;
+            repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
+                .context("pin snapshot in its private Git repository")?;
             remote.root_pinned();
-        }
-        let git_dir = repo.path().to_path_buf();
-        let pin = Pin {
-            git_dir: pin_git_dir,
-            name: pin_ref.clone(),
-            oid: tree_oid,
+            Some(Pin {
+                git_dir: pin_git_dir,
+                name: pin_ref,
+                oid: tree_oid,
+            })
+        } else {
+            None
         };
+        let git_dir = repo.path().to_path_buf();
         Ok(Self {
             tree_oid,
             git_dir,
-            pin_ref,
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     repo,
@@ -761,7 +751,7 @@ impl Snapshot {
                     spool_directory: run_directory.to_path_buf(),
                     _local_object_bridge: local_bridge,
                 }),
-                _pin: pin,
+                pin,
             }),
         })
     }
@@ -1488,7 +1478,7 @@ mod tests {
         assert_eq!(snapshot.metrics().retained_raw_blob_bytes, 0);
     }
     #[test]
-    fn reads_objects_modes_links_and_cleans_pin() {
+    fn reads_objects_modes_and_links_from_an_unchanged_repository() {
         let (tmp, oid) = fixture();
         std::fs::write(tmp.path().join("script"), b"dirty checkout").unwrap();
         let snap = Snapshot::load(tmp.path(), OsStr::new("HEAD"), "test-pin").unwrap();
@@ -1506,18 +1496,10 @@ mod tests {
         assert_eq!(link.kind, EntryKind::Symlink);
         assert_eq!(snap.read_link(link.oid).unwrap(), b"script");
         let repo = Repository::open(tmp.path()).unwrap();
-        assert_eq!(
-            repo.find_reference("refs/git-on/test-pin")
-                .unwrap()
-                .target(),
-            Some(oid)
-        );
-        assert!(Snapshot::load(tmp.path(), OsStr::new("HEAD"), "test-pin").is_err());
+        assert!(repo.find_reference("refs/git-on/test-pin").is_err());
         let shared = snap.clone();
         drop(snap);
-        assert!(repo.find_reference("refs/git-on/test-pin").is_ok());
-        drop(shared);
-        assert!(repo.find_reference("refs/git-on/test-pin").is_err());
+        assert_eq!(shared.read_link(link.oid).unwrap(), b"script");
         assert_eq!(
             std::fs::read(tmp.path().join("script")).unwrap(),
             b"dirty checkout"
@@ -1575,9 +1557,6 @@ mod tests {
                 assert_eq!(child.unwrap().oid, entry.oid);
                 assert!(snap.read(entry.oid, 20, 1).is_err());
             }
-            assert!(repo.find_reference("refs/git-on/demand").is_ok());
-            drop(snap);
-            assert!(repo.find_reference("refs/git-on/demand").is_err());
         }
     }
     #[test]
@@ -1729,20 +1708,41 @@ mod tests {
     #[test]
     fn durable_pin_record_precedes_pin_and_failed_record_leaves_no_reference() {
         let (tmp, oid) = fixture();
+        let run = TempDir::new().unwrap();
         let repo = Repository::open(tmp.path()).unwrap();
-        let result = Snapshot::load_with_pin_record(
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowFilter", true)
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("uploadpack.allowAnySHA1InWant", true)
+            .unwrap();
+        let private = run.path().canonicalize().unwrap().join("remote-repository");
+        let result = Snapshot::load_source_with_pin_record(
             tmp.path(),
-            OsStr::new(&oid.to_string()),
+            Some(tmp.path().as_os_str()),
+            OsStr::new("HEAD"),
+            false,
+            false,
+            run.path(),
             "record",
             |dir, pin, tree| {
-                assert_eq!(dir, repo.path());
+                assert_eq!(dir, private);
                 assert_eq!(tree, oid);
-                assert!(repo.find_reference(pin).is_err());
+                assert!(Repository::open_bare(dir)
+                    .unwrap()
+                    .find_reference(pin)
+                    .is_err());
                 anyhow::bail!("simulated manifest failure")
             },
         );
         assert!(result.unwrap_err().to_string().contains("manifest failure"));
         assert!(repo.find_reference("refs/git-on/record").is_err());
+        assert!(Repository::open_bare(private)
+            .unwrap()
+            .find_reference("refs/git-on/record")
+            .is_err());
     }
     #[test]
     fn startup_listing_lookup_and_read_are_separately_lazy() {

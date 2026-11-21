@@ -322,16 +322,13 @@ mod tests {
         assert_eq!(snapshot.metrics().tree_reads, 2);
     }
     #[test]
-    fn policy_owns_pin_and_errors_fail_closed() {
-        let (tmp, snapshot, policy) = fixture("*\n", "");
-        let repo = Repository::open(tmp.path()).unwrap();
+    fn policy_retains_the_snapshot_and_errors_fail_closed() {
+        let (_tmp, snapshot, policy) = fixture("*\n", "");
         drop(snapshot);
-        assert!(repo.find_reference("refs/git-on/policy").is_ok());
         assert!(!policy.allows(Path::new("nested/existing.log/child"), false));
         assert!(!policy.allows(Path::new("nested/existing.log"), false));
         assert!(policy.allows(Path::new("untracked"), false));
         drop(policy);
-        assert!(repo.find_reference("refs/git-on/policy").is_err());
         for content in [
             b"*\n".as_slice(),
             b"version https://git-lfs.github.com/spec/v1\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsize 123\n",

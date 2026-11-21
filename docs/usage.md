@@ -185,20 +185,21 @@ git-on does not drain or wait for captured-output pipes because it creates none.
 detached process outside the managed group can still retain inherited descriptors;
 git-on is a foreground runner, not a service daemonizer or host process sandbox.
 
-Git trees are pinned under `refs/git-on/<id>` while in use. Normal completion unmounts,
-releases the pin, and removes temporary state. A busy mount or abrupt termination can leave a temporary
-directory, mount, and pin; minimal private recovery metadata allows checked cleanup
-without keeping execution logs or a run manifest:
+Local runs keep the selected tree ID in memory and read the source repository.
+If external maintenance deletes an object needed later, git-on reports the read
+failure. Remote runs can hold a reference in their private temporary repository.
+Normal completion unmounts and removes temporary state. A busy mount or abrupt
+termination can leave a temporary directory or mount. Minimal recovery metadata
+allows checked cleanup.
 
 ```sh
 git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run, will only
-unmount a matching git-on filesystem, and checks the pin's exact target before deleting
-it. A busy stale mount requires stopping processes using it first. Cleanup does not kill
-processes by stale PID. A surviving pin intentionally prevents garbage collection until
-cleanup releases it.
+Cleanup refuses an active locked run, unmounts only a matching git-on filesystem,
+and checks the exact target of any pin recorded by this release or an older one
+before releasing it. A busy stale mount requires stopping processes using it first.
+Cleanup does not kill processes by stale PID.
 
 SIGKILL is uncatchable and does not forward a signal to the command. The command
 may keep running in its own process group. git-on does not enable FUSE
@@ -212,10 +213,10 @@ not stop surviving commands or infer process ownership from old PIDs.
 ## Lazy access and performance
 
 The [behavioral and performance specification](specification.md) defines the contract.
-Startup resolves and pins the selected tree and mounts its root; it does not recursively
-enumerate the source. Lookup loads ancestor directory metadata and the requested blob
-header, directory listing loads only that directory, and read loads the requested
-content. Write checks load only applicable pinned ignore files.
+Native mounts start from the selected tree OID and load metadata on demand.
+Lookup loads ancestor directory metadata and the requested blob header. A
+directory listing loads only that directory. Reads load the requested content.
+Write checks load only applicable pinned ignore files.
 
 The 16 MiB block cache holds small blobs and individual blocks of spilled
 files. Newly verified large blobs enter a separate eight-entry LRU whole

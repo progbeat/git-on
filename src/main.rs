@@ -225,9 +225,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            bail!(
-                "mount is busy or unmount failed; transient data and pin preserved for --cleanup"
-            );
+            bail!("mount is busy or unmount failed; recovery state preserved for --cleanup");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -718,7 +716,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .env("GIT_ON_TREE_OID", state.tree_oid.as_ref().unwrap());
+            .env("GIT_ON_TREE_OID", snapshot.tree_oid.to_string());
         let mut terminal = Terminal::capture();
         let tty_fd = terminal.descriptor();
         let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() });

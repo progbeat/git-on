@@ -112,3 +112,12 @@ cannot be met at the same time.
 
 **Answer:** Exceeding available RAM is outside the practical workloads Git-on
 should support. Git-on should leave process limits to the host.
+
+**Question:** Which contract should remain for `git gc` and crash recovery with
+`--cleanup`? In a test, `git gc --prune=now` removed an object the snapshot
+needed when no Git ref had been written. A separate `--cleanup` after `SIGKILL`
+uses the saved record to find the ref and check its target.
+
+**Answer:** I do not understand what this has to do with git on. Git on is for
+temporary materialization and must have no permanent effect on repositories or
+on the system as a whole.

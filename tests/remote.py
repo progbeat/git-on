@@ -704,7 +704,7 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             self.assertEqual(result.stdout,b'expected\n')
             self.assertEqual(refs(),before)
             self.assertEqual(list(f.root.glob('git-on-*')),[])
-    def test_local_common_directory_reads_and_releases_pins_in_the_native_repository(self):
+    def test_local_common_directory_reads_without_changing_native_repository_refs(self):
         f=self.f; f.cwd=f.repo; unscoped=dict(f.env); common=f.root/'common.git'
         run(['git','clone','--bare','--no-local','--quiet',f.repo,common],env=f.env)
         f.git('config','user.name','Common Repository',at=common)
@@ -721,17 +721,21 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
         self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
         process=f.probe('local',commit)
         self.assertEqual(f.line(process)['tree'],tree)
+        for repository in before: self.assertEqual(refs(repository),before[repository])
         value,_=f.operation(process,'read file')
         self.assertEqual(value['data'],'common repository\n'); f.finish(process)
         for repository in before: self.assertEqual(refs(repository),before[repository])
-        if OPTIONS.require_fuse:
+        if OPTIONS.require_fuse or OPTIONS.require_nfs:
             result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
                                   cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout,b'common repository\n')
             for repository in before: self.assertEqual(refs(repository),before[repository])
             ready=f.root/'common-ready'
-            code=f'import os,time; from pathlib import Path; assert Path("file").read_text() == "common repository\\n"; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(30)'
+            code=(f'import os,time; from pathlib import Path; '
+                  f'assert Path("file").read_text() == "common repository\\n"; '
+                  f'ready=Path({str(ready)!r}); pending=ready.with_suffix(".new"); '
+                  f'pending.write_text(str(os.getpid())); pending.replace(ready); time.sleep(30)')
             process=subprocess.Popen([str(OPTIONS.binary),commit,'--',sys.executable,'-c',code],
                                      cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             f.children.append(process)
@@ -740,13 +744,17 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
             self.assertTrue(ready.exists(),'common-directory snapshot did not execute its command')
             child=int(ready.read_text()); runs=list(f.root.glob('git-on-*'))
             self.assertEqual(len(runs),1)
+            live_refs={repository:refs(repository) for repository in before}
             process.kill(); process.wait(timeout=5)
             with contextlib.suppress(ProcessLookupError): os.kill(child,signal.SIGTERM)
             process.communicate(timeout=5)
+            stale_refs={repository:refs(repository) for repository in before}
             cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(runs[0])],
                                    cwd=f.cwd,env=unscoped,capture_output=True,timeout=15)
             self.assertEqual(cleanup.returncode,0,cleanup.stderr)
             self.assertFalse(runs[0].exists())
+            self.assertEqual(live_refs,before)
+            self.assertEqual(stale_refs,before)
             for repository in before: self.assertEqual(refs(repository),before[repository])
     def test_local_c_quoted_alternate_with_colon_and_non_utf8_path_matches_native_git(self):
         f=self.f; f.cwd=f.repo; objects=f.root/os.fsdecode(b'alternate:objects-\xff'); objects.mkdir()

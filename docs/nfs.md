@@ -51,8 +51,8 @@ consumes an error while flushing buffered writes.
 ## Cleanup
 
 Git-on normally unmounts while the listener and worker still serve the client.
-It then stops the listener, connections and worker before releasing the Git pin
-and deleting the temporary data. If cleanup fails, it reports the retained run
+It then stops the listener, connections and worker before releasing any private
+remote pin and deleting the temporary data. If cleanup fails, it reports the retained run
 directory. Stop processes using the mount, then run
 `git on --cleanup <temporary-directory>`. Cleanup checks recovered run identity
 against the system's NFS mount entries and refuses to delete a directory that
