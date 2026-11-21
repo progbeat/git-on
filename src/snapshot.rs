@@ -131,9 +131,9 @@ struct Pin {
 }
 
 /// libgit2 handles relative object environments before Git's repository setup
-/// and splits alternate paths on every colon. Adapt native Git's selected
-/// locations to private ASCII aliases without copying any objects.
-fn local_object_bridge(
+/// and splits alternate paths on every colon. Configure its ODB with the
+/// object locations selected by native Git.
+fn configure_local_object_database(
     git: &crate::git::Git,
     repo: &Repository,
     run_directory: &Path,
@@ -204,6 +204,27 @@ fn local_object_bridge(
             }
         }
     }
+    if let Some(paths) = locations
+        .iter()
+        .map(|path| path.to_str())
+        .collect::<Option<Vec<_>>>()
+        // Direct ODB backends start at depth zero. Keep the existing bridge
+        // traversal when these locations specify further alternates.
+        .filter(|_| {
+            locations
+                .iter()
+                .all(|path| matches!(path.join("info/alternates").try_exists(), Ok(false)))
+        })
+    {
+        let database = git2::Odb::new()?;
+        for path in paths {
+            database.add_disk_alternate(path)?;
+        }
+        repo.set_odb(&database)?;
+        return Ok(None);
+    }
+    // A repository of aliases preserves the extra traversal step for nested
+    // locations and adapts byte paths to git2's UTF-8 alternate API.
     let bridge = tempfile::Builder::new()
         .prefix("local-object-bridge-")
         .tempdir_in(run_directory)?;
@@ -662,7 +683,7 @@ impl Snapshot {
             // Keep the GC pin in the same ref namespace as native update-ref,
             // so normal release and recorded stale cleanup find that pin.
             repo.remove_namespace()?;
-            let bridge = local_object_bridge(&git, &repo, run_directory)?;
+            let bridge = configure_local_object_database(&git, &repo, run_directory)?;
             (repo, None, oid, Some(git), bridge)
         };
         let ensure = |remote: &mut Option<crate::remote::Remote>, oid| -> Result<()> {

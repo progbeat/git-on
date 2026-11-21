@@ -69,7 +69,12 @@ so inherited output remains writable after the native Git process exits.
 On Linux the handle uses an anonymous memory file when available. Lazy
 decoding fills the object buffer in RAM and verifies the full Git OID before
 serving or spilling it. Reads contained in a resident blob or one authenticated
-block share its buffer with the filesystem backend.
+block share its buffer with the filesystem backend. Reusable pack decoders
+complete split headers before passing the compressed body to zlib by reference.
+The native ref capability check discards the ref listing and retains the
+separate packet trace for compatibility with detached helpers.
+Flat UTF-8 object database overrides configure libgit2 directly. Nested
+alternates and non-UTF-8 paths use temporary aliases for the git2 binding.
 After the root is pinned, remote subtrees are retained as parsed directory
 metadata without writing loose tree objects.
 The host enforces inherited process resource limits. See the

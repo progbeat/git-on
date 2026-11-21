@@ -317,7 +317,7 @@ impl Remote {
             .arg("--")
             .arg(&remote.source)
             .stdin(Stdio::inherit());
-        let outcome = crate::git::run(command, true).context("advertise remote refs");
+        let outcome = crate::git::run_ref_advertisement(command).context("advertise remote refs");
         // Record an established master even if upload-pack or cancellation then
         // fails. The in-memory identity protects Drop; the small private record
         // lets validated stale cleanup identify the same socket after SIGKILL.

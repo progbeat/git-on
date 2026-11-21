@@ -419,7 +419,7 @@ impl Pack<'_> {
         check_transfer(self.stop.as_deref())
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    fn write(&mut self, mut bytes: &[u8]) -> Result<()> {
         if self.count == Some(self.entries) {
             ensure!(
                 bytes.len() <= TRAILER - self.pending.len(),
@@ -428,25 +428,32 @@ impl Pack<'_> {
         }
         self.bytes += bytes.len() as u64;
         self.checksum.update(bytes);
-        // Take complete headers and compressed data from the transport's slice.
-        // Carry the remainder only if a field straddled two writes or the
-        // pack trailer has arrived.
-        if self.pending.is_empty() {
-            let used = self.inflate_entries(bytes)?;
-            self.pending.extend_from_slice(&bytes[used..]);
-            self.consumed += used;
-        } else {
-            let mut pending = std::mem::take(&mut self.pending);
-            pending.extend_from_slice(bytes);
-            let used = self.inflate_entries(&pending)?;
-            pending.drain(..used);
-            self.pending = pending;
-            self.consumed += used;
+        if !self.pending.is_empty() && self.count != Some(self.entries) {
+            // Complete the field that straddles these writes, then let zlib
+            // consume the compressed body directly from the transport slice.
+            let mut prefix = std::mem::take(&mut self.pending);
+            while let Some((&byte, rest)) = bytes.split_first() {
+                prefix.push(byte);
+                let used = self.inflate_entries(&prefix, rest.len())?;
+                prefix.drain(..used);
+                self.consumed += used;
+                bytes = rest;
+                if prefix.is_empty() || self.count == Some(self.entries) {
+                    break;
+                }
+            }
+            self.pending = prefix;
         }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let used = self.inflate_entries(bytes, 0)?;
+        self.pending.extend_from_slice(&bytes[used..]);
+        self.consumed += used;
         Ok(())
     }
 
-    fn inflate_entries(&mut self, input: &[u8]) -> Result<usize> {
+    fn inflate_entries(&mut self, input: &[u8], remaining: usize) -> Result<usize> {
         let mut position = 0;
         let count = match self.count {
             Some(count) => count,
@@ -524,14 +531,14 @@ impl Pack<'_> {
             }
             if self.entries + 1 == count {
                 ensure!(
-                    input.len() - position <= TRAILER,
+                    input.len() - position + remaining <= TRAILER,
                     "oversized Git pack trailer"
                 );
             }
             self.publish_entry()?;
         }
         ensure!(
-            self.entries < count || input.len() - position <= TRAILER,
+            self.entries < count || input.len() - position + remaining <= TRAILER,
             "oversized Git pack trailer"
         );
         Ok(position)
@@ -1136,10 +1143,14 @@ mod tests {
                 Ok(())
             }),
         );
-        for chunk in packet.chunks(4096) {
+        // Leave the first entry's size field incomplete before supplying a
+        // much larger transport chunk containing its compressed payload.
+        let split = 13;
+        response.pack.write(&packet[..split]).unwrap();
+        for chunk in packet[split..].chunks(4096) {
             response.pack.write(chunk).unwrap();
         }
-        assert_eq!(response.pack.pending.capacity(), 0);
+        assert!(response.pack.pending.capacity() <= TRAILER);
         assert!(delivered.load(std::sync::atomic::Ordering::Relaxed));
         response.pack.write(&trailer).unwrap();
         response.pack.finish().unwrap();

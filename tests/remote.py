@@ -432,6 +432,49 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(f.line(process)['tree'],f.tree)
         f.finish(process)
         self.assertEqual(f.git('for-each-ref','--format=%(refname) %(objectname)'),before)
+    def test_native_filter_advertisement_discards_listing_and_preserves_detached_helper(self):
+        f=self.f; native=shutil.which('git'); tools=f.root/'trace-tools'; tools.mkdir()
+        source='file://'+str(f.repo)
+        sink=f.root/'listing-sink'; ready=f.root/'trace-ready'; result=f.root/'trace-result'
+        detached='''import os,subprocess,sys,time
+from pathlib import Path
+git,source,ready,result=sys.argv[1:]; ready,result=Path(ready),Path(result)
+deadline=time.monotonic()+10
+while not ready.exists() and time.monotonic()<deadline: time.sleep(.01)
+if not ready.exists():
+    result.write_bytes(b'timed out waiting for native ref advertisement')
+    raise SystemExit(1)
+os.write(2,b'late diagnostic\\n')
+run=subprocess.run([git,'ls-remote',source,'HEAD'],capture_output=True,close_fds=False,timeout=5)
+pending=result.with_suffix('.new')
+pending.write_bytes(str(run.returncode).encode()+b'\\n'+run.stdout+run.stderr)
+pending.rename(result)
+'''
+        wrapper=tools/'git'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,subprocess,sys
+from pathlib import Path
+args=sys.argv[1:]
+if 'ls-remote' in args and '--symref' in args:
+    with open(os.devnull,'wb') as null:
+        Path({str(sink)!r}).write_text(str(os.path.sameopenfile(1,null.fileno())))
+    subprocess.Popen([sys.executable,'-c',{detached!r},{native!r},{source!r},{str(ready)!r},{str(result)!r}],
+                     stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                     close_fds=False,start_new_session=True)
+os.execv({native!r},[{native!r},*args])
+''')
+        wrapper.chmod(0o700)
+        f.env.update(PATH=str(tools)+os.pathsep+f.env['PATH'],GIT_TRACE_BARE='1')
+        process=f.probe(source)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        ready.touch()
+        deadline=time.monotonic()+10
+        while not result.exists() and time.monotonic()<deadline: time.sleep(.01)
+        self.assertTrue(result.exists(),'detached helper did not finish after ref advertisement')
+        detached_status=result.read_bytes()
+        f.finish(process)
+        self.assertEqual(sink.read_text(),'True')
+        self.assertEqual(detached_status,b'0\n'+f.commit.encode()+b'\tHEAD\n')
     def test_native_fetch_reference_hook_sees_private_refs_and_repository(self):
         f=self.f; f.cwd=f.repo; hooks=f.root/'hooks'; hooks.mkdir(); log=f.root/'hook-log'
         hook=hooks/'reference-transaction'
@@ -816,8 +859,10 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                     f.cwd,f.env=cwd,env
                     process=f.probe('local',commit)
                     self.assertEqual(f.line(process)['tree'],tree)
+                    bridges=list(f.root.glob('*/local-object-bridge-*'))
                     value,_=f.operation(process,'read file')
                     self.assertEqual(value['data'].encode(),payload); f.finish(process)
+                    self.assertEqual(bridges,[])
                     if OPTIONS.require_fuse:
                         result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
                                               cwd=cwd,env=env,capture_output=True,timeout=20)
@@ -856,6 +901,29 @@ os.execv({native!r}, [{native!r}, *sys.argv[1:]])
                         self.assertEqual(result.stdout,b'bare relative alternate\n')
                 finally: f.cwd,f.env=previous_cwd,previous_env
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
+    def test_local_nested_environment_alternates_match_native_git(self):
+        f=self.f; stores=[f.root/f'objects-{index}' for index in range(7)]
+        for store in stores: (store/'info').mkdir(parents=True)
+        for store,following in zip(stores,stores[1:]):
+            (store/'info'/'alternates').write_text(str(following)+'\n')
+        f.env['GIT_OBJECT_DIRECTORY']=str(stores[-1])
+        blob=f.git('hash-object','-w','--stdin',data=b'nested alternate\n')
+        del f.env['GIT_OBJECT_DIRECTORY']
+        tree=f.git('mktree','--missing',data=f'100644 blob {blob}\tleaf\n'.encode())
+        for alternate,accepted in ((stores[0],False),(stores[1],True)):
+            with self.subTest(alternate=alternate.name):
+                env=dict(f.env,GIT_ALTERNATE_OBJECT_DIRECTORIES=str(alternate))
+                native=subprocess.run(['git','cat-file','-p',tree+':leaf'],cwd=f.repo,env=env,
+                                      capture_output=True,timeout=10)
+                self.assertEqual(native.returncode==0,accepted,native.stderr)
+                probe=subprocess.run([OPTIONS.probe,'local',tree,'--metrics-only'],cwd=f.repo,
+                                     env=env,input=b'read leaf\nexit\n',capture_output=True,timeout=10)
+                self.assertEqual(probe.returncode==0,accepted,probe.stderr)
+                if accepted:
+                    self.assertEqual(json.loads(probe.stdout.splitlines()[1])['data'].encode(),native.stdout)
+                else:
+                    self.assertEqual(len(probe.stdout.splitlines()),1)
+                    self.assertIn(b'read blob header',probe.stderr)
     def test_https_fresh_runs_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         wanted={f.commit,f.tree,f.subtree,f.blob}

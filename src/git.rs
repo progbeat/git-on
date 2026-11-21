@@ -372,6 +372,21 @@ pub(crate) fn run_builtin(command: Command) -> Result<std::process::Output> {
     run_captured(command, true, true, None, None, false, CaptureMode::Channel)
 }
 
+pub(crate) fn run_ref_advertisement(mut command: Command) -> Result<std::process::Output> {
+    // The capability check uses the packet trace. Native Git's listing of
+    // every advertised ref has no consumer here.
+    command.stdout(Stdio::null());
+    run_captured(
+        command,
+        false,
+        true,
+        None,
+        None,
+        false,
+        CaptureMode::MayDetach,
+    )
+}
+
 pub(crate) fn run_fetch(
     command: Command,
     input: Option<&mut dyn std::io::Read>,
