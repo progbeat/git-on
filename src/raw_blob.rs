@@ -770,14 +770,14 @@ impl RawBlobs {
         state.objects.contains_key(&oid) || state.packed.contains_key(&oid)
     }
 
-    pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<()>, ready: bool) -> bool {
+    pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<()>, delivered: bool) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .objects
             .get(&oid)
             .is_some_and(|object| {
-                (object.used || ready)
+                (object.used || delivered)
                     && object
                         .transfer
                         .as_ref()

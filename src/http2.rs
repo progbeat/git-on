@@ -133,6 +133,7 @@ struct Decoder {
     buffered: Arc<AtomicUsize>,
     complete_body: Arc<AtomicBool>,
     report_failure: Option<ReportFailure>,
+    terminal_error: Option<String>,
     result: Receiver<Result<pack_stream::Received>>,
     thread: Option<JoinHandle<()>>,
     paused: bool,
@@ -182,6 +183,7 @@ impl Decoder {
             buffered,
             complete_body,
             report_failure,
+            terminal_error: None,
             result,
             thread: Some(thread),
             paused: false,
@@ -225,6 +227,13 @@ impl Decoder {
             self.complete_body.store(true, Ordering::Release);
             drop(self.input.take());
         } else {
+            if self.report_failure.is_some() {
+                self.terminal_error = outcome
+                    .as_ref()
+                    .err()
+                    .filter(|error| !crate::object::is_cancelled(error))
+                    .map(|error| format!("{error:#}"));
+            }
             self.cancel();
         }
         outcome
@@ -251,6 +260,10 @@ impl Drop for Decoder {
         self.cancel();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        // A publication already in progress can finish after the first report.
+        if let (Some(report), Some(error)) = (&self.report_failure, self.terminal_error.take()) {
+            report(&anyhow::Error::msg(error));
         }
     }
 }
@@ -722,12 +735,15 @@ mod tests {
         let scratch = crate::raw_blob::RawBlobs::new(directory.path()).unwrap();
         let (publish, published) = mpsc::channel();
         let (release, resumed) = mpsc::channel();
+        let exposed = Arc::new(AtomicBool::new(false));
+        let expose = exposed.clone();
         let pack = pack_stream::Response::new(
             scratch,
             vec![oid],
             Box::new(move |_| {
                 publish.send(())?;
                 resumed.recv_timeout(Duration::from_secs(3))?;
+                expose.store(true, Ordering::Release);
                 Ok(())
             }),
         );
@@ -740,7 +756,7 @@ mod tests {
             stop.clone(),
             Arc::new(wake),
             Some(Arc::new(move |error| {
-                let _ = report.send(error.to_string());
+                let _ = report.send((error.to_string(), exposed.load(Ordering::Acquire)));
             })),
         )
         .unwrap();
@@ -780,13 +796,15 @@ mod tests {
             result.err().unwrap().to_string(),
             "required transfer was reset"
         );
-        assert_eq!(reported.try_recv().unwrap(), "required transfer was reset");
+        let expected = "required transfer was reset".to_owned();
+        assert_eq!(reported.try_recv().unwrap(), (expected.clone(), false));
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !client.retiring.is_empty() {
             assert!(client.progress().unwrap().is_empty());
             assert!(std::time::Instant::now() < deadline);
             thread::yield_now();
         }
+        assert_eq!(reported.try_recv().unwrap(), (expected, true));
     }
 
     #[test]

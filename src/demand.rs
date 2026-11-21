@@ -46,6 +46,7 @@ pub(crate) enum Acquired {
 
 pub(crate) struct Batch {
     pub(crate) oids: Vec<Oid>,
+    succeeded: bool,
     result: Mutex<Option<Result<Acquired>>>,
 }
 
@@ -53,6 +54,7 @@ impl Batch {
     fn new(oids: Vec<Oid>, result: Result<Acquired>) -> Arc<Self> {
         Arc::new(Self {
             oids,
+            succeeded: result.is_ok(),
             result: Mutex::new(Some(result)),
         })
     }
@@ -121,7 +123,16 @@ impl Demand {
 
     fn served_reader(&self, oid: Oid, cache: &RawBlobs, transfer: &Arc<()>) -> bool {
         // A reader can use a cached object without joining this transfer.
-        cache.was_served(oid, transfer, self.required() && self.ready())
+        let delivered = self.required()
+            && self
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.succeeded);
+        cache.was_served(oid, transfer, delivered)
     }
 
     #[cfg(target_os = "macos")]
@@ -1527,6 +1538,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_prefetch_does_not_treat_a_cancelled_waiter_as_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Arc::<Shared>::default();
+        let data = b"late but no reader";
+        let oid = Oid::hash_object(git2::ObjectType::Blob, data).unwrap();
+        let (work, demand) = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            let work = Work::take(&mut queue.ahead, true).unwrap();
+            (work, queue.foreground(oid))
+        };
+        let report = shared.report_http2_failure(&work, &scratch);
+        let error = anyhow::anyhow!("unused forecast transfer failed");
+        report(&error);
+        demand.complete(Batch::new(
+            vec![oid],
+            Err(object::OperationCancelled.into()),
+        ));
+        scratch
+            .insert_fetched(
+                oid,
+                data.len(),
+                &data[..],
+                work.speculative.as_ref().map(Arc::downgrade),
+            )
+            .unwrap();
+        shared.complete_object(oid, &demand, true, Acquired::Stored);
+        report(&error);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
     fn failed_prefetch_reports_pack_errors_after_a_real_read() {
         for joins_request in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -1554,7 +1599,9 @@ mod tests {
                 )
                 .unwrap();
             if joins_request {
-                shared.complete_object(oid, &work.items[0].demand, true, Acquired::Stored);
+                let demand = &work.items[0].demand;
+                shared.complete_object(oid, demand, true, Acquired::Stored);
+                assert!(matches!(demand.wait().take(), Some(Ok(Acquired::Stored))));
             } else {
                 let (blob, first) = scratch.for_read(oid).unwrap().unwrap();
                 assert!(first);
