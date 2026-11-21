@@ -119,9 +119,9 @@ impl Demand {
         self.0.required.load(Ordering::Relaxed)
     }
 
-    fn served_reader(&self, oid: Oid, cache: &RawBlobs) -> bool {
-        // A reader can use an admitted forecast without joining its flight.
-        (self.required() && self.ready()) || cache.was_read(oid)
+    fn served_reader(&self, oid: Oid, cache: &RawBlobs, transfer: &Arc<()>) -> bool {
+        // A reader can use a cached object without joining this transfer.
+        cache.was_served(oid, transfer, self.required() && self.ready())
     }
 
     #[cfg(target_os = "macos")]
@@ -144,7 +144,8 @@ struct QueuedDemand {
 
 struct Work {
     items: Vec<QueuedDemand>,
-    speculative: bool,
+    // Each speculative transfer has its own identity, including retries.
+    speculative: Option<Arc<()>>,
 }
 
 impl Work {
@@ -169,7 +170,10 @@ impl Work {
                 items.push(item);
             }
         }
-        Some(Self { items, speculative })
+        Some(Self {
+            items,
+            speculative: speculative.then(|| Arc::new(())),
+        })
     }
 
     fn wants(&self) -> Vec<Oid> {
@@ -177,7 +181,7 @@ impl Work {
     }
 
     fn cache_remainder(&self) -> bool {
-        self.speculative || self.items.iter().all(|item| item.demand.ready())
+        self.speculative.is_some() || self.items.iter().all(|item| item.demand.ready())
     }
 }
 
@@ -773,7 +777,8 @@ impl Shared {
     ) -> pack_stream::Response {
         let shared = self.clone();
         let mut cache = scratch.clone();
-        let speculative = work.speculative;
+        let transfer = work.speculative.clone();
+        let speculative = transfer.is_some();
         let tasks: Arc<[_]> = work
             .items
             .iter()
@@ -796,7 +801,7 @@ impl Shared {
                 if object.kind() == git2::ObjectType::Blob {
                     cache.insert_verified_blob(
                         object,
-                        speculative,
+                        transfer.as_ref().map(Arc::downgrade),
                         || !speculative || demand.required(),
                         || publish(Acquired::Stored),
                     )
@@ -848,6 +853,7 @@ impl Shared {
         }
         indexed?;
         let mut cache = scratch.clone();
+        let transfer = work.speculative.as_ref().map(Arc::downgrade);
         for item in work.items.iter().filter(|item| !item.demand.ready()) {
             let (size, kind) = odb.read_header(item.oid)?;
             anyhow::ensure!(
@@ -861,7 +867,7 @@ impl Shared {
                     .arg(item.oid.to_string())
                     .stdin(std::process::Stdio::null());
                 let (output, ()) = crate::git::run_with_output(command, None, |input| {
-                    cache.insert_fetched(item.oid, size, input)?;
+                    cache.insert_fetched(item.oid, size, input, transfer.clone())?;
                     Ok(())
                 })
                 .context("stream large prefetched Git blob")?;
@@ -872,9 +878,9 @@ impl Shared {
                 );
             } else {
                 let object = odb.read(item.oid)?;
-                cache.insert_prefetched_odb_blob(item.oid, &object)?;
+                cache.insert_prefetched_odb_blob(item.oid, &object, transfer.clone())?;
             }
-            if work.speculative {
+            if work.speculative.is_some() {
                 self.prefetched_blobs.fetch_add(1, Ordering::Relaxed);
             }
             self.oids.fetch_add(1, Ordering::Relaxed);
@@ -899,7 +905,7 @@ impl Shared {
             if lane.is_none() {
                 self.http2_fetches.fetch_add(1, Ordering::Relaxed);
             }
-            if work.speculative {
+            if work.speculative.is_some() {
                 self.prefetches.fetch_add(1, Ordering::Relaxed);
             }
             match pack.fallback {
@@ -919,19 +925,20 @@ impl Shared {
         if let Some(index) = lane {
             queue.busy[index] = false;
         }
-        let required = !work.speculative
-            || result.is_err()
+        let required = work.speculative.as_ref().is_none_or(|transfer| {
+            result.is_err()
                 && work
                     .items
                     .iter()
-                    .any(|item| item.demand.served_reader(item.oid, scratch));
+                    .any(|item| item.demand.served_reader(item.oid, scratch, transfer))
+        });
         // Retire a speculative success from the queue once its verified blob
         // is visible in the raw store. A foreground waiter still holds a clone.
         work.items.retain(|item| {
             if !item.demand.ready() {
                 return true;
             }
-            if work.speculative && !item.demand.required() {
+            if work.speculative.is_some() && !item.demand.required() {
                 queue.pending.remove(&item.oid);
             }
             false
@@ -975,20 +982,22 @@ impl Shared {
         work: &Work,
         cache: &RawBlobs,
     ) -> crate::http2::ReportFailure {
-        let forecast = work.speculative.then(|| {
-            work.items
+        let forecast = work.speculative.as_ref().map(|transfer| {
+            let items = work
+                .items
                 .iter()
                 .map(|item| (item.oid, item.demand.clone()))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (transfer.clone(), items)
         });
         let shared = self.clone();
         let cache = cache.clone();
         Arc::new(move |error| {
             let mut queue = shared.queue.lock().unwrap();
-            if forecast.as_ref().is_none_or(|items| {
+            if forecast.as_ref().is_none_or(|(transfer, items)| {
                 items
                     .iter()
-                    .any(|(oid, demand)| demand.served_reader(*oid, &cache))
+                    .any(|(oid, demand)| demand.served_reader(*oid, &cache, transfer))
             }) {
                 queue.failure.get_or_insert_with(|| format!("{error:#}"));
             }
@@ -1487,6 +1496,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_prefetch_ignores_reads_supplied_by_another_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scratch = RawBlobs::new(directory.path()).unwrap();
+        let shared = Arc::<Shared>::default();
+        let data = b"blob from another pack";
+        let oid = Oid::hash_object(git2::ObjectType::Blob, data).unwrap();
+        let work = {
+            let mut queue = shared.queue.lock().unwrap();
+            let item = queue.insert(oid);
+            queue.ahead.push_back(item);
+            Work::take(&mut queue.ahead, true).unwrap()
+        };
+        scratch
+            .insert_fetched(oid, data.len(), &data[..], None)
+            .unwrap();
+        assert!(scratch.for_read(oid).unwrap().is_some());
+        let error = anyhow::anyhow!("unused forecast transfer failed");
+        shared.report_http2_failure(&work, &scratch)(&error);
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+        shared.finish(
+            work,
+            Err(error),
+            Instant::now(),
+            None,
+            &scratch,
+            &Git::capture(directory.path()).unwrap(),
+        );
+        assert!(shared.queue.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
     fn failed_prefetch_reports_pack_errors_after_a_real_read() {
         for joins_request in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -1505,7 +1545,14 @@ mod tests {
                 work
             };
             let report = shared.report_http2_failure(&work, &scratch);
-            scratch.insert_fetched(oid, data.len(), &data[..]).unwrap();
+            scratch
+                .insert_fetched(
+                    oid,
+                    data.len(),
+                    &data[..],
+                    work.speculative.as_ref().map(Arc::downgrade),
+                )
+                .unwrap();
             if joins_request {
                 shared.complete_object(oid, &work.items[0].demand, true, Acquired::Stored);
             } else {
@@ -1571,7 +1618,7 @@ mod tests {
         };
         pool.scratch
             .clone()
-            .insert_fetched(oid, data.len(), &data[..])
+            .insert_fetched(oid, data.len(), &data[..], None)
             .unwrap();
         let mut required_during_lookup = false;
         let demand = pool

@@ -21,7 +21,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard,
+        mpsc, Arc, Condvar, Mutex, MutexGuard, Weak,
     },
     thread,
     time::Duration,
@@ -69,6 +69,7 @@ struct Descriptor {
     used: bool,
     content_checked: bool,
     directory: Option<Arc<Directory>>,
+    transfer: Option<Weak<()>>,
 }
 impl Descriptor {
     fn kind(&self) -> ObjectType {
@@ -769,13 +770,19 @@ impl RawBlobs {
         state.objects.contains_key(&oid) || state.packed.contains_key(&oid)
     }
 
-    pub(crate) fn was_read(&self, oid: Oid) -> bool {
+    pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<()>, ready: bool) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .objects
             .get(&oid)
-            .is_some_and(|object| object.used)
+            .is_some_and(|object| {
+                (object.used || ready)
+                    && object
+                        .transfer
+                        .as_ref()
+                        .is_some_and(|source| std::ptr::eq(source.as_ptr(), Arc::as_ptr(transfer)))
+            })
     }
 
     pub(crate) fn has_packed(&self, oid: Oid) -> bool {
@@ -839,7 +846,7 @@ impl RawBlobs {
         Some((directory, first))
     }
     pub(crate) fn insert(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
-        self.insert_blob(oid, size, true, || {
+        self.insert_blob(oid, size, true, None, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
@@ -855,15 +862,16 @@ impl RawBlobs {
             object.id() == oid && object.kind() == ObjectType::Blob,
             "ODB object identity/type changed before raw import"
         );
-        self.insert_odb(oid, object, true)
+        self.insert_odb(oid, object, true, None)
     }
     pub(crate) fn insert_fetched(
         &mut self,
         oid: Oid,
         size: usize,
         input: impl Read,
+        transfer: Option<Weak<()>>,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, size, false, || {
+        self.insert_blob(oid, size, false, transfer, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
@@ -873,7 +881,7 @@ impl RawBlobs {
     pub(crate) fn insert_verified_blob(
         &mut self,
         object: crate::pack_stream::VerifiedObject,
-        speculative: bool,
+        transfer: Option<Weak<()>>,
         waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(),
     ) -> Result<()> {
@@ -882,20 +890,20 @@ impl RawBlobs {
             "streamed object is not a blob"
         );
         let oid = object.oid();
-        self.insert_verified_bytes(oid, object.into_data(), speculative, waiting, ready)
+        self.insert_verified_bytes(oid, object.into_data(), transfer, waiting, ready)
     }
 
     fn insert_verified_bytes(
         &mut self,
         oid: Oid,
         bytes: Vec<u8>,
-        speculative: bool,
+        transfer: Option<Weak<()>>,
         waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(),
     ) -> Result<()> {
         let size = bytes.len();
         if size <= BLOCK {
-            self.insert_blob(oid, size, false, || Ok(bytes))?;
+            self.insert_blob(oid, size, false, transfer, || Ok(bytes))?;
             ready();
             return Ok(());
         }
@@ -913,20 +921,22 @@ impl RawBlobs {
         let payload = Arc::new(bytes);
         store.preparing.insert(oid);
         _preparation = BlobPreparation { blobs: self, oid };
-        if speculative {
-            store.forecasts.insert(oid, payload.clone());
+        if let Some(transfer) = &transfer {
+            store
+                .forecasts
+                .insert(oid, (payload.clone(), transfer.clone()));
         }
         let mut ready = Some(ready);
         // Check demand after registering the buffer under the same store lock
         // used by a late reader to claim a completed forecast.
         if waiting() && store.can_publish_decoded(oid) {
-            store.publish_decoded(oid, payload.clone());
+            store.publish_decoded(oid, payload.clone(), transfer.clone());
             drop(store);
             ready.take().unwrap()();
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
-        let result = self.admit_blob(store, oid, false, Vec::new(), Some(payload));
+        let result = self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer);
         if let Err(error) = &result {
             let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
             store.forecasts.remove(&oid);
@@ -946,14 +956,15 @@ impl RawBlobs {
         if store.objects.contains_key(&oid) || store.packed.contains_key(&oid) {
             return DemandLookup::Available;
         }
-        let Some(payload) = store.forecasts.get(&oid) else {
+        let Some((payload, transfer)) = store.forecasts.get(&oid) else {
             return DemandLookup::Missing;
         };
         if !store.can_publish_decoded(oid) {
             return DemandLookup::Missing;
         }
         let payload = payload.clone();
-        store.publish_decoded(oid, payload);
+        let transfer = transfer.clone();
+        store.publish_decoded(oid, payload, Some(transfer));
         DemandLookup::ClaimedForecast
     }
 
@@ -961,12 +972,13 @@ impl RawBlobs {
         &mut self,
         oid: Oid,
         object: &git2::OdbObject<'_>,
+        transfer: Option<Weak<()>>,
     ) -> Result<()> {
         anyhow::ensure!(
             object.id() == oid && object.kind() == ObjectType::Blob,
             "prefetched ODB object identity/type changed"
         );
-        self.insert_odb(oid, object, false)?;
+        self.insert_odb(oid, object, false, transfer)?;
         Ok(())
     }
 
@@ -975,8 +987,9 @@ impl RawBlobs {
         oid: Oid,
         object: &git2::OdbObject<'_>,
         used: bool,
+        transfer: Option<Weak<()>>,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, object.len(), used, || {
+        self.insert_blob(oid, object.len(), used, transfer, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(object.len())?;
             crate::object::copy_odb_blob(object, &mut bytes)?;
@@ -996,6 +1009,7 @@ impl RawBlobs {
         oid: Oid,
         size: usize,
         used: bool,
+        transfer: Option<Weak<()>>,
         decode: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<RawBlob> {
         let _preparation;
@@ -1016,7 +1030,7 @@ impl RawBlobs {
             decode()?
         };
         anyhow::ensure!(bytes.len() == size, "verified blob length changed");
-        self.admit_blob(store, oid, used, bytes, None)
+        self.admit_blob(store, oid, used, bytes, None, transfer)
     }
 
     fn admit_blob<'a>(
@@ -1026,6 +1040,7 @@ impl RawBlobs {
         used: bool,
         bytes: Vec<u8>,
         shared: Option<Arc<Vec<u8>>>,
+        transfer: Option<Weak<()>>,
     ) -> Result<RawBlob> {
         let payload = shared.as_deref().unwrap_or(&bytes);
         let size = payload.len();
@@ -1056,7 +1071,7 @@ impl RawBlobs {
             Box::new([])
         };
         if !store.objects.contains_key(&oid) {
-            store.publish_blob(oid, size, used);
+            store.publish_blob(oid, size, used, transfer);
         }
         if resident {
             store.admit(oid, 0, bytes)?;
@@ -1119,6 +1134,7 @@ impl RawBlobs {
                 used: false,
                 content_checked: false,
                 directory: Some(directory),
+                transfer: None,
             },
         );
         store.packed.remove(&oid);
@@ -1251,7 +1267,7 @@ struct Store {
     hot: lru::LruCache<Oid, Arc<Vec<u8>>>,
     spilling: Option<(Oid, Arc<Vec<u8>>)>,
     decoded: HashMap<Oid, Arc<Vec<u8>>>,
-    forecasts: HashMap<Oid, Arc<Vec<u8>>>,
+    forecasts: HashMap<Oid, (Arc<Vec<u8>>, Weak<()>)>,
     hot_limit: usize,
     memory_bytes: usize,
     memory_limit: usize,
@@ -1272,8 +1288,8 @@ impl Store {
         self.hot_limit != 0 && self.failure.is_none() && !self.objects.contains_key(&oid)
     }
 
-    fn publish_decoded(&mut self, oid: Oid, bytes: Arc<Vec<u8>>) {
-        self.publish_blob(oid, bytes.len(), false);
+    fn publish_decoded(&mut self, oid: Oid, bytes: Arc<Vec<u8>>, transfer: Option<Weak<()>>) {
+        self.publish_blob(oid, bytes.len(), false, transfer);
         self.decoded.insert(oid, bytes);
     }
 
@@ -1289,7 +1305,7 @@ impl Store {
             })
     }
 
-    fn publish_blob(&mut self, oid: Oid, size: usize, used: bool) {
+    fn publish_blob(&mut self, oid: Oid, size: usize, used: bool, transfer: Option<Weak<()>>) {
         self.objects.insert(
             oid,
             Descriptor {
@@ -1299,6 +1315,7 @@ impl Store {
                 used,
                 content_checked: false,
                 directory: None,
+                transfer,
             },
         );
         self.packed.remove(&oid);
@@ -1934,7 +1951,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::disk_only(directory.path()).unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, b"good").unwrap();
-        store.insert_fetched(oid, 4, b"good".as_slice()).unwrap();
+        store
+            .insert_fetched(oid, 4, b"good".as_slice(), None)
+            .unwrap();
         for first in [true, false] {
             let (blob, used) = store.for_read(oid).unwrap().unwrap();
             assert_eq!(used, first);
@@ -2093,7 +2112,13 @@ mod tests {
         let oid = Oid::hash_object(ObjectType::Blob, &forecast).unwrap();
         let mut notified = false;
         assert!(store
-            .insert_verified_bytes(oid, forecast, true, || false, || notified = true)
+            .insert_verified_bytes(
+                oid,
+                forecast,
+                Some(Weak::new()),
+                || false,
+                || notified = true
+            )
             .is_err());
         assert_eq!(store.failure(), None);
         assert!(!store.available(oid));
@@ -2202,7 +2227,13 @@ mod tests {
                         .reserve_pack_decode(|| true, crate::object::check_transfer)
                         .unwrap();
                     decoder
-                        .insert_verified_bytes(received_oid, bytes, true, || false, || {})
+                        .insert_verified_bytes(
+                            received_oid,
+                            bytes,
+                            Some(Weak::new()),
+                            || false,
+                            || {},
+                        )
                         .unwrap();
                 });
                 scope.spawn(move || {
@@ -2244,7 +2275,7 @@ mod tests {
                         .insert_verified_bytes(
                             oid,
                             bytes,
-                            false,
+                            None,
                             || {
                                 let _ = decoded.send(());
                                 true

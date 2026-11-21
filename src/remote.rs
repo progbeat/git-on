@@ -1513,7 +1513,7 @@ impl Remote {
         mut input: impl Read,
     ) -> Result<()> {
         if kind == git2::ObjectType::Blob {
-            self.raw_blobs.insert_fetched(oid, size, input)?;
+            self.raw_blobs.insert_fetched(oid, size, input, None)?;
         } else {
             // Revision resolution and native signature verification need Git's
             // metadata ODB; blob payloads have no second loose copy.
