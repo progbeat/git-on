@@ -500,6 +500,9 @@ impl RawDirectory {
     }
 }
 
+#[cfg(test)]
+type SpillResultObserver = Box<dyn FnMut(bool) + Send>;
+
 #[derive(Default)]
 struct WriteMetrics {
     calls: AtomicU64,
@@ -507,7 +510,7 @@ struct WriteMetrics {
     #[cfg(test)]
     on_spill: Mutex<Option<Box<dyn Fn() + Send>>>,
     #[cfg(test)]
-    on_spill_written: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    on_spill_result: Mutex<Option<SpillResultObserver>>,
     #[cfg(test)]
     fail_write_after: Mutex<Option<usize>>,
 }
@@ -561,15 +564,16 @@ impl Pending {
             crate::object::check_transfer()?;
             digests.push(*blake3::hash(block).as_bytes());
         }
-        RawWriter {
+        let result = RawWriter {
             file: &mut self.file,
             totals,
         }
-        .write_all(bytes)?;
+        .write_all(bytes);
         #[cfg(test)]
-        if let Some(written) = totals.on_spill_written.lock().unwrap().take() {
-            written();
+        if let Some(observe) = totals.on_spill_result.lock().unwrap().as_mut() {
+            observe(result.is_ok());
         }
+        result?;
         self.committed = true;
         Ok(digests.into_boxed_slice())
     }
@@ -967,19 +971,24 @@ impl RawBlobs {
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
-        let result = self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer);
-        if let Err(error) = &result {
+        let admission = self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer);
+        if let Err(error) = admission {
             let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
             store.forecasts.remove(&oid);
-            if store.decoded.contains_key(&oid) && !crate::object::is_cancelled(error) {
+            // The verified data may already have served a read. Once the
+            // command ends, a late cache placement failure is cancellation.
+            crate::object::check_transfer()?;
+            if store.decoded.contains_key(&oid) && !crate::object::is_cancelled(&error) {
                 // A real reader claimed these verified bytes. Keep them
                 // readable and propagate the failed admission at shutdown.
                 store.failure.get_or_insert_with(|| format!("{error:#}"));
             }
-        } else if let Some(ready) = ready {
+            return Err(error);
+        }
+        if let Some(ready) = ready {
             ready();
         }
-        result.map(|_| ())
+        Ok(())
     }
 
     pub(crate) fn lookup_demand(&self, oid: Oid) -> DemandLookup {
@@ -1061,7 +1070,11 @@ impl RawBlobs {
             decode()?
         };
         anyhow::ensure!(bytes.len() == size, "verified blob length changed");
-        self.admit_blob(store, oid, used, bytes, None, transfer)
+        let admission = self.admit_blob(store, oid, used, bytes, None, transfer);
+        if admission.is_err() {
+            crate::object::check_transfer()?;
+        }
+        admission
     }
 
     fn admit_blob<'a>(
@@ -2236,7 +2249,12 @@ mod tests {
         const CHILD: &str = "GIT_ON_TEST_CANCELLED_SPILL_CHILD";
         // The shutdown latch is process-wide.
         let Ok(phase) = std::env::var(CHILD) else {
-            for phase in ["during-write", "after-retry"] {
+            for phase in [
+                "during-write",
+                "after-retry",
+                "failed-retry",
+                "native-failed-retry",
+            ] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -2262,31 +2280,45 @@ mod tests {
             state.hot_limit = 1;
             state.directory.writes.clone()
         };
-        let state = Arc::downgrade(&store.state);
-        let cancel_and_fail_open = move || {
-            crate::git::stop_operations();
-            state
-                .upgrade()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .directory
-                .spill_error = Some(libc::EMFILE);
-        };
         match phase.as_str() {
             "during-write" => {
-                *writes.on_spill.lock().unwrap() = Some(Box::new(cancel_and_fail_open))
+                *writes.on_spill.lock().unwrap() = Some(Box::new(crate::git::stop_operations));
             }
             "after-retry" => {
                 *writes.fail_write_after.lock().unwrap() = Some(0);
-                *writes.on_spill_written.lock().unwrap() = Some(Box::new(cancel_and_fail_open));
+                *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
+                    if succeeded {
+                        crate::git::stop_operations();
+                    }
+                }));
+            }
+            "failed-retry" | "native-failed-retry" => {
+                *writes.fail_write_after.lock().unwrap() = Some(0);
+                let mut retry = false;
+                let metrics = Arc::downgrade(&writes);
+                *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
+                    assert!(!succeeded);
+                    if retry {
+                        crate::git::stop_operations();
+                    } else {
+                        let metrics = metrics.upgrade().unwrap();
+                        *metrics.fail_write_after.lock().unwrap() = Some(0);
+                        retry = true;
+                    }
+                }));
             }
             _ => panic!("unexpected shutdown phase {phase}"),
         }
         let admit = |store: &mut RawBlobs, byte| {
             let bytes = vec![byte; BLOCK + 1];
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
-            store.insert_verified_bytes(oid, bytes, None, || true, || {})
+            if phase == "native-failed-retry" {
+                store
+                    .insert_fetched(oid, bytes.len(), bytes.as_slice(), None)
+                    .map(|_| ())
+            } else {
+                store.insert_verified_bytes(oid, bytes, None, || true, || {})
+            }
         };
         admit(&mut store, b'a').unwrap();
         admit(&mut store, b'b').unwrap();
@@ -2295,6 +2327,8 @@ mod tests {
         assert!(crate::object::is_cancelled(&error), "{error:#}");
         assert_eq!(store.failure(), None);
         assert_eq!(store.disk_metrics().1, u64::from(phase == "after-retry"));
+        let open_calls = store.state.lock().unwrap().directory.open_calls.get();
+        assert_eq!(open_calls, if phase == "during-write" { 1 } else { 2 });
     }
 
     #[test]
