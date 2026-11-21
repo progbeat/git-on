@@ -8,8 +8,20 @@ holds whole blobs up to 64 KiB and at most one recently read block per spilled
 blob. A separate LRU retains the eight most recently used larger blobs whole.
 Newly verified larger blobs enter this cache so the first read can use the
 decoded buffer without writing and rereading a raw file. Even a partial read
-can require a whole blob in RAM. The hot cache bounds the number of retained
-blobs, so its memory use depends on their combined sizes.
+can require a whole blob in RAM.
+
+The count limit targets source repositories where a few whole blobs fit
+comfortably in RAM. The payload bytes in the hot LRU are bounded by the
+combined uncompressed size of the eight largest distinct blobs in the tree.
+At the revisions below, this is about 14.35 MiB for CPython, 16.91 MiB for Go,
+and 120.97 MiB for Linux. [CPython `de54cf5`](https://github.com/python/cpython/tree/de54cf5be371a6f5e2e9f208c38def5f81d3ef02) ·
+[Go 1.24.0](https://github.com/golang/go/tree/3901409b5d0fb7c85a3e6730a59943cc93b2835c) ·
+[Linux v6.12](https://github.com/torvalds/linux/tree/adc218676eef25575469234709c2d87185ca223a)
+
+On trees with blob sizes like these, keeping a few verified buffers whole
+avoids temporary writes and disk reads when a command revisits them. A
+pending spill and active decoding buffers are additional memory costs.
+Several unusually large blobs can exhaust a tight process memory limit.
 
 Eviction spills verified data to private backing when needed. One large spill
 can run in the background while readers use verified buffers. If that write

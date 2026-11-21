@@ -36,6 +36,9 @@ pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const COPY_UP_OPEN_FLAGS: i32 = libc::O_NOATIME;
 #[cfg(not(target_os = "linux"))]
 pub(crate) const COPY_UP_OPEN_FLAGS: i32 = 0;
+// A handful of whole blobs has a modest memory cost in the source trees
+// this cache targets. Keep their verified buffers available for rereads.
+// See the measured blob sizes in docs/resources.md.
 const HOT_BLOBS: usize = 8;
 const COPY_BUFFER: usize = 1024 * 1024;
 fn invalid(message: &str) -> anyhow::Error {
@@ -881,7 +884,7 @@ impl RawBlobs {
         self.insert_blob(oid, size, true, None, || {
             // Lazy reads assume each blob fits in RAM. Verifying the whole
             // blob in memory lets even the first range read use that buffer
-            // before any spill. The hot cache limits retention by blob count.
+            // before any spill.
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
