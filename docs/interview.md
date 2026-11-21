@@ -100,4 +100,7 @@ to Git-on's process memory are outside the threat model.
 
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 
-**Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.
+**Answer**: If the command can finish with two checked-out copies of the
+selected revision on disk, Git-on must be able to run it too. This concerns
+available space on the filesystem. A finite process `RLIMIT_FSIZE` is outside
+the intended workload.

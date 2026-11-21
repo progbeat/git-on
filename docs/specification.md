@@ -143,6 +143,14 @@ The native mount and write-policy contracts apply to local and remote runs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
+### Resource assumptions
+
+Acceptance assumes an unlimited inherited `RLIMIT_FSIZE`. A finite
+`RLIMIT_FSIZE` is a host-imposed limit on how large the process may create
+or extend an individual file. Adapting to that limit is outside Git-on's
+supported workload. The two-checkout budget concerns available filesystem
+space for Git-on and the command.
+
 ## Backend selection and materialization
 
 [Startup indication](startup-indication.md) defines progress display, terminal
@@ -176,11 +184,11 @@ this backend implements the explicit-all subset.
 The lazy startup and performance requirements below apply to both native mounts.
 
 Remote materialization obtains the selected revision in one shallow transfer
-when host per-file limits permit it. A mount fallback reuses the original
-selection and fetches the full snapshot in one additional shallow transfer.
-Compressed objects are decoded into their final paths;
-already prepared contents are reused for repeated OIDs. Finite per-file limits
-retain bounded transfers rather than creating a pack that exceeds that limit.
+when the filesystem supports the resulting pack file size. A mount fallback
+reuses the original selection and fetches the full snapshot in one additional
+shallow transfer.
+Compressed objects are decoded into their final paths, and already prepared
+contents are reused for repeated OIDs.
 
 ## FUSE operation coverage requirement
 

@@ -128,8 +128,9 @@ take precedence and can join an active speculative request without duplicating
 its fetch. If that speculation fails, only waiting ordinary demands reenter
 the request queue.
 A diagnosed pack failure after serving a required read fails the invocation.
-These paths require a reusable transport and an unrestricted per-file size
-limit.
+These paths require a reusable transport. The specification's
+[resource assumptions](specification.md#resource-assumptions) apply to remote
+execution.
 
 The HTTPS and SSH receivers share the same incremental Git framing and pack
 decoder. It inflates ordinary entries in memory and verifies the canonical Git
@@ -142,18 +143,17 @@ connection driver, with per-stream backpressure. Blob payloads enter the same
 authenticated, run-local store. Unrequested objects in a verified pack remain
 available in compressed form for later demands.
 
-Explicit-all eager materialization needs the entire selected tree. When no
-per-file resource limit is in effect, fetch the selected revision once with
-depth one and without an object filter. Retain the compressed pack and decode
-file contents directly into their destination paths, reusing already prepared
-objects. This does not fetch the repository's complete history. This path does
-not require server-side filtering or a separate capability advertisement.
+Explicit-all eager materialization needs the entire selected tree. Fetch the
+selected revision once with depth one and without an object filter. Retain the
+compressed pack and decode file contents directly into their destination
+paths, reusing already prepared objects. This does not fetch the repository's
+complete history. This path does not require server-side filtering or a
+separate capability advertisement.
 
-Under finite per-file limits, materialization retains individual-object
-transfers rather than aggregating otherwise readable objects into an oversized
-pack. At most 256 known object IDs from the current directory share one
-native `fetch --stdin` and decoder operation when batching is allowed. Each object is checked for existing
-run-local availability and deduplicated before requesting it; all use `tree:0`.
+When materialization fetches missing objects by OID, at most 256 known object
+IDs from the current directory can share one native `fetch --stdin` and
+decoder operation. Each object is checked for existing run-local availability
+and deduplicated before requesting it. These requests use `tree:0`.
 All paths request only known objects. The batch
 size bounds request memory/argv work, not repository or file counts. Metrics
 separately report requested-object count (`remote_fetches`) and actual native
@@ -162,9 +162,9 @@ Session request/decode counts and transport process starts are separate from
 native fetch/cat-file counters. Server-side Git subprocesses remain real work,
 included in waited CPU for local source fixtures.
 
-For filtered lazy or resource-limited execution, the server must advertise
-filtering before any object transfer. Rejection of a requested unadvertised OID
-names the OID and includes Git's server diagnostic.
+For filtered lazy execution, the server must advertise filtering before any
+object transfer. Rejection of a requested unadvertised OID names the OID and
+includes Git's server diagnostic.
 
 Two-operand local-path and `file://` sources use upload-pack and require the same
 capabilities. Ordinary local repositories do not enable them by default. When

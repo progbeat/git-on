@@ -69,10 +69,11 @@ cleanup follows the documented recovery contract.
 Git-on catches `SIGXFSZ` from its own writes so `EFBIG` follows normal error
 handling and cleanup. Executed commands retain the caller's default or ignored
 signal disposition.
-Eager remote demands use individual exact-object requests under a finite
-inherited file-size limit: a want count cannot bound native Git's resulting
-pack size. Unrestricted runs retain batching. Request stdin is streamed through
-a channel; decoder request staging uses bounded parts.
+With a finite inherited file-size limit, the current implementation uses
+individual exact-object requests during eager materialization. The
+[resource assumptions](specification.md#resource-assumptions) define the
+supported workload. Request stdin is streamed through a channel, and decoder
+request staging uses bounded parts.
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects
@@ -128,8 +129,7 @@ threat model.
 ## Verification requirements
 
 - Raw-store tests cover identity, length and block corruption, failed publication,
-  eviction, active readers, retry after a partial background write and inherited
-  file-size limits.
+  eviction, active readers and retry after a partial background write.
 - Remote, SSH and lifecycle tests check transport reuse, cancellation, cleanup
   and reduced descriptor limits.
 - Object and metadata reuse tests check exact results, source demands, bounded
