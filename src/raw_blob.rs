@@ -507,6 +507,8 @@ struct WriteMetrics {
     #[cfg(test)]
     on_spill: Mutex<Option<Box<dyn Fn() + Send>>>,
     #[cfg(test)]
+    on_spill_written: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     fail_write_after: Mutex<Option<usize>>,
 }
 
@@ -564,6 +566,10 @@ impl Pending {
             totals,
         }
         .write_all(bytes)?;
+        #[cfg(test)]
+        if let Some(written) = totals.on_spill_written.lock().unwrap().take() {
+            written();
+        }
         self.committed = true;
         Ok(digests.into_boxed_slice())
     }
@@ -611,6 +617,9 @@ impl HotWriter {
         oid: Oid,
         bytes: Arc<Vec<u8>>,
     ) -> Result<()> {
+        // The command can finish while an earlier spill is being awaited.
+        // Check cancellation before opening the file for each new write.
+        crate::object::check_transfer()?;
         let output = store.directory.begin_spill(oid)?;
         if self.jobs.is_none() {
             let (jobs, queue) = mpsc::channel::<HotSpill>();
@@ -1115,7 +1124,6 @@ impl RawBlobs {
         if let Some((oid, bytes)) = &store.spilling {
             // Keep the verified victim readable after a failed spill and
             // retry that write before allowing another eviction.
-            crate::object::check_transfer()?;
             writer.submit(&self.state, &store, *oid, bytes.clone())?;
             drop(store);
             writer.wait()??;
@@ -2227,31 +2235,53 @@ mod tests {
     fn cancelled_hot_spill_does_not_poison_the_store() {
         const CHILD: &str = "GIT_ON_TEST_CANCELLED_SPILL_CHILD";
         // The shutdown latch is process-wide.
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "raw_blob::tests::cancelled_hot_spill_does_not_poison_the_store",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        let Ok(phase) = std::env::var(CHILD) else {
+            for phase in ["during-write", "after-retry"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "raw_blob::tests::cancelled_hot_spill_does_not_poison_the_store",
+                    ])
+                    .env(CHILD, phase)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{phase}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
-        }
+        };
 
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::new(directory.path()).unwrap();
-        {
+        let writes = {
             let mut state = store.state.lock().unwrap();
             state.hot_limit = 1;
-            *state.directory.writes.on_spill.lock().unwrap() =
-                Some(Box::new(crate::git::stop_operations));
+            state.directory.writes.clone()
+        };
+        let state = Arc::downgrade(&store.state);
+        let cancel_and_fail_open = move || {
+            crate::git::stop_operations();
+            state
+                .upgrade()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .directory
+                .spill_error = Some(libc::EMFILE);
+        };
+        match phase.as_str() {
+            "during-write" => {
+                *writes.on_spill.lock().unwrap() = Some(Box::new(cancel_and_fail_open))
+            }
+            "after-retry" => {
+                *writes.fail_write_after.lock().unwrap() = Some(0);
+                *writes.on_spill_written.lock().unwrap() = Some(Box::new(cancel_and_fail_open));
+            }
+            _ => panic!("unexpected shutdown phase {phase}"),
         }
         let admit = |store: &mut RawBlobs, byte| {
             let bytes = vec![byte; BLOCK + 1];
@@ -2261,11 +2291,10 @@ mod tests {
         admit(&mut store, b'a').unwrap();
         admit(&mut store, b'b').unwrap();
 
-        // Reopening the file for a retry would mask the worker's cancellation.
-        store.state.lock().unwrap().directory.spill_error = Some(libc::EMFILE);
         let error = admit(&mut store, b'c').unwrap_err();
         assert!(crate::object::is_cancelled(&error), "{error:#}");
         assert_eq!(store.failure(), None);
+        assert_eq!(store.disk_metrics().1, u64::from(phase == "after-retry"));
     }
 
     #[test]
