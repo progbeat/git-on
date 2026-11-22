@@ -474,7 +474,7 @@ impl Server {
         let data = data?;
         let (attr, _) = self.core.nfs_attributes(ino, true).map_err(errno)?;
         w.boolean(offset as u64 + data.len() as u64 >= attr.size);
-        w.opaque(&data);
+        w.opaque_data(data, data_limit);
         Ok(())
     }
 
@@ -831,7 +831,7 @@ impl Server {
                 if 4 + bytes.len().next_multiple_of(4) > limit {
                     return Err(REP_TOO_BIG);
                 }
-                w.opaque(&bytes);
+                w.opaque_data(bytes, limit - 4);
             }
             Create {
                 kind,

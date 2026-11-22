@@ -1,12 +1,18 @@
 use super::{
     protocol::{StateId, MAX_OPS},
     read_record,
-    server::Server,
+    server::{RpcReply, Server},
     status::*,
+    write_response,
     xdr::{fragment, Reader, Writer, MAX_RECORD},
     FilesystemFailures,
 };
-use crate::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
+use crate::{
+    filesystem::Overlay,
+    policy::WritePolicy,
+    raw_blob::{RawBlobs, BLOCK},
+    snapshot::Snapshot,
+};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -160,29 +166,53 @@ fn create_session_replay_keeps_only_the_operation_payload() {
 
 #[test]
 fn cached_read_reply_fits_the_negotiated_slot_budget() {
-    const COUNT: usize = 600 * 1024;
+    const COUNT: usize = 600 * 1024 + 1;
+    const SECOND: usize = 128 * 1024 + 3;
     const LIMIT: usize = 1024 * 1024;
-    let (_dir, mut server) = fixture_with_content(WritePolicy::None, &vec![b'x'; COUNT]);
-    let create = create_session_request(&mut server, call, LIMIT as u32);
-    let reply = server.rpc(&call(2, 1, &create)).unwrap();
-    let mut response = results(&reply, OK, 1);
-    stat(&mut response, 43, OK);
-    let session = response.fixed().unwrap();
-    let ops = xdr(|w| {
-        sequence(w, &session, 1, 0, 0);
-        lookup_tracked(w);
-        w.u32(25); // READ
-        StateId::ANONYMOUS.encode(w);
-        w.u64(0);
-        w.u32(COUNT as u32);
-        w.u32(10); // GETFH
-    });
-    let reply = server.rpc_reply(&call(3, 5, &ops)).unwrap();
-    let body = reply.body.unwrap();
-    assert!(body.len() > COUNT);
-    assert!(body.capacity() + reply.header.len() <= LIMIT);
-    let replay = server.rpc_reply(&call(4, 5, &ops)).unwrap().body.unwrap();
-    assert!(Arc::ptr_eq(&body, &replay));
+    for size in [COUNT, LIMIT + 1] {
+        let contents = vec![b'x'; size];
+        let (_dir, mut server) = fixture_with_content(WritePolicy::None, &contents);
+        let create = create_session_request(&mut server, call, LIMIT as u32);
+        let reply = server.rpc(&call(2, 1, &create)).unwrap();
+        let mut response = results(&reply, OK, 1);
+        stat(&mut response, 43, OK);
+        let session = response.fixed().unwrap();
+        let ops = xdr(|w| {
+            sequence(w, &session, 1, 0, 0);
+            lookup_tracked(w);
+            w.u32(25); // READ
+            StateId::ANONYMOUS.encode(w);
+            w.u64(0);
+            w.u32(COUNT as u32);
+            w.u32(25); // A second range shares the same verified allocation.
+            StateId::ANONYMOUS.encode(w);
+            w.u64(3);
+            w.u32(SECOND as u32);
+            w.u32(10); // GETFH
+        });
+        let reply = server.rpc_reply(&call(3, 6, &ops)).unwrap();
+        let body = reply.body.unwrap();
+        assert!(body.len() > COUNT + SECOND);
+        assert!(body.capacity() + reply.header.len() <= LIMIT);
+        assert_eq!(body.data_slice_count(), 2 * usize::from(size == COUNT));
+        let replay = server.rpc_reply(&call(4, 6, &ops)).unwrap().body.unwrap();
+        assert!(Arc::ptr_eq(&body, &replay));
+        let encoded = server.rpc(&call(5, 6, &ops)).unwrap();
+        let mut response = results(&encoded, OK, 6);
+        stat(&mut response, 53, OK);
+        response.take(36).unwrap();
+        stat(&mut response, 24, OK); // PUTROOTFH
+        stat(&mut response, 15, OK); // LOOKUP
+        stat(&mut response, 25, OK);
+        assert_eq!(response.boolean().unwrap(), size == COUNT);
+        assert_eq!(response.opaque(COUNT).unwrap(), &contents[..COUNT]);
+        stat(&mut response, 25, OK);
+        assert!(!response.boolean().unwrap());
+        assert_eq!(response.opaque(SECOND).unwrap(), &contents[3..3 + SECOND]);
+        stat(&mut response, 10, OK);
+        assert!(!response.opaque(64).unwrap().is_empty());
+        response.finish().unwrap();
+    }
 }
 
 pub(super) fn sequence(w: &mut Writer, session: &[u8; 16], sequence: u32, slot: u32, highest: u32) {
@@ -636,6 +666,59 @@ fn request_counts_and_lengths_are_bounded() {
     let ops = xdr(|w| sequence(w, &session, 1, 0, 3));
     let reply = server.rpc(&call(1, (MAX_OPS + 1) as u32, &ops)).unwrap();
     stat(&mut results(&reply, TOO_MANY_OPS, 1), 53, TOO_MANY_OPS);
+}
+
+#[tokio::test]
+async fn checked_blocks_and_padding_reach_the_socket_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+    let bytes: Vec<_> = (0..3 * BLOCK).map(|n| (n % 251) as u8).collect();
+    let oid = git2::Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap();
+    let blob = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
+    let offset = BLOCK - 1;
+    let count = BLOCK + 3;
+    let mut writer = Writer::default();
+    writer.opaque_data(
+        blob.read_shared(offset as u64, count as u32).unwrap(),
+        4 * BLOCK,
+    );
+    writer.u32(123);
+    let body = writer.into_reply(Some(4 * BLOCK));
+    assert_eq!(body.data_slice_count(), 3);
+    let response = RpcReply {
+        header: vec![0; 4],
+        body: Some(Arc::new(body)),
+    };
+
+    let (mut peer, stream) = tokio::net::UnixStream::pair().unwrap();
+    let (_, mut output) = stream.into_split();
+    let deadline = Duration::from_secs(5);
+    let (_, received) = tokio::time::timeout(deadline, async {
+        tokio::try_join!(
+            write_response(&mut output, Some(response), deadline),
+            read_record(&mut peer)
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let mut reply = Reader::new(&received);
+    assert_eq!(reply.u32().unwrap(), 0);
+    assert_eq!(reply.opaque(count).unwrap(), &bytes[offset..offset + count]);
+    assert_eq!(reply.u32().unwrap(), 123);
+    reply.finish().unwrap();
+    for operation_budget in [4 * BLOCK, 2 * BLOCK] {
+        let mut writer = Writer::default();
+        writer.opaque_data(
+            blob.read_shared(offset as u64, count as u32).unwrap(),
+            operation_budget,
+        );
+        writer.u32(123);
+        let replay = writer.into_reply(Some(2 * BLOCK));
+        assert_eq!(replay.data_slice_count(), 0);
+        assert!(replay.capacity() <= 2 * BLOCK);
+        assert!(replay.slices().flatten().eq(&received[4..]));
+    }
 }
 
 #[tokio::test]

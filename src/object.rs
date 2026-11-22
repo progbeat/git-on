@@ -91,7 +91,7 @@ pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {
 /// headers needed to validate and resolve that link are visited.
 pub(crate) fn selected_child(kind: ObjectType, data: &[u8]) -> Result<Oid> {
     let child = match kind {
-        ObjectType::Commit => commit_tree(data),
+        ObjectType::Commit => commit_tree(data, |_| {}),
         ObjectType::Tag => tag_target(data),
         _ => None,
     };
@@ -140,10 +140,15 @@ fn identity_header(fields: &mut &[u8], prefix: &[u8]) -> Option<()> {
     Some(())
 }
 
-fn commit_tree(mut fields: &[u8]) -> Option<Oid> {
+pub(crate) fn commit_links(data: &[u8], parent: impl FnMut(Oid)) -> Result<Oid> {
+    commit_tree(data, parent)
+        .ok_or_else(|| InvalidObject("invalid Git commit headers".into()).into())
+}
+
+fn commit_tree(mut fields: &[u8], mut parent: impl FnMut(Oid)) -> Option<Oid> {
     let tree = oid_header(&mut fields, b"tree ")?;
     while fields.starts_with(b"parent ") {
-        oid_header(&mut fields, b"parent ")?;
+        parent(oid_header(&mut fields, b"parent ")?);
     }
     identity_header(&mut fields, b"author ")?;
     while fields.starts_with(b"author ") {
@@ -170,18 +175,6 @@ fn tag_target(mut fields: &[u8]) -> Option<Oid> {
         return None;
     }
     Some(target)
-}
-
-pub(crate) struct TeeRead<R, W> {
-    pub(crate) input: R,
-    pub(crate) output: W,
-}
-impl<R: Read, W: Write> Read for TeeRead<R, W> {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.input.read(bytes)?;
-        self.output.write_all(&bytes[..count])?;
-        Ok(count)
-    }
 }
 
 /// The destination is staging storage: callers must not expose it until this
@@ -279,18 +272,19 @@ pub(crate) fn copy_odb_blob(
     output: impl Write,
     validate: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        object.kind() == ObjectType::Blob,
-        "ODB object is not a blob"
-    );
+    verify_odb_object(object, ObjectType::Blob)?;
+    validate(object.data())?;
+    write_verified_buffer(object.data(), output)
+}
+
+pub(crate) fn verify_odb_object(object: &git2::OdbObject<'_>, kind: ObjectType) -> Result<()> {
+    anyhow::ensure!(object.kind() == kind, "ODB object is not a {}", kind.str());
     if !NATIVE_OID_VERIFICATION.load(Ordering::Acquire) {
-        let mut hash =
-            VerifiedWriter::new(std::io::sink(), ObjectType::Blob, object.len(), object.id());
+        let mut hash = VerifiedWriter::new(std::io::sink(), kind, object.len(), object.id());
         write_verified_buffer(object.data(), &mut hash)?;
         hash.finish()?;
     }
-    validate(object.data())?;
-    write_verified_buffer(object.data(), output)
+    check_transfer()
 }
 
 pub(crate) fn write_verified_buffer(bytes: &[u8], mut output: impl Write) -> Result<()> {

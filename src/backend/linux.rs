@@ -2,6 +2,7 @@
 //! this module only converts typed callbacks and holds Linux backing handles.
 use super::{FileAttr, FileType, SetAttributes, TimeOrNow};
 use crate::filesystem::{FsResult, Overlay, SourceLookup};
+use crate::raw_blob::ReadData;
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -25,6 +26,24 @@ const TTL: Duration = Duration::ZERO;
 // generated children or mutable directory streams. A fully readonly namespace
 // may also cache directory pages. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+// FUSE lookup replies with a zero node ID cache a missing name.
+const MISSING_ENTRY: fuser::FileAttr = fuser::FileAttr {
+    ino: INodeNo(0),
+    size: 0,
+    blocks: 0,
+    atime: SystemTime::UNIX_EPOCH,
+    mtime: SystemTime::UNIX_EPOCH,
+    ctime: SystemTime::UNIX_EPOCH,
+    crtime: SystemTime::UNIX_EPOCH,
+    kind: fuser::FileType::RegularFile,
+    perm: 0,
+    nlink: 0,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    blksize: 0,
+    flags: 0,
+};
 pub(super) const REMOTE_WORKERS: usize = 8;
 // TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
 // interrupted without a blocked dispatcher. Do not emulate it by polling
@@ -185,9 +204,10 @@ fn empty(reply: ReplyEmpty, result: FsResult<()>) {
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
-fn data(reply: ReplyData, result: FsResult<impl AsRef<[u8]>>) {
+fn data(reply: ReplyData, result: FsResult<ReadData>) {
     match result {
-        Ok(data) => reply.data(data.as_ref()),
+        // fuser exposes a single payload slice for a FUSE read reply.
+        Ok(data) => reply.data(&data.contiguous()),
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
@@ -244,12 +264,17 @@ impl Filesystem for Fuse {
             else {
                 break None;
             };
-            let (inode, oid) = match lookup {
-                SourceLookup::Inode(ino) => (Some(ino), state.core.pending_source_size(ino)),
-                SourceLookup::Tree(oid) => (None, Some(oid)),
+            let (inode, pending) = match lookup {
+                SourceLookup::Inode(ino) => (
+                    Some(ino),
+                    state
+                        .core
+                        .pending_source_size(ino)
+                        .and_then(|oid| state.core.start_remote_demand(oid, Some(ino))),
+                ),
+                SourceLookup::Tree(oid) => (None, state.core.start_remote_tree_demand(oid)),
             };
-            let Some(pending) = oid.and_then(|oid| state.core.start_remote_demand(oid, inode))
-            else {
+            let Some(pending) = pending else {
                 break inode;
             };
             drop(state);
@@ -266,6 +291,13 @@ impl Filesystem for Fuse {
             Ok(a) => {
                 let (attr_ttl, entry_ttl) = state.cache_ttls(&a);
                 reply.entry_with_ttls(&attr_ttl, &entry_ttl, &attr(a), Generation(0));
+            }
+            Err(libc::ENOENT)
+                if prepared.is_none()
+                    && state.core.read_only()
+                    && state.source_cacheable(parent.0) =>
+            {
+                reply.entry_with_ttls(&TTL, &PINNED_TTL, &MISSING_ENTRY, Generation(0));
             }
             Err(error) => reply.error(Errno::from_i32(error)),
         }
@@ -647,7 +679,10 @@ impl Filesystem for Fuse {
             .parallel_reads
             .then(|| state.core.pending_source_tree(ino.0))
             .flatten()
-            .and_then(|oid| state.core.start_remote_demand(oid, None))
+            .and_then(|oid| {
+                state.core.begin_directory_enumeration();
+                state.core.start_remote_tree_demand(oid)
+            })
         {
             drop(state);
             pending.finish();

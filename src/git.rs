@@ -16,6 +16,25 @@ pub struct Git {
 }
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
+        let mut git = Self::capture_configuration(cwd)?;
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .stdin(Stdio::null());
+        git.original_dir = run_builtin(command)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|mut output| {
+                if output.stdout.last() == Some(&b'\n') {
+                    output.stdout.pop();
+                }
+                PathBuf::from(OsString::from_vec(output.stdout))
+            });
+        Ok(git)
+    }
+
+    pub(crate) fn capture_configuration(cwd: &Path) -> Result<Self> {
         let mut command = Command::new("git");
         command
             .current_dir(cwd)
@@ -53,22 +72,37 @@ impl Git {
         Ok(Self {
             cwd: cwd.to_path_buf(),
             config,
-            original_dir: {
-                let mut command = Command::new("git");
-                command
-                    .current_dir(cwd)
-                    .args(["rev-parse", "--absolute-git-dir"])
-                    .stdin(Stdio::null());
-                run_builtin(command)
-                    .ok()
-                    .filter(|x| x.status.success())
-                    .map(|x| {
-                        PathBuf::from(OsString::from_vec(
-                            x.stdout.strip_suffix(b"\n").unwrap_or(&x.stdout).to_vec(),
-                        ))
-                    })
-            },
+            original_dir: None,
         })
+    }
+
+    pub(crate) fn capture_snapshot(cwd: &Path, revision: &OsStr) -> Result<(Self, Oid)> {
+        let mut git = Self::capture_configuration(cwd)?;
+        let output = git.output(
+            None,
+            &[
+                OsStr::new("rev-parse"),
+                OsStr::new("--absolute-git-dir"),
+                OsStr::new("--verify"),
+                OsStr::new("--end-of-options"),
+                revision,
+            ],
+        )?;
+        // The repository path can contain a newline. The last line is the OID.
+        let mut fields = output
+            .strip_suffix(b"\n")
+            .unwrap_or(&output)
+            .rsplitn(2, |&byte| byte == b'\n');
+        let oid = Oid::from_str(std::str::from_utf8(fields.next().unwrap_or_default())?)
+            .context("resolve exact SHA-1 revision (SHA-256 repositories unsupported)")?;
+        let path_len = fields
+            .next()
+            .context("native Git did not identify the selected repository directory")?
+            .len();
+        let mut path = output;
+        path.truncate(path_len);
+        git.original_dir = Some(PathBuf::from(OsString::from_vec(path)));
+        Ok((git, oid))
     }
     pub fn command(&self, dir: Option<&Path>) -> Command {
         let mut command = Command::new("git");
@@ -135,16 +169,18 @@ impl Git {
     pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
         // Keep caller-defined server programs, server options and fsck policy
         // on native fetch's complete compatibility path.
-        if self.config.iter().any(|(key, value)| {
-            let key = key.as_bytes();
-            key.ends_with(b".uploadpack")
-                || key.ends_with(b".vcs")
-                || key.ends_with(b".serveroption")
-                || key.starts_with(b"fsck.")
-                || key == b"fetch.fsckobjects"
-                || key == b"transfer.fsckobjects"
-                || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
-        }) {
+        if packet_trace_destination().is_some()
+            || self.config.iter().any(|(key, value)| {
+                let key = key.as_bytes();
+                key.ends_with(b".uploadpack")
+                    || key.ends_with(b".vcs")
+                    || key.ends_with(b".serveroption")
+                    || key.starts_with(b"fsck.")
+                    || key == b"fetch.fsckobjects"
+                    || key == b"transfer.fsckobjects"
+                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+            })
+        {
             return Ok(false);
         }
 
@@ -166,6 +202,7 @@ impl Git {
         // Native Git remains responsible for explicit HTTP configuration
         // and transport policy. Apply this before any libcurl discovery.
         self.transport_policy_is_default("https")
+            && packet_trace_destination().is_none()
             && !self.config.iter().any(|(key, _)| {
                 let key = key.as_bytes();
                 key.starts_with(b"http.")
@@ -175,10 +212,14 @@ impl Git {
             && !std::env::vars_os().any(|(key, _)| {
                 let key = key.as_bytes();
                 key.starts_with(b"GIT_HTTP_")
+                    || key.starts_with(b"GIT_PROXY_SSL_")
                     || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
                     || matches!(
                         key,
-                        b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
+                        b"GIT_TRACE_CURL"
+                            | b"GIT_CURL_VERBOSE"
+                            | b"GIT_SMART_HTTP"
+                            | b"GIT_USER_AGENT"
                     )
             })
     }
@@ -196,9 +237,98 @@ impl Git {
         self.config.iter().any(|(key, _)| key == "protocol.version")
     }
 
+    pub(crate) fn credential_replay_has_host_scope(&self) -> bool {
+        self.config.iter().all(|(key, _)| {
+            let Some(credential) = key.as_bytes().strip_prefix(b"credential.") else {
+                return true;
+            };
+            if credential.rsplit(|&byte| byte == b'.').next() == Some(b"usehttppath") {
+                return false;
+            }
+            let Some(scope) = credential.rsplitn(2, |&byte| byte == b'.').nth(1) else {
+                return true;
+            };
+            // A fresh credential process can reapply these scopes after Git
+            // supplies the username and drops the repository path from fill.
+            std::str::from_utf8(scope)
+                .ok()
+                .filter(|scope| {
+                    scope.split_once("://").is_some_and(|(_, authority)| {
+                        let authority = authority.strip_suffix('/').unwrap_or(authority);
+                        !authority.contains(['/', '\\', '@', '%', '?', '#'])
+                    })
+                })
+                .and_then(|scope| url::Url::parse(scope).ok())
+                .is_some_and(|scope| {
+                    matches!(scope.scheme(), "http" | "https")
+                        && scope.host_str().is_some()
+                        && scope.username().is_empty()
+                        && scope.password().is_none()
+                        && scope.path() == "/"
+                        && scope.query().is_none()
+                        && scope.fragment().is_none()
+                })
+        })
+    }
+
+    pub(crate) fn fetch_settings_require_native_git(&self) -> bool {
+        self.config
+            .iter()
+            .any(|(key, value)| !streaming_fetch_config(key.as_bytes(), value.as_deref()))
+    }
+
+    pub(crate) fn has_fetch_mapping(&self, source: &OsStr) -> Result<bool> {
+        let mut mappings = self
+            .config
+            .iter()
+            .filter_map(|(key, _)| fetch_mapping_remote(key.as_bytes()));
+        if !cfg!(target_os = "macos") || source.as_bytes().is_ascii() {
+            return Ok(mappings.any(|name| name == source.as_bytes()));
+        }
+        if mappings.next().is_none() {
+            return Ok(false);
+        }
+        // Ask the same Git executable to look up the key with its configured
+        // Unicode precomposition. An unrelated mapping should not force a
+        // native fetch of a path or an alias.
+        let mut key = OsString::from("remote.");
+        key.push(source);
+        key.push(".fetch");
+        let mut command = self.command(None);
+        command
+            .args(["config", "--includes", "--get-all", "--"])
+            .arg(key)
+            .stdin(Stdio::null());
+        let output = run_builtin(command)?;
+        Ok(output.status.code() != Some(1) || !output.stderr.is_empty())
+    }
+
+    pub(crate) fn has_multiple_group_members(&self, source: &OsStr) -> bool {
+        self.config
+            .iter()
+            .filter(|(key, _)| key.as_bytes().strip_prefix(b"remotes.") == Some(source.as_bytes()))
+            .filter_map(|(_, value)| value.as_deref())
+            .flat_map(|value| {
+                value
+                    .as_bytes()
+                    .split(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+            })
+            .filter(|member| !member.is_empty())
+            .nth(1)
+            .is_some()
+    }
+
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
         let mut command = self.command(dir);
         command.args(args).stdin(Stdio::null());
+        if args
+            .first()
+            .is_some_and(|operation| *operation == "rev-parse")
+        {
+            // Older Git can fetch a missing promisor tree during REV:path
+            // resolution, even with GIT_NO_LAZY_FETCH set.
+            command.env("GIT_ALLOW_PROTOCOL", "");
+        }
         let out = if local_query(args) {
             run_builtin(command)
         } else {
@@ -231,9 +361,16 @@ impl Git {
             .as_deref()
             .context("native Git did not identify the selected repository directory")
     }
+    fn verification_command(&self, dir: &Path) -> Command {
+        // Git resolves relative object alternates after discovering the
+        // worktree. Use the captured invocation context for that repository.
+        let private = (self.original_dir.as_deref() != Some(dir)).then_some(dir);
+        self.command(private)
+    }
+
     pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
         let operation = match kind { git2::ObjectType::Commit => "verify-commit", git2::ObjectType::Tag => "verify-tag", _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature") };
-        let mut command = self.command(Some(dir));
+        let mut command = self.verification_command(dir);
         command
             .arg(operation)
             .arg(oid.to_string())
@@ -282,9 +419,71 @@ impl Git {
     }
 }
 
+fn fetch_mapping_remote(key: &[u8]) -> Option<&[u8]> {
+    key.strip_prefix(b"remote.")?.strip_suffix(b".fetch")
+}
+
+fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>) -> bool {
+    // Git fetch validates settings outside fetch.*, even with no worktree or
+    // destination ref. Delegate unfamiliar settings to that command so new
+    // config keys retain their native validation and behavior.
+    match key {
+        b"core.repositoryformatversion" => true, // The private repository owns its format.
+        b"core.askpass" | b"core.sshcommand" | b"user.name" | b"user.email"
+        | b"user.signingkey" => value.is_some(),
+        b"core.bare"
+        | b"core.filemode"
+        | b"core.ignorecase"
+        | b"core.logallrefupdates"
+        | b"core.precomposeunicode"
+        | b"core.quotepath"
+        | b"core.symlinks"
+        | b"push.autosetupremote" => {
+            matches!(value.map(OsStr::as_bytes), None | Some(b"true" | b"false"))
+        }
+        b"init.defaultbranch" => value
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| git2::Reference::is_valid_name(&format!("refs/heads/{name}"))),
+        b"protocol.version" => value == Some(OsStr::new("2")),
+        // Credential helpers and transport policy have their own gates.
+        key if key.starts_with(b"credential.") || key.starts_with(b"http.") => true,
+        // Git resolves remote names and rewrite settings. Matching fetch maps
+        // have already been checked when deciding whether to use native Git.
+        key if key.starts_with(b"remote.") => {
+            value.is_some()
+                && (key[b"remote.".len()..].ends_with(b".url")
+                    || fetch_mapping_remote(key).is_some())
+        }
+        key if key.starts_with(b"url.") => {
+            value.is_some() && (key.ends_with(b".insteadof") || key.ends_with(b".pushinsteadof"))
+        }
+        key if key.starts_with(b"branch.") => {
+            value.is_some() && (key.ends_with(b".remote") || key.ends_with(b".merge"))
+        }
+        _ => false,
+    }
+}
+
 fn local_query(args: &[&OsStr]) -> bool {
     match args {
         // Resolving an index operand with rev-parse can invoke core.fsmonitor.
+        [operation, verify, boundary, revision] | [operation, _, verify, boundary, revision]
+            if *operation == "rev-parse"
+                && *verify == "--verify"
+                && *boundary == "--end-of-options"
+                && (args.len() == 4 || args[1] == "--absolute-git-dir") =>
+        {
+            *revision == "HEAD"
+                || (revision.as_bytes().len() == 40
+                    && revision.as_bytes().iter().all(u8::is_ascii_hexdigit))
+        }
+        [operation, format, option, location]
+            if *operation == "rev-parse"
+                && *format == "--path-format=absolute"
+                && *option == "--git-path" =>
+        {
+            *location == "objects"
+        }
         [operation, option] if *operation == "rev-parse" => matches!(
             option.as_bytes(),
             b"--show-prefix" | b"--show-cdup" | b"--local-env-vars"
@@ -372,11 +571,44 @@ pub(crate) fn run_builtin(command: Command) -> Result<std::process::Output> {
     run_captured(command, true, true, None, None, false, CaptureMode::Channel)
 }
 
-pub(crate) fn run_ref_advertisement(mut command: Command) -> Result<std::process::Output> {
-    // The capability check uses the packet trace. Native Git's listing of
-    // every advertised ref has no consumer here.
+fn packet_trace_destination() -> Option<OsString> {
+    std::env::var_os("GIT_TRACE_PACKET").filter(|value| {
+        !value.is_empty() && value != "0" && !value.as_bytes().eq_ignore_ascii_case(b"false")
+    })
+}
+
+pub(crate) fn run_ref_advertisement(
+    mut command: Command,
+    run: &Path,
+) -> Result<(std::process::Output, bool)> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+
+    let caller_trace = packet_trace_destination();
+    let mut capture = tempfile::Builder::new()
+        .prefix("native-advertisement-")
+        .tempfile_in(run)
+        .context("open capability trace")?;
+    let caller_trace = caller_trace.map(|target| {
+        // Darwin's descriptor aliases share the original access mode. Give
+        // the replay child a separate, read-only description so a destination
+        // that names its input cannot overwrite the capability trace.
+        let reader = (|| -> Result<_> {
+            let reader = std::fs::File::open(capture.path()).context("open trace for replay")?;
+            let original = capture.as_file().metadata()?;
+            let opened = reader.metadata()?;
+            if (opened.dev(), opened.ino()) != (original.dev(), original.ino()) {
+                bail!("capability trace was replaced");
+            }
+            Ok(reader)
+        })();
+        (target, reader)
+    });
+    let sink = capture.path().with_extension("null");
+    std::os::unix::fs::symlink("/dev/null", &sink)?;
+    command.env("GIT_TRACE_PACKET", capture.path());
+    // Only the capability trace is needed. Discard the listing of refs.
     command.stdout(Stdio::null());
-    run_captured(
+    let output = run_captured(
         command,
         false,
         true,
@@ -384,17 +616,223 @@ pub(crate) fn run_ref_advertisement(mut command: Command) -> Result<std::process
         None,
         false,
         CaptureMode::MayDetach,
-    )
+    );
+    // Existing writers retain their regular file. Later opens go to the null
+    // device, even if a configured helper starts another Git after ls-remote.
+    let redirect = std::fs::rename(sink, capture.path());
+    if redirect.is_ok() {
+        // The run directory owns the sink's new lifetime.
+        capture.disable_cleanup(true);
+    }
+    let output = output?;
+    if !output.status.success() && caller_trace.is_none() {
+        return Ok((output, false));
+    }
+    if output.status.success() {
+        redirect.context("redirect capability trace")?;
+    }
+    let trace = capture.as_file();
+    let length = trace.metadata()?.len();
+    if let Some((target, reader)) = caller_trace.filter(|_| length > 0) {
+        // Keep discovery tied to this operation's private trace. A caller's
+        // destination can already contain packet data from other connections.
+        let result = reader
+            .and_then(|reader| forward_packet_trace(&reader, capture.path(), length, &target));
+        if let Err(error) = result {
+            if crate::object::is_cancelled(&error) {
+                return Err(error);
+            }
+            eprintln!("warning: unable to write GIT_TRACE_PACKET: {error}");
+        }
+    }
+    let filtering = output.status.success()
+        && trace_advertises_filter(trace.take(length)).context("read capability trace")?;
+    Ok((output, filtering))
+}
+
+fn forward_packet_trace(
+    trace: &std::fs::File,
+    source: &Path,
+    length: u64,
+    target: &OsStr,
+) -> Result<()> {
+    use std::{io::Read, os::fd::FromRawFd};
+
+    let bytes = target.as_bytes();
+    let fd = match bytes {
+        b"1" => Some(libc::STDERR_FILENO),
+        [digit @ b'2'..=b'9'] => Some(i32::from(digit - b'0')),
+        _ if bytes.eq_ignore_ascii_case(b"true") => Some(libc::STDERR_FILENO),
+        _ => None,
+    };
+    let output = if let Some(fd) = fd {
+        if fd > libc::STDERR_FILENO {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            // Git can only see inherited descriptors. Never use a private
+            // close-on-exec descriptor which now occupies a requested slot.
+            if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EBADF).into());
+            }
+        }
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fcntl returned a new descriptor that this file now owns.
+        let destination = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        let mut command = Command::new("/bin/cat");
+        command.stdout(Stdio::from(destination));
+        run_captured(
+            command,
+            false,
+            true,
+            None,
+            Some(&mut trace.take(length)),
+            false,
+            CaptureMode::Channel,
+        )?
+    } else if !Path::new(target).is_absolute() {
+        bail!("expected an absolute pathname or a trace descriptor");
+    } else if let Some(output) = forward_packet_trace_by_fd(trace, length, target)? {
+        output
+    } else {
+        // Open the destination with the caller's stdio intact. Feed the
+        // original capture through a FIFO if descriptor paths are unavailable.
+        let fifo = source.with_extension("forward");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "exec /bin/cat >> \"$1\" < \"$2\"",
+                "git-on-packet-trace",
+            ])
+            .arg(target)
+            .arg(&fifo);
+        let output = run_captured(
+            command,
+            false,
+            false,
+            None,
+            Some(&mut trace.take(length)),
+            false,
+            CaptureMode::NamedInput(&fifo),
+        );
+        let _ = std::fs::remove_file(&fifo);
+        output?
+    };
+    crate::object::check_transfer()?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        if diagnostic.trim().is_empty() {
+            bail!("trace writer exited with {}", output.status);
+        }
+        bail!("{}", diagnostic.trim());
+    }
+    Ok(())
+}
+
+fn forward_packet_trace_by_fd(
+    trace: &std::fs::File,
+    length: u64,
+    target: &OsStr,
+) -> Result<Option<std::process::Output>> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{fs::MetadataExt, process::CommandExt},
+    };
+
+    let fd = unsafe { libc::fcntl(trace.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if fd < 0 {
+        return Ok(None);
+    }
+    // Keep this descriptor alive through the supervised writer. It is only
+    // inherited in that child and no longer depends on the capture's name.
+    let capture = unsafe { std::fs::File::from_raw_fd(fd) };
+    let identity = capture.metadata()?;
+    let name = fd.to_string();
+    let Some(source) = ["/proc/self/fd", "/dev/fd"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(&name))
+        .find(|path| {
+            std::fs::File::open(path)
+                .and_then(|alias| alias.metadata())
+                .is_ok_and(|metadata| {
+                    (metadata.dev(), metadata.ino()) == (identity.dev(), identity.ino())
+                })
+        })
+    else {
+        return Ok(None);
+    };
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "exec /usr/bin/head -c \"$3\" \"$2\" >> \"$1\"",
+            "git-on-packet-trace",
+        ])
+        .arg(target)
+        .arg(source)
+        .arg(length.to_string());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = run_captured(
+        command,
+        false,
+        false,
+        None,
+        None,
+        false,
+        CaptureMode::InheritStdio,
+    );
+    drop(capture);
+    output.map(Some)
+}
+
+fn trace_advertises_filter(mut trace: impl std::io::Read) -> std::io::Result<bool> {
+    const WORD: &[u8] = b"filter\\0";
+    let mut matched = 0;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = match trace.read(&mut buffer) {
+            Ok(0) => return Ok(matches!(matched, 6 | 8)),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        for &byte in &buffer[..count] {
+            if byte.is_ascii_whitespace() {
+                if matches!(matched, 6 | 8) {
+                    return Ok(true);
+                }
+                matched = 0;
+            } else if WORD.get(matched) == Some(&byte) {
+                matched += 1;
+            } else {
+                matched = WORD.len() + 1;
+            }
+        }
+    }
 }
 
 pub(crate) fn run_fetch(
-    command: Command,
+    mut command: Command,
     input: Option<&mut dyn std::io::Read>,
 ) -> Result<std::process::Output> {
     let progress = crate::terminal_ui::progress_enabled();
+    command.stdout(Stdio::null());
     let mut output = run_captured(
         command,
-        true,
+        false,
         true,
         None,
         input,
@@ -523,7 +961,7 @@ fn run_captured(
     failed_output: Option<&std::sync::atomic::AtomicBool>,
     input: Option<&mut dyn std::io::Read>,
     progress: bool,
-    mode: CaptureMode,
+    mode: CaptureMode<'_>,
 ) -> Result<std::process::Output> {
     use std::{
         os::unix::{io::AsRawFd, process::CommandExt},
@@ -539,17 +977,21 @@ fn run_captured(
             .context("Git operation stopped after command completion");
     }
     let mut input = input
-        .map(|source| NativeInput::new(&mut command, source))
+        .map(|source| match mode {
+            CaptureMode::NamedInput(path) => NativeInput::fifo(path, source),
+            _ => NativeInput::new(&mut command, source),
+        })
         .transpose()?;
+    let may_detach = matches!(mode, CaptureMode::MayDetach);
     let mut stdout = if capture_stdout {
-        let (capture, writer) = NativeCapture::new(mode)?;
+        let (capture, writer) = NativeCapture::new(may_detach)?;
         command.stdout(writer);
         Some(capture)
     } else {
         None
     };
     let mut stderr = if capture_stderr {
-        let (capture, writer) = NativeCapture::new(mode)?;
+        let (capture, writer) = NativeCapture::new(may_detach)?;
         command.stderr(writer);
         Some(capture)
     } else {
@@ -559,7 +1001,11 @@ fn run_captured(
         .then(crate::terminal_ui::NativeProgress::new);
     let managed = crate::terminal_ui::owns_terminal();
     crate::terminal_ui::configure(&mut command);
-    if managed && input.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    if managed
+        && input.is_none()
+        && !matches!(mode, CaptureMode::InheritStdio)
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
         command.stdin(Stdio::null());
     }
     let tty = (!managed).then(controlling_terminal).flatten();
@@ -647,7 +1093,7 @@ fn run_captured(
         }
         wakeup.wait(
             Duration::from_millis(10),
-            input.as_ref().map(|input| input.pipe.as_raw_fd()),
+            input.as_ref().and_then(NativeInput::fd),
             [
                 stdout.as_ref().and_then(NativeCapture::fd),
                 stderr.as_ref().and_then(NativeCapture::fd),
@@ -681,10 +1127,11 @@ fn run_captured(
     })
 }
 
-#[derive(Clone, Copy)]
-enum CaptureMode {
+enum CaptureMode<'a> {
     Channel,
     MayDetach,
+    InheritStdio,
+    NamedInput(&'a Path),
 }
 
 enum NativeCapture {
@@ -710,8 +1157,8 @@ pub(crate) fn capture_file() -> std::io::Result<std::fs::File> {
 }
 
 impl NativeCapture {
-    fn new(mode: CaptureMode) -> std::io::Result<(Self, Stdio)> {
-        if matches!(mode, CaptureMode::MayDetach) {
+    fn new(may_detach: bool) -> std::io::Result<(Self, Stdio)> {
+        if may_detach {
             // Native Git can leave a configured hook or a persistent SSH
             // proxy writing to its inherited descriptors after Git exits.
             // A capture channel would return EPIPE when its reader closes.
@@ -777,10 +1224,17 @@ impl NativeCapture {
 
 struct NativeInput<'a> {
     source: &'a mut dyn std::io::Read,
-    pipe: std::os::unix::net::UnixStream,
+    pipe: InputPipe,
     bytes: [u8; 8192],
     pending: std::ops::Range<usize>,
 }
+
+enum InputPipe {
+    Socket(std::os::unix::net::UnixStream),
+    WaitingForFifo(PathBuf, u64, u64),
+    Fifo(std::fs::File),
+}
+
 impl<'a> NativeInput<'a> {
     fn new(command: &mut Command, source: &'a mut dyn std::io::Read) -> std::io::Result<Self> {
         use std::os::fd::OwnedFd;
@@ -789,13 +1243,63 @@ impl<'a> NativeInput<'a> {
         command.stdin(Stdio::from(OwnedFd::from(child)));
         Ok(Self {
             source,
-            pipe,
+            pipe: InputPipe::Socket(pipe),
             bytes: [0; 8192],
             pending: 0..0,
         })
     }
+
+    fn fifo(path: &Path, source: &'a mut dyn std::io::Read) -> std::io::Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let expected = std::fs::symlink_metadata(path)?;
+        if !expected.file_type().is_fifo() {
+            return Err(std::io::Error::other("packet trace FIFO was replaced"));
+        }
+        Ok(Self {
+            source,
+            pipe: InputPipe::WaitingForFifo(path.to_owned(), expected.dev(), expected.ino()),
+            bytes: [0; 8192],
+            pending: 0..0,
+        })
+    }
+
+    fn fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        match &self.pipe {
+            InputPipe::Socket(pipe) => Some(pipe.as_raw_fd()),
+            InputPipe::Fifo(pipe) => Some(pipe.as_raw_fd()),
+            InputPipe::WaitingForFifo(..) => None,
+        }
+    }
+
     fn advance(&mut self) -> std::io::Result<bool> {
-        use std::io::{ErrorKind, Write};
+        use std::{
+            io::{ErrorKind, Write},
+            os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+        };
+        if let InputPipe::WaitingForFifo(path, device, inode) = &self.pipe {
+            let output = match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(output) => output,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let metadata = output.metadata()?;
+            if !metadata.file_type().is_fifo()
+                || (metadata.dev(), metadata.ino()) != (*device, *inode)
+            {
+                return Err(std::io::Error::other("packet trace FIFO was replaced"));
+            }
+            self.pipe = InputPipe::Fifo(output);
+        }
+        let output: &mut dyn Write = match &mut self.pipe {
+            InputPipe::Socket(pipe) => pipe,
+            InputPipe::Fifo(pipe) => pipe,
+            InputPipe::WaitingForFifo(..) => unreachable!(),
+        };
         // Bound work between cancellation checks, including for a decoder's
         // large segmented request stream. No input worker or full copy is needed.
         for _ in 0..8 {
@@ -809,7 +1313,7 @@ impl<'a> NativeInput<'a> {
                 }
                 self.pending = 0..count;
             }
-            match self.pipe.write(&self.bytes[self.pending.clone()]) {
+            match output.write(&self.bytes[self.pending.clone()]) {
                 Ok(0) => return Err(ErrorKind::WriteZero.into()),
                 Ok(count) => self.pending.start += count,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -1021,6 +1525,42 @@ mod transport_policy_tests {
     use super::*;
 
     #[test]
+    fn local_verification_command_keeps_worktree_relative_alternates() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let here = directory.path().join("worktree");
+        git2::Repository::init(&here)?;
+        let alternate = git2::Repository::init(directory.path().join("alternate"))?;
+        let object = alternate.blob(b"only in the alternate")?;
+        let invocation = here.join("inside");
+        std::fs::create_dir(&invocation)?;
+        let git = Git::capture(&invocation)?;
+        let mut command = git.verification_command(git.repository_dir()?);
+        command
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "../alternate/.git/objects",
+            )
+            .args(["cat-file", "-t", &object.to_string()]);
+        let result = run_builtin(command)?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"blob\n");
+        Ok(())
+    }
+
+    #[test]
+    fn capability_trace_recognizes_whole_tokens_across_reads() {
+        use std::io::Read;
+
+        let partial = &b"refilter filter-unsupported\nfilter\\"[..];
+        assert!(!trace_advertises_filter(partial).unwrap());
+        assert!(trace_advertises_filter(partial.chain(&b"0\n"[..])).unwrap());
+    }
+
+    #[test]
     fn url_query_channels_require_the_exact_local_command() {
         let local = ["ls-remote", "--get-url", "--", "source"].map(OsStr::new);
         let remote = ["ls-remote", "--get-url", "--no-get-url", "source"].map(OsStr::new);
@@ -1104,9 +1644,9 @@ printf 'clock\000'
             .unwrap()
             .set_str("core.fsmonitor", hook.to_str().unwrap())
             .unwrap();
-        let selected = Git::capture(root).unwrap().resolve(OsStr::new(":view"));
+        let selected = Git::capture_snapshot(root, OsStr::new(":view"));
         std::fs::write(root.join("helper-ready"), b"").unwrap();
-        assert_eq!(selected.unwrap(), commit);
+        assert_eq!(selected.unwrap().1, commit);
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let outcome = std::fs::read(root.join("helper-done")).ok();

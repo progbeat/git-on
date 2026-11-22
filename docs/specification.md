@@ -133,8 +133,9 @@ The native mount and write-policy contracts apply to local and remote runs.
   The application may handle the error, continue, or exit normally.
 - The writable layer is fresh for each run. It uses private filesystem-backed
   storage in a per-run directory under `TMPDIR/git-on` (or the system temporary
-  location's `git-on` directory). If another unprivileged user owns that group,
-  git-on uses a private group for the current user. Git-on creates no private memory filesystem
+  location's `git-on` directory). If another unprivileged user owns that group
+  or an ordinary file occupies its name, git-on uses a private group for the current
+  user. Git-on creates no private memory filesystem
   and imposes no disk quota. The underlying temporary filesystem's capacity and
   operating-system limits apply.
 - Completion unmounts the snapshot and removes the run's temporary files.
@@ -145,11 +146,13 @@ The native mount and write-policy contracts apply to local and remote runs.
   failures and orderly cleanup whenever possible. Manual stale-run recovery
   does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
-  cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, releasing a recorded Git pin and identifying the owned SSH socket;
-  it is not a run manifest or log.
-  `git on --cleanup <temporary-directory>` must refuse active directories, avoid unrelated mounts and changed pin targets, and
-  never terminate processes based on stale PIDs.
+  cleanup. New runs publish an empty ownership file after acquiring its
+  exclusive lock. The mount identity comes from the private directory's
+  name, owner and inode. SSH recovery retains
+  the owned endpoint identity. Cleanup accepts older run records and checks a
+  recorded Git pin's target before releasing it.
+  `git on --cleanup <temporary-directory>` must refuse active directories and
+  unrelated mounts. It never terminates processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
@@ -196,7 +199,7 @@ The lazy startup and performance requirements below apply to both native mounts.
 Remote materialization obtains the selected revision in one shallow transfer.
 A mount fallback reuses the original selection and fetches the full snapshot
 in one additional shallow transfer.
-Compressed objects are decoded into their final paths, and already prepared
+Verified contents are written to their final paths, and already prepared
 contents are reused for repeated OIDs.
 
 ## FUSE operation coverage requirement
@@ -334,9 +337,11 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
    complexity. Where practical, compute and cache needed results as the data
    is processed, taking into account the capabilities of the libraries in use.
 
-The preceding sections describe the current behavior contract. The target
-design must reconcile snapshot pin writes, temporary Git repositories,
-pack staging, and crash recovery with these requirements.
+The preceding sections describe the current behavior contract. Native Git
+compatibility can still stage packs in temporary storage when it applies the
+caller's fetch and transport policies. The target design must reconcile
+temporary Git repositories, pack staging and SSH crash recovery with these
+requirements.
 
 ## Acceptance evidence
 

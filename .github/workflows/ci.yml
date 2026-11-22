@@ -476,7 +476,15 @@ jobs:
           python3 tests/fsync_contract.py --binary target/debug/git-on --require-nfs
           python3 tests/remote.py --binary target/debug/git-on --require-nfs \
             RemoteTests.test_local_common_directory_reads_without_changing_native_repository_refs \
+            RemoteTests.test_eager_copy_rejects_configuration_rejected_by_native_fetch \
+            RemoteTests.test_eager_file_copy_selects_decomposed_ref_as_native_git \
+            RemoteTests.test_eager_ssh_obeys_native_ref_selection_and_update_policy \
+            RemoteTests.test_native_local_alternates_do_not_fetch_missing_promisor_objects \
+            RemoteTests.test_local_alternates_keep_the_primary_depth_alongside_env \
+            RemoteTests.test_native_local_alternates_keep_the_resolved_environment_store \
+            RemoteTests.test_native_local_alternates_read_from_a_long_resolved_environment \
             RemoteTests.test_materialized_remote_fetches_the_selected_tree_once \
+            RemoteTests.test_auto_copy_releases_the_pooled_channel_before_native_fetch \
             RemoteTests.test_git_on_in_a_terminal_reuses_the_https_demand_session \
             RemoteTests.test_cancel_concurrent_https_demands \
             RemoteTests.test_cold_directory_demand_overlaps_file_lookup \

@@ -4,7 +4,9 @@ from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
+from random import Random
 import re
+import select
 import shlex
 import shutil
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zlib
@@ -55,8 +58,17 @@ def ssh_upload_pack(root):
                     sys.stdout.buffer.write((root / 'prefix').read_bytes())
                     sys.stdout.buffer.flush()
                     (root / 'pack-started').touch()
-                    assert await_file(root / 'release-pack', 15)
+                    wait_for_eof = root / 'wait-for-request-eof'
+                    if wait_for_eof.exists():
+                        assert select.select([0], [], [], 4)[0], 'expected EOF before the pack trailer'
+                        assert not os.read(0, 1), 'expected SSH request EOF'
+                        (root / 'received-request-eof').touch()
+                    else:
+                        assert await_file(root / 'release-pack', 15)
                     sys.stdout.buffer.write((root / 'tail').read_bytes())
+                    if wait_for_eof.exists():
+                        sys.stdout.buffer.flush()
+                        raise SystemExit(int(wait_for_eof.read_text()))
                 else:
                     git.stdin.write(request)
                     git.stdin.flush()
@@ -95,6 +107,44 @@ def ssh_branch_pack(root):
             git.stdin.close()
 
 
+def ssh_eof_pack(root, failed):
+    repository = root / 'server.git'
+    closing = set((root / 'closing').read_bytes().splitlines())
+    try:
+        (root / 'initial-channel').mkdir()
+    except FileExistsError:
+        pass
+    else:
+        # Induce the normal slow-start path with negotiated spare channels.
+        time.sleep(.35)
+    with subprocess.Popen(['git', 'upload-pack', repository], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE) as git:
+        try:
+            for packet in packets(git.stdout):
+                sys.stdout.buffer.write(packet)
+            sys.stdout.buffer.flush()
+            if (root / 'expire-spares').is_file() and not select.select([0], [], [], .45)[0]:
+                (root / f'expired-{os.getpid()}').touch()
+                return 0
+            while request := b''.join(packets(sys.stdin.buffer)):
+                wants = re.findall(rb'want ([0-9a-f]{40})', request)
+                wanted = wants[0]
+                time.sleep(.1)
+                if wanted in closing and select.select([0], [], [], 1.2)[0]:
+                    assert not os.read(0, 1), 'extra input on a terminal request'
+                    (root / wanted.decode()).touch()
+                git.stdin.write(request)
+                git.stdin.flush()
+                for packet in packets(git.stdout):
+                    sys.stdout.buffer.write(packet)
+                sys.stdout.buffer.flush()
+                if wanted == failed:
+                    return 49
+        finally:
+            git.stdin.close()
+    return 0
+
+
 def pack_entry(kind, data):
     size = len(data)
     header = bytearray([(kind << 4) | (size & 15)])
@@ -104,6 +154,14 @@ def pack_entry(kind, data):
         header.append(size & 127)
         size >>= 7
     return bytes(header) + zlib.compress(data)
+
+
+def split_pack_packets(head, tail):
+    chunks = [head[index:index+60000] for index in range(0, len(head), 60000)]
+    framed = b''.join(f'{len(chunk)+5:04x}'.encode() + b'\1' + chunk for chunk in chunks[:-1])
+    last = chunks[-1]
+    assert len(last) + len(tail) + 5 <= 65520
+    return framed + f'{len(last)+len(tail)+5:04x}'.encode() + b'\1' + last, tail + b'0000'
 
 
 class SplitPack:
@@ -123,12 +181,8 @@ class SplitPack:
         # first blob. Several objects and the PACK trailer are still unsent.
         head = pack if hold_trailer else header + entries[0]
         tail = (b'' if hold_trailer else b''.join(entries[1:])) + hashlib.sha1(pack).digest()
-        chunks = [head[index:index+60000] for index in range(0, len(head), 60000)]
-        framed = b''.join(f'{len(chunk)+5:04x}'.encode() + b'\1' + chunk for chunk in chunks[:-1])
-        last = chunks[-1]
-        assert len(last) + len(tail) + 5 <= 65520
-        self.prefix = b'000dpackfile\n' + framed + f'{len(last)+len(tail)+5:04x}'.encode() + b'\1' + last
-        self.tail = tail + b'0000'
+        prefix, self.tail = split_pack_packets(head, tail)
+        self.prefix = b'000dpackfile\n' + prefix
 
 
 def fixture_in_short_tmp():
@@ -143,6 +197,57 @@ def mount_flag():
 
 
 class StreamingTests(unittest.TestCase):
+    def sparse_ssh_fixture(self, failed=False):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        url = fixture.ssh(protocol_v2=True, max_sessions=5)
+        closing = [fixture.subtree, fixture.blob]
+        (fixture.root / 'closing').write_text('\n'.join(closing))
+        shim = [sys.executable, str(Path(__file__).resolve()), '--ssh-eof',
+                str(fixture.root), fixture.blob if failed else '']
+        fixture.force_upload_pack('exec ' + shlex.join(shim) + '\n')
+        return fixture, url, closing
+
+    def run_sparse_ssh(self, fixture, url, command):
+        return subprocess.run(
+            [OPTIONS.binary, url, fixture.commit, mount_flag(), '--write-policy=none',
+             '--', *command],
+            cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=15,
+        )
+
+    def test_sparse_ssh_closes_used_channels_while_they_send_packs(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                fixture, url, closing = self.sparse_ssh_fixture(failed)
+                command = ['cat', 'deep/file'] if failed else ['cat', 'deep/file', 'other']
+                result = self.run_sparse_ssh(fixture, url, command)
+                self.assertEqual(result.stdout, b'expected\n' if failed else b'expected\nunrelated payload\n',
+                                 result.stderr)
+                self.assertEqual(result.returncode, 125 if failed else 0, result.stderr)
+                if failed:
+                    self.assertIn(b'SSH transport exited with exit status: 49', result.stderr)
+                for oid in closing:
+                    self.assertTrue((fixture.root / oid).is_file(),
+                                    f'SSH stdin remained open while pack for {oid} was in flight')
+                self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
+    def test_sparse_ssh_ignores_standbys_that_expired_before_the_first_lookup(self):
+        fixture, url, closing = self.sparse_ssh_fixture()
+        (fixture.root / 'expire-spares').touch()
+        result = self.run_sparse_ssh(fixture, url, ['/bin/sh', '-c', 'sleep 1.1; exec cat deep/file'])
+        self.assertTrue(list(fixture.root.glob('expired-*')), 'no standby timed out')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+        self.assertFalse(any((fixture.root / oid).exists() for oid in closing))
+        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
+    def test_first_cold_ssh_directory_enumeration_keeps_channels_reusable(self):
+        fixture, url, _ = self.sparse_ssh_fixture()
+        result = self.run_sparse_ssh(fixture, url, ['ls', '-1', 'deep'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'file\n')
+        self.assertFalse((fixture.root / fixture.subtree).exists(), 'SSH stdin closed during readdir')
+
     def ssh_branch_fixture(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
@@ -340,6 +445,167 @@ Path({str(done)!r}).touch()
         self.assertEqual(process.returncode, 0, errors)
         self.assertNotIn(fixture.other.encode(), {oid for _, wants in proxy.records for oid in wants})
 
+    def test_successful_child_exit_waits_for_the_pack_used_by_its_read(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        upstream = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        proxy = Multiplexer(fixture, upstream, None)
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        pack = subprocess.check_output(['git', '-C', fixture.repo, 'pack-objects', '--stdout'],
+                                       input=(fixture.blob + '\n').encode(), env=fixture.env)
+        prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                split = SimpleNamespace(wants={fixture.blob.encode()}, prefix=b'000dpackfile\n' + prefix,
+                                        tail=tail, started=fixture.root / f'started-{interrupted}',
+                                        release=fixture.root / f'release-{interrupted}')
+                proxy.split_pack = split
+                self.addCleanup(split.release.touch)
+                pidfile = fixture.root / f'child-{interrupted}'
+                script = f"""
+import os
+from pathlib import Path
+assert Path('deep/file').read_bytes() == b'expected\\n'
+pidfile = Path({str(pidfile)!r})
+pending = pidfile.with_suffix('.new')
+pending.write_text(str(os.getpid()))
+pending.replace(pidfile)
+"""
+                process = subprocess.Popen(
+                    [OPTIONS.binary, url, fixture.commit, mount_flag(), '--write-policy=none',
+                     '--', sys.executable, '-I', '-S', '-c', script],
+                    cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                fixture.children.append(process)
+                try:
+                    self.assertTrue(await_file(pidfile, 8, process), 'the child did not complete its read')
+                    pid = int(pidfile.read_text())
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            break
+                        self.assertLess(time.monotonic(), deadline, 'the child did not exit')
+                        time.sleep(.01)
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        process.wait(timeout=.3)
+                finally:
+                    if interrupted:
+                        split.tail = None
+                    split.release.touch()
+                _, errors = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 125 if interrupted else 0, errors)
+                if interrupted:
+                    self.assertIn(b'execution incomplete', errors)
+
+    def test_ssh_used_pack_can_finish_after_command_exit_sends_eof(self):
+        for remote_exit in (0, 49):
+            with self.subTest(remote_exit=remote_exit):
+                fixture = fixture_in_short_tmp()
+                try:
+                    url = fixture.ssh(protocol_v2=True)
+                    pack = subprocess.check_output(
+                        ['git', '-C', fixture.repo, 'pack-objects', '--stdout'],
+                        input=(fixture.blob + '\n').encode(), env=fixture.env,
+                    )
+                    prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
+                    (fixture.root / 'wants').write_text(fixture.blob + '\n')
+                    (fixture.root / 'prefix').write_bytes(b'000dpackfile\n' + prefix)
+                    (fixture.root / 'tail').write_bytes(tail)
+                    (fixture.root / 'wait-for-request-eof').write_text(str(remote_exit))
+                    shim = shlex.join([sys.executable, str(Path(__file__).resolve()),
+                                       '--ssh-pack', str(fixture.root)])
+                    authorized = fixture.root / 'authorized'
+                    authorized.write_text(f'command="{shim}" ' + authorized.read_text())
+                    command = 'import os; os.listdir("."); print(open("deep/file").read(), end="")'
+                    result = subprocess.run(
+                        [OPTIONS.binary, url, fixture.commit, mount_flag(),
+                         '--write-policy=none', '--', sys.executable, '-I', '-S', '-c', command],
+                        cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=18,
+                    )
+                    self.assertEqual(result.stdout, b'expected\n', result.stderr)
+                    self.assertTrue((fixture.root / 'received-request-eof').exists(), result.stderr)
+                    self.assertEqual(result.returncode, 125 if remote_exit else 0, result.stderr)
+                    if remote_exit:
+                        self.assertIn(b'SSH transport exited with exit status: 49', result.stderr)
+                finally:
+                    fixture.close()
+
+    def test_remote_copy_up_before_pack_trailer_fits_two_checkouts(self):
+        if not OPTIONS.require_fuse:
+            self.skipTest('requires a real Linux FUSE mount and a private tmpfs quota')
+        from filesystem_quota import compare_on_tmpfs
+
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        data = Random(41).randbytes(3 * 1024 * 1024)
+        blob = fixture.git('hash-object', '-w', '--stdin', data=data)
+        entries = [f'100644 blob {blob}\tlarge\n']
+        for index in range(9):
+            oid = fixture.git('hash-object', '-w', '--stdin', data=bytes([index]) * (64 * 1024 + 1))
+            entries.append(f'100644 blob {oid}\tz{index}\n')
+        tree = fixture.git('mktree', data=''.join(entries).encode())
+        commit = fixture.git('commit-tree', tree, data=b'copy before the trailer\n')
+        fixture.git('update-ref', 'refs/heads/main', commit)
+        pack = subprocess.check_output(['git', '-C', fixture.repo, 'pack-objects', '--stdout'],
+                                       input=(blob + '\n').encode(), env=fixture.env)
+        prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
+        split = SimpleNamespace(wants={blob.encode()}, prefix=b'000dpackfile\n' + prefix, tail=tail,
+                                started=fixture.root / 'pack-started', release=fixture.root / 'release-pack')
+        upstream = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        proxy = Multiplexer(fixture, upstream, None)
+        proxy.split_pack = split
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        self.addCleanup(split.release.touch)
+        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+
+        script = f"""
+import hashlib, os, time
+from pathlib import Path
+mounted = not Path('.git').exists()
+with open('large', 'r+b', buffering=0) as file:
+    assert file.read(128) == {data[:128]!r}
+    for index in range(9):
+        with open(f'z{{index}}', 'rb') as filler:
+            assert filler.read(1) == bytes([index])
+    if mounted:
+        root = Path.cwd().parent
+        deadline = time.monotonic() + 5
+        while True:
+            spilled = next(root.glob('raw-objects-*/{blob}'), None)
+            if spilled and spilled.stat().st_size == {len(data)}:
+                break
+            assert time.monotonic() < deadline, 'source spill did not complete'
+            time.sleep(.01)
+    assert os.pwrite(file.fileno(), b'W', 0) == 1
+    os.fsync(file.fileno())
+    file.seek(0)
+    assert hashlib.sha256(file.read()).hexdigest() == {hashlib.sha256(b'W' + data[1:]).hexdigest()!r}
+    if mounted:
+        assert os.path.ismount('.') and Path({str(split.started)!r}).exists()
+        assert not list(root.glob('raw-parts-*/*')), 'compressed pack was staged'
+        assert not (root / 'remote-repository').exists(), 'native Git pack storage was used'
+        with spilled.open('rb') as source:
+            assert source.read(128) == {data[:128]!r}
+        release = Path({str(split.release)!r})
+        assert not release.exists()
+        release.touch()
+print('updated private copy')
+"""
+        compare_on_tmpfs(self, fixture.root, OPTIONS.binary.resolve(), fixture.cwd, fixture.env['PATH'],
+                         [sys.executable, '-I', '-S', '-c', script], size_mib=11, source=url,
+                         checkout_copies=2, tls_ca=fixture.env['GIT_SSL_CAINFO'], revision=commit,
+                         runner_size_mib=7)
+        self.assertTrue(split.release.exists(), 'write did not finish before the trailer')
+
     def test_ssh_channel_rejection_preserves_the_owned_master(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
@@ -380,5 +646,7 @@ if __name__ == '__main__':
         ssh_upload_pack(Path(sys.argv[2]))
     elif sys.argv[1:2] == ['--ssh-branch']:
         ssh_branch_pack(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ['--ssh-eof']:
+        sys.exit(ssh_eof_pack(Path(sys.argv[2]), sys.argv[3].encode()))
     else:
         unittest.main(argv=[sys.argv[0], *ARGS])

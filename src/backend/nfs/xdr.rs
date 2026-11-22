@@ -1,4 +1,6 @@
 //! Bounds-checked XDR primitives for the local ONC RPC service.
+use crate::raw_blob::ReadData;
+
 pub(super) const MAX_RECORD: usize = 2 * 1024 * 1024;
 pub(super) const MAX_DATA: usize = 1024 * 1024;
 
@@ -73,23 +75,118 @@ impl<'a> Reader<'a> {
 #[derive(Default)]
 pub(super) struct Writer {
     bytes: Vec<u8>,
+    payloads: Vec<Payload>,
+    payload_wire_len: usize,
+}
+
+struct Payload {
+    // Insertion point in the encoded fields, before its data and XDR padding.
+    at: usize,
+    data: ReadData,
+    capacity: usize,
+}
+
+impl Payload {
+    fn wire_len(&self) -> usize {
+        self.data.len().next_multiple_of(4)
+    }
+}
+
+pub(super) struct ReplyBody {
+    fields: Vec<u8>,
+    payloads: Vec<Payload>,
+    payload_wire_len: usize,
+}
+
+impl ReplyBody {
+    pub(super) fn len(&self) -> usize {
+        self.fields.len() + self.payload_wire_len
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.fields.capacity()
+            + self
+                .payloads
+                .iter()
+                .map(|part| part.capacity)
+                .sum::<usize>()
+    }
+
+    pub(super) fn data_slice_count(&self) -> usize {
+        self.payloads
+            .iter()
+            .map(|part| part.data.chunk_count())
+            .sum()
+    }
+
+    pub(super) fn slices(&self) -> impl Iterator<Item = &[u8]> {
+        let mut previous = 0;
+        let suffix = self.payloads.last().map_or(0, |part| part.at);
+        self.payloads
+            .iter()
+            .flat_map(move |part| {
+                let fields = &self.fields[previous..part.at];
+                previous = part.at;
+                let padding = &[0; 3][..part.wire_len() - part.data.len()];
+                std::iter::once(fields)
+                    .chain(part.data.chunks())
+                    .chain(std::iter::once(padding))
+            })
+            .chain(std::iter::once(&self.fields[suffix..]))
+            .filter(|slice| !slice.is_empty())
+    }
 }
 
 impl Writer {
+    /// Field offsets remain stable when payloads are sent separately.
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    pub(super) fn wire_len(&self) -> usize {
+        self.len() + self.payload_wire_len
+    }
+
     pub(super) fn bytes(&self) -> &[u8] {
+        debug_assert!(self.payloads.is_empty());
         &self.bytes
     }
 
     pub(super) fn into_bytes(self) -> Vec<u8> {
+        debug_assert!(self.payloads.is_empty());
         self.bytes
+    }
+
+    pub(super) fn into_reply(self, replay_budget: Option<usize>) -> ReplyBody {
+        let mut reply = ReplyBody {
+            fields: self.bytes,
+            payloads: self.payloads,
+            payload_wire_len: self.payload_wire_len,
+        };
+        if let Some(budget) = replay_budget.filter(|&budget| reply.capacity() > budget) {
+            reply.fields.shrink_to_fit();
+            if reply.capacity() > budget {
+                // A small read range can hold a much larger cache allocation.
+                // Keep the exact reply within the negotiated replay budget.
+                let mut fields = Vec::with_capacity(reply.len());
+                for slice in reply.slices() {
+                    fields.extend_from_slice(slice);
+                }
+                reply = ReplyBody {
+                    fields,
+                    payloads: Vec::new(),
+                    payload_wire_len: 0,
+                };
+            }
+        }
+        reply
     }
 
     pub(super) fn truncate(&mut self, len: usize) {
         self.bytes.truncate(len);
+        while self.payloads.last().is_some_and(|part| part.at > len) {
+            self.payload_wire_len -= self.payloads.pop().unwrap().wire_len();
+        }
     }
 
     pub(super) fn fixed(&mut self, value: &[u8]) {
@@ -112,6 +209,41 @@ impl Writer {
         self.u32(value.len().try_into().expect("bounded XDR output"));
         self.fixed(value);
         self.bytes.resize(self.len().next_multiple_of(4), 0);
+    }
+
+    pub(super) fn opaque_data(&mut self, data: ReadData, data_budget: usize) {
+        let allocation = match &data {
+            ReadData::Owned(bytes) => bytes.capacity(),
+            _ => data
+                .shared_allocations()
+                .filter(|bytes| {
+                    !self
+                        .payloads
+                        .iter()
+                        .flat_map(|part| part.data.shared_allocations())
+                        .any(|previous| bytes.shares_allocation(previous))
+                })
+                .map(|bytes| bytes.capacity())
+                .sum(),
+        };
+        self.u32(data.len().try_into().expect("bounded XDR output"));
+        if allocation > data_budget {
+            // Release oversized source owners as operations are encoded.
+            for chunk in data.chunks() {
+                self.fixed(chunk);
+            }
+            self.bytes.resize(self.len().next_multiple_of(4), 0);
+            return;
+        }
+        if !data.is_empty() {
+            let payload = Payload {
+                at: self.len(),
+                data,
+                capacity: allocation,
+            };
+            self.payload_wire_len += payload.wire_len();
+            self.payloads.push(payload);
+        }
     }
 
     pub(super) fn patch_u32(&mut self, offset: usize, value: u32) {

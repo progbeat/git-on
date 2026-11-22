@@ -134,29 +134,50 @@ struct PreparedBlob {
 }
 impl PreparedBlob {
     fn copy_to(&self, root: &Path, oid: git2::Oid, output: &mut dyn std::io::Write) -> Result<()> {
-        let copy = |input: &mut dyn std::io::Read| {
-            crate::object::copy_verified(
-                input,
-                output,
-                git2::ObjectType::Blob,
-                usize::try_from(self.size)?,
-                oid,
-            )
-        };
         match self.kind {
-            EntryKind::Symlink => {
-                let target = fs::read_link(root.join(&self.path))?;
-                copy(&mut target.as_os_str().as_bytes())
-            }
+            EntryKind::Symlink => self.with_symlink_target(root, oid, |bytes| {
+                crate::object::write_verified_buffer(bytes, output)
+            }),
             EntryKind::File => {
                 let mut input = OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(root.join(&self.path))?;
                 crate::spool::private_file_metadata(&input)?;
-                copy(&mut input)
+                crate::object::copy_verified(
+                    &mut input,
+                    output,
+                    git2::ObjectType::Blob,
+                    usize::try_from(self.size)?,
+                    oid,
+                )
             }
             EntryKind::Directory => unreachable!("only prepared blobs are retained"),
+        }
+    }
+
+    fn with_symlink_target<T>(
+        &self,
+        root: &Path,
+        oid: git2::Oid,
+        consume: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if self.kind == EntryKind::Symlink {
+            let target = fs::read_link(root.join(&self.path))?;
+            let bytes = target.as_os_str().as_bytes();
+            let mut verifier = crate::object::VerifiedWriter::new(
+                std::io::sink(),
+                git2::ObjectType::Blob,
+                usize::try_from(self.size)?,
+                oid,
+            );
+            crate::object::write_verified_buffer(bytes, &mut verifier)?;
+            verifier.finish()?;
+            consume(bytes)
+        } else {
+            let mut target = Vec::new();
+            self.copy_to(root, oid, &mut target)?;
+            consume(&target)
         }
     }
 }
@@ -166,6 +187,7 @@ pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
     snapshot.begin_materialization()?;
     directory(
         snapshot,
+        snapshot.tree_oid,
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
@@ -173,18 +195,15 @@ pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
 }
 fn directory(
     snapshot: &Snapshot,
+    oid: git2::Oid,
     relative: &Path,
     root: &Path,
     prepared: &mut std::collections::HashMap<git2::Oid, PreparedBlob>,
 ) -> Result<()> {
-    let mut children = snapshot.children(relative)?.into_iter();
-    let mut expected = std::collections::HashSet::new();
-    loop {
-        let batch: Vec<_> = children.by_ref().take(256).collect();
-        if batch.is_empty() {
-            break;
-        }
-        snapshot.prepare_materialization(&batch, |oid| prepared.contains_key(&oid))?;
+    let source = snapshot.directory_by_oid(oid)?;
+    let children = Snapshot::directory_children(&source, relative).collect::<Result<Vec<_>>>()?;
+    for batch in children.chunks(256) {
+        snapshot.prepare_materialization(batch, |oid| prepared.contains_key(&oid))?;
         for (name, entry) in batch {
             if let Some(signal) = crate::git::cancelled_signal() {
                 bail!("materialization cancelled by signal {signal}");
@@ -199,7 +218,7 @@ fn directory(
                 "unsupported snapshot name {:?}",
                 name
             );
-            let relative = relative.join(&name);
+            let relative = relative.join(name);
             let path = root.join(&relative);
             ensure!(
                 entry.mode != 0o160000,
@@ -210,7 +229,7 @@ fn directory(
                 match entry.kind {
                     EntryKind::Directory => {
                         fs::create_dir(&path)?;
-                        directory(snapshot, &relative, root, prepared)?;
+                        directory(snapshot, entry.oid, &relative, root, prepared)?;
                         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
                         ensure!(
                             fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
@@ -218,39 +237,34 @@ fn directory(
                         );
                     }
                     EntryKind::Symlink => {
-                        let target = if let Some(source) = prepared.get(&entry.oid) {
-                            let mut target = Vec::new();
-                            source.copy_to(root, entry.oid, &mut target)?;
+                        let create = |target: &[u8]| -> Result<u64> {
                             ensure!(
                                 !target.is_empty() && !target.contains(&0),
                                 "unusable symlink target"
                             );
-                            target
-                        } else {
-                            let mut target = Vec::new();
-                            snapshot.copy_verified_blob(entry.oid, &mut target)?;
+                            symlink(std::ffi::OsStr::from_bytes(target), &path)?;
                             ensure!(
-                                !target.is_empty() && !target.contains(&0),
-                                "unusable symlink target"
+                                fs::read_link(&path)?.as_os_str().as_bytes() == target,
+                                "host cannot preserve symlink target"
                             );
-                            target
+                            Ok(target.len() as u64)
                         };
-                        symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
-                        ensure!(
-                            fs::read_link(&path)?.as_os_str().as_bytes() == target,
-                            "host cannot preserve symlink target"
-                        );
+                        let size = match prepared.get(&entry.oid) {
+                            Some(source) => source.with_symlink_target(root, entry.oid, create)?,
+                            None => snapshot.with_materialized_symlink_target(entry.oid, create)?,
+                        };
                         prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
                             path: relative.clone(),
-                            size: target.len() as u64,
+                            size,
                             kind: entry.kind,
                         });
                     }
                     EntryKind::File => {
+                        let mode = entry.mode & 0o777;
                         let mut output = OpenOptions::new()
                             .write(true)
                             .create_new(true)
-                            .mode(0o600)
+                            .mode(mode)
                             .custom_flags(libc::O_NOFOLLOW)
                             .open(&path)?;
                         if let Some(source) = prepared.get(&entry.oid) {
@@ -269,12 +283,15 @@ fn directory(
                                 },
                             );
                         }
-                        let mode = entry.mode & 0o777;
-                        output.set_permissions(fs::Permissions::from_mode(mode))?;
-                        ensure!(
-                            output.metadata()?.permissions().mode() & 0o777 == mode,
-                            "host cannot preserve executable/permission bits"
-                        );
+                        // Normally creation already applied the final mode.
+                        // Repair and verify bits removed by the caller's umask.
+                        if output.metadata()?.permissions().mode() & 0o777 != mode {
+                            output.set_permissions(fs::Permissions::from_mode(mode))?;
+                            ensure!(
+                                output.metadata()?.permissions().mode() & 0o777 == mode,
+                                "host cannot preserve executable/permission bits"
+                            );
+                        }
                     }
                 }
                 Ok(())
@@ -292,17 +309,16 @@ fn directory(
                 }
                 return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
             }
-            expected.insert(name);
         }
     }
     let actual = fs::read_dir(root.join(relative))?
         .map(|e| e.map(|e| e.file_name()))
         .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
     ensure!(
-        actual == expected,
+        actual.len() == source.len() && actual.iter().all(|name| source.index(name).is_some()),
         "host changed snapshot names in {}: expected {:?}, found {:?}",
         relative.display(),
-        expected,
+        source.children().map(|(name, ..)| name).collect::<Vec<_>>(),
         actual
     );
     Ok(())

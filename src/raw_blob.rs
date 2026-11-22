@@ -7,10 +7,12 @@ use crate::{
 use anyhow::{Context, Result};
 use git2::{ObjectType, Oid};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
+    ops::Range,
     os::{
         fd::AsRawFd,
         unix::{
@@ -20,8 +22,8 @@ use std::{
     },
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock,
     },
     thread,
     time::Duration,
@@ -40,7 +42,16 @@ pub(crate) const COPY_UP_OPEN_FLAGS: i32 = 0;
 // this cache targets. Keep their verified buffers available for rereads.
 // See the measured blob sizes in docs/resources.md.
 const HOT_BLOBS: usize = 8;
-const COPY_BUFFER: usize = 1024 * 1024;
+const ACTIVE_DECODES: usize = 8;
+const COMPLETION_DECODES: usize = ACTIVE_DECODES + 1;
+const COPY_BUFFER: usize = 16 * BLOCK;
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_COPY: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
@@ -65,16 +76,97 @@ impl std::fmt::Display for BackingCleanupError {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct Transfer {
+    state: AtomicU8,
+    served: AtomicBool,
+    deferred_failure: Mutex<Option<DeferredTransferFailure>>,
+}
+
+struct DeferredTransferFailure {
+    message: Arc<str>,
+    reported: Arc<OnceLock<Arc<str>>>,
+}
+
+impl DeferredTransferFailure {
+    fn report(self) {
+        let _ = self.reported.set(self.message);
+    }
+}
+
+impl Transfer {
+    const VERIFIED: u8 = 1;
+    const FAILED: u8 = 2;
+
+    pub(crate) fn mark_verified(&self) {
+        self.state.store(Self::VERIFIED, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_served(&self) {
+        if !self.served() {
+            let mut deferred = self.deferred_failure.lock().unwrap();
+            if let Some(failure) = deferred.take() {
+                failure.report();
+            }
+            self.served.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn report_failure_on_use(
+        &self,
+        message: Arc<str>,
+        reported: Arc<OnceLock<Arc<str>>>,
+    ) {
+        let mut deferred = self.deferred_failure.lock().unwrap();
+        let failure = DeferredTransferFailure { message, reported };
+        // Serialize registration with the first reader, without taking the
+        // demand queue lock from inside the raw object store.
+        if self.served() {
+            failure.report();
+        } else {
+            *deferred = Some(failure);
+        }
+    }
+
+    pub(crate) fn served(&self) -> bool {
+        self.served.load(Ordering::Acquire)
+    }
+
+    fn verified(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == Self::VERIFIED
+    }
+
+    fn failed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == Self::FAILED
+    }
+
+    fn check(source: Option<&Arc<Self>>) -> Result<()> {
+        if source.is_some_and(|source| source.failed()) {
+            return Err(crate::object::OperationCancelled.into());
+        }
+        Ok(())
+    }
+}
+
 struct Descriptor {
     size: u64,
     blocks: Box<[[u8; 32]]>,
     file: bool,
     used: bool,
+    claimed: bool,
     content_checked: bool,
     directory: Option<Arc<Directory>>,
-    transfer: Option<Weak<()>>,
+    transfer: Option<Arc<Transfer>>,
 }
 impl Descriptor {
+    fn mark_served(&self) {
+        if !self.used && !self.claimed {
+            if let Some(transfer) = &self.transfer {
+                transfer.mark_served();
+            }
+        }
+    }
+
     fn kind(&self) -> ObjectType {
         if self.directory.is_some() {
             ObjectType::Tree
@@ -82,45 +174,179 @@ impl Descriptor {
             ObjectType::Blob
         }
     }
+
+    fn available(&self) -> bool {
+        self.used || self.claimed || self.transfer.as_ref().is_none_or(|source| !source.failed())
+    }
+
+    fn belongs_to(&self, transfer: &Arc<Transfer>) -> bool {
+        self.transfer
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, transfer))
+    }
 }
 struct Resident {
     block: usize,
-    bytes: Arc<Vec<u8>>,
+    bytes: BlobBytes,
+}
+
+pub(crate) struct OdbBlob(git2::OdbObject<'static>);
+
+impl OdbBlob {
+    fn new(object: git2::OdbObject<'_>) -> Self {
+        // SAFETY: libgit2's git_odb_read returns an owning reference. The
+        // git_odb_object contains the buffer and a reference count, with no
+        // pointer to the ODB. git_odb_object_data and git_odb_object_free
+        // operate on that allocation even after the originating ODB drops.
+        Self(unsafe {
+            std::mem::transmute::<git2::OdbObject<'_>, git2::OdbObject<'static>>(object)
+        })
+    }
+}
+
+// SAFETY: this wrapper exposes only the immutable data. libgit2 releases the
+// owning reference through an atomic decrement, independently of the ODB.
+unsafe impl Send for OdbBlob {}
+unsafe impl Sync for OdbBlob {}
+
+#[derive(Clone)]
+pub(crate) enum BlobBytes {
+    Rust(Arc<Vec<u8>>),
+    Odb(Arc<OdbBlob>),
+}
+
+impl BlobBytes {
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Rust(bytes) => bytes.capacity(),
+            Self::Odb(object) => object.0.len(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn shares_allocation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Rust(left), Self::Rust(right)) => Arc::ptr_eq(left, right),
+            (Self::Odb(left), Self::Odb(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl From<Vec<u8>> for BlobBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Rust(Arc::new(bytes))
+    }
+}
+
+impl std::ops::Deref for BlobBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Rust(bytes) => bytes,
+            Self::Odb(object) => object.0.data(),
+        }
+    }
+}
+
+impl std::fmt::Debug for BlobBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlobBytes")
+            .field("len", &self.len())
+            .finish()
+    }
 }
 #[derive(Debug)]
 pub(crate) enum ReadData {
     Owned(Vec<u8>),
-    Shared(Arc<Vec<u8>>, std::ops::Range<usize>),
+    Shared(BlobBytes, Range<usize>),
+    Blocks {
+        ranges: Vec<CheckedRange>,
+        len: usize,
+    },
 }
-impl AsRef<[u8]> for ReadData {
-    fn as_ref(&self) -> &[u8] {
+
+#[derive(Debug)]
+pub(crate) struct CheckedRange {
+    bytes: BlobBytes,
+    range: Range<usize>,
+}
+
+impl CheckedRange {
+    fn slice(&self) -> &[u8] {
+        &self.bytes[self.range.clone()]
+    }
+}
+
+impl ReadData {
+    pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Owned(bytes) => bytes,
-            Self::Shared(bytes, range) => &bytes[range.clone()],
+            Self::Owned(bytes) => bytes.len(),
+            Self::Shared(_, range) => range.len(),
+            Self::Blocks { len, .. } => *len,
         }
     }
-}
-impl std::ops::Deref for ReadData {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.as_ref()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-}
-impl ReadData {
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        let (one, ranges): (_, &[CheckedRange]) = match self {
+            Self::Owned(bytes) => (Some(bytes.as_slice()), &[]),
+            Self::Shared(bytes, range) => (Some(&bytes[range.clone()]), &[]),
+            Self::Blocks { ranges, .. } => (None, ranges),
+        };
+        one.into_iter()
+            .chain(ranges.iter().map(CheckedRange::slice))
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn chunk_count(&self) -> usize {
+        match self {
+            Self::Blocks { ranges, .. } => ranges.len(),
+            _ => 1,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn shared_allocations(&self) -> impl Iterator<Item = &BlobBytes> {
+        let (one, ranges): (_, &[CheckedRange]) = match self {
+            Self::Owned(_) => (None, &[]),
+            Self::Shared(bytes, _) => (Some(bytes), &[]),
+            Self::Blocks { ranges, .. } => (None, ranges),
+        };
+        one.into_iter().chain(ranges.iter().map(|part| &part.bytes))
+    }
+    pub(crate) fn contiguous(&self) -> Cow<'_, [u8]> {
+        match self {
+            Self::Owned(bytes) => Cow::Borrowed(bytes),
+            Self::Shared(bytes, range) => Cow::Borrowed(&bytes[range.clone()]),
+            Self::Blocks { .. } => Cow::Owned(self.copy_chunks()),
+        }
+    }
+    fn copy_chunks(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(self.len());
+        for chunk in self.chunks() {
+            data.extend_from_slice(chunk);
+        }
+        data
+    }
     pub(crate) fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Owned(bytes) => bytes,
-            Self::Shared(bytes, range) if range.start == 0 && range.end == bytes.len() => {
+            Self::Shared(BlobBytes::Rust(bytes), range)
+                if range.start == 0 && range.end == bytes.len() =>
+            {
                 Arc::unwrap_or_clone(bytes)
             }
             Self::Shared(bytes, range) => bytes[range].to_vec(),
+            Self::Blocks { .. } => self.copy_chunks(),
         }
     }
 }
 #[cfg(test)]
 impl<T: AsRef<[u8]>> PartialEq<T> for ReadData {
     fn eq(&self, other: &T) -> bool {
-        self.as_ref() == other.as_ref()
+        self.len() == other.as_ref().len() && self.chunks().flatten().eq(other.as_ref())
     }
 }
 #[derive(Clone)]
@@ -130,6 +356,13 @@ pub(crate) struct RawBlob {
     size: u64,
     kind: ObjectType,
 }
+
+enum CopySource {
+    Resident(BlobBytes),
+    Spilled(Arc<RawReader>),
+    Empty,
+}
+
 impl RawBlob {
     pub(crate) fn kind(&self) -> ObjectType {
         self.kind
@@ -138,16 +371,20 @@ impl RawBlob {
         self.size
     }
     pub(crate) fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
-        self.read_shared(offset, size).map(ReadData::into_vec)
+        self.read_range(offset, size, false).map(ReadData::into_vec)
     }
     pub(crate) fn read_shared(&self, offset: u64, size: u32) -> Result<ReadData> {
+        self.read_range(offset, size, cfg!(target_os = "macos"))
+    }
+    fn read_range(&self, offset: u64, size: u32, scatter: bool) -> Result<ReadData> {
         self.range(
             offset,
             self.size.saturating_sub(offset).min(u64::from(size)),
+            scatter,
         )
     }
     pub(crate) fn read_all(&self) -> Result<ReadData> {
-        self.range(0, self.size)
+        self.range(0, self.size, false)
     }
     pub(crate) fn check_content_once(&self, check: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
         if self
@@ -162,7 +399,7 @@ impl RawBlob {
             return Ok(());
         }
         let bytes = self.read_all()?;
-        check(&bytes)?;
+        check(&bytes.contiguous())?;
         // The descriptor identifies immutable Git contents; successful format
         // validation need not hydrate the object again on future opens. This
         // flag never replaces block authentication of bytes returned to users.
@@ -183,8 +420,8 @@ impl RawBlob {
             .get(&self.oid)
             .is_some_and(|object| object.file)
     }
-    fn range(&self, offset: u64, length: u64) -> Result<ReadData> {
-        let result = self.checked_range(offset, length);
+    fn range(&self, offset: u64, length: u64, scatter: bool) -> Result<ReadData> {
+        let result = self.checked_range(offset, length, scatter);
         if let Err(error) = &result {
             // Reads can outlive the Snapshot lock through an active reader.
             // Preserve storage failures for the remote runner's final status,
@@ -199,7 +436,7 @@ impl RawBlob {
             store.failure.get_or_insert_with(|| format!("{error:#}"));
         }
     }
-    fn checked_range(&self, offset: u64, length: u64) -> Result<ReadData> {
+    fn checked_range(&self, offset: u64, length: u64, scatter: bool) -> Result<ReadData> {
         if length == 0 {
             return Ok(ReadData::Owned(Vec::new()));
         }
@@ -215,11 +452,16 @@ impl RawBlob {
         }
         let first = usize::try_from(offset / BLOCK as u64)?;
         let last = usize::try_from((end - 1) / BLOCK as u64)?;
-        let mut result = if first == last {
-            None
-        } else {
-            Some(Vec::with_capacity(usize::try_from(length)?))
-        };
+        let len = usize::try_from(length)?;
+        let mut contiguous = Vec::new();
+        let mut ranges = Vec::new();
+        if first != last {
+            if scatter {
+                ranges.reserve_exact(last - first + 1);
+            } else {
+                contiguous.reserve_exact(len);
+            }
+        }
         let mut file = None;
         for block in first..=last {
             crate::object::check_transfer()?;
@@ -243,29 +485,58 @@ impl RawBlob {
                 if file.is_none() {
                     file = Some(store.directory.reader(self.oid, self.size)?);
                 }
-                let mut bytes = vec![0; size];
-                read_checked_block(file.as_ref().unwrap(), start, &mut bytes, &expected)?;
+                // The final block can stay in the cache. Other full blocks
+                // can be read and authenticated directly in a contiguous reply.
+                let direct = !scatter && block < last && from == 0 && to == size;
+                let mut bytes = if direct { Vec::new() } else { vec![0; size] };
+                let output = if direct {
+                    let output_start = contiguous.len();
+                    contiguous.resize(output_start + size, 0);
+                    &mut contiguous[output_start..]
+                } else {
+                    &mut bytes
+                };
+                read_checked_block(&file.as_ref().unwrap().file, start, output, &expected)?;
                 #[cfg(test)]
                 {
                     store.authenticated_bytes += size as u64;
                 }
-                let bytes = Arc::new(bytes);
-                if let Err(error) = store.admit(self.oid, block, bytes.clone()) {
-                    // Optional admission can spill a different resident object.
-                    // A failed write preserves that resident and the checked bytes.
-                    if error.downcast_ref::<io::Error>().is_none() {
-                        return Err(error);
+                if direct {
+                    continue;
+                }
+                let bytes = BlobBytes::from(bytes);
+                if block == last {
+                    // The last block is the only one that can stay resident.
+                    // Earlier misses must leave a later cache hit available.
+                    if let Err(error) = store.admit(self.oid, block, bytes.clone()) {
+                        // Optional admission can spill another resident object.
+                        // A failed write preserves it and the checked bytes.
+                        if error.downcast_ref::<io::Error>().is_none() {
+                            return Err(error);
+                        }
                     }
                 }
                 bytes
             };
-            if let Some(result) = &mut result {
-                result.extend_from_slice(&bytes[from..to]);
-            } else {
+            if first == last {
                 return Ok(ReadData::Shared(bytes, from..to));
             }
+            if scatter {
+                ranges.push(CheckedRange {
+                    bytes,
+                    range: from..to,
+                });
+            } else {
+                // Consumers that require one allocation release each scratch
+                // block before reading the next, even for whole-object reads.
+                contiguous.extend_from_slice(&bytes[from..to]);
+            }
         }
-        Ok(ReadData::Owned(result.expect("multi-block read")))
+        Ok(if scatter {
+            ReadData::Blocks { ranges, len }
+        } else {
+            ReadData::Owned(contiguous)
+        })
     }
     pub(crate) fn copy_up(&self, path: &Path, retain: u64) -> Result<File> {
         let result = self.copy_to(path, retain);
@@ -276,13 +547,7 @@ impl RawBlob {
         }
         result
     }
-    fn copy_to(&self, path: &Path, retain: u64) -> Result<File> {
-        let parent = File::options()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path.parent().context("backing parent")?)
-            .map_err(BackingError)?;
-        let name = CString::new(path.file_name().context("backing name")?.as_bytes())?;
+    fn copy_source(&self, retain: u64) -> Result<CopySource> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let object = store
             .objects
@@ -293,57 +558,87 @@ impl RawBlob {
             "mutable source is not a blob"
         );
 
-        let input = if object.file {
-            Some(
-                store
-                    .directory
-                    .reader(self.oid, self.size)
-                    .map_err(|error| {
-                        match error
-                            .downcast_ref::<io::Error>()
-                            .and_then(io::Error::raw_os_error)
-                        {
-                            Some(code @ (libc::EMFILE | libc::ENFILE)) => {
-                                BackingError(io::Error::from_raw_os_error(code)).into()
-                            }
-                            _ => error,
+        if object.file {
+            let input = store
+                .directory
+                .reader(self.oid, self.size)
+                .map_err(|error| {
+                    match error
+                        .downcast_ref::<io::Error>()
+                        .and_then(io::Error::raw_os_error)
+                    {
+                        Some(code @ (libc::EMFILE | libc::ENFILE)) => {
+                            BackingError(io::Error::from_raw_os_error(code)).into()
                         }
-                    })?,
-            )
-        } else {
-            None
+                        _ => error,
+                    }
+                })?;
+            return Ok(CopySource::Spilled(input));
+        }
+        if retain == 0 {
+            return Ok(CopySource::Empty);
+        }
+        let bytes = match store.hot_payload(self.oid) {
+            Some(bytes) => bytes,
+            None => {
+                &store
+                    .memory
+                    .get(&self.oid)
+                    .context("missing resident source")?
+                    .bytes
+            }
         };
+        Ok(CopySource::Resident(bytes.clone()))
+    }
+
+    fn copy_to(&self, path: &Path, retain: u64) -> Result<File> {
+        let parent = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.parent().context("backing parent")?)
+            .map_err(BackingError)?;
+        let name = CString::new(path.file_name().context("backing name")?.as_bytes())?;
+        // A copy owns its input across eviction so backing I/O does not block
+        // other reads, pack publication, or spill completion.
+        let source = self.copy_source(retain)?;
         // A writer can change any byte in the private copy, including retained
         // bytes. Keep block authentication on immutable reads so copy-up can
         // clone the source without reading its contents.
-        let (mut output, cloned_size) = open_copy(&parent, &name, input.as_deref())?;
+        // A short retained prefix costs at most one cache block to copy.
+        // Cloning the whole source and discarding most of it does more work.
+        let clone_source = match &source {
+            CopySource::Spilled(input) if retain == self.size || retain > BLOCK as u64 => {
+                Some(&input.file)
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some(before_copy) = BEFORE_COPY.take() {
+            before_copy();
+        }
+        let (mut output, cloned_size) = open_copy(&parent, &name, clone_source)?;
         let copied = (|| -> Result<()> {
-            if let Some(input) = input {
-                if let Some(size) = cloned_size {
-                    RawDirectory::validate_size(size, self.size)?;
-                    if retain < self.size {
-                        output.set_len(retain).map_err(BackingError)?;
+            match source {
+                CopySource::Spilled(input) => {
+                    if let Some(size) = cloned_size {
+                        RawDirectory::validate_size(size, self.size)?;
+                        if retain < self.size {
+                            output.set_len(retain).map_err(BackingError)?;
+                        }
+                    } else {
+                        // Only the sequential copy uses the cursor. Immutable
+                        // readers use positional reads on the same descriptor.
+                        let _cursor = input.copy_cursor.lock().unwrap_or_else(|e| e.into_inner());
+                        copy_spilled(&input.file, &mut output, retain)?;
                     }
-                } else {
-                    // Raw reads are positional. The store serializes copy-up
-                    // while the filesystem copies from this descriptor.
-                    copy_spilled(&input, &mut output, retain)?;
                 }
-            } else if retain != 0 {
-                let bytes = match store.hot_payload(self.oid) {
-                    Some(bytes) => bytes.as_slice(),
-                    None => {
-                        &store
-                            .memory
-                            .get(&self.oid)
-                            .context("missing resident source")?
-                            .bytes
+                CopySource::Resident(bytes) => {
+                    for chunk in bytes[..retain as usize].chunks(COPY_BUFFER) {
+                        crate::object::check_transfer()?;
+                        output.write_all(chunk).map_err(BackingError)?;
                     }
-                };
-                for chunk in bytes[..retain as usize].chunks(COPY_BUFFER) {
-                    crate::object::check_transfer()?;
-                    output.write_all(chunk).map_err(BackingError)?;
                 }
+                CopySource::Empty => (),
             }
             Ok(())
         })();
@@ -353,7 +648,7 @@ impl RawBlob {
         }
         #[cfg(test)]
         if cloned_size.is_some() {
-            store.cloned_copies += 1;
+            self.state.lock().unwrap().cloned_copies += 1;
         }
         Ok(output)
     }
@@ -482,12 +777,17 @@ fn open_copy(parent: &File, name: &CStr, source: Option<&File>) -> Result<(File,
     }
 }
 
+struct RawReader {
+    file: File,
+    copy_cursor: Mutex<()>,
+}
+
 /// A descriptor for the owned directory anchors operations even after a path
 /// rename. One last-read descriptor is shared by the store; blobs and child
 /// handles do not each retain a descriptor. Every disk read rechecks metadata.
 struct RawDirectory {
     fd: Arc<File>,
-    reader: Option<(Oid, Arc<File>)>,
+    reader: Option<(Oid, Arc<RawReader>)>,
     _owner: tempfile::TempDir,
     writes: Arc<WriteMetrics>,
     incomplete: Arc<Mutex<HashSet<Oid>>>,
@@ -538,11 +838,11 @@ impl RawDirectory {
         Self::validate_size(metadata.len(), size)?;
         Ok(file)
     }
-    fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<File>> {
+    fn reader(&mut self, oid: Oid, size: u64) -> Result<Arc<RawReader>> {
         if let Some((cached, file)) = &self.reader {
             if *cached == oid {
                 let metadata =
-                    private_file_metadata(file).context("validate private raw object")?;
+                    private_file_metadata(&file.file).context("validate private raw object")?;
                 Self::validate_size(metadata.len(), size)?;
                 return Ok(file.clone());
             }
@@ -552,7 +852,10 @@ impl RawDirectory {
         // Release the old slot first: it may be the last available descriptor
         // under the caller's limit, so opening before replacement can fail.
         self.reader = None;
-        let file = Arc::new(self.open(oid, false, size)?);
+        let file = Arc::new(RawReader {
+            file: self.open(oid, false, size)?,
+            copy_cursor: Mutex::new(()),
+        });
         self.reader = Some((oid, file.clone()));
         Ok(file)
     }
@@ -606,6 +909,8 @@ struct WriteMetrics {
     on_spill_result: Mutex<Option<SpillResultObserver>>,
     #[cfg(test)]
     fail_write_after: Mutex<Option<usize>>,
+    #[cfg(test)]
+    cancel_after_bytes: AtomicU64,
 }
 
 struct RawWriter<'a> {
@@ -632,6 +937,13 @@ impl Write for RawWriter<'_> {
             *remaining -= count;
         }
         self.totals.bytes.fetch_add(count as u64, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            let cancel_at = self.totals.cancel_after_bytes.load(Ordering::Relaxed);
+            if cancel_at != 0 && self.totals.bytes.load(Ordering::Relaxed) >= cancel_at {
+                crate::git::stop_operations();
+            }
+        }
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -653,15 +965,37 @@ impl Pending {
             pause();
         }
         let mut digests = Vec::with_capacity(bytes.len().div_ceil(BLOCK));
-        for block in bytes.chunks(BLOCK) {
-            crate::object::check_transfer()?;
-            digests.push(*blake3::hash(block).as_bytes());
-        }
-        let result = RawWriter {
+        let mut output = RawWriter {
             file: &mut self.file,
             totals,
-        }
-        .write_all(bytes);
+        };
+        // Start writing before the complete blob has been hashed. Each chunk
+        // covers whole digest blocks, with a partial block only at the end.
+        let result = bytes
+            .chunks(COPY_BUFFER)
+            .try_for_each(|mut chunk| -> Result<()> {
+                for block in chunk.chunks(BLOCK) {
+                    crate::object::check_transfer()?;
+                    digests.push(*blake3::hash(block).as_bytes());
+                }
+                // A short write leaves part of this chunk to retry.
+                while !chunk.is_empty() {
+                    crate::object::check_transfer()?;
+                    match output.write(chunk) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "failed to write whole buffer",
+                            )
+                            .into());
+                        }
+                        Ok(written) => chunk = &chunk[written..],
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(())
+            });
         #[cfg(test)]
         if let Some(observe) = totals.on_spill_result.lock().unwrap().as_mut() {
             observe(result.is_ok());
@@ -685,7 +1019,7 @@ impl Drop for Pending {
 
 struct HotSpill {
     oid: Oid,
-    bytes: Arc<Vec<u8>>,
+    bytes: BlobBytes,
     output: Pending,
     writes: Arc<WriteMetrics>,
     result: mpsc::Sender<Result<()>>,
@@ -712,7 +1046,7 @@ impl HotWriter {
         state: &Arc<Mutex<Store>>,
         store: &Store,
         oid: Oid,
-        bytes: Arc<Vec<u8>>,
+        bytes: BlobBytes,
     ) -> Result<()> {
         // The command can finish while an earlier spill is being awaited.
         // Check cancellation before opening the file for each new write.
@@ -781,7 +1115,6 @@ pub(crate) struct RawBlobs {
     prepared: Arc<Condvar>,
     hot_writer: Arc<Mutex<HotWriter>>,
     pack_decodes: Arc<PackDecodes>,
-    root_prepared: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -792,6 +1125,12 @@ struct PackDecodes {
 
 pub(crate) struct PackDecode(Arc<PackDecodes>);
 
+pub(crate) enum PackDecodePriority {
+    Speculative,
+    Demand,
+    Completion,
+}
+
 #[derive(PartialEq, Eq)]
 pub(crate) enum DemandLookup {
     Missing,
@@ -801,7 +1140,10 @@ pub(crate) enum DemandLookup {
 
 #[derive(Clone)]
 pub(crate) enum ReceivedObject {
-    Verified(crate::pack_stream::VerifiedObject),
+    Verified {
+        object: crate::pack_stream::VerifiedObject,
+        transfer: Option<Arc<Transfer>>,
+    },
     Packed(Arc<tempfile::TempDir>),
 }
 
@@ -857,16 +1199,7 @@ impl RawBlobs {
             prepared: Arc::default(),
             hot_writer: Arc::default(),
             pack_decodes: Arc::default(),
-            root_prepared: Arc::default(),
         })
-    }
-
-    pub(crate) fn record_root_prepared(&self) {
-        self.root_prepared.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn root_is_prepared(&self) -> bool {
-        self.root_prepared.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -876,7 +1209,7 @@ impl RawBlobs {
 
     pub(crate) fn reserve_pack_decode(
         &self,
-        required: impl Fn() -> bool,
+        priority: impl Fn() -> PackDecodePriority,
         check: impl Fn() -> Result<()>,
     ) -> Result<PackDecode> {
         let slots = &self.pack_decodes;
@@ -885,10 +1218,21 @@ impl RawBlobs {
         // cancellation while waiting so an interrupted fetch can unwind.
         loop {
             check()?;
-            // Speculative streams may pause mid-object. Leave one buffer for
-            // a real read, including a read that joins a running forecast.
-            if *active < HOT_BLOBS - 1 || (*active < HOT_BLOBS && required()) {
+            if *active < ACTIVE_DECODES - 1 {
                 break;
+            }
+            // Leave a buffer for a real read while the command runs. After
+            // it exits, a used pack must also be able to finish validation
+            // while unrelated transfers hold the ordinary decode permits.
+            if *active <= ACTIVE_DECODES {
+                let limit = match priority() {
+                    PackDecodePriority::Speculative => ACTIVE_DECODES - 1,
+                    PackDecodePriority::Demand => ACTIVE_DECODES,
+                    PackDecodePriority::Completion => COMPLETION_DECODES,
+                };
+                if *active < limit {
+                    break;
+                }
             }
             (active, _) = slots
                 .ready
@@ -908,26 +1252,99 @@ impl RawBlobs {
     }
     pub(crate) fn get(&self, oid: Oid) -> Result<Option<RawBlob>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.objects.get(&oid).map(|object| self.blob(oid, object)))
+        Ok(state
+            .objects
+            .get(&oid)
+            .filter(|object| object.available())
+            .map(|object| self.blob(oid, object)))
+    }
+    pub(crate) fn claim(&self, oid: Oid) -> Result<bool> {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !store.claim(oid) {
+            return Ok(false);
+        }
+        let Some(payload) = store
+            .decoded
+            .get(&oid)
+            .filter(|_| !store.preparing.contains(&oid) && store.failure.is_none())
+            .cloned()
+        else {
+            return Ok(true);
+        };
+        // A decoder left verified bytes available after a placement error.
+        // Only one reader retries admission, while others can keep using RAM.
+        store.preparing.insert(oid);
+        let _preparation = BlobPreparation { blobs: self, oid };
+        if let Err(error) = self.admit_blob(store, oid, false, payload, None) {
+            crate::object::check_transfer()?;
+            if !error.is::<io::Error>() {
+                return Err(error);
+            }
+        }
+        Ok(true)
     }
     pub(crate) fn available(&self, oid: Oid) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.available(oid)
     }
 
+    pub(crate) fn needs_pack_proof(&self, oid: Oid) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.objects.get(&oid).is_none_or(|object| {
+            !object.used
+                && !object.claimed
+                && object
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|source| !source.verified())
+        })
+    }
+
     pub(crate) fn remember_verified(
         &self,
         extras: impl IntoIterator<Item = crate::pack_stream::VerifiedObject>,
+        source: Option<&Arc<Transfer>>,
     ) {
         let mut extras = extras.into_iter();
         let Some(first) = extras.next() else { return };
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         for extra in std::iter::once(first).chain(extras) {
             let oid = extra.oid();
-            if !store.objects.contains_key(&oid)
-                && !matches!(store.received.get(&oid), Some(ReceivedObject::Verified(_)))
-            {
-                store.received.insert(oid, ReceivedObject::Verified(extra));
+            if let Some(object) = store.objects.get_mut(&oid) {
+                if !object.used
+                    && !object.claimed
+                    && object
+                        .transfer
+                        .as_ref()
+                        .is_some_and(|previous| source.is_none() || !previous.verified())
+                {
+                    // Keep the already checked bytes and bind a future read
+                    // to the pack that has finished authenticating them.
+                    object.transfer = source.cloned();
+                }
+            } else {
+                use std::collections::hash_map::Entry;
+                match store.received.entry(oid) {
+                    Entry::Occupied(mut entry) => match entry.get_mut() {
+                        ReceivedObject::Verified { transfer, .. } => {
+                            if source.is_none() {
+                                *transfer = None;
+                            }
+                        }
+                        packed @ ReceivedObject::Packed(_) => {
+                            *packed = ReceivedObject::Verified {
+                                object: extra,
+                                transfer: source.cloned(),
+                            };
+                        }
+                    },
+                    Entry::Vacant(entry) => {
+                        entry.insert(ReceivedObject::Verified {
+                            object: extra,
+                            transfer: source.cloned(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -951,24 +1368,45 @@ impl RawBlobs {
             .cloned()
     }
 
-    pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<()>, delivered: bool) -> bool {
+    pub(crate) fn was_served(&self, oid: Oid, transfer: &Arc<Transfer>, delivered: bool) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .objects
             .get(&oid)
             .is_some_and(|object| {
-                (object.used || delivered)
-                    && object
-                        .transfer
-                        .as_ref()
-                        .is_some_and(|source| std::ptr::eq(source.as_ptr(), Arc::as_ptr(transfer)))
+                (object.used || object.claimed || delivered) && object.belongs_to(transfer)
             })
+    }
+
+    /// Stop speculative publication and decide whether a consumer already
+    /// depended on this pack under the same lock used to claim its objects.
+    pub(crate) fn fail_forecast(
+        &self,
+        transfer: &Arc<Transfer>,
+        deliveries: impl Iterator<Item = (Oid, bool)>,
+    ) -> bool {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        transfer.state.store(Transfer::FAILED, Ordering::Relaxed);
+        let mut required = false;
+        for (oid, delivered) in deliveries {
+            if let Some(object) = store
+                .objects
+                .get_mut(&oid)
+                .filter(|object| object.belongs_to(transfer))
+            {
+                if object.used || object.claimed || delivered {
+                    object.claimed = true;
+                    required = true;
+                }
+            }
+        }
+        required
     }
 
     pub(crate) fn remember_packed(&self, oid: Oid, directory: &Arc<tempfile::TempDir>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.objects.contains_key(&oid) {
+        if !state.objects.get(&oid).is_some_and(Descriptor::available) {
             state
                 .received
                 .entry(oid)
@@ -986,7 +1424,11 @@ impl RawBlobs {
 
     pub(crate) fn for_read(&mut self, oid: Oid) -> Result<Option<(RawBlob, bool)>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(object) = state.objects.get_mut(&oid) else {
+        let Some(object) = state
+            .objects
+            .get_mut(&oid)
+            .filter(|object| object.available())
+        else {
             return Ok(None);
         };
         anyhow::ensure!(
@@ -994,6 +1436,7 @@ impl RawBlobs {
             "snapshot file does not reference a blob"
         );
         let first = !object.used;
+        object.mark_served();
         object.used = true;
         Ok(Some((self.blob(oid, object), first)))
     }
@@ -1002,6 +1445,7 @@ impl RawBlobs {
         let object = store.objects.get_mut(&oid)?;
         let directory = object.directory.clone()?;
         let first = !object.used;
+        object.mark_served();
         object.used = true;
         Some((directory, first))
     }
@@ -1013,38 +1457,46 @@ impl RawBlobs {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
-            Ok(bytes)
+            Ok(BlobBytes::from(bytes))
         })
+    }
+    pub(crate) fn insert_prepared_blob(&mut self, oid: Oid, bytes: Vec<u8>) -> Result<RawBlob> {
+        // The local native reader authenticated the bytes and checked the
+        // command's exit before transferring the allocation to the cache.
+        self.insert_blob(oid, bytes.len(), true, None, || Ok(BlobBytes::from(bytes)))
     }
     pub(crate) fn insert_odb_blob(
         &mut self,
         oid: Oid,
-        object: &git2::OdbObject<'_>,
+        object: git2::OdbObject<'_>,
     ) -> Result<RawBlob> {
         anyhow::ensure!(
             object.id() == oid && object.kind() == ObjectType::Blob,
             "ODB object identity/type changed before raw import"
         );
-        self.insert_odb(oid, object, true, None)
+        self.insert_blob(oid, object.len(), true, None, || {
+            crate::object::verify_odb_object(&object, ObjectType::Blob)?;
+            Ok(BlobBytes::Odb(Arc::new(OdbBlob::new(object))))
+        })
     }
     pub(crate) fn insert_fetched(
         &mut self,
         oid: Oid,
         size: usize,
         input: impl Read,
-        transfer: Option<Weak<()>>,
+        transfer: Option<Arc<Transfer>>,
     ) -> Result<RawBlob> {
         self.insert_blob(oid, size, false, transfer, || {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
-            Ok(bytes)
+            Ok(BlobBytes::from(bytes))
         })
     }
     pub(crate) fn insert_verified_blob(
         &mut self,
         object: crate::pack_stream::VerifiedObject,
-        transfer: Option<Weak<()>>,
+        transfer: Option<Arc<Transfer>>,
         speculative: bool,
         waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(bool),
@@ -1068,23 +1520,25 @@ impl RawBlobs {
         &mut self,
         oid: Oid,
         bytes: impl Into<Arc<Vec<u8>>>,
-        transfer: Option<Weak<()>>,
+        transfer: Option<Arc<Transfer>>,
         speculative: bool,
         waiting: impl FnOnce() -> bool,
         ready: impl FnOnce(bool),
     ) -> Result<()> {
-        let payload = bytes.into();
+        let payload = BlobBytes::Rust(bytes.into());
         let _preparation;
         let mut store = self.wait_for_preparation(oid);
-        if store.objects.contains_key(&oid) {
+        Transfer::check(transfer.as_ref())?;
+        if let Some(object) = store.objects.get_mut(&oid) {
+            if !object.available() {
+                object.transfer = transfer;
+            }
             drop(store);
             ready(true);
             return Ok(());
         }
         if payload.len() <= BLOCK {
-            if let Err(error) =
-                self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer)
-            {
+            if let Err(error) = self.admit_blob(store, oid, false, payload, transfer) {
                 crate::object::check_transfer()?;
                 return Err(error);
             }
@@ -1111,19 +1565,22 @@ impl RawBlobs {
             store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
-        let admission = self.admit_blob(store, oid, false, Vec::new(), Some(payload), transfer);
+        let admission = self.admit_blob(store, oid, false, payload, transfer);
         if let Err(error) = admission {
             let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
             store.forecasts.remove(&oid);
             // The verified data may already have served a read. Once the
             // command ends, a late cache placement failure is cancellation.
             crate::object::check_transfer()?;
-            if store.decoded.contains_key(&oid) && !crate::object::is_cancelled(&error) {
-                // A real reader claimed these verified bytes. Keep them
-                // readable and propagate the failed admission at shutdown.
-                store.failure.get_or_insert_with(|| format!("{error:#}"));
+            if !store.decoded.contains_key(&oid) || crate::object::is_cancelled(&error) {
+                return Err(error);
             }
-            return Err(error);
+            if !error.is::<io::Error>() {
+                store.failure.get_or_insert_with(|| format!("{error:#}"));
+                return Err(error);
+            }
+            // Placement can recover while the decoder continues to validate
+            // the pack. A later admission can reuse this verified buffer.
         }
         if let Some(ready) = ready {
             ready(false);
@@ -1133,34 +1590,20 @@ impl RawBlobs {
 
     pub(crate) fn lookup_demand(&self, oid: Oid) -> DemandLookup {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if store.available(oid) {
+        if store.claim(oid) || store.received.contains_key(&oid) {
             return DemandLookup::Available;
         }
         let Some((payload, transfer)) = store.forecasts.get(&oid) else {
             return DemandLookup::Missing;
         };
-        if !store.can_publish_decoded(oid) {
+        if transfer.failed() || !store.can_publish_decoded(oid) {
             return DemandLookup::Missing;
         }
         let payload = payload.clone();
         let transfer = transfer.clone();
         store.publish_decoded(oid, payload, Some(transfer));
+        store.claim(oid);
         DemandLookup::ClaimedForecast
-    }
-
-    fn insert_odb(
-        &mut self,
-        oid: Oid,
-        object: &git2::OdbObject<'_>,
-        used: bool,
-        transfer: Option<Weak<()>>,
-    ) -> Result<RawBlob> {
-        self.insert_blob(oid, object.len(), used, transfer, || {
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(object.len())?;
-            crate::object::copy_odb_blob(object, &mut bytes, |_| Ok(()))?;
-            Ok(bytes)
-        })
     }
 
     fn insert_blob(
@@ -1168,12 +1611,12 @@ impl RawBlobs {
         oid: Oid,
         size: usize,
         used: bool,
-        transfer: Option<Weak<()>>,
-        decode: impl FnOnce() -> Result<Vec<u8>>,
+        transfer: Option<Arc<Transfer>>,
+        decode: impl FnOnce() -> Result<BlobBytes>,
     ) -> Result<RawBlob> {
         let _preparation;
         let mut store = self.wait_for_preparation(oid);
-        if let Some(object) = store.objects.get(&oid) {
+        if let Some(object) = store.objects.get(&oid).filter(|object| object.available()) {
             return Ok(self.blob(oid, object));
         }
         // A large decode can wait for Git. Reserve its OID without holding
@@ -1189,7 +1632,14 @@ impl RawBlobs {
             decode()?
         };
         anyhow::ensure!(bytes.len() == size, "verified blob length changed");
-        let admission = self.admit_blob(store, oid, used, bytes, None, transfer);
+        Transfer::check(transfer.as_ref())?;
+        if let Some(object) = store.objects.get_mut(&oid) {
+            if !object.available() {
+                object.transfer = transfer;
+            }
+            return Ok(self.blob(oid, object));
+        }
+        let admission = self.admit_blob(store, oid, used, bytes, transfer);
         if admission.is_err() {
             crate::object::check_transfer()?;
         }
@@ -1201,11 +1651,9 @@ impl RawBlobs {
         mut store: MutexGuard<'a, Store>,
         oid: Oid,
         used: bool,
-        bytes: Vec<u8>,
-        shared: Option<Arc<Vec<u8>>>,
-        transfer: Option<Weak<()>>,
+        payload: BlobBytes,
+        transfer: Option<Arc<Transfer>>,
     ) -> Result<RawBlob> {
-        let payload = shared.as_deref().unwrap_or(&bytes);
         let size = payload.len();
         let weight = payload
             .capacity()
@@ -1221,15 +1669,25 @@ impl RawBlobs {
             drop(store);
             let mut writer = self.hot_writer.lock().unwrap_or_else(|e| e.into_inner());
             store = self.complete_eviction(&mut writer)?;
-            if store.hot.len() == store.hot_limit {
-                let (&victim, bytes) = store.hot.peek_lru().context("missing hot blob")?;
-                writer.submit(&self.state, &store, victim, bytes.clone())?;
-                store.spilling = store.hot.pop_lru();
+            Transfer::check(transfer.as_ref())?;
+            while let Some(deferred) = store
+                .decoded
+                .keys()
+                .find(|oid| !store.preparing.contains(*oid))
+                .copied()
+            {
+                self.evict_hot_if_full(&mut store, &mut writer)?;
+                let bytes = store.decoded.remove(&deferred).expect("deferred blob");
+                store.hot.put(deferred, bytes);
+                drop(store);
+                store = self.complete_eviction(&mut writer)?;
+                Transfer::check(transfer.as_ref())?;
             }
+            self.evict_hot_if_full(&mut store, &mut writer)?;
         }
         let file = size != 0 && !resident && !hot;
         let blocks = if file {
-            store.directory.spill(oid, payload)?
+            store.directory.spill(oid, &payload)?
         } else {
             Box::new([])
         };
@@ -1237,17 +1695,24 @@ impl RawBlobs {
             store.publish_blob(oid, size, used, transfer);
         }
         if resident {
-            store.admit(oid, 0, shared.unwrap_or_else(|| Arc::new(bytes)))?;
+            store.admit(oid, 0, payload)?;
         } else if hot {
-            store
-                .hot
-                .put(oid, shared.unwrap_or_else(|| Arc::new(bytes)));
+            store.hot.put(oid, payload);
         }
         if file {
             store.finish_spill(oid, blocks);
         }
         store.decoded.remove(&oid);
         Ok(self.blob(oid, &store.objects[&oid]))
+    }
+
+    fn evict_hot_if_full(&self, store: &mut Store, writer: &mut HotWriter) -> Result<()> {
+        if store.hot.len() == store.hot_limit {
+            let (&victim, bytes) = store.hot.peek_lru().context("missing hot blob")?;
+            writer.submit(&self.state, store, victim, bytes.clone())?;
+            store.spilling = store.hot.pop_lru();
+        }
+        Ok(())
     }
 
     fn complete_eviction(&self, writer: &mut HotWriter) -> Result<MutexGuard<'_, Store>> {
@@ -1280,20 +1745,37 @@ impl RawBlobs {
             .unwrap_or_else(|e| e.into_inner())
     }
     pub(crate) fn insert_tree(&self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
-        self.cache_directory(oid, size, || Directory::verified(oid, size, input))
+        self.cache_directory(oid, size, None, || Directory::verified(oid, size, input))
+    }
+    pub(crate) fn insert_prepared_tree(
+        &self,
+        oid: Oid,
+        size: usize,
+        directory: Directory,
+    ) -> Result<RawBlob> {
+        self.cache_directory(oid, size, None, || Ok(directory))
     }
     pub(crate) fn insert_verified_tree(
         &self,
         object: &crate::pack_stream::VerifiedObject,
+        transfer: Option<Arc<Transfer>>,
     ) -> Result<RawBlob> {
-        self.cache_directory(object.oid(), object.data().len(), || {
+        self.cache_directory(object.oid(), object.data().len(), transfer, || {
             Directory::from_verified(object)
         })
+    }
+    pub(crate) fn insert_odb_tree(
+        &self,
+        oid: Oid,
+        object: &git2::OdbObject<'_>,
+    ) -> Result<RawBlob> {
+        self.cache_directory(oid, object.len(), None, || Directory::from_odb(oid, object))
     }
     fn cache_directory(
         &self,
         oid: Oid,
         size: usize,
+        transfer: Option<Arc<Transfer>>,
         prepare: impl FnOnce() -> Result<Directory>,
     ) -> Result<RawBlob> {
         let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1308,9 +1790,10 @@ impl RawBlobs {
                 blocks: Box::new([]),
                 file: false,
                 used: false,
+                claimed: false,
                 content_checked: false,
                 directory: Some(directory),
-                transfer: None,
+                transfer,
             },
         );
         store.received.remove(&oid);
@@ -1416,7 +1899,7 @@ impl RawBlobs {
         self.hot_writer.lock().unwrap().wait()?
     }
     #[cfg(test)]
-    fn disk_only(directory: &Path) -> Result<Self> {
+    pub(crate) fn disk_only(directory: &Path) -> Result<Self> {
         let value = Self::new(directory)?;
         {
             let mut store = value.state.lock().unwrap();
@@ -1432,10 +1915,10 @@ struct Store {
     preparing: HashSet<Oid>,
     received: HashMap<Oid, ReceivedObject>,
     memory: lru::LruCache<Oid, Resident>,
-    hot: lru::LruCache<Oid, Arc<Vec<u8>>>,
-    spilling: Option<(Oid, Arc<Vec<u8>>)>,
-    decoded: HashMap<Oid, Arc<Vec<u8>>>,
-    forecasts: HashMap<Oid, (Arc<Vec<u8>>, Weak<()>)>,
+    hot: lru::LruCache<Oid, BlobBytes>,
+    spilling: Option<(Oid, BlobBytes)>,
+    decoded: HashMap<Oid, BlobBytes>,
+    forecasts: HashMap<Oid, (BlobBytes, Arc<Transfer>)>,
     hot_limit: usize,
     memory_bytes: usize,
     memory_limit: usize,
@@ -1452,19 +1935,37 @@ struct Store {
 }
 impl Store {
     fn available(&self, oid: Oid) -> bool {
-        self.objects.contains_key(&oid) || self.received.contains_key(&oid)
+        self.objects.get(&oid).is_some_and(Descriptor::available)
+            || self.received.contains_key(&oid)
+    }
+
+    fn claim(&mut self, oid: Oid) -> bool {
+        if let Some(object) = self
+            .objects
+            .get_mut(&oid)
+            .filter(|object| object.available())
+        {
+            object.mark_served();
+            object.claimed = true;
+            return true;
+        }
+        false
     }
 
     fn can_publish_decoded(&self, oid: Oid) -> bool {
-        self.hot_limit != 0 && self.failure.is_none() && !self.objects.contains_key(&oid)
+        // An early publication can outlive its decoder after a failed spill.
+        self.hot_limit != 0
+            && self.decoded.len() < COMPLETION_DECODES
+            && self.failure.is_none()
+            && !self.objects.contains_key(&oid)
     }
 
-    fn publish_decoded(&mut self, oid: Oid, bytes: Arc<Vec<u8>>, transfer: Option<Weak<()>>) {
+    fn publish_decoded(&mut self, oid: Oid, bytes: BlobBytes, transfer: Option<Arc<Transfer>>) {
         self.publish_blob(oid, bytes.len(), false, transfer);
         self.decoded.insert(oid, bytes);
     }
 
-    fn hot_payload(&mut self, oid: Oid) -> Option<&Arc<Vec<u8>>> {
+    fn hot_payload(&mut self, oid: Oid) -> Option<&BlobBytes> {
         self.hot
             .get(&oid)
             .or_else(|| self.decoded.get(&oid))
@@ -1476,7 +1977,14 @@ impl Store {
             })
     }
 
-    fn publish_blob(&mut self, oid: Oid, size: usize, used: bool, transfer: Option<Weak<()>>) {
+    fn publish_blob(&mut self, oid: Oid, size: usize, used: bool, transfer: Option<Arc<Transfer>>) {
+        let received = self.received.remove(&oid);
+        let transfer = match &received {
+            Some(ReceivedObject::Verified {
+                transfer: proof, ..
+            }) if transfer.as_ref().is_some_and(|source| !source.verified()) => proof.clone(),
+            _ => transfer,
+        };
         self.objects.insert(
             oid,
             Descriptor {
@@ -1484,12 +1992,12 @@ impl Store {
                 blocks: Box::new([]),
                 file: false,
                 used,
+                claimed: false,
                 content_checked: false,
                 directory: None,
                 transfer,
             },
         );
-        self.received.remove(&oid);
         self.blob_entries += 1;
         self.blob_bytes += size as u64;
     }
@@ -1530,8 +2038,7 @@ impl Store {
         }
         Ok(())
     }
-    fn admit(&mut self, oid: Oid, block: usize, bytes: impl Into<Arc<Vec<u8>>>) -> Result<()> {
-        let bytes = bytes.into();
+    fn admit(&mut self, oid: Oid, block: usize, bytes: BlobBytes) -> Result<()> {
         let weight = bytes
             .capacity()
             .checked_add(ENTRY_CHARGE)
@@ -1665,6 +2172,37 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn copy_up_leaves_the_store_available_during_backing_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let data = vec![b'x'; BLOCK + 3];
+        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+        let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
+
+        for name in ["resident", "spilled"] {
+            let mut cache = store.clone();
+            let reader = original.clone();
+            BEFORE_COPY.set(Some(Box::new(move || {
+                assert!(
+                    cache.state.try_lock().is_ok(),
+                    "{name} copy holds the store lock"
+                );
+                if name == "resident" {
+                    cache.evict_all_for_test().unwrap();
+                }
+                assert_eq!(reader.read(0, 1).unwrap(), b"x");
+            })));
+            let file = original
+                .copy_up(&directory.path().join(name), original.len())
+                .unwrap();
+            let mut bytes = vec![0; data.len()];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(bytes, data);
+        }
+    }
+
     #[test]
     fn a_spilled_copy_distinguishes_source_and_destination_io_failures() {
         let root = tempfile::tempdir().unwrap();
@@ -1734,6 +2272,13 @@ mod tests {
         let second = original
             .copy_up(&directory.path().join("second"), retained as u64)
             .unwrap();
+        let prefix = original
+            .copy_up(&directory.path().join("prefix"), 1)
+            .unwrap();
+        assert_eq!(prefix.metadata().unwrap().len(), 1);
+        let mut first_byte = [0];
+        prefix.read_exact_at(&mut first_byte, 0).unwrap();
+        assert_eq!(first_byte, [b'x']);
         assert_ne!(first.metadata().unwrap().ino(), source_inode);
         assert_ne!(
             second.metadata().unwrap().ino(),
@@ -2005,7 +2550,9 @@ mod tests {
             let blob = store.insert(oid, size, data.as_slice()).unwrap();
             let head = blob.read_shared(0, 16).unwrap();
             let next = blob.read_shared(4, 8).unwrap();
-            assert_eq!(next.as_ref(), &data[4..12]);
+            let head = head.chunks().next().unwrap();
+            let next = next.chunks().next().unwrap();
+            assert_eq!(next, &data[4..12]);
             assert_eq!(head.as_ptr().wrapping_add(4), next.as_ptr());
         }
     }
@@ -2059,6 +2606,18 @@ mod tests {
         let bytes: Vec<_> = (0..3 * BLOCK + 17).map(|n| (n % 251) as u8).collect();
         let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
         let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
+        store.state.lock().unwrap().memory_limit = BLOCK + ENTRY_CHARGE;
+        let cached = reader.read_shared(BLOCK as u64, 1).unwrap();
+        let range = reader.read_range((BLOCK - 1) as u64, 3, true).unwrap();
+        let mut chunks = range.chunks();
+        assert_eq!(chunks.next().unwrap(), &bytes[BLOCK - 1..BLOCK]);
+        let second = chunks.next().unwrap();
+        assert_eq!(second, &bytes[BLOCK..BLOCK + 2]);
+        assert!(chunks.next().is_none());
+        assert_eq!(cached.chunks().next().unwrap().as_ptr(), second.as_ptr());
+        let contiguous = reader.read_range((BLOCK - 1) as u64, 3, false).unwrap();
+        assert!(matches!(contiguous, ReadData::Owned(_)));
+        assert_eq!(contiguous, &bytes[BLOCK - 1..BLOCK + 2]);
         for (start, size) in [
             (BLOCK - 1, 3),
             (BLOCK, BLOCK),
@@ -2099,7 +2658,13 @@ mod tests {
         file.write_all_at(&vec![b'a'; BLOCK], BLOCK as u64).unwrap();
         assert!(reader.read(0, 1).is_err());
         assert!(reader.read(BLOCK as u64, 1).is_err());
-        file.write_all_at(&bytes, 0).unwrap();
+        file.write_all_at(&bytes[..BLOCK], 0).unwrap();
+        let error = reader.read(0, bytes.len() as u32).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("verified raw blob bytes were modified"));
+        file.write_all_at(&bytes[BLOCK..], BLOCK as u64).unwrap();
+        assert_eq!(reader.read(0, bytes.len() as u32).unwrap(), bytes);
         file.set_len(bytes.len() as u64 - 1).unwrap();
         assert!(
             reader.read(0, 1).is_err(),
@@ -2188,7 +2753,7 @@ mod tests {
             let oid = Oid::hash_object(ObjectType::Blob, bytes.as_bytes()).unwrap();
             store.insert(oid, bytes.len(), bytes.as_bytes()).unwrap();
         }
-        let mut previous: Option<std::sync::Weak<File>> = None;
+        let mut previous: Option<std::sync::Weak<RawReader>> = None;
         for number in (0..257).rev() {
             let bytes = format!("blob-{number}");
             let oid = Oid::hash_object(ObjectType::Blob, bytes.as_bytes()).unwrap();
@@ -2333,7 +2898,7 @@ mod tests {
             .insert_verified_bytes(
                 oid,
                 forecast,
-                Some(Weak::new()),
+                Some(Arc::default()),
                 true,
                 || false,
                 |_| notified = true
@@ -2352,7 +2917,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = RawBlobs::new(directory.path()).unwrap();
         let busy: Vec<_> = (1..HOT_BLOBS)
-            .map(|_| cache.reserve_pack_decode(|| false, check_transfer).unwrap())
+            .map(|_| {
+                cache
+                    .reserve_pack_decode(|| PackDecodePriority::Speculative, check_transfer)
+                    .unwrap()
+            })
             .collect();
         let required = AtomicBool::new(false);
         let (forecast, pending) = mpsc::channel();
@@ -2362,7 +2931,16 @@ mod tests {
             scope.spawn(|| {
                 started.send(()).unwrap();
                 let permit = cache
-                    .reserve_pack_decode(|| required.load(Ordering::Relaxed), check_transfer)
+                    .reserve_pack_decode(
+                        || {
+                            if required.load(Ordering::Relaxed) {
+                                PackDecodePriority::Demand
+                            } else {
+                                PackDecodePriority::Speculative
+                            }
+                        },
+                        check_transfer,
+                    )
                     .unwrap();
                 forecast.send(permit).unwrap();
             });
@@ -2373,7 +2951,9 @@ mod tests {
                 panic!("a forecast used the reserved foreground buffer");
             }
             scope.spawn(|| {
-                let permit = cache.reserve_pack_decode(|| true, check_transfer).unwrap();
+                let permit = cache
+                    .reserve_pack_decode(|| PackDecodePriority::Demand, check_transfer)
+                    .unwrap();
                 foreground.send(permit).unwrap();
             });
             let independent = demanded.recv_timeout(Duration::from_secs(3));
@@ -2431,35 +3011,197 @@ mod tests {
             state.hot_limit = 1;
             state.directory.writes.clone()
         };
+        let size = COPY_BUFFER + BLOCK + 1;
+        let contents = |seed: u8| {
+            let mut bytes = vec![seed; size];
+            for (index, block) in bytes.chunks_mut(BLOCK).enumerate() {
+                block.fill(seed.wrapping_add(index as u8));
+            }
+            bytes
+        };
         let insert = |store: &mut RawBlobs, byte| {
-            let bytes = vec![byte; BLOCK + 1];
+            let bytes = contents(byte);
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
             store.insert(oid, bytes.len(), bytes.as_slice())
         };
         let victim = insert(&mut store, b'a').unwrap();
-        *writes.fail_write_after.lock().unwrap() = Some(3);
+        let failed_after = COPY_BUFFER + 3;
+        *writes.fail_write_after.lock().unwrap() = Some(failed_after);
+        let (failed, failure) = mpsc::channel();
+        *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
+            if !succeeded {
+                failed.send(()).unwrap();
+            }
+        }));
 
         insert(&mut store, b'b').unwrap();
+        failure.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!victim.on_disk());
         assert_eq!(victim.read(0, 1).unwrap(), b"a");
 
         insert(&mut store, b'c').unwrap();
         assert!(victim.on_disk());
-        assert_eq!(victim.read_all().unwrap(), vec![b'a'; BLOCK + 1]);
+        assert_eq!(victim.read_all().unwrap(), contents(b'a'));
         store.wait_for_spill().unwrap();
         assert_eq!(
             writes.bytes.load(Ordering::Relaxed),
-            (3 + 2 * (BLOCK + 1)) as u64
+            (failed_after + 2 * size) as u64
         );
+    }
+
+    #[test]
+    fn packed_blob_reads_retain_the_odb_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("source");
+        let repo = git2::Repository::init_bare(&repository).unwrap();
+        let bytes = vec![b'p'; BLOCK + 1];
+        let oid = repo.blob(&bytes).unwrap();
+        {
+            let mut pack = repo.packbuilder().unwrap();
+            pack.insert_object(oid, None).unwrap();
+            pack.write(&repo.path().join("objects/pack"), 0).unwrap();
+        }
+        let hex = oid.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+        drop(repo);
+
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let (raw, allocation) = {
+            let repo = git2::Repository::open_bare(&repository).unwrap();
+            let odb = repo.odb().unwrap();
+            assert!(
+                odb.reader(oid).is_err(),
+                "fixture must use the packed ODB path"
+            );
+            let object = odb.read(oid).unwrap();
+            let allocation = object.data().as_ptr() as usize;
+            (store.insert_odb_blob(oid, object).unwrap(), allocation)
+        };
+        std::thread::spawn(move || {
+            let range = raw.read_shared(0, 128).unwrap();
+            let slice = range.chunks().next().unwrap();
+            assert_eq!(slice, &bytes[..128]);
+            assert_eq!(slice.as_ptr() as usize, allocation);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_second_partial_spill_failure_keeps_the_admission_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let writes = {
+            let mut state = store.state.lock().unwrap();
+            state.hot_limit = 1;
+            state.directory.writes.clone()
+        };
+        let insert = |store: &mut RawBlobs, byte| {
+            let bytes = vec![byte; BLOCK + 1];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            store.insert(oid, bytes.len(), bytes.as_slice()).unwrap()
+        };
+        let victim = insert(&mut store, b'a');
+        *writes.fail_write_after.lock().unwrap() = Some(3);
+        let mut rearm = true;
+        let metrics = Arc::downgrade(&writes);
+        *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
+            if !succeeded && rearm {
+                *metrics.upgrade().unwrap().fail_write_after.lock().unwrap() = Some(3);
+                rearm = false;
+            }
+        }));
+        insert(&mut store, b'b');
+
+        let bytes = vec![b'c'; BLOCK + 1];
+        let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+        store
+            .insert_verified_bytes(oid, bytes, None, false, || true, |_| {})
+            .unwrap();
+        assert!(!victim.on_disk());
+        assert_eq!(victim.read(0, 1).unwrap(), b"a");
+        assert_eq!(store.failure(), None);
+        let (blob, _) = store.for_read(oid).unwrap().unwrap();
+        assert_eq!(blob.read(0, 1).unwrap(), b"c");
+
+        assert!(store.claim(oid).unwrap());
+        store.wait_for_spill().unwrap();
+        assert!(victim.on_disk());
+        assert_eq!(victim.read(0, 1).unwrap(), b"a");
+        assert!(store.state.lock().unwrap().decoded.is_empty());
+        assert_eq!(
+            writes.bytes.load(Ordering::Relaxed),
+            (6 + 2 * (BLOCK + 1)) as u64
+        );
+    }
+
+    #[test]
+    fn a_different_admission_drains_bounded_buffers_after_repeated_spill_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = RawBlobs::new(directory.path()).unwrap();
+        let writes = {
+            let mut state = store.state.lock().unwrap();
+            state.hot_limit = 1;
+            state.directory.writes.clone()
+        };
+        let full = Arc::new(AtomicBool::new(true));
+        let spill_full = full.clone();
+        let metrics = Arc::downgrade(&writes);
+        *writes.fail_write_after.lock().unwrap() = Some(3);
+        *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
+            if !succeeded && spill_full.load(Ordering::Relaxed) {
+                *metrics.upgrade().unwrap().fail_write_after.lock().unwrap() = Some(3);
+            }
+        }));
+        let insert = |store: &mut RawBlobs, byte| {
+            let bytes = vec![byte; BLOCK + 1];
+            let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
+            let result = store.insert_verified_bytes(oid, bytes, None, false, || true, |_| {});
+            (oid, result)
+        };
+        insert(&mut store, b'a').1.unwrap();
+        insert(&mut store, b'b').1.unwrap();
+        let mut accepted = Vec::new();
+        for byte in b'c'..=b'n' {
+            let (oid, result) = insert(&mut store, byte);
+            match result {
+                Ok(()) => accepted.push((oid, byte)),
+                Err(error) => assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(libc::ENOSPC),
+                ),
+            }
+        }
+        let waiting = store.state.lock().unwrap().decoded.len();
+        assert_eq!(waiting, accepted.len());
+        assert!(accepted.len() > 1);
+
+        full.store(false, Ordering::Relaxed);
+        *writes.fail_write_after.lock().unwrap() = None;
+        insert(&mut store, b'z').1.unwrap();
+        store.wait_for_spill().unwrap();
+        assert!(
+            store.state.lock().unwrap().decoded.is_empty(),
+            "a new admission left {waiting} previously decoded blobs outside the LRU"
+        );
+        assert!(waiting < usize::from(b'n' - b'c' + 1));
+        assert_eq!(store.failure(), None);
+        for (oid, byte) in accepted {
+            let (blob, _) = store.for_read(oid).unwrap().unwrap();
+            assert_eq!(blob.read(0, 1).unwrap(), [byte]);
+        }
     }
 
     #[test]
     fn cancelled_hot_spill_does_not_poison_the_store() {
         const CHILD: &str = "GIT_ON_TEST_CANCELLED_SPILL_CHILD";
+        const SHORT_WRITE: usize = 3;
         // The shutdown latch is process-wide.
         let Ok(phase) = std::env::var(CHILD) else {
             for phase in [
                 "during-write",
+                "after-first-chunk",
+                "after-short-write",
                 "after-retry",
                 "failed-retry",
                 "native-failed-retry",
@@ -2489,10 +3231,22 @@ mod tests {
             state.hot_limit = 1;
             state.directory.writes.clone()
         };
+        let cancel_after = match phase.as_str() {
+            "after-first-chunk" => Some(COPY_BUFFER),
+            "after-short-write" => Some(SHORT_WRITE),
+            _ => None,
+        };
+        if let Some(bytes) = cancel_after {
+            writes
+                .cancel_after_bytes
+                .store(bytes as u64, Ordering::Relaxed);
+        }
         match phase.as_str() {
             "during-write" => {
                 *writes.on_spill.lock().unwrap() = Some(Box::new(crate::git::stop_operations));
             }
+            "after-first-chunk" => {}
+            "after-short-write" => *writes.fail_write_after.lock().unwrap() = Some(SHORT_WRITE),
             "after-retry" => {
                 *writes.fail_write_after.lock().unwrap() = Some(0);
                 *writes.on_spill_result.lock().unwrap() = Some(Box::new(move |succeeded| {
@@ -2518,8 +3272,13 @@ mod tests {
             }
             _ => panic!("unexpected shutdown phase {phase}"),
         }
+        let size = if phase == "after-first-chunk" {
+            COPY_BUFFER + BLOCK + 1
+        } else {
+            BLOCK + 1
+        };
         let admit = |store: &mut RawBlobs, byte| {
-            let bytes = vec![byte; BLOCK + 1];
+            let bytes = vec![byte; size];
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
             if phase == "native-failed-retry" {
                 store
@@ -2536,8 +3295,25 @@ mod tests {
         assert!(crate::object::is_cancelled(&error), "{error:#}");
         assert_eq!(store.failure(), None);
         assert_eq!(store.disk_metrics().1, u64::from(phase == "after-retry"));
-        let open_calls = store.state.lock().unwrap().directory.open_calls.get();
-        assert_eq!(open_calls, if phase == "during-write" { 1 } else { 2 });
+        let mut state = store.state.lock().unwrap();
+        let first_attempt = phase == "during-write" || cancel_after.is_some();
+        assert_eq!(
+            state.directory.open_calls.get(),
+            if first_attempt { 1 } else { 2 }
+        );
+        if let Some(written) = cancel_after {
+            let original = vec![b'a'; size];
+            let oid = Oid::hash_object(ObjectType::Blob, &original).unwrap();
+            assert_eq!(writes.bytes.load(Ordering::Relaxed), written as u64);
+            if phase == "after-short-write" {
+                assert_eq!(writes.calls.load(Ordering::Relaxed), 1);
+            }
+            assert!(!state.directory._owner.path().join(oid.to_string()).exists());
+            let descriptor = &state.objects[&oid];
+            assert!(!descriptor.file);
+            assert!(descriptor.blocks.is_empty());
+            assert_eq!(&**state.hot_payload(oid).unwrap(), original.as_slice());
+        }
     }
 
     #[test]
@@ -2576,7 +3352,10 @@ mod tests {
         let _active: Vec<_> = (2..HOT_BLOBS)
             .map(|_| {
                 store
-                    .reserve_pack_decode(|| true, crate::object::check_transfer)
+                    .reserve_pack_decode(
+                        || PackDecodePriority::Demand,
+                        crate::object::check_transfer,
+                    )
                     .unwrap()
             })
             .collect();
@@ -2597,13 +3376,16 @@ mod tests {
                 let bytes = received.clone();
                 scope.spawn(move || {
                     let _decode = decoder
-                        .reserve_pack_decode(|| true, crate::object::check_transfer)
+                        .reserve_pack_decode(
+                            || PackDecodePriority::Demand,
+                            crate::object::check_transfer,
+                        )
                         .unwrap();
                     decoder
                         .insert_verified_bytes(
                             received_oid,
                             bytes,
-                            Some(Weak::new()),
+                            Some(Arc::default()),
                             true,
                             || false,
                             |_| {},
@@ -2641,7 +3423,10 @@ mod tests {
             let second_ready = if streamed.is_some() {
                 scope.spawn(move || {
                     let _decode = another_decoder
-                        .reserve_pack_decode(|| true, crate::object::check_transfer)
+                        .reserve_pack_decode(
+                            || PackDecodePriority::Demand,
+                            crate::object::check_transfer,
+                        )
                         .unwrap();
                     let bytes = vec![HOT_BLOBS as u8 + 2; BLOCK + 1];
                     let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
@@ -2677,7 +3462,10 @@ mod tests {
                 scope.spawn(move || {
                     started.send(()).unwrap();
                     let _decode = last_decoder
-                        .reserve_pack_decode(|| true, crate::object::check_transfer)
+                        .reserve_pack_decode(
+                            || PackDecodePriority::Demand,
+                            crate::object::check_transfer,
+                        )
                         .unwrap();
                     reserved.send(()).unwrap();
                 });
@@ -2808,6 +3596,6 @@ mod tests {
             .insert_tree(oid, duplicate.len(), duplicate.as_slice())
             .is_err());
         assert!(store.get(oid).unwrap().is_none());
-        assert_eq!(tree.children().unwrap().len(), 1);
+        assert_eq!(tree.children().len(), 1);
     }
 }

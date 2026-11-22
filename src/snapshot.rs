@@ -6,9 +6,10 @@ use serde::Serialize;
 #[cfg(feature = "test-metrics")]
 use std::collections::BTreeMap;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt, fs,
+    io::{self, BufRead, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::symlink,
@@ -123,11 +124,253 @@ pub struct Entry {
     /// correct size from an ODB header, without requesting the file payload.
     pub size: Option<u64>,
 }
-#[derive(Debug)]
-struct Pin {
-    git_dir: PathBuf,
-    name: String,
-    oid: Oid,
+
+enum LocalObjectAnchor {
+    Native(Box<NativeLocalObjects>),
+    Temporary {
+        _directory: tempfile::TempDir,
+    },
+    #[cfg(target_os = "linux")]
+    Descriptor {
+        _file: fs::File,
+    },
+}
+
+/// libgit2 treats ordinary relative entries as cwd-relative and cannot
+/// decode Git's C-quoted entries. Keep this compatibility path in native Git
+/// so a similarly named directory in the caller's cwd cannot supply objects.
+struct NativeLocalObjects {
+    batch: Mutex<NativeObjectBatch>,
+    #[cfg(feature = "test-metrics")]
+    git: crate::git::Git,
+    #[cfg(feature = "test-metrics")]
+    primary: PathBuf,
+    #[cfg(feature = "test-metrics")]
+    alternates: OsString,
+}
+
+struct NativeObjectBatch {
+    contents: crate::transport::BatchProcess,
+    // Git before 2.36 needs a separate header-only process.
+    headers: Option<crate::transport::BatchProcess>,
+}
+
+impl NativeLocalObjects {
+    fn new(git: &crate::git::Git, primary: PathBuf, alternates: OsString) -> Result<Self> {
+        let version = git.output(None, &[OsStr::new("--version")])?;
+        let version = std::str::from_utf8(&version)
+            .ok()
+            .and_then(|text| text.strip_prefix("git version "))
+            .and_then(|text| text.split_whitespace().next())
+            .and_then(|text| text.split_once('.'))
+            .and_then(|(major, rest)| {
+                Some((
+                    major.parse::<u32>().ok()?,
+                    rest.split('.').next()?.parse().ok()?,
+                ))
+            });
+        let start = |mode| {
+            let mut command = Self::command(git, &primary, &alternates);
+            command.arg(mode);
+            crate::transport::BatchProcess::spawn(command)
+        };
+        let batch = if version.is_some_and(|version| version >= (2, 36)) {
+            NativeObjectBatch {
+                contents: start("--batch-command")?,
+                headers: None,
+            }
+        } else {
+            let mut contents = start("--batch")?;
+            let headers = start("--batch-check")?;
+            // Resolve both Git object stores during startup. The contents
+            // process would otherwise see later changes to an alternate path.
+            let absent = Oid::zero();
+            let _ = contents.exchange(format!("{absent}\n").as_bytes(), |input| {
+                Self::receive(absent, true, input, |_, _, _| Ok(()))
+            })?;
+            NativeObjectBatch {
+                contents,
+                headers: Some(headers),
+            }
+        };
+        Ok(Self {
+            batch: Mutex::new(batch),
+            #[cfg(feature = "test-metrics")]
+            git: git.clone(),
+            #[cfg(feature = "test-metrics")]
+            primary,
+            #[cfg(feature = "test-metrics")]
+            alternates,
+        })
+    }
+
+    fn command(git: &crate::git::Git, primary: &Path, alternates: &OsStr) -> std::process::Command {
+        let mut command = git.command(None);
+        command
+            .arg("cat-file")
+            .env("GIT_OBJECT_DIRECTORY", primary)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates)
+            // Older Git versions do not honor GIT_NO_LAZY_FETCH.
+            .env("GIT_ALLOW_PROTOCOL", "");
+        command
+    }
+
+    fn header(&self, oid: Oid) -> Result<(usize, ObjectType)> {
+        self.cat_file(oid, false, |size, kind, _| Ok((size, kind)))
+    }
+
+    fn read<T>(
+        &self,
+        oid: Oid,
+        consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
+    ) -> Result<T> {
+        self.cat_file(oid, true, consume)
+    }
+
+    fn bytes(&self, oid: Oid, expected: ObjectType) -> Result<Vec<u8>> {
+        self.read(oid, |size, kind, input| {
+            anyhow::ensure!(kind == expected, "Git object type changed during transfer");
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(size)?;
+            let mut verified = crate::object::VerifiedWriter::new(&mut payload, kind, size, oid);
+            loop {
+                crate::object::check_transfer()?;
+                let bytes = input.fill_buf()?;
+                if bytes.is_empty() {
+                    break;
+                }
+                verified.write_all(bytes)?;
+                let count = bytes.len();
+                input.consume(count);
+            }
+            verified.finish()?;
+            Ok(payload)
+        })
+    }
+
+    fn cat_file<T>(
+        &self,
+        oid: Oid,
+        body: bool,
+        consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
+    ) -> Result<T> {
+        let mut batch = self.batch.lock().unwrap();
+        let NativeObjectBatch { contents, headers } = &mut *batch;
+        let (process, request) = if let Some(headers) = headers {
+            (if body { contents } else { headers }, format!("{oid}\n"))
+        } else {
+            let verb = if body { "contents" } else { "info" };
+            (contents, format!("{verb} {oid}\n"))
+        };
+        process.exchange(request.as_bytes(), |input| {
+            Self::receive(oid, body, input, consume)
+        })?
+    }
+
+    fn receive<T>(
+        oid: Oid,
+        body: bool,
+        mut input: &mut dyn BufRead,
+        consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
+    ) -> Result<Result<T>> {
+        let mut header = String::new();
+        (&mut input).take(128).read_line(&mut header)?;
+        anyhow::ensure!(header.ends_with('\n'), "invalid native Git object header");
+        let mut fields = header.split_ascii_whitespace();
+        anyhow::ensure!(
+            fields.next().and_then(|value| Oid::from_str(value).ok()) == Some(oid),
+            "native Git returned a different object"
+        );
+        let kind = fields.next().context("missing native Git object type")?;
+        if kind == "missing" && fields.next().is_none() {
+            return Ok(Err(anyhow::anyhow!("missing local Git object {oid}")));
+        }
+        let kind = ObjectType::from_str(kind).context("invalid native Git object type")?;
+        let size: usize = fields.next().context("missing Git object size")?.parse()?;
+        anyhow::ensure!(fields.next().is_none(), "invalid native Git object header");
+        let mut data = (&mut input).take(if body { size as u64 } else { 0 });
+        let value = consume(size, kind, &mut data);
+        if body {
+            // A consumer error need not invalidate the local object store.
+            // Finish the response so the next request starts at its header.
+            if let Err(error) = &value {
+                if crate::object::is_cancelled(error) {
+                    return Err(anyhow::anyhow!(crate::object::OperationCancelled));
+                }
+                io::copy(&mut data, &mut io::sink())?;
+            }
+            anyhow::ensure!(data.limit() == 0, "truncated native Git object");
+            let mut newline = [0];
+            input.read_exact(&mut newline)?;
+            anyhow::ensure!(newline == *b"\n", "invalid native Git object delimiter");
+        }
+        Ok(value)
+    }
+
+    fn stop(&self) -> Result<()> {
+        let batch = self.batch.lock().unwrap();
+        let contents = batch.contents.stop();
+        let headers = batch
+            .headers
+            .as_ref()
+            .map_or(Ok(()), crate::transport::BatchProcess::stop);
+        contents.and(headers)
+    }
+
+    #[cfg(feature = "test-metrics")]
+    fn objects(&self) -> Result<Vec<Oid>> {
+        let mut command = Self::command(&self.git, &self.primary, &self.alternates);
+        command
+            .args(["--batch-all-objects", "--batch-check=%(objectname)"])
+            .stdin(std::process::Stdio::null());
+        let output = crate::git::run_builtin(command)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "native Git could not enumerate objects"
+        );
+        std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(|line| Ok(Oid::from_str(line)?))
+            .collect()
+    }
+}
+
+fn needs_native_alternates(path: &Path, depth: usize, visited: &mut HashSet<PathBuf>) -> bool {
+    // Git and libgit2 both bound recursion. Inspect up to the same number
+    // of links even when a deeper alternate would repeat an earlier location.
+    if depth > 6 {
+        return false;
+    }
+    let bytes = match fs::read(path.join("info/alternates")) {
+        Ok(bytes) => bytes,
+        Err(error) => return error.kind() != io::ErrorKind::NotFound,
+    };
+    let Ok(path) = path.canonicalize() else {
+        return true;
+    };
+    if !visited.insert(path.clone()) {
+        return false;
+    }
+    bytes.split(|&byte| byte == b'\n').any(|line| {
+        if line.is_empty() || line.starts_with(b"#") {
+            return false;
+        }
+        if !matches!(line[0], b'/' | b'.') || line.contains(&b'\r') || line.contains(&0) {
+            return true;
+        }
+        needs_native_alternates(&path.join(OsStr::from_bytes(line)), depth + 1, visited)
+    })
+}
+
+fn primary_has_disk_alternates(path: &Path) -> bool {
+    match fs::read(path.join("info/alternates")) {
+        // libgit2 also splits at carriage returns. Keep ambiguous lists on
+        // the native path even if every LF-separated line appears to be a comment.
+        Ok(bytes) => bytes
+            .split(|&byte| byte == b'\n')
+            .any(|line| line.contains(&b'\r') || (!line.is_empty() && !line.starts_with(b"#"))),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 /// libgit2 handles relative object environments before Git's repository setup
@@ -137,10 +380,32 @@ fn configure_local_object_database(
     git: &crate::git::Git,
     repo: &Repository,
     run_directory: &Path,
-) -> Result<Option<tempfile::TempDir>> {
-    let alternates = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES");
-    if alternates.is_none() && std::env::var_os("GIT_OBJECT_DIRECTORY").is_none() {
-        return Ok(None);
+) -> Result<Option<LocalObjectAnchor>> {
+    let alternates =
+        std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").filter(|value| !value.is_empty());
+    let object_directory = std::env::var_os("GIT_OBJECT_DIRECTORY");
+    if alternates.is_none()
+        && object_directory.as_deref().is_none_or(|path| {
+            let path = Path::new(path);
+            path.is_absolute()
+                && fs::canonicalize(path)
+                    .as_deref()
+                    .is_ok_and(|name| name == path)
+        })
+    {
+        // FROM_ENV already supplies this resolved primary path byte for byte
+        // at the correct depth for its own info/alternates.
+        let primary = object_directory
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo.commondir().join("objects"));
+        return if needs_native_alternates(&primary, 0, &mut HashSet::new()) {
+            NativeLocalObjects::new(git, primary, OsString::new())
+                .map(Box::new)
+                .map(LocalObjectAnchor::Native)
+                .map(Some)
+        } else {
+            Ok(None)
+        };
     }
     let primary = git.output(
         None,
@@ -151,9 +416,10 @@ fn configure_local_object_database(
             OsStr::new("objects"),
         ],
     )?;
-    let mut locations = vec![PathBuf::from(OsString::from_vec(
+    let primary = PathBuf::from(OsString::from_vec(
         primary.strip_suffix(b"\n").unwrap_or(&primary).to_vec(),
-    ))];
+    ));
+    let mut locations = vec![primary];
     let mut cwd = git.cwd.canonicalize()?;
     if alternates.is_some() {
         let prefix = git.output(
@@ -183,7 +449,8 @@ fn configure_local_object_database(
         let decoded = remaining
             .starts_with(b"\"")
             .then(|| gix_quote::ansi_c::undo(remaining.into()))
-            .and_then(Result::ok);
+            .and_then(Result::ok)
+            .filter(|(_, end)| closed_c_quote(&remaining[..*end]));
         let (value, consumed) = if remaining.starts_with(b"#") {
             (Vec::new(), end)
         } else if let Some((value, consumed)) = decoded {
@@ -197,23 +464,49 @@ fn configure_local_object_database(
         if !remaining.is_empty() {
             remaining = &remaining[1..];
         }
+        // Git's path normalization takes a NUL-terminated pathname.
+        let value = value.split(|&byte| byte == 0).next().unwrap_or_default();
         if !value.is_empty() {
-            let path = PathBuf::from(OsString::from_vec(value));
+            let path = Path::new(OsStr::from_bytes(value));
             if let Ok(path) = cwd.join(path).canonicalize() {
                 locations.push(path);
             }
         }
     }
+    let mut visited = HashSet::new();
+    let primary_needs_own_depth =
+        alternates.is_some() && primary_has_disk_alternates(&locations[0]);
+    if primary_needs_own_depth
+        || locations.iter().enumerate().any(|(index, path)| {
+            needs_native_alternates(path, usize::from(index != 0), &mut visited)
+        })
+    {
+        let primary = locations[0].canonicalize()?;
+        return NativeLocalObjects::new(
+            git,
+            primary,
+            normalized_alternate_environment(&locations[1..])
+                .unwrap_or_else(|| alternates.unwrap_or_default()),
+        )
+        .map(Box::new)
+        .map(LocalObjectAnchor::Native)
+        .map(Some);
+    }
+    if alternates.is_none() && locations[0].to_str().is_none() {
+        return configure_byte_primary(repo, &locations[0], run_directory).map(Some);
+    }
     if let Some(paths) = locations
         .iter()
         .map(|path| path.to_str())
         .collect::<Option<Vec<_>>>()
-        // Direct ODB backends start at depth zero. Keep the existing bridge
-        // traversal when these locations specify further alternates.
+        // The primary store starts at depth zero. Inherited alternates start
+        // one level deeper, so nested environment entries still need a bridge.
         .filter(|_| {
-            locations
-                .iter()
-                .all(|path| matches!(path.join("info/alternates").try_exists(), Ok(false)))
+            alternates.is_none()
+                || locations
+                    .iter()
+                    .skip(1)
+                    .all(|path| matches!(path.join("info/alternates").try_exists(), Ok(false)))
         })
     {
         let database = git2::Odb::new()?;
@@ -237,20 +530,91 @@ fn configure_local_object_database(
     }
     fs::write(bridge.path().join("objects/info/alternates"), aliases)?;
     repo.set_odb(&private.odb()?)?;
-    Ok(Some(bridge))
-}
-impl Drop for Pin {
-    fn drop(&mut self) {
-        if let Ok(repo) = Repository::open(&self.git_dir) {
-            if let Ok(mut reference) = repo.find_reference(&self.name) {
-                if reference.target() == Some(self.oid) {
-                    let _ = reference.delete();
-                }
-            };
-        }
-    }
+    Ok(Some(LocalObjectAnchor::Temporary { _directory: bridge }))
 }
 
+fn closed_c_quote(value: &[u8]) -> bool {
+    value.len() > 1
+        && value.ends_with(b"\"")
+        && value[..value.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count()
+            % 2
+            == 0
+}
+
+fn normalized_alternate_environment(paths: &[PathBuf]) -> Option<OsString> {
+    // Expanded paths can exceed exec's per-string limit. Keep the original
+    // Git environment in that case so native Git visits the graph only once
+    // and preserves its traversal order and nesting limit.
+    const MAX_ALTERNATE_BYTES: usize = 32 * 1024;
+    let mut list = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        if !seen.insert(path) {
+            continue;
+        }
+        if !list.is_empty() {
+            list.push(b':');
+        }
+        list.push(b'"');
+        for &byte in path.as_os_str().as_bytes() {
+            if matches!(byte, b'"' | b'\\') {
+                list.push(b'\\');
+            }
+            list.push(byte);
+        }
+        list.push(b'"');
+        if list.len() > MAX_ALTERNATE_BYTES {
+            return None;
+        }
+    }
+    Some(OsString::from_vec(list))
+}
+
+fn configure_byte_primary(
+    repo: &Repository,
+    primary: &Path,
+    run_directory: &Path,
+) -> Result<LocalObjectAnchor> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+
+        let file = fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(primary)?;
+        // The binding takes a UTF-8 string. This name addresses the resolved
+        // byte path at primary depth without modifying any filesystem entry.
+        let alias = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let identity = file.metadata()?;
+        if fs::metadata(&alias)
+            .is_ok_and(|alias| (alias.dev(), alias.ino()) == (identity.dev(), identity.ino()))
+        {
+            let database = git2::Odb::new()?;
+            database.add_disk_alternate(&alias)?;
+            repo.set_odb(&database)?;
+            return Ok(LocalObjectAnchor::Descriptor { _file: file });
+        }
+    }
+
+    // Make the selected store the object directory itself. Registering it
+    // through an alternates list would lose one level of primary traversal.
+    let bridge = tempfile::Builder::new()
+        .prefix("local-object-bridge-")
+        .tempdir_in(run_directory)?;
+    fs::create_dir(bridge.path().join("refs"))?;
+    fs::write(bridge.path().join("HEAD"), b"ref: refs/heads/main\n")?;
+    symlink(primary, bridge.path().join("objects"))?;
+    repo.set_odb(&Repository::open_bare(bridge.path())?.odb()?)?;
+    Ok(LocalObjectAnchor::Temporary { _directory: bridge })
+}
 /// Application-level demand requests, excluding initial tree-ish resolution.
 /// libgit2's necessary pack/delta decoding is not separately observable here.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -272,6 +636,8 @@ pub struct SnapshotMetrics {
     /// Exact received Git pack payloads on invocation-owned demand sessions.
     /// Neither counter includes protocol framing, TLS or other wire overhead.
     pub remote_session_pack_bytes: u64,
+    /// Peak verified allocation capacity retained by the single eager pack.
+    pub remote_eager_verified_pack_capacity: usize,
     pub tree_reads: u64,
     pub prepared_tree_entries: u64,
     pub verification_metadata_bytes: usize,
@@ -360,9 +726,15 @@ struct State {
     #[cfg(test)]
     ancestor_tree_lookups: u64,
     spool_directory: PathBuf,
-    _local_object_bridge: Option<tempfile::TempDir>,
+    _local_object_anchor: Option<LocalObjectAnchor>,
 }
 impl State {
+    fn native_local(&self) -> Option<&NativeLocalObjects> {
+        match &self._local_object_anchor {
+            Some(LocalObjectAnchor::Native(native)) => Some(native),
+            _ => None,
+        }
+    }
     fn repository(&self) -> Option<&Repository> {
         self.local_repo.as_ref().or_else(|| {
             self.remote
@@ -371,13 +743,19 @@ impl State {
         })
     }
     fn object_kind(&self, oid: Oid) -> Result<ObjectType> {
+        if let Some(native) = self.native_local() {
+            return native.header(oid).map(|(_, kind)| kind);
+        }
         if let Some(remote) = &self.remote {
             if let Some(raw) = remote.raw_blobs.get(oid)? {
                 return Ok(raw.kind());
             }
-            if let Some(crate::raw_blob::ReceivedObject::Verified(object)) =
+            if let Some(crate::raw_blob::ReceivedObject::Verified { object, transfer }) =
                 remote.raw_blobs.received(oid)
             {
+                if let Some(transfer) = transfer {
+                    transfer.mark_served();
+                }
                 return Ok(object.kind());
             }
         }
@@ -385,6 +763,9 @@ impl State {
         Ok(repo.odb()?.read_header(oid)?.1)
     }
     fn selected_child(&self, oid: Oid, kind: ObjectType) -> Result<Oid> {
+        if let Some(native) = self.native_local() {
+            return crate::object::selected_child(kind, &native.bytes(oid, kind)?);
+        }
         if let Some(repo) = self.repository() {
             return match kind {
                 ObjectType::Commit => Ok(repo.find_commit(oid)?.tree_id()),
@@ -393,12 +774,16 @@ impl State {
             };
         }
         let remote = self.remote.as_ref().expect("in-memory remote snapshot");
-        let Some(crate::raw_blob::ReceivedObject::Verified(object)) =
+        let Some(crate::raw_blob::ReceivedObject::Verified { object, transfer }) =
             remote.raw_blobs.received(oid)
         else {
             bail!("missing verified Git metadata {oid}");
         };
-        crate::object::selected_child(kind, object.data())
+        let child = crate::object::selected_child(kind, object.data())?;
+        if let Some(transfer) = transfer {
+            transfer.mark_served();
+        }
+        Ok(child)
     }
     fn ensure(&mut self, oid: Oid) -> Result<()> {
         if let Some(remote) = &mut self.remote {
@@ -430,24 +815,31 @@ impl State {
             self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
         }
         let (tree, first) = {
-            let odb = self
-                .repository()
-                .context("missing verified directory")?
-                .odb()?;
             let storage = self.raw_store().expect("directory cache");
-            if let Ok((reader, size, kind)) = odb.reader(oid) {
-                anyhow::ensure!(
-                    kind == ObjectType::Tree,
-                    "snapshot directory does not reference a tree"
-                );
-                storage.insert_tree(oid, size, reader)?;
+            if let Some(native) = self.native_local() {
+                let (size, directory) = native.read(oid, |size, kind, input| {
+                    anyhow::ensure!(
+                        kind == ObjectType::Tree,
+                        "snapshot directory does not reference a tree"
+                    );
+                    Ok((size, Directory::verified(oid, size, input)?))
+                })?;
+                storage.insert_prepared_tree(oid, size, directory)?;
             } else {
-                let object = odb.read(oid).context("decode snapshot tree")?;
-                anyhow::ensure!(
-                    object.kind() == ObjectType::Tree,
-                    "snapshot directory does not reference a tree"
-                );
-                storage.insert_tree(oid, object.len(), object.data())?;
+                let odb = self
+                    .repository()
+                    .context("missing verified directory")?
+                    .odb()?;
+                if let Ok((reader, size, kind)) = odb.reader(oid) {
+                    anyhow::ensure!(
+                        kind == ObjectType::Tree,
+                        "snapshot directory does not reference a tree"
+                    );
+                    storage.insert_tree(oid, size, reader)?;
+                } else {
+                    let object = odb.read(oid).context("decode snapshot tree")?;
+                    storage.insert_odb_tree(oid, &object)?;
+                };
             }
             storage
                 .directory(oid)
@@ -484,12 +876,15 @@ impl State {
             self.headers.insert(oid, size);
             return Ok(size);
         }
-        let (size, kind) = self
-            .repository()
-            .context("missing verified Git blob")?
-            .odb()?
-            .read_header(oid)
-            .context("read blob header")?;
+        let (size, kind) = if let Some(native) = self.native_local() {
+            native.header(oid)?
+        } else {
+            self.repository()
+                .context("missing verified Git blob")?
+                .odb()?
+                .read_header(oid)
+                .context("read blob header")?
+        };
         if kind != ObjectType::Blob {
             bail!("snapshot file does not reference a blob");
         }
@@ -546,31 +941,38 @@ impl State {
             self.metrics.cache_hits += 1;
             raw
         } else {
-            let repo = self.local_repo.as_ref().unwrap();
-            let (size, kind) = repo.odb()?.read_header(oid)?;
-            anyhow::ensure!(
-                kind == ObjectType::Blob,
-                "snapshot file does not reference a blob"
-            );
             if self.raw_blobs.is_none() {
                 self.raw_blobs = Some(crate::raw_blob::RawBlobs::new(&self.spool_directory)?);
             }
             let raw = self.raw_blobs.as_mut().unwrap();
-            let odb = repo.odb()?;
-            let (blob, streamed) = if let Ok((reader, length, kind)) = odb.reader(oid) {
-                anyhow::ensure!(
-                    kind == ObjectType::Blob && length == size,
-                    "Git blob changed during transfer"
-                );
-                (raw.insert(oid, size, reader)?, true)
-            } else {
-                let object = odb.read(oid).context("decode Git blob")?;
-                anyhow::ensure!(
-                    object.kind() == ObjectType::Blob && object.len() == size,
-                    "Git blob changed during transfer"
-                );
-                (raw.insert_odb_blob(oid, &object)?, false)
-            };
+            let (blob, size, streamed) =
+                if let Some(LocalObjectAnchor::Native(native)) = &self._local_object_anchor {
+                    let payload = native.bytes(oid, ObjectType::Blob)?;
+                    let size = payload.len();
+                    (raw.insert_prepared_blob(oid, payload)?, size, true)
+                } else {
+                    let odb = self.local_repo.as_ref().unwrap().odb()?;
+                    let (size, kind) = odb.read_header(oid)?;
+                    anyhow::ensure!(
+                        kind == ObjectType::Blob,
+                        "snapshot file does not reference a blob"
+                    );
+                    let streamed = odb.reader(oid);
+                    if let Ok((reader, length, kind)) = streamed {
+                        anyhow::ensure!(
+                            kind == ObjectType::Blob && length == size,
+                            "Git blob changed during transfer"
+                        );
+                        (raw.insert(oid, size, reader)?, size, true)
+                    } else {
+                        let object = odb.read(oid).context("decode Git blob")?;
+                        anyhow::ensure!(
+                            object.kind() == ObjectType::Blob && object.len() == size,
+                            "Git blob changed during transfer"
+                        );
+                        (raw.insert_odb_blob(oid, object)?, size, false)
+                    }
+                };
             self.metrics.blob_loads += 1;
             self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
             if size > crate::raw_blob::BLOCK {
@@ -595,16 +997,37 @@ impl State {
         }
         Ok(())
     }
+    fn copy_blob_reader(
+        oid: Oid,
+        size: usize,
+        kind: ObjectType,
+        input: impl Read,
+        output: &mut dyn Write,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            kind == ObjectType::Blob,
+            "snapshot file does not reference a blob"
+        );
+        if size < 1024 {
+            let mut small = Vec::with_capacity(size);
+            crate::object::copy_verified(input, &mut small, kind, size, oid)?;
+            Self::validate_blob(&small)?;
+            output.write_all(&small)?;
+        } else {
+            crate::object::copy_verified(input, output, kind, size, oid)?;
+        }
+        Ok(())
+    }
     /// Full-object consumers explicitly need the returned bytes (ignore rules
     /// and symlink targets). Ordinary ranged reads use BlobReader directly.
     fn with_blob<T>(&mut self, oid: Oid, consume: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
         let reader = self.open(oid)?;
-        consume(&reader.0.data.read_all()?)
+        consume(&reader.0.data.read_all()?.contiguous())
     }
 }
 struct Inner {
     state: Mutex<State>,
-    pin: Option<Pin>,
+    pack_verification: Option<crate::demand::PackVerification>,
 }
 /// Clones share the selected tree and its object caches.
 #[derive(Clone)]
@@ -646,25 +1069,23 @@ impl fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("tree_oid", &self.tree_oid)
             .field("git_dir", &self.git_dir)
-            .field("pin_ref", &self.inner.pin.as_ref().map(|pin| &pin.name))
             .finish_non_exhaustive()
     }
 }
 impl Snapshot {
-    pub fn load(repo_path: &Path, treeish: &OsStr, run_id: &str) -> Result<Self> {
-        Self::load_source_with_pin_record(
+    pub fn load(repo_path: &Path, treeish: &OsStr, _run_id: &str) -> Result<Self> {
+        Self::load_source(
             repo_path,
             None,
             treeish,
             false,
             false,
             &std::env::temp_dir(),
-            run_id,
-            |_, _, _| Ok(()),
         )
     }
-    /// Record a private Git pin before creating it so cleanup can recover it.
-    /// An in-memory snapshot keeps only its selected tree OID.
+
+    /// Load a snapshot and retain its resolved tree in memory. The former run
+    /// ID and pin callback are accepted for source compatibility.
     #[allow(clippy::too_many_arguments)]
     pub fn load_source_with_pin_record<F>(
         repo_path: &Path,
@@ -673,13 +1094,33 @@ impl Snapshot {
         verify: bool,
         materialized: bool,
         run_directory: &Path,
-        run_id: &str,
-        mut record: F,
+        _run_id: &str,
+        _record: F,
     ) -> Result<Self>
     where
         F: FnMut(&Path, &str, Oid) -> Result<()>,
     {
-        let (local_repo, remote, oid, git, local_bridge) = if let Some(source) = source {
+        Self::load_source(
+            repo_path,
+            source,
+            treeish,
+            verify,
+            materialized,
+            run_directory,
+        )
+    }
+
+    /// Open the selected tree for one run. Native remote storage, if needed,
+    /// belongs to that run and its Git commands disable automatic maintenance.
+    pub fn load_source(
+        repo_path: &Path,
+        source: Option<&OsStr>,
+        treeish: &OsStr,
+        verify: bool,
+        materialized: bool,
+        run_directory: &Path,
+    ) -> Result<Self> {
+        let (local_repo, remote, oid, git, local_anchor) = if let Some(source) = source {
             let (remote, oid) = crate::remote::Remote::open_for_execution(
                 repo_path,
                 source,
@@ -690,8 +1131,7 @@ impl Snapshot {
             )?;
             (None, Some(remote), oid, None, None)
         } else {
-            let git = crate::git::Git::capture(repo_path)?;
-            let oid = git.resolve(treeish)?;
+            let (git, oid) = crate::git::Git::capture_snapshot(repo_path, treeish)?;
             // Native Git resolved the operand in the caller's object namespace.
             // Keep that environment for subsequent lazy libgit2 object reads.
             let repo = Repository::open_ext(
@@ -700,8 +1140,8 @@ impl Snapshot {
                 &[] as &[&OsStr],
             )
             .context("open selected Git repository and object environment")?;
-            let bridge = configure_local_object_database(&git, &repo, run_directory)?;
-            (Some(repo), None, oid, Some(git), bridge)
+            let anchor = configure_local_object_database(&git, &repo, run_directory)?;
+            (Some(repo), None, oid, Some(git), anchor)
         };
         let mut state = State {
             local_repo,
@@ -714,19 +1154,19 @@ impl Snapshot {
             #[cfg(test)]
             ancestor_tree_lookups: 0,
             spool_directory: run_directory.to_path_buf(),
-            _local_object_bridge: local_bridge,
+            _local_object_anchor: local_anchor,
         };
         if verify {
-            let git = state
-                .remote
-                .as_ref()
-                .map(|r| r.git.as_ref())
-                .or(git.as_ref())
-                .unwrap();
-            let repo = state
-                .repository()
-                .context("native Git verification repository missing")?;
-            git.verify(repo.path(), oid, state.object_kind(oid)?)?;
+            let (git, directory) = if let Some(remote) = &state.remote {
+                let repo = remote
+                    .native_repository()
+                    .context("native Git verification repository missing")?;
+                (remote.git.as_ref(), repo.path())
+            } else {
+                let git = git.as_ref().expect("captured local Git repository");
+                (git, git.repository_dir()?)
+            };
+            git.verify(directory, oid, state.object_kind(oid)?)?;
         }
         let mut selected = oid;
         let tree_oid = loop {
@@ -746,42 +1186,21 @@ impl Snapshot {
                 _ => bail!("revision does not resolve to a tree"),
             }
         };
-        let pin = if let Some(repo) = state
-            .remote
-            .as_ref()
-            .and_then(|remote| remote.native_repository())
-        {
-            let pin_ref = format!("refs/git-on/{run_id}");
-            if run_id.is_empty() || !git2::Reference::is_valid_name(&pin_ref) {
-                bail!("invalid snapshot run ID");
-            }
-            let pin_git_dir = repo
-                .commondir()
-                .canonicalize()
-                .context("resolve pin reference storage")?;
-            record(&pin_git_dir, &pin_ref, tree_oid)?;
-            repo.reference(&pin_ref, tree_oid, false, "git-on snapshot pin")
-                .context("pin snapshot in its private Git repository")?;
-            Some(Pin {
-                git_dir: pin_git_dir,
-                name: pin_ref,
-                oid: tree_oid,
-            })
-        } else {
-            None
-        };
-        let git_dir = if let Some(remote) = &mut state.remote {
-            remote.root_prepared();
+        let git_dir = if let Some(remote) = &state.remote {
             remote.dir.clone()
         } else {
             state.local_repo.as_ref().unwrap().path().to_path_buf()
         };
+        let pack_verification = state
+            .remote
+            .as_ref()
+            .map(|remote| remote.pack_verification.clone());
         Ok(Self {
             tree_oid,
             git_dir,
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
-                pin,
+                pack_verification,
             }),
         })
     }
@@ -791,15 +1210,39 @@ impl Snapshot {
             .lock()
             .map_err(|_| anyhow::anyhow!("snapshot object cache poisoned"))
     }
+    /// A successful command must wait for the packs that supplied its reads.
+    pub fn verify_used_packs(&self) -> Result<()> {
+        self.inner
+            .pack_verification
+            .as_ref()
+            .map_or(Ok(()), crate::demand::PackVerification::wait)
+    }
+
+    /// The native mount is ready and startup can no longer fall back to copy.
+    pub fn begin_mounted_reads(&self) {
+        if let Some(verification) = &self.inner.pack_verification {
+            verification.mounted();
+        }
+    }
+
+    pub(crate) fn begin_directory_enumeration(&self) {
+        if let Some(verification) = &self.inner.pack_verification {
+            verification.enumerating();
+        }
+    }
+
     pub fn stop_remote_transport(&self) -> Result<()> {
         crate::git::stop_operations();
         let state = self.state()?;
         let transport = state
             .remote
             .as_ref()
-            .map_or(Ok(()), |remote| remote.stop_transport());
+            .map_or(Ok(()), crate::remote::Remote::stop_transport);
+        let native = state
+            .native_local()
+            .map_or(Ok(()), NativeLocalObjects::stop);
         let cache = state.raw_store().map_or(Ok(()), |raw| raw.stop());
-        transport.and(cache)
+        transport.and(native).and(cache)
     }
     pub fn remote_failure(&self) -> Option<String> {
         self.state()
@@ -817,6 +1260,7 @@ impl Snapshot {
     pub(crate) fn start_remote_demand<I: Iterator<Item = Oid>>(
         &self,
         oid: Oid,
+        immediate: bool,
         candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Option<PendingObject> {
         let mut state = self.state().ok()?;
@@ -826,20 +1270,20 @@ impl Snapshot {
         let demand = state
             .remote
             .as_mut()?
-            .start_demand(oid, candidates)
+            .start_demand(oid, immediate, candidates)
             .ok()??;
         Some(PendingObject {
             snapshot: self.clone(),
             demand,
         })
     }
-    fn metadata(mode: u32, oid: Oid, path: &Path) -> Result<Entry> {
+    fn metadata(mode: u32, oid: Oid, display_path: impl FnOnce() -> String) -> Result<Entry> {
         let kind = match mode {
             0o040000 => EntryKind::Directory,
             0o100644 | 0o100755 => EntryKind::File,
             0o120000 => EntryKind::Symlink,
-            0o160000 => bail!("submodules are unsupported: {}", path.display()),
-            mode => bail!("unsupported Git mode {mode:o}: {}", path.display()),
+            0o160000 => bail!("submodules are unsupported: {}", display_path()),
+            mode => bail!("unsupported Git mode {mode:o}: {}", display_path()),
         };
         Ok(Entry {
             kind,
@@ -870,7 +1314,7 @@ impl Snapshot {
             let Some((mode, oid)) = tree.lookup(name) else {
                 return Ok(None);
             };
-            entry = Self::metadata(mode, oid, path)?;
+            entry = Self::metadata(mode, oid, || path.display().to_string())?;
         }
         Ok(Some(entry))
     }
@@ -917,7 +1361,7 @@ impl Snapshot {
         let (mode, oid) = directory
             .metadata_at(index)
             .context("directory entry missing")?;
-        Self::metadata(mode, oid, path)
+        Self::metadata(mode, oid, || path.display().to_string())
     }
     /// Share a verified directory without copying names or reading children.
     pub(crate) fn directory(&self, path: &Path) -> Result<Arc<Directory>> {
@@ -942,7 +1386,10 @@ impl Snapshot {
             state.metrics.cache_hits += u64::from(!first);
             return Ok(Some(tree));
         }
-        if let Some(repo) = state.repository() {
+        if let Some(repo) = state
+            .repository()
+            .filter(|_| state.native_local().is_none())
+        {
             if repo.odb()?.exists(oid) {
                 return state.tree(oid).map(Some);
             }
@@ -951,27 +1398,31 @@ impl Snapshot {
     }
     /// Enumerate one directory without reading child tree objects or blob headers.
     pub fn children(&self, path: &Path) -> Result<Vec<(OsString, Entry)>> {
-        self.directory(path)?
-            .children()?
-            .into_iter()
-            .map(|item| {
-                Ok((
-                    item.name.clone(),
-                    if item.mode == 0o160000 {
-                        // A gitlink name may be listed, but lookup/stat/open of
-                        // that name must fail instead of presenting a checkout.
-                        Entry {
-                            kind: EntryKind::Directory,
-                            mode: item.mode,
-                            oid: item.oid,
-                            size: Some(0),
-                        }
-                    } else {
-                        Self::metadata(item.mode, item.oid, &path.join(&item.name))?
-                    },
-                ))
-            })
+        let directory = self.directory(path)?;
+        Self::directory_children(&directory, path)
+            .map(|entry| entry.map(|(name, entry)| (name.to_os_string(), entry)))
             .collect()
+    }
+
+    pub(crate) fn directory_children<'a>(
+        directory: &'a Directory,
+        path: &'a Path,
+    ) -> impl Iterator<Item = Result<(&'a OsStr, Entry)>> {
+        directory.children().map(move |(name, mode, oid)| {
+            let entry = if mode == 0o160000 {
+                // A gitlink name may be listed, but lookup/stat/open of that
+                // name must fail instead of presenting a checkout.
+                Entry {
+                    kind: EntryKind::Directory,
+                    mode,
+                    oid,
+                    size: Some(0),
+                }
+            } else {
+                Self::metadata(mode, oid, || path.join(name).display().to_string())?
+            };
+            Ok((name, entry))
+        })
     }
     /// Fetch a previously selected remote snapshot for automatic copy fallback.
     pub fn fetch_copy_objects(&self) -> Result<()> {
@@ -990,7 +1441,7 @@ impl Snapshot {
     }
     pub(crate) fn prepare_materialization(
         &self,
-        children: &[(OsString, Entry)],
+        children: &[(&OsStr, Entry)],
         prepared: impl Fn(Oid) -> bool,
     ) -> Result<()> {
         let mut state = self.state()?;
@@ -999,12 +1450,11 @@ impl Snapshot {
         };
         // The materializer supplies bounded batches and reuses completed
         // destinations across batches/directories instead of fetching again.
-        let oids: Vec<_> = children
+        let oids = children
             .iter()
             .filter(|(_, entry)| entry.mode != 0o160000 && !prepared(entry.oid))
-            .map(|(_, entry)| entry.oid)
-            .collect();
-        remote.ensure_batch(&oids)
+            .map(|(_, entry)| entry.oid);
+        remote.ensure_batch(oids)
     }
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
@@ -1067,7 +1517,9 @@ impl Snapshot {
                 let data = reader.read_shared(offset, (size - offset).min(64 * 1024) as u32)?;
                 anyhow::ensure!(!data.is_empty(), "truncated Git blob");
                 crate::object::check_transfer()?;
-                output.write_all(&data)?;
+                for chunk in data.chunks() {
+                    output.write_all(chunk)?;
+                }
                 offset += data.len() as u64;
             }
             if size == 0 {
@@ -1087,23 +1539,22 @@ impl Snapshot {
             state.metrics.streamed_blob_loads += u64::from(streamed);
             return Ok(size);
         }
+        if let Some(native) = state.native_local() {
+            let size = native.read(oid, |size, kind, input| {
+                State::copy_blob_reader(oid, size, kind, input, output)?;
+                Ok(size)
+            })?;
+            state.metrics.blob_loads += 1;
+            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
+            state.metrics.streamed_blob_loads += u64::from(size > crate::raw_blob::BLOCK);
+            return Ok(size as u64);
+        }
         let odb = state
             .repository()
             .context("missing verified Git blob")?
             .odb()?;
         let (size, streamed) = if let Ok((input, size, kind)) = odb.reader(oid) {
-            anyhow::ensure!(
-                kind == ObjectType::Blob,
-                "snapshot file does not reference a blob"
-            );
-            if size < 1024 {
-                let mut small = Vec::with_capacity(size);
-                crate::object::copy_verified(input, &mut small, kind, size, oid)?;
-                State::validate_blob(&small)?;
-                output.write_all(&small)?;
-            } else {
-                crate::object::copy_verified(input, &mut *output, kind, size, oid)?;
-            }
+            State::copy_blob_reader(oid, size, kind, input, output)?;
             (size, true)
         } else {
             let object = odb.read(oid).context("decode Git blob")?;
@@ -1128,6 +1579,70 @@ impl Snapshot {
         }
         Ok(size as u64)
     }
+    pub(crate) fn with_materialized_symlink_target<T>(
+        &self,
+        oid: Oid,
+        consume: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(object) = self.take_verified_materialization_blob(oid)? {
+            return consume(object.data());
+        }
+        let mut state = self.state()?;
+        if let Some(repo) = state
+            .local_repo
+            .as_ref()
+            .filter(|_| state.native_local().is_none())
+        {
+            let odb = repo.odb()?;
+            let object = odb.read(oid).context("decode Git symlink target")?;
+            anyhow::ensure!(object.id() == oid, "Git blob changed during transfer");
+            crate::object::verify_odb_object(&object, ObjectType::Blob)?;
+            State::validate_blob(object.data())?;
+            let result = consume(object.data())?;
+            let size = object.len() as u64;
+            drop(object);
+            drop(odb);
+            state.metrics.blob_loads += 1;
+            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size);
+            return Ok(result);
+        }
+        drop(state);
+        let mut target = Vec::new();
+        self.copy_verified_blob(oid, &mut target)?;
+        consume(&target)
+    }
+
+    /// Move ownership of a verified pack buffer to the eager materializer.
+    fn take_verified_materialization_blob(
+        &self,
+        oid: Oid,
+    ) -> Result<Option<crate::pack_stream::VerifiedObject>> {
+        let mut state = self.state()?;
+        let Some(remote) = &state.remote else {
+            return Ok(None);
+        };
+        let Some(crate::raw_blob::ReceivedObject::Verified { object, transfer }) =
+            remote.raw_blobs.received(oid)
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            object.kind() == ObjectType::Blob,
+            "materialized file is not a blob"
+        );
+        State::validate_blob(object.data())?;
+        if let Some(transfer) = transfer {
+            transfer.mark_served();
+        }
+        remote.raw_blobs.forget_received(oid);
+        state.metrics.blob_loads += 1;
+        state.metrics.blob_bytes = state
+            .metrics
+            .blob_bytes
+            .saturating_add(object.data().len() as u64);
+        Ok(Some(object))
+    }
+
     pub(crate) fn copy_up(
         &self,
         oid: Oid,
@@ -1139,8 +1654,8 @@ impl Snapshot {
         raw.copy_up(path, size)
     }
     pub fn read(&self, oid: Oid, offset: u64, size: u32) -> Result<Vec<u8>> {
-        self.read_shared(oid, offset, size)
-            .map(crate::raw_blob::ReadData::into_vec)
+        let raw = self.state()?.prepare_blob(oid)?;
+        raw.read(offset, size)
     }
     pub(crate) fn read_shared(
         &self,
@@ -1154,12 +1669,17 @@ impl Snapshot {
         raw.read_shared(offset, size)
     }
     pub fn read_link(&self, oid: Oid) -> Result<Vec<u8>> {
-        self.state()?.with_blob(oid, |bytes| {
-            if bytes.is_empty() || bytes.contains(&0) {
-                bail!("unusable symlink target");
-            }
-            Ok(bytes.to_vec())
-        })
+        self.read_link_shared(oid)
+            .map(crate::raw_blob::ReadData::into_vec)
+    }
+    pub(crate) fn read_link_shared(&self, oid: Oid) -> Result<crate::raw_blob::ReadData> {
+        let raw = self.state()?.prepare_blob(oid)?;
+        let bytes = raw.read_all()?;
+        anyhow::ensure!(
+            !bytes.is_empty() && !bytes.chunks().any(|chunk| chunk.contains(&0)),
+            "unusable symlink target"
+        );
+        Ok(bytes)
     }
     /// Parse a demanded ignore blob directly, without retaining a second copy.
     pub(crate) fn with_blob<T>(
@@ -1199,6 +1719,7 @@ impl Snapshot {
             metrics.remote_fetches = remote.completed_fetches();
             metrics.remote_fetch_operations = remote.fetch_operations();
             metrics.remote_decode_operations = remote.decode_operations();
+            metrics.remote_eager_verified_pack_capacity = remote.eager_verified_pack_capacity();
             (
                 metrics.remote_session_fetch_operations,
                 metrics.remote_session_decode_operations,
@@ -1282,7 +1803,9 @@ impl Snapshot {
     pub fn available_objects(&self) -> Result<Vec<Oid>> {
         let state = self.state()?;
         let mut objects = Vec::new();
-        if let Some(repo) = state.repository() {
+        if let Some(native) = state.native_local() {
+            objects = native.objects()?;
+        } else if let Some(repo) = state.repository() {
             repo.odb()?.foreach(|oid| {
                 objects.push(*oid);
                 true
@@ -1738,13 +2261,16 @@ mod tests {
     #[test]
     fn invocation_from_worktree_subdirectory() {
         let (tmp, oid) = fixture();
-        let directory = tmp.path().join("some/deep/path");
+        let parent = TempDir::new().unwrap();
+        let repository = parent.path().join("repository\nname");
+        std::fs::rename(tmp.path(), &repository).unwrap();
+        let directory = repository.join("some/deep/path");
         std::fs::create_dir_all(&directory).unwrap();
         let snap = Snapshot::load(&directory, OsStr::new("HEAD"), "discovery").unwrap();
         assert_eq!(snap.tree_oid, oid);
     }
     #[test]
-    fn durable_pin_record_precedes_pin_and_failed_record_leaves_no_reference() {
+    fn native_remote_selection_needs_no_private_pin() {
         let (tmp, oid) = fixture();
         let run = TempDir::new().unwrap();
         let repo = Repository::open(tmp.path()).unwrap();
@@ -1757,30 +2283,23 @@ mod tests {
             .set_bool("uploadpack.allowAnySHA1InWant", true)
             .unwrap();
         let private = run.path().canonicalize().unwrap().join("remote-repository");
-        let result = Snapshot::load_source_with_pin_record(
+        let snapshot = Snapshot::load_source(
             tmp.path(),
             Some(tmp.path().as_os_str()),
             OsStr::new("HEAD"),
             false,
             false,
             run.path(),
-            "record",
-            |dir, pin, tree| {
-                assert_eq!(dir, private);
-                assert_eq!(tree, oid);
-                assert!(Repository::open_bare(dir)
-                    .unwrap()
-                    .find_reference(pin)
-                    .is_err());
-                anyhow::bail!("simulated manifest failure")
-            },
-        );
-        assert!(result.unwrap_err().to_string().contains("manifest failure"));
-        assert!(repo.find_reference("refs/git-on/record").is_err());
-        assert!(Repository::open_bare(private)
-            .unwrap()
-            .find_reference("refs/git-on/record")
-            .is_err());
+        )
+        .unwrap();
+        assert_eq!(snapshot.tree_oid, oid);
+        for repository in [repo, Repository::open_bare(private).unwrap()] {
+            assert!(repository
+                .references_glob("refs/git-on/*")
+                .unwrap()
+                .next()
+                .is_none());
+        }
     }
     #[test]
     fn startup_listing_lookup_and_read_are_separately_lazy() {
@@ -1789,8 +2308,16 @@ mod tests {
         assert_eq!(snap.metrics().tree_reads, 0);
         assert_eq!(snap.metrics().header_reads, 0);
         assert_eq!(snap.metrics().blob_loads, 0);
-        let listing = snap.children(Path::new("")).unwrap();
+        let root = Path::new("");
+        let directory = snap.directory(root).unwrap();
+        let listing = Snapshot::directory_children(&directory, root)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(listing.len(), 4);
+        assert!(listing
+            .iter()
+            .zip(directory.children())
+            .all(|((listed, _), (stored, _, _))| std::ptr::eq(*listed, stored)));
         assert!(listing
             .iter()
             .filter(|(_, e)| e.kind != EntryKind::Directory)

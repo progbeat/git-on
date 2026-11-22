@@ -52,11 +52,23 @@ name alone proves nothing about demand.
 
 Where protocol v2 and the caller's policy permit, exact demands reuse
 invocation-owned channels. Native Git resolves the original repository and
-prepares the OpenSSH arguments. Its `fetch-pack --diag-url` diagnostics supply
-decoded paths for the local file transport. Unknown formats retain native fetch.
-A full SHA-1 object ID
-or unambiguous branch can use the reusable HTTPS channel for the initial fetch
-after validating filtering and authentication. An SSH identity that
+prepares the OpenSSH arguments. Local paths and `file://` URLs can stream a
+full OID, an unambiguous branch, or `HEAD` from `upload-pack` from the first
+filtered fetch. Git's `fetch-pack --diag-url` resolves paths that need URL
+parsing. Its private Git directory is also available to the compatibility
+path. The stream does not write a pack or index there. Named selections that
+require `want-ref`, unknown formats, and configured fetch behavior retain
+native fetch.
+A full SHA-1 object ID or unambiguous branch can use the reusable HTTPS channel
+for the initial fetch after the server advertises filtering. A named branch
+uses `ls-refs` to resolve its OID. With a full OID, the first fetch can handle
+the POST authentication challenge directly. A non-pack reply to the first
+fetch can require a ref query to finish authentication before retrying the
+same OID. If HTTPS falls back to native Git before decoding the first pack,
+native fetch keeps any OID already selected by the reusable channel. Git selects
+branches of named remotes with configured fetch mappings and applies their tracking
+ref updates in the private repository. Git also handles configured remote groups.
+An SSH identity that
 authenticates without a prompt can select the branch or exact object ID and
 fetch the root tree over one owned channel. Other refspecs use native Git's
 selection with the caller's credentials, proxies and TLS policy.
@@ -76,7 +88,11 @@ object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
 an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
-It uses Git's credential helpers for HTTP Basic authentication. Libcurl and
+For a supported host-scoped HTTP Basic challenge, native Git fills the
+credentials and reports approval or rejection to its helpers. Helpers can
+provide a username and password or continue an exchange with pre-encoded
+Authorization values as the server changes challenges. Other initial
+challenges and credential policies use native Git's HTTP exchange. Libcurl and
 the peer govern the active streams. The loader can briefly wait for
 overlapping demands after confirming a scan or observing consistently slow
 replies.
@@ -84,6 +100,13 @@ Each foreground fetch can group up to 64 already pending OIDs.
 Explicit Git HTTP configuration, authentication outside the supported exchange,
 and servers without HTTP/2 or filtered protocol v2 use the native helper.
 Transport selection completes before any object demand is sent.
+
+When the native ref advertisement supplies capabilities, Git-on captures
+the packet trace in a private temporary file and scans bounded chunks for
+filter support. Detached writers can finish using their open descriptors.
+Later opens of the trace path go to the null device during the run.
+An explicitly configured `GIT_TRACE_PACKET` destination receives the captured
+advertisement when discovery finishes, including when filtering is unavailable.
 
 Native helpers start with four available channels. If each of the first eight
 successful transfers takes at least 64 milliseconds, the pool can use up to
@@ -101,14 +124,27 @@ If fetching the selected object also takes at least 64 milliseconds, up to two
 more SSH channels can start negotiating while the root tree is fetched.
 Ready startup channels can serve exact demands while other channels are still
 negotiating and the pool is measuring its first replies.
+An established SSH channel can serve exact demands when the opening limit
+shrinks. When ordinary slots are unavailable, a released slot can reconnect
+for an exact demand while another pack or startup negotiation is in progress.
+If the reopen attempt is refused during startup, the slot retries after a
+standby finishes negotiating. Recovery through a slot that has never opened
+waits for active packs and startup attempts to finish.
 When another channel opens during execution, pending requests stay eligible
 on the existing channels until one is available to send them.
 Beyond the initial SSH pool, actual demands open additional channels.
 Prefetch can use those channels after they connect.
+Before the first enumeration of a snapshot directory, a slow pathname lookup
+or file read can send SSH EOF with the final request on a channel while
+another negotiated channel stays ready for the next read. Enumeration keeps
+channels reusable for the reads it can trigger. Pack verification and the
+channel's exit status still determine whether each request completed
+successfully.
 An idle pool starts an ordinary request immediately. While a transfer is active,
 the queue can wait up to two milliseconds on a slow source or during a confirmed
 scan. For a confirmed scan, the wait can reach twelve milliseconds while the
-source is slow or still being measured.
+source is slow or still being measured. On FUSE over HTTP/2, a required tree
+bypasses this wait so a pathname operation can discover its next dependency.
 
 A first access to a regular file in a directory opened for enumeration finds
 uncached and previously unscheduled blob OIDs in Git's depth-first order
@@ -125,9 +161,17 @@ The predictor tracks at most 512 OIDs ahead of actual accesses.
 When the window fills after read-ahead has expanded or on a slower connection,
 completed predictions can age out after unrelated accesses. Ordinary demands
 take precedence and can join an active speculative request without duplicating
-its fetch. If that speculation fails, only waiting ordinary demands reenter
-the request queue.
+its fetch. If that speculation fails, waiting ordinary demands can retry.
+A later read of an unused prediction needs another fetch or confirmation
+from a complete alternate pack.
 A diagnosed pack failure after serving a required read fails the invocation.
+After a successful command exit, the runner waits for validation of the packs
+that supplied its reads. A separate large-object decode permit lets that
+validation proceed when unrelated streams occupy the ordinary permits. The
+runner sends EOF to SSH channels once their final requests are submitted,
+including while receiving a pack the command already used. It checks the
+exit status of channels that supplied reads and are idle once pack validation
+finishes. It cancels unrelated requests still in flight.
 An exact transfer can fail independently of the invocation when validated
 extras from another pack complete every demand and supply the requested data.
 These paths require a reusable transport. The specification's
@@ -142,8 +186,8 @@ also verifies the complete pack's checksum and framing. The receiver
 applies deltas to verified bases in memory from the first fetch, including
 when preparing the selected revision. If a delta precedes its base, the receiver
 keeps its decoded instructions until the base arrives.
-HTTPS decodes response bodies off the connection driver, with per-stream
-backpressure. Requested blobs enter the authenticated, run-local store.
+Multiplexed HTTPS decodes response bodies off the connection driver, with
+per-stream backpressure. Requested blobs enter the authenticated, run-local store.
 Delta reconstruction borrows verified bases from the active pack. Extra
 objects retain those buffers for later access and become readable after the
 pack is verified. A demand for a known entry can wait for validation without
@@ -152,11 +196,28 @@ its destination.
 The native Git compatibility path can use temporary pack files.
 
 Explicit-all eager materialization needs the entire selected tree. Fetch the
-selected revision once with depth one and without an object filter. Retain the
-compressed pack and decode file contents directly into their destination
-paths, reusing already prepared objects. This does not fetch the repository's
-complete history. This path does not require server-side filtering or a
-separate capability advertisement.
+selected revision once with depth one and without an object filter. Reusable
+HTTPS, SSH, local paths and `file://` URLs can use a full OID, an unambiguous
+branch, or the advertised `HEAD`. The file transport uses the
+installed Git's `upload-pack` under its default transport policy. HTTPS
+accepts HTTP/2, HTTP/1.1, and HTTP/1.0 responses for this one-time transfer.
+For SSH and `file://`, close the request stream after sending the fetch and
+verify the process exit status after receiving the complete pack. Decode the pack in RAM
+and write verified file contents to their
+destination paths. If automatic mount setup fails and copying is allowed, the
+same transfer can use the already selected OID. Native Git handles competing
+refs, named fetches on servers advertising `ref-in-want`, other refspecs,
+configured fetch mappings and hooks, and signature verification. Explicit
+Git settings outside those handled by the streaming path go through native
+fetch, including settings that Git validates before accepting a pack.
+In that path, retain the compressed pack and decode
+directly into destination files. Both paths reuse already prepared objects.
+Neither path needs server-side filtering or fetches the repository's complete
+history. The direct HTTPS path reports accepted or rejected Basic credentials
+through Git's configured helpers when both credential operations use the same
+host scope. Git receives the server's original challenge values. A rejected
+credential ends the exchange. Native Git handles repository- or user-scoped
+credentials and other authentication challenges.
 
 When materialization fetches missing objects by OID, at most 256 known object
 IDs from the current directory can share one native `fetch --stdin` and
@@ -217,8 +278,8 @@ local and remote snapshots.
 
 Each remote invocation owns an invocation-local object store. The direct
 reusable HTTPS and SSH startup paths keep the selected commit or tag and its
-root tree in memory. Native fetch, signature verification, native interactive
-preparation and eager copy fallback can use a private temporary bare repository.
+root tree in memory. Native fetch, signature verification and native interactive
+preparation can use a private temporary bare repository.
 When HTTPS challenges for credentials, Git's helper runs in its usual private
 repository context. Reusable fetches still keep their verified Git objects in
 memory.
@@ -262,8 +323,8 @@ SIGKILL cannot run cleanup handlers. The runner does not request FUSE
 `auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected
 and fresh directory access fails with `ENOTCONN`. The command's separate process
 group and an established persistent SSH master can survive. Run directories,
-private objects and exact Git pins remain; kernel file locks are released when
-their owning descriptors close. Stop the command and other mount users yourself,
+private objects remain. Kernel locks are released when their owning descriptors
+close. Stop the command and other mount users yourself,
 then run `git on --cleanup <temporary-directory>` to unmount and release recorded
 resources. Recovery never kills processes using stale PID records. A kill during
 mount setup can leave the same disconnected mount even before the command starts.
@@ -311,7 +372,7 @@ clients must be readable regular executable files. The private record stores
 those identities, not executable contents, SSH arguments, configuration or
 credentials. Equal-length edits with restored timestamps still fail validation.
 A changed or unavailable client causes a visible cleanup failure and retains
-the socket, pin and run directory. After validation, shutdown sends the OpenSSH
+the socket and run directory. After validation, shutdown sends the OpenSSH
 mux version 4 termination request directly over the owned control socket; it
 never executes the selected client or wrapper again. This removes the pathname
 check/use race without relying on a mutable executable fd or changing wrapper

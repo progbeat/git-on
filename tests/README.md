@@ -210,14 +210,14 @@ after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
 active state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
-runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
+runs verify isolation and normal mount cleanup. Example artifact tests
 inspect caches inside the command or explicitly copy them to an external path.
 
 Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
 during startup transport and after the mounted child starts. SIGKILL observations
 kill only the runner first: assert the exact mount remains in `mountinfo`, fresh
 directory access returns `ENOTCONN`, the child group and SSH master survive,
-private files and the exact pin remain, and run/cache flocks are available.
+and private files remain. Stale cleanup can acquire the private run lock.
 External fixture cleanup stops the owned child before checked stale recovery;
 recovery must remove the mount and private state and close the recorded master.
 A native fusermount wrapper holds helper completion after the actual mount to

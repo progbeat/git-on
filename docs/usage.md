@@ -201,15 +201,15 @@ git on --cleanup /path/to/stale-temporary-directory
 
 Pass the individual run directory. Cleanup also accepts run directories
 from older versions. It refuses an active locked run, unmounts only a
-matching git-on filesystem,
-and checks the exact target of any pin recorded by this release or an older one
-before releasing it. A busy stale mount requires stopping processes using it first.
+matching git-on filesystem, and checks the target of any pin recorded by an
+older release before releasing it. A busy stale mount requires stopping
+processes using it first.
 Cleanup does not kill processes by stale PID.
 
 SIGKILL is uncatchable and does not forward a signal to the command. The command
 may keep running in its own process group. git-on does not enable FUSE
 `auto_unmount`; killing the runner after mounting leaves a disconnected mount
-whose fresh directory accesses fail with `ENOTCONN`. Temporary files, pins and a
+whose fresh directory accesses fail with `ENOTCONN`. Temporary files and a
 recorded remote SSH master may remain. Stop the command and any other mount users
 first, then use the cleanup command above. The same recovery can be necessary if
 the runner dies during mount setup before launching the command. Cleanup does

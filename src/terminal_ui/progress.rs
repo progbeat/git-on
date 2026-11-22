@@ -1,5 +1,10 @@
 //! Transfer telemetry. Terminal drawing remains on the preparation UI thread.
-use std::{fs::File, os::unix::fs::FileExt, sync::Mutex};
+use std::{
+    fs::File,
+    os::unix::fs::FileExt,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone)]
 pub(super) struct Report {
@@ -58,6 +63,45 @@ impl NativeProgress {
 impl Drop for NativeProgress {
     fn drop(&mut self) {
         *REPORT.lock().unwrap() = self.previous.take();
+    }
+}
+
+pub(crate) struct PackProgress {
+    report: NativeProgress,
+    started: Instant,
+    last_update: Option<Instant>,
+}
+
+impl PackProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            report: NativeProgress::new(),
+            started: Instant::now(),
+            last_update: None,
+        }
+    }
+
+    pub(crate) fn remote(&mut self, bytes: &[u8]) {
+        self.report.lines.feed(bytes);
+    }
+
+    pub(crate) fn received(&mut self, position: usize, total: usize, bytes: u64) {
+        let now = Instant::now();
+        if total == 0
+            || self
+                .last_update
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+        {
+            return;
+        }
+        self.last_update = Some(now);
+        let kib = bytes as f64 / 1024.0;
+        let seconds = now.duration_since(self.started).as_secs_f64().max(0.001);
+        *REPORT.lock().unwrap() = Some(Report {
+            label: "Receiving objects".into(),
+            detail: format!("{:.2} MiB | {:.2} KiB/s", kib / 1024.0, kib / seconds),
+            counts: Some((position as u64, total as u64)),
+        });
     }
 }
 

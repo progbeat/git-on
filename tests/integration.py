@@ -228,6 +228,17 @@ class CliTests(RepositoryTest):
         self.assertEqual(Path(os.fsdecode(result.stdout).strip()), self.repo / "git-on")
         self.assertFalse((self.repo / "git-on").exists())
 
+    def test_uses_private_temporary_group_when_name_is_a_file(self):
+        occupied = self.system_tmp / "git-on"
+        occupied.write_bytes(b"existing file")
+        result, _ = self.invoke_argv([
+            "HEAD", "--backend=copy", "--write-policy=all", "--", "/bin/cat", "tracked.txt",
+        ])
+        self.assert_success(result)
+        self.assertEqual(result.stdout, (self.repo / "tracked.txt").read_bytes())
+        self.assertEqual(occupied.read_bytes(), b"existing file")
+        self.assertEqual(list(self.system_tmp.iterdir()), [occupied])
+
     def test_refuses_symlinked_temporary_group(self):
         target = self.root / "other-storage"
         target.mkdir()
@@ -439,6 +450,17 @@ class CliTests(RepositoryTest):
                 self.assertEqual(sentinel.read_text(), "preserve")
                 self.assertEqual(list(unrelated.iterdir()), [sentinel])
                 self.assertTrue(alias.is_symlink())
+        group = self.system_tmp / "git-on"
+        group.mkdir(mode=0o700)
+        for name, mode in [("g12345", 0o700), ("g54321", 0o1700)]:
+            with self.subTest(mode=oct(mode)):
+                lookalike = group / name
+                lookalike.mkdir(mode=0o700)
+                lookalike.chmod(mode)
+                (lookalike / ".lock").touch()
+                (lookalike / "sentinel").write_text("preserve")
+                self.assertNotEqual(self.cleanup_run(lookalike).returncode, 0)
+                self.assertEqual((lookalike / "sentinel").read_text(), "preserve")
 
     def test_cleanup_rejects_malformed_state_without_deleting_contents(self):
         run = self.system_tmp / "git-on-unrecognized"
@@ -451,6 +473,127 @@ class CliTests(RepositoryTest):
         result = self.cleanup_run(run)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_text(), "preserve")
+
+    def test_cleanup_recovers_an_interrupted_lock_publication(self):
+        group = self.system_tmp / "git-on"
+        group.mkdir(mode=0o700)
+        run = group / "g12345"
+        run.mkdir(mode=0o700)
+        marker = run / ".git-on-lock-new"
+        marker.touch(mode=0o600)
+        with marker.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.cleanup_run(run)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn(b"active or locked", blocked.stderr)
+        sentinel = run / "valuable"
+        sentinel.write_bytes(b"keep")
+        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), b"keep")
+        self.assertTrue(marker.is_file())
+        sentinel.unlink()
+        recovered = self.cleanup_run(run)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(run.exists())
+        self.assertFalse(group.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "uses Darwin's immutable directory flag")
+    def test_cleanup_can_retry_after_the_parent_refuses_directory_removal(self):
+        for name in (".git-on-lock-new", ".git-on-lock-v2"):
+            with self.subTest(marker=name), tempfile.TemporaryDirectory(dir=self.system_tmp) as sub:
+                group = Path(sub) / "git-on"
+                group.mkdir(mode=0o700)
+                run = group / "g12345"
+                run.mkdir(mode=0o700)
+                marker = run / name
+                marker.touch(mode=0o600)
+                flags = group.stat().st_flags
+                os.chflags(group, flags | stat.UF_IMMUTABLE)
+                try:
+                    denied = self.cleanup_run(run)
+                    self.assertNotEqual(denied.returncode, 0, denied.stderr)
+                finally:
+                    os.chflags(group, flags)
+                self.assertTrue(marker.is_file())
+                self.assert_success(self.cleanup_run(run))
+                self.assertFalse(run.exists())
+                self.assertFalse(group.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "uses Darwin's immutable file flag")
+    def test_cleanup_resumes_with_the_same_parked_marker(self):
+        for orphaned, mode in ((False, 0o700), (True, 0o700), (True, 0o1770)):
+            with self.subTest(orphaned=orphaned, mode=oct(mode)), tempfile.TemporaryDirectory(dir=self.system_tmp) as sub:
+                group = Path(sub) / "git-on"
+                group.mkdir(mode=0o700)
+                group.chmod(mode)
+                run = group / "g12345"
+                run.mkdir(mode=0o700)
+                marker = run / ".git-on-lock-v2"
+                marker.touch(mode=0o600)
+                inode = marker.stat().st_ino
+                child = run / "protected"
+                child.write_bytes(b"still here")
+                flags = child.stat().st_flags
+                os.chflags(child, flags | stat.UF_IMMUTABLE)
+                try:
+                    denied = self.cleanup_run(run)
+                    self.assertNotEqual(denied.returncode, 0, denied.stderr)
+                    self.assertEqual(child.read_bytes(), b"still here")
+                finally:
+                    os.chflags(child, flags)
+                [parked] = [path for path in group.iterdir() if path.is_file()]
+                self.assertEqual(parked.stat().st_ino, inode)
+                if orphaned:
+                    child.unlink()
+                    run.rmdir()
+                self.assert_success(self.cleanup_run(run))
+                self.assertFalse(run.exists())
+                self.assertFalse(parked.exists())
+                self.assertEqual(group.exists(), mode == 0o1770)
+
+    def test_cleanup_refuses_a_run_directory_locked_during_startup(self):
+        group = self.system_tmp / "git-on"
+        group.mkdir(mode=0o700)
+        run = group / "g12345"
+        run.mkdir(mode=0o700)
+        marker = run / ".git-on-lock-new"
+        marker.touch(mode=0o600)
+        directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            denied = self.cleanup_run(run)
+            self.assertNotEqual(denied.returncode, 0, denied.stderr)
+            self.assertIn(b"active or locked", denied.stderr)
+            self.assertTrue(marker.exists())
+        finally:
+            os.close(directory)
+        self.assert_success(self.cleanup_run(run))
+        self.assertFalse(group.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "regression at the Darwin path limit")
+    def test_cleanup_accepts_long_run_path_with_private_lock(self):
+        parent = self.system_tmp.resolve()
+        while len(os.fsencode(parent)) < 1000:
+            remaining = 1000 - len(os.fsencode(parent))
+            step = min(81, remaining)
+            if remaining - step == 1:
+                step -= 1
+            parent /= "d" * (step - 1)
+            parent.mkdir()
+        group = parent / "git-on"
+        group.mkdir(mode=0o700)
+        run = group / "g12345"
+        run.mkdir(mode=0o700)
+        directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fd = os.open(".git-on-lock-v2", os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                         0o600, dir_fd=directory)
+            os.close(fd)
+        finally:
+            os.close(directory)
+        self.assertEqual(len(os.fsencode(run)), 1014)
+        self.assert_success(self.cleanup_run(run))
+        self.assertFalse(run.exists())
 
 
 @unittest.skipUnless(MOUNT_AVAILABLE, "real FUSE or NFS mount required")
@@ -2436,8 +2579,9 @@ print(index)
             self.assertEqual(list(self.system_tmp.iterdir()), [self.system_tmp / "git-on"])
             for run in runs:
                 self.assertEqual(run.parent, self.system_tmp / "git-on")
-                self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
-                self.assertTrue((run / ".state").is_file())
+                self.assertEqual(run.stat().st_mode & 0o777, 0o700)
+                self.assertFalse((run / ".state").exists())
+                self.assertFalse((run / ".lock").exists())
                 self.assertFalse((run / "manifest.json").exists())
                 self.assertFalse((run / "stdout.log").exists())
                 self.assertFalse((run / "stderr.log").exists())
@@ -2857,7 +3001,7 @@ assert p.exists()
                 mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
-            self.assertTrue((run / ".state").is_file())
+            self.assertFalse((run / ".state").exists())
             self.assertFalse(list(run.glob("t*")))
             self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
             cleanup = self.cleanup_run(run)
@@ -2951,7 +3095,7 @@ time.sleep(300)
         process, run, _ = self.start_sleeping_run()
         active_cleanup = self.cleanup_run(run)
         self.assertNotEqual(active_cleanup.returncode, 0)
-        self.assertTrue((run / ".state").is_file())
+        self.assertFalse((run / ".lock").exists())
         self.assertTrue((run / "backing").is_dir())
         process.send_signal(signal.SIGTERM)
         _, stderr = process.communicate(timeout=15)
@@ -2959,19 +3103,56 @@ time.sleep(300)
         self.assert_no_runtime_files()
 
     def test_sigkill_recovery_explicitly_removes_stale_tempdir(self):
+        self.recover_stale_run()
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires an NFS mount")
+    def test_sigkill_recovery_after_nfs_socket_directory_disappears(self):
+        self.recover_stale_run(remove_socket=True)
+
+    def recover_stale_run(self, remove_socket=False):
+        socket_dir = None
         if sys.platform == "darwin":
             group = self.system_tmp / "Git-On"
             group.mkdir(mode=0o700)
             if not (self.system_tmp / "git-on").exists():
                 group.rmdir()  # The volume is case-sensitive.
         process, run, child_pid = self.start_sleeping_run()
+        if sys.platform == "darwin":
+            mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
+            source, = [line.partition(" on ")[0] for line in mounts
+                       if line.partition(" on ")[2].rpartition(" (")[0] == str(run / "mount")]
+            self.assertTrue(source.startswith("<") and source.endswith(">:/"), source)
+            socket_dir = Path(source[1:-3]).parent
+            self.assertTrue(socket_dir.is_dir(), socket_dir)
         process.kill()
         try: os.killpg(child_pid, signal.SIGKILL)
         except ProcessLookupError: pass
         process.communicate(timeout=10)
-        self.assertTrue((run / ".state").is_file())
+        self.assertFalse((run / ".state").exists())
         self.assertTrue((run / "backing").is_dir())
-        self.assert_success(self.cleanup_run(run))
+        if remove_socket:
+            def restore_endpoint_for_cleanup():
+                if run.exists() and socket_dir.parent.is_dir():
+                    socket_dir.mkdir(mode=0o700, exist_ok=True)
+            self.addCleanup(restore_endpoint_for_cleanup)
+            (socket_dir / "s").unlink(missing_ok=True)
+            socket_dir.rmdir()
+            mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
+            self.assertTrue(any(line.startswith(source + " on " + str(run / "mount") + " (")
+                                for line in mounts))
+        if sys.platform == "linux":
+            moved = self.system_tmp.with_name(self.system_tmp.name + "-moved")
+            self.system_tmp.rename(moved)
+            try:
+                recovered = moved / run.relative_to(self.system_tmp)
+                self.assert_success(self.cleanup_run(recovered))
+                self.assertFalse(recovered.exists())
+            finally:
+                moved.rename(self.system_tmp)
+        else:
+            self.assert_success(self.cleanup_run(run))
+        if socket_dir is not None:
+            self.assertFalse(socket_dir.exists(), socket_dir)
         self.assertFalse(run.exists())
         self.assert_no_runtime_files()
 
@@ -3033,19 +3214,27 @@ time.sleep(300)
 
     def test_only_tree_oid_is_injected_and_tmpdir_is_private_then_removed(self):
         code = r"""
-import json, os, stat, sys
+import os, subprocess, sys
 from pathlib import Path
 injected = {key: value for key, value in os.environ.items() if key.startswith('GIT_ON_')}
 assert injected == {'GIT_ON_TREE_OID': os.environ['EXPECTED_TREE']}, injected
 run = Path.cwd().parent
 assert Path.cwd().name == 'mount'
 assert run.parent == Path(os.environ['TMPDIR']) / 'git-on'
-assert stat.S_IMODE(run.stat().st_mode) == 0o700
-state = json.loads((run / '.state').read_text())
+assert run.stat().st_mode & 0o777 == 0o700
+assert not (run / '.state').exists()
+assert not (run / '.lock').exists()
+assert (run / '.git-on-lock-v2').stat().st_size == 0
 if sys.platform == 'darwin':
-    socket = Path(state['nfs_socket'])
-    assert socket.parent.parent in (Path('/private/tmp/git-on'),
-                                    Path('/private/tmp') / f'.go{os.geteuid():x}')
+    mounts = subprocess.check_output(['/sbin/mount'], text=True).splitlines()
+    source, = [line.partition(' on ')[0] for line in mounts
+               if line.partition(' on ')[2].rpartition(' (')[0] == str(Path.cwd())]
+    assert source.startswith('<') and source.endswith('>:/'), source
+    socket = Path(source[1:-3])
+    group = socket.parent.parent
+    assert group.parent == Path('/private/tmp')
+    assert group.name in ('git-on', f'.go{os.geteuid():x}')
+    assert socket.parent.name.startswith('nfs-')
     assert socket.is_socket()
     print(socket.parent)
 assert (run / 'backing').is_dir()

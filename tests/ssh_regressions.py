@@ -44,6 +44,21 @@ class SshRegressionTests(unittest.TestCase):
         self.f = remote.Fixture()
         self.addCleanup(self.f.close)
 
+    def legacy_pin_recovery(self, fixture, directory):
+        repository = directory / 'remote-repository'
+        pin = 'refs/git-on/probe'
+        tree = remote.run(['git', '-C', fixture.repo, 'cat-file', 'tree', fixture.tree],
+                          env=fixture.env)
+        self.assertEqual(
+            fixture.git('hash-object', '-t', 'tree', '-w', '--stdin', data=tree, at=repository),
+            fixture.tree)
+        fixture.git('update-ref', pin, fixture.tree, at=repository)
+        (directory / '.lock').touch()
+        (directory / '.state').write_text(json.dumps(dict(
+            format='git-on-temp-v1', id='probe',
+            git_dir=str(repository), tree_oid=fixture.tree, pin_ref=pin)))
+        return ['git', '--git-dir=' + str(repository), 'show-ref', '--verify', pin]
+
     def loaded_read(self, url, fixture=None):
         f = self.f if fixture is None else fixture
         process = f.probe(url)
@@ -154,7 +169,6 @@ class SshRegressionTests(unittest.TestCase):
         control=[ssh,'-F','/dev/null','-S',str(directory/'ssh-control'),'-O','check','git-on-control']
         checked=subprocess.run(control,capture_output=True,check=True,timeout=5)
         descriptor=os.pidfd_open(int(re.search(rb'pid=(\d+)',checked.stderr).group(1)))
-        pin=['git','--git-dir='+str(directory/'remote-repository'),'show-ref','--verify','refs/git-on/probe']
         try:
             if mode=='recovery':
                 process.kill(); process.communicate(timeout=10)
@@ -166,9 +180,7 @@ class SshRegressionTests(unittest.TestCase):
                 current=executable.stat()
                 self.assertEqual((current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns),
                                  (metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns))
-            (directory/'.lock').touch()
-            (directory/'.state').write_text(json.dumps(dict(format='git-on-temp-v1',id='probe',keep=False,
-                       git_dir=str(directory/'remote-repository'),tree_oid=f.tree,pin_ref='refs/git-on/probe')))
+            pin=self.legacy_pin_recovery(f,directory)
             if mode=='recovery':
                 result=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
                 status,errors=result.returncode,result.stderr
@@ -244,12 +256,8 @@ class SshRegressionTests(unittest.TestCase):
             self.assertIn(b'probe recovery retained', errors)
             self.assertTrue(directory.exists())
             self.assertFalse(select.select([descriptor], [], [], 0)[0])
-            pin = ['git', '--git-dir=' + str(directory / 'remote-repository'), 'show-ref', '--verify', 'refs/git-on/probe']
+            pin = self.legacy_pin_recovery(f, directory)
             self.assertEqual(subprocess.run(pin, capture_output=True, timeout=5).returncode, 0)
-            (directory / '.lock').touch()
-            (directory / '.state').write_text(json.dumps(dict(
-                format='git-on-temp-v1', id='probe', keep=False,
-                git_dir=str(directory / 'remote-repository'), tree_oid=f.tree, pin_ref='refs/git-on/probe')))
             executable.unlink(); backup.rename(executable)
             for invalid in ('relative', 'unknown-field', 'invalid-type', 'missing-digest', 'bad-digest', 'directory', 'symlink', 'in-place'):
                 with self.subTest(record=invalid):
@@ -309,8 +317,8 @@ class SshRegressionTests(unittest.TestCase):
             process.kill(); process.communicate(timeout=10)
             (directory / '.lock').touch()
             (directory / '.state').write_text(json.dumps(dict(
-                format='git-on-temp-v1', id='probe', keep=False,
-                git_dir=str(directory / 'remote-repository'), tree_oid=f.tree, pin_ref='refs/git-on/probe')))
+                format='git-on-temp-v1', id='probe',
+                git_dir=None, tree_oid=None, pin_ref=None)))
             cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
                                      env=f.env, capture_output=True, timeout=10)
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
@@ -700,9 +708,9 @@ class SshRegressionTests(unittest.TestCase):
         native_children = []
         try:
             deadline = time.monotonic() + 5
-            while not any((run / '.state').is_file() for run in remote.run_directories(f.root)) and process.poll() is None and time.monotonic() < deadline:
+            while not remote.run_directories(f.root) and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
-            self.assertTrue(any((run / '.state').is_file() for run in remote.run_directories(f.root)), 'runner state was never created')
+            self.assertTrue(remote.run_directories(f.root), 'runner directory was never created')
             deadline = time.monotonic() + 5
             while not native_children and process.poll() is None and time.monotonic() < deadline:
                 for entry in Path('/proc').iterdir():

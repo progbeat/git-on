@@ -28,10 +28,19 @@ can run in the background while readers use verified buffers. If that write
 fails, the blob stays readable in RAM and the next large-blob admission
 retries it before starting another eviction. Incremental HTTPS and SSH pack
 decoders reserve a decode slot before inflating a large blob. One of the
-eight slots stays available for required reads when prefetches occupy the
-rest. Native Git decoding can allocate whole-blob buffers outside those slots.
+eight ordinary slots stays available for required reads. After the command
+exits, a ninth slot lets used packs finish verification while unrelated
+transfers hold the ordinary slots. Native Git decoding can allocate
+whole-blob buffers outside those slots.
 A read can use its verified buffer while placement waits, including after
-joining an in-progress prefetch. Network requests can run concurrently.
+joining an in-progress prefetch. If a placement write fails, an exposed
+buffer stays in decoded memory while the receiver finishes verifying the
+pack. The cache can retain up to nine early publications awaiting placement,
+including active decoders and buffers left after an I/O error. Admission of
+another large blob retries placement with those buffers. A later read of the
+same object can also trigger the retry. When all nine slots are occupied,
+newly decoded buffers are published once placement succeeds. Network requests
+can run concurrently.
 Prepared objects remain reusable across close/reopen and RAM eviction without
 another fetch or decode. If an optional disk-block admission needs a spill that
 fails, return the checked bytes and keep the unbacked resident.
@@ -41,6 +50,8 @@ fails, return the checked bytes and keep the unbacked resident.
 Trusted RAM retains object IDs, exact lengths and a 32-byte BLAKE3 digest per
 64 KiB block of each spilled object. Full-block digests cost 1/2048 of the
 payload size. Touched trees are parsed once into shared immutable structures.
+The materializer borrows names from those structures and recurses by the
+verified child tree OID.
 The whole-blob cache, active reads, full-object decoding buffers, verification
 metadata and namespace state are accounted for outside the 16 MiB block budget.
 
@@ -48,8 +59,11 @@ Libgit2 uses 8 MiB source-pack mapping windows and a 16 MiB soft mapped-byte
 budget. The pack descriptor cache retains up to 32 descriptors.
 Active windows and necessary packed-object/delta decoding can exceed retained
 cache budgets. Libgit2 can retain decoded delta bases up to 1 MiB each and
-16 MiB per pack. Packed/delta decoding can require a complete decoded object;
-these budgets are not object-size or total-memory ceilings.
+16 MiB per pack. When a local packed blob needs whole-object decoding, the cache
+retains the immutable libgit2 allocation. The same allocation serves ranges
+and can supply a spill or copy-up. Packed trees are parsed directly from the
+verified ODB buffer. These budgets are independent of the sizes
+of the objects being decoded and read.
 
 The wholly readonly `none` policy permits kernel directory-page caching on FUSE
 ABI 7.28 and later. Mutable policies keep directory contents live. Cached pages
@@ -68,13 +82,26 @@ operations that can invoke detached hooks or SSH proxies uses a seekable handle
 so inherited output remains writable after the native Git process exits.
 On Linux the handle uses an anonymous memory file when available. Lazy
 decoding fills the object buffer in RAM and verifies the full Git OID before
-serving or spilling it. Reads contained in a resident blob or one authenticated
-block share its buffer with the filesystem backend. Reusable pack decoders
-complete split headers before passing the compressed body to zlib by reference.
+serving or spilling it. Reads borrow ranges from the resident blob or from the
+authenticated cache blocks they touch. Reusable pack decoders complete split
+headers before passing the compressed body to zlib by reference.
+NFS sends these ranges and symlink targets with their XDR fields using vectored
+I/O. A replay slot retains a compact encoding when the backing allocations
+would exceed its budget. The FUSE library accepts a single payload slice.
+Full blocks read for a contiguous reply can be authenticated in that buffer.
+An already resident block or an unaligned range is gathered as needed.
 The native ref capability check discards the ref listing and retains the
 separate packet trace for compatibility with detached helpers.
-Flat UTF-8 object database overrides configure libgit2 directly. Nested
-alternates and non-UTF-8 paths use temporary aliases for the git2 binding.
+Without environment alternates, Git-on can open a resolved, absolute primary
+object directory directly, including its own `info/alternates` and byte paths.
+An indirect primary path is resolved before libgit2 opens it. Linux can pass a
+directory descriptor to libgit2 when the resolved path contains non-UTF-8
+bytes. Flat UTF-8 environment alternates also configure libgit2 directly.
+Special alternate paths can still use temporary aliases for the git2 binding.
+When an `info/alternates` file uses Git's quoted syntax or a relative entry that
+libgit2 would resolve from the wrong directory, native `git cat-file` serves
+object headers and verified requested payloads through pipes. The invocation
+opens the selected primary store directly and uses its native alternates.
 The direct reusable HTTPS and SSH startup paths borrow verified commit or tag
 headers in memory. Native Git fetches, native preparation and signature
 verification can require a private temporary repository. Once the root is
@@ -85,6 +112,9 @@ The host enforces inherited process resource limits. See the
 supported workload.
 Successful cleanup releases all invocation-owned storage. Failed cleanup
 follows the documented recovery contract.
+Before deleting its run directory, the runner moves the locked ownership
+marker into the private temporary group. A retry can reuse that inode even
+when the first removal encountered an I/O error.
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects
@@ -92,7 +122,9 @@ stream; packed/delta objects retain libgit2's required decoding. A repeated OID
 reuses a prepared file or symlink target across directories, authenticating the
 copied bytes against that original OID. File copies remain independent. The
 command starts only after every destination has passed verification and policy
-checks. Remote materialization isolates each received compressed pack. Only the
+checks. Direct HTTPS, SSH, and `file://` materialization keep the decoded pack
+in RAM and release file buffers as they reach their destinations. Native Git fallback
+isolates each received compressed pack. Only the
 pack currently being decoded has an open ODB; it is released with its indexes
 after its last needed blob reaches the execution tree. Blobs up to 64 KiB use
 the ODB transfer; larger blobs stream from
@@ -108,6 +140,9 @@ the retained bytes directly otherwise. Truncating to zero starts empty. An
 allowed writer can change any part of the private file, so all its bytes use
 ordinary I/O, including bytes retained from the source. All handles of the
 inode then see the private data. Eligible Linux FUSE opens can use passthrough.
+Writable `all` FUSE mounts use one request worker. When the filesystem
+cannot clone a spilled blob, copying its retained bytes delays later FUSE
+requests until the write completes.
 
 Unlink preserves open or looked-up inodes until their last reference is
 released. The immutable source remains reusable from the cache for the
@@ -120,13 +155,17 @@ is later discarded. Transport/metadata staging and durability work are excluded.
 The separate retained-raw counters describe current storage, not cumulative I/O.
 `hot_blob_spill_bytes` measures the whole buffer held by an unfinished eviction.
 `verified_decode_buffer_bytes` measures published pack buffers awaiting cache placement.
+`remote_eager_verified_pack_capacity` measures the peak capacity of distinct
+verified buffers held by an eager pack, counting references to the same buffer
+once. In-progress inflation, unresolved delta instructions and metadata are
+separate allocations.
 
 ## Integrity
 
 Every source object must match its canonical Git OID before publication.
 The pinned git2/libgit2 build uses collision-detecting SHA1DC; the CLI enables
-strict native verification before Git work or threads. Only a typed owned ODB
-blob with matching identity/type can reuse that proof. Streams and builds
+strict native verification before Git work or threads. Owned ODB objects
+with matching identity and type can reuse that proof. Streams and builds
 without that policy use independent verification.
 
 Trusted block hashes are formed from the same verified bytes. When reading a

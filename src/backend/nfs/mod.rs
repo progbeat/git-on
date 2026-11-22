@@ -303,19 +303,34 @@ async fn write_response(
     let Some(RpcReply { header, body }) = response else {
         return Ok(());
     };
-    let body = body.as_deref().map_or(&[][..], Vec::as_slice);
-    let size = header.len() + body.len();
+    let size = header.len() + body.as_ref().map_or(0, |body| body.len());
     if size > MAX_RECORD {
         return Err(io::Error::other("NFS response exceeds record limit"));
     }
     let record = (0x8000_0000 | size as u32).to_be_bytes();
     tokio::time::timeout(idle, async {
-        let mut buffers = [
-            IoSlice::new(&record),
-            IoSlice::new(&header),
-            IoSlice::new(body),
-        ];
-        let mut pending = &mut buffers[..if body.is_empty() { 2 } else { 3 }];
+        let slices = [record.as_slice(), header.as_slice()]
+            .into_iter()
+            .chain(body.iter().flat_map(|body| body.slices()))
+            .map(IoSlice::new);
+        // A contiguous payload needs at most six slices, including XDR
+        // padding and any operations that follow it.
+        let mut inline = [IoSlice::new(&[]); 6];
+        let mut extended;
+        let mut pending = if body
+            .as_ref()
+            .is_none_or(|body| body.data_slice_count() <= 1)
+        {
+            let mut count = 0;
+            for slice in slices {
+                inline[count] = slice;
+                count += 1;
+            }
+            &mut inline[..count]
+        } else {
+            extended = slices.collect::<Vec<_>>();
+            &mut extended[..]
+        };
         while !pending.is_empty() {
             let written = output.write_vectored(pending).await?;
             if written == 0 {

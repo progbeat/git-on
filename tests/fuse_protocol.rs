@@ -343,6 +343,34 @@ fn protocol_kernel_cache_only_retains_protected_source() {
 }
 
 #[test]
+fn protocol_missing_entry_cache_requires_readonly_directory() {
+    for policy in [
+        WritePolicy::None,
+        WritePolicy::Ignored,
+        WritePolicy::Untracked,
+        WritePolicy::All,
+    ] {
+        let mut p = Peer::with_policy(policy);
+        let name = "missing.tmp";
+        let lookup = names(vec![], &[name]);
+        if policy == WritePolicy::None {
+            let entry = p.ok(1, 1, lookup.clone());
+            assert_eq!(num(&entry, 0), 0);
+            assert_ne!(num(&entry, 16), 0);
+            assert_eq!(num(&entry, 24), 0);
+            p.err(1, u64::MAX, lookup.clone(), libc::ENOENT);
+            let file = p.lookup(1, "tracked");
+            p.err(1, file, lookup, libc::ENOTDIR);
+        } else {
+            p.err(1, 1, lookup, libc::ENOENT);
+            let (created, handle) = p.create(name);
+            assert_eq!(p.lookup(1, name), created);
+            p.release(created, handle);
+        }
+    }
+}
+
+#[test]
 fn protocol_cached_source_directory_attrs_do_not_cache_generated_membership() {
     for policy in [WritePolicy::Ignored, WritePolicy::Untracked] {
         let mut p = Peer::with_policy(policy);
@@ -579,7 +607,7 @@ fn protocol_none_denies_supported_mutations_and_preserves_source() {
         "alias.tmp",
         "renamed.tmp",
     ] {
-        p.err(1, 1, names(vec![], &[name]), libc::ENOENT);
+        assert_eq!(p.lookup(1, name), 0);
     }
 }
 

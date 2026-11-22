@@ -3,7 +3,7 @@ use super::{
     locks::LockState,
     protocol::{self, Channel, Credentials, Operation, Rpc, SessionId, StateId, MAX_OPS},
     status::*,
-    xdr::{Writer, MAX_RECORD},
+    xdr::{ReplyBody, Writer, MAX_RECORD},
 };
 use crate::filesystem::Overlay;
 use sha2::{Digest, Sha256};
@@ -54,12 +54,12 @@ struct Slot {
 struct Replay {
     digest: [u8; 32],
     credentials: Credentials,
-    reply: Arc<Vec<u8>>,
+    reply: Arc<ReplyBody>,
 }
 
 pub(super) struct RpcReply {
     pub(super) header: Vec<u8>,
-    pub(super) body: Option<Arc<Vec<u8>>>,
+    pub(super) body: Option<Arc<ReplyBody>>,
 }
 
 struct Session {
@@ -234,7 +234,9 @@ impl Server {
     pub fn rpc(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         let RpcReply { mut header, body } = self.rpc_reply(data)?;
         if let Some(body) = body {
-            header.extend_from_slice(&body);
+            for slice in body.slices() {
+                header.extend_from_slice(slice);
+            }
         }
         Some(header)
     }
@@ -302,7 +304,7 @@ impl Server {
         credentials: Credentials,
         raw_request: &[u8],
         request_size: usize,
-    ) -> Arc<Vec<u8>> {
+    ) -> Arc<ReplyBody> {
         let mut reply = Writer::default();
         reply.u32(OK);
         reply.opaque(request.tag);
@@ -311,10 +313,10 @@ impl Server {
 
         if request.minor != 1 {
             reply.patch_u32(0, MINOR_MISMATCH);
-            return Arc::new(reply.into_bytes());
+            return Arc::new(reply.into_reply(None));
         }
         if request.count == 0 {
-            return Arc::new(reply.into_bytes());
+            return Arc::new(reply.into_reply(None));
         }
         let mut context = Context::new(credentials);
         let mut budget = MAX_RECORD - RPC_REPLY_HEADER;
@@ -371,7 +373,7 @@ impl Server {
                             op => {
                                 // Always leave room to report a subsequent operation's error.
                                 let tail = if i + 1 < request.count { 12 } else { 0 };
-                                let limit = budget.saturating_sub(reply.len() + tail);
+                                let limit = budget.saturating_sub(reply.wire_len() + tail);
                                 self.perform(op, &mut context, request.count, i, limit, &mut reply)
                             }
                         }
@@ -399,11 +401,7 @@ impl Server {
         }
         reply.patch_u32(count_at, count);
         // The socket and the replay slot share the exact same response body.
-        let mut bytes = reply.into_bytes();
-        if replay_slot.is_some() && bytes.capacity() > budget {
-            bytes.shrink_to_fit();
-        }
-        let reply = Arc::new(bytes);
+        let reply = Arc::new(reply.into_reply(replay_slot.is_some().then_some(budget)));
         if let Some((sequence, digest)) = replay_slot {
             if let Some(session) = self.sessions.get_mut(&sequence.session) {
                 session.slots[sequence.slot as usize] = Slot {
@@ -704,7 +702,7 @@ impl Server {
 
 enum Sequenced {
     New(u64, usize),
-    Replay(Arc<Vec<u8>>),
+    Replay(Arc<ReplyBody>),
 }
 
 #[cfg(test)]

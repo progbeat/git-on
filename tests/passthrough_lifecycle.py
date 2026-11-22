@@ -129,8 +129,6 @@ def scenario(binary, expected, mode):
         assert run_directory.parent in allowed_groups, mount
         assert mount.name == 'mount'
         assert run_directory.stat().st_uid == os.getuid() and run_directory.stat().st_mode & 0o777 == 0o700
-        state = json.loads((run_directory / '.state').read_text())
-        assert state['format'] == 'git-on-temp-v1'
         assert str(mount) in mounts_below(run_directory), 'real FUSE mount required'
         worker = subprocess.Popen([sys.executable, '-c', WORKER], cwd=mount,
                                   env=environment, stdout=logs, stderr=logs)

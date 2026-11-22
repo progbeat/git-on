@@ -10,11 +10,11 @@ use std::{
         unix::{
             fs::{FileTypeExt, MetadataExt},
             net::UnixStream,
-            process::CommandExt,
+            process::{CommandExt, ExitStatusExt},
         },
     },
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -39,26 +39,94 @@ fn check_transfer(stop: &Stop) -> io::Result<()> {
     crate::object::check_transfer().map_err(io::Error::other)
 }
 
-struct Input(UnixStream, Stop);
+pub(crate) fn child_exited(pid: u32) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == 0 {
+        Ok(crate::platform::siginfo_pid(&info) != 0)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+struct Input {
+    socket: UnixStream,
+    stop: Stop,
+    leader: Option<u32>,
+    close_after_command: Option<CloseAfterCommand>,
+}
+
+struct CloseAfterCommand {
+    request: Arc<UnixStream>,
+    finished: Arc<AtomicBool>,
+}
+
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         loop {
-            check_transfer(&self.1)?;
+            check_transfer(&self.stop)?;
+            if self
+                .close_after_command
+                .as_ref()
+                .is_some_and(|watch| watch.finished.load(Ordering::Acquire))
+            {
+                let watch = self
+                    .close_after_command
+                    .take()
+                    .expect("command exit watcher");
+                shutdown_request(&watch.request)?;
+            }
             let mut poll = libc::pollfd {
-                fd: self.0.as_raw_fd(),
+                fd: self.socket.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
             match unsafe { libc::poll(&mut poll, 1, 10) } {
                 -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
                 -1 => return Err(io::Error::last_os_error()),
-                0 => continue,
-                _ => return self.0.read(data),
+                0 => {
+                    if let Some(pid) = self.leader {
+                        if child_exited(pid)? {
+                            // Drain bytes already queued by SSH. A surviving
+                            // writer must not delay EOF after the leader exits.
+                            let count = unsafe {
+                                libc::recv(
+                                    self.socket.as_raw_fd(),
+                                    data.as_mut_ptr().cast(),
+                                    data.len(),
+                                    libc::MSG_DONTWAIT,
+                                )
+                            };
+                            if count >= 0 {
+                                return Ok(count as usize);
+                            }
+                            let error = io::Error::last_os_error();
+                            match error.kind() {
+                                io::ErrorKind::WouldBlock => return Ok(0),
+                                io::ErrorKind::Interrupted => continue,
+                                _ => return Err(error),
+                            }
+                        }
+                    }
+                }
+                _ => return self.socket.read(data),
             }
         }
     }
 }
-struct Output(UnixStream, Stop);
+struct Output(Arc<UnixStream>, Stop);
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         loop {
@@ -72,7 +140,7 @@ impl Write for Output {
                 -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
                 -1 => return Err(io::Error::last_os_error()),
                 0 => continue,
-                _ => match self.0.write(data) {
+                _ => match self.0.as_ref().write(data) {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                     result => return result,
                 },
@@ -88,24 +156,162 @@ impl Write for Output {
 struct Owner(Mutex<Option<Child>>);
 impl Owner {
     fn stop(&self) -> Result<()> {
+        self.stop_with_status().map(|_| ())
+    }
+
+    fn stop_with_status(&self) -> Result<Option<ExitStatus>> {
         let mut child = self
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("transport owner poisoned"))?;
-        if let Some(mut child) = child.take() {
-            let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let error = (killed != 0).then(io::Error::last_os_error);
-            child.wait().context("wait for owned demand transport")?;
-            if let Some(error) = error.filter(|error| error.raw_os_error() != Some(libc::ESRCH)) {
+        let Some(child) = child.take() else {
+            return Ok(None);
+        };
+        let exited = child_exited(child.id()).unwrap_or(false);
+        let status = Self::kill_and_reap(child, exited)?;
+        // SIGKILL can be our own cancellation. Any other terminal signal or
+        // status belongs to the process, including an already observed SIGKILL.
+        Ok((exited || status.signal() != Some(libc::SIGKILL)).then_some(status))
+    }
+
+    fn kill_and_reap(mut child: Child, exited: bool) -> Result<std::process::ExitStatus> {
+        let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let error = (killed != 0).then(io::Error::last_os_error);
+        let exited = exited
+            || (error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::EPERM)
+                && child_exited(child.id()).unwrap_or(false));
+        let status = child.wait().context("wait for owned demand transport")?;
+        if let Some(error) = error {
+            let errno = error.raw_os_error();
+            // Darwin can return EPERM for a group containing only its
+            // unreaped leader. A live same-user member receives the signal.
+            if errno != Some(libc::ESRCH) && !(exited && errno == Some(libc::EPERM)) {
                 return Err(error).context("stop owned demand transport group");
             }
         }
-        Ok(())
+        Ok(status)
+    }
+
+    fn finish(
+        &self,
+        mut output: &UnixStream,
+        check_end: bool,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<std::process::ExitStatus> {
+        let mut owned = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transport owner poisoned"))?;
+        let pid = owned.as_ref().context("transport has already closed")?.id();
+        output.set_nonblocking(true)?;
+        let mut fd = Some(output.as_raw_fd());
+        let mut buffer = [0; 8192];
+        let wakeup = crate::git::ChildExitWakeup::new(pid);
+        loop {
+            check()?;
+            let exited = child_exited(pid)?;
+            if fd.is_some() {
+                match output.read(&mut buffer) {
+                    Ok(0) => fd = None,
+                    Ok(_) => {
+                        ensure!(!check_end, "unexpected data after Git response");
+                        if !exited {
+                            continue;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if exited {
+                // Bytes written by the leader are now drained or rejected.
+                // Its PID still reserves the group while we stop descendants.
+                return Self::kill_and_reap(owned.take().expect("owned transport"), true);
+            }
+            wakeup.wait(std::time::Duration::from_millis(10), None, [fd, None]);
+        }
     }
 }
 impl Drop for Owner {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+fn spawn_piped(mut command: Command, stop: Stop) -> Result<(Child, Output, BufReader<Input>)> {
+    check_transfer(&stop)?;
+    let (input, to_child) = UnixStream::pair()?;
+    input.set_nonblocking(true)?;
+    let (output, from_child) = UnixStream::pair()?;
+    command
+        .stdin(Stdio::from(OwnedFd::from(to_child)))
+        .stdout(Stdio::from(OwnedFd::from(from_child)));
+    unsafe {
+        command.pre_exec(|| {
+            // Give the owned process a separate group and no controlling TTY.
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    Ok((
+        child,
+        Output(Arc::new(input), stop.clone()),
+        BufReader::with_capacity(
+            64 * 1024,
+            Input {
+                socket: output,
+                stop,
+                leader: None,
+                close_after_command: None,
+            },
+        ),
+    ))
+}
+
+pub(crate) struct BatchProcess {
+    owner: Owner,
+    input: Output,
+    output: BufReader<Input>,
+}
+
+impl BatchProcess {
+    pub(crate) fn spawn(command: Command) -> Result<Self> {
+        let (child, input, mut output) =
+            spawn_piped(command, None).context("start native Git object reader")?;
+        output.get_mut().leader = Some(child.id());
+        Ok(Self {
+            owner: Owner(Mutex::new(Some(child))),
+            input,
+            output,
+        })
+    }
+
+    pub(crate) fn exchange<T>(
+        &mut self,
+        request: &[u8],
+        receive: impl FnOnce(&mut dyn BufRead) -> Result<T>,
+    ) -> Result<T> {
+        let result = (|| {
+            self.input.write_all(request)?;
+            receive(&mut self.output)
+        })();
+        result.map_err(|error| {
+            let status = self.owner.stop_with_status().ok().flatten();
+            match status {
+                Some(status) if !status.success() => {
+                    error.context(format!("native Git object reader exited with {status}"))
+                }
+                _ => error,
+            }
+        })
+    }
+
+    pub(crate) fn stop(&self) -> Result<()> {
+        self.owner.stop()
     }
 }
 
@@ -145,6 +351,10 @@ impl Connection {
 
     pub(crate) fn is_ssh(&self) -> bool {
         self.ssh.is_some()
+    }
+
+    pub(crate) fn is_stateless(&self) -> bool {
+        self.helper
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -202,44 +412,52 @@ pub(crate) struct Session {
     output: BufReader<Input>,
     errors: File,
     stateless: bool,
+    completed_fetch: AtomicBool,
 }
 
 pub(crate) struct StartingSession(Session);
 
+#[derive(Debug)]
+pub(crate) struct FailedTransportExit(ExitStatus);
+
+impl std::fmt::Display for FailedTransportExit {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(output, "native demand transport exited with {}", self.0)
+    }
+}
+impl std::error::Error for FailedTransportExit {}
+
+#[derive(Debug)]
+pub(crate) struct FailedTransportCompletion;
+
+impl std::fmt::Display for FailedTransportCompletion {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str("cannot confirm completed SSH response")
+    }
+}
+impl std::error::Error for FailedTransportCompletion {}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FetchMode {
+    Filtered,
+    FilteredSelection { selecting_ref: bool },
+    Snapshot { selecting_ref: bool },
+}
+
 impl StartingSession {
     pub(crate) fn spawn(mut command: Command, helper: bool, stop: Stop) -> Result<Self> {
         check_transfer(&stop)?;
-        let (input, to_child) = UnixStream::pair()?;
-        input.set_nonblocking(true)?;
-        let (output, from_child) = UnixStream::pair()?;
         let errors = crate::git::capture_file()?;
-        command
-            .stdin(Stdio::from(OwnedFd::from(to_child)))
-            .stdout(Stdio::from(OwnedFd::from(from_child)))
-            .stderr(errors.try_clone()?);
-        unsafe {
-            command.pre_exec(|| {
-                // Credential helpers must not be able to read the command's
-                // terminal through /dev/tty. The session ID also owns a new
-                // process group for transport cancellation and reaping.
-                if libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command
-            .spawn()
-            .context("start invocation demand transport")?;
-        // Command retains its Stdio descriptors after spawn. Close the
-        // parent's copies so an exited helper produces EOF during handshake.
-        drop(command);
+        command.stderr(errors.try_clone()?);
+        let (child, input, output) =
+            spawn_piped(command, stop).context("start invocation demand transport")?;
         Ok(Self(Session {
             owner: Owner(Mutex::new(Some(child))),
-            input: Output(input, stop.clone()),
-            output: BufReader::with_capacity(64 * 1024, Input(output, stop)),
+            input,
+            output,
             errors,
             stateless: helper,
+            completed_fetch: AtomicBool::new(false),
         }))
     }
 
@@ -248,7 +466,7 @@ impl StartingSession {
         let mut sockets: Vec<_> = sessions
             .iter()
             .map(|session| libc::pollfd {
-                fd: session.0.output.get_ref().0.as_raw_fd(),
+                fd: session.0.output.get_ref().socket.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             })
@@ -275,18 +493,20 @@ impl StartingSession {
         let mut preview = [0; 4096];
         let read = unsafe {
             libc::recv(
-                self.0.output.get_ref().0.as_raw_fd(),
+                self.0.output.get_ref().socket.as_raw_fd(),
                 preview.as_mut_ptr().cast(),
                 preview.len(),
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
-        read > 0 && read_v2_capabilities(&mut &preview[..read as usize]).unwrap_or(false)
+        read > 0
+            && read_v2_capabilities(&mut &preview[..read as usize], FetchMode::Filtered)
+                .unwrap_or(false)
     }
 
     pub(crate) fn negotiate(mut self) -> Result<Option<Session>> {
         let session = &mut self.0;
-        match session.handshake(session.stateless) {
+        match session.handshake(session.stateless, FetchMode::Filtered) {
             Ok(true) => Ok(Some(self.0)),
             Ok(false) => Ok(None),
             Err(error) => {
@@ -295,6 +515,26 @@ impl StartingSession {
                     .with_context(|| format!("open native demand channel: {}", diagnostic.trim()))
             }
         }
+    }
+
+    pub(crate) fn negotiate_selection(
+        mut self,
+        branch: Option<&BranchQuery>,
+        mode: FetchMode,
+    ) -> Result<Option<(Session, Option<Oid>)>> {
+        self.0.observe_leader()?;
+        if self.0.handshake(false, mode).unwrap_or(false) {
+            match branch {
+                None => return Ok(Some((self.0, None))),
+                Some(query) => {
+                    if let Ok(Some(oid)) = self.0.select_branch(query) {
+                        return Ok(Some((self.0, Some(oid))));
+                    }
+                }
+            }
+        }
+        self.0.finish(false)?;
+        Ok(None)
     }
 
     pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
@@ -315,6 +555,16 @@ pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 impl Session {
+    fn observe_leader(&mut self) -> Result<()> {
+        let owned = self
+            .owner
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transport owner poisoned"))?;
+        self.output.get_mut().leader = owned.as_ref().map(Child::id);
+        Ok(())
+    }
+
     /// A missing protocol/helper capability is an optional optimization miss,
     /// before any fetch. Errors after a fetch request must never retry it.
     #[cfg(test)]
@@ -330,9 +580,9 @@ impl Session {
     }
     pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         self.input.1 = Some(stop.clone());
-        self.output.get_mut().1 = Some(stop);
+        self.output.get_mut().stop = Some(stop);
     }
-    fn handshake(&mut self, helper: bool) -> Result<bool> {
+    fn handshake(&mut self, helper: bool, mode: FetchMode) -> Result<bool> {
         if helper {
             self.input.write_all(b"capabilities\n")?;
             let mut available = false;
@@ -357,7 +607,7 @@ impl Session {
                 "native helper rejected protocol connection"
             );
         }
-        read_v2_capabilities(&mut self.output)
+        read_v2_capabilities(&mut self.output, mode)
     }
     fn line(&mut self) -> Result<Vec<u8>> {
         let mut line = Vec::new();
@@ -384,12 +634,12 @@ impl Session {
     }
 
     pub(crate) fn branch_ready(&self) -> io::Result<bool> {
-        check_transfer(&self.output.get_ref().1)?;
+        check_transfer(&self.output.get_ref().stop)?;
         if !self.output.buffer().is_empty() {
             return Ok(true);
         }
         let mut socket = libc::pollfd {
-            fd: self.output.get_ref().0.as_raw_fd(),
+            fd: self.output.get_ref().socket.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -406,32 +656,59 @@ impl Session {
     pub(crate) fn fetch_stream(
         &mut self,
         oids: &[Oid],
+        mode: FetchMode,
+        response: crate::pack_stream::Response<'_>,
+    ) -> Result<crate::pack_stream::Received> {
+        self.fetch_response(oids, mode, response, false)
+    }
+
+    fn fetch_response(
+        &mut self,
+        oids: &[Oid],
+        mode: FetchMode,
         mut response: crate::pack_stream::Response<'_>,
+        last_request: bool,
     ) -> Result<crate::pack_stream::Received> {
         response.set_stop(self.input.1.clone());
         let result = (|| {
+            if !self.stateless && self.output.get_ref().leader.is_none() {
+                self.observe_leader()?;
+            }
             self.errors.set_len(0)?;
             self.errors.rewind()?;
-            self.input.write_all(&exact_request(oids)?)?;
+            self.input.write_all(&fetch_request(oids, mode)?)?;
+            if last_request {
+                // This is the final request. Let the peer close its channel
+                // while the pack is still arriving.
+                self.close_input()?;
+            }
             let pack = response.read(&mut self.output)?;
             self.check_helper_end()?;
+            self.completed_fetch.store(true, Ordering::Relaxed);
             Ok(pack)
         })();
         self.with_fetch_context(oids, result)
     }
 
     fn with_fetch_context<T>(&mut self, oids: &[Oid], result: Result<T>) -> Result<T> {
-        result.with_context(|| {
-            let diagnostic = self.error_text();
+        result.map_err(|error| {
+            let status = self.owner.stop_with_status().ok().flatten();
+            let diagnostic = self.stderr_tail();
+            let error = match status {
+                // Cancellation of the current request cannot hide an
+                // independent failure on a previously used channel.
+                Some(status) if !status.success() => error.context(FailedTransportExit(status)),
+                _ => error,
+            };
             let wanted = if let [oid] = oids {
                 format!("object {oid}")
             } else {
                 format!("objects ({} requests, first {})", oids.len(), oids[0])
             };
-            format!(
+            error.context(format!(
                 "remote fetch of exact {wanted} failed: {}",
                 diagnostic.trim()
-            )
+            ))
         })
     }
     fn check_helper_end(&mut self) -> Result<()> {
@@ -443,11 +720,125 @@ impl Session {
         }
         Ok(())
     }
+
+    pub(crate) fn fetch_snapshot(
+        mut self,
+        oid: Oid,
+        response: crate::pack_stream::Response<'_>,
+        transport: &str,
+    ) -> Result<crate::pack_stream::Received> {
+        self.observe_leader()?;
+        let received = self.fetch_response(
+            &[oid],
+            FetchMode::Snapshot {
+                selecting_ref: false,
+            },
+            response,
+            true,
+        )?;
+        let result = self.verify_exit(transport, || Ok(check_transfer(&self.input.1)?));
+        self.with_fetch_context(&[oid], result).map(|()| received)
+    }
+
+    pub(crate) fn reuse_ssh_snapshot(
+        self,
+        oid: Oid,
+        response: crate::pack_stream::Response<'_>,
+    ) -> Result<Option<crate::pack_stream::Received>> {
+        if self.has_exited() {
+            self.confirm_ssh_exit().and(self.stop())?;
+            return Ok(None);
+        }
+        self.fetch_snapshot(oid, response, "SSH").map(Some)
+    }
+
+    pub(crate) fn fetch_last_ssh(
+        mut self,
+        oids: &[Oid],
+        response: crate::pack_stream::Response<'_>,
+    ) -> Result<crate::pack_stream::Received> {
+        let received = self.fetch_response(oids, FetchMode::Filtered, response, true)?;
+        let result = self
+            .verify_exit("SSH", || Ok(check_transfer(&self.input.1)?))
+            .context(FailedTransportCompletion);
+        self.with_fetch_context(oids, result).map(|()| received)
+    }
+
+    fn verify_exit(&self, transport: &str, check: impl Fn() -> Result<()>) -> Result<()> {
+        ensure!(
+            self.output.buffer().is_empty(),
+            "unexpected data after final Git response"
+        );
+        let status = self.finish_with(true, check)?;
+        ensure!(
+            status.success(),
+            "{transport} transport exited with {status}"
+        );
+        Ok(())
+    }
+
+    fn finish(&self, check_end: bool) -> Result<std::process::ExitStatus> {
+        self.finish_with(check_end, || Ok(check_transfer(&self.input.1)?))
+    }
+
+    pub(crate) fn completed_fetch(&self) -> bool {
+        self.completed_fetch.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn process_id(&self) -> u32 {
+        self.owner.0.lock().unwrap().as_ref().unwrap().id()
+    }
+
+    pub(crate) fn has_exited(&self) -> bool {
+        child_exited(self.process_id()).is_ok_and(|exited| exited)
+    }
+
+    pub(crate) fn confirm_ssh_exit(&self) -> Result<()> {
+        if !self.completed_fetch.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.verify_exit("SSH", || {
+            // The user's command has ended. This is an orderly close of an
+            // idle, used channel, independent of cancelled background reads.
+            if crate::git::cancelled_signal().is_some() {
+                return Err(crate::object::OperationCancelled.into());
+            }
+            Ok(())
+        })
+    }
+
+    fn finish_with(
+        &self,
+        check_end: bool,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<std::process::ExitStatus> {
+        self.close_input()?;
+        // The next native operation can reuse the control master. Wait until
+        // the discovery channel releases its remote session slot. A wrapper's
+        // detached helper can retain stdout after the SSH process has exited.
+        self.owner
+            .finish(&self.output.get_ref().socket, check_end, check)
+    }
+
+    pub(crate) fn close_input_after_command(&mut self, finished: Arc<AtomicBool>) {
+        self.output.get_mut().close_after_command = Some(CloseAfterCommand {
+            request: self.input.0.clone(),
+            finished,
+        });
+    }
+
+    pub(crate) fn close_input(&self) -> Result<()> {
+        Ok(shutdown_request(&self.input.0)?)
+    }
+
     pub(crate) fn stop(&self) -> Result<()> {
         self.owner.stop()
     }
     pub(crate) fn error_text(&mut self) -> String {
         let _ = self.owner.stop();
+        self.stderr_tail()
+    }
+    fn stderr_tail(&mut self) -> String {
         let mut bytes = Vec::new();
         let length = self.errors.metadata().map_or(0, |metadata| metadata.len());
         let _ = self
@@ -459,6 +850,21 @@ impl Session {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+
+fn shutdown_request(socket: &UnixStream) -> io::Result<()> {
+    match socket.shutdown(std::net::Shutdown::Write) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 pub(crate) fn packet_length(header: &[u8; 4]) -> Result<usize> {
     ensure!(
         header.iter().all(u8::is_ascii_hexdigit),
@@ -501,22 +907,26 @@ fn request_packet(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_v2_capabilities(input: &mut impl Read) -> Result<bool> {
+fn read_v2_capabilities(input: &mut impl Read, mode: FetchMode) -> Result<bool> {
     if !matches!(read_packet(input)?, Packet::Data(version) if packet_text(&version) == b"version 2")
     {
         return Ok(false);
     }
     let mut fetch = false;
     let mut filter = false;
+    let mut shallow = false;
+    let mut ref_in_want = false;
     loop {
         match read_packet(input)? {
             Packet::Flush => break,
             Packet::Data(capability) => {
                 if let Some(values) = capability.strip_prefix(b"fetch=") {
                     fetch = true;
-                    filter |= values
-                        .split(u8::is_ascii_whitespace)
-                        .any(|value| value == b"filter");
+                    for value in values.split(u8::is_ascii_whitespace) {
+                        filter |= value == b"filter";
+                        shallow |= value == b"shallow";
+                        ref_in_want |= value == b"ref-in-want";
+                    }
                 }
                 if let Some(format) = capability.strip_prefix(b"object-format=") {
                     ensure!(
@@ -528,8 +938,18 @@ fn read_v2_capabilities(input: &mut impl Read) -> Result<bool> {
             _ => bail!("invalid demand capability advertisement"),
         }
     }
-    ensure!(fetch && filter, "demand transport lacks object filtering");
-    Ok(true)
+    match mode {
+        FetchMode::Filtered => {
+            ensure!(fetch && filter, "demand transport lacks object filtering");
+            Ok(true)
+        }
+        // Native Git can request the advertised ref by name when the peer
+        // supports ref-in-want (for example, across load-balanced replicas).
+        FetchMode::FilteredSelection { selecting_ref } | FetchMode::Snapshot { selecting_ref } => {
+            let filtered = matches!(mode, FetchMode::FilteredSelection { .. });
+            Ok(fetch && shallow && (!filtered || filter) && !(selecting_ref && ref_in_want))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -539,13 +959,24 @@ pub(crate) struct BranchQuery {
 }
 
 impl BranchQuery {
+    pub(crate) fn for_snapshot(revision: &std::ffi::OsStr) -> Option<Self> {
+        if revision == "HEAD" {
+            Some(Self {
+                wanted: "HEAD".into(),
+                alternatives: Vec::new(),
+            })
+        } else {
+            Self::new(revision)
+        }
+    }
+
     pub(crate) fn new(revision: &std::ffi::OsStr) -> Option<Self> {
         let revision = revision.to_str()?;
         if revision.is_empty()
             || revision.len() > 1024
             || revision.starts_with('-')
             || revision.starts_with('+')
-            || revision == "HEAD"
+            || matches!(revision, "HEAD" | "tag")
         {
             return None;
         }
@@ -653,7 +1084,7 @@ fn read_selected_branch(
     }
 }
 
-pub(crate) fn read_http_capabilities(mut input: &[u8]) -> Result<bool> {
+pub(crate) fn read_http_capabilities(mut input: &[u8], mode: FetchMode) -> Result<bool> {
     let mut body = input;
     if matches!(
         read_packet(&mut body)?,
@@ -665,10 +1096,10 @@ pub(crate) fn read_http_capabilities(mut input: &[u8]) -> Result<bool> {
         );
         input = body;
     }
-    read_v2_capabilities(&mut input)
+    read_v2_capabilities(&mut input, mode)
 }
 
-pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
+pub(crate) fn fetch_request(oids: &[Oid], mode: FetchMode) -> Result<Vec<u8>> {
     // One small exact-demand request, not one syscall/signal-status read
     // for every pkt-line header and body. Every wanted OID is explicit.
     let mut request = Vec::with_capacity(256);
@@ -677,14 +1108,17 @@ pub(crate) fn exact_request(oids: &[Oid]) -> Result<Vec<u8>> {
     for oid in oids {
         request_packet(&mut request, format!("want {oid}\n").as_bytes())?;
     }
-    for value in [
-        b"deepen 1\n".as_slice(),
-        b"filter tree:0\n",
-        b"no-progress\n",
-        b"done\n",
-    ] {
-        request_packet(&mut request, value)?;
+    request_packet(&mut request, b"deepen 1\n")?;
+    let filtered = !matches!(mode, FetchMode::Snapshot { .. });
+    if filtered {
+        request_packet(&mut request, b"filter tree:0\n")?;
+    } else {
+        request_packet(&mut request, b"ofs-delta\n")?;
     }
+    if filtered || !crate::terminal_ui::progress_enabled() {
+        request_packet(&mut request, b"no-progress\n")?;
+    }
+    request_packet(&mut request, b"done\n")?;
     request.extend_from_slice(b"0000");
     Ok(request)
 }
@@ -702,6 +1136,31 @@ fn check_http_end(input: impl Read) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_channel_leaves_copy_free_to_open_a_new_one() -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '000eversion 2\\n0019fetch=shallow filter\\n0000'",
+        ]);
+        let session =
+            Session::connect(command, false)?.context("local channel did not negotiate")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !session.has_exited() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "local channel did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let directory = tempfile::tempdir()?;
+        let scratch = crate::raw_blob::RawBlobs::new(directory.path())?;
+        let oid = Oid::from_bytes(&[1; 20])?;
+        let response = crate::pack_stream::Response::for_materialization(scratch, oid);
+        assert!(session.reuse_ssh_snapshot(oid, response)?.is_none());
+        Ok(())
+    }
     use flate2::{write::ZlibEncoder, Compression};
     use sha1_checked::{Digest, Sha1};
     fn pack(payload: &[u8]) -> Vec<u8> {
@@ -738,10 +1197,16 @@ mod tests {
         source.shutdown(std::net::Shutdown::Write).unwrap();
         let session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input, None),
-            output: BufReader::new(Input(output, None)),
+            input: Output(Arc::new(input), None),
+            output: BufReader::new(Input {
+                socket: output,
+                stop: None,
+                leader: None,
+                close_after_command: None,
+            }),
             errors: tempfile::tempfile().unwrap(),
             stateless: false,
+            completed_fetch: AtomicBool::new(false),
         };
         (session, peer)
     }
@@ -788,7 +1253,7 @@ mod tests {
                 text_packet(&mut bytes, b"object-format=sha1", format_lf);
                 bytes.extend_from_slice(b"0000");
                 let (mut session, _request_peer) = peer_response(&bytes);
-                assert!(session.handshake(false).unwrap());
+                assert!(session.handshake(false, FetchMode::Filtered).unwrap());
             }
         }
         for lf in [false, true] {
@@ -798,7 +1263,7 @@ mod tests {
             text_packet(&mut bytes, b"object-format=sha256", lf);
             bytes.extend_from_slice(b"0000");
             let (mut session, _request_peer) = peer_response(&bytes);
-            assert!(session.handshake(false).is_err());
+            assert!(session.handshake(false, FetchMode::Filtered).is_err());
         }
     }
     #[test]
@@ -839,7 +1304,9 @@ mod tests {
                         Ok(())
                     }),
                 );
-                let received = session.fetch_stream(&[oid], response).unwrap();
+                let received = session
+                    .fetch_stream(&[oid], FetchMode::Filtered, response)
+                    .unwrap();
                 assert_eq!(received.bytes, good.len() as u64);
             }
         }
@@ -885,7 +1352,7 @@ mod tests {
             );
             let (mut session, _peer) = peer_response(&bytes);
             session
-                .fetch_stream(&[oid], response)
+                .fetch_stream(&[oid], FetchMode::Filtered, response)
                 .map(|_| published.unwrap())
         };
         for data in [Vec::new(), vec![b'x'; 1024 * 1024]] {
@@ -911,7 +1378,9 @@ mod tests {
                 vec![Oid::zero()],
                 Box::new(|_| panic!("malformed response published an object")),
             );
-            assert!(session.fetch_stream(&[Oid::zero()], response).is_err());
+            assert!(session
+                .fetch_stream(&[Oid::zero()], FetchMode::Filtered, response)
+                .is_err());
         }
     }
     #[test]
@@ -954,6 +1423,40 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
+
+    #[test]
+    fn cancelled_fetch_keeps_an_independent_transport_failure() -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '000eversion 2\\n0019fetch=shallow filter\\n0000'; exit 49",
+        ]);
+        let mut session = Session::connect(command, false)?.context("persistent transport")?;
+        let pid = session.owner.0.lock().unwrap().as_ref().unwrap().id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !child_exited(pid)? {
+            assert!(std::time::Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let root = tempfile::tempdir()?;
+        let cache = crate::raw_blob::RawBlobs::new(root.path())?;
+        let oid = Oid::zero();
+        session.set_stop(Arc::new(AtomicBool::new(true)));
+        let response = crate::pack_stream::Response::new(
+            cache,
+            vec![oid],
+            Box::new(|_| panic!("cancelled response published an object")),
+        );
+        let error = session
+            .fetch_stream(&[oid], FetchMode::Filtered, response)
+            .err()
+            .context("cancelled fetch succeeded")?;
+        assert!(crate::object::is_cancelled(&error));
+        assert!(error.is::<FailedTransportExit>(), "{error:#}");
+        assert!(format!("{error:#}").contains("exit status: 49"));
+        Ok(())
+    }
+
     #[test]
     fn native_error_tail_has_bounded_memory() {
         let (input, _input_peer) = UnixStream::pair().unwrap();
@@ -963,10 +1466,16 @@ mod tests {
         errors.write_all(b"actual failure").unwrap();
         let mut session = Session {
             owner: Owner(Mutex::new(None)),
-            input: Output(input, None),
-            output: BufReader::new(Input(output, None)),
+            input: Output(Arc::new(input), None),
+            output: BufReader::new(Input {
+                socket: output,
+                stop: None,
+                leader: None,
+                close_after_command: None,
+            }),
             errors,
             stateless: false,
+            completed_fetch: AtomicBool::new(false),
         };
         let message = session.error_text();
         assert!(
@@ -983,11 +1492,11 @@ fn http_advertisement_accepts_the_version_two_service_preamble() {
     request_packet(&mut capabilities, b"version 2\n").unwrap();
     request_packet(&mut capabilities, b"fetch=shallow filter\n").unwrap();
     capabilities.extend_from_slice(b"0000");
-    assert!(read_http_capabilities(&capabilities).unwrap());
+    assert!(read_http_capabilities(&capabilities, FetchMode::Filtered).unwrap());
 
     let mut announced = Vec::new();
     request_packet(&mut announced, b"# service=git-upload-pack\n").unwrap();
     announced.extend_from_slice(b"0000");
     announced.extend_from_slice(&capabilities);
-    assert!(read_http_capabilities(&announced).unwrap());
+    assert!(read_http_capabilities(&announced, FetchMode::Filtered).unwrap());
 }

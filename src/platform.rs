@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(target_os = "linux")]
 use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs, io,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -15,6 +15,9 @@ use std::{
 
 const TEMP_GROUP: &str = "git-on";
 const PRIVATE_GROUP_PREFIX: &str = ".go";
+// Reserved for a run that locks the directory itself. Keep the same owner-only
+// permissions as prior runs and distinguish them without an extra file.
+pub const RUN_LOCK_NAME: &CStr = c".git-on-lock-v2";
 
 fn private_group_name(uid: u32) -> String {
     format!("{PRIVATE_GROUP_PREFIX}{uid:x}")
@@ -67,13 +70,17 @@ fn removable_group(metadata: &fs::Metadata, uid: u32) -> bool {
 }
 
 pub fn create_temporary_entry(parent: &Path, name: &str) -> io::Result<PathBuf> {
-    create_temporary_entry_before(parent, name, |_| Ok(()))
+    create_entry_in_group(parent, name, true)
 }
 
-fn create_temporary_entry_before(
+fn group_owner_matches(owner: u32, uid: u32, allow_shared_group: bool) -> bool {
+    owner == uid || allow_shared_group && owner == 0
+}
+
+fn create_entry_in_group(
     parent: &Path,
     name: &str,
-    mut prepare: impl FnMut(&Path) -> io::Result<()>,
+    allow_shared_group: bool,
 ) -> io::Result<PathBuf> {
     if name.is_empty()
         || !name
@@ -102,13 +109,15 @@ fn create_temporary_entry_before(
                 return Err(error);
             }
         };
-        if !usable_group(&metadata, uid, 0o700) {
+        if !group_owner_matches(metadata.uid(), uid, allow_shared_group)
+            || !usable_group(&metadata, uid, 0o700)
+        {
             if created && metadata.is_dir() && metadata.uid() == uid {
                 let _ = fs::remove_dir(&group);
             }
-            // A sticky directory's owner can move its entries. Keep a separate
-            // private group when another user already owns the usual name.
-            if !fallback && metadata.uid() != uid {
+            // Another user can move entries in their sticky directory.
+            // A regular file also occupies the name without providing a group.
+            if !fallback && (metadata.uid() != uid || metadata.is_file()) {
                 fallback = true;
                 group = parent.join(private_group_name(uid));
                 continue;
@@ -132,10 +141,6 @@ fn create_temporary_entry_before(
             continue;
         }
         let path = group.join(name);
-        if let Err(error) = prepare(&path) {
-            let _ = remove_empty_temporary_group(&group);
-            return Err(error);
-        }
         // If the last invocation removed the empty group, mkdirat fails
         // instead of creating an entry in a replacement at the same path.
         if unsafe { libc::mkdirat(directory.as_raw_fd(), name_c.as_ptr(), 0o700) } == 0 {
@@ -183,6 +188,68 @@ pub fn grouped_run(dir: &Path) -> bool {
         let bytes = name.as_encoded_bytes();
         bytes.len() == 6 && bytes.iter().all(u8::is_ascii_alphanumeric)
     })
+}
+
+pub fn usable_run_group(group: &Path, metadata: &fs::Metadata) -> bool {
+    let uid = unsafe { libc::geteuid() };
+    group.file_name().is_some_and(|name| {
+        let name = name.as_encoded_bytes();
+        (name.eq_ignore_ascii_case(TEMP_GROUP.as_bytes())
+            || name.eq_ignore_ascii_case(private_group_name(uid).as_bytes()))
+            && usable_group(metadata, uid, 0o700)
+    })
+}
+
+pub fn run_identity(dir: &Path) -> Result<Option<(fs::File, String)>> {
+    if !grouped_run(dir)
+        || !dir.file_name().is_some_and(|name| {
+            name.as_encoded_bytes()
+                .strip_prefix(b"g")
+                .is_some_and(|suffix| suffix.iter().all(u8::is_ascii_hexdigit))
+        })
+    {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(dir)?;
+    let mode = metadata.mode() & 0o1777;
+    if mode != 0o700 {
+        return Ok(None);
+    }
+    let uid = unsafe { libc::geteuid() };
+    let group = dir.parent().unwrap();
+    if !metadata.is_dir()
+        || metadata.uid() != uid
+        || !usable_run_group(group, &fs::symlink_metadata(group)?)
+    {
+        bail!("temporary run has unexpected group or owner");
+    }
+    let (directory, opened) = temporary_group_handle(dir)?;
+    if !same_group(&metadata, &opened) || opened.mode() & 0o1777 != mode {
+        bail!("temporary run changed while opening it");
+    }
+    let mut identity = blake3::Hasher::new_derive_key("git-on temporary run identity v2");
+    // The name and inode survive an ancestor rename.
+    identity.update(&opened.ino().to_le_bytes());
+    identity.update(&uid.to_le_bytes());
+    identity.update(dir.file_name().unwrap().as_encoded_bytes());
+    #[cfg(target_os = "linux")]
+    identity.update(&opened.dev().to_le_bytes());
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        // The short socket directory can outlive a reboot and its device
+        // renumbering. Creation time distinguishes equal inodes on volumes.
+        identity.update(&opened.st_birthtime().to_le_bytes());
+        identity.update(&opened.st_birthtime_nsec().to_le_bytes());
+    }
+    let hash = identity.finalize();
+    let id = uuid::Uuid::from_bytes(hash.as_bytes()[..16].try_into().unwrap());
+    Ok(Some((directory, id.to_string())))
+}
+
+pub fn same_run_directory(dir: &Path, locked: &fs::File) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(dir)?;
+    Ok(metadata.is_dir() && same_group(&metadata, &locked.metadata()?))
 }
 
 pub fn ssh_control_path(run: &Path) -> PathBuf {
@@ -281,14 +348,27 @@ pub fn mount_is_ours(
 ) -> Result<bool> {
     let point = dir.join("mount");
     #[cfg(target_os = "macos")]
-    let expected = selected_nfs_socket(Path::new(NFS_SOCKET_BASE), id, recorded_socket)?
-        .map(|socket| nfs_mount_source(&socket));
+    let expected = if recorded_socket.is_some() {
+        selected_nfs_socket(Path::new(NFS_SOCKET_BASE), id, recorded_socket)?
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else if valid_nfs_socket_id(id) {
+        nfs_socket_paths(Path::new(NFS_SOCKET_BASE), id).into()
+    } else {
+        Vec::new()
+    };
     #[cfg(target_os = "linux")]
-    let expected = Some(format!("git-on:{id}"));
+    let expected = format!("git-on:{id}");
     let mut found = false;
     for (path, source) in mounts()? {
         if path == point {
-            if expected.as_deref() != Some(source.as_str()) || found {
+            #[cfg(target_os = "macos")]
+            let matches = expected
+                .iter()
+                .any(|socket| nfs_mount_source(socket) == source);
+            #[cfg(target_os = "linux")]
+            let matches = source == expected;
+            if !matches || found {
                 bail!("mountpoint is occupied by a different or stacked filesystem");
             }
             found = true;
@@ -301,37 +381,117 @@ pub fn mount_is_ours(
 const NFS_SOCKET_BASE: &str = "/private/tmp";
 
 #[cfg(target_os = "macos")]
-pub fn reserve_nfs_socket(
-    id: &str,
-    mut record: impl FnMut(&Path) -> io::Result<()>,
-) -> io::Result<PathBuf> {
-    create_temporary_entry_before(Path::new(NFS_SOCKET_BASE), &format!("nfs-{id}"), |dir| {
-        record(&dir.join("s"))
+pub fn reserve_nfs_socket(id: &str) -> io::Result<PathBuf> {
+    // A new run derives its endpoint during cleanup. Reserve only in a
+    // caller-owned group so an unrelated, inaccessible shared group cannot
+    // be mistaken for one holding the endpoint.
+    create_entry_in_group(Path::new(NFS_SOCKET_BASE), &format!("nfs-{id}"), false)
+        .map(|dir| dir.join("s"))
+}
+
+#[cfg(target_os = "macos")]
+fn valid_nfs_socket_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
+}
+
+#[cfg(target_os = "macos")]
+fn nfs_socket_groups(base: &Path, uid: u32) -> [PathBuf; 2] {
+    [base.join(TEMP_GROUP), base.join(private_group_name(uid))]
+}
+
+#[cfg(target_os = "macos")]
+fn nfs_socket_paths(base: &Path, id: &str) -> [PathBuf; 3] {
+    let directory = format!("nfs-{id}");
+    let [primary, private] = nfs_socket_groups(base, unsafe { libc::geteuid() })
+        .map(|group| group.join(&directory).join("s"));
+    [
+        primary,
+        private,
+        base.join(format!("git-on-nfs-{id}")).join("s"),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+pub fn legacy_nfs_socket(id: &str) -> Option<PathBuf> {
+    valid_nfs_socket_id(id).then(|| {
+        let [_, _, legacy] = nfs_socket_paths(Path::new(NFS_SOCKET_BASE), id);
+        legacy
     })
-    .map(|dir| dir.join("s"))
 }
 
 #[cfg(target_os = "macos")]
 fn selected_nfs_socket(base: &Path, id: &str, recorded: Option<&Path>) -> Result<Option<PathBuf>> {
-    if !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id) {
+    if !valid_nfs_socket_id(id) {
         if recorded.is_some() {
             bail!("invalid recorded NFS socket identity");
         }
         return Ok(None);
     }
     let uid = unsafe { libc::geteuid() };
-    let directory = format!("nfs-{id}");
-    let primary = base.join(TEMP_GROUP).join(&directory).join("s");
-    let private = base
-        .join(private_group_name(uid))
-        .join(&directory)
-        .join("s");
-    match recorded {
-        Some(socket) if socket == primary => Ok(Some(primary)),
-        Some(socket) if socket == private => Ok(Some(private)),
-        Some(_) => bail!("invalid recorded NFS socket path"),
-        None => Ok(Some(base.join(format!("git-on-nfs-{id}")).join("s"))),
+    let candidates = nfs_socket_paths(base, id);
+    if let Some(recorded) = recorded {
+        return candidates
+            .into_iter()
+            .find(|path| path == recorded)
+            .map(Some)
+            .context("invalid recorded NFS socket path");
     }
+    let mut selected = None;
+    let mut inaccessible_group = None;
+    for socket in candidates {
+        let directory = socket.parent().unwrap();
+        let group = directory.parent().unwrap();
+        let group_usable = if group == base {
+            true
+        } else {
+            match fs::symlink_metadata(group) {
+                Ok(metadata)
+                    if metadata.is_dir() && group_owner_matches(metadata.uid(), uid, false) =>
+                {
+                    usable_group(&metadata, uid, 0o100)
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("inspect NFS socket group"),
+            }
+        };
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    group_usable,
+                    "NFS socket group {} is inaccessible or changed",
+                    group.display()
+                );
+                anyhow::ensure!(
+                    owned_nfs_socket_directory(&metadata, uid),
+                    "NFS socket directory {} has unexpected type, ownership or permissions",
+                    directory.display()
+                );
+                if selected.replace(socket).is_some() {
+                    bail!("multiple private NFS socket directories match this run");
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) if !group_usable && error.kind() == io::ErrorKind::PermissionDenied => {
+                // This group may have lost access since allocation. Another
+                // layout can still identify the run's endpoint.
+                inaccessible_group.get_or_insert_with(|| group.to_path_buf());
+            }
+            Err(error) => return Err(error).context("inspect NFS socket directory"),
+        }
+    }
+    if let (None, Some(group)) = (&selected, inaccessible_group) {
+        bail!(
+            "NFS socket group {} is inaccessible or changed",
+            group.display()
+        );
+    }
+    Ok(selected)
+}
+
+#[cfg(target_os = "macos")]
+fn owned_nfs_socket_directory(metadata: &fs::Metadata, uid: u32) -> bool {
+    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
 }
 
 #[cfg(target_os = "macos")]
@@ -347,13 +507,19 @@ pub fn cleanup_nfs_socket(id: &str, recorded: Option<&Path>) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn cleanup_nfs_socket_under(base: &Path, id: &str, recorded: Option<&Path>) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
+    let uid = unsafe { libc::geteuid() };
     let Some(socket) = selected_nfs_socket(base, id, recorded)? else {
+        if valid_nfs_socket_id(id) {
+            for group in nfs_socket_groups(base, uid) {
+                remove_empty_temporary_group(&group)
+                    .context("remove temporary NFS socket group")?;
+            }
+        }
         return Ok(());
     };
     let directory = socket.parent().unwrap();
     let group = directory.parent().unwrap();
     let grouped = group != base;
-    let uid = unsafe { libc::geteuid() };
     if grouped {
         match fs::symlink_metadata(group) {
             Ok(metadata) if usable_group(&metadata, uid, 0o100) => {}
@@ -372,7 +538,7 @@ fn cleanup_nfs_socket_under(base: &Path, id: &str, recorded: Option<&Path>) -> R
         }
         Err(error) => return Err(error).context("inspect NFS socket directory"),
     };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !owned_nfs_socket_directory(&metadata, uid) {
         bail!("NFS socket directory has unexpected type or ownership");
     }
     let source = nfs_mount_source(&socket);
@@ -525,6 +691,14 @@ mod temporary_group_tests {
     }
 
     #[test]
+    fn shared_root_is_eligible_for_runs_but_not_derived_socket_groups() {
+        let user = 501;
+        assert!(group_owner_matches(0, user, true));
+        assert!(!group_owner_matches(0, user, false));
+        assert!(group_owner_matches(user, user, false));
+    }
+
+    #[test]
     fn group_open_error_removes_the_new_empty_group() {
         let temporary = tempfile::tempdir().unwrap();
         OPEN_ERROR.set(Some(libc::EIO));
@@ -558,17 +732,6 @@ mod temporary_group_tests {
     }
 
     #[test]
-    fn an_entry_is_created_only_after_its_recovery_step_succeeds() {
-        let temporary = tempfile::tempdir().unwrap();
-        let result = create_temporary_entry_before(temporary.path(), "nfs-example", |path| {
-            assert!(!path.exists());
-            Err(io::Error::other("recording failed"))
-        });
-        assert_eq!(result.unwrap_err().to_string(), "recording failed");
-        assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
-    }
-
-    #[test]
     fn grouped_ssh_paths_fit_the_existing_path_budget() {
         let temporary = Path::new("/tmp");
         let previous = temporary.join("git-on-123456/ssh-control");
@@ -585,18 +748,65 @@ mod temporary_group_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn an_unsearchable_group_does_not_prevent_legacy_socket_cleanup() {
+    fn an_unsearchable_group_does_not_prevent_derived_socket_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let group = directory.path().join(TEMP_GROUP);
         fs::DirBuilder::new().mode(0o600).create(&group).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let legacy = directory.path().join(format!("git-on-nfs-{id}"));
-        fs::DirBuilder::new().mode(0o700).create(&legacy).unwrap();
+        let [_, _, legacy_socket] = nfs_socket_paths(directory.path(), &id);
+        let absent = cleanup_nfs_socket_under(directory.path(), &id, Some(&legacy_socket));
+        let legacy = legacy_socket.parent().unwrap();
+        fs::DirBuilder::new().mode(0o700).create(legacy).unwrap();
         let result = cleanup_nfs_socket_under(directory.path(), &id, None);
         fs::set_permissions(&group, fs::Permissions::from_mode(0o700)).unwrap();
+        absent.unwrap();
         result.unwrap();
         assert!(group.is_dir());
         assert!(!legacy.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn derived_cleanup_can_retry_after_permissions_are_restored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let group = temporary.path().join(TEMP_GROUP);
+        let endpoint = group.join(format!("nfs-{id}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&endpoint)
+            .unwrap();
+        for (path, mode) in [(&group, 0o600), (&endpoint, 0o750)] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            let result = cleanup_nfs_socket_under(temporary.path(), &id, None);
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(result.unwrap_err().to_string().contains("NFS socket"));
+            assert!(endpoint.is_dir());
+        }
+        cleanup_nfs_socket_under(temporary.path(), &id, None).unwrap();
+        assert!(!group.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn derived_cleanup_removes_empty_groups_when_the_endpoint_is_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let group = directory.path().join(TEMP_GROUP);
+        let private = directory.path().join(private_group_name(uid));
+        for path in [&group, &private] {
+            fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        let another_run = private.join("another-run");
+        fs::create_dir(&another_run).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        cleanup_nfs_socket_under(directory.path(), &id, None).unwrap();
+        assert!(!group.exists());
+        assert!(another_run.is_dir());
+        fs::remove_dir(&another_run).unwrap();
+        cleanup_nfs_socket_under(directory.path(), &id, None).unwrap();
+        assert!(!private.exists());
     }
 
     #[cfg(target_os = "macos")]

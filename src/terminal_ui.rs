@@ -2,7 +2,7 @@
 use anyhow::Result;
 mod progress;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-pub(crate) use progress::{diagnostics as progress_diagnostics, NativeProgress};
+pub(crate) use progress::{diagnostics as progress_diagnostics, NativeProgress, PackProgress};
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
@@ -258,7 +258,7 @@ impl StartupProgress {
                         }
                         last_tick = Instant::now();
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::park_timeout(Duration::from_millis(10));
                 }
                 pause_indication(&mut echo);
             })?;
@@ -273,6 +273,7 @@ impl StartupProgress {
         PREPARING.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
             if let Some(original) = self.original_stop.take() {
                 unsafe {

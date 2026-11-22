@@ -5,19 +5,13 @@ use git2::Oid;
 use sha1_checked::{Digest, Sha1};
 use std::{
     collections::HashMap,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     io::{BufRead, BufReader, Read},
     os::unix::ffi::OsStrExt,
     sync::Arc,
 };
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
-}
-#[derive(Clone, Debug)]
-pub(crate) struct TreeItem {
-    pub(crate) name: OsString,
-    pub(crate) mode: u32,
-    pub(crate) oid: Oid,
 }
 struct Node {
     name: Arc<OsStr>,
@@ -43,8 +37,16 @@ impl Directory {
             object.kind() == git2::ObjectType::Tree,
             "streamed object is not a tree"
         );
+        Self::from_verified_bytes(object.data())
+    }
+    pub(crate) fn from_odb(oid: Oid, object: &git2::OdbObject<'_>) -> Result<Self> {
+        anyhow::ensure!(object.id() == oid, "snapshot tree changed during transfer");
+        crate::object::verify_odb_object(object, git2::ObjectType::Tree)?;
+        Self::from_verified_bytes(object.data())
+    }
+    fn from_verified_bytes(data: &[u8]) -> Result<Self> {
         Self::parse(VerifiedBytes {
-            remaining: object.data(),
+            remaining: data,
             available: 0,
         })
     }
@@ -52,26 +54,20 @@ impl Directory {
         let mut parser = Parser::new(input);
         let mut entries = Vec::new();
         let mut names = HashMap::new();
-        while let Some(item) = parser.next()? {
+        let mut name_bytes = 0;
+        while let Some(node) = parser.next()? {
             if entries.len().is_multiple_of(256) {
                 crate::object::check_transfer()?;
             }
-            let name: Arc<OsStr> = Arc::from(OsStr::from_bytes(item.name));
-            if names.insert(name.clone(), entries.len()).is_some() {
+            name_bytes += node.name.len() + 3 * std::mem::size_of::<usize>();
+            if names.insert(node.name.clone(), entries.len()).is_some() {
                 return Err(invalid("duplicate path in Git tree"));
             }
-            entries.push(Node {
-                name,
-                mode: item.mode,
-                oid: item.oid,
-            });
+            entries.push(node);
         }
         let weight = std::mem::size_of::<Self>()
             + entries.capacity() * std::mem::size_of::<Node>()
-            + entries
-                .iter()
-                .map(|item| item.name.len() + 3 * std::mem::size_of::<usize>())
-                .sum::<usize>()
+            + name_bytes
             + 2 * names.capacity() * (std::mem::size_of::<(Arc<OsStr>, usize)>() + 1);
         Ok(Self {
             entries,
@@ -98,13 +94,6 @@ impl Directory {
             .get(index)
             .map(|node| (node.name.clone(), node.mode))
     }
-    fn owned(node: &Node) -> TreeItem {
-        TreeItem {
-            name: node.name.to_os_string(),
-            mode: node.mode,
-            oid: node.oid,
-        }
-    }
     /// Resolve metadata without allocating a copy of the already-known name.
     pub(crate) fn lookup(&self, name: &OsStr) -> Option<(u32, Oid)> {
         self.index(name).and_then(|index| self.metadata_at(index))
@@ -112,8 +101,10 @@ impl Directory {
     pub(crate) fn metadata_at(&self, index: usize) -> Option<(u32, Oid)> {
         self.entries.get(index).map(|node| (node.mode, node.oid))
     }
-    pub(crate) fn children(&self) -> Result<Vec<TreeItem>> {
-        Ok(self.entries.iter().map(Self::owned).collect())
+    pub(crate) fn children(&self) -> impl ExactSizeIterator<Item = (&OsStr, u32, Oid)> {
+        self.entries
+            .iter()
+            .map(|node| (node.name.as_ref(), node.mode, node.oid))
     }
 }
 // Parse the verified buffer directly while retaining the cancellation cadence
@@ -190,11 +181,6 @@ struct Parser<R> {
     input: R,
     name: Vec<u8>,
 }
-struct Item<'a> {
-    name: &'a [u8],
-    mode: u32,
-    oid: Oid,
-}
 impl<R: BufRead> Parser<R> {
     fn new(input: R) -> Self {
         Self {
@@ -202,7 +188,7 @@ impl<R: BufRead> Parser<R> {
             name: Vec::new(),
         }
     }
-    fn next(&mut self) -> Result<Option<Item<'_>>> {
+    fn next(&mut self) -> Result<Option<Node>> {
         // libgit2 accepts arbitrarily many leading zeroes but bounds the value
         // to UINT16_MAX before normalizing legacy modes. Parse incrementally so
         // preserving that behavior does not need an unbounded text buffer.
@@ -230,19 +216,7 @@ impl<R: BufRead> Parser<R> {
                 .context("Git tree mode overflow")?;
         }
         let mode = u32::from(mode);
-        self.name.clear();
-        // Git tree names have no platform NAME_MAX field. Keep one active name
-        // rather than imposing a parser limit from the current host filesystem;
-        // a materializer/kernel reports its actual representation limitation.
-        self.input.read_until(0, &mut self.name)?;
-        if self.name.last() != Some(&0) {
-            return Err(invalid("unterminated Git tree name"));
-        }
-        let length = self.name.len() - 1;
-        let name = &self.name[..length];
-        if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
-            return Err(invalid("invalid name in Git tree"));
-        }
+        let name = self.read_name()?;
         let mut oid = [0; 20];
         self.input.read_exact(&mut oid)?;
         // Preserve libgit2's normalized mode semantics, including legacy modes.
@@ -258,10 +232,73 @@ impl<R: BufRead> Parser<R> {
         } else {
             0o100644
         };
-        Ok(Some(Item {
+        Ok(Some(Node {
             name,
             mode,
             oid: Oid::from_bytes(&oid)?,
         }))
+    }
+
+    fn read_name(&mut self) -> Result<Arc<OsStr>> {
+        self.name.clear();
+        loop {
+            let bytes = match self.input.fill_buf() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if bytes.is_empty() {
+                return Err(invalid("unterminated Git tree name"));
+            }
+            if let Some(end) = memchr::memchr(0, bytes) {
+                // Copy from the input directly into the shared name when it
+                // fits in this chunk. Use scratch only across chunk boundaries.
+                let name = if self.name.is_empty() {
+                    &bytes[..end]
+                } else {
+                    self.name.extend_from_slice(&bytes[..end]);
+                    self.name.as_slice()
+                };
+                if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
+                    return Err(invalid("invalid name in Git tree"));
+                }
+                let name = Arc::from(OsStr::from_bytes(name));
+                self.input.consume(end + 1);
+                return Ok(name);
+            }
+            let count = bytes.len();
+            self.name.extend_from_slice(bytes);
+            self.input.consume(count);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::ObjectType;
+
+    #[test]
+    fn a_name_crossing_the_input_boundary_preserves_raw_bytes_and_the_next_entry() {
+        let mode = b"100644 ";
+        let mut long = vec![b'a'; 64 * 1024 - mode.len()];
+        *long.last_mut().unwrap() = 0xfe;
+        let short = b"file-\xff";
+        let oid = Oid::hash_object(ObjectType::Blob, b"blob").unwrap();
+        let mut bytes = Vec::new();
+        for name in [&long, short.as_slice()] {
+            bytes.extend_from_slice(mode);
+            bytes.extend_from_slice(name);
+            bytes.push(0);
+            bytes.extend_from_slice(oid.as_bytes());
+        }
+        let tree_oid = Oid::hash_object(ObjectType::Tree, &bytes).unwrap();
+        for tree in [
+            Directory::verified(tree_oid, bytes.len(), bytes.as_slice()).unwrap(),
+            Directory::from_verified_bytes(&bytes).unwrap(),
+        ] {
+            assert_eq!(tree.len(), 2);
+            assert_eq!(tree.lookup(OsStr::from_bytes(&long)), Some((0o100644, oid)));
+            assert_eq!(tree.at(1), Some((OsStr::from_bytes(short), 0o100644)));
+        }
     }
 }

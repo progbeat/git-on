@@ -73,12 +73,21 @@ class ObjectReuseTests(unittest.TestCase):
     def test_session_counts_replace_native_demands_without_hiding_repeat_work(self):
         good=dict(child_observations=[dict(completed=p,files=160,payload_bytes=1310720,metadata_result_bytes=23040) for p in ('first','repeat')],
             metrics=dict(remote_fetches=162,remote_raw_blob_imports=160,remote_raw_blob_bytes=1310720,blob_loads=160,blob_cache_bytes=100,blob_cache_limit=8388608,
-                remote_fetch_operations=1,remote_decode_operations=0,remote_session_fetch_operations=161,remote_session_decode_operations=161,remote_session_starts=1),
-            fuse_requests={'read':1},native_commands={'fetch':1})
+                remote_fetch_operations=0,remote_decode_operations=0,remote_session_fetch_operations=162,remote_session_decode_operations=162,remote_session_starts=1),
+            fuse_requests={'read':1},native_commands={})
         validate_runner(good,160,8192,144,'fuse')
         for key in ('remote_fetch_operations','remote_decode_operations','remote_session_fetch_operations','remote_session_decode_operations','remote_session_starts'):
             broken=copy.deepcopy(good);broken['metrics'][key]+=1
             with self.assertRaises(AssertionError):validate_runner(broken,160,8192,144,'fuse')
+
+        eager = object_reuse_row('a' * 40, 'materialized')
+        eager['metrics'].update(remote_fetch_operations=0, remote_session_fetch_operations=1,
+                                remote_session_decode_operations=1, remote_session_starts=1)
+        eager['native_commands'] = {}
+        validate_runner(eager, 32, 8192, 144, 'materialized')
+        eager['metrics']['remote_session_decode_operations'] += 1
+        with self.assertRaises(AssertionError):
+            validate_runner(eager, 32, 8192, 144, 'materialized')
 
 
 if __name__=='__main__':unittest.main()

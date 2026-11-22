@@ -2,9 +2,11 @@
 //! real upload-pack protocol and filters; SSH/HTTPS are separately exercised.
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
-use std::{ffi::OsStr, path::Path, process::Command};
+use std::{ffi::OsStr, path::Path};
 #[cfg(target_os = "linux")]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+const _: fn(&git_on::remote::Remote) -> anyhow::Result<()> = git_on::remote::Remote::stop_transport;
 
 fn fixture() -> (tempfile::TempDir, Oid, Oid, Oid) {
     let temp = tempfile::tempdir().unwrap();
@@ -63,8 +65,8 @@ fn load_operands(
         verify,
         false,
         &run,
-        "test",
-        |_, _, _| Ok(()),
+        "test-pin",
+        |_, _, _| panic!("loading a snapshot should leave Git references alone"),
     )
 }
 #[test]
@@ -148,18 +150,16 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
 }
 
 #[test]
-fn remote_metadata_and_payloads_are_demanded_and_pinned() {
-    let (temp, commit, tree, untouched) = fixture();
+fn remote_metadata_and_payloads_stay_bound_to_the_selected_snapshot() {
+    let (temp, _, tree, _) = fixture();
     let snap = load(temp.path(), "HEAD", false).unwrap();
     assert_eq!(snap.tree_oid, tree);
-    let run_repo = Repository::open_bare(&snap.git_dir).unwrap();
-    let odb = run_repo.odb().unwrap();
-    assert!(odb.exists(commit));
-    assert!(!odb.exists(untouched));
-    assert_eq!(snap.metrics().blob_loads, 0);
+    let startup = snap.metrics();
+    assert_eq!(startup.remote_fetches, 2);
+    assert_eq!(startup.blob_loads, 0);
     let names = snap.children(Path::new("")).unwrap();
     assert_eq!(names.len(), 2);
-    assert!(!odb.exists(untouched));
+    assert_eq!(snap.metrics().remote_fetches, startup.remote_fetches);
     let server = Repository::open_bare(temp.path().join("server")).unwrap();
     server
         .find_reference("refs/heads/main")
@@ -168,35 +168,17 @@ fn remote_metadata_and_payloads_are_demanded_and_pinned() {
         .unwrap();
     let entry = snap.entry(Path::new("deep/value")).unwrap().unwrap();
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
-    odb.refresh().unwrap();
-    assert!(!odb.exists(untouched));
     assert_eq!(snap.tree_oid, tree);
-    let objects = Command::new("git")
-        .arg("--git-dir")
-        .arg(&snap.git_dir)
-        .args(["cat-file", "--batch-all-objects", "--batch-check"])
-        .output()
-        .unwrap();
-    assert!(objects.status.success());
-    assert_eq!(
-        objects
-            .stdout
-            .split(|x| *x == b'\n')
-            .filter(|x| !x.is_empty())
-            .count(),
-        // Only the selected commit and pinned root tree use the metadata ODB.
-        2
-    );
-    assert_eq!(snap.metrics().remote_raw_blob_imports, 1);
+    let first = snap.metrics();
+    assert_eq!(first.remote_fetches, 4);
+    assert_eq!(first.remote_raw_blob_imports, 1);
     let pack_bytes = (
-        snap.metrics().remote_native_pack_bytes,
-        snap.metrics().remote_session_pack_bytes,
+        first.remote_native_pack_bytes,
+        first.remote_session_pack_bytes,
     );
-    assert!(pack_bytes.0 > 0);
     assert!(pack_bytes.0 + pack_bytes.1 > b"selected\n".len() as u64);
-    let fetches = snap.metrics().remote_fetches;
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
-    assert_eq!(snap.metrics().remote_fetches, fetches);
+    assert_eq!(snap.metrics().remote_fetches, first.remote_fetches);
     assert_eq!(snap.metrics().blob_loads, 1);
     assert_eq!(
         (
@@ -315,7 +297,7 @@ fn eager_remote_batches_are_bounded_and_reuse_objects_across_batch_boundaries() 
             &[&server.find_commit(parent).unwrap()],
         )
         .unwrap();
-    let snapshot = load(temp.path(), "HEAD", false).unwrap();
+    let snapshot = load(temp.path(), "HEAD:", false).unwrap();
     let destination = temp.path().join("view");
     std::fs::create_dir(&destination).unwrap();
     git_on::materialize::materialize(&snapshot, &destination).unwrap();

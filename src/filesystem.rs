@@ -6,7 +6,7 @@ use crate::directory_view::{
     Cursor as DirectoryCursor, Rows as DirectoryRows, Version as DirectoryVersion,
 };
 use crate::policy::{Policy, WritePolicy};
-use crate::raw_blob::ReadData;
+use crate::raw_blob::{BlobBytes, ReadData};
 use crate::snapshot::{BlobReader, Entry, EntryKind, Snapshot, BLOB_CACHE_BYTES};
 use anyhow::{Context, Result};
 use git2::Oid;
@@ -42,7 +42,7 @@ struct Node {
     create_verifier: Option<[u8; 8]>,
     lookups: u64,
     snapshot_path: Option<PathBuf>,
-    bytes: Vec<u8>,
+    link_target: Option<BlobBytes>,
     file: Option<File>,
     external_io: bool,
     pending_unlink: bool,
@@ -234,6 +234,7 @@ pub struct Overlay {
     source_directories: Vec<SourceDirectory>,
     source_directory_keys: HashMap<PathBuf, usize>,
     prefetch_frontier: VecDeque<usize>,
+    enumerating_snapshot: bool,
     #[cfg(test)]
     directory_prepared_rows: usize,
     next_ino: u64,
@@ -316,7 +317,7 @@ impl Overlay {
                 create_verifier: None,
                 lookups: 1,
                 snapshot_path: Some(PathBuf::new()),
-                bytes: Vec::new(),
+                link_target: None,
                 file: None,
                 external_io: false,
                 pending_unlink: false,
@@ -345,6 +346,7 @@ impl Overlay {
             source_directories: Vec::new(),
             source_directory_keys: HashMap::new(),
             prefetch_frontier: VecDeque::new(),
+            enumerating_snapshot: false,
             #[cfg(test)]
             directory_prepared_rows: 0,
             next_ino: 2,
@@ -481,7 +483,7 @@ impl Overlay {
                 create_verifier: None,
                 lookups: 0,
                 snapshot_path: Some(source),
-                bytes: Vec::new(),
+                link_target: None,
                 file: None,
                 external_io: false,
                 pending_unlink: false,
@@ -656,10 +658,11 @@ impl Overlay {
         ino: u64,
         path: &Path,
     ) -> FsResult<(DirectoryEntries, Option<DirectoryRows>)> {
-        let source = self
-            .node(ino)?
-            .snapshot_path
-            .clone()
+        let source = self.node(ino)?.snapshot_path.clone();
+        if source.is_some() {
+            self.begin_directory_enumeration();
+        }
+        let source = source
             .map(|source| self.source_directory(&source))
             .transpose()?;
         if let Some(key) = source {
@@ -721,6 +724,13 @@ impl Overlay {
             DirectoryEntries::Merged(version)
         };
         Ok((entries, rows))
+    }
+
+    pub(crate) fn begin_directory_enumeration(&mut self) {
+        if !self.enumerating_snapshot {
+            self.enumerating_snapshot = true;
+            self._snapshot.begin_directory_enumeration();
+        }
     }
     fn close_handle(&mut self, ino: u64, fh: u64) {
         let _ = self.refresh_backing_attr(ino);
@@ -1107,7 +1117,7 @@ impl Overlay {
                 create_verifier: None,
                 lookups: 0,
                 snapshot_path: None,
-                bytes,
+                link_target: (kind == FileType::Symlink).then(|| BlobBytes::from(bytes)),
                 file: None,
                 external_io: false,
                 pending_unlink: false,
@@ -1429,7 +1439,11 @@ impl Overlay {
                 .map_err(snapshot_errno)?
                 .is_some()
             {
-                for (name, _) in self._snapshot.children(&source).map_err(snapshot_errno)? {
+                let directory = self._snapshot.directory(&source).map_err(snapshot_errno)?;
+                let children = Snapshot::directory_children(&directory, &source)
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(snapshot_errno)?;
+                for (name, _) in children {
                     if self.lower_path(&p.join(name)).is_some() {
                         return Ok(false);
                     }
@@ -1693,7 +1707,20 @@ impl Overlay {
     ) -> Option<crate::snapshot::PendingObject> {
         let snapshot = self._snapshot.clone();
         let files = inode.and_then(|ino| self.opened_files_after(ino));
-        snapshot.start_remote_demand(oid, files.map(|files| move |dense| files.prioritize(dense)))
+        snapshot.start_remote_demand(
+            oid,
+            false,
+            files.map(|files| move |dense| files.prioritize(dense)),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_remote_tree_demand(
+        &self,
+        oid: Oid,
+    ) -> Option<crate::snapshot::PendingObject> {
+        let no_read_ahead: Option<fn(bool) -> std::iter::Empty<Oid>> = None;
+        self._snapshot.start_remote_demand(oid, true, no_read_ahead)
     }
 
     fn opened_files_after(&mut self, ino: u64) -> Option<OpenedFiles<'_>> {
@@ -1909,15 +1936,16 @@ impl Overlay {
         self.ensure_size(ino)?;
         Ok(self.node(ino)?.attr)
     }
-    pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<Vec<u8>> {
+    pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<ReadData> {
         let n = self.node(ino)?;
         if n.attr.kind != FileType::Symlink {
             return Err(libc::EINVAL);
         }
         if let Some(oid) = n.oid {
-            self._snapshot.read_link(oid).map_err(snapshot_errno)
+            self._snapshot.read_link_shared(oid).map_err(snapshot_errno)
         } else {
-            Ok(n.bytes.clone())
+            let target = n.link_target.as_ref().ok_or(libc::EIO)?;
+            Ok(ReadData::Shared(target.clone(), 0..target.len()))
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3440,7 +3468,7 @@ mod tests {
         let fh = fs.open_file(ino, libc::O_RDONLY).unwrap();
         assert_eq!(fs.read_data(ino, fh, 7, 100).unwrap(), b"content\n");
         assert!(fs.read_data(ino, fh, 999, 100).unwrap().is_empty());
-        assert_eq!(fs.read_data(ino, fh, -1, 1), Err(libc::EINVAL));
+        assert_eq!(fs.read_data(ino, fh, -1, 1).unwrap_err(), libc::EINVAL);
         assert_eq!(fs.open_file(ino, libc::O_RDWR), Err(libc::EROFS));
         assert_eq!(
             fs.open_file(ino, libc::O_RDONLY | libc::O_TRUNC),
@@ -3464,11 +3492,15 @@ mod tests {
             Err(libc::EEXIST)
         );
         let link = fs.ensure(Path::new("link")).unwrap();
+        let first = fs.read_link(link).unwrap();
+        let second = fs.read_link(link).unwrap();
+        let first = first.chunks().next().unwrap();
+        let second = second.chunks().next().unwrap();
+        assert_eq!(first, b"tracked.tmp");
         assert_eq!(
-            fs._snapshot
-                .read_link(fs.nodes[&link].oid.unwrap())
-                .unwrap(),
-            b"tracked.tmp"
+            first.as_ptr(),
+            second.as_ptr(),
+            "repeated readlink copied the verified target"
         );
     }
     #[test]

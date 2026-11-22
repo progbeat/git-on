@@ -5,7 +5,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use git2::{ObjectType, Oid};
 use sha1_checked::{Digest, Sha1};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::BufRead,
     mem::MaybeUninit,
     sync::{
@@ -50,26 +50,33 @@ impl VerifiedObject {
 }
 
 type Publish<'a> = Box<dyn FnMut(VerifiedObject) -> Result<()> + Send + 'a>;
-type Required = Box<dyn Fn(&[Oid]) -> bool + Send>;
+type DecodePriority = Box<dyn Fn(&[Oid]) -> crate::raw_blob::PackDecodePriority + Send>;
 type PendingExtra = Box<dyn FnMut(Oid) + Send>;
 
 pub(crate) struct Received {
     pub(crate) bytes: u64,
+    pub(crate) eager_verified_capacity: usize,
     extras: Vec<VerifiedObject>,
 }
 
 impl Received {
-    pub(crate) fn cache_extras(&mut self, scratch: &RawBlobs, mut record: impl FnMut(Oid)) {
+    pub(crate) fn cache_extras(
+        &mut self,
+        scratch: &RawBlobs,
+        source: Option<&Arc<crate::raw_blob::Transfer>>,
+        mut record: impl FnMut(Oid),
+    ) {
         let extras = std::mem::take(&mut self.extras);
         for entry in &extras {
             record(entry.oid);
         }
-        scratch.remember_verified(extras);
+        scratch.remember_verified(extras, source);
     }
 }
 
 pub(crate) struct Response<'a> {
     pack: Pack<'a>,
+    progress: Option<crate::terminal_ui::PackProgress>,
     phase: Phase,
     header: [u8; 4],
     header_len: usize,
@@ -84,6 +91,7 @@ pub(crate) struct Response<'a> {
 enum Phase {
     Section,
     Shallow,
+    PackHeader,
     Pack,
     Done,
 }
@@ -96,8 +104,9 @@ impl<'a> Response<'a> {
                 stop: None,
                 wants,
                 publish,
+                snapshot: None,
                 pending_extra: None,
-                required: None,
+                decode_priority: None,
                 bytes: 0,
                 pending: Vec::new(),
                 checksum: Checksum::default(),
@@ -108,6 +117,7 @@ impl<'a> Response<'a> {
                 accepts_surplus: false,
                 bases: None,
             },
+            progress: None,
             phase: Phase::Section,
             header: [0; 4],
             header_len: 0,
@@ -119,12 +129,28 @@ impl<'a> Response<'a> {
         }
     }
 
+    pub(crate) fn for_materialization(scratch: RawBlobs, oid: Oid) -> Self {
+        let mut response = Self::new(scratch, vec![oid], Box::new(|_| Ok(())));
+        // Eager execution starts only after the whole pack is validated.
+        // Retain the selected object with the rest instead of publishing it early.
+        response.pack.snapshot = Some(SnapshotSelection {
+            oid,
+            shallow: HashSet::new(),
+        });
+        response.progress =
+            crate::terminal_ui::progress_enabled().then(crate::terminal_ui::PackProgress::new);
+        response
+    }
+
     pub(crate) fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
         self.pack.stop = stop;
     }
 
-    pub(crate) fn set_required(&mut self, required: impl Fn(&[Oid]) -> bool + Send + 'static) {
-        self.pack.required = Some(Box::new(required));
+    pub(crate) fn set_decode_priority(
+        &mut self,
+        priority: impl Fn(&[Oid]) -> crate::raw_blob::PackDecodePriority + Send + 'static,
+    ) {
+        self.pack.decode_priority = Some(Box::new(priority));
     }
 
     pub(crate) fn on_pending_extra(&mut self, pending: impl FnMut(Oid) + Send + 'static) {
@@ -153,7 +179,7 @@ impl<'a> Response<'a> {
                 self.header_len = 0;
                 match crate::transport::packet_length(&self.header)? {
                     0 if matches!(self.phase, Phase::Pack) => self.phase = Phase::Done,
-                    1 if matches!(self.phase, Phase::Shallow) => self.phase = Phase::Section,
+                    1 if matches!(self.phase, Phase::Shallow) => self.phase = Phase::PackHeader,
                     length @ 5..=65520 => {
                         self.remaining = length - 4;
                         self.channel = None;
@@ -180,8 +206,18 @@ impl<'a> Response<'a> {
                     }
                 };
                 match channel {
-                    1 => self.pack.write(payload)?,
-                    2 => (),
+                    1 => {
+                        self.pack.write(payload)?;
+                        if let (Some(progress), Some(total)) = (&mut self.progress, self.pack.count)
+                        {
+                            progress.received(self.pack.entries, total, self.pack.bytes);
+                        }
+                    }
+                    2 => {
+                        if let Some(progress) = &mut self.progress {
+                            progress.remote(payload);
+                        }
+                    }
                     3 | b'E' => self.text.extend_from_slice(payload),
                     _ => bail!("invalid Git pack sideband"),
                 }
@@ -196,7 +232,11 @@ impl<'a> Response<'a> {
     }
 
     fn finish_packet(&mut self) -> Result<()> {
-        if matches!(self.phase, Phase::Section | Phase::Shallow) || self.channel == Some(b'E') {
+        if matches!(
+            self.phase,
+            Phase::Section | Phase::Shallow | Phase::PackHeader
+        ) || self.channel == Some(b'E')
+        {
             crate::transport::check_packet_error(&self.text)?;
         }
         match self.phase {
@@ -205,10 +245,24 @@ impl<'a> Response<'a> {
                 b"shallow-info" => self.phase = Phase::Shallow,
                 _ => bail!("invalid Git fetch response section"),
             },
-            Phase::Shallow => ensure!(
-                self.text.starts_with(b"shallow ") || self.text.starts_with(b"unshallow "),
-                "invalid Git shallow section"
-            ),
+            Phase::Shallow => {
+                // Requests start without any advertised shallow boundary.
+                let oid = crate::transport::packet_text(&self.text)
+                    .strip_prefix(b"shallow ")
+                    .filter(|oid| oid.len() == 40)
+                    .and_then(|oid| Oid::from_str(std::str::from_utf8(oid).ok()?).ok())
+                    .context("invalid Git shallow section")?;
+                if let Some(snapshot) = &mut self.pack.snapshot {
+                    snapshot.shallow.insert(oid);
+                }
+            }
+            Phase::PackHeader => {
+                ensure!(
+                    crate::transport::packet_text(&self.text) == b"packfile",
+                    "invalid Git fetch response section"
+                );
+                self.phase = Phase::Pack;
+            }
             Phase::Pack if self.channel == Some(3) => {
                 bail!(
                     "remote pack failed: {}",
@@ -259,8 +313,9 @@ struct Pack<'a> {
     stop: Option<Arc<AtomicBool>>,
     wants: Vec<Oid>,
     publish: Publish<'a>,
+    snapshot: Option<SnapshotSelection>,
     pending_extra: Option<PendingExtra>,
-    required: Option<Required>,
+    decode_priority: Option<DecodePriority>,
     bytes: u64,
     pending: Vec<u8>,
     checksum: Checksum,
@@ -270,6 +325,11 @@ struct Pack<'a> {
     entry: Option<Entry>,
     accepts_surplus: bool,
     bases: Option<PackBases>,
+}
+
+struct SnapshotSelection {
+    oid: Oid,
+    shallow: HashSet<Oid>,
 }
 
 struct Entry {
@@ -318,6 +378,7 @@ struct PackBases {
     objects: HashMap<Oid, VerifiedObject>,
     pending: HashMap<BaseReference, Vec<PendingDelta>>,
     extras: Vec<VerifiedObject>,
+    eager_verified_capacity: usize,
 }
 
 impl PackBases {
@@ -327,6 +388,71 @@ impl PackBases {
             BaseReference::Oid(oid) => oid,
         };
         self.objects.contains_key(&oid).then_some(oid)
+    }
+
+    fn check_snapshot(
+        &self,
+        selection: &SnapshotSelection,
+        stop: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let get = |oid: Oid| {
+            self.objects
+                .get(&oid)
+                .with_context(|| format!("shallow pack omitted required object {oid}"))
+        };
+        let mut selected = get(selection.oid)?;
+        while selected.kind == ObjectType::Tag {
+            check_transfer(stop)?;
+            selected = get(object::selected_child(selected.kind, selected.data())?)?;
+        }
+        if selected.kind != ObjectType::Commit || selection.shallow.contains(&selected.oid) {
+            return Ok(());
+        }
+        // Materialization checks the selected tree. If the server did not
+        // declare the selected commit shallow, native fetch also expects the
+        // reachable history and its trees up to the declared boundaries.
+        let mut pending = Vec::new();
+        let tree = object::commit_links(selected.data(), |parent| {
+            pending.push((parent, ObjectType::Commit));
+        })?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut visited = HashSet::from([selected.oid, tree]);
+        while let Some((oid, kind)) = pending.pop() {
+            check_transfer(stop)?;
+            let verified = self
+                .objects
+                .get(&oid)
+                .with_context(|| format!("shallow pack omitted required {} {oid}", kind.str()))?;
+            ensure!(
+                verified.kind == kind,
+                "shallow pack references {oid} as a {}",
+                kind.str()
+            );
+            if kind == ObjectType::Blob || !visited.insert(oid) {
+                continue;
+            }
+            if kind == ObjectType::Commit {
+                let tree = object::commit_links(verified.data(), |parent| {
+                    if !selection.shallow.contains(&oid) {
+                        pending.push((parent, ObjectType::Commit));
+                    }
+                })?;
+                pending.push((tree, ObjectType::Tree));
+            } else {
+                let directory = crate::tree::Directory::from_verified(verified)?;
+                for index in 0..directory.len() {
+                    let (mode, oid) = directory.metadata_at(index).expect("tree entry");
+                    match mode {
+                        0o040000 => pending.push((oid, ObjectType::Tree)),
+                        0o160000 => (), // Gitlinks name objects outside the repository.
+                        _ => pending.push((oid, ObjectType::Blob)),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -469,7 +595,7 @@ impl Pack<'_> {
                 self.count = Some(count);
                 self.accepts_surplus = count > self.wants.len();
                 position = 12;
-                if count > 1 {
+                if count > 1 || self.snapshot.is_some() {
                     self.bases = Some(PackBases::default());
                 }
                 count
@@ -597,10 +723,12 @@ impl Pack<'_> {
             let wanted = self.wants.iter().position(|&item| item == oid);
             if let Some(want) = wanted {
                 self.wants.swap_remove(want);
-                if self.bases.is_none() {
-                    return (self.publish)(object);
+                if self.snapshot.is_none() {
+                    if self.bases.is_none() {
+                        return (self.publish)(object);
+                    }
+                    (self.publish)(object.clone())?;
                 }
-                (self.publish)(object.clone())?;
             } else if self.bases.is_none() {
                 bail!("remote supplied unexpected object {oid} in a single-entry pack");
             } else if !self.accepts_surplus {
@@ -608,7 +736,13 @@ impl Pack<'_> {
             }
             let bases = self.bases.as_mut().expect("multi-object stream");
             if let std::collections::hash_map::Entry::Vacant(slot) = bases.objects.entry(oid) {
-                if wanted.is_none() && self.scratch.get(oid)?.is_none() {
+                if self.snapshot.is_some() {
+                    // Pack bases and extras can own the same buffer.
+                    bases.eager_verified_capacity += object.data.capacity();
+                }
+                if (wanted.is_none() || self.snapshot.is_some())
+                    && self.scratch.needs_pack_proof(oid)
+                {
                     bases.extras.push(object.clone());
                     if let Some(pending) = &mut self.pending_extra {
                         pending(oid);
@@ -669,9 +803,11 @@ impl Pack<'_> {
             .then(|| {
                 self.scratch.reserve_pack_decode(
                     || {
-                        self.required
+                        self.decode_priority
                             .as_ref()
-                            .is_none_or(|required| required(&self.wants))
+                            .map_or(crate::raw_blob::PackDecodePriority::Demand, |priority| {
+                                priority(&self.wants)
+                            })
                     },
                     || self.check_transfer(),
                 )
@@ -688,14 +824,18 @@ impl Pack<'_> {
         if let Some(oid) = self.wants.first() {
             bail!("remote did not supply requested object {oid}");
         }
-        let extras = if let Some(bases) = self.bases.take() {
+        let (extras, eager_verified_capacity) = if let Some(bases) = self.bases.take() {
             ensure!(bases.pending.is_empty(), "Git pack omitted a delta base");
-            bases.extras
+            if let Some(selection) = &self.snapshot {
+                bases.check_snapshot(selection, self.stop.as_deref())?;
+            }
+            (bases.extras, bases.eager_verified_capacity)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
         Ok(Received {
             bytes: self.bytes,
+            eager_verified_capacity,
             extras,
         })
     }
@@ -804,7 +944,7 @@ mod tests {
 
     fn verified_extra(store: &RawBlobs, oid: Oid) -> VerifiedObject {
         match store.received(oid) {
-            Some(ReceivedObject::Verified(object)) => object,
+            Some(ReceivedObject::Verified { object, .. }) => object,
             _ => panic!("expected a verified extra Git object"),
         }
     }
@@ -890,7 +1030,7 @@ mod tests {
         assert!(scratch.get(base_oid).unwrap().is_none());
         response.pack.write(&Sha1::digest(&pack)).unwrap();
         let mut received = response.pack.finish().unwrap();
-        received.cache_extras(&scratch, |_| {});
+        received.cache_extras(&scratch, None, |_| {});
         assert_eq!(verified_extra(&scratch, base_oid).data(), base);
     }
 
@@ -971,7 +1111,7 @@ mod tests {
         response.pack.write(&Sha1::digest(&pack)).unwrap();
         let mut received = response.pack.finish().unwrap();
         assert_eq!(received.extras.len(), 11);
-        received.cache_extras(&scratch, |_| {});
+        received.cache_extras(&scratch, None, |_| {});
         let surplus = Oid::hash_object(ObjectType::Blob, &vec![9; base.len()]).unwrap();
         assert!(scratch.get(surplus).unwrap().is_none());
         assert_eq!(
@@ -1017,7 +1157,7 @@ mod tests {
         response.pack.write(&pack).unwrap();
         response.pack.write(&Sha1::digest(&pack)).unwrap();
         let mut received = response.pack.finish().unwrap();
-        received.cache_extras(&scratch, |_| {});
+        received.cache_extras(&scratch, None, |_| {});
         assert_eq!(verified_extra(&scratch, oids[1]).data(), bases[1]);
         assert_eq!(DELTA_APPLICATIONS.get(), usize::from(depth) * 2);
     }
@@ -1048,7 +1188,7 @@ mod tests {
             .pack
             .finish()
             .unwrap()
-            .cache_extras(&scratch, |_| {});
+            .cache_extras(&scratch, None, |_| {});
 
         assert_eq!(verified_extra(&scratch, oid).data(), base);
         assert_eq!(std::fs::read(selected.path().join("pack")).unwrap(), base);
@@ -1180,6 +1320,17 @@ mod tests {
             };
             assert!(error.unwrap_err().to_string().contains("trailer"));
         }
+    }
+
+    #[test]
+    fn snapshot_rejects_an_invalid_shallow_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let mut response = Response::for_materialization(scratch, Oid::zero());
+        let error = response
+            .write_http(b"0011shallow-info\n0014shallow invalid\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid Git shallow section"));
     }
 
     #[test]

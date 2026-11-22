@@ -269,6 +269,7 @@ impl Server {
         }
         self.require_access(&Context::new(credentials), ino, libc::R_OK | libc::X_OK)
             .ok()?;
+        self.core.begin_directory_enumeration();
         Some(ObjectDemand::Final(oid, None))
     }
 
