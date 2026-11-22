@@ -282,6 +282,39 @@ class Http2Tests(unittest.TestCase):
                     self.assertEqual(report['remote_http2_fetch_operations'], 0, report)
                     self.assertEqual(report['remote_native_pack_bytes'], 0, report)
 
+    def test_lazy_https_respects_native_fetch_configuration(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        backend = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        token = base64.b64encode(b'fixture:example-password').decode()
+        proxy = Multiplexer(fixture, backend, 'Basic ' + token)
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        source = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        oracle = fixture.root / 'native-fetch.git'
+        fixture.git('init', '--bare', '--quiet', oracle, at=fixture.root)
+        env = dict(fixture.env, GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='credential.helper',
+                   GIT_CONFIG_VALUE_0='!f() { echo username=fixture; echo password=example-password; }; f',
+                   GIT_CONFIG_KEY_1='fetch.prune', GIT_CONFIG_VALUE_1='invalid')
+        native = subprocess.run(
+            ['git', '--git-dir', oracle, 'fetch', '--no-tags', '--depth=1',
+             '--filter=tree:0', '--', source, fixture.commit],
+            cwd=fixture.cwd, env=env, capture_output=True, timeout=15,
+        )
+        self.assertNotEqual(native.returncode, 0, native.stdout)
+        self.assertIn(b'fetch.prune', native.stderr)
+        for revision in ('main', fixture.commit):
+            with self.subTest(revision=revision):
+                result = subprocess.run(
+                    [OPTIONS.probe, source, revision], input=b'exit\n',
+                    cwd=fixture.cwd, env=env, capture_output=True, timeout=15,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, b'')
+                self.assertIn(b'fetch.prune', result.stderr)
+
     def test_https_native_fallback_keeps_the_selected_revision(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)

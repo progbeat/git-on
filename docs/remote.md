@@ -57,8 +57,9 @@ full OID, an unambiguous branch, or `HEAD` from `upload-pack` from the first
 filtered fetch. Git's `fetch-pack --diag-url` resolves paths that need URL
 parsing. Its private Git directory is also available to the compatibility
 path. The stream does not write a pack or index there. Named selections that
-require `want-ref`, unknown formats, and configured fetch behavior retain
-native fetch.
+require `want-ref` and unknown formats retain native fetch. For every
+transport, native Git applies caller settings that the streaming path cannot
+honor when it selects the initial revision.
 A full SHA-1 object ID or unambiguous branch can use the reusable HTTPS channel
 for the initial fetch after the server advertises filtering. A named branch
 uses `ls-refs` to resolve its OID. With a full OID, the first fetch can handle

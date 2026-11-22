@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Increasing distinct-object demand: observe retained packs and pack-index work.
+"""Observe native pack and index work with increasing distinct-object demand.
 
 strace observes only the loader, excluding native Git subprocesses. Source-probe
 reports only counters between reads, then enumerates available OIDs once.
@@ -30,21 +30,30 @@ def exercise(binary,count,before=False):
         argv=['strace','-ttt','-T','-yy','-e','trace=getdents64,newfstatat,statx','-o',str(trace),str(binary.resolve()),'file://'+str(f.repo),'HEAD']
         if not before: argv.append('--metrics-only')
         commands=(''.join(f'read f{index:04d}\n' for index in range(count))*2+'report\nexit\n').encode()
+        # An explicit fetch policy selects the native compatibility path
+        # without changing Git's default object verification setting.
+        env = dict(f.env, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='fetch.fsckObjects',
+                   GIT_CONFIG_VALUE_0='false')
         begin=time.monotonic_ns()
-        result=subprocess.run(argv,cwd=f.cwd,env=f.env,input=commands,capture_output=True,check=True)
+        result=subprocess.run(argv,cwd=f.cwd,env=env,input=commands,capture_output=True,check=True)
         rows=[json.loads(row) for row in result.stdout.splitlines()]
         values=[row['data'] for row in rows if 'data' in row]
         assert values==[f'object-{i}\n' for i in range(count)]*2
         reports=[row for row in rows if 'metrics' in row]
         first=reports[count]['metrics'];second=reports[-1]['metrics']
-        assert set(reports[-1]['objects'])=={commit,tree,*oids},'private ODB lost available objects'
+        expected={commit,tree,*oids}
+        assert set(reports[-1]['objects'])==expected,'private ODB lost available objects'
         if not before: assert all('objects' not in row for row in reports[:-1]),'per-read ODB enumeration returned'
         if before:
-            assert second['disk_cache']['misses']==first['disk_cache']['misses']
-            assert second['disk_cache']['stores']==first['disk_cache']['stores']
+            assert first['blob_loads'] == count, first
+            assert set(reports[count]['objects']) == expected, 'historical probe missed objects on first pass'
+            if 'remote_fetches' in first:
+                assert second['remote_fetches'] == first['remote_fetches'], 'historical probe refetched available objects'
         else:
             assert first['remote_fetches']==count+2,first
             assert second['remote_fetches']==first['remote_fetches'],'available run objects fetched again'
+            assert second['remote_fetch_operations'] == first['remote_fetch_operations'] > 0, second
+            assert second['remote_session_fetch_operations'] == 0, second
         pack_bytes=pack_metadata=0
         for line in trace.read_text().splitlines():
             if '/remote-repository/objects/pack' not in line: continue
@@ -56,7 +65,7 @@ def exercise(binary,count,before=False):
         # retained pack counts are covered by the interactive permanent test.
         observation=dict(binary=str(binary),distinct_blobs=count,passes=2,pack_directory_bytes_enumerated=pack_bytes,
             pack_metadata_syscalls=pack_metadata,elapsed_ns=time.monotonic_ns()-begin,metrics=second,
-            baseline=before,object_storage='private run ODB; second pass same run' if not before else 'historical global cache',measurement='loader-only strace; final OID enumeration once' if not before else 'historical helper enumerates OIDs per read')
+            baseline=before,object_storage='private run ODB; second pass same run' if not before else 'historical loader; second pass same run',measurement='loader-only strace; final OID enumeration once' if not before else 'historical helper enumerates OIDs per read')
         if not before:
             assert 0<pack_bytes<=2048*(count+2),observation
             assert 0<pack_metadata<=64*(count+2),observation

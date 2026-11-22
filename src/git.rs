@@ -271,10 +271,10 @@ impl Git {
         })
     }
 
-    pub(crate) fn fetch_settings_require_native_git(&self) -> bool {
-        self.config
-            .iter()
-            .any(|(key, value)| !streaming_fetch_config(key.as_bytes(), value.as_deref()))
+    pub(crate) fn fetch_settings_require_native_git(&self, materializing: bool) -> bool {
+        self.config.iter().any(|(key, value)| {
+            !streaming_fetch_config(key.as_bytes(), value.as_deref(), materializing)
+        })
     }
 
     pub(crate) fn has_fetch_mapping(&self, source: &OsStr) -> Result<bool> {
@@ -423,7 +423,7 @@ fn fetch_mapping_remote(key: &[u8]) -> Option<&[u8]> {
     key.strip_prefix(b"remote.")?.strip_suffix(b".fetch")
 }
 
-fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>) -> bool {
+fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>, materializing: bool) -> bool {
     // Git fetch validates settings outside fetch.*, even with no worktree or
     // destination ref. Delegate unfamiliar settings to that command so new
     // config keys retain their native validation and behavior.
@@ -445,6 +445,9 @@ fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>) -> bool {
             .and_then(OsStr::to_str)
             .is_some_and(|name| git2::Reference::is_valid_name(&format!("refs/heads/{name}"))),
         b"protocol.version" => value == Some(OsStr::new("2")),
+        // The default parallel fetch setting only affects remote groups and
+        // submodules, neither of which a streamed filtered selection fetches.
+        b"fetch.parallel" if !materializing => value == Some(OsStr::new("1")),
         // Credential helpers and transport policy have their own gates.
         key if key.starts_with(b"credential.") || key.starts_with(b"http.") => true,
         // Git resolves remote names and rewrite settings. Matching fetch maps
@@ -1754,6 +1757,42 @@ printf 'clock\000'
             };
             assert!(!git.http2_compatible(), "{key}");
         }
+    }
+
+    #[test]
+    fn streaming_defers_other_fetch_settings_to_native_git() {
+        for (key, value) in [
+            ("advice.fetchshowforcedupdates", "invalid"),
+            ("color.advice", "invalid"),
+            ("core.abbrev", "invalid"),
+            ("core.disambiguate", "invalid"),
+            ("feature.manyfiles", "invalid"),
+            ("fetch.parallel", "-1"),
+            ("fetch.prune", "invalid"),
+            ("index.version", "invalid"),
+            ("push.default", "invalid"),
+            ("submodule.fetchjobs", "invalid"),
+            ("submodule.recurse", "invalid"),
+            ("transfer.unpacklimit", "invalid"),
+        ] {
+            for materializing in [false, true] {
+                assert!(
+                    !streaming_fetch_config(key.as_bytes(), Some(OsStr::new(value)), materializing),
+                    "{key}"
+                );
+            }
+        }
+        let default_parallel = Some(OsStr::new("1"));
+        assert!(streaming_fetch_config(
+            b"fetch.parallel",
+            default_parallel,
+            false
+        ));
+        assert!(!streaming_fetch_config(
+            b"fetch.parallel",
+            default_parallel,
+            true
+        ));
     }
 }
 

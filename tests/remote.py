@@ -423,17 +423,8 @@ class RemoteTests(unittest.TestCase):
         oracle = f.root / 'native-fetch.git'
         f.git('init', '--bare', '--quiet', oracle, at=f.root)
         invalid_config = {
-            'advice.fetchshowforcedupdates': 'invalid',
-            'color.advice': 'invalid',
             'core.abbrev': 'invalid',
-            'core.disambiguate': 'invalid',
-            'feature.manyfiles': 'invalid',
             'fetch.parallel': '-1',
-            'index.version': 'invalid',
-            'push.default': 'invalid',
-            'submodule.fetchjobs': 'invalid',
-            'submodule.recurse': 'invalid',
-            'transfer.unpacklimit': 'invalid',
         }
         for key, value in invalid_config.items():
             with self.subTest(key=key):

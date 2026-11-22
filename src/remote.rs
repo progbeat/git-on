@@ -345,7 +345,12 @@ impl Remote {
             let oid = remote.fetch_selected(NativeRevision::Query(revision), true, false)?;
             return Ok((remote, oid));
         }
-        let exact = (revision.as_bytes().len() == 40
+        // Matching fetch mappings and unsupported settings require native
+        // fetch before any direct transport can select the revision.
+        let native_selection = remote.git.fetch_settings_require_native_git(materialized)
+            || remote.git.has_fetch_mapping(source)?;
+        let exact = (!native_selection
+            && revision.as_bytes().len() == 40
             && revision.as_bytes().iter().all(u8::is_ascii_hexdigit))
         .then(|| {
             revision
@@ -353,11 +358,10 @@ impl Remote {
                 .and_then(|value| Oid::from_str(value).ok())
         })
         .flatten();
-        // Native Git owns remote groups and tracking ref updates. On Darwin,
-        // the private repository also determines how Git matches non-ASCII refs.
-        let has_fetch_mapping = remote.git.has_fetch_mapping(source)?;
-        let select_ref_directly = exact.is_none()
-            && !has_fetch_mapping
+        // On Darwin the private repository determines how native Git matches
+        // non-ASCII refs.
+        let select_ref_directly = !native_selection
+            && exact.is_none()
             && (!cfg!(target_os = "macos") || revision.as_bytes().is_ascii());
         let branch = select_ref_directly
             .then(|| transport::BranchQuery::for_snapshot(revision))
@@ -365,9 +369,7 @@ impl Remote {
         let stream_target = exact
             .map(SnapshotTarget::Object)
             .or_else(|| branch.as_ref().map(SnapshotTarget::Branch))
-            .filter(|_| {
-                !verify && !has_fetch_mapping && !remote.git.fetch_settings_require_native_git()
-            });
+            .filter(|_| !verify);
         let mut selected_for_native = None;
         if remote.materializing {
             // Native fetch owns refspec selection and configured ref updates.
@@ -665,7 +667,7 @@ impl Remote {
         self.materializing = true;
         // The revision has already been resolved and possibly verified.
         // Request that exact object again without the lazy fetch filter.
-        if !self.git.fetch_settings_require_native_git()
+        if !self.git.fetch_settings_require_native_git(true)
             && !self.git.has_fetch_mapping(&self.source)?
             && matches!(
                 self.fetch_snapshot(SnapshotTarget::Object(selected))?,
