@@ -2861,6 +2861,8 @@ mod tests {
     fn hot_blobs_spill_only_after_eviction_and_follow_recency() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = RawBlobs::new(directory.path()).unwrap();
+        // The whole-blob cache uses its entry limit even above the block budget.
+        store.state.lock().unwrap().memory_limit = BLOCK;
         let insert = |store: &mut RawBlobs, value| {
             let bytes = vec![value; BLOCK + 1];
             let oid = Oid::hash_object(ObjectType::Blob, &bytes).unwrap();
@@ -2871,7 +2873,9 @@ mod tests {
             .collect();
         assert_eq!(hot[0].read(0, 1).unwrap(), [0]);
         assert_eq!(store.write_metrics(), (0, 0));
-        assert_eq!(store.hot_metrics().1, HOT_BLOBS);
+        let (hot_bytes, hot_entries, _, _) = store.hot_metrics();
+        assert!(hot_bytes > BLOCK);
+        assert_eq!(hot_entries, HOT_BLOBS);
         insert(&mut store, HOT_BLOBS as u8);
         store.wait_for_spill().unwrap();
         assert!(!hot[0].on_disk());

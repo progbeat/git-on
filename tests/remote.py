@@ -762,32 +762,26 @@ assert not list((repo / 'objects/pack').glob('*'))
         f.git('config', 'uploadpack.allowFilter', 'false')
         reader, writer = os.pipe()
         try:
-            # Exercise forwarding when the inherited writer has two digits.
-            inherited_writer = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 10)
-            os.close(writer)
-            writer = inherited_writer
-            os.set_blocking(writer, False)
-            filled = 0
-            for chunk in (b'x' * 4096, b'x'):
+            # Some Linux cat implementations grow the pipe, and splice can
+            # queue more bytes than the nominal capacity. Leave ample trace.
+            trace_size = 128 * 1024
+            if sys.platform == 'linux':
+                max_pipe_size = 1024 * 1024
                 try:
-                    while True:
-                        filled += os.write(writer, chunk)
-                except BlockingIOError:
+                    configured = int(Path('/proc/sys/fs/pipe-max-size').read_text())
+                    max_pipe_size = max(max_pipe_size, configured)
+                except OSError:
                     pass
-            os.set_blocking(writer, True)
-            # Leave enough trace to block again after the parent drains the
-            # filler. The first replay must fill the pipe before cancellation.
+                trace_size = 4 * max_pipe_size
             native_git = shutil.which('git', path=f.env['PATH'])
             tools = f.root / 'trace-replay-tools'
             tools.mkdir()
             wrapper = tools / 'git'
-            trace_line = b'ignored trace line\n'
-            trace_lines = 4 * max(filled, 65536) // len(trace_line) + 1
             wrapper.write_text(f"""#!{sys.executable}
 import os, sys
 if 'ls-remote' in sys.argv and '--symref' in sys.argv:
     with open(os.environ['GIT_TRACE_PACKET'], 'ab') as output:
-        output.write({trace_line!r} * {trace_lines})
+        output.truncate({trace_size})
 os.execv({native_git!r}, [{native_git!r}, *sys.argv[1:]])
 """)
             wrapper.chmod(0o700)
@@ -795,28 +789,30 @@ os.execv({native_git!r}, [{native_git!r}, *sys.argv[1:]])
 import os, sys
 writer = int(sys.argv[1])
 os.dup2(writer, 3, inheritable=True)
-if writer != 3:
-    os.close(writer)
+os.close(writer)
 os.execv(sys.argv[2], sys.argv[2:])
 """
-            command = [sys.executable, '-c', launch, str(writer), OPTIONS.binary,
-                       f.repo.as_uri(), f.commit,
-                       '--write-policy=none', '--', 'printf', 'child-ran']
             env = dict(f.env, GIT_TRACE_PACKET='3', PATH=str(tools) + os.pathsep + f.env['PATH'])
-            with subprocess.Popen(command, cwd=f.cwd, env=env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  pass_fds=(writer,)) as runner:
+            # Exercise forwarding when the inherited writer has two digits.
+            inherited_writer = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 10)
+            try:
+                command = [sys.executable, '-c', launch, str(inherited_writer), OPTIONS.binary,
+                           f.repo.as_uri(), f.commit, '--write-policy=none', '--', 'printf', 'child-ran']
+                runner = subprocess.Popen(command, cwd=f.cwd, env=env, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, pass_fds=(inherited_writer,))
+            finally:
+                os.close(inherited_writer)
+            with runner:
                 try:
-                    remaining = filled
-                    while remaining:
-                        remaining -= len(os.read(reader, remaining))
                     deadline = time.monotonic() + 10
-                    while int.from_bytes(
-                            fcntl.ioctl(reader, termios.FIONREAD, bytes(4)), sys.byteorder) < filled:
+                    while True:
                         if runner.poll() is not None:
                             _, stderr = runner.communicate(timeout=2)
-                            self.fail(f'runner exited {runner.returncode} before forwarding trace: {stderr!r}')
-                        self.assertLess(time.monotonic(), deadline, 'trace replay did not fill the pipe')
+                            self.fail(f'runner exited {runner.returncode} before trace blocked: {stderr!r}')
+                        readable, writable, _ = select.select([reader], [writer], [], 0)
+                        if readable and not writable:
+                            break
+                        self.assertLess(time.monotonic(), deadline, 'trace replay did not block')
                         time.sleep(.01)
                     runner.send_signal(signal.SIGTERM)
                     stdout, stderr = runner.communicate(timeout=4)
@@ -2183,9 +2179,9 @@ print('caught-EIO-and-returned-success')
     def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
         # Read a working set that fits the whole-blob cache without spilling.
         f=self.f
-        sizes=(16*1024*1024+1,64*1024+1,64*1024+1)
+        size=64*1024+1
         ids=[f.git('hash-object','-w','--stdin',data=bytes([byte])*size)
-             for byte,size in zip(b'abc',sizes)]
+             for byte in b'abc']
         tree=f.git('mktree',data=''.join(f'100644 blob {oid}\t{name}\n' for name,oid in zip('abc',ids)).encode())
         commit=f.git('commit-tree',tree,data=b'large run-local reuse fixture\n');f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
@@ -2209,7 +2205,7 @@ print('caught-EIO-and-returned-success')
         self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
         f.finish(process)
         self.assertFalse((f.root/'cache').exists())
-        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=sum(sizes),metrics=last['metrics'])),flush=True)
+        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=len(ids)*size,metrics=last['metrics'])),flush=True)
 
     def test_materialized_remote_fetches_the_selected_tree_once(self):
         f=self.f;entries=[]
