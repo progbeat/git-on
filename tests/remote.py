@@ -762,26 +762,61 @@ assert not list((repo / 'objects/pack').glob('*'))
         f.git('config', 'uploadpack.allowFilter', 'false')
         reader, writer = os.pipe()
         try:
+            # Exercise forwarding when the inherited writer has two digits.
+            inherited_writer = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 10)
+            os.close(writer)
+            writer = inherited_writer
             os.set_blocking(writer, False)
+            filled = 0
             for chunk in (b'x' * 4096, b'x'):
                 try:
                     while True:
-                        os.write(writer, chunk)
+                        filled += os.write(writer, chunk)
                 except BlockingIOError:
                     pass
             os.set_blocking(writer, True)
-            command = ['sh', '-c', 'exec 3>&"$1"; shift; exec "$@"', 'trace-fixture',
-                       str(writer), OPTIONS.binary, f.repo.as_uri(), f.commit,
+            # Leave enough trace to block again after the parent drains the
+            # filler. The first replay must fill the pipe before cancellation.
+            native_git = shutil.which('git', path=f.env['PATH'])
+            tools = f.root / 'trace-replay-tools'
+            tools.mkdir()
+            wrapper = tools / 'git'
+            trace_line = b'ignored trace line\n'
+            trace_lines = 4 * max(filled, 65536) // len(trace_line) + 1
+            wrapper.write_text(f"""#!{sys.executable}
+import os, sys
+if 'ls-remote' in sys.argv and '--symref' in sys.argv:
+    with open(os.environ['GIT_TRACE_PACKET'], 'ab') as output:
+        output.write({trace_line!r} * {trace_lines})
+os.execv({native_git!r}, [{native_git!r}, *sys.argv[1:]])
+""")
+            wrapper.chmod(0o700)
+            launch = """
+import os, sys
+writer = int(sys.argv[1])
+os.dup2(writer, 3, inheritable=True)
+if writer != 3:
+    os.close(writer)
+os.execv(sys.argv[2], sys.argv[2:])
+"""
+            command = [sys.executable, '-c', launch, str(writer), OPTIONS.binary,
+                       f.repo.as_uri(), f.commit,
                        '--write-policy=none', '--', 'printf', 'child-ran']
-            with subprocess.Popen(command, cwd=f.cwd, env=dict(f.env, GIT_TRACE_PACKET='3'),
+            env = dict(f.env, GIT_TRACE_PACKET='3', PATH=str(tools) + os.pathsep + f.env['PATH'])
+            with subprocess.Popen(command, cwd=f.cwd, env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   pass_fds=(writer,)) as runner:
                 try:
+                    remaining = filled
+                    while remaining:
+                        remaining -= len(os.read(reader, remaining))
                     deadline = time.monotonic() + 10
-                    while not any(path.is_symlink() and path.suffix != '.null'
-                                  for path in f.root.rglob('native-advertisement-*')):
-                        self.assertIsNone(runner.poll(), 'runner missed packet trace forwarding')
-                        self.assertLess(time.monotonic(), deadline, 'advertisement did not finish')
+                    while int.from_bytes(
+                            fcntl.ioctl(reader, termios.FIONREAD, bytes(4)), sys.byteorder) < filled:
+                        if runner.poll() is not None:
+                            _, stderr = runner.communicate(timeout=2)
+                            self.fail(f'runner exited {runner.returncode} before forwarding trace: {stderr!r}')
+                        self.assertLess(time.monotonic(), deadline, 'trace replay did not fill the pipe')
                         time.sleep(.01)
                     runner.send_signal(signal.SIGTERM)
                     stdout, stderr = runner.communicate(timeout=4)
@@ -831,7 +866,7 @@ if 'ls-remote' in args and '--symref' in args:
         stdout_discarded=os.path.sameopenfile(1,null.fileno())
         Path({str(sink)!r}).write_text(str(stdout_discarded))
     with trace.open('ab') as writer:
-        writer.write(b'irrelevant packet trace\\n' * 16384)
+        writer.write(b'irrelevant packet trace\\n' * 4096)
         writer.flush()
         subprocess.Popen(
             [sys.executable,'-c',{detached!r},{native!r},{source!r},{str(ready)!r},
@@ -842,7 +877,7 @@ os.execv({native!r},[{native!r},*args])
 ''')
         wrapper.chmod(0o700)
         f.env.update(PATH=str(tools)+os.pathsep+f.env['PATH'],GIT_TRACE_BARE='1')
-        process=f.probe(source)
+        process=f.probe(source, 'HEAD:')
         self.assertEqual(f.line(process)['tree'],f.tree)
         ready.touch()
         deadline=time.monotonic()+10
@@ -2867,9 +2902,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                 f.resume.clear(); f.stalled.clear(); f.denied_oids=set()
                 master,slave=pty.openpty()
                 self.addCleanup(os.close,master)
+                # Keep the slave open until the parent drains the transcript.
+                self.addCleanup(os.close,slave)
                 child="import sys; sys.stderr.write('CHILD-START\\n'); print('child output')"
-                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=slave)
-                os.close(slave); f.children.append(process)
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--backend=copy','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=slave)
+                f.children.append(process)
                 self.assertTrue(f.stalled.wait(10),'materialization never reached controlled object stall')
                 transcript=bytearray(); deadline=time.monotonic()+5
                 while b'git on' not in transcript and time.monotonic()<deadline:
@@ -2895,7 +2932,9 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                 else:
                     self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
                     self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
-                    if outcome=='error': self.assertIn(b'native Git fetch failed',transcript)
+                    if outcome=='error':
+                        self.assertRegex(transcript.rsplit(b'\x1b[2K', 1)[-1],
+                                         rb'\b(?:HTTP (?:error )?403|returned error: 403)\b')
                 self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')

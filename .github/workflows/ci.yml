@@ -160,7 +160,8 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
           "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on --require-fuse
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on \
+            --probe target/release/examples/source-probe --require-fuse
           "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/release/git-on --require-fuse
       - name: Share the exact-head instrumented runner with WebKit
         if: needs.changes.outputs.scale == 'true'
