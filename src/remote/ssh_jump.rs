@@ -215,6 +215,10 @@ fn validate_nc(args: &[Vec<u8>]) -> Result<()> {
         (host == b"%h" || literal(host)) && (port == b"%p" || numeric(port)),
         "unsupported nc ProxyCommand destination"
     );
+    let options = match options.split_last() {
+        Some((separator, options)) if separator == b"--" => options,
+        _ => options,
+    };
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let flags = option.strip_prefix(b"-").unwrap_or_default();
@@ -353,11 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn nc_proxy_value_options_accept_both_native_spellings() {
+    fn nc_proxy_options_accept_native_spellings() {
         for (arguments, valid) in [
             ("-w 5 -x proxy.example:1080 -X connect", true),
             ("-w5 -xproxy.example:1080 -Xconnect", true),
             ("-vw5 -nxproxy.example:1080 -4Xconnect", true),
+            ("-w 5 --", true),
             ("-wfast", false),
         ] {
             let arguments: Vec<_> = arguments

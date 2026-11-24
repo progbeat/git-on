@@ -2049,6 +2049,14 @@ print(Path('deep/file').read_text(), end='')
         verifier.write_text(
             '#!/bin/sh\n'
             'test "$(git config --global fixture.verify)" = enabled || exit 1\n'
+            'test "$(git config --local fixture.verify)" = deny || exit 1\n'
+            'test "$(git config --get fixture.policy)" = permit || exit 1\n'
+            'if git config --local --get fixture.policy >/dev/null; then exit 1; fi\n'
+            'test "$(git config --get fixture.conditional)" = enabled || exit 1\n'
+            'if test "$FIXTURE_CHECK_WORKTREE_CONFIG" = 1; then\n'
+            '    test "$(git config --worktree fixture.verify)" = permit || exit 1\n'
+            '    test "$(git config --get fixture.verify)" = permit || exit 1\n'
+            'fi\n'
             'if test -n "$FIXTURE_WORKTREE"; then\n'
             '    test "$(git rev-parse --show-toplevel)" = "$FIXTURE_WORKTREE" || exit 1\n'
             '    test "$(git -C "$FIXTURE_POLICY" config --local fixture.verify)" = permit || exit 1\n'
@@ -2061,23 +2069,40 @@ print(Path('deep/file').read_text(), end='')
             f'exec {shlex.quote(shutil.which("ssh-keygen"))} "$@"\n'
         )
         verifier.chmod(0o700)
+        conditional_config = f.root / 'conditional-config'
+        conditional_config.write_text('[fixture]\n\tconditional = enabled\n')
         for object_format in ('sha1', 'sha256'):
             with self.subTest(object_format=object_format):
                 caller = f.root / object_format
                 caller.mkdir()
-                f.git('init', '--quiet', '--object-format=' + object_format, at=caller)
+                extra = ('--ref-format=reftable', '--initial-branch=verification') if object_format == 'sha256' else ()
+                f.git('init', '--quiet', '--object-format=' + object_format, *extra, at=caller)
+                f.git('config', '--global', f'includeIf.gitdir:{caller.resolve()}/.git.path',
+                      str(conditional_config))
                 f.git('config', 'fixture.verify', 'deny', at=caller)
+                policy_config = caller / '.git' / 'fixture-policy'
+                policy_config.write_text('[fixture]\n\tpolicy = permit\n')
+                f.git('config', 'include.path', 'fixture-policy', at=caller)
                 f.git('config', 'gpg.format', 'ssh', at=caller)
-                allowed_path = allowed
                 if object_format == 'sha256':
-                    allowed_path = Path('allowed-signers')
-                    shutil.copyfile(allowed, caller / allowed_path)
-                f.git('config', 'gpg.ssh.allowedSignersFile', str(allowed_path), at=caller)
-                f.git('config', 'gpg.ssh.program', str(verifier), at=caller)
+                    f.git('config', 'extensions.worktreeConfig', 'true', at=caller)
+                    f.git('config', '--worktree', 'fixture.verify', 'permit', at=caller)
+                    branch_config = f.root / 'branch-verifier-config'
+                    shutil.copyfile(allowed, caller / 'allowed-signers')
+                    f.git('config', '--file', str(branch_config),
+                          'gpg.ssh.allowedSignersFile', 'allowed-signers')
+                    f.git('config', '--file', str(branch_config), 'gpg.ssh.program', str(verifier))
+                    f.git('config', '--global', 'includeIf.onbranch:verification.path', str(branch_config))
+                    self.assertEqual(f.git('config', 'gpg.ssh.program', at=caller), str(verifier))
+                else:
+                    f.git('config', 'gpg.ssh.allowedSignersFile', str(allowed), at=caller)
+                    f.git('config', 'gpg.ssh.program', str(verifier), at=caller)
                 cwd = caller / 'nested'
                 cwd.mkdir()
                 environment = dict(f.env)
-                if object_format == 'sha1':
+                if object_format == 'sha256':
+                    environment['FIXTURE_CHECK_WORKTREE_CONFIG'] = '1'
+                else:
                     f.git('init', '--quiet', at=cwd)
                     shutil.rmtree(cwd / '.git/objects')
                     self.assertEqual(f.git('rev-parse', '--absolute-git-dir', at=cwd),

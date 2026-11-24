@@ -235,6 +235,9 @@ repository- or user-scoped credentials and other authentication challenges.
   private repository context.
 - Verification of a remote object uses a private repository to expose that
   object to Git. Local signature verification uses the caller's repository.
+  When a SHA-256 caller verifies a remote SHA-1 object, a private config
+  directory carries its repository-local verifier settings into the SHA-1
+  context and reuses the existing object directory.
 - An object-location bridge adapts byte paths or nested alternates to libgit2
   when needed. Linux can use an open directory descriptor for byte paths.
   Git's quoted or relative alternate forms may use `git cat-file` for headers

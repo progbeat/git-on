@@ -21,18 +21,19 @@ pub struct Git {
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
         let mut git = Self::capture_configuration(cwd)?;
-        git.original_dir = git.caller_path("--absolute-git-dir");
+        git.original_dir = git.caller_path(&["--absolute-git-dir"]);
         if git.original_dir.is_some() {
-            git.original_worktree = git.caller_path("--show-toplevel");
+            git.original_worktree = git.caller_path(&["--show-toplevel"]);
         }
         Ok(git)
     }
 
-    fn caller_path(&self, option: &str) -> Option<PathBuf> {
+    fn caller_path(&self, options: &[&str]) -> Option<PathBuf> {
         let mut command = native_git_command();
         command
             .current_dir(&self.cwd)
-            .args(["rev-parse", option])
+            .arg("rev-parse")
+            .args(options)
             .stdin(Stdio::null());
         run_builtin(command)
             .ok()
@@ -46,28 +47,12 @@ impl Git {
     }
 
     pub(crate) fn capture_configuration(cwd: &Path) -> Result<Self> {
-        let mut command = native_git_command();
-        command
-            .current_dir(cwd)
-            // GIT_CONFIG overrides the config builtin alone. Fetch and
-            // signature verification use the normal configuration stack.
-            .env_remove("GIT_CONFIG")
-            .args(["config", "--null", "--list", "--includes"])
-            .stdin(Stdio::null());
-        let output = run_builtin(command)
-            .context("read effective Git configuration")
-            .map_err(native_git_error)?;
-        if !output.status.success() {
-            bail!(
-                "read effective Git configuration: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         let mut config = Vec::new();
-        for record in output.stdout.split(|b| *b == 0).filter(|x| !x.is_empty()) {
+        let output = read_configuration(cwd, &["--includes"])?;
+        for record in output.split(|b| *b == 0).filter(|x| !x.is_empty()) {
             let (key, value) = record.split_once_byte(b'\n');
             // Includes were expanded in the caller's original repository context.
-            if key.starts_with(b"include.") || key.starts_with(b"includeif.") {
+            if is_config_include(key) {
                 continue;
             }
             config.push((
@@ -423,7 +408,12 @@ impl Git {
             .as_deref()
             .context("native Git did not identify the selected repository directory")
     }
-    fn verification_command(&self, dir: &Path, objects: Option<&Path>) -> Command {
+    fn verification_command(
+        &self,
+        dir: &Path,
+        objects: Option<&Path>,
+        common_dir: Option<&Path>,
+    ) -> Command {
         let mut command = Command::new("git");
         command
             .current_dir(&self.cwd)
@@ -441,10 +431,11 @@ impl Git {
             )
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env_remove("GIT_QUARANTINE_PATH");
-        let different_format = self.config.iter().any(|(key, value)| {
-            key == "extensions.objectformat" && value.as_deref() != Some(OsStr::new("sha1"))
-        });
-        if let Some(caller) = self.original_dir.as_deref().filter(|_| !different_format) {
+        if let Some(caller) = self
+            .original_dir
+            .as_deref()
+            .filter(|_| common_dir.is_none())
+        {
             if let Some(worktree) = &self.original_worktree {
                 if !self.cwd.starts_with(worktree) {
                     // A detached core.worktree may not discover this Git dir.
@@ -462,21 +453,28 @@ impl Git {
                 }
             }
         } else {
+            // Keep the caller's Git directory identity for native conditional
+            // includes. The common directory supplies a private SHA-1 config
+            // and refs, and GIT_OBJECT_DIRECTORY supplies the fetched objects.
+            let git_dir = common_dir.and(self.original_dir.as_deref()).unwrap_or(dir);
             command
                 .arg("--git-dir")
-                .arg(dir)
+                .arg(git_dir)
                 .env_remove("GIT_COMMON_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
                 .env_remove("GIT_SHALLOW_FILE")
                 .env_remove("GIT_GRAFT_FILE");
-            if different_format {
-                // Native Git needs the private SHA-1 context here. Carry
-                // over the caller's effective signature settings. Git
-                // resolves their relative paths from the worktree root.
+            if let Some(common_dir) = common_dir {
+                command.env("GIT_COMMON_DIR", common_dir);
                 if let Some(worktree) = &self.original_worktree {
-                    command.current_dir(worktree);
+                    command
+                        .current_dir(worktree)
+                        .arg("--work-tree")
+                        .arg(worktree);
                 }
+                // The SHA-1 view cannot resolve the caller's SHA-256 refs.
+                // Preserve signature settings already evaluated on its branch.
                 for (key, value) in &self.config {
                     if key.as_bytes().starts_with(b"gpg.") {
                         let mut setting = key.clone();
@@ -510,7 +508,23 @@ impl Git {
                 "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
             ),
         };
-        let mut command = self.verification_command(dir, objects);
+        let different_format = self
+            .original_dir
+            .as_deref()
+            .is_some_and(|caller| caller != dir)
+            && self.config.iter().any(|(key, value)| {
+                key == "extensions.objectformat" && value.as_deref() != Some(OsStr::new("sha1"))
+            });
+        let config = if different_format {
+            let source = self
+                .caller_path(&["--path-format=absolute", "--git-path", "config"])
+                .context("locate the caller's Git configuration")?;
+            Some(prepare_verifier_config(&self.cwd, &source, dir)?)
+        } else {
+            None
+        };
+        let mut command =
+            self.verification_command(dir, objects, config.as_ref().map(tempfile::TempDir::path));
         command.arg(operation).arg(oid.to_string());
         // Native Git owns acceptance, including the caller's configured trust threshold.
         // Its default can accept unknown-trust OpenPGP; a git-on threshold here
@@ -564,6 +578,124 @@ impl Git {
             .find(|(key, _)| key == "ssh.variant")
             .map(|(_, value)| value.clone().unwrap_or_default())
     }
+}
+
+fn read_configuration(cwd: &Path, options: &[&str]) -> Result<Vec<u8>> {
+    let mut command = native_git_command();
+    command
+        .current_dir(cwd)
+        // GIT_CONFIG overrides the config builtin alone. Fetch and
+        // signature verification use the normal configuration stack.
+        .env_remove("GIT_CONFIG")
+        .args(["config", "--null", "--list"])
+        .args(options)
+        .stdin(Stdio::null());
+    let output = run_builtin(command)
+        .context("read effective Git configuration")
+        .map_err(native_git_error)?;
+    if !output.status.success() {
+        bail!(
+            "read effective Git configuration: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn is_config_include(key: &[u8]) -> bool {
+    key.starts_with(b"include.") || key.starts_with(b"includeif.")
+}
+
+fn prepare_verifier_config(cwd: &Path, source: &Path, git_dir: &Path) -> Result<tempfile::TempDir> {
+    let source_dir = source
+        .parent()
+        .context("locate the caller's config directory")?;
+    let output = read_configuration(cwd, &["--local", "--no-includes"])?;
+    let mut config = b"[core]\n\trepositoryformatversion = 1\n".to_vec();
+    for record in output
+        .split(|&byte| byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let (key, value) = record.split_once_byte(b'\n');
+        if key == b"core.repositoryformatversion"
+            || (key.starts_with(b"extensions.") && key != b"extensions.worktreeconfig")
+        {
+            continue;
+        }
+        let include = is_config_include(key) && key.ends_with(b".path");
+        let relocated_key = include
+            .then(|| relocate_condition(key, source_dir))
+            .flatten();
+        let key = relocated_key.as_deref().unwrap_or(key);
+        let (section, name) = key.split_once_byte(b'.');
+        let name = name.context("Git configuration key has no section")?;
+        config.push(b'[');
+        config.extend_from_slice(section);
+        let name = if let Some(dot) = name.iter().rposition(|&byte| byte == b'.') {
+            config.push(b' ');
+            quote_config(&mut config, &name[..dot], false);
+            &name[dot + 1..]
+        } else {
+            name
+        };
+        config.extend_from_slice(b"]\n\t");
+        config.extend_from_slice(name);
+        if let Some(value) = value {
+            config.extend_from_slice(b" = ");
+            if include && !value.starts_with(b"~") && !value.starts_with(b"%(prefix)/") {
+                let path = source_dir.join(OsStr::from_bytes(value));
+                quote_config(&mut config, path.as_os_str().as_bytes(), true);
+            } else {
+                quote_config(&mut config, value, true);
+            }
+        }
+        config.push(b'\n');
+    }
+    // Give verification its own local configuration scope without changing
+    // the fetch repository's settings or copying any fetched objects.
+    let directory = tempfile::Builder::new()
+        .prefix("verify-config-")
+        .tempdir_in(git_dir)
+        .context("create private native Git verification config directory")?;
+    std::fs::create_dir(directory.path().join("refs"))?;
+    std::fs::write(directory.path().join("config"), config)?;
+    Ok(directory)
+}
+
+fn relocate_condition(key: &[u8], source_dir: &Path) -> Option<Vec<u8>> {
+    let prefixes = [
+        b"includeif.gitdir:./".as_slice(),
+        b"includeif.gitdir/i:./".as_slice(),
+    ];
+    let (prefix, pattern) = prefixes
+        .into_iter()
+        .find_map(|prefix| key.strip_prefix(prefix).map(|pattern| (prefix, pattern)))?;
+    let mut key = prefix[..prefix.len() - 2].to_vec();
+    // "./" anchors the pattern at the original config's directory. Treat
+    // that directory as literal when building an absolute Git glob.
+    for &byte in source_dir.as_os_str().as_bytes() {
+        if b"\\[*?".contains(&byte) {
+            key.push(b'\\');
+        }
+        key.push(byte);
+    }
+    key.push(b'/');
+    key.extend_from_slice(pattern);
+    Some(key)
+}
+
+fn quote_config(out: &mut Vec<u8>, bytes: &[u8], escape_controls: bool) {
+    out.push(b'"');
+    for &byte in bytes {
+        match byte {
+            b'\\' | b'"' => out.extend([b'\\', byte]),
+            b'\n' if escape_controls => out.extend(b"\\n"),
+            b'\t' if escape_controls => out.extend(b"\\t"),
+            8 if escape_controls => out.extend(b"\\b"),
+            _ => out.push(byte),
+        }
+    }
+    out.push(b'"');
 }
 
 fn fetch_mapping_remote(key: &[u8]) -> Option<&[u8]> {
@@ -1595,7 +1727,7 @@ mod transport_policy_tests {
         let invocation = here.join("inside");
         std::fs::create_dir(&invocation)?;
         let git = Git::capture(&invocation)?;
-        let mut command = git.verification_command(git.repository_dir()?, None);
+        let mut command = git.verification_command(git.repository_dir()?, None, None);
         command
             .env(
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES",
