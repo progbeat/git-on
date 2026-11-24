@@ -782,7 +782,7 @@ fn retirement_succeeds_after_a_lost_unlink_reply() {
         (&RETRY_UNLINK_LOST_REPLY, libc::ETIMEDOUT),
         (&RETRY_UNLINK_LOST_REPLY, libc::ENOENT),
     ] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let record = ownership_record(&dir);
         fault.set(Some(errno));
         assert!(run.remove(&dir).unwrap());
@@ -790,7 +790,7 @@ fn retirement_succeeds_after_a_lost_unlink_reply() {
         assert!(!record.exists());
     }
     for is_directory in [false, true] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         if is_directory {
             fs::create_dir(dir.join("child")).unwrap();
         } else {
@@ -805,7 +805,7 @@ fn retirement_succeeds_after_a_lost_unlink_reply() {
 #[test]
 fn stale_marker_after_unlock_requires_a_peer_to_have_removed_the_record() {
     for peer_removed in [false, true] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let record = ownership_record(&dir);
         let path = dir.clone();
         AFTER_MARKER_UNLOCK.set(Some(Box::new(move || {
@@ -829,7 +829,7 @@ fn stale_marker_after_unlock_requires_a_peer_to_have_removed_the_record() {
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn unconfirmed_nfs_removal_reports_the_run_for_recovery() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     let record = ownership_record(&dir);
     RUN_RMDIR_LOST_REPLY.set(Some(libc::ETIMEDOUT));
@@ -852,7 +852,7 @@ fn cleanup_checks_disappearing_and_replaced_children() {
         Some(BeforeChildOpen::Stale { removed: true }),
         Some(BeforeChildOpen::Stale { removed: false }),
     ] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let outside = dir.parent().unwrap().join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("retained"), b"preserve").unwrap();
@@ -878,7 +878,7 @@ fn cleanup_checks_disappearing_and_replaced_children() {
 fn a_run_renamed_before_removal_keeps_its_recovery_marker() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     for replacement in [false, true] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let record = ownership_record(&dir);
         fs::write(dir.join("state"), b"retained").unwrap();
         if replacement && is_nfs(&run.directory).unwrap() {
@@ -957,7 +957,7 @@ fn cleanup_walk_leaves_a_late_bind_mount_untouched() {
 
 #[test]
 fn retirement_retries_when_the_last_placeholder_has_gone() {
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     LAST_RETIREMENT_RMDIR_WAS_BUSY.set(true);
     assert!(run.remove(&dir).unwrap());
     assert!(!ownership_record(&dir).exists());
@@ -966,7 +966,7 @@ fn retirement_retries_when_the_last_placeholder_has_gone() {
 #[test]
 #[ignore = "requires an NFS client that defers unlink of opened files"]
 fn nfs_retirement_closes_the_marker_before_unlink() {
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     ASSERT_MARKER_UNLINK_IS_IMMEDIATE.set(true);
     assert!(run.remove(&dir).unwrap());
@@ -1008,7 +1008,7 @@ fn long_path_descendant(directory: &File) -> File {
 
 #[test]
 fn cleanup_handles_a_deferred_name_beyond_the_absolute_path_limit() {
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     let ancestor = long_path_descendant(&run.directory);
     let placeholder = c".nfs0123456789abcdef00000001";
     assert_eq!(
@@ -1039,7 +1039,7 @@ fn deferred_nfs_cleanup_preserves_command_status() {
     use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
 
     for late_close in [false, true] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let RunLock::Sibling(record) = &run.location else {
             panic!("expected a sibling ownership record");
         };
@@ -1083,7 +1083,7 @@ fn deferred_nfs_cleanup_preserves_command_status() {
 fn nfs_cleanup_retries_late_entries_once() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     for (name, insertions) in [(".nfs0123456789abcdef00000001", 1), ("late-entry", 3)] {
-        let (root, dir, run) = reserved_run();
+        let (_root, dir, run) = reserved_run();
         let record = ownership_record(&dir);
         let can_recover = fixture_has_run_identity(&dir);
         FORCE_NFS_REMOVAL.set(true);
@@ -1121,7 +1121,7 @@ fn nfs_cleanup_retries_late_entries_once() {
 #[test]
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn nfs_mount_information_survives_a_failed_filesystem_probe() {
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     let descendant = long_path_descendant(&run.directory);
     let fd = descendant.as_raw_fd();
@@ -1139,7 +1139,7 @@ fn nfs_mount_information_survives_a_failed_filesystem_probe() {
 #[test]
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn nfs_removal_retries_when_the_open_file_closes_before_the_scan() {
-    let (root, dir, run) = reserved_run();
+    let (_root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     let mut held = ["first", "second"].map(|name| {
         let child = dir.join(name);
@@ -1260,7 +1260,7 @@ fn legacy_recovery_skips_another_owners_records() {
 
 #[test]
 fn cleanup_preserves_the_run_if_its_group_loses_private_permissions() {
-    let (root, dir, locked) = reserved_run();
+    let (_root, dir, locked) = reserved_run();
     let group = dir.parent().unwrap();
     let sentinel = dir.join("runtime");
     fs::write(&sentinel, b"owned contents").unwrap();
