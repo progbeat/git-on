@@ -244,7 +244,7 @@ class SshRegressionTests(unittest.TestCase):
         record_path = directory / 'ssh-control-owner'
         record = json.loads(record_path.read_text())
         workspace = (directory / '.git-on-memory').resolve(strict=True)
-        self.assertTrue(record_path.resolve().is_relative_to(workspace))
+        self.assertFalse(record_path.is_symlink())
         self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
         control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
         checked = subprocess.run(control, capture_output=True, check=True, timeout=5)

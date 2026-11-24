@@ -55,7 +55,7 @@ def private_mount_namespace(test):
 
 def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, source=None,
                      write_policy='all', git_config=None, checkout_copies=1, tls_ca=None,
-                     revision='HEAD', runner_size_mib=None):
+                     revision='HEAD', runner_size_mib=None, service_on_volume=False):
     runner_size_mib = size_mib if runner_size_mib is None else runner_size_mib
     assert 0 < runner_size_mib <= size_mib
     prefix, uid, gid = private_mount_namespace(test)
@@ -65,7 +65,7 @@ def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, so
 from contextlib import ExitStack
 import json,os,shutil,subprocess,sys,tempfile
 from pathlib import Path
-volume,binary,repo,mount,programs,uid,gid,command,size,runner_size,source,policy,config,copies,tls_ca,revision=sys.argv[1:]
+volume,binary,repo,mount,programs,uid,gid,command,size,runner_size,source,policy,config,copies,tls_ca,revision,service_on_volume=sys.argv[1:]
 uid,gid,size,runner_size=map(int,(uid,gid,size,runner_size));volume=Path(volume);command=json.loads(command)
 subprocess.run([mount,'-t','tmpfs','-o',f'size={size}m,mode=700,uid={uid},gid={gid}','tmpfs',str(volume)],check=True)
 if os.geteuid()==0 and uid!=0:
@@ -98,6 +98,7 @@ shutil.rmtree(clone)
 if copies=='2':shutil.rmtree(spare)
 assert os.statvfs(volume).f_bavail*os.statvfs(volume).f_frsize==before,'baseline did not restore initial free space'
 operands=[source,revision] if source else [revision]
+if service_on_volume=='1':env['GIT_ON_SERVICE_TMPDIR']=str(temporary)
 with ExitStack() as stack:
  if runner_size<size:
   # Keep the smaller budget in force during the run, including short-lived files.
@@ -113,7 +114,8 @@ print('git-on + command passed on tmpfs',flush=True)
         result=subprocess.run([*prefix,sys.executable,'-I','-S','-c',driver,str(volume),str(binary),
                                str(repo),shutil.which('mount'),programs,str(uid),str(gid),
                                json.dumps(command),str(size_mib),str(runner_size_mib),source or '',write_policy,
-                               json.dumps(git_config or {}),str(checkout_copies),str(tls_ca or ''),revision],
+                               json.dumps(git_config or {}),str(checkout_copies),str(tls_ca or ''),revision,
+                               str(int(service_on_volume))],
                               capture_output=True,timeout=30)
     except subprocess.TimeoutExpired as error:
         raise AssertionError(

@@ -70,6 +70,15 @@ impl Directory {
     pub(crate) fn keep_for_owner(&mut self) {
         self.directory.remove_on_drop = false;
     }
+
+    pub(crate) fn can_fall_back_to(&self, run: &Path) -> bool {
+        std::env::var_os("GIT_ON_SERVICE_TMPDIR").is_none()
+            && tmpfs_stats(self.path()).is_ok()
+            && fs::metadata(self.path())
+                .ok()
+                .zip(fs::metadata(run).ok())
+                .is_some_and(|(service, run)| service.dev() != run.dev())
+    }
 }
 
 struct Workspace {

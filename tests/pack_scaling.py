@@ -56,7 +56,10 @@ def exercise(binary,count,before=False):
             assert second['remote_session_fetch_operations'] == 0, second
         pack_bytes=pack_metadata=0
         for line in trace.read_text().splitlines():
-            if '/remote-repository/objects/pack' not in line: continue
+            primary = '/remote-repository/objects/pack' in line
+            received = '/received-pack-' in line and '/objects/pack' in line
+            if not (primary or received):
+                continue
             if re.search(r'\b(getdents64|newfstatat|statx)\(',line): pack_metadata+=1
             if 'getdents64(' in line:
                 returned=re.search(r'= (\d+) ',line)

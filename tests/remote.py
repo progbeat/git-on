@@ -119,7 +119,9 @@ def git_on_environment(binary, environment, tools):
 
 def private_odb_fault(root="Path.cwd().parent"):
     """Block the pack directory before a native object demand."""
-    return f"packs={root}/'remote-repository/objects/pack'; packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n"
+    return (f"repository={root}/'remote-repository'; packs=repository/'pack-staging'; "
+            "packs=packs if packs.is_symlink() else repository/'objects/pack'; "
+            "packs.rename(packs.with_name('blocked-packs')); packs.write_bytes(b'blocked')\n")
 
 def exec_fixture_child(argv, cwd, env):
     try:
@@ -869,6 +871,11 @@ os.execv({native!r},[{native!r},*args])
         hook.write_text('#!/bin/sh\nprintf called >> ' + shlex.quote(str(audit)) + '\n')
         hook.chmod(0o700)
         f.git('config', 'core.hooksPath', str(hooks))
+        alternate_audit = f.root / 'alternate-audit'
+        alternate = f.root / 'alternate-refs'
+        alternate.write_text('#!/bin/sh\nprintf called > ' + shlex.quote(str(alternate_audit)) + '\n')
+        alternate.chmod(0o700)
+        f.git('config', 'core.alternateRefsCommand', str(alternate))
         refs = f.git('for-each-ref', '--format=%(refname) %(objectname)')
         config = (f.repo / 'config').read_bytes()
         def objects():
@@ -883,6 +890,7 @@ os.execv({native!r},[{native!r},*args])
         f.finish(process)
 
         self.assertEqual(audit.read_bytes(), b'original')
+        self.assertFalse(alternate_audit.exists())
         self.assertEqual((f.repo / 'config').read_bytes(), config)
         self.assertEqual(f.git('for-each-ref', '--format=%(refname) %(objectname)'), refs)
         self.assertEqual(objects(), before)
@@ -896,13 +904,16 @@ os.execv({native!r},[{native!r},*args])
         (link,) = f.root.glob('*/remote-repository')
         repository = link.resolve(strict=True)
         workspace = (link.parent / '.git-on-memory').resolve(strict=True)
-        self.assertTrue(repository.is_relative_to(workspace))
+        staging = (repository / 'pack-staging').resolve(strict=True)
+        self.assertTrue(repository.is_relative_to(link.parent.resolve()))
+        self.assertTrue(staging.is_relative_to(workspace))
+        self.assertEqual(repository.stat().st_dev, link.parent.stat().st_dev)
         self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
         if sys.platform == 'darwin':
             self.assertEqual(workspace.parent, f.root.resolve())
             self.assertEqual(workspace.stat().st_dev, f.root.stat().st_dev)
         else:
-            self.assertEqual(run(['stat', '-f', '-c', '%T', repository]).strip(), b'tmpfs')
+            self.assertEqual(run(['stat', '-f', '-c', '%T', staging]).strip(), b'tmpfs')
 
         # An unlinked diagnostic can outlive the runner in a detached Git
         # helper. Keep the descriptor open across runner exit and use it.
@@ -995,6 +1006,75 @@ os.execv({native!r},[{native!r},*args])
                      cwd=f.cwd, env=f.env, timeout=20)
         self.assertEqual(output, b'expected\n')
         assert_no_run_state(self, f.cwd)
+
+    def test_native_fetch_retries_only_when_pack_writes_exhaust_tmpfs(self):
+        if sys.platform != 'linux' or not Path('/dev/shm').is_dir():
+            self.skipTest('requires the automatic Linux tmpfs')
+        f = self.f
+        tmpfs = Path('/dev/shm').resolve()
+        if f.root.stat().st_dev == tmpfs.stat().st_dev:
+            self.skipTest('requires a separate system temporary filesystem')
+        attempts = f.root / 'fetch-attempts'
+        tools = f.root / 'git-tools'
+        tools.mkdir()
+        native = shutil.which('git', path=f.env['PATH'])
+        git = tools / 'git'
+        git.write_text(f"""#!{sys.executable}
+import os, subprocess, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if 'fetch' in args:
+    root = Path(os.environ['TMPDIR']).resolve()
+    repository = Path(args[args.index('--git-dir') + 1]).resolve()
+    objects = Path(os.environ['GIT_OBJECT_DIRECTORY']).resolve()
+    assert repository.is_relative_to({str(f.root.resolve())!r})
+    assert objects.is_relative_to(root) and (objects / 'pack').is_dir()
+    with open({str(attempts)!r}, 'a') as log:
+        print(root, file=log)
+    if os.environ['FIXTURE_STORAGE_PHASE'] == 'reference':
+        subprocess.run([{native!r}, *args], check=True)
+        sys.exit("error: couldn't write destination reference: No space left on device")
+    if '--no-write-fetch-head' in args and root.is_relative_to({str(tmpfs)!r}):
+        if os.environ['FIXTURE_STORAGE_PHASE'] == 'index':
+            (objects / 'pack' / 'tmp_pack_fixture').write_bytes(b'x' * 4096)
+            sys.exit("fatal: sha1 file 'tmp_idx_fixture' write error. Out of diskspace")
+        sys.exit('fatal: write error: No space left on device')
+os.execv({native!r}, [{native!r}, *args])
+""")
+        git.chmod(0o700)
+        f.env.update(PATH=str(tools) + os.pathsep + f.env['PATH'],
+                     GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='fetch.fsckObjects',
+                     GIT_CONFIG_VALUE_0='false', GIT_CONFIG_KEY_1='fetch.unpackLimit',
+                     GIT_CONFIG_VALUE_1='1', XDG_RUNTIME_DIR=str(f.root))
+        source = f.repo.as_uri()
+        refspec = 'main:refs/heads/selected'
+        for phase in ('pack', 'index', 'reference'):
+            with self.subTest(phase=phase):
+                f.env['FIXTURE_STORAGE_PHASE'] = phase
+                f.env['GIT_TRACE'] = '1' if phase == 'reference' else '0'
+                attempts.write_text('')
+                process = f.probe(source, refspec)
+                if phase == 'reference':
+                    _, errors = process.communicate(timeout=20)
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertIn(b"couldn't write", errors)
+                    self.assertIn(b'index-pack', errors)
+                    self.assertEqual(len(attempts.read_text().splitlines()), 1)
+                else:
+                    self.assertEqual(f.line(process)['tree'], f.tree)
+                    value, report = f.operation(process, 'read deep/file')
+                    self.assertEqual(value['data'], 'expected\n')
+                    f.finish(process)
+                    paths = list(map(Path, attempts.read_text().splitlines()))
+                    self.assertEqual(report['metrics']['remote_fetch_operations'], len(paths))
+                    if phase == 'index':
+                        self.assertGreaterEqual(report['metrics']['remote_native_pack_bytes'], 4096)
+                    self.assertTrue(paths[0].is_relative_to(tmpfs))
+                    self.assertTrue(paths[1].is_relative_to(tmpfs))
+                    self.assertTrue(paths[2].is_relative_to(f.root.resolve()))
+                    self.assertTrue(all(path == paths[2] for path in paths[2:]))
+                assert_no_run_state(self, f.root)
 
     def test_native_fetch_keeps_case_distinct_destination_names(self):
         f = self.f
@@ -1947,13 +2027,28 @@ print(Path('deep/file').read_text(), end='')
 
     def test_remote_verifier_keeps_the_callers_git_configuration(self):
         f = self.f
-        self.signing()
+        _, allowed = self.signing()
+        f.env.pop('GIT_CONFIG_COUNT')
         f.env['GIT_CONFIG_GLOBAL'] = str(f.root / 'gitconfig')
         f.git('config', '--global', 'fixture.verify', 'enabled')
+        policy = f.root / 'policy'
+        policy.mkdir()
+        f.git('init', '--quiet', at=policy)
+        f.git('config', 'fixture.verify', 'permit', at=policy)
         verifier = f.root / 'caller-verify'
+        journal = f.root / 'verifier-used'
         verifier.write_text(
             '#!/bin/sh\n'
             'test "$(git config --global fixture.verify)" = enabled || exit 1\n'
+            'if test -n "$FIXTURE_WORKTREE"; then\n'
+            '    test "$(git rev-parse --show-toplevel)" = "$FIXTURE_WORKTREE" || exit 1\n'
+            '    test "$(git -C "$FIXTURE_POLICY" config --local fixture.verify)" = permit || exit 1\n'
+            'fi\n'
+            'if test "$FIXTURE_NO_WORKTREE" = 1; then\n'
+            '    test "$(git rev-parse --is-inside-work-tree)" = false || exit 1\n'
+            '    test "$(git rev-parse --is-bare-repository)" = false || exit 1\n'
+            'fi\n'
+            f'printf invoked > {shlex.quote(str(journal))}\n'
             f'exec {shlex.quote(shutil.which("ssh-keygen"))} "$@"\n'
         )
         verifier.chmod(0o700)
@@ -1962,11 +2057,42 @@ print(Path('deep/file').read_text(), end='')
                 caller = f.root / object_format
                 caller.mkdir()
                 f.git('init', '--quiet', '--object-format=' + object_format, at=caller)
+                f.git('config', 'fixture.verify', 'deny', at=caller)
+                f.git('config', 'gpg.format', 'ssh', at=caller)
+                allowed_path = allowed
+                if object_format == 'sha256':
+                    allowed_path = Path('allowed-signers')
+                    shutil.copyfile(allowed, caller / allowed_path)
+                f.git('config', 'gpg.ssh.allowedSignersFile', str(allowed_path), at=caller)
                 f.git('config', 'gpg.ssh.program', str(verifier), at=caller)
-                output = run([OPTIONS.binary, f.repo.as_uri(), 'refs/tags/signed', '--verify',
-                              '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
-                             cwd=caller, env=f.env, timeout=20)
-                self.assertEqual(output, b'expected\n')
+                cwd = caller / 'nested'
+                cwd.mkdir()
+                environment = dict(f.env)
+                if object_format == 'sha1':
+                    f.git('init', '--quiet', at=cwd)
+                    shutil.rmtree(cwd / '.git/objects')
+                    self.assertEqual(f.git('rev-parse', '--absolute-git-dir', at=cwd),
+                                     str(caller.resolve() / '.git'))
+                    environment['FIXTURE_WORKTREE'] = str(caller.resolve())
+                    environment['FIXTURE_POLICY'] = str(policy.resolve())
+                contexts = [(cwd, environment, None)]
+                if object_format == 'sha1':
+                    contexts.append((caller / '.git', dict(f.env, FIXTURE_NO_WORKTREE='1'), None))
+                    worktree = f.root / 'separate-worktree'
+                    worktree.mkdir()
+                    contexts.append((caller, f.env, worktree))
+                for directory, env, worktree in contexts:
+                    with self.subTest(directory=directory.name):
+                        if worktree is not None:
+                            f.git('config', 'core.worktree', str(worktree), at=caller)
+                            self.assertEqual(f.git('rev-parse', '--show-toplevel', at=caller),
+                                             str(worktree.resolve()))
+                        journal.unlink(missing_ok=True)
+                        output = run([OPTIONS.binary, f.repo.as_uri(), 'refs/tags/signed', '--verify',
+                                      '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
+                                     cwd=directory, env=env, timeout=20)
+                        self.assertEqual(output, b'expected\n')
+                        self.assertEqual(journal.read_text(), 'invoked')
 
     def test_native_openpgp_verification_uses_git_configuration(self):
         f = self.f
@@ -2416,8 +2542,8 @@ os.execv({native!r}, [{native!r}, *args])
         command=[sys.executable,'-c','from pathlib import Path; import sys; Path(sys.argv[1]).touch()',str(sentinel)]
         env=dict(f.env,PATH=str(OPTIONS.binary.parent)+':'+f.env['PATH'])
         for policy in ('repository','git-c'):
-            # The -c case must override a permissive repository setting, then
-            # survive Git::capture and replay into the remote private repository.
+            # The -c case must override a permissive repository setting for
+            # both local and remote native verification.
             f.git('config','gpg.minTrustLevel','fully' if policy=='repository' else 'undefined')
             config=[] if policy=='repository' else ['-c','gpg.minTrustLevel=fully']
             runner=[str(OPTIONS.binary)] if policy=='repository' else ['git',*config,'on']
@@ -3271,7 +3397,8 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         reports=[row['metrics'] for row in rows if 'metrics' in row]
         self.assertEqual(reports[-1]['remote_fetches'],4)
         self.assertEqual(reports[-1]['remote_fetches'],reports[-2]['remote_fetches'])
-        lines=[line for line in trace.read_text().splitlines() if '/remote-repository/objects/' in line]
+        lines = [line for line in trace.read_text().splitlines()
+                 if '/received-pack-' in line and '/objects/' in line]
         self.assertTrue(any(re.search(r'\bwrite\(',line) for line in lines),'object writes were not traced')
         self.assertEqual([line for line in lines if re.search(r'\b(fsync|fdatasync)\(',line)],[])
         self.assertEqual(f.git('config','--list'),before)
@@ -3705,9 +3832,9 @@ os.execv(native,[native,*args])
                     if index in (15,63,127,191):
                         samples.append(dict(objects=index+1,descriptors=len(list(Path(f'/proc/{process.pid}/fd').iterdir()))))
                         if not expect_failure:
-                            pack_dirs=list(f.root.glob('*/remote-repository/objects/pack'))
-                            self.assertEqual(len(pack_dirs),1)
-                            self.assertEqual(list(pack_dirs[0].iterdir()),[],'per-demand packs accumulated in the run ODB')
+                            (stage,) = f.root.glob('*/remote-repository/pack-staging')
+                            self.assertEqual(len(list(stage.resolve().glob('received-pack-*'))),
+                                             1, 'per-demand packs accumulated beside the selection')
             except (AssertionError,BrokenPipeError) as error:
                 failure=str(error)
                 process.wait(timeout=10)
@@ -3913,7 +4040,9 @@ os.execv(native,[native,*args])
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(master_fd,signal.SIGTERM)
             os.close(master_fd)
         self.addCleanup(dispose_master)
-        self.assertTrue((directory/'ssh-control-owner').is_file())
+        owner = directory / 'ssh-control-owner'
+        self.assertTrue(owner.is_file())
+        self.assertFalse(owner.is_symlink())
         def cleanup():
             with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
             if process.poll() is None: process.kill()

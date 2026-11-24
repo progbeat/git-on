@@ -62,9 +62,12 @@ the command after `--`.
 - Resolution, fetch, snapshot preparation, and cleanup preserve source refs,
   indexes, object databases, Git configuration, and worktrees. These operations
   leave no persistent clone and make no requests to write remote repository data.
-- Native compatibility paths may use a private directory for the regular
-  files Git and its transport require. They prefer an existing writable
-  `tmpfs` and fall back to the system temporary directory.
+- Native fetch keeps its selection record and private refs in the run
+  directory. Incoming Git objects, pack indexes, and temporary files required
+  by the transport prefer an existing writable `tmpfs`. Snapshot selection
+  and verification reuse the received objects in place.
+  A pack write that fills an automatically selected `tmpfs` can retry on
+  the run filesystem before native Git records its selection.
 - Native resolution and fetch disable hooks and local filesystem monitors. Credential
   lookup reads existing credentials. An authentication result does not save,
   erase, or replace stored credentials, host keys, or cookies.

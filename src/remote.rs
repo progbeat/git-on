@@ -204,6 +204,15 @@ struct ReceivedPack {
     odb: Odb<'static>,
     directory: Arc<tempfile::TempDir>,
 }
+impl ReceivedPack {
+    fn objects(&self) -> PathBuf {
+        self.directory.path().join("objects")
+    }
+}
+struct NativeSelection {
+    pack: ReceivedPack,
+    metadata: HashSet<Oid>,
+}
 enum PrivateRepository {
     Context(Repository),
     Objects(Repository),
@@ -292,6 +301,7 @@ pub struct Remote {
     failed: OnceLock<String>,
     materializing: bool,
     snapshot_transport: Option<SnapshotTransport>,
+    selection_pack: Option<NativeSelection>,
     active_materialized_pack: Option<ReceivedPack>,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
     // This must outlive the native repository and its staged readers.
@@ -309,11 +319,18 @@ impl Remote {
         materialized: bool,
         verify: bool,
     ) -> Result<(Self, Oid)> {
+        let run = std::path::absolute(run).context("resolve private run directory")?;
+        let run = run.as_path();
         // Capture effective configuration first: even `git --version` can read
         // it. Preserve the first native operation's cancellation/TTY lifecycle.
-        // Config includes still use the caller's context. Any repository
-        // we pass to Git for this remote belongs to the new run.
-        let git = Git::capture_configuration(cwd).map_err(|error| {
+        // Config includes use the caller's context. Discover its repository
+        // for native verification. Transport still uses the new run's ODB.
+        let git = if verify {
+            Git::capture(cwd)
+        } else {
+            Git::capture_configuration(cwd)
+        }
+        .map_err(|error| {
             if error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
@@ -382,10 +399,9 @@ impl Remote {
                     std::env::current_exe()?,
                     storage.path().join(SSH_LAUNCHER),
                 )?;
-                storage.link(
-                    run,
-                    OsStr::new(SSH_CONTROL_OWNER_FILE),
-                    Path::new(SSH_CONTROL_OWNER_FILE),
+                std::os::unix::fs::symlink(
+                    run.join(SSH_CONTROL_OWNER_FILE),
+                    storage.path().join(SSH_CONTROL_OWNER_FILE),
                 )?;
                 Ok(storage)
             })
@@ -430,6 +446,7 @@ impl Remote {
             // Eager execution needs the whole selected tree in one transfer.
             materializing: materialized,
             snapshot_transport: None,
+            selection_pack: None,
             active_materialized_pack: None,
             raw_blobs,
             native_storage: None,
@@ -585,6 +602,29 @@ impl Remote {
     pub(crate) fn native_repository(&self) -> Option<&Repository> {
         self.repo.as_ref().and_then(PrivateRepository::objects)
     }
+    pub(crate) fn selection_odb(&self, oid: Oid) -> Option<&Odb<'_>> {
+        self.selection_pack
+            .as_ref()
+            .filter(|selection| selection.metadata.contains(&oid))
+            .map(|selection| &selection.pack.odb)
+    }
+    #[cfg(feature = "test-metrics")]
+    pub(crate) fn selection_metadata(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.selection_pack
+            .iter()
+            .flat_map(|selection| selection.metadata.iter().copied())
+    }
+    pub(crate) fn verify_selection(&self, oid: Oid, kind: git2::ObjectType) -> Result<()> {
+        self.native_repository()
+            .context("native Git verification repository missing")?;
+        let objects = self
+            .selection_pack
+            .as_ref()
+            .filter(|selection| selection.metadata.contains(&oid))
+            .map(|selection| selection.pack.objects());
+        self.git
+            .verify_in_object_directory(&self.dir, oid, kind, objects.as_deref())
+    }
     fn odb(&self) -> Result<Option<Odb<'_>>> {
         Ok(self.native_repository().map(Repository::odb).transpose()?)
     }
@@ -598,9 +638,7 @@ impl Remote {
     }
 
     fn create_native_repository(&mut self) -> Result<Repository> {
-        let storage = Directory::new_for_run("repo-", &self.run)?;
-        let name = "remote-repository";
-        let dir = storage.path().join(name);
+        let dir = self.dir.clone();
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -612,11 +650,7 @@ impl Remote {
         let mut options = git2::RepositoryInitOptions::new();
         options.bare(true).external_template(false);
         let repo = Repository::init_opts(&dir, &options)?;
-        let repo = if storage
-            .path()
-            .join(name.to_ascii_uppercase())
-            .try_exists()?
-        {
+        let repo = if self.run.join("REMOTE-REPOSITORY").try_exists()? {
             // Keep the writable libgit2 object database. Native Git manages
             // refs with reftable so their names retain case-sensitive semantics.
             let objects = Repository::from_odb(repo.odb()?)?;
@@ -625,7 +659,7 @@ impl Remote {
             fs::remove_file(dir.join("config"))?;
             fs::remove_dir_all(dir.join("refs"))?;
             let mut command = self.git.command(Some(&dir));
-            command.env("TMPDIR", storage.path()).args([
+            command.env("TMPDIR", &self.run).args([
                 "init",
                 "--bare",
                 "--quiet",
@@ -650,10 +684,50 @@ impl Remote {
             &format!("remote.git-on-owned-{}.promisor", uuid::Uuid::new_v4()),
             true,
         )?;
-        storage.link(&self.run, name.as_ref(), Path::new(name))?;
-        self.dir = dir;
-        self.native_storage = Some(storage);
+        // FETCH_HEAD and refs stay on the filesystem of the run.
+        // Git can write the incoming objects on a different one.
+        match Directory::new_for_run("pack-", &self.run) {
+            Ok(storage) => {
+                std::os::unix::fs::symlink(storage.path(), dir.join("pack-staging"))?;
+                self.native_storage = Some(storage);
+            }
+            Err(error)
+                if std::env::var_os("GIT_ON_SERVICE_TMPDIR").is_none()
+                    && io_out_of_space(&error) =>
+            {
+                self.use_run_pack_storage()?;
+            }
+            Err(error) => return Err(error),
+        }
         Ok(repo)
+    }
+
+    fn use_run_pack_storage(&self) -> Result<()> {
+        let directory = self.dir.join("native-packs");
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let link = self.dir.join("next-pack-staging");
+        std::os::unix::fs::symlink(directory, &link)?;
+        fs::rename(link, self.dir.join("pack-staging"))?;
+        Ok(())
+    }
+
+    fn staged_pack_location(&self) -> Result<PathBuf> {
+        let directory = fs::read_link(self.dir.join("pack-staging"))
+            .context("open native pack staging directory")?;
+        anyhow::ensure!(
+            self.native_storage
+                .as_ref()
+                .is_some_and(|store| store.path() == directory)
+                || directory == self.dir.join("native-packs"),
+            "native pack staging directory changed"
+        );
+        Ok(directory)
+    }
+
+    fn can_move_pack_storage(&self, parent: &Path) -> bool {
+        self.native_storage
+            .as_ref()
+            .is_some_and(|storage| storage.path() == parent && storage.can_fall_back_to(&self.run))
     }
 
     fn object_command(&self) -> Command {
@@ -723,6 +797,68 @@ impl Remote {
         }
         Ok(command)
     }
+
+    fn run_native_fetch(
+        &mut self,
+        mut initial: bool,
+        input: Option<&[u8]>,
+        writes_fetch_head: bool,
+        prepare: impl Fn(&Self, bool) -> Result<Command>,
+    ) -> Result<(std::process::Output, tempfile::TempDir)> {
+        let alternate = self
+            .selection_pack
+            .as_ref()
+            .map(|selection| git_alternate_path(&selection.pack.objects()));
+        loop {
+            let parent = self.staged_pack_location()?;
+            let directory = match received_pack_directory(&parent) {
+                Err(error) if io_out_of_space(&error) && self.can_move_pack_storage(&parent) => {
+                    self.use_run_pack_storage()?;
+                    continue;
+                }
+                result => result?,
+            };
+            let mut command = prepare(self, initial)?;
+            command
+                .env("TMPDIR", &parent)
+                .env("GIT_OBJECT_DIRECTORY", directory.path().join("objects"));
+            if let Some(alternate) = &alternate {
+                // The pack's object directory has no repository or refs.
+                command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate);
+            }
+            let mut input = input;
+            self.fetch_operations += 1;
+            let output =
+                crate::git::run_fetch(command, input.as_mut().map(|input| input as &mut dyn Read));
+            let mut retry = false;
+            if let Ok(output) = &output {
+                if let Ok(bytes) = received_pack_bytes(directory.path()) {
+                    self.native_received_pack_bytes =
+                        self.native_received_pack_bytes.saturating_add(bytes);
+                }
+                retry = !output.status.success()
+                    && self.can_move_pack_storage(&parent)
+                    && pack_write_out_of_space(&output.stderr, &self.dir)
+                    && (!writes_fetch_head || matches!(fetched_head(&self.dir), Ok(None)));
+            }
+            if retry {
+                // Free the failed object files before writing SSH's owner
+                // record. The two service directories can share a tmpfs.
+                drop(directory);
+                if initial {
+                    self.record_socket_owner()?;
+                }
+                self.use_run_pack_storage()?;
+                initial = initial && self.socket_owner.is_none();
+                continue;
+            }
+            if initial {
+                self.record_socket_owner()?;
+            }
+            return Ok((output?, directory));
+        }
+    }
+
     fn fetch_selected(
         &mut self,
         revision: NativeRevision<'_>,
@@ -733,21 +869,7 @@ impl Remote {
         // namespace abbreviation and destination. All resulting refs and
         // FETCH_HEAD live in this owned bare repository, never in the caller.
         self.prepare_native_repository()?;
-        let mut command = self.command(initial)?;
-        command.args(["fetch", "--no-tags", "--depth=1"]);
-        command.args(refetch.then_some("--refetch"));
         let materializing = self.materializing || refetch;
-        if materializing {
-            // Prevent small eager transfers from becoming a second decoded
-            // loose-object copy before final-path materialization.
-            command.arg("--keep");
-        }
-        command.arg(if materializing {
-            "--no-filter"
-        } else {
-            "--filter=tree:0"
-        });
-        crate::terminal_ui::configure_fetch(&mut command);
         let oid_argument;
         let argument = match revision {
             NativeRevision::Query(query) => query,
@@ -756,17 +878,26 @@ impl Remote {
                 OsStr::new(&oid_argument)
             }
         };
-        command
-            .arg("--")
-            .arg(&self.source)
-            .arg(argument)
-            .stdin(Stdio::null());
-        let outcome =
-            crate::git::run_fetch(command, None).context("fetch selected remote revision");
-        if initial {
-            self.record_socket_owner()?;
-        }
-        let out = outcome?;
+        let (out, received) = self
+            .run_native_fetch(initial, None, true, |remote, first| {
+                let mut command = remote.command(first)?;
+                command.args(["fetch", "--no-tags", "--depth=1"]);
+                command.args(refetch.then_some("--refetch"));
+                if materializing {
+                    // Keep the received pack for final-path materialization.
+                    command.args(["--keep", "--no-filter"]);
+                } else {
+                    command.arg("--filter=tree:0");
+                }
+                crate::terminal_ui::configure_fetch(&mut command);
+                command
+                    .arg("--")
+                    .arg(&remote.source)
+                    .arg(argument)
+                    .stdin(Stdio::null());
+                Ok(command)
+            })
+            .context("fetch selected remote revision")?;
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
             bail!(
@@ -783,33 +914,23 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        let head = fs::read(self.dir.join("FETCH_HEAD")).context("read native Git fetch result")?;
-        let mut selected = None;
-        for line in head
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let oid = line.split(|byte| *byte == b'\t').next().unwrap();
-            let oid = Oid::from_str(std::str::from_utf8(oid)?).context(
-                "native Git fetched a non-SHA-1 object (SHA-256 repositories unsupported)",
-            )?;
-            if selected.is_some_and(|selected| selected != oid) {
-                bail!("native Git fetch selected multiple objects; a snapshot requires exactly one selected object");
-            }
-            selected = Some(oid);
-        }
-        let oid = selected.context("native Git fetch selected no object to mount")?;
+        let oid =
+            fetched_head(&self.dir)?.context("native Git fetch selected no object to mount")?;
         if let NativeRevision::Selected(expected) = revision {
             anyhow::ensure!(oid == expected, "remote changed the selected snapshot");
         }
-        self.import_received((!materializing).then_some(std::slice::from_ref(&oid)))?;
-        if !self.native_repository().unwrap().odb()?.exists(oid)
-            && self.raw_blobs.get(oid)?.is_none()
+        self.import_received(
+            received,
+            (!materializing).then_some(std::slice::from_ref(&oid)),
+            true,
+        )?;
+        if !self.raw_blobs.available(oid)
+            && self.selection_odb(oid).is_none()
+            && !self.native_repository().unwrap().odb()?.exists(oid)
         {
             bail!("native Git fetch did not supply selected object {oid}");
         }
         self.completed_fetches += 1;
-        self.fetch_operations += 1;
         Ok(oid)
     }
     pub(crate) fn fetch_copy_objects(&mut self, selected: Oid) -> Result<()> {
@@ -853,7 +974,13 @@ impl Remote {
         self.session = None;
     }
 
-    pub(crate) fn finish_materialized_pack(&mut self) -> Result<()> {
+    pub(crate) fn finish_materialization(&mut self) -> Result<()> {
+        self.finish_materialized_pack()?;
+        self.selection_pack = None;
+        Ok(())
+    }
+
+    fn finish_materialized_pack(&mut self) -> Result<()> {
         if let Some(pack) = self.active_materialized_pack.take() {
             if let Some(decoder) = &pack.decoder {
                 decoder.finish()?;
@@ -910,10 +1037,9 @@ impl Remote {
             if streamed {
                 if pack.decoder.is_none() {
                     let mut command = self.git.command(Some(&self.dir));
-                    command.env("TMPDIR", &self.dir).env(
-                        "GIT_OBJECT_DIRECTORY",
-                        pack.directory.path().join("objects"),
-                    );
+                    command
+                        .env("TMPDIR", &self.dir)
+                        .env("GIT_OBJECT_DIRECTORY", pack.objects());
                     command.args([
                         "-c",
                         "core.bigFileThreshold=8m",
@@ -977,6 +1103,7 @@ impl Remote {
                     self.import_packed_object(oid, directory.path())
                 }
                 Some(ReceivedObject::Packed { .. }) => Ok(()),
+                None if self.selection_odb(oid).is_some() => Ok(()),
                 None => self.fetch(&[oid]),
             }
         })();
@@ -1415,39 +1542,40 @@ impl Remote {
             }
         }
         self.prepare_native_repository()?;
-        let mut command = self.command(false)?;
-        command.args([
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--depth=1",
-            "--filter=tree:0",
-        ]);
-        crate::terminal_ui::configure_fetch(&mut command);
         let mut requests = Vec::new();
-        if oids.len() == 1 {
-            command
-                .arg("--")
-                .arg(&self.source)
-                .arg(oids[0].to_string())
-                .stdin(Stdio::null());
-        } else {
+        if oids.len() != 1 {
             for oid in oids {
                 writeln!(requests, "{oid}")?;
             }
-            command.arg("--stdin").arg("--").arg(&self.source);
         }
-        let output = if requests.is_empty() {
-            crate::git::run_fetch(command, None)
-        } else {
-            crate::git::run_fetch(command, Some(&mut requests.as_slice()))
-        };
-        let out = match output {
-            Ok(out) => out,
-            Err(error) => {
-                return Err(error).context("fetch exact remote object");
-            }
-        };
+        let (out, received) = self
+            .run_native_fetch(
+                false,
+                (!requests.is_empty()).then_some(requests.as_slice()),
+                false,
+                |remote, first| {
+                    let mut command = remote.command(first)?;
+                    command.args([
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--depth=1",
+                        "--filter=tree:0",
+                    ]);
+                    crate::terminal_ui::configure_fetch(&mut command);
+                    if let [oid] = oids {
+                        command
+                            .arg("--")
+                            .arg(&remote.source)
+                            .arg(oid.to_string())
+                            .stdin(Stdio::null());
+                    } else {
+                        command.arg("--stdin").arg("--").arg(&remote.source);
+                    }
+                    Ok(command)
+                },
+            )
+            .context("fetch exact remote object")?;
         let error = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
             let selected = if oids.len() == 1 {
@@ -1462,7 +1590,7 @@ impl Remote {
                 "remote server does not support object filtering; full-clone fallback is forbidden"
             );
         }
-        self.import_received((!self.materializing).then_some(oids))?;
+        self.import_received(received, (!self.materializing).then_some(oids), false)?;
         let odb = self.native_repository().unwrap().odb()?;
         for oid in oids {
             if !self.raw_blobs.available(*oid) && !odb.exists(*oid) {
@@ -1471,7 +1599,6 @@ impl Remote {
         }
         drop(odb);
         self.completed_fetches += oids.len() as u64;
-        self.fetch_operations += 1;
         Ok(())
     }
     fn http_command(&self) -> Result<Command> {
@@ -1992,65 +2119,18 @@ impl Remote {
         self.completed_fetches += 1;
         Ok(true)
     }
-    /// Native filtered fetches always retain promisor packs. Keeping one pack
-    /// per demand makes later Git/libgit2 pack discovery grow with all previous
-    /// demands. Decode only new received objects directly into raw run storage,
-    /// then release their files/indexes before the next operation. The private
-    /// repository has one serialized writer and no auto-maintenance.
-    fn take_received(&mut self) -> Result<Option<ReceivedPack>> {
-        let pack_directory = self.dir.join("objects/pack");
-        let mut received = Vec::new();
-        for entry in fs::read_dir(&pack_directory)? {
-            crate::object::check_transfer()?;
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(text) = name.to_str() else {
-                bail!("invalid received pack filename");
-            };
-            if let Some((hash, _)) = text
-                .strip_prefix("pack-")
-                .and_then(|name| name.split_once('.'))
-            {
-                if hash.len() == 40 && Oid::from_str(hash).is_ok() && entry.file_type()?.is_file() {
-                    received.push((name, entry.path()));
-                }
-            }
-        }
-        if received.is_empty() {
-            return Ok(None);
-        }
-        let staging = Arc::new(
-            tempfile::Builder::new()
-                .prefix("received-pack-")
-                .tempdir_in(&self.dir)?,
-        );
-        let objects = staging.path().join("objects/pack");
-        fs::create_dir_all(&objects)?;
-        // The decoder sees only this newly received pack set, never all prior
-        // demands. Companion indexes, including optional .rev, move together.
-        for (name, path) in &received {
-            crate::object::check_transfer()?;
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "pack")
-            {
-                self.native_received_pack_bytes = self
-                    .native_received_pack_bytes
-                    .saturating_add(fs::metadata(path)?.len());
-            }
-            fs::rename(path, objects.join(name))?;
-        }
-        Ok(Some(ReceivedPack {
+    // The object directory belongs to this fetch alone. Keep its reader and
+    // any indexed blobs alive until the snapshot has consumed them.
+    fn import_received(
+        &mut self,
+        directory: tempfile::TempDir,
+        wanted: Option<&[Oid]>,
+        retain_selection: bool,
+    ) -> Result<()> {
+        let received = ReceivedPack {
             decoder: None,
-            odb: received_pack_database(staging.path())?,
-            directory: staging,
-        }))
-    }
-    // Lazy demands decode their requested blobs now. Materialization reads
-    // the staged blobs when it writes the checkout.
-    fn import_received(&mut self, wanted: Option<&[Oid]>) -> Result<()> {
-        let Some(received) = self.take_received()? else {
-            return Ok(());
+            odb: received_pack_database(directory.path())?,
+            directory: Arc::new(directory),
         };
         let destination_odb = self
             .repo
@@ -2060,12 +2140,12 @@ impl Remote {
             .odb()?;
         let cache = &mut self.raw_blobs;
         let mut requests = Vec::new();
+        let mut metadata = HashSet::new();
         let mut failure = None;
         let iteration = received.odb.foreach(|oid| {
             let outcome = (|| -> Result<()> {
                 crate::object::check_transfer()?;
-                if wanted.is_some() && (cache.get(*oid)?.is_some() || destination_odb.exists(*oid))
-                {
+                if cache.get(*oid)?.is_some() {
                     return Ok(());
                 }
                 let (size, kind) = received.odb.read_header(*oid)?;
@@ -2074,21 +2154,17 @@ impl Remote {
                     if wanted.is_some_and(|wanted| wanted.contains(oid)) {
                         requests.push(*oid);
                     }
-                } else if wanted.is_some()
-                    || (!destination_odb.exists(*oid) && cache.get(*oid)?.is_none())
-                {
+                } else if kind == git2::ObjectType::Tree {
                     let object = received.odb.read(*oid)?;
-                    if kind == git2::ObjectType::Tree {
-                        cache.insert_odb_tree(*oid, &object)?;
-                    } else {
-                        let mut writer = destination_odb.writer(size, kind)?;
-                        crate::object::copy_verified(object.data(), &mut writer, kind, size, *oid)?;
-                        anyhow::ensure!(
-                            writer.finalize()? == *oid,
-                            "received metadata OID changed"
-                        );
-                        cache.forget_received(*oid);
-                    }
+                    cache.insert_odb_tree(*oid, &object)?;
+                } else if retain_selection {
+                    metadata.insert(*oid);
+                } else if !destination_odb.exists(*oid) {
+                    let object = received.odb.read(*oid)?;
+                    let mut writer = destination_odb.writer(size, kind)?;
+                    crate::object::copy_verified(object.data(), &mut writer, kind, size, *oid)?;
+                    anyhow::ensure!(writer.finalize()? == *oid, "received metadata OID changed");
+                    cache.forget_received(*oid);
                 }
                 Ok(())
             })();
@@ -2102,13 +2178,22 @@ impl Remote {
             return Err(error);
         }
         iteration?;
-        // Release ODB/pack descriptors before launching the native decoder.
-        drop(received.odb);
+        let directory = received.directory.clone();
         drop(destination_odb);
-        if requests.is_empty() {
-            return Ok(());
+        if retain_selection {
+            // Reuse the received Git objects for selection and verification.
+            // Materialization releases them before launching the command.
+            self.selection_pack = Some(NativeSelection {
+                pack: received,
+                metadata,
+            });
+        } else {
+            drop(received);
         }
-        self.decode_received(received.directory.path(), &requests)
+        if !requests.is_empty() {
+            self.decode_received(directory.path(), &requests)?;
+        }
+        Ok(())
     }
     fn import_packed_object(&mut self, oid: Oid, directory: &Path) -> Result<()> {
         self.decode_received(directory, &[oid])?;
@@ -2268,13 +2353,7 @@ impl Remote {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(
-                self.ssh_storage
-                    .as_ref()
-                    .unwrap()
-                    .path()
-                    .join(SSH_CONTROL_OWNER_FILE),
-            )
+            .open(self.run.join(SSH_CONTROL_OWNER_FILE))
             .context("record owned SSH control socket")?;
         file.write_all(&record)?;
         Ok(())
@@ -2447,6 +2526,132 @@ fn owned_socket(socket: &Path, owner: &SocketOwner) -> bool {
             && metadata.dev() == owner.device
             && metadata.ino() == owner.inode
     })
+}
+
+fn fetched_head(repository: &Path) -> Result<Option<Oid>> {
+    let head = match fs::read(repository.join("FETCH_HEAD")) {
+        Ok(head) => head,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read native Git fetch result"),
+    };
+    anyhow::ensure!(
+        head.is_empty() || head.ends_with(b"\n"),
+        "incomplete native Git fetch result"
+    );
+    let mut selected = None;
+    for line in head
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let oid = line.split(|byte| *byte == b'\t').next().unwrap();
+        anyhow::ensure!(oid.len() == 40, "native Git fetched a non-SHA-1 object");
+        let oid =
+            Oid::from_str(std::str::from_utf8(oid)?).context("read native Git selected OID")?;
+        anyhow::ensure!(
+            selected.is_none_or(|selected| selected == oid),
+            "native Git fetch selected multiple objects; a snapshot requires exactly one selected object"
+        );
+        selected = Some(oid);
+    }
+    Ok(selected)
+}
+
+fn pack_write_out_of_space(stderr: &[u8], repository: &Path) -> bool {
+    let repository = repository.as_os_str().as_bytes();
+    let failure_lines = || {
+        stderr.split(|byte| *byte == b'\n').filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            (!line.starts_with(b"remote: ")
+                && !line.first().is_some_and(u8::is_ascii_digit)
+                && !line
+                    .windows(repository.len())
+                    .any(|path| path == repository))
+            .then_some(line)
+        })
+    };
+    let matches_errno = |message: &[u8]| {
+        !message.is_empty()
+            && failure_lines().any(|line| {
+                line.strip_suffix(message)
+                    .is_some_and(|line| line.ends_with(b": "))
+            })
+    };
+    if matches_errno(b"No space left on device")
+        || failure_lines().any(|line| line.ends_with(b"write error. Out of diskspace"))
+    {
+        return true;
+    }
+    // Native Git reports strerror(ENOSPC). Match the caller's message
+    // locale without changing Git's environment or other threads.
+    let locale =
+        unsafe { libc::newlocale(libc::LC_MESSAGES_MASK, c"".as_ptr(), std::ptr::null_mut()) };
+    if locale.is_null() {
+        return false;
+    }
+    let previous = unsafe { libc::uselocale(locale) };
+    let result = if previous.is_null() {
+        false
+    } else {
+        let error = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        unsafe { libc::uselocale(previous) };
+        matches_errno(
+            error
+                .split_once(" (os error ")
+                .map_or(error.as_str(), |(message, _)| message)
+                .as_bytes(),
+        )
+    };
+    unsafe { libc::freelocale(locale) };
+    result
+}
+
+fn received_pack_directory(parent: &Path) -> Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("received-pack-")
+        .tempdir_in(parent)?;
+    fs::create_dir_all(directory.path().join("objects/pack"))?;
+    Ok(directory)
+}
+
+fn git_alternate_path(path: &Path) -> OsString {
+    // Git parses quoted alternate paths before splitting on colons.
+    let path = path.as_os_str().as_bytes();
+    let mut quoted = Vec::with_capacity(path.len() + 2);
+    quoted.push(b'"');
+    for &byte in path {
+        if matches!(byte, b'"' | b'\\') {
+            quoted.push(b'\\');
+        }
+        quoted.push(byte);
+    }
+    quoted.push(b'"');
+    OsString::from_vec(quoted)
+}
+
+fn io_out_of_space(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
+    })
+}
+
+fn received_pack_bytes(directory: &Path) -> Result<u64> {
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(directory.join("objects/pack"))? {
+        crate::object::check_transfer()?;
+        let entry = entry?;
+        if (entry
+            .path()
+            .extension()
+            .is_some_and(|suffix| suffix == "pack")
+            || entry.file_name().as_bytes().starts_with(b"tmp_pack_"))
+            && entry.file_type()?.is_file()
+        {
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(bytes)
 }
 
 fn received_pack_database(directory: &Path) -> Result<Odb<'static>> {

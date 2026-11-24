@@ -745,6 +745,9 @@ impl State {
                 }
                 return Ok(object.kind());
             }
+            if let Some(odb) = remote.selection_odb(oid) {
+                return Ok(odb.read_header(oid)?.1);
+            }
         }
         let repo = self.repository().context("missing verified Git object")?;
         Ok(repo.odb()?.read_header(oid)?.1)
@@ -752,6 +755,15 @@ impl State {
     fn selected_child(&self, oid: Oid, kind: ObjectType) -> Result<Oid> {
         if let Some(native) = self.native_local() {
             return crate::object::selected_child(kind, &native.bytes(oid, kind)?);
+        }
+        if let Some(odb) = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.selection_odb(oid))
+        {
+            let object = odb.read(oid)?;
+            crate::object::verify_odb_object(&object, kind)?;
+            return crate::object::selected_child(kind, object.data());
         }
         if let Some(repo) = self.repository() {
             return match kind {
@@ -1130,16 +1142,13 @@ impl Snapshot {
             _local_object_anchor: local_anchor,
         };
         if verify {
-            let (git, directory) = if let Some(remote) = &state.remote {
-                remote
-                    .native_repository()
-                    .context("native Git verification repository missing")?;
-                (remote.git.as_ref(), remote.dir.as_path())
+            let kind = state.object_kind(oid)?;
+            if let Some(remote) = &state.remote {
+                remote.verify_selection(oid, kind)?;
             } else {
                 let git = git.as_ref().expect("captured local Git repository");
-                (git, git.repository_dir()?)
-            };
-            git.verify(directory, oid, state.object_kind(oid)?)?;
+                git.verify(git.repository_dir()?, oid, kind)?;
+            }
         }
         let mut selected = oid;
         let tree_oid = loop {
@@ -1429,7 +1438,7 @@ impl Snapshot {
     pub(crate) fn finish_materialization(&self) -> Result<()> {
         let mut state = self.state()?;
         if let Some(remote) = &mut state.remote {
-            return remote.finish_materialized_pack();
+            return remote.finish_materialization();
         }
         state
             .native_local()
@@ -1790,6 +1799,7 @@ impl Snapshot {
         }
         if let Some(remote) = &state.remote {
             objects.extend(remote.raw_blobs.oids()?);
+            objects.extend(remote.selection_metadata());
         }
         objects.sort_unstable();
         objects.dedup();

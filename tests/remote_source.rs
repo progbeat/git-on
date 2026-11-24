@@ -210,7 +210,23 @@ fn remote_metadata_and_payloads_stay_bound_to_the_selected_snapshot() {
 #[test]
 fn remote_colon_refspec_selects_full_tree_in_a_private_repository() {
     let (temp, _, tree, _) = fixture();
-    let snap = load(temp.path(), "main:deep", false).unwrap();
+    let run = tempfile::tempdir_in(temp.path()).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let relative_run = cwd
+        .components()
+        .skip(1)
+        .fold(PathBuf::new(), |path, _| path.join(".."))
+        .join(run.path().strip_prefix("/").unwrap());
+    let source = format!("file://{}", temp.path().join("server").display());
+    let snap = Snapshot::load_source(
+        temp.path(),
+        Some(OsStr::new(&source)),
+        OsStr::new("main:deep"),
+        false,
+        false,
+        &relative_run,
+    )
+    .unwrap();
     assert_eq!(snap.tree_oid, tree);
     let entry = snap.entry(Path::new("deep/value")).unwrap().unwrap();
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
@@ -407,15 +423,16 @@ fn review_run_odb_fetch_failure_is_latched() {
     // Break the private pack destination before a lazy subtree demand. The
     // native fetch must fail, and an application catching EIO cannot turn the
     // resulting incomplete remote execution into success.
-    let packs = snapshot.git_dir.join("objects/pack");
-    std::fs::remove_dir(&packs).unwrap();
+    let packs = snapshot.git_dir.join("pack-staging");
+    let target = std::fs::read_link(&packs).unwrap();
+    std::fs::remove_file(&packs).unwrap();
     std::fs::write(&packs, b"blocked private pack directory").unwrap();
     assert!(snapshot.entry(Path::new("deep/value")).is_err());
     let failure = snapshot
         .remote_failure()
         .expect("private ODB fetch failure was not latched");
     std::fs::remove_file(&packs).unwrap();
-    std::fs::create_dir(&packs).unwrap();
+    std::os::unix::fs::symlink(target, &packs).unwrap();
     assert!(snapshot.entry(Path::new("deep/value")).is_err());
     assert_eq!(snapshot.remote_failure().as_deref(), Some(failure.as_str()));
 }

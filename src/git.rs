@@ -16,16 +16,25 @@ pub struct Git {
     pub cwd: PathBuf,
     config: Vec<(OsString, Option<OsString>)>,
     original_dir: Option<PathBuf>,
+    original_worktree: Option<PathBuf>,
 }
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
         let mut git = Self::capture_configuration(cwd)?;
+        git.original_dir = git.caller_path("--absolute-git-dir");
+        if git.original_dir.is_some() {
+            git.original_worktree = git.caller_path("--show-toplevel");
+        }
+        Ok(git)
+    }
+
+    fn caller_path(&self, option: &str) -> Option<PathBuf> {
         let mut command = native_git_command();
         command
-            .current_dir(cwd)
-            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(&self.cwd)
+            .args(["rev-parse", option])
             .stdin(Stdio::null());
-        git.original_dir = run_builtin(command)
+        run_builtin(command)
             .ok()
             .filter(|output| output.status.success())
             .map(|mut output| {
@@ -33,8 +42,7 @@ impl Git {
                     output.stdout.pop();
                 }
                 PathBuf::from(OsString::from_vec(output.stdout))
-            });
-        Ok(git)
+            })
     }
 
     pub(crate) fn capture_configuration(cwd: &Path) -> Result<Self> {
@@ -71,6 +79,7 @@ impl Git {
             cwd: cwd.to_path_buf(),
             config,
             original_dir: None,
+            original_worktree: None,
         })
     }
 
@@ -79,6 +88,7 @@ impl Git {
             cwd: cwd.to_path_buf(),
             config: Vec::new(),
             original_dir: None,
+            original_worktree: None,
         };
         if index::selects_from_index(revision) {
             let (directory, oid) = index::resolve(&git, revision)?;
@@ -407,7 +417,7 @@ impl Git {
             .as_deref()
             .context("native Git did not identify the selected repository directory")
     }
-    fn verification_command(&self, dir: &Path) -> Command {
+    fn verification_command(&self, dir: &Path, objects: Option<&Path>) -> Command {
         let mut command = Command::new("git");
         command
             .current_dir(&self.cwd)
@@ -419,13 +429,33 @@ impl Git {
         // Keep Git's ordinary configuration stack and working directory.
         // The verifier for a fetched object reads only the private SHA-1 ODB.
         command
-            .env("GIT_OBJECT_DIRECTORY", dir.join("objects"))
+            .env(
+                "GIT_OBJECT_DIRECTORY",
+                objects.map_or_else(|| dir.join("objects"), Path::to_path_buf),
+            )
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env_remove("GIT_QUARANTINE_PATH");
         let different_format = self.config.iter().any(|(key, value)| {
             key == "extensions.objectformat" && value.as_deref() != Some(OsStr::new("sha1"))
         });
-        if self.original_dir.is_none() || different_format {
+        if let Some(caller) = self.original_dir.as_deref().filter(|_| !different_format) {
+            if let Some(worktree) = &self.original_worktree {
+                if !self.cwd.starts_with(worktree) {
+                    // A detached core.worktree may not discover this Git dir.
+                    command
+                        .arg("--git-dir")
+                        .arg(caller)
+                        .arg("--work-tree")
+                        .arg(worktree);
+                } else if std::env::var_os("GIT_DIR").is_none()
+                    && std::env::var_os("GIT_WORK_TREE").is_none()
+                {
+                    // Start at the worktree root to avoid discovering an
+                    // incomplete nested repository through the private ODB.
+                    command.current_dir(worktree);
+                }
+            }
+        } else {
             command
                 .arg("--git-dir")
                 .arg(dir)
@@ -436,7 +466,11 @@ impl Git {
                 .env_remove("GIT_GRAFT_FILE");
             if different_format {
                 // Native Git needs the private SHA-1 context here. Carry
-                // over the caller's effective signature settings.
+                // over the caller's effective signature settings. Git
+                // resolves their relative paths from the worktree root.
+                if let Some(worktree) = &self.original_worktree {
+                    command.current_dir(worktree);
+                }
                 for (key, value) in &self.config {
                     if key.as_bytes().starts_with(b"gpg.") {
                         let mut setting = key.clone();
@@ -453,6 +487,16 @@ impl Git {
     }
 
     pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
+        self.verify_in_object_directory(dir, oid, kind, None)
+    }
+
+    pub(crate) fn verify_in_object_directory(
+        &self,
+        dir: &Path,
+        oid: Oid,
+        kind: git2::ObjectType,
+        objects: Option<&Path>,
+    ) -> Result<()> {
         let operation = match kind {
             git2::ObjectType::Commit => "verify-commit",
             git2::ObjectType::Tag => "verify-tag",
@@ -460,7 +504,7 @@ impl Git {
                 "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
             ),
         };
-        let mut command = self.verification_command(dir);
+        let mut command = self.verification_command(dir, objects);
         command.arg(operation).arg(oid.to_string());
         // Native Git owns acceptance, including the caller's configured trust threshold.
         // Its default can accept unknown-trust OpenPGP; a git-on threshold here
@@ -1542,7 +1586,7 @@ mod transport_policy_tests {
         let invocation = here.join("inside");
         std::fs::create_dir(&invocation)?;
         let git = Git::capture(&invocation)?;
-        let mut command = git.verification_command(git.repository_dir()?);
+        let mut command = git.verification_command(git.repository_dir()?, None);
         command
             .env(
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -1778,6 +1822,7 @@ printf 'clock\000'
                 cwd: PathBuf::new(),
                 config: vec![(key.into(), Some("never".into()))],
                 original_dir: None,
+                original_worktree: None,
             };
             assert!(!git.http2_compatible(), "{key}");
         }

@@ -168,13 +168,18 @@ and the visible checkout in `copy` mode.
 
 ### Temporary storage
 
-Git-on creates a private service directory on demand for native Git packs,
-indexes, and regular files required for transport or diagnostics. It chooses
+Git-on keeps native Git's selection record and private refs in the run
+directory. It creates a private service directory on demand for incoming
+objects, pack indexes, and transport or diagnostic files. It chooses
 the writable `tmpfs` with the most available space among `/dev/shm`,
 `XDG_RUNTIME_DIR`, and the system temporary directory. If none is writable
 `tmpfs`, it uses the system temporary directory, usually `TMPDIR`. Set
 `GIT_ON_SERVICE_TMPDIR` to choose an existing writable `tmpfs` explicitly.
-The selected filesystem must have room for the native files.
+If a pack write runs out of space on an automatically chosen `tmpfs`,
+Git-on can retry it once using the run filesystem before native Git records
+its selection. Git writes incoming packs and indexes directly to
+the directory Git-on reads for that fetch.
+An explicit `GIT_ON_SERVICE_TMPDIR` must have room for the native files.
 
 `--verify` uses the configured Git verifier and its ordinary environment.
 Verification can have the same effects as a direct Git invocation, including

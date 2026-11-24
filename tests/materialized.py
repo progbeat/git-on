@@ -240,14 +240,23 @@ print('large file verified')
                 self.clean()
 
     @unittest.skipUnless(sys.platform == 'linux', 'private tmpfs quota requires Linux mount namespaces')
-    def test_native_fetch_with_large_commit_metadata_fits_two_checkouts(self):
+    def test_native_fetch_with_packed_metadata_fits_two_checkouts(self):
         from filesystem_quota import compare_on_tmpfs
         self.commit_with_large_message()
+        # The clone keeps these similar tag messages as deltas. Importing
+        # them individually as loose objects exceeds its disk budget.
+        message = base64.b64encode(shake_256(b'tag metadata fixture').digest(192 * 1024))
+        revision = 'HEAD'
+        for index in range(6):
+            name = f'nested-{index}'
+            self.git('tag', '-a', '--cleanup=verbatim', '-F', '-', name, revision, data=message)
+            revision = f'refs/tags/{name}'
         command = [sys.executable, '-I', '-S', '-c',
                    "from pathlib import Path; assert Path('tool').is_file(); print('ready')"]
         compare_on_tmpfs(self, self.root, BINARY, self.repo, self.env['PATH'], command,
                          size_mib=1, source=self.repo.as_uri(), checkout_copies=2,
-                         git_config={'fetch.parallel': '1'})
+                         git_config={'fetch.parallel': '1', 'fetch.unpackLimit': '1'},
+                         revision=revision, service_on_volume=True)
         self.clean()
 
     @unittest.skipUnless(sys.platform=='linux','private tmpfs quota requires Linux mount namespaces')
