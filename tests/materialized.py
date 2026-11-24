@@ -231,6 +231,7 @@ print('large file verified')
         child_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
         child_env, calls = record_git_invocations(self.root, child_env)
         for key, value, native in ((None, None, False), ('ssh.variant', 'ssh', False),
+                                   ('color.ui', 'auto', False),
                                    ('fetch.parallel', '1', True)):
             with self.subTest(configuration=key):
                 calls.write_text('')

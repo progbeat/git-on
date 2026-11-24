@@ -1328,7 +1328,7 @@ mod tests {
     fn snapshot_rejects_an_invalid_shallow_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
-        let mut response = Response::for_materialization(scratch, Oid::zero());
+        let mut response = Response::for_materialization(scratch, Oid::ZERO_SHA1);
         let error = response
             .write_http(b"0011shallow-info\n0014shallow invalid\n")
             .unwrap_err();
@@ -1344,7 +1344,7 @@ mod tests {
         for prefix in [b"".as_slice(), b"0011shallow-info\n", b"000dpackfile\n"] {
             let mut response = Response::new(
                 scratch.clone(),
-                vec![Oid::zero()],
+                vec![Oid::ZERO_SHA1],
                 Box::new(|_| panic!("a rejected fetch published an object")),
             );
             response.write_http(prefix).unwrap();

@@ -1378,7 +1378,7 @@ mod tests {
             "printf '%s blob 8\\nx' \"$2\"; while [ ! -f \"$1\" ]; do sleep 0.02; done",
             "batch-reader",
         ]);
-        let oid = git2::Oid::zero();
+        let oid = git2::Oid::ZERO_SHA1;
         command.arg(&release).arg(oid.to_string());
         let mut decoder = BatchProcess::spawn(command)?;
         let (failed, failure) = std::sync::mpsc::channel();
@@ -1618,7 +1618,7 @@ mod tests {
                 text_packet(&mut bytes, b"shallow-info", shallow_lf);
                 text_packet(
                     &mut bytes,
-                    format!("shallow {}", Oid::zero()).as_bytes(),
+                    format!("shallow {}", Oid::ZERO_SHA1).as_bytes(),
                     shallow_lf,
                 );
                 bytes.extend_from_slice(b"0001");
@@ -1691,7 +1691,7 @@ mod tests {
             let good = pack(&data);
             let oid = Oid::hash_object(git2::ObjectType::Blob, &data).unwrap();
             assert_eq!(receive(&good, oid).unwrap(), data);
-            assert!(receive(&good, Oid::zero()).is_err());
+            assert!(receive(&good, Oid::ZERO_SHA1).is_err());
             let body = &good[..good.len() - 20];
             let truncated = checksum(body[..body.len() - 2].to_vec());
             assert!(receive(&truncated, oid).is_err());
@@ -1707,11 +1707,11 @@ mod tests {
             let (mut session, _peer) = peer_response(malformed);
             let response = crate::pack_stream::Response::new(
                 cache.clone(),
-                vec![Oid::zero()],
+                vec![Oid::ZERO_SHA1],
                 Box::new(|_| panic!("malformed response published an object")),
             );
             assert!(session
-                .fetch_stream(&[Oid::zero()], FetchMode::Filtered, response)
+                .fetch_stream(&[Oid::ZERO_SHA1], FetchMode::Filtered, response)
                 .is_err());
         }
     }
@@ -1772,7 +1772,7 @@ mod tests {
         }
         let root = tempfile::tempdir()?;
         let cache = crate::raw_blob::RawBlobs::new(root.path())?;
-        let oid = Oid::zero();
+        let oid = Oid::ZERO_SHA1;
         session.set_stop(Arc::new(AtomicBool::new(true)));
         let response = crate::pack_stream::Response::new(
             cache,

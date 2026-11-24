@@ -1956,9 +1956,9 @@ mod tests {
             let mut previous = MAX_READ_AHEAD;
             for width in [128, 128, 64, 64, 4] {
                 for _ in 1..FORECAST_MISSES {
-                    assert_eq!(queue.forecast_width(Oid::zero()), previous);
+                    assert_eq!(queue.forecast_width(Oid::ZERO_SHA1), previous);
                 }
-                assert_eq!(queue.forecast_width(Oid::zero()), width);
+                assert_eq!(queue.forecast_width(Oid::ZERO_SHA1), width);
                 previous = width;
             }
         }
@@ -3125,7 +3125,7 @@ mod tests {
     #[test]
     fn cancelled_ssh_connection_completes_the_waiting_demand() {
         let mut queue = Queue::default();
-        let demand = queue.foreground(Oid::zero());
+        let demand = queue.foreground(Oid::ZERO_SHA1);
         assert!(matches!(
             queue.native_work(0, true),
             Some(NativeWork::Connect)
@@ -3143,8 +3143,8 @@ mod tests {
     #[test]
     fn a_validated_extra_does_not_open_an_ssh_channel() {
         let mut queue = Queue::default();
-        queue.foreground(Oid::zero());
-        queue.complete_extra(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
+        queue.complete_extra(Oid::ZERO_SHA1);
         assert!(queue.native_work(0, true).is_none());
     }
 
@@ -3158,7 +3158,7 @@ mod tests {
         queue.ssh_channels[..INITIAL_CONNECTIONS].fill(SshChannel::Unavailable);
         let ready = INITIAL_CONNECTIONS;
         queue.ssh_channels[ready] = SshChannel::Ready(std::process::id());
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
         let Some(NativeWork::Fetch { work, .. }) = queue.native_work(ready, false) else {
             panic!("an established channel can serve exact requests");
         };
@@ -3184,7 +3184,7 @@ mod tests {
         let last = INITIAL_CONNECTIONS;
         queue.ssh_channels[last] = SshChannel::Ready(std::process::id());
         queue.busy[last] = true;
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
         assert!(queue.native_work(last + 1, true).is_none());
         queue.ssh_channels[last] = SshChannel::Spent;
         assert!(queue.native_work(last + 1, true).is_none());
@@ -3208,7 +3208,7 @@ mod tests {
         queue.ssh_channels[released] = SshChannel::Spent;
         queue.ssh_channels[active] = SshChannel::Ready(std::process::id());
         queue.busy[active] = true;
-        let demand = queue.foreground(Oid::zero());
+        let demand = queue.foreground(Oid::ZERO_SHA1);
 
         assert!(queue.native_work(unopened, true).is_none());
         assert!(matches!(
@@ -3231,7 +3231,7 @@ mod tests {
         let released = INITIAL_CONNECTIONS;
         queue.ssh_channels[released] = SshChannel::Spent;
         queue.starting[released + 1] = true;
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
 
         assert!(matches!(
             queue.native_work(released, true),
@@ -3257,7 +3257,7 @@ mod tests {
         queue.ssh_channels[0] = SshChannel::Unavailable;
         queue.starting[1] = true;
         queue.ssh_channels[2] = SshChannel::Spent;
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
 
         assert!(matches!(
             queue.native_work(2, true),
@@ -3275,7 +3275,7 @@ mod tests {
         let released = INITIAL_CONNECTIONS;
         queue.ssh_channels[released] = SshChannel::Spent;
         queue.starting[released + 1] = true;
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
 
         assert!(matches!(
             queue.native_work(released, true),
@@ -3302,7 +3302,7 @@ mod tests {
         };
         queue.ssh_channels[0] = SshChannel::Spent;
         queue.busy[0] = true;
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
         assert!(matches!(
             queue.native_work(1, true),
             Some(NativeWork::Connect)
@@ -3326,7 +3326,7 @@ mod tests {
         queue.busy[..INITIAL_CONNECTIONS].fill(true);
         let standby = INITIAL_CONNECTIONS + 1;
         queue.ssh_channels[standby] = SshChannel::Ready(std::process::id());
-        queue.foreground(Oid::zero());
+        queue.foreground(Oid::ZERO_SHA1);
         assert!(queue.native_work(INITIAL_CONNECTIONS, true).is_none());
         assert!(matches!(
             queue.native_work(standby, false),
@@ -3382,7 +3382,7 @@ mod tests {
         let now = Instant::now();
         let mut queue = Queue::default();
         queue.waiting.push_back(QueuedDemand {
-            oid: Oid::zero(),
+            oid: Oid::ZERO_SHA1,
             demand: Demand::default(),
             queued_at: now,
             prefetch_width: READ_AHEAD,

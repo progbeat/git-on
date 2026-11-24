@@ -6,7 +6,7 @@ use crate::{
     transport,
 };
 use anyhow::{bail, Context, Result};
-use git2::{Odb, Oid, Repository};
+use git2::{Binding, IntoCString, Odb, Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -2657,13 +2657,14 @@ fn received_pack_bytes(directory: &Path) -> Result<u64> {
 }
 
 fn received_pack_database(directory: &Path) -> Result<Odb<'static>> {
-    let objects = directory.join("objects");
+    let path = directory.join("objects").into_c_string()?;
     let odb = Odb::new()?;
-    odb.add_disk_alternate(
-        objects
-            .to_str()
-            .context("invalid received pack storage path")?,
-    )?;
+    // SAFETY: both arguments stay alive through this call. libgit2 copies
+    // the byte path into the alternate backend it attaches to the ODB.
+    let status = unsafe { libgit2_sys::git_odb_add_disk_alternate(odb.raw(), path.as_ptr()) };
+    if status < 0 {
+        return Err(git2::Error::last_error(status)).context("open received pack object directory");
+    }
     Ok(odb)
 }
 fn stop_owned_connection(socket: &Path, owner: &SocketOwner) -> Result<()> {

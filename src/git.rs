@@ -468,10 +468,7 @@ impl Git {
             if let Some(common_dir) = common_dir {
                 command.env("GIT_COMMON_DIR", common_dir);
                 if let Some(worktree) = &self.original_worktree {
-                    command
-                        .current_dir(worktree)
-                        .arg("--work-tree")
-                        .arg(worktree);
+                    command.arg("--work-tree").arg(worktree);
                 }
                 // The SHA-1 view cannot resolve the caller's SHA-256 refs.
                 // Preserve signature settings already evaluated on its branch.
@@ -763,6 +760,7 @@ fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>, materializing: bool
             .and_then(OsStr::to_str)
             .is_some_and(|name| git2::Reference::is_valid_name(&format!("refs/heads/{name}"))),
         b"protocol.version" => value == Some(OsStr::new("2")),
+        b"color.ui" => value.is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"auto")),
         // The default parallel fetch setting only affects remote groups and
         // submodules, neither of which a streamed filtered selection fetches.
         b"fetch.parallel" if !materializing => value == Some(OsStr::new("1")),

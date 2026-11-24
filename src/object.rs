@@ -328,7 +328,7 @@ pub unsafe fn configure_pack_descriptors() -> Result<usize> {
     NATIVE_OID_VERIFICATION.store(
         version.vendored()
             && version.libgit2_version() == (1, 9, 7)
-            && version.crate_version() == "0.20.4",
+            && version.crate_version() == "0.21.0",
         Ordering::Release,
     );
     Ok(PACK_DESCRIPTORS)

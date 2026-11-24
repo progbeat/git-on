@@ -1016,6 +1016,34 @@ os.execv({native!r},[{native!r},*args])
         self.assertEqual(output, b'expected\n')
         assert_no_run_state(self, f.cwd)
 
+    @unittest.skipUnless(sys.platform == 'linux' and Path('/dev/shm').is_dir(),
+                         'requires Linux tmpfs and byte paths')
+    def test_native_fetch_accepts_a_byte_path_for_service_storage(self):
+        f = self.f
+        runtime = f.root / os.fsdecode(b'run-\xff')
+        runtime.mkdir()
+        home = f.root / 'home'
+        home.mkdir()
+        included = home / 'pack-context'
+        included.write_text('[unterminated\n')
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as tmpfs:
+            service = Path(tmpfs) / os.fsdecode(b'objects-\xff')
+            service.mkdir()
+            (home / '.gitconfig').write_text(
+                '[core]\nrepositoryFormatVersion = 1\n[extensions]\nobjectFormat = sha256\n'
+                f'[includeIf "gitdir:{Path(tmpfs).resolve()}/**"]\n\tpath = {included}\n'
+            )
+            f.env.update(HOME=str(home), TMPDIR=str(runtime), GIT_ON_SERVICE_TMPDIR=str(service))
+            with self.native_copy_workspace() as (process, directory, workspace):
+                snapshot_file, = directory.glob('*/deep/file')
+                self.assertEqual(snapshot_file.read_bytes(), b'expected\n')
+                self.assertTrue(directory.is_relative_to(runtime.resolve()))
+                self.assertTrue(workspace.is_relative_to(service.resolve()))
+                process.kill()
+            run([OPTIONS.binary, '--cleanup', directory], cwd=f.cwd, env=f.env, timeout=15)
+            self.assertEqual(list(service.iterdir()), [])
+            assert_no_run_state(self, runtime)
+
     def test_native_fetch_retries_only_when_pack_writes_exhaust_tmpfs(self):
         if sys.platform != 'linux' or not Path('/dev/shm').is_dir():
             self.skipTest('requires the automatic Linux tmpfs')
@@ -2115,8 +2143,14 @@ print(Path('deep/file').read_text(), end='')
                     worktree = f.root / 'separate-worktree'
                     worktree.mkdir()
                     contexts.append((caller, f.env, worktree))
+                else:
+                    explicit = dict(environment, GIT_DIR=str(caller.resolve() / '.git'),
+                                    GIT_WORK_TREE=str(caller.resolve()))
+                    contexts.append((f.cwd, explicit, None))
                 for directory, env, worktree in contexts:
                     with self.subTest(directory=directory.name):
+                        if directory == f.cwd:
+                            (caller / 'allowed-signers').rename(directory / 'allowed-signers')
                         if worktree is not None:
                             f.git('config', 'core.worktree', str(worktree), at=caller)
                             self.assertEqual(f.git('rev-parse', '--show-toplevel', at=caller),

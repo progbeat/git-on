@@ -230,7 +230,8 @@ repository- or user-scoped credentials and other authentication challenges.
 - Native fetch uses a private repository for destination refs and
   `FETCH_HEAD`. Git writes incoming objects and indexes directly to a
   separate temporary object directory. Selection and verification read the
-  original commit and tag objects from that directory.
+  original commit and tag objects from that directory. Git-on passes the
+  directory path to libgit2 as bytes.
 - Native ref negotiation or escaped file-URL diagnostics can use the same
   private repository context.
 - Verification of a remote object uses a private repository to expose that

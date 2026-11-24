@@ -184,7 +184,7 @@ impl NativeLocalObjects {
             let headers = start("--batch-check")?;
             // Resolve both Git object stores during startup. The contents
             // process would otherwise see later changes to an alternate path.
-            let absent = Oid::zero();
+            let absent = Oid::ZERO_SHA1;
             let _ = contents.exchange(format!("{absent}\n").as_bytes(), |input| {
                 crate::git::receive_batch_object(
                     absent,
