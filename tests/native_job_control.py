@@ -138,9 +138,16 @@ class NativeJobControlTests(unittest.TestCase):
         shell.send((shlex.join(argv) + '\n').encode())
         shell.expect(b"identity': ")
         runner, = children(shell.pid)
-        git, = children(runner)
+        shell.groups.add(runner)
+        native = []
+        for child in children(runner):
+            transports = children(child)
+            if any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh' for pid in transports):
+                native.append((child, transports))
+        self.assertEqual(len(native), 1, 'expected one native Git process with an SSH transport')
+        (git, self.transport_pids), = native
         self.runner, self.native_group = runner, os.getpgid(git)
-        shell.groups.update((runner, self.native_group))
+        shell.groups.add(self.native_group)
         if not native_terminal:
             run, = remote.run_directories(self.f.root)
             self.assertEqual(run.parent, self.f.root / 'git-on')
@@ -152,10 +159,6 @@ class NativeJobControlTests(unittest.TestCase):
         self.assertNotEqual(self.native_group, runner)
         self.assertEqual(os.getsid(git), shell.pid if native_terminal else git)
         self.assertEqual(os.tcgetpgrp(shell.fd), self.native_group if native_terminal else runner)
-        transports = children(git)
-        self.assertTrue(transports, 'real native Git did not own an SSH transport')
-        self.transport_pids = transports
-        self.assertTrue(any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh' for pid in transports))
 
     def stop_authentication(self):
         self.begin_authentication()

@@ -2,7 +2,10 @@
 //! real upload-pack protocol and filters; SSH/HTTPS are separately exercised.
 use git2::{Oid, Repository, Signature};
 use git_on::snapshot::Snapshot;
-use std::{ffi::OsStr, path::Path};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 #[cfg(target_os = "linux")]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -43,6 +46,9 @@ fn fixture() -> (tempfile::TempDir, Oid, Oid, Oid) {
     (temp, commit, tree, untouched)
 }
 fn load(root: &Path, rev: &str, verify: bool) -> anyhow::Result<Snapshot> {
+    load_server(root, rev, verify).map(|(snapshot, _)| snapshot)
+}
+fn load_server(root: &Path, rev: &str, verify: bool) -> anyhow::Result<(Snapshot, PathBuf)> {
     let source = format!("file://{}", root.join("server").display());
     load_operands(root, OsStr::new(&source), OsStr::new(rev), verify)
 }
@@ -51,14 +57,14 @@ fn load_operands(
     source: &OsStr,
     rev: &OsStr,
     verify: bool,
-) -> anyhow::Result<Snapshot> {
+) -> anyhow::Result<(Snapshot, PathBuf)> {
     // Production always owns a fresh private run. Keep it under the fixture so
     // repeated native fetches share the cache, never a previous FETCH_HEAD.
     let run = tempfile::Builder::new()
         .prefix("run-")
         .tempdir_in(root)?
         .keep();
-    Snapshot::load_source_with_pin_record(
+    let snapshot = Snapshot::load_source_with_pin_record(
         root,
         Some(source),
         rev,
@@ -67,17 +73,20 @@ fn load_operands(
         &run,
         "test-pin",
         |_, _, _| panic!("loading a snapshot should leave Git references alone"),
-    )
+    )?;
+    Ok((snapshot, run))
 }
 #[test]
 fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
     use std::os::unix::fs::FileExt;
+    use std::time::{Duration, Instant};
+    const SIZE: usize = 128 * 1024;
     let (temp, _, _, untouched) = fixture();
     let repo = Repository::open_bare(temp.path().join("server")).unwrap();
-    let oid = repo.blob(&vec![b'v'; 128 * 1024]).unwrap();
+    let oid = repo.blob(&vec![b'v'; SIZE]).unwrap();
     let mut builder = repo.treebuilder(None).unwrap();
     builder.insert("file", oid, 0o100644).unwrap();
-    let fillers: Vec<_> = (0..9)
+    let fillers: Vec<_> = (0..8)
         .map(|value| {
             let filler = repo.blob(&vec![value; 64 * 1024 + 1]).unwrap();
             builder
@@ -98,14 +107,16 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
     )
     .unwrap();
     for retained_reader in [false, true] {
-        let snap = load(temp.path(), "HEAD", false).unwrap();
+        let (snap, run) = load_server(temp.path(), "HEAD", false).unwrap();
         let entry = snap.entry(Path::new("file")).unwrap().unwrap();
         let reader = retained_reader.then(|| snap.open(entry.oid).unwrap());
         assert_eq!(snap.read(oid, 0, 1).unwrap(), b"v");
         for (value, filler) in fillers.iter().enumerate() {
             assert_eq!(snap.read(*filler, 0, 1).unwrap(), [value as u8]);
         }
-        let store = std::fs::read_dir(snap.git_dir.parent().unwrap())
+        // The raw cache belongs to the run. Native Git's directory may
+        // be on a separate service memory filesystem.
+        let store = std::fs::read_dir(run)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| {
@@ -116,6 +127,13 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
             })
             .unwrap();
         let path = store.join(oid.to_string());
+        // Early reads can return while the background writer is still
+        // publishing the evicted object and its block digests.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while snap.metrics().retained_raw_blob_bytes < SIZE as u64 {
+            assert!(Instant::now() < deadline, "raw blob did not spill");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -248,7 +266,8 @@ fn direct_non_utf8_repository_paths_are_native_git_operands() {
         .path()
         .join(OsString::from_vec(b"source-\xff".to_vec()));
     std::os::unix::fs::symlink(temp.path().join("server"), &source).unwrap();
-    let snap = load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
+    let (snap, _) =
+        load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
     assert_eq!(snap.tree_oid, tree);
     let entry = snap.entry(Path::new("deep/value")).unwrap().unwrap();
     assert_eq!(snap.read(entry.oid, 0, 100).unwrap(), b"selected\n");
@@ -257,7 +276,8 @@ fn direct_non_utf8_repository_paths_are_native_git_operands() {
 fn remote_materialization_preserves_the_selected_tree_without_a_checkout() {
     let (temp, _, tree, _) = fixture();
     let source = temp.path().join("server");
-    let snap = load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
+    let (snap, _) =
+        load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
     let destination = temp.path().join("materialized");
     std::fs::create_dir(&destination).unwrap();
     git_on::materialize::materialize(&snap, &destination).unwrap();

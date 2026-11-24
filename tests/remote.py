@@ -1879,7 +1879,8 @@ os.execv({native!r},[{native!r},*args])
         keyring = public_home / 'fixture public.gpg'
         config = public_home / 'gpg.conf'
         keyring_options = f'no-default-keyring\nkeyring "{keyring.name}"\n'
-        config.write_text(f'log-file {journal}\ntrustdb-name {trustdb}\n' + keyring_options)
+        original_options = f'log-file {journal}\ntrustdb-name {trustdb}\n' + keyring_options
+        config.write_text(original_options)
         process = f.probe('local', signed, verify=True)
         _, errors = process.communicate(timeout=20)
         self.assertNotEqual(process.returncode, 0)
@@ -1889,7 +1890,17 @@ os.execv({native!r},[{native!r},*args])
         public = run(['gpg', '--batch', '--export'], env=env)
         run(['gpg', '--no-options', '--no-default-keyring', '--keyring', str(keyring),
              '--batch', '--import'], input=public, env=public_env)
+        unused_policy = f.root / 'unused-certificate-policy'
+        unused_policy.mkdir()
+        x509_config = public_home / 'gpgsm.conf'
+        x509_options = f'policy-file "{unused_policy}"\n'
+        x509_config.write_text(x509_options)
+        native = ['git', '-C', f.repo, 'verify-commit', signed]
+        config.write_text(f'log-file {f.root / "native-verifier-log"}\n'
+                          f'trustdb-name {f.root / "native-trustdb"}\n' + keyring_options)
+        run(native, env=public_env)
         original_keyring = keyring.read_bytes()
+        config.write_text(original_options)
         f.env['GNUPGHOME'] = '~/.gnupg'
         process = f.probe('local', signed, verify=True)
         self.assertEqual(f.line(process)['tree'], f.tree)
@@ -1897,11 +1908,11 @@ os.execv({native!r},[{native!r},*args])
         self.assertFalse(trustdb.exists(), 'verification created a trust database in the caller home')
         self.assertEqual(journal.read_bytes(), b'keep this log\n')
         self.assertEqual(keyring.read_bytes(), original_keyring)
+        self.assertEqual(x509_config.read_text(), x509_options)
 
         version = run(['gpg', '--no-options', '--version'], env=public_env).splitlines()[0].split()[-1]
         series = os.fsdecode(b'.'.join(version.split(b'.')[:2]))
         versioned_config = public_home / f'gpg.conf-{series}'
-        native = ['git', '-C', f.repo, 'verify-commit', signed]
         for name, regular, versioned in (
             ('ignored options directive', keyring_options + f'options {f.root / "unused.conf"}\n', None),
             ('version-specific config', 'no-default-keyring\n', keyring_options),
@@ -1944,6 +1955,19 @@ os.execv({native!r},[{native!r},*args])
         f.finish(process)
         self.assertEqual(custom.read_bytes(), original_keyring)
 
+        alternate_home = f.root / 'delegate-home'
+        alternate_home.mkdir()
+        alternate_keyring = alternate_home / 'public.gpg'
+        alternate_keyring.write_bytes(original_keyring)
+        versioned_config.unlink(missing_ok=True)
+        config.write_text('no-default-keyring\nkeyring ~/public.gpg\n')
+        wrapper.write_text(f'#!/bin/sh\nHOME={shlex.quote(str(alternate_home))} exec gpg "$@"\n')
+        run(native, env=f.env)
+        process = f.probe('local', signed, verify=True)
+        self.assertEqual(f.line(process)['tree'], f.tree)
+        f.finish(process)
+        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+
     @unittest.skipUnless(shutil.which('gpgsm'), 'requires the native X.509 verifier')
     def test_x509_verification_uses_the_callers_certificate_policy(self):
         f = self.f
@@ -1964,6 +1988,9 @@ os.execv({native!r},[{native!r},*args])
         policies = f.repo / 'fixture policy.txt'
         policies.write_text(policy + '\n')
         (home / 'gpgsm.conf').write_text(f'disable-crl-checks\npolicy-file "{policies.name}"\n')
+        unused_keyring = home / 'unused-openpgp-keyring'
+        unused_keyring.mkdir()
+        (home / 'gpg.conf').write_text(f'keyring "{unused_keyring}"\n')
         run(['gpgsm', '--batch', '--import', certificate], cwd=f.repo, env=f.env)
         # Some gpgsm builds require /dev/stdin for Git's detached input.
         wrapper = f.root / 'gpgsm-stdin'
@@ -1972,7 +1999,13 @@ os.execv({native!r},[{native!r},*args])
         browser_socket = f.root / 'browser-agent.sock'
         wrapper.write_text(f'''#!{sys.executable}
 from pathlib import Path
-import subprocess, sys
+import os, subprocess, sys
+if uid := os.environ.get('FIXTURE_DELEGATED_OPENPGP_UID'):
+    key = os.environ['FIXTURE_DELEGATED_OPENPGP_KEY']
+    subprocess.run(['gpg', '--batch', '--import', key], stdout=subprocess.DEVNULL, check=True)
+    listed = subprocess.check_output(['gpg2', '--batch', '--list-keys', uid])
+    if not any(line.startswith(b'pub:') for line in listed.splitlines()):
+        sys.exit('delegated OpenPGP configuration was not applied')
 status = subprocess.run(
     [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for arg in sys.argv[1:])]
 ).returncode
@@ -1995,12 +2028,44 @@ sys.exit(status)
         agent_config = home / 'gpg-agent.conf'
         socket_options = f'extra-socket {extra_socket}\nbrowser-socket {browser_socket}\n'
         agent_config.write_text(socket_options)
+        command = [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all',
+                   '--', 'cat', 'deep/file']
         result = subprocess.run(
-            [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
+            command,
             cwd=f.repo, env=f.env, capture_output=True, timeout=20,
         )
         self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
         self.assertEqual(agent_config.read_text(), socket_options)
+
+        # This wrapper needs its OpenPGP import in the following tool call.
+        agent_config.unlink()
+        signer = f.root / 'pgp'
+        signer.mkdir(mode=0o700)
+        signing_env = dict(f.env, GNUPGHOME=str(signer))
+        self.addCleanup(run, ['gpgconf', '--kill', 'all'], env=signing_env)
+        uid = 'Delegate fixture <delegate@example.invalid>'
+        run(['gpg', '--batch', '--pinentry-mode', 'loopback', '--passphrase', '',
+             '--quick-generate-key', uid, 'ed25519', 'sign', '0'], env=signing_env)
+        public_key = f.root / 'delegated-public.gpg'
+        public_key.write_bytes(run(['gpg', '--batch', '--export', uid], env=signing_env))
+        pgp_keyring = home / 'delegate.gpg'
+        pgp_options = 'no-default-keyring\nwith-colons\nkeyring '
+        (home / 'gpg.conf').write_text(pgp_options + 'native-delegate.gpg\n')
+        tools = f.root / 'delegated-tools'
+        tools.mkdir()
+        (tools / 'gpg2').symlink_to(shutil.which('gpg', path=f.env['PATH']))
+        forwarding = tools / 'gpg'
+        forwarding.write_text('#!/bin/sh\nexec gpg2 "$@"\n')
+        forwarding.chmod(0o700)
+        delegated_env = dict(f.env, FIXTURE_DELEGATED_OPENPGP_UID=uid,
+                             FIXTURE_DELEGATED_OPENPGP_KEY=str(public_key),
+                             PATH=str(tools) + os.pathsep + f.env['PATH'])
+        run(native, env=delegated_env)
+        (home / 'gpg.conf').write_text(pgp_options + pgp_keyring.name + '\n')
+        result = subprocess.run(command, cwd=f.repo, env=delegated_env, capture_output=True, timeout=20)
+        self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+        self.assertFalse(pgp_keyring.exists())
+
         agent_config.write_text('no-user-trustlist\n')
         run(['gpgconf', '--kill', 'gpg-agent'], env=f.env)
         untrusted = subprocess.run(native, env=f.env, capture_output=True, timeout=20)

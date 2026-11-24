@@ -42,7 +42,7 @@ fn flat_recovery_survives_an_active_lock_and_a_failed_retirement() {
     assert_eq!(fs::read(&state).unwrap(), record);
 
     AFTER_MARKER_UNLOCK.set(Some(Box::new(|| {
-        Err(std::io::Error::from_raw_os_error(libc::EPERM).into())
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
     })));
     assert_eq!(io_errno(&cleanup(&dir).unwrap_err()), Some(libc::EPERM));
     assert!(!dir.exists());

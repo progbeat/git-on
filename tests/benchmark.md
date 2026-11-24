@@ -152,9 +152,11 @@ a release result, or claim an SLA from a single machine's median.
 
 The per-sample timeout first sends TERM to the private measurement session and
 then KILL after five seconds. Normal signal handling lets git-on unmount and
-clean up; a force kill can leave temporary mount/backing state and a Git pin.
-Use `git on --cleanup <stale-temporary-directory>` if recovery is needed. The
-harness does not discover or remove unrelated temporary directories. An escaped
+clean up. A force kill can leave temporary mount or backing state.
+Use `git on --cleanup <stale-temporary-directory>` if recovery is needed. Older
+binaries used by the harness can also leave a Git pin in the source repository.
+Cleanup preserves those legacy refs. The harness does not discover or remove
+unrelated temporary directories. An escaped
 descendant retaining a capture descriptor cannot turn a timeout into a success;
 incomplete capture is recorded as failure. An external CI timeout, OOM kill, or
 machine failure may prevent the harness from writing a final sample. Retain the

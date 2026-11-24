@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
@@ -18,13 +18,70 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 const VERIFIER_TOOLS: &[&str] = &["gpg", "gpg2", "gpgsm"];
 const DELEGATE_PATH: &str = "GIT_ON_GNUPG_DELEGATE_PATH";
 const DELEGATE_HOME: &str = "GIT_ON_GNUPG_DELEGATE_HOME";
-const DELEGATE_PREFIX: &str = "delegate-";
+const DELEGATE_SOURCE: &str = "GIT_ON_GNUPG_DELEGATE_SOURCE";
+const DELEGATE_KEY: &str = "GIT_ON_GNUPG_DELEGATE_KEY";
+const DELEGATE_PREFIX: &str = "d-";
 
-#[derive(Clone, Copy)]
-enum VerificationInputs {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
     OpenPgp,
     X509,
-    Configured,
+}
+
+impl Format {
+    fn for_program(program: &str) -> Self {
+        if program == "gpgsm" {
+            Self::X509
+        } else {
+            Self::OpenPgp
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            Self::OpenPgp => "gpg",
+            Self::X509 => "gpgsm",
+        }
+    }
+}
+
+struct VerificationInputs {
+    format: Option<Format>,
+    copy_extra: bool,
+}
+
+struct DelegateContext<'a> {
+    cwd: &'a Path,
+    source: Option<&'a Path>,
+    caller: Option<&'a Path>,
+    format: Format,
+}
+
+impl DelegateContext<'_> {
+    fn key(&self) -> blake3::Hash {
+        let mut hash = blake3::Hasher::new();
+        hash.update(self.format.program().as_bytes());
+        hash.update(&[0]);
+        for location in [Some(self.cwd), self.source, self.caller] {
+            if let Some(location) = location {
+                hash.update(location.as_os_str().as_bytes());
+            }
+            hash.update(&[0]);
+        }
+        hash.finalize()
+    }
+
+    fn bind_home(&self, command: &mut Command, home: &Path) {
+        command
+            .env("GNUPGHOME", home)
+            .env("XDG_RUNTIME_DIR", home)
+            .env(DELEGATE_HOME, home)
+            .env(DELEGATE_KEY, self.key().to_hex().as_str())
+            .env_remove(DELEGATE_SOURCE);
+        if let Some(source) = self.source {
+            command.env(DELEGATE_SOURCE, source);
+        }
+    }
 }
 
 const VERIFIERS: [(&str, &str, &str, &str); 2] = [
@@ -65,15 +122,18 @@ impl Scratch {
                         b"gpg.program" | b"gpg.openpgp.program" | b"gpg.x509.program"
                     )
             });
+            let cwd = command.get_current_dir().unwrap_or(Path::new("."));
+            let source = resolve_home(cwd, env::var_os("GNUPGHOME"))?;
+            let caller = env::home_dir();
             let home = prepare_home(
                 directory,
-                command.get_current_dir().unwrap_or(Path::new(".")),
-                if custom_verifier {
-                    VerificationInputs::Configured
-                } else {
-                    VerificationInputs::X509
+                cwd,
+                VerificationInputs {
+                    format: None,
+                    copy_extra: custom_verifier,
                 },
-                env::var_os("GNUPGHOME"),
+                source.as_deref(),
+                caller.as_deref(),
             )?;
             command
                 .env("GNUPGHOME", &home)
@@ -128,10 +188,9 @@ fn stop_workspace_verifiers(directory: &Path) {
     stop_verifiers(directory);
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .as_bytes()
-                .starts_with(DELEGATE_PREFIX.as_bytes())
+            let name = entry.file_name();
+            if (name.as_bytes().starts_with(DELEGATE_PREFIX.as_bytes())
+                || name.as_bytes().starts_with(b"delegate-"))
                 && entry.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 stop_verifiers(&entry.path());
@@ -185,22 +244,30 @@ pub fn invoke_verifier() -> Option<i32> {
         let configured =
             std::env::var_os(format!("{variable}_CONFIGURED")).as_deref() == Some(OsStr::new("1"));
         let cwd = env::current_dir()?;
-        let inputs = if configured {
-            VerificationInputs::Configured
-        } else if *default == "gpgsm" {
-            VerificationInputs::X509
-        } else {
-            VerificationInputs::OpenPgp
+        let format = Format::for_program(default);
+        let inputs = VerificationInputs {
+            format: Some(format),
+            copy_extra: configured,
         };
-        let home = prepare_home(run, &cwd, inputs, env::var_os("GNUPGHOME"))?;
+        let source = resolve_home(&cwd, env::var_os("GNUPGHOME"))?;
+        let caller = env::home_dir();
+        let home = prepare_home(run, &cwd, inputs, source.as_deref(), caller.as_deref())?;
         let mut command = Command::new(program);
-        command
-            .args(arguments)
-            .env("GNUPGHOME", &home)
-            .env("XDG_RUNTIME_DIR", &home);
-        let _delegate = configured
-            .then(|| configure_delegate(&mut command, run, &cwd, &home))
-            .transpose()?;
+        command.args(arguments);
+        let _delegate = if configured {
+            let context = DelegateContext {
+                cwd: &cwd,
+                source: source.as_deref(),
+                caller: caller.as_deref(),
+                format,
+            };
+            Some(configure_delegate(&mut command, run, &home, &context)?)
+        } else {
+            command
+                .env("GNUPGHOME", &home)
+                .env("XDG_RUNTIME_DIR", &home);
+            None
+        };
         Ok(command.status()?)
     })()))
 }
@@ -227,8 +294,8 @@ fn verifier_program_variable(name: &str) -> String {
 fn configure_delegate(
     command: &mut Command,
     run: &Path,
-    cwd: &Path,
     home: &Path,
+    context: &DelegateContext<'_>,
 ) -> Result<tempfile::TempDir> {
     let original = env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
     let tools = tempfile::Builder::new()
@@ -238,7 +305,7 @@ fn configure_delegate(
     let executable = env::current_exe()?;
     for name in VERIFIER_TOOLS {
         let program = env::split_paths(&original)
-            .map(|path| cwd.join(path).join(name))
+            .map(|path| context.cwd.join(path).join(name))
             .find(|candidate| {
                 candidate
                     .metadata()
@@ -252,10 +319,8 @@ fn configure_delegate(
     let path = env::join_paths(
         std::iter::once(tools.path().to_path_buf()).chain(env::split_paths(&original)),
     )?;
-    command
-        .env("PATH", path)
-        .env(DELEGATE_PATH, tools.path())
-        .env(DELEGATE_HOME, home);
+    command.env("PATH", path).env(DELEGATE_PATH, tools.path());
+    context.bind_home(command, home);
     Ok(tools)
 }
 
@@ -285,44 +350,75 @@ fn run_delegate(
     let mut command = Command::new(program);
     command.args(forwarded);
     let existing = env::var_os(DELEGATE_HOME).context("missing private GnuPG home")?;
-    if source.as_deref() == Some(existing.as_os_str()) {
-        return Ok(command
-            .env("GNUPGHOME", &existing)
-            .env("XDG_RUNTIME_DIR", &existing)
-            .status()?);
-    }
-    let scratch = tempfile::Builder::new()
-        .prefix(DELEGATE_PREFIX)
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(run)?;
-    let home = prepare_home(
-        scratch.path(),
-        &env::current_dir()?,
-        VerificationInputs::Configured,
-        source,
-    )?;
-    let status = command
-        .env("GNUPGHOME", &home)
-        .env("XDG_RUNTIME_DIR", &home)
-        .status();
-    stop_verifiers(scratch.path());
-    Ok(status?)
+    let inherited_home = source.as_deref() == Some(existing.as_os_str());
+    let format = Format::for_program(name);
+    let cwd = env::current_dir()?;
+    let source = if inherited_home {
+        env::var_os(DELEGATE_SOURCE).map(PathBuf::from)
+    } else {
+        resolve_home(&cwd, source)?
+    };
+    let caller = env::home_dir();
+    let context = DelegateContext {
+        cwd: &cwd,
+        source: source.as_deref(),
+        caller: caller.as_deref(),
+        format,
+    };
+    let key = context.key().to_hex();
+    let same_context = env::var_os(DELEGATE_KEY).as_deref() == Some(OsStr::new(key.as_str()));
+    let home = if inherited_home && same_context {
+        PathBuf::from(existing)
+    } else {
+        delegated_home(run, &context)?
+    };
+    context.bind_home(&mut command, &home);
+    Ok(command.status()?)
 }
 
-fn prepare_home(
-    run: &Path,
-    cwd: &Path,
-    inputs: VerificationInputs,
-    source_home: Option<OsString>,
-) -> Result<PathBuf> {
-    let home = run.join("keys");
-    match fs::DirBuilder::new().mode(0o700).create(&home) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(home),
-        Err(error) => return Err(error.into()),
+fn delegated_home(run: &Path, context: &DelegateContext<'_>) -> Result<PathBuf> {
+    // Keep the socket pathname inside GnuPG's Unix socket length limit.
+    let key = context.key().to_hex();
+    let directory = run.join(format!("{DELEGATE_PREFIX}{}", &key[..16]));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&directory)?;
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(directory.join("prepare.lock"))?;
+    marker.lock()?;
+    let home = directory.join("keys");
+    let ready = directory.join("prepared");
+    if !ready.try_exists()? {
+        // An interrupted preparation can leave a partial copy before it
+        // releases the lock. Only expose the home after the complete copy.
+        match fs::remove_dir_all(&home) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let inputs = VerificationInputs {
+            format: Some(context.format),
+            copy_extra: true,
+        };
+        prepare_home(
+            &directory,
+            context.cwd,
+            inputs,
+            context.source,
+            context.caller,
+        )?;
+        fs::File::create(ready)?;
     }
-    let caller = std::env::home_dir();
-    let source = match source_home.filter(|source| !source.is_empty()) {
+    Ok(home)
+}
+
+fn resolve_home(cwd: &Path, source_home: Option<OsString>) -> Result<Option<PathBuf>> {
+    Ok(match source_home.filter(|source| !source.is_empty()) {
         Some(source) if source.as_bytes().starts_with(b"~") => {
             // Ask GnuPG to resolve both ~/ and ~user/ with its own home rules.
             let output = Command::new("gpgconf")
@@ -345,8 +441,23 @@ fn prepare_home(
             Some(PathBuf::from(OsString::from_vec(path.to_vec())))
         }
         Some(source) => Some(cwd.join(source)),
-        None => caller.as_ref().map(|caller| caller.join(".gnupg")),
-    };
+        None => env::home_dir().map(|caller| caller.join(".gnupg")),
+    })
+}
+
+fn prepare_home(
+    run: &Path,
+    cwd: &Path,
+    inputs: VerificationInputs,
+    source: Option<&Path>,
+    caller: Option<&Path>,
+) -> Result<PathBuf> {
+    let home = run.join("keys");
+    match fs::DirBuilder::new().mode(0o700).create(&home) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(home),
+        Err(error) => return Err(error.into()),
+    }
     let Some(source) = source else {
         return Ok(home);
     };
@@ -363,14 +474,14 @@ fn prepare_home(
     ] {
         copy_public_file(&source.join(name), &home.join(name))?;
     }
-    let entries = match fs::read_dir(&source) {
+    let entries = match fs::read_dir(source) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(home),
         Err(error) => return Err(error.into()),
     };
     let mut directories = Vec::new();
-    if !matches!(inputs, VerificationInputs::OpenPgp) {
-        let metadata = fs::metadata(&source)?;
+    if inputs.copy_extra || inputs.format != Some(Format::OpenPgp) {
+        let metadata = fs::metadata(source)?;
         directories.push((metadata.dev(), metadata.ino()));
     }
     let mut named_files = 0;
@@ -383,6 +494,13 @@ fn prepare_home(
             .strip_prefix(b"gpg.conf-")
             .and_then(|version| version.first())
             .is_some_and(u8::is_ascii_digit);
+        // Git dispatches verification by the signature format. Each GnuPG
+        // verifier reads its own options, plus the shared helper configs.
+        if (inputs.format == Some(Format::OpenPgp) && matches!(filename, b"gpgsm.conf" | b"crls.d"))
+            || (inputs.format == Some(Format::X509) && (versioned || filename == b"gpg.conf"))
+        {
+            continue;
+        }
         if !versioned
             && !matches!(
                 filename,
@@ -394,9 +512,7 @@ fn prepare_home(
                     | b"dirmngr.conf"
             )
         {
-            if matches!(inputs, VerificationInputs::Configured)
-                || matches!(inputs, VerificationInputs::X509) && filename == b"crls.d"
-            {
+            if inputs.copy_extra || filename == b"crls.d" {
                 copy_verifier_input(&entry, &home.join(name), &mut directories)?;
             }
             continue;
@@ -469,7 +585,6 @@ fn prepare_home(
                         cwd.join(OsStr::from_bytes(path))
                     } else if let Some(suffix) = path.strip_prefix(b"~/") {
                         caller
-                            .as_deref()
                             .context("resolve caller's GnuPG path")?
                             .join(OsStr::from_bytes(suffix))
                     } else if path.contains(&b'/') {
@@ -618,6 +733,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delegated_configuration_resolves_relative_policy_in_each_working_directory() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = tempfile::tempdir()?;
+        fs::write(
+            source.path().join("gpgsm.conf"),
+            b"policy-file issuer.policy\n",
+        )?;
+        for value in ["1.2.3.4", "1.2.3.5"] {
+            let cwd = tempfile::tempdir()?;
+            fs::write(cwd.path().join("issuer.policy"), value)?;
+            let home = delegated_home(
+                scratch.path(),
+                &DelegateContext {
+                    cwd: cwd.path(),
+                    source: Some(source.path()),
+                    caller: None,
+                    format: Format::X509,
+                },
+            )?;
+            let config = fs::read_to_string(home.join("gpgsm.conf"))?;
+            let path = config
+                .strip_prefix("policy-file ")
+                .context("prepared policy")?;
+            assert_eq!(fs::read_to_string(path.trim_end())?, value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_keyring_resolves_tilde_in_each_callers_home() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = tempfile::tempdir()?;
+        fs::write(source.path().join("gpg.conf"), b"keyring ~/public.gpg\n")?;
+        for data in [b"first", b"other"] {
+            let caller = tempfile::tempdir()?;
+            fs::write(caller.path().join("public.gpg"), data)?;
+            let home = delegated_home(
+                scratch.path(),
+                &DelegateContext {
+                    cwd: scratch.path(),
+                    source: Some(source.path()),
+                    caller: Some(caller.path()),
+                    format: Format::OpenPgp,
+                },
+            )?;
+            let config = fs::read_to_string(home.join("gpg.conf"))?;
+            let path = config
+                .strip_prefix("keyring ")
+                .context("prepared keyring")?;
+            assert_eq!(fs::read(home.join(path.trim_end()))?, data);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn x509_preparation_copies_the_crl_cache_without_its_locks() -> Result<()> {
         let source = tempfile::tempdir()?;
         let scratch = tempfile::tempdir()?;
@@ -628,8 +798,12 @@ mod tests {
         let private = prepare_home(
             scratch.path(),
             source.path(),
-            VerificationInputs::X509,
-            Some(source.path().as_os_str().to_owned()),
+            VerificationInputs {
+                format: Some(Format::X509),
+                copy_extra: false,
+            },
+            Some(source.path()),
+            None,
         )?;
         assert_eq!(
             fs::read(private.join("crls.d/DIR.txt"))?,
