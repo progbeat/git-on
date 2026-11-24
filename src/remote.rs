@@ -2,7 +2,7 @@
 use crate::{
     git::Git,
     raw_blob::{ReceivedObject, Transfer},
-    service_memory::Directory,
+    service_storage::Directory,
     transport,
 };
 use anyhow::{bail, Context, Result};
@@ -47,8 +47,7 @@ pub fn invoke_ssh_launcher() -> Option<i32> {
     {
         return None;
     }
-    let direct = arguments.next_if(|arg| arg == "--direct").is_some();
-    let launching = direct || arguments.next_if(|arg| arg == "--launch").is_some();
+    let launching = arguments.next_if(|arg| arg == "--launch").is_some();
     let (program, git_arguments) = if launching {
         let program = arguments.next()?;
         let count = arguments.next()?.to_str()?.parse::<usize>().ok()?;
@@ -68,7 +67,6 @@ pub fn invoke_ssh_launcher() -> Option<i32> {
     }
     options.extend(arguments);
     let mut command = Command::new(&program);
-    let argv0 = (!direct).then_some(launcher.as_os_str());
     let settings = options
         .len()
         .checked_sub(git_arguments)
@@ -77,16 +75,14 @@ pub fn invoke_ssh_launcher() -> Option<i32> {
             if !launching && before_host > 0 && options[before_host - 1] == "--" {
                 before_host -= 1;
             }
-            ssh_host_files::launch(&program, argv0, &launcher, options, before_host)
+            ssh_host_files::launch(&program, &launcher, options, before_host)
         });
     let error = match settings {
         Err(error) => error,
         Ok(settings) => {
             // OpenSSH uses argv[0] for its implicit ProxyJump command. Each
             // jump applies the same options and reads native config files.
-            if let Some(argv0) = argv0 {
-                command.arg0(argv0);
-            }
+            command.arg0(ssh_jump::LAUNCHER_COMMAND);
             command.env("GIT_ON_SSH_CLIENT_PROGRAM", settings.jump_client);
             command.args(settings.args).exec().into()
         }
@@ -380,7 +376,7 @@ impl Remote {
         let ssh_storage = socket
             .as_ref()
             .map(|socket| -> Result<_> {
-                let storage = Directory::new("ssh-")?;
+                let storage = Directory::new_for_run("ssh-", run)?;
                 std::os::unix::fs::symlink(socket, storage.path().join("socket"))?;
                 std::os::unix::fs::symlink(
                     std::env::current_exe()?,
@@ -602,8 +598,8 @@ impl Remote {
     }
 
     fn create_native_repository(&mut self) -> Result<Repository> {
-        let storage = Directory::new("repo-")?;
-        let name = OsStr::new("remote-repository");
+        let storage = Directory::new_for_run("repo-", &self.run)?;
+        let name = "remote-repository";
         let dir = storage.path().join(name);
         fs::DirBuilder::new()
             .mode(0o700)
@@ -616,13 +612,45 @@ impl Remote {
         let mut options = git2::RepositoryInitOptions::new();
         options.bare(true).external_template(false);
         let repo = Repository::init_opts(&dir, &options)?;
+        let repo = if storage
+            .path()
+            .join(name.to_ascii_uppercase())
+            .try_exists()?
+        {
+            // Keep the writable libgit2 object database. Native Git manages
+            // refs with reftable so their names retain case-sensitive semantics.
+            let objects = Repository::from_odb(repo.odb()?)?;
+            drop(repo);
+            fs::remove_file(dir.join("HEAD"))?;
+            fs::remove_file(dir.join("config"))?;
+            fs::remove_dir_all(dir.join("refs"))?;
+            let mut command = self.git.command(Some(&dir));
+            command.env("TMPDIR", storage.path()).args([
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                "--initial-branch=master",
+                "--object-format=sha1",
+                "--ref-format=reftable",
+            ]);
+            let output = crate::git::run_builtin(command)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "initialize private reftable repository: {}",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+            objects
+        } else {
+            repo
+        };
         // A source path can be a valid fetch operand but an invalid
         // promisor remote name. This separate promisor has no URL.
-        repo.config()?.set_bool(
+        git2::Config::open(&dir.join("config"))?.set_bool(
             &format!("remote.git-on-owned-{}.promisor", uuid::Uuid::new_v4()),
             true,
         )?;
-        storage.link(&self.run, name, Path::new(name))?;
+        storage.link(&self.run, name.as_ref(), Path::new(name))?;
         self.dir = dir;
         self.native_storage = Some(storage);
         Ok(repo)
@@ -2361,7 +2389,7 @@ fn same_socket_path(left: &Path, right: &Path) -> bool {
             })
 }
 
-pub(crate) fn has_memory_connection(root: &Path) -> bool {
+pub(crate) fn has_ssh_connection(root: &Path) -> bool {
     fs::read_dir(root).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
             let path = entry.path();
@@ -2767,10 +2795,7 @@ fn validate_ssh_command(command: &OsStr) -> Result<()> {
 // prefixes and compounds cannot safely identify the OpenSSH executable.
 // Transparent GIT_SSH executables that forward OpenSSH argv remain supported.
 const SSH_WRAPPER: &str = r#"git_on_ssh_config() {
-    git_on_config=; git_on_launcher=$GIT_ON_SSH_LAUNCHER
-    case "$git_on_launcher" in
-        *[!a-zA-Z0-9_./-]*) git_on_launcher=; return 0 ;;
-    esac
+    git_on_config=
     if [ "$git_on_explicit_config" = 0 ]; then return; fi
     git_on_config=$GIT_ON_SSH_CONFIG
     if [ -f "$git_on_config" ]; then return; fi
@@ -2876,10 +2901,7 @@ git_on_ssh_command() {
         set -- -o ControlMaster=no -o BatchMode=yes "$@"
     fi
     if [ "$GIT_ON_SSH_INITIAL" = 1 ]; then
-        if [ -n "$git_on_launcher" ]; then
-            exec "$git_on_launcher" --launch "$executable" "$git_on_git_argc" "$@"
-        fi
-        exec "$GIT_ON_SSH_LAUNCHER" --direct "$executable" "$git_on_git_argc" "$@"
+        exec "$GIT_ON_SSH_LAUNCHER" --launch "$executable" "$git_on_git_argc" "$@"
     fi
     exec "$executable" "$@"
 }"#;

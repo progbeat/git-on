@@ -163,7 +163,7 @@ pub(crate) fn credentials(
     url: &str,
     challenges: &[Vec<u8>],
     previous: Option<&Credentials>,
-    scratch: &mut Option<crate::service_memory::Directory>,
+    scratch: &mut Option<crate::service_storage::Directory>,
 ) -> Result<Option<Credentials>> {
     command
         .args(["-c", "credential.interactive=false", "credential", "fill"])
@@ -198,7 +198,7 @@ pub(crate) fn credentials(
     request.push(b'\n');
     let scratch = match scratch {
         Some(directory) => directory,
-        None => scratch.insert(crate::service_memory::Directory::new("credential-")?),
+        None => scratch.insert(crate::service_storage::Directory::new("credential-")?),
     };
     command.env("TMPDIR", scratch.path());
     let (output, mut values) =

@@ -1,5 +1,5 @@
 use super::{native_git_error, run_builtin, Git};
-use crate::service_memory::Directory;
+use crate::service_storage::Directory;
 use anyhow::{Context, Result};
 use git2::Oid;
 use std::{

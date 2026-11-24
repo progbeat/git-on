@@ -23,13 +23,10 @@ fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
-    if let Some(status) = git_on::service_memory::invoke() {
+    if let Some(status) = git_on::service_storage::invoke() {
         std::process::exit(status);
     }
     if let Some(status) = git_on::remote::invoke_ssh_launcher() {
-        std::process::exit(status);
-    }
-    if let Some(status) = git_on::git::invoke_verifier() {
         std::process::exit(status);
     }
     // Same process-start resource policy as the production CLI.

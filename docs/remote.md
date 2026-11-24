@@ -22,8 +22,10 @@ worktree checkout to prepare them.
 
 Fetch syntax such as `heads/main`, `tags/release`, `+main` and
 `main:refs/heads/demo` is interpreted by Git. A destination ref is written only
-in the private temporary repository, never the caller's repository. In two-operand
-mode, `main:directory` is a fetch refspec, not a snapshot-subdirectory selector.
+in the private temporary repository, never the caller's repository. On a
+case-insensitive temporary filesystem that repository uses Git's reftable
+backend so distinct ref names retain their identity. In two-operand mode,
+`main:directory` is a fetch refspec, not a snapshot-subdirectory selector.
 Use the command's arguments or working-directory logic to choose a directory
 inside that fetched snapshot. One-operand local `HEAD:directory` remains native
 Git tree selection.
@@ -225,27 +227,26 @@ repository- or user-scoped credentials and other authentication challenges.
 
 ### Temporary Git contexts
 
-A temporary Git repository serves native fetch and signature verification.
-Git's file-URL diagnostic can also need a Git repository to parse escaped
-local URLs. The pack reader opens the indexes Git already built from a
-separate object directory. For local revisions with nested alternates or
-byte paths, a read-only object-location bridge represents the source layout
-for libgit2 when needed. Git-on resolves indirect object paths before opening
-them and can use an open directory descriptor for byte paths on Linux.
-Git's quoted or relative on-disk alternate forms that libgit2 would interpret
-differently use native `git cat-file` for headers and verified payload streams.
-Index expressions such as `:path` use a private Git context
-that directs split-index timestamp updates to service storage. Native Git
-reads the primary index, its referenced base and objects from the source.
-An alternate index outside the Git directory may need a private copy of its
-referenced base to preserve Git's lookup order. Standard streamed HTTPS,
-SSH and plain local paths need no temporary Git repository, including during
-credential lookup. This includes `origin` with the standard tracking refspec
-when its resolved URL streams.
+- Native fetch uses a private repository for objects, destination refs, and
+  `FETCH_HEAD`. The pack reader opens the indexes Git built in that repository.
+- Native ref negotiation or escaped file-URL diagnostics can use the same
+  private repository context.
+- Verification of a remote object uses a private repository to expose that
+  object to Git. Local signature verification uses the caller's repository.
+- An object-location bridge adapts byte paths or nested alternates to libgit2
+  when needed. Linux can use an open directory descriptor for byte paths.
+  Git's quoted or relative alternate forms may use `git cat-file` for headers
+  and payload reads.
+- Index expressions such as `:path` use a private context for split-index
+  timestamp updates. Git reads the index and its objects from the source.
+  An alternate index may require a private copy of its referenced base to
+  preserve Git's lookup order.
 
-Native object directories, verification scratch and any regular files used
-for diagnostics are memory-backed. See
-[temporary storage](usage.md#temporary-storage) for the platform settings.
+Standard streamed HTTPS, SSH, and plain local paths use no temporary Git
+repository unless native verification or a compatibility operation needs one.
+This includes `origin` with the standard tracking refspec when its resolved URL
+streams. Credential lookup uses a directory only for any files it needs.
+See [temporary storage](usage.md#temporary-storage) for filesystem selection.
 
 When materialization fetches missing objects by OID, at most 256 known object
 IDs from the current directory can share one native `fetch --stdin` and
@@ -339,7 +340,7 @@ failure as applicable. No failure reruns a started child or silently changes
 write policy.
 
 Completion removes the run's temporary repository and owned SSH connection.
-After abrupt termination, the workspace retains memory-backed recovery data
+After abrupt termination, the workspace retains private recovery data
 while the recorded SSH master or a busy run needs it. See
 [foreground lifecycle and cleanup](usage.md#foreground-lifecycle-and-cleanup)
 and [resource limits](resources.md).
@@ -405,20 +406,19 @@ OpenSSH checks existing host keys at the destination and at each configured
 jump. Every hop uses the run's read-only host-key policy.
 With `CheckHostIP=yes`, OpenSSH checks existing address entries as usual.
 Git-on keeps the configured lookup order and directs additions to a private
-target. It uses `/dev/null` when the list has room and a memory-backed copy of
+target. It uses `/dev/null` when the list has room and a private copy of
 the first file at OpenSSH's list limit. An ambiguous host-file setting stops
 SSH setup.
 OpenSSH discovers its default user and system configuration files in their
-original contexts. A launcher in service memory passes the read-only options
+original contexts. A launcher in service storage passes the read-only options
 to implicit jump clients and to `ProxyCommand ssh -W …` with literal
 OpenSSH options, including when an argv-forwarding wrapper changes the
 OpenSSH executable name. Literal `nc` network relays also work, including
 OpenSSH's documented `nc -X connect -x proxy %h %p` form. Proxy commands
 that require an arbitrary shell program are unsupported. An explicit
 `-F` profile keeps its user
-configuration context. When setting `GIT_ON_SERVICE_TMPDIR` for a proxied
-connection, choose a path OpenSSH can pass to its generated shell command
-without quoting.
+configuration context. The launcher and the private profile can use temporary
+paths containing spaces.
 Apple's OpenSSH combines reading and storing passphrases in its
 `UseKeychain` option. Git-on keeps that option disabled for new connections
 to preserve the caller's Keychain. OpenSSH can use identities already
@@ -447,25 +447,19 @@ restricted by git-on. Configure `gpg.ssh.allowedSignersFile` through gitconfig o
 inherited `git -c`. No runner trust, fingerprint, signing or key-management
 interface exists.
 
-Git-on gives native Git a private directory for signature scratch files.
-When Git invokes a GnuPG verifier, Git-on copies its public keyrings and trust
-inputs into service storage. GnuPG selects its configuration, including
-version-specific options, from the private home. Configured keyring and trust
-paths resolve to copies there. Configured verifier programs can also read
-additional verification files at their original paths relative to that home.
-X.509 verification can use the caller's cached CRLs from a private copy.
-When a configured wrapper invokes GnuPG by name, Git-on also prepares the
-home the wrapper selects through `GNUPGHOME` or `--homedir`.
-Configured wrappers and other verifier programs must keep their own writes
-within the service directory supplied for verification.
-The verification agent uses private sockets.
-Verification diagnostics use the inherited diagnostic stream.
+Native signature verification uses the caller's verifier environment,
+including its home, temporary paths, keyrings, trust data, and agent setup.
+The [service-state exception](specification.md#service-state) permits the
+ordinary effects of a direct `git verify-commit` or `git verify-tag`, including
+writes directed by the configured verifier. Diagnostics use the inherited
+streams. Cleanup covers Git-on's own temporary data.
 
-Verify an annotated tag as that exact tag, then peel its recorded targets to a
-tree. The target commit need not carry a second signature. A lightweight tag
-resolves to its commit, which must verify. Annotated tag chains are peeled to
-their selected tree without imposing an arbitrary runner depth limit. Raw
-tree/blob IDs fail clearly, with no history search for another object.
+Verify an annotated tag by the OID of the tag object. Its signature covers the
+recorded target OID. Follow those recorded targets to the selected tree even
+if the tag ref moves after verification. Selecting a commit OID or a
+lightweight tag requires the commit's signature. Annotated tag chains are
+peeled to their selected tree. An unavailable object needed to identify the
+verified tree prevents launch. Raw tree and blob IDs fail clearly.
 Any failed native verification forbids mounting and execution. Acceptance is
 exactly native Git's result under the caller's effective configuration; git-on
 adds no signer allowlist or trust threshold. Git's default OpenPGP verification
@@ -495,8 +489,10 @@ digit tree. SSH tests count encrypted-identity/agent prompts and authenticated
 connections, refuse authentication and drop the owned connection. Object-storage
 tests verify same-run availability, fresh-run fetches, no dependence on global
 cache paths and preservation of historical cache directories. Native SSH
-and OpenPGP fixtures cover verification, effective config, tags, raw trees,
-replacements and ref races. Real mounts additionally cover remote ignored writes,
+and OpenPGP fixtures cover verification, caller configuration and effects,
+tags, raw trees, and replacements. A ref-movement test moves an annotated tag
+after native Git has accepted its exact tag OID and checks the original tree.
+Real mounts additionally cover remote ignored writes,
 keep/cleanup/cancellation and transport errors caught by the child. Loader tests
 without FUSE are distinct evidence. Public GitHub smoke is optional external
 evidence, separate from deterministic required gates. Consult exact-head CI

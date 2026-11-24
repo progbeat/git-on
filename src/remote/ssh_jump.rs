@@ -11,35 +11,60 @@ pub(super) struct Proxy {
     pub(super) implicit: bool,
 }
 
+// OpenSSH inserts argv[0] into its implicit ProxyJump shell command.
+pub(super) const LAUNCHER_COMMAND: &str = r#""$GIT_ON_SSH_LAUNCHER""#;
+const LAUNCHER_WORD: &[u8] = b"$GIT_ON_SSH_LAUNCHER";
+
 pub(super) fn from_probe(
     jump: Option<&[u8]>,
     proxy: Option<&[u8]>,
     diagnostics: &[u8],
-    launcher: Option<&OsStr>,
+    program: &OsStr,
+    ssh_args: &[OsString],
 ) -> Result<Option<Proxy>> {
     if jump.is_none_or(|jump| jump.is_empty() || jump == b"none") {
-        return explicit_proxy(proxy, launcher);
+        return explicit_proxy(proxy);
     }
     let implicit = diagnostics.rsplit(|&byte| byte == b'\n').find_map(|line| {
         line.strip_prefix(b"debug1: Setting implicit ProxyCommand from ProxyJump: ")
     });
-    let launcher = launcher
-        .context("choose a GIT_ON_SERVICE_TMPDIR without shell characters for ProxyJump")?;
     let implicit = implicit.context("OpenSSH did not report its implicit jump command")?;
     let implicit = implicit.strip_suffix(b"\r").unwrap_or(implicit);
-    let words = file_words(implicit).context("read OpenSSH jump arguments")?;
+    // OpenSSH prints -F's value literally, including spaces in a private
+    // temporary path. Keep the known argument intact when rebuilding argv.
+    let unquoted_config = short_arguments(ssh_args)
+        .filter_map(|(_, option)| option.filter(|option| option.flag == b'F'))
+        .last()
+        .map(|option| option.value())
+        .filter(|path| {
+            path.iter()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || b"_./-".contains(byte)))
+        })
+        .and_then(|path| {
+            let printed = [b" -F ", path, b" "].concat();
+            let start = memchr::memmem::find(implicit, &printed)?;
+            Some((start + b" -F".len(), path, start + printed.len() - 1))
+        });
+    let words = match unquoted_config {
+        Some((before, path, after)) => {
+            let mut words = file_words(&implicit[..before]).context("read OpenSSH jump options")?;
+            words.push(path.to_vec());
+            words.extend(file_words(&implicit[after..]).context("read OpenSSH jump destination")?);
+            words
+        }
+        None => file_words(implicit).context("read OpenSSH jump arguments")?,
+    };
     let (client, args) = words
         .split_first()
         .context("OpenSSH reported an empty jump command")?;
-    if client == launcher.as_bytes() {
+    let owned_launcher = client == LAUNCHER_WORD;
+    if owned_launcher && unquoted_config.is_none() {
         return Ok(None);
     }
 
-    // A forwarding wrapper changed argv[0]. Keep native jump arguments but
-    // send the connection through the owned launcher. Rebuild argv from the
-    // known OpenSSH layout rather than treating diagnostic text as a command.
-    let mut command = Vec::new();
-    add_argument(&mut command, launcher.as_bytes());
+    // Preserve native jump arguments when a wrapper reset argv[0] or when a
+    // configuration path needs quoting.
+    let mut command = LAUNCHER_COMMAND.as_bytes().to_vec();
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         match flag.as_slice() {
@@ -65,7 +90,11 @@ pub(super) fn from_probe(
                 command.extend_from_slice(b" -W '[%h]:%p' --");
                 add_argument(&mut command, host);
                 return Ok(Some(Proxy {
-                    client: OsString::from_vec(client.clone()),
+                    client: if owned_launcher {
+                        program.to_owned()
+                    } else {
+                        OsString::from_vec(client.clone())
+                    },
                     command,
                     implicit: true,
                 }));
@@ -76,7 +105,7 @@ pub(super) fn from_probe(
     bail!("OpenSSH reported an incomplete jump command")
 }
 
-fn explicit_proxy(proxy: Option<&[u8]>, launcher: Option<&OsStr>) -> Result<Option<Proxy>> {
+fn explicit_proxy(proxy: Option<&[u8]>) -> Result<Option<Proxy>> {
     let Some(proxy) = proxy.filter(|value| !value.is_empty() && *value != b"none") else {
         return Ok(None);
     };
@@ -106,10 +135,7 @@ fn explicit_proxy(proxy: Option<&[u8]>, launcher: Option<&OsStr>) -> Result<Opti
         !host.is_empty() && !host.starts_with(b"-") && !host.contains(&b'%'),
         "SSH ProxyCommand requires a literal forwarding host"
     );
-    let launcher = launcher
-        .context("choose a GIT_ON_SERVICE_TMPDIR without shell characters for ProxyCommand")?;
-    let mut command = Vec::new();
-    add_argument(&mut command, launcher.as_bytes());
+    let mut command = LAUNCHER_COMMAND.as_bytes().to_vec();
     let mut forwards = false;
     let args: Vec<_> = args.iter().cloned().map(OsString::from_vec).collect();
     let args = args.strip_suffix(&[OsString::from("--")]).unwrap_or(&args);

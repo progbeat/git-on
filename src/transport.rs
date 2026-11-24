@@ -1,6 +1,6 @@
 //! Invocation-owned native transports. Protocol v2 permits branch selection
 //! and successive exact-object requests on the same channel.
-use crate::{platform::child_exited, service_memory::CaptureFile};
+use crate::{platform::child_exited, service_storage::CaptureFile};
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
 use std::{

@@ -129,3 +129,9 @@ packs and indexes for nonstandard refspecs and settings that still require
 native Git?
 
 **Answer:** No. Apply the “disk only on LRU eviction” rule in this PR.
+
+The current [storage requirements](specification.md#storage-and-buffer-requirements)
+supersede this answer for regular files required by native Git. They permit
+temporary disk storage when an existing writable tmpfs is unavailable.
+The [service-state contract](specification.md#service-state) permits the
+ordinary effects of Git's configured verifier during `--verify`.

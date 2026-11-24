@@ -128,7 +128,7 @@ pub struct Entry {
 enum LocalObjectAnchor {
     Native(Box<NativeLocalObjects>),
     Temporary {
-        _directory: crate::service_memory::Directory,
+        _directory: crate::service_storage::Directory,
     },
     #[cfg(target_os = "linux")]
     Descriptor {
@@ -495,7 +495,7 @@ fn configure_local_object_database(
     }
     // A repository of aliases preserves the extra traversal step for nested
     // locations and adapts byte paths to git2's UTF-8 alternate API.
-    let bridge = crate::service_memory::Directory::new("local-object-bridge-")?;
+    let bridge = crate::service_storage::Directory::new("local-object-bridge-")?;
     bridge.link(
         run_directory,
         bridge.path().file_name().unwrap(),
@@ -588,7 +588,7 @@ fn configure_byte_primary(
 
     // Make the selected store the object directory itself. Registering it
     // through an alternates list would lose one level of primary traversal.
-    let bridge = crate::service_memory::Directory::new("local-object-bridge-")?;
+    let bridge = crate::service_storage::Directory::new("local-object-bridge-")?;
     bridge.link(
         run_directory,
         bridge.path().file_name().unwrap(),
@@ -1104,7 +1104,7 @@ impl Snapshot {
             )?;
             (None, Some(remote), oid, None, None)
         } else {
-            let (git, oid) = crate::git::Git::capture_snapshot(repo_path, treeish, verify)?;
+            let (git, oid) = crate::git::Git::capture_snapshot(repo_path, treeish)?;
             // Native Git resolved the operand in the caller's object namespace.
             // Keep that environment for subsequent lazy libgit2 object reads.
             let repo = Repository::open_ext(
@@ -1131,10 +1131,10 @@ impl Snapshot {
         };
         if verify {
             let (git, directory) = if let Some(remote) = &state.remote {
-                let repo = remote
+                remote
                     .native_repository()
                     .context("native Git verification repository missing")?;
-                (remote.git.as_ref(), repo.path())
+                (remote.git.as_ref(), remote.dir.as_path())
             } else {
                 let git = git.as_ref().expect("captured local Git repository");
                 (git, git.repository_dir()?)
@@ -2301,12 +2301,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.tree_oid, oid);
-        for repository in [repo, Repository::open_bare(private).unwrap()] {
-            assert!(repository
-                .references_glob("refs/git-on/*")
-                .unwrap()
-                .next()
-                .is_none());
+        for directory in [repo.path(), private.as_path()] {
+            let result = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(directory)
+                .args(["for-each-ref", "refs/git-on/"])
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+            assert!(result.stdout.is_empty(), "{result:?}");
         }
     }
     #[test]

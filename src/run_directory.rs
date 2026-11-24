@@ -103,21 +103,26 @@ pub(super) fn cleanup(dir: &Path) -> Result<()> {
         None => ensure_unmounted(&dir, None)?,
     }
     git_on::remote::stop_connection(&ssh_control_path(&dir))?;
-    let memory = git_on::service_memory::stale_memory_workspace(&dir);
     #[cfg(target_os = "macos")]
     git_on::platform::cleanup_nfs_socket(&id, nfs_socket.as_deref())?;
-    if let Some(locked) = owned {
+    let workspace = if let Some(locked) = owned {
         locked.prepare_cleanup()?;
+        let workspace = locked.cleanup_service_workspace(&dir)?;
         anyhow::ensure!(locked.remove(&dir)?, "temporary run was already cleaned");
-    } else if let Some((lock, _)) = legacy {
-        legacy::remove_flat_run(&dir, lock)?;
-    }
+        workspace
+    } else {
+        let workspace = git_on::service_storage::legacy_workspace(&dir);
+        if let Some((lock, _)) = legacy {
+            legacy::remove_flat_run(&dir, lock)?;
+        }
+        workspace
+    };
     if grouped_run(&dir) {
         remove_empty_temporary_group(dir.parent().unwrap())
             .context("remove temporary git-on group")?;
     }
-    if let Some(root) = memory {
-        git_on::service_memory::wait_for_stale_memory(&root)?;
+    if let Some(root) = workspace {
+        git_on::service_storage::wait_for_stale_workspace(&root)?;
     }
     Ok(())
 }
@@ -1591,6 +1596,37 @@ impl LockedRun {
             "temporary run changed during cleanup"
         );
         Ok(())
+    }
+
+    pub(super) fn cleanup_service_workspace(&self, dir: &Path) -> Result<Option<PathBuf>> {
+        use git_on::service_storage::{self, WORKSPACE_BINDING};
+        self.check_directory(dir)?;
+        let record = match open_marker(
+            self.directory.as_raw_fd(),
+            WORKSPACE_BINDING,
+            libc::O_RDONLY,
+            0,
+        ) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(service_storage::legacy_workspace(dir));
+            }
+            Err(error) => return Err(error).context("open service storage recovery record"),
+        };
+        let workspace = service_storage::open_stale_workspace(record)?;
+        // Keep the locked run and its recovery record until the files are gone.
+        if let Some(mut workspace) = workspace {
+            let removed = workspace.remove().with_context(|| {
+                format!(
+                    "service storage cleanup failed. Run retained at {}",
+                    CleanupPath(dir)
+                )
+            })?;
+            if !removed {
+                return Err(PendingGroupCleanup::retry(dir).into());
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn remove(self, dir: &Path) -> Result<bool> {

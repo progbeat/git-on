@@ -168,19 +168,18 @@ and the visible checkout in `copy` mode.
 
 ### Temporary storage
 
-Native Git packs, indexes, verification scratch and regular diagnostic
-files use separate memory-backed storage. On Linux, Git-on selects the writable
-tmpfs with the most available space among `/dev/shm` and `XDG_RUNTIME_DIR`.
-Native fetch needs room there for its pack and indexes.
-On macOS it creates an invocation-owned, case-sensitive RAM volume when a
-tool needs regular files. Git-on mounts the verified device directly where
-macOS permits user-owned HFS mounts. The sparse volume has the host's RAM as its
-logical capacity and allocates backing memory as blocks are written. Set
-`GIT_ON_SERVICE_RAM_MIB` to choose a smaller capacity, or set
-`GIT_ON_SERVICE_TMPDIR` to use an existing writable tmpfs on either platform.
-The memory filesystem capacity applies to tools that need it. Git-on reports
-an error if required memory storage is unavailable. The operating system can
-page memory to swap according to its own policy.
+Git-on creates a private service directory on demand for native Git packs,
+indexes, and regular files required for transport or diagnostics. It chooses
+the writable `tmpfs` with the most available space among `/dev/shm`,
+`XDG_RUNTIME_DIR`, and the system temporary directory. If none is writable
+`tmpfs`, it uses the system temporary directory, usually `TMPDIR`. Set
+`GIT_ON_SERVICE_TMPDIR` to choose an existing writable `tmpfs` explicitly.
+The selected filesystem must have room for the native files.
+
+`--verify` uses the configured Git verifier and its ordinary environment.
+Verification can have the same effects as a direct Git invocation, including
+writes to the verifier's usual profile. See [native signature
+verification](remote.md#native-signature-verification).
 
 git-on unmounts and removes temporary writes after the command finishes.
 `--keep` and `-k` were removed in 1.3.0. Use explicit external paths for required

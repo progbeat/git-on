@@ -24,9 +24,12 @@
   memory from the first fetch. Stream native decoder requests and borrow cached
   blob ranges when serving reads.
 - Keep direct reusable HTTPS and SSH startup metadata in verified in-memory
-  buffers. Keep native Git packs, indexes, and signature verification scratch
-  on a separate memory filesystem. Scan the native ref advertisement trace
-  with bounded memory.
+  buffers. Store the files required by native Git in a private directory on
+  an existing writable tmpfs or in the system temporary directory. Scan the
+  native ref advertisement trace with bounded memory.
+- Use Git's configured signature verifier in its normal environment. A signed
+  annotated tag selects the tree recorded by the verified tag object even
+  when the tag ref moves.
 - Stream the first filtered fetch from compatible local paths and `file://`
   URLs without staging a pack or index.
 - Decode the shallow snapshot pack in memory for compatible HTTPS, SSH, and

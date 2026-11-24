@@ -24,14 +24,12 @@ pub(super) struct Launch {
 
 pub(super) fn launch(
     program: &OsStr,
-    launcher: Option<&OsStr>,
     launcher_path: &Path,
     args: Vec<OsString>,
     before_host: usize,
 ) -> Result<Launch> {
     let mut probe = Probe {
         program,
-        launcher,
         disable_keychain: cfg!(target_os = "macos"),
     };
     let inspection_args = inspection_args(&args, before_host);
@@ -41,7 +39,8 @@ pub(super) fn launch(
         setting(&settings, b"proxyjump"),
         setting(&settings, b"proxycommand"),
         &settings.stderr,
-        launcher,
+        program,
+        &args[..before_host],
     )?;
     let (check_host_ip, host_files) = keep_host_files_read_only(
         &probe,
@@ -259,7 +258,7 @@ fn replace_first_host_file(
     words: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     // OpenSSH accepts 32 user files. Preserve the first file's entries
-    // at that limit by placing only its append target in service memory.
+    // at that limit by placing only its append target in service storage.
     let (first, rest) = words.split_first().context("missing first SSH host file")?;
     let source = inspect_file(probe, args, first)?;
     let remaining = effective
@@ -388,7 +387,6 @@ pub(super) fn file_words(values: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 struct Probe<'a> {
     program: &'a OsStr,
-    launcher: Option<&'a OsStr>,
     disable_keychain: bool,
 }
 
@@ -416,10 +414,7 @@ impl Probe<'_> {
 
     fn capture(&self, args: &[OsString], option: Option<&OsStr>) -> Result<Output> {
         let mut command = Command::new(self.program);
-        if let Some(launcher) = self.launcher {
-            command.arg0(launcher);
-        }
-        command.arg("-G");
+        command.arg0(ssh_jump::LAUNCHER_COMMAND).arg("-G");
         if self.disable_keychain {
             command.args(["-o", DISABLE_KEYCHAIN]);
         }

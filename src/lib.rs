@@ -12,7 +12,7 @@ pub mod policy;
 mod raw_blob;
 pub mod remote;
 #[doc(hidden)]
-pub mod service_memory;
+pub mod service_storage;
 pub mod snapshot;
 mod spool;
 #[doc(hidden)]

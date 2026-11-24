@@ -545,19 +545,14 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         return Ok(ExitStatus::from_raw(signal));
     }
 
-    let temporary = env::temp_dir();
-    let temporary = if temporary.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        &temporary
-    };
+    let temporary = git_on::platform::temporary_base();
     let explain_temp_error = || {
         format!(
             "cannot create a private snapshot in {}. Check the directory's write/search permissions and available space, or choose another TMPDIR",
             temporary.display()
         )
     };
-    let parent = fs::canonicalize(temporary).with_context(explain_temp_error)?;
+    let parent = fs::canonicalize(&temporary).with_context(explain_temp_error)?;
     let (dir, locked) = run_directory::create(&parent).with_context(explain_temp_error)?;
     execute_in_group(invoked, run, dir, locked, &mut signals)
 }
@@ -810,6 +805,7 @@ fn execute_in_group(
         // before deleting their backing files, including on NFS clients.
         locked.check_directory(&dir)?;
         drop(observed.take());
+        locked.cleanup_service_workspace(&dir)?;
         Ok(())
     })()
     .and_then(|()| locked.remove(&dir))
@@ -833,10 +829,10 @@ fn finish_execution(
         }
         // Keep the private object files available to a later checked cleanup.
         if let Some(snapshot) = observed {
-            if let Err(error) = git_on::service_memory::retain_for_cleanup(dir) {
+            if let Err(error) = git_on::service_storage::retain_for_cleanup(dir) {
                 let _ = writeln!(
                     io::stderr().lock(),
-                    "git-on: retain memory for cleanup: {error:#}"
+                    "git-on: retain service files for cleanup: {error:#}"
                 );
             }
             std::mem::forget(snapshot);
@@ -869,13 +865,10 @@ fn subscribe_signals() -> std::io::Result<Signals> {
 }
 fn main() {
     let invoked = Instant::now();
-    if let Some(status) = git_on::service_memory::invoke() {
+    if let Some(status) = git_on::service_storage::invoke() {
         std::process::exit(status);
     }
     if let Some(status) = git_on::remote::invoke_ssh_launcher() {
-        std::process::exit(status);
-    }
-    if let Some(status) = git_on::git::invoke_verifier() {
         std::process::exit(status);
     }
     if let Some(status) = git_on::terminal_ui::invoke_askpass() {

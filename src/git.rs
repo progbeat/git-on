@@ -10,9 +10,6 @@ use std::{
 };
 
 mod index;
-mod verification;
-pub use verification::invoke_verifier;
-pub(crate) use verification::stop_memory_verifiers;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -77,19 +74,11 @@ impl Git {
         })
     }
 
-    pub(crate) fn capture_snapshot(
-        cwd: &Path,
-        revision: &OsStr,
-        verify: bool,
-    ) -> Result<(Self, Oid)> {
-        let mut git = if verify {
-            Self::capture_configuration(cwd)?
-        } else {
-            Self {
-                cwd: cwd.to_path_buf(),
-                config: Vec::new(),
-                original_dir: None,
-            }
+    pub(crate) fn capture_snapshot(cwd: &Path, revision: &OsStr) -> Result<(Self, Oid)> {
+        let mut git = Self {
+            cwd: cwd.to_path_buf(),
+            config: Vec::new(),
+            original_dir: None,
         };
         if index::selects_from_index(revision) {
             let (directory, oid) = index::resolve(&git, revision)?;
@@ -135,65 +124,7 @@ impl Git {
                 "core.hooksPath=/dev/null",
             ]);
         if let Some(dir) = dir {
-            if self.original_dir.as_deref() != Some(dir) {
-                // Replay each effective value exactly once in the private repo.
-                command
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                    .env_remove("GIT_CONFIG_PARAMETERS")
-                    .env_remove("GIT_CONFIG_COUNT");
-                let mut count = 0;
-                for (key, value) in &self.config {
-                    // Object/ref storage belongs to the private repository,
-                    // rather than the caller's format. Replaying format zero
-                    // over a newly created promisor pack would make native Git
-                    // reject its intentionally missing tree objects.
-                    if key == "core.repositoryformatversion"
-                        || key.as_bytes().starts_with(b"extensions.")
-                        // The deprecated loose-object durability switch can
-                        // override core.fsync=none. Private objects are never
-                        // resumed after a crash; preserve the caller's setting
-                        // only for operations in its own repository.
-                        || key == "core.fsyncobjectfiles"
-                    {
-                        continue;
-                    }
-                    let value = value.as_deref().unwrap_or(OsStr::new("true"));
-                    let variable = format!("GIT_CONFIG_VALUE_{count}");
-                    command.env(format!("GIT_CONFIG_KEY_{count}"), key);
-                    if key.as_bytes().starts_with(b"credential.")
-                        && key.as_bytes().ends_with(b".helper")
-                    {
-                        command.env(variable, credential_get_only(value));
-                    } else if key.as_bytes().starts_with(b"http.")
-                        && key.as_bytes().ends_with(b".savecookies")
-                    {
-                        command.env(variable, "false");
-                    } else {
-                        command.env(variable, value);
-                    }
-                    count += 1;
-                }
-                command.env("GIT_CONFIG_COUNT", count.to_string());
-                // Local upload-pack inherits GIT_NAMESPACE from native Git.
-                for key in [
-                    "GIT_DIR",
-                    "GIT_WORK_TREE",
-                    "GIT_COMMON_DIR",
-                    "GIT_OBJECT_DIRECTORY",
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                    "GIT_INDEX_FILE",
-                    "GIT_SHALLOW_FILE",
-                    "GIT_GRAFT_FILE",
-                    "GIT_QUARANTINE_PATH",
-                ] {
-                    command.env_remove(key);
-                }
-            }
-            command
-                .arg("--git-dir")
-                .arg(dir)
-                .args(["-c", "core.bare=true"]);
+            self.configure_repository(&mut command, dir);
         }
         if let Some(program) = self.config.iter().rev().find_map(|(key, value)| {
             (key == "core.askpass")
@@ -203,6 +134,63 @@ impl Git {
             crate::terminal_ui::core_askpass(&mut command, program);
         }
         command
+    }
+
+    fn configure_repository(&self, command: &mut Command, dir: &Path) {
+        if self.original_dir.as_deref() != Some(dir) {
+            // Replay configuration from the original invocation. The private
+            // repository supplies its own object and ref storage format.
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT");
+            let mut count = 0;
+            for (key, value) in &self.config {
+                if key == "core.repositoryformatversion"
+                    || key.as_bytes().starts_with(b"extensions.")
+                    // The loose-object durability switch can override
+                    // core.fsync=none on Git-on's disposable fetches.
+                    || key == "core.fsyncobjectfiles"
+                {
+                    continue;
+                }
+                let value = value.as_deref().unwrap_or(OsStr::new("true"));
+                let variable = format!("GIT_CONFIG_VALUE_{count}");
+                command.env(format!("GIT_CONFIG_KEY_{count}"), key);
+                if key.as_bytes().starts_with(b"credential.")
+                    && key.as_bytes().ends_with(b".helper")
+                {
+                    command.env(variable, credential_get_only(value));
+                } else if key.as_bytes().starts_with(b"http.")
+                    && key.as_bytes().ends_with(b".savecookies")
+                {
+                    command.env(variable, "false");
+                } else {
+                    command.env(variable, value);
+                }
+                count += 1;
+            }
+            command.env("GIT_CONFIG_COUNT", count.to_string());
+            // Local upload-pack inherits GIT_NAMESPACE from native Git.
+            for key in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_INDEX_FILE",
+                "GIT_SHALLOW_FILE",
+                "GIT_GRAFT_FILE",
+                "GIT_QUARANTINE_PATH",
+            ] {
+                command.env_remove(key);
+            }
+        }
+        command
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["-c", "core.bare=true"]);
     }
 
     pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
@@ -420,27 +408,73 @@ impl Git {
             .context("native Git did not identify the selected repository directory")
     }
     fn verification_command(&self, dir: &Path) -> Command {
-        // Git resolves relative object alternates after discovering the
-        // worktree. Use the captured invocation context for that repository.
-        let private = (self.original_dir.as_deref() != Some(dir)).then_some(dir);
-        self.command(private)
+        let mut command = Command::new("git");
+        command
+            .current_dir(&self.cwd)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1");
+        if self.original_dir.as_deref() == Some(dir) {
+            return command;
+        }
+        // Keep Git's ordinary configuration stack and working directory.
+        // The verifier for a fetched object reads only the private SHA-1 ODB.
+        command
+            .env("GIT_OBJECT_DIRECTORY", dir.join("objects"))
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_QUARANTINE_PATH");
+        let different_format = self.config.iter().any(|(key, value)| {
+            key == "extensions.objectformat" && value.as_deref() != Some(OsStr::new("sha1"))
+        });
+        if self.original_dir.is_none() || different_format {
+            command
+                .arg("--git-dir")
+                .arg(dir)
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_SHALLOW_FILE")
+                .env_remove("GIT_GRAFT_FILE");
+            if different_format {
+                // Native Git needs the private SHA-1 context here. Carry
+                // over the caller's effective signature settings.
+                for (key, value) in &self.config {
+                    if key.as_bytes().starts_with(b"gpg.") {
+                        let mut setting = key.clone();
+                        if let Some(value) = value {
+                            setting.push("=");
+                            setting.push(value);
+                        }
+                        command.arg("-c").arg(setting);
+                    }
+                }
+            }
+        }
+        command
     }
 
     pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
-        let operation = match kind { git2::ObjectType::Commit => "verify-commit", git2::ObjectType::Tag => "verify-tag", _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature") };
+        let operation = match kind {
+            git2::ObjectType::Commit => "verify-commit",
+            git2::ObjectType::Tag => "verify-tag",
+            _ => bail!(
+                "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
+            ),
+        };
         let mut command = self.verification_command(dir);
-        let scratch = verification::Scratch::new()?;
-        scratch.configure(&mut command, &self.config)?;
-        command
-            .arg(operation)
-            .arg(oid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+        command.arg(operation).arg(oid.to_string());
         // Native Git owns acceptance, including the caller's configured trust threshold.
         // Its default can accept unknown-trust OpenPGP; a git-on threshold here
         // would silently replace that policy.
-        let status = run(command, false)?.status;
+        let status = run_captured(
+            command,
+            false,
+            false,
+            None,
+            None,
+            false,
+            CaptureMode::Foreground,
+        )?
+        .status;
         if !status.success() {
             bail!("native Git {operation} failed for {oid}; execution forbidden");
         }
@@ -1049,8 +1083,9 @@ fn run_captured(
     let mut progress = (progress && crate::terminal_ui::progress_enabled())
         .then(crate::terminal_ui::NativeProgress::new);
     let isolated = !matches!(mode, CaptureMode::InheritedGroup);
-    let managed = isolated && crate::terminal_ui::owns_terminal();
-    if isolated {
+    let transport_terminal = isolated && !matches!(mode, CaptureMode::Foreground);
+    let managed = transport_terminal && crate::terminal_ui::owns_terminal();
+    if transport_terminal {
         crate::terminal_ui::configure(&mut command);
     }
     if managed && input.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -1183,6 +1218,7 @@ enum CaptureMode {
     Channel,
     InheritedGroup,
     MayDetach,
+    Foreground,
 }
 
 enum NativeCapture {
@@ -1190,7 +1226,7 @@ enum NativeCapture {
         pipe: Option<std::os::unix::net::UnixStream>,
         bytes: Vec<u8>,
     },
-    File(crate::service_memory::CaptureFile),
+    File(crate::service_storage::CaptureFile),
 }
 
 impl NativeCapture {
@@ -1199,7 +1235,7 @@ impl NativeCapture {
             // Native Git can leave a configured hook or a persistent SSH
             // proxy writing to its inherited descriptors after Git exits.
             // A capture channel would return EPIPE when its reader closes.
-            let file = crate::service_memory::CaptureFile::new()?;
+            let file = crate::service_storage::CaptureFile::new()?;
             let writer = file.file.try_clone()?.into();
             return Ok((Self::File(file), writer));
         }
@@ -1633,7 +1669,7 @@ printf 'clock\000'
         let before = std::fs::read(&index).unwrap();
         let stale = "sharedindex.5555555555555555555555555555555555555555";
         std::os::unix::fs::symlink(stale, repo.path().join(stale)).unwrap();
-        let (_, selected) = Git::capture_snapshot(root, OsStr::new(":view"), false).unwrap();
+        let (_, selected) = Git::capture_snapshot(root, OsStr::new(":view")).unwrap();
         assert_eq!(selected, commit);
         assert!(!root.join("helper-done").exists());
         assert_eq!(std::fs::read(&index).unwrap(), before);
@@ -1645,7 +1681,7 @@ printf 'clock\000'
         let alternate = root.join("index-alternate");
         std::fs::copy(index, &alternate).unwrap();
         std::env::set_var("GIT_INDEX_FILE", &alternate);
-        let (_, selected) = Git::capture_snapshot(root, OsStr::new(":0:view"), false).unwrap();
+        let (_, selected) = Git::capture_snapshot(root, OsStr::new(":0:view")).unwrap();
         assert_eq!(selected, commit);
         assert_eq!(
             std::fs::metadata(shared).unwrap().modified().unwrap(),
@@ -1831,7 +1867,7 @@ mod tests {
     fn detached_native_capture_is_memory_backed() -> Result<()> {
         use std::os::fd::AsRawFd;
 
-        let capture = crate::service_memory::CaptureFile::new()?;
+        let capture = crate::service_storage::CaptureFile::new()?;
         let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
         assert_eq!(
             unsafe { libc::fstatfs(capture.file.as_raw_fd(), stats.as_mut_ptr()) },

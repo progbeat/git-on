@@ -115,7 +115,7 @@ fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
             assert_eq!(snap.read(*filler, 0, 1).unwrap(), [value as u8]);
         }
         // The raw cache belongs to the run. Native Git's directory may
-        // be on a separate service memory filesystem.
+        // be on a separate temporary filesystem.
         let store = std::fs::read_dir(run)
             .unwrap()
             .map(|entry| entry.unwrap().path())

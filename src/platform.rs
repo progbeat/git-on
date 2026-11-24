@@ -16,6 +16,14 @@ const PRIVATE_GROUP_PREFIX: &str = ".go";
 // The owner-only file whose exclusive lock protects a published run.
 pub const RUN_LOCK_NAME: &CStr = c".git-on-lock-v2";
 
+pub fn temporary_base() -> PathBuf {
+    let directory = std::env::temp_dir();
+    if directory.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+    directory
+}
+
 fn private_group_name(uid: u32) -> String {
     format!("{PRIVATE_GROUP_PREFIX}{uid:x}")
 }

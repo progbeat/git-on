@@ -12,7 +12,6 @@ import fcntl
 import http.server
 import json
 import os
-import plistlib
 import pty
 from pathlib import Path
 import pwd
@@ -64,7 +63,7 @@ def assert_no_run_state(test, root):
     groups = (root / 'git-on', root / f'.go{os.geteuid():x}')
     records = [record for group in groups for pattern in ('.git-on-run-*', '.git-on-remove-*')
                for record in group.glob(pattern)]
-    test.assertEqual(run_directories(root) + records, [])
+    test.assertEqual(run_directories(root) + records + list(root.glob('.git-on-service-*')), [])
 
 def assert_run_unlocked(directory):
     record = directory.parent / f'.git-on-run-{os.geteuid():x}-{directory.name}'
@@ -872,6 +871,10 @@ os.execv({native!r},[{native!r},*args])
         f.git('config', 'core.hooksPath', str(hooks))
         refs = f.git('for-each-ref', '--format=%(refname) %(objectname)')
         config = (f.repo / 'config').read_bytes()
+        def objects():
+            root = f.repo / 'objects'
+            return {path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+        before = objects()
 
         process = f.probe(f.repo.as_uri(), 'main:refs/heads/private-copy')
         self.assertEqual(f.line(process)['tree'], f.tree)
@@ -882,41 +885,139 @@ os.execv({native!r},[{native!r},*args])
         self.assertEqual(audit.read_bytes(), b'original')
         self.assertEqual((f.repo / 'config').read_bytes(), config)
         self.assertEqual(f.git('for-each-ref', '--format=%(refname) %(objectname)'), refs)
+        self.assertEqual(objects(), before)
 
-    def test_native_fetch_uses_memory_and_releases_it_after_runner_death(self):
+    def test_native_fetch_uses_private_storage_and_releases_it_after_runner_death(self):
         f = self.f
+        if sys.platform == 'darwin':
+            f.env['XDG_RUNTIME_DIR'] = str(f.root)
         process = f.probe(f.repo.as_uri(), 'main:refs/heads/private-copy')
         self.assertEqual(f.line(process)['tree'], f.tree)
         (link,) = f.root.glob('*/remote-repository')
         repository = link.resolve(strict=True)
-        memory = (link.parent / '.git-on-memory').resolve(strict=True)
+        workspace = (link.parent / '.git-on-memory').resolve(strict=True)
+        self.assertTrue(repository.is_relative_to(workspace))
+        self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
         if sys.platform == 'darwin':
-            mount = next(parent for parent in repository.parents if parent.is_mount())
-            disk = plistlib.loads(run(['/usr/sbin/diskutil', 'info', '-plist', mount]))
-            images = plistlib.loads(run(['/usr/bin/hdiutil', 'info', '-plist']))['images']
-            (image,) = [
-                image
-                for image in images
-                if image['image-path'].startswith('ram://') and
-                any(entity.get('dev-entry') == disk['DeviceNode'] for entity in image['system-entities'])
-            ]
-            physical_memory = int(run(['/usr/sbin/sysctl', '-n', 'hw.memsize']))
-            self.assertEqual(image['blockcount'] * image['blocksize'], physical_memory)
+            self.assertEqual(workspace.parent, f.root.resolve())
+            self.assertEqual(workspace.stat().st_dev, f.root.stat().st_dev)
         else:
-            self.assertIn(run(['stat', '-f', '-c', '%T', repository]).strip(), (b'tmpfs', b'ramfs'))
+            self.assertEqual(run(['stat', '-f', '-c', '%T', repository]).strip(), b'tmpfs')
 
         # An unlinked diagnostic can outlive the runner in a detached Git
         # helper. Keep the descriptor open across runner exit and use it.
-        with tempfile.TemporaryFile(dir=memory) as diagnostic:
+        with tempfile.TemporaryFile(dir=workspace) as diagnostic:
             process.kill()
             process.communicate(timeout=20)
             diagnostic.write(b'late diagnostic')
             diagnostic.seek(0)
             self.assertEqual(diagnostic.read(), b'late diagnostic')
         deadline = time.monotonic() + 10
-        while memory.exists() and time.monotonic() < deadline:
+        while workspace.exists() and time.monotonic() < deadline:
             time.sleep(.05)
-        self.assertFalse(memory.exists(), 'native repository outlived its memory lease')
+        self.assertFalse(workspace.exists(), 'native repository outlived the runner')
+
+    @contextlib.contextmanager
+    def native_copy_workspace(self):
+        f = self.f
+        child = 'import sys; from pathlib import Path; print(Path.cwd().parent, flush=True); sys.stdin.read()'
+        process = subprocess.Popen(
+            [OPTIONS.binary, f.repo.as_uri(), 'main:refs/heads/selected',
+             '--backend=copy', '--write-policy=all', '--', sys.executable, '-c', child],
+            cwd=f.cwd, env=f.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertTrue(select.select([process.stdout], [], [], 20)[0], 'command did not start')
+            line = process.stdout.readline()
+            self.assertTrue(line, 'command did not report its run directory')
+            directory = Path(os.fsdecode(line.rstrip(b'\n')))
+            workspace = (directory / '.git-on-memory').resolve(strict=True)
+            self.addCleanup(shutil.rmtree, workspace, True)
+            yield process, directory, workspace
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=20)
+
+    @contextlib.contextmanager
+    def replace_service_directory(self, workspace):
+        saved = workspace.with_name(workspace.name + '-saved')
+        workspace.rename(saved)
+        try:
+            workspace.mkdir(mode=0o700)
+            sentinel = workspace / 'untouched'
+            sentinel.write_bytes(b'keep this directory')
+            yield sentinel
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+            saved.rename(workspace)
+
+    def test_checked_cleanup_removes_service_files_after_both_processes_die(self):
+        f = self.f
+        with self.native_copy_workspace() as (process, directory, workspace):
+            processes = run(['ps', '-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'args='])
+            owner_args = [str(process.pid).encode(), b'--internal-service-storage']
+            owners = [int(fields[0]) for row in processes.splitlines()
+                      if (fields := row.split(maxsplit=2))[1:] == owner_args]
+            self.assertEqual(len(owners), 1)
+            os.kill(owners[0], signal.SIGKILL)
+            process.kill()
+        self.assertTrue(workspace.is_dir())
+
+        cleanup = [OPTIONS.binary, '--cleanup', directory]
+        with self.replace_service_directory(workspace) as sentinel:
+            rejected = subprocess.run(cleanup, cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+            self.assertEqual(rejected.returncode, 125, rejected.stderr)
+            self.assertIn(b'service storage changed', rejected.stderr)
+            self.assertEqual(sentinel.read_bytes(), b'keep this directory')
+            self.assertTrue(directory.exists(), 'failed cleanup discarded its recovery record')
+        run(cleanup, cwd=f.cwd, env=f.env, timeout=15)
+        self.assertFalse(workspace.exists())
+        self.assertFalse(directory.exists())
+
+    def test_automatic_cleanup_preserves_a_replacement_service_directory(self):
+        f = self.f
+        with self.native_copy_workspace() as (process, directory, workspace):
+            with self.replace_service_directory(workspace) as sentinel:
+                _, errors = process.communicate(timeout=20)
+                self.assertTrue(sentinel.is_file(), 'automatic cleanup removed the replacement')
+                self.assertEqual(sentinel.read_bytes(), b'keep this directory')
+                self.assertEqual(process.returncode, 125, errors)
+                self.assertTrue(directory.exists())
+        run([OPTIONS.binary, '--cleanup', directory], cwd=f.cwd, env=f.env, timeout=15)
+        self.assertFalse(workspace.exists())
+
+    def test_native_fetch_honors_empty_tmpdir(self):
+        f = self.f
+        f.env.update(TMPDIR='', XDG_RUNTIME_DIR=str(f.root))
+        output = run([OPTIONS.binary, f.repo.as_uri(), 'main:refs/heads/selected',
+                      '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
+                     cwd=f.cwd, env=f.env, timeout=20)
+        self.assertEqual(output, b'expected\n')
+        assert_no_run_state(self, f.cwd)
+
+    def test_native_fetch_keeps_case_distinct_destination_names(self):
+        f = self.f
+        source = f.root / 'reftable.git'
+        f.git('init', '--bare', '--quiet', '--ref-format=reftable', str(source), at=f.root)
+        (source / 'objects/info/alternates').write_text(str(f.repo / 'objects') + '\n')
+        refs = ('refs/heads/release', 'refs/heads/RELEASE/next')
+        for ref in refs:
+            f.git('update-ref', ref, f.commit, at=source)
+        f.env['XDG_RUNTIME_DIR'] = str(f.root)
+
+        inspect = '''
+import subprocess, sys
+from pathlib import Path
+
+destination = Path.cwd().parent / 'remote-repository'
+subprocess.run(['git', '-C', str(destination), 'rev-parse', *sys.argv[1:]], check=True)
+print(Path('deep/file').read_text(), end='')
+'''
+        output = run([OPTIONS.binary, source.as_uri(), 'refs/heads/*:refs/heads/*',
+                      '--backend=copy', '--write-policy=all', '--',
+                      sys.executable, '-c', inspect, *refs], cwd=f.cwd, env=f.env, timeout=20)
+        self.assertEqual(output.decode().splitlines(), [f.commit, f.commit, 'expected'])
 
     def test_fetch_invalid_revision_reports_native_git_error(self):
         f=self.f; source='file://'+str(f.repo)
@@ -1843,199 +1944,74 @@ os.execv({native!r},[{native!r},*args])
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file')
                 self.assertEqual(value['data'],'expected\n'); f.finish(process)
-    def test_native_openpgp_verification_uses_git_configuration(self):
-        f=self.f; home=f.root/'gnupg'; home.mkdir(mode=0o700)
-        env=dict(f.env,GNUPGHOME=str(home))
-        run(['gpg','--batch','--pinentry-mode','loopback','--passphrase','','--quick-generate-key','Fixture <fixture@example.invalid>','ed25519','sign','0'],env=env)
-        wrapper=f.root/'gpg-program'; wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{home}" exec gpg "$@"\n'); wrapper.chmod(0o700)
-        f.git('config','gpg.program',str(wrapper)); f.git('config','user.signingkey','fixture@example.invalid')
-        signed=f.git('commit-tree','-S',f.tree,data=b'OpenPGP fixture\n')
-        f.cwd=f.repo
-        process=f.probe('local',signed,verify=True); f.line(process); f.operation(process,'read deep/file'); f.finish(process)
-        empty=f.root/'unknown-gnupg'; empty.mkdir(mode=0o700)
-        wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{empty}" exec gpg "$@"\n')
-        process=f.probe('local',signed,verify=True); _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0); self.assertIn(b'execution forbidden',errors)
-        self.assertEqual(list(empty.iterdir()), [])
-        # The default verifier must also refuse the unknown signature with a
-        # fresh home without initializing a keyring there.
-        f.git('config', '--unset', 'gpg.program')
-        home_without_keyring = f.root / 'fresh-home'
-        home_without_keyring.mkdir()
-        f.env['HOME'] = str(home_without_keyring)
-        f.env.pop('GNUPGHOME', None)
-        process = f.probe('local', signed, verify=True)
-        _, errors = process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode, 0)
-        self.assertIn(b'execution forbidden', errors)
-        self.assertEqual(list(home_without_keyring.iterdir()), [])
-        public_home = home_without_keyring / '.gnupg'
-        public_home.mkdir(mode=0o700)
-        public_env = dict(f.env, GNUPGHOME=str(public_home))
-        self.addCleanup(run, ['gpgconf', '--kill', 'all'], env=public_env)
-        journal = f.root / 'verifier-log'
-        journal.write_bytes(b'keep this log\n')
-        trustdb = f.root / 'original-trustdb'
-        keyring = public_home / 'fixture public.gpg'
-        config = public_home / 'gpg.conf'
-        keyring_options = f'no-default-keyring\nkeyring "{keyring.name}"\n'
-        original_options = f'log-file {journal}\ntrustdb-name {trustdb}\n' + keyring_options
-        config.write_text(original_options)
-        process = f.probe('local', signed, verify=True)
-        _, errors = process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode, 0)
-        self.assertIn(b'execution forbidden', errors)
-        self.assertEqual(journal.read_bytes(), b'keep this log\n')
 
-        public = run(['gpg', '--batch', '--export'], env=env)
-        run(['gpg', '--no-options', '--no-default-keyring', '--keyring', str(keyring),
-             '--batch', '--import'], input=public, env=public_env)
-        unused_policy = f.root / 'unused-certificate-policy'
-        unused_policy.mkdir()
-        x509_config = public_home / 'gpgsm.conf'
-        x509_options = f'policy-file "{unused_policy}"\n'
-        x509_config.write_text(x509_options)
-        native = ['git', '-C', f.repo, 'verify-commit', signed]
-        config.write_text(f'log-file {f.root / "native-verifier-log"}\n'
-                          f'trustdb-name {f.root / "native-trustdb"}\n' + keyring_options)
-        run(native, env=public_env)
-        original_keyring = keyring.read_bytes()
-        config.write_text(original_options)
-        f.env['GNUPGHOME'] = '~/.gnupg'
-        process = f.probe('local', signed, verify=True)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        f.finish(process)
-        self.assertFalse(trustdb.exists(), 'verification created a trust database in the caller home')
-        self.assertEqual(journal.read_bytes(), b'keep this log\n')
-        self.assertEqual(keyring.read_bytes(), original_keyring)
-        self.assertEqual(x509_config.read_text(), x509_options)
-
-        version = run(['gpg', '--no-options', '--version'], env=public_env).splitlines()[0].split()[-1]
-        series = os.fsdecode(b'.'.join(version.split(b'.')[:2]))
-        versioned_config = public_home / f'gpg.conf-{series}'
-        import pwd
-        configurations = [
-            ('ignored options directive', keyring_options + f'options {f.root / "unused.conf"}\n', None),
-            ('version-specific config', 'no-default-keyring\n', keyring_options),
-        ]
-        try:
-            account = pwd.getpwuid(os.getuid())
-        except KeyError:
-            with self.subTest(configuration='named user home'):
-                self.skipTest('current UID has no passwd entry')
-        else:
-            named_path = f'~{account.pw_name}/{os.path.relpath(keyring, account.pw_dir)}'
-            configurations.insert(0, ('named user home', f'no-default-keyring\nkeyring "{named_path}"\n', None))
-        for name, regular, versioned in configurations:
-            with self.subTest(configuration=name):
-                config.write_text(regular)
-                if versioned is not None:
-                    versioned_config.write_text(versioned)
-                run(native, env=f.env)
-                process = f.probe('local', signed, verify=True)
-                self.assertEqual(f.line(process)['tree'], f.tree)
-                f.finish(process)
-                self.assertEqual(config.read_text(), regular)
-                if versioned is not None:
-                    self.assertEqual(versioned_config.read_text(), versioned)
-
-        inactive = public_home / 'gpg.conf-99.0'
-        invalid_ring = f.root / 'unusable-keyring'
-        invalid_ring.mkdir()
-        inactive_options = f'keyring "{invalid_ring}"\n'
-        inactive.write_text(inactive_options)
-        run(native, env=public_env)
-        process = f.probe('local', signed, verify=True)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        f.finish(process)
-        self.assertEqual(inactive.read_text(), inactive_options)
-
-        # A configured program can bypass PATH delegation and choose its own options.
-        inactive.write_text(keyring_options)
-        versioned_config.write_text('no-default-keyring\n')
-        probe_log = f.root / 'unexpected-config-probe'
-        native_gpg = shlex.quote(shutil.which('gpg', path=f.env['PATH']))
-        f.env['GNUPGHOME'] = str(public_home)
-        f.git('config', 'gpg.program', str(wrapper))
-        for program in (native_gpg, 'gpg'):
-            with self.subTest(explicit_options=program):
-                wrapper.write_text(
-                    '#!/bin/sh\n'
-                    f'if test "$1" = --debug; then touch {shlex.quote(str(probe_log))}; fi\n'
-                    f'exec {program} --options "$GNUPGHOME/{inactive.name}" "$@"\n'
-                )
-                run(native, env=f.env)
-                process = f.probe('local', signed, verify=True)
-                self.assertEqual(f.line(process)['tree'], f.tree)
-                f.finish(process)
-                self.assertFalse(probe_log.exists())
-        inactive.write_text(inactive_options)
-
-        custom = f.root / 'external-wrapper-keys' / 'verification'
-        custom.parent.mkdir(mode=0o700)
-        keyring.rename(custom)
-        (public_home / 'wrapper-keys').symlink_to(custom.parent, target_is_directory=True)
-        (custom.parent / 'home').symlink_to(public_home, target_is_directory=True)
-        wrapper.write_text(
-            '#!/bin/sh\nexec gpg --no-options --no-default-keyring '
-            '--keyring "$GNUPGHOME/wrapper-keys/verification" "$@"\n'
+    def test_remote_verifier_keeps_the_callers_git_configuration(self):
+        f = self.f
+        self.signing()
+        f.env['GIT_CONFIG_GLOBAL'] = str(f.root / 'gitconfig')
+        f.git('config', '--global', 'fixture.verify', 'enabled')
+        verifier = f.root / 'caller-verify'
+        verifier.write_text(
+            '#!/bin/sh\n'
+            'test "$(git config --global fixture.verify)" = enabled || exit 1\n'
+            f'exec {shlex.quote(shutil.which("ssh-keygen"))} "$@"\n'
         )
-        f.env['GNUPGHOME'] = str(public_home)
-        f.git('config', 'gpg.program', str(wrapper))
-        run(native, env=f.env)
-        process = f.probe('local', signed, verify=True)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        f.finish(process)
-        self.assertEqual(custom.read_bytes(), original_keyring)
+        verifier.chmod(0o700)
+        for object_format in ('sha1', 'sha256'):
+            with self.subTest(object_format=object_format):
+                caller = f.root / object_format
+                caller.mkdir()
+                f.git('init', '--quiet', '--object-format=' + object_format, at=caller)
+                f.git('config', 'gpg.ssh.program', str(verifier), at=caller)
+                output = run([OPTIONS.binary, f.repo.as_uri(), 'refs/tags/signed', '--verify',
+                              '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
+                             cwd=caller, env=f.env, timeout=20)
+                self.assertEqual(output, b'expected\n')
 
-        alternate_home = f.root / 'delegate-home'
-        alternate_home.mkdir()
-        alternate_keyring = alternate_home / 'public.gpg'
-        alternate_keyring.write_bytes(original_keyring)
-        versioned_config.unlink(missing_ok=True)
-        config.write_text('no-default-keyring\nkeyring ~/public.gpg\n')
-        wrapper.write_text(f'#!/bin/sh\nHOME={shlex.quote(str(alternate_home))} exec gpg "$@"\n')
-        run(native, env=f.env)
-        process = f.probe('local', signed, verify=True)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        f.finish(process)
-        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+    def test_native_openpgp_verification_uses_git_configuration(self):
+        f = self.f
+        signing_home = f.root / 'gnupg'
+        empty_home = f.root / 'unknown-gnupg'
+        for home in (signing_home, empty_home):
+            home.mkdir(mode=0o700)
+            self.addCleanup(run, ['gpgconf', '--kill', 'all'],
+                            env=dict(f.env, GNUPGHOME=str(home)))
+        f.env['GNUPGHOME'] = str(signing_home)
+        uid = 'OpenPGP fixture <fixture@example.invalid>'
+        run(['gpg', '--batch', '--pinentry-mode', 'loopback', '--passphrase', '',
+             '--quick-generate-key', uid, 'ed25519', 'sign', '0'], env=f.env)
+        signed = f.git('-c', 'user.signingkey=fixture@example.invalid', 'commit-tree',
+                       '-S', f.tree, data=b'OpenPGP fixture\n')
 
-        invalid_home = f.root / 'not-a-gnupg-directory'
-        invalid_home.write_bytes(b'caller file')
-        alternate_config = alternate_home / 'gpg.conf'
-        alternate_config.write_text('no-default-keyring\nkeyring public.gpg\n')
-        wrapper.write_text(f'#!/bin/sh\nexec gpg --homedir {shlex.quote(str(alternate_home))} "$@"\n')
-        f.env['GNUPGHOME'] = str(invalid_home)
-        run(native, env=f.env)
-        process = f.probe('local', signed, verify=True)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        f.finish(process)
-        self.assertEqual(invalid_home.read_bytes(), b'caller file')
-        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+        journal = f.root / 'verifier-journal'
+        trace = f.root / 'git-trace'
+        verifier = f.root / 'caller-gpg'
+        gpg = shlex.quote(shutil.which('gpg', path=f.env['PATH']))
+        verifier.write_text(
+            '#!/bin/sh\n'
+            f'printf "%s\\n%s\\n" "$GNUPGHOME" "$TMPDIR" >> {shlex.quote(str(journal))}\n'
+            f'exec {gpg} "$@"\n'
+        )
+        verifier.chmod(0o700)
+        f.git('config', 'gpg.program', str(verifier))
 
-        (alternate_home / versioned_config.name).write_text(alternate_config.read_text())
-        alternate_config.write_text('no-default-keyring\n')
-        inaccessible_home = f.root / 'inaccessible-gnupg'
-        inaccessible_home.mkdir()
-        for inherited, mode in ((inaccessible_home, 0o000), (alternate_home, 0o300)):
-            with self.subTest(inherited_home=inherited.name):
-                if inherited == alternate_home:
-                    f.git('config', '--unset', 'gpg.program')
-                f.env['GNUPGHOME'] = str(inherited)
-                inherited.chmod(mode)
-                try:
-                    if os.access(inherited, os.R_OK):
-                        continue  # Root can still list the fixture.
-                    run(native, env=f.env)
-                    process = f.probe('local', signed, verify=True)
-                    self.assertEqual(f.line(process)['tree'], f.tree)
-                    f.finish(process)
-                    self.assertEqual(inherited.stat().st_mode & 0o777, mode)
-                finally:
-                    inherited.chmod(0o700)
-        self.assertEqual(list(inaccessible_home.iterdir()), [])
-        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+        for home, status, stdout in ((signing_home, 0, b'expected\n'), (empty_home, 125, b'')):
+            with self.subTest(gnupg_home=home.name):
+                env = dict(f.env, GNUPGHOME=str(home), GIT_TRACE=str(trace),
+                           GIT_ON_SERVICE_TMPDIR=str(f.root / 'no-service-storage'))
+                journal.unlink(missing_ok=True)
+                trace.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [OPTIONS.binary, '--verify', signed, '--backend=copy', '--write-policy=all',
+                     '--', 'cat', 'deep/file'],
+                    cwd=f.repo, env=env, capture_output=True, timeout=20,
+                )
+                self.assertEqual(journal.read_text().splitlines(), [str(home), str(f.root)])
+                self.assertIn(f'verify-commit {signed}', trace.read_text())
+                self.assertEqual((result.returncode, result.stdout), (status, stdout), result.stderr)
+                if status:
+                    self.assertIn(b'execution forbidden', result.stderr)
+                assert_no_run_state(self, f.root)
 
     @unittest.skipUnless(shutil.which('gpgsm'), 'requires the native X.509 verifier')
     def test_x509_verification_uses_the_callers_certificate_policy(self):
@@ -2057,31 +2033,13 @@ os.execv({native!r},[{native!r},*args])
         policies = f.repo / 'fixture policy.txt'
         policies.write_text(policy + '\n')
         (home / 'gpgsm.conf').write_text(f'disable-crl-checks\npolicy-file "{policies.name}"\n')
-        unused_keyring = home / 'unused-openpgp-keyring'
-        unused_keyring.mkdir()
-        (home / 'gpg.conf').write_text(f'keyring "{unused_keyring}"\n')
         run(['gpgsm', '--batch', '--import', certificate], cwd=f.repo, env=f.env)
         # Some gpgsm builds require /dev/stdin for Git's detached input.
         wrapper = f.root / 'gpgsm-stdin'
         verifier = shutil.which('gpgsm')
-        extra_socket = f.root / 'extra-agent.sock'
-        browser_socket = f.root / 'browser-agent.sock'
         wrapper.write_text(f'''#!{sys.executable}
-from pathlib import Path
-import os, subprocess, sys
-if uid := os.environ.get('FIXTURE_DELEGATED_OPENPGP_UID'):
-    key = os.environ['FIXTURE_DELEGATED_OPENPGP_KEY']
-    subprocess.run(['gpg', '--batch', '--import', key], stdout=subprocess.DEVNULL, check=True)
-    listed = subprocess.check_output(['gpg2', '--batch', '--list-keys', uid])
-    if not any(line.startswith(b'pub:') for line in listed.splitlines()):
-        sys.exit('delegated OpenPGP configuration was not applied')
-status = subprocess.run(
-    [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for arg in sys.argv[1:])]
-).returncode
-for name in ({os.fspath(extra_socket)!r}, {os.fspath(browser_socket)!r}):
-    if Path(name).is_socket():
-        sys.exit(f'verification opened an external agent socket at {{name}}')
-sys.exit(status)
+import os, sys
+os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for arg in sys.argv[1:])])
 ''')
         wrapper.chmod(0o700)
         f.git('config', 'gpg.x509.program', str(wrapper))
@@ -2095,45 +2053,10 @@ sys.exit(status)
         native = ['git', '-C', str(f.repo), 'verify-commit', commit]
         run(native, env=f.env)
         agent_config = home / 'gpg-agent.conf'
-        socket_options = f'extra-socket {extra_socket}\nbrowser-socket {browser_socket}\n'
-        agent_config.write_text(socket_options)
         command = [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all',
                    '--', 'cat', 'deep/file']
-        result = subprocess.run(
-            command,
-            cwd=f.repo, env=f.env, capture_output=True, timeout=20,
-        )
+        result = subprocess.run(command, cwd=f.repo, env=f.env, capture_output=True, timeout=20)
         self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-        self.assertEqual(agent_config.read_text(), socket_options)
-
-        # This wrapper needs its OpenPGP import in the following tool call.
-        agent_config.unlink()
-        signer = f.root / 'pgp'
-        signer.mkdir(mode=0o700)
-        signing_env = dict(f.env, GNUPGHOME=str(signer))
-        self.addCleanup(run, ['gpgconf', '--kill', 'all'], env=signing_env)
-        uid = 'Delegate fixture <delegate@example.invalid>'
-        run(['gpg', '--batch', '--pinentry-mode', 'loopback', '--passphrase', '',
-             '--quick-generate-key', uid, 'ed25519', 'sign', '0'], env=signing_env)
-        public_key = f.root / 'delegated-public.gpg'
-        public_key.write_bytes(run(['gpg', '--batch', '--export', uid], env=signing_env))
-        pgp_keyring = home / 'delegate.gpg'
-        pgp_options = 'no-default-keyring\nwith-colons\nkeyring '
-        (home / 'gpg.conf').write_text(pgp_options + 'native-delegate.gpg\n')
-        tools = f.root / 'delegated-tools'
-        tools.mkdir()
-        (tools / 'gpg2').symlink_to(shutil.which('gpg', path=f.env['PATH']))
-        forwarding = tools / 'gpg'
-        forwarding.write_text('#!/bin/sh\nexec gpg2 "$@"\n')
-        forwarding.chmod(0o700)
-        delegated_env = dict(f.env, FIXTURE_DELEGATED_OPENPGP_UID=uid,
-                             FIXTURE_DELEGATED_OPENPGP_KEY=str(public_key),
-                             PATH=str(tools) + os.pathsep + f.env['PATH'])
-        run(native, env=delegated_env)
-        (home / 'gpg.conf').write_text(pgp_options + pgp_keyring.name + '\n')
-        result = subprocess.run(command, cwd=f.repo, env=delegated_env, capture_output=True, timeout=20)
-        self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-        self.assertFalse(pgp_keyring.exists())
 
         agent_config.write_text('no-user-trustlist\n')
         run(['gpgconf', '--kill', 'gpg-agent'], env=f.env)
@@ -2392,40 +2315,66 @@ sys.exit(status)
                 self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
 
     def test_native_verifier_moving_ref_keeps_exact_distinct_tree(self):
-        f=self.f; signed,allowed=self.signing(); f.cwd=f.repo
-        unused_keys = f.root / 'unused-openpgp'
-        unused_keys.mkdir()
-        (unused_keys / 'pubring.kbx').touch(mode=0)
-        f.env['GNUPGHOME'] = str(unused_keys)
-        different_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
-        different=f.git('commit-tree',different_tree,data=b'distinct tree B\n')
-        f.git('update-ref','refs/heads/main',signed)
-        verifier=f.root/'ssh-verifier'
-        ready = f.root / 'verifier-ready'
-        os.mkfifo(ready)
-        stream = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
-        self.addCleanup(os.close, stream)
-        release = f.root / 'ref-moved'
-        verifier.write_text(
-            '#!/bin/sh\n'
-            f'test "$TMPDIR" != {shlex.quote(str(f.root))} || exit 17\n'
-            'has_signature=0\nfor argument do case "$argument" in "$TMPDIR"/*) '
-            'if test -f "$argument"; then has_signature=1; fi ;; esac; done\n'
-            'test "$has_signature" = 1 || exit 17\n'
-            f'printf ready > {shlex.quote(str(ready))}\n'
-            f'for attempt in $(seq 1 100); do test -f {shlex.quote(str(release))} && exec ssh-keygen "$@"; sleep .05; done\n'
-            'exit 1\n'
-        )
-        verifier.chmod(0o700)
-        f.env.update(GIT_CONFIG_COUNT='3',GIT_CONFIG_KEY_2='gpg.ssh.program',GIT_CONFIG_VALUE_2=str(verifier))
-        process=f.probe('local','HEAD',verify=True)
-        self.assertTrue(select.select([stream], [], [], 5)[0], 'verifier did not start')
-        self.assertEqual(os.read(stream, 5), b'ready')
-        f.git('update-ref', 'refs/heads/main', different)
-        release.touch()
-        self.assertEqual(f.line(process)['tree'],f.tree)
-        value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n'); f.finish(process)
-        self.assertEqual(f.git('rev-parse','HEAD'),different)
+        f = self.f
+        signed, _ = self.signing()
+        tag = f.git('rev-parse', 'refs/tags/signed')
+        different_dir = f.git('mktree', data=f'100644 blob {f.other}\tfile\n'.encode())
+        different_tree = f.git('mktree', data=f'040000 tree {different_dir}\tdeep\n'.encode())
+        different = f.git('commit-tree', different_tree, data=b'distinct tree\n')
+        f.git('tag', '-a', '-m', 'replacement tag', 'replacement', different)
+        replacement = f.git('rev-parse', 'refs/tags/replacement')
+        f.git('update-ref', 'refs/heads/main', signed)
+
+        native = shutil.which('git', path=f.env['PATH'])
+        tools = f.root / 'git-tools'
+        tools.mkdir()
+        git = tools / 'git'
+        log = f.root / 'verified-object'
+        git.write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+for operation in ('verify-commit', 'verify-tag'):
+    if operation in args:
+        result = subprocess.run([{native!r}, *args])
+        if result.returncode == 0:
+            with open({str(log)!r}, 'a') as output:
+                output.write(json.dumps(args[args.index(operation):]) + '\\n')
+            if obsolete := os.environ.get('FIXTURE_REMOVE_OBJECT'):
+                Path(obsolete).unlink()
+            else:
+                subprocess.run([{native!r}, 'update-ref', os.environ['FIXTURE_MOVE_REF'],
+                                os.environ['FIXTURE_MOVE_TO']], check=True)
+        sys.exit(result.returncode)
+os.execv({native!r}, [{native!r}, *args])
+""")
+        git.chmod(0o700)
+        for reference, operation, oid, destination in (
+            ('refs/heads/main', 'verify-commit', signed, different),
+            ('refs/tags/signed', 'verify-tag', tag, replacement),
+            ('refs/tags/replacement', 'verify-tag', tag, None),
+        ):
+            with self.subTest(operation=operation, reference=reference, destination=destination):
+                log.unlink(missing_ok=True)
+                env = dict(f.env, PATH=str(tools) + os.pathsep + f.env['PATH'])
+                if destination is None:
+                    f.git('update-ref', reference, tag)
+                    env['FIXTURE_REMOVE_OBJECT'] = str(f.repo / 'objects' / signed[:2] / signed[2:])
+                else:
+                    env.update(FIXTURE_MOVE_REF=reference, FIXTURE_MOVE_TO=destination)
+                result = subprocess.run(
+                    [OPTIONS.binary, reference, '--verify', '--backend=copy', '--write-policy=all',
+                     '--', 'cat', 'deep/file'],
+                    cwd=f.repo, env=env, capture_output=True, timeout=20,
+                )
+                self.assertEqual(git_invocations(log), [[operation, oid]])
+                if destination is None:
+                    self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
+                else:
+                    self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+                    self.assertEqual(f.git('rev-parse', reference), destination)
+                assert_no_run_state(self, f.root)
 
     def openpgp_signing(self):
         f=self.f; signing=f.root/'gpg-sign'; signing.mkdir(mode=0o700)

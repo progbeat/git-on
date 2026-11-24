@@ -46,17 +46,26 @@ separate from that contract; a requirement is not a claim of a passing test.
 ## Service state
 
 Git-on may read caller files and repositories and obtain data from remote
-sources. Git-on and the processes it starts for its own work must keep changes
-inside run-owned service storage. This applies during preparation, execution,
-normal teardown, failure, cancellation, and stale-run cleanup. The runner may
-write normal process output to the caller's stdout and stderr.
+sources. During preparation, execution, teardown, failure, cancellation, and
+stale-run cleanup, Git-on and its service operations keep their writes inside
+run-owned storage. The runner may write ordinary output to stdout and stderr.
 
-- Source refs, indexes, object databases, Git configuration, and worktrees
-  retain their contents. The runner leaves no persistent clone and makes no
-  requests to write remote repository data.
-- Native compatibility paths may stage Git objects and indexes in a memory
-  filesystem when Git needs them for fetch or signature verification.
-- Native Git operations disable hooks and local filesystem monitors. Credential
+Signature verification with `--verify` is an exception to the service write
+boundary. Git-on calls `git verify-commit` or `git verify-tag` on the selected
+object ID. Git and its configured verifier use the caller's effective
+configuration and the verifier's ordinary environment. Direct verification
+may write to its normal profile or to other paths selected by its configuration.
+Git and its verifier own those effects, including on failure or cancellation.
+Git-on cleans up the files it creates for the run. The write policy governs
+the command after `--`.
+
+- Resolution, fetch, snapshot preparation, and cleanup preserve source refs,
+  indexes, object databases, Git configuration, and worktrees. These operations
+  leave no persistent clone and make no requests to write remote repository data.
+- Native compatibility paths may use a private directory for the regular
+  files Git and its transport require. They prefer an existing writable
+  `tmpfs` and fall back to the system temporary directory.
+- Native resolution and fetch disable hooks and local filesystem monitors. Credential
   lookup reads existing credentials. An authentication result does not save,
   erase, or replace stored credentials, host keys, or cookies.
 - Cleanup can remove owned runtime data. Recovery metadata from an older
@@ -98,8 +107,11 @@ is part of this bug fix; it does not require a major version increment.
   identify one distinct selected object; a result with no object or multiple
   different objects cannot identify the single snapshot. The selected object
   must yield a Git tree. These are checks of Git's result, not operand syntax.
-  Signature verification examines the exact selected commit or annotated tag;
-  a tree returned by `HEAD:path` has no signature to verify.
+  Signature verification uses the full OID of the selected commit or annotated
+  tag. For a tag, derive the snapshot from the target recorded in the verified
+  tag object. Later movements of the tag or branch name leave the selected
+  object unchanged. A failed check or an unavailable selected object before
+  tree preparation completes prevents the command from starting.
 - Fetch destinations are confined to the private repository. Existing object-demand, filter,
   cancellation, SSH ownership, cache and filesystem contracts still apply;
   materialization cannot bypass any Git resolution, verification or object error.
@@ -157,8 +169,7 @@ The native mount and write-policy contracts apply to local and remote runs.
   location's `git-on` directory). If another unprivileged user owns that group
   or an ordinary file occupies its name, git-on uses a private group for the current
   user. The writable layer uses the underlying temporary filesystem's capacity
-  and operating-system limits. Its location is independent of private service
-  memory.
+  and operating-system limits. Native service files can use a separate location.
 - Completion unmounts the snapshot and removes the run's temporary files.
   The last run removes its empty group.
   When an NFS client defers removal because a file is still open, git-on
@@ -177,8 +188,10 @@ The native mount and write-policy contracts apply to local and remote runs.
   retire the marker without allocating another inode.
   `git on --cleanup <temporary-directory>` accepts legacy records and unused
   reservations. It refuses active runs and preserves directories, mounts, or
-  endpoints whose identity it cannot verify. Older Git pins remain in the
-  source repository. Cleanup never terminates processes based on stale PIDs.
+  endpoints whose identity it cannot verify. It can reclaim verified service
+  directories after their helper exits. If removal must be retried, it keeps
+  the run record. Older Git pins remain in the source repository.
+  Cleanup never terminates processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
@@ -189,12 +202,9 @@ needed to decode and retain a pack. Git-on leaves inherited process
 limits, including `RLIMIT_FSIZE`, to the host. It follows its own cache
 policy independently of those limits. The two-checkout budget concerns
 available filesystem space for Git-on and the command.
-When native Git or a verifier requires regular files, the available
-space on the service memory filesystem also bounds the invocation.
-This capacity is independent of the space available under `TMPDIR`.
-If both automatic Linux tmpfs choices are too small for a native pack
-and its indexes, select a larger writable tmpfs with
-`GIT_ON_SERVICE_TMPDIR`.
+Regular files required by native Git use the capacity and limits of the
+selected temporary filesystem. `GIT_ON_SERVICE_TMPDIR` can select an existing
+writable `tmpfs`. The verifier uses its own environment and storage limits.
 
 ## Backend selection and materialization
 
@@ -353,12 +363,11 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
 
 ## Storage and buffer requirements
 
-1. When Git-on or a helper writes data that Git-on owns and keeps internal,
-   it may write to disk only to spill blob contents evicted from the LRU
-   cache. Git-on may read existing repositories from disk. The user-visible
-   execution tree from `copy` may reside on disk, including when `auto`
-   selects `copy`. User writes may use disk, including copy-up and backing
-   files on native mounts.
+1. Internally managed object buffers use disk for LRU eviction and for the
+   private regular files required by native Git compatibility. Git-on may
+   read existing repositories from disk. The visible execution tree from
+   `copy` and user writes, including copy-up and native-mount backing files,
+   may use disk.
 2. Immutable data already in RAM is used without copying on every execution
    path. Components borrow existing buffers or transfer ownership of them
    without copying their contents.
@@ -369,12 +378,11 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
    complexity. Where practical, compute and cache needed results as the data
    is processed, taking into account the capabilities of the libraries in use.
 
-Native Git compatibility may require filesystem paths for private Git objects,
-pack indexes, diagnostics or verifier files. Those paths use a memory
-filesystem. Internal synchronization and recovery may use directory entries,
-empty locks and sockets alongside the writable layer. Those entries carry
-ownership and lifetime information without staging internal file contents
-there.
+Git-on creates private native Git object files, pack indexes, and regular
+diagnostic or transport files on demand. It uses existing filesystems for
+these files and removes them with the invocation. Internal synchronization
+and recovery may use directory entries, empty locks, and sockets alongside
+the writable layer. The external verifier's files follow its native configuration.
 
 ## Acceptance evidence
 

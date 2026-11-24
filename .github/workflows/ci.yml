@@ -485,7 +485,15 @@ jobs:
           python3 tests/fsync_contract.py --binary target/debug/git-on --require-nfs
           python3 tests/remote.py --binary target/debug/git-on --require-nfs \
             RemoteTests.test_local_common_directory_reads_without_changing_native_repository_refs \
-            RemoteTests.test_native_fetch_uses_memory_and_releases_it_after_runner_death \
+            RemoteTests.test_native_fetch_does_not_run_the_source_reference_hook \
+            RemoteTests.test_native_fetch_uses_private_storage_and_releases_it_after_runner_death \
+            RemoteTests.test_checked_cleanup_removes_service_files_after_both_processes_die \
+            RemoteTests.test_automatic_cleanup_preserves_a_replacement_service_directory \
+            RemoteTests.test_native_fetch_honors_empty_tmpdir \
+            RemoteTests.test_native_fetch_keeps_case_distinct_destination_names \
+            RemoteTests.test_native_openpgp_verification_uses_git_configuration \
+            RemoteTests.test_native_verifier_moving_ref_keeps_exact_distinct_tree \
+            RemoteTests.test_remote_verifier_keeps_the_callers_git_configuration \
             RemoteTests.test_eager_copy_rejects_configuration_rejected_by_native_fetch \
             RemoteTests.test_eager_file_copy_selects_decomposed_ref_as_native_git \
             RemoteTests.test_decomposed_file_remote_uses_configured_fetch_mapping \
@@ -501,6 +509,8 @@ jobs:
             RemoteTests.test_cold_directory_demand_overlaps_file_lookup \
             RemoteTests.test_concurrent_https_lookups_combine_only_requested_objects \
             RemoteTests.test_review_real_mount_caught_run_odb_fault_forces_runner_failure
+          python3 tests/ssh_regressions.py --binary target/debug/git-on \
+            SshRegressionTests.test_proxy_jump_leaves_its_known_hosts_file_unchanged
           GIT_ON_TEST_FSYNC_ERROR=1 cargo test --locked --lib --features test-metrics backend::nfs::tests::sync_errors_are_returned_in_rpc_replies -- --exact --ignored
       - name: Multiplex exact Git demands through real NFS
         run: |

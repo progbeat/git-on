@@ -1,7 +1,7 @@
 //! File-shaped service data for tools which require real filesystem paths.
 use anyhow::{bail, Context, Result};
 use std::{
-    ffi::OsStr,
+    ffi::{CStr, OsStr},
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
     os::fd::AsRawFd,
@@ -19,22 +19,40 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELPER_ARGV0: &str = "--internal-service-memory";
+mod directory;
+#[doc(hidden)]
+pub use directory::OwnedDirectory;
+
+const HELPER_ARGV0: &str = "--internal-service-storage";
+// Older runners use this link to recognize when checked recovery has finished.
 const RUN_LINK: &str = ".git-on-memory";
 const BINDING: &str = "run-owner";
+#[doc(hidden)]
+pub const WORKSPACE_BINDING: &CStr = c".git-on-service-owner";
 const RETAIN: &str = "recovery-requested";
 static HELPER_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static WORKSPACE: Mutex<Weak<Workspace>> = Mutex::new(Weak::new());
 
 pub(crate) struct Directory {
-    directory: tempfile::TempDir,
+    directory: OwnedDirectory,
     _workspace: Arc<Workspace>,
 }
 
 impl Directory {
     pub(crate) fn new(prefix: &str) -> Result<Self> {
+        Self::create(prefix, None)
+    }
+
+    pub(crate) fn new_for_run(prefix: &str, run: &Path) -> Result<Self> {
+        Self::create(prefix, Some(run))
+    }
+
+    fn create(prefix: &str, run: Option<&Path>) -> Result<Self> {
         let workspace = Workspace::get()?;
-        let directory = private_directory(prefix, &workspace.path)?;
+        if let (Some(run), Owner::Process { .. }) = (run, &workspace._owner) {
+            bind_run(run, &workspace.directory)?;
+        }
+        let directory = workspace.directory.child(prefix)?;
         Ok(Self {
             directory,
             _workspace: workspace,
@@ -46,39 +64,33 @@ impl Directory {
     }
 
     pub(crate) fn link(&self, run: &Path, name: &OsStr, entry: &Path) -> io::Result<()> {
-        if matches!(self._workspace._owner, Owner::Process { .. }) {
-            bind_run(run, &self._workspace.path)?;
-        }
         symlink(self.path().join(entry), run.join(name))
     }
 
     pub(crate) fn keep_for_owner(&mut self) {
-        self.directory.disable_cleanup(true);
+        self.directory.remove_on_drop = false;
     }
 }
 
 struct Workspace {
-    path: PathBuf,
+    directory: OwnedDirectory,
     _owner: Owner,
 }
 
 impl Workspace {
     fn get() -> Result<Arc<Self>> {
-        let mut cached = WORKSPACE.lock().expect("memory workspace mutex poisoned");
+        let mut cached = WORKSPACE.lock().expect("service workspace mutex poisoned");
         if let Some(workspace) = cached.upgrade() {
             return Ok(workspace);
         }
-        let (path, owner) = if HELPER_AVAILABLE.load(Ordering::Relaxed) {
-            Lease::start().context("start invocation-owned memory storage")?
+        let (directory, owner) = if HELPER_AVAILABLE.load(Ordering::Relaxed) {
+            let (path, owner) = Lease::start().context("start invocation-owned service storage")?;
+            (OwnedDirectory::open(&path)?, owner)
         } else {
-            let storage = Storage::new(|| false)?;
-            (
-                storage.path().to_path_buf(),
-                Owner::Inline { _storage: storage },
-            )
+            (service_workspace()?, Owner::Inline)
         };
         let workspace = Arc::new(Self {
-            path,
+            directory,
             _owner: owner,
         });
         *cached = Arc::downgrade(&workspace);
@@ -87,7 +99,7 @@ impl Workspace {
 }
 
 enum Owner {
-    Inline { _storage: Storage },
+    Inline,
     Process { _lease: Lease },
 }
 
@@ -102,7 +114,7 @@ impl Lease {
         crate::object::check_transfer()?;
         // The lease pipe closes even if the caller is killed. Give its owner
         // a separate process group so ordinary job cancellation leaves it
-        // available to clean up the invocation's RAM storage.
+        // available to clean up the invocation's service directory.
         let child = Command::new(std::env::current_exe()?)
             .arg0(HELPER_ARGV0)
             .process_group(0)
@@ -129,7 +141,7 @@ impl Lease {
         let path = bytes
             .strip_prefix(b"P")
             .filter(|path| path.starts_with(b"/"))
-            .context("memory storage helper did not return a workspace")?;
+            .context("service storage helper did not return a workspace")?;
         lease.reply = Some(reply);
         Ok((
             PathBuf::from(OsStr::from_bytes(path)),
@@ -142,8 +154,8 @@ impl Drop for Lease {
     fn drop(&mut self) {
         drop(self.child.stdin.take());
         if self.abandoned_setup {
-            // An attach already in progress must finish reporting its device
-            // before its owner can tear it down. It has no inherited STDIO.
+            // Filesystem setup can still be in progress on a slow temporary
+            // filesystem. The owner will remove it after the lease closes.
             return;
         }
         let mut byte = [0];
@@ -160,7 +172,7 @@ impl Drop for Lease {
                     let message = message.strip_suffix(&[0]).unwrap_or(&message);
                     let _ = writeln!(
                         io::stderr().lock(),
-                        "git-on: memory storage: {}",
+                        "git-on: service storage: {}",
                         String::from_utf8_lossy(message)
                     );
                 }
@@ -203,7 +215,7 @@ fn setup_reply<R: Read + AsRawFd>(
         }
         anyhow::ensure!(
             !input.is_empty(),
-            "memory storage helper closed its setup pipe"
+            "service storage helper closed its setup pipe"
         );
         let length = input.len();
         bytes.extend_from_slice(input);
@@ -249,7 +261,7 @@ fn serve() -> Result<()> {
     if caller_left() {
         return Ok(());
     }
-    let mut storage = Storage::new(caller_left)?;
+    let mut storage = service_workspace()?;
     send_reply(b'P', storage.path().as_os_str().as_bytes())?;
     // Do not consume arbitrary data from the parent. A read end without a
     // writer is the only message required by the lease.
@@ -260,82 +272,123 @@ fn serve() -> Result<()> {
             break;
         }
     }
-    crate::git::stop_memory_verifiers(storage.path());
-    let root = storage.path();
-    let retained = RunBinding::load(root).filter(|run| {
-        run.matches(root)
-            && (root.join(RETAIN).exists() || crate::remote::has_memory_connection(root))
-    });
+    let root = storage.path().to_owned();
+    let retained = DirectoryBinding::read(&root.join(BINDING))
+        .ok()
+        .flatten()
+        .filter(|run| {
+            run.owns_workspace(&root)
+                && (root.join(RETAIN).exists() || crate::remote::has_ssh_connection(&root))
+        });
     if let Some(run) = &retained {
         release_runner()?;
-        wait_while(|| Ok(run.matches(storage.path())))?;
+        wait_while(|| Ok(run.owns_workspace(&root)))?;
     }
-    if !storage.try_close()? {
+    if !storage.remove()? {
         if retained.is_none() {
             release_runner()?;
         }
-        // Detached programs can still own an unlinked diagnostic descriptor.
-        // Retry the ordinary unmount once the OS has released those readers.
-        wait_while(|| Ok(!storage.try_close()?))?;
+        // An NFS temporary directory can retain an open, unlinked diagnostic
+        // file until its last writer closes the descriptor.
+        wait_while(|| storage.remove().map(|removed| !removed).map_err(Into::into))?;
     }
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RunBinding {
+#[derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DirectoryBinding {
     path: Vec<u8>,
     device: u64,
     inode: u64,
 }
 
-impl RunBinding {
-    fn load(root: &Path) -> Option<Self> {
-        let file = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(root.join(BINDING))
-            .ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        serde_json::from_reader(file.take(32 * 1024)).ok()
+impl DirectoryBinding {
+    fn new(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self::for_directory(path, &metadata))
     }
 
-    fn matches(&self, root: &Path) -> bool {
-        let path = Path::new(OsStr::from_bytes(&self.path));
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            metadata.is_dir() && (metadata.dev(), metadata.ino()) == (self.device, self.inode)
-        }) && fs::read_link(path.join(RUN_LINK)).as_deref().ok() == Some(root)
+    fn for_directory(path: &Path, metadata: &fs::Metadata) -> Self {
+        Self {
+            path: path.as_os_str().as_bytes().to_vec(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        Path::new(OsStr::from_bytes(&self.path))
+    }
+
+    fn read(path: &Path) -> io::Result<Option<Self>> {
+        let file = match File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Self::from_file(file).map(Some)
+    }
+
+    fn from_file(file: File) -> io::Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("invalid service storage record type"));
+        }
+        Ok(serde_json::from_reader(file.take(32 * 1024))?)
+    }
+
+    fn write(&self, path: &Path) -> io::Result<()> {
+        if Self::read(path)?.as_ref() == Some(self) {
+            return Ok(());
+        }
+        match publish_record(path, |file| Ok(serde_json::to_writer(file, self)?)) {
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && Self::read(path)?.as_ref() == Some(self) =>
+            {
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        metadata.is_dir() && (metadata.dev(), metadata.ino()) == (self.device, self.inode)
+    }
+
+    fn owns_workspace(&self, root: &Path) -> bool {
+        fs::symlink_metadata(self.path()).is_ok_and(|metadata| self.matches(&metadata))
+            && fs::read_link(self.path().join(RUN_LINK)).as_deref().ok() == Some(root)
     }
 }
 
-fn bind_run(run: &Path, root: &Path) -> io::Result<()> {
-    let path = run.canonicalize()?;
-    let metadata = fs::metadata(&path)?;
-    let binding = RunBinding {
-        path: path.as_os_str().as_bytes().to_vec(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    let record = root.join(BINDING);
-    match File::options()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(record)
-    {
-        Ok(file) => serde_json::to_writer(file, &binding)?,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if RunBinding::load(root)
-                .is_some_and(|previous| previous.path == binding.path && previous.matches(root))
-            {
-                return Ok(());
-            }
-            return Err(error);
+fn publish_record(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    let mut record = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    write(record.as_file_mut())?;
+    record.persist_noclobber(path)?;
+    Ok(())
+}
+
+fn bind_run(run: &Path, workspace: &OwnedDirectory) -> io::Result<()> {
+    let run = run.canonicalize()?;
+    let root = workspace.path();
+    let name = OsStr::from_bytes(WORKSPACE_BINDING.to_bytes());
+    DirectoryBinding::for_directory(root, &workspace.directory.metadata()?)
+        .write(&run.join(name))?;
+    DirectoryBinding::new(&run)?.write(&root.join(BINDING))?;
+    let link = run.join(RUN_LINK);
+    match symlink(root, &link) {
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists && fs::read_link(&link)? == root =>
+        {
+            Ok(())
         }
-        Err(error) => return Err(error),
+        result => result,
     }
-    symlink(root, path.join(RUN_LINK))
 }
 
 fn wait_while(mut busy: impl FnMut() -> Result<bool>) -> Result<()> {
@@ -361,15 +414,15 @@ fn release_runner() -> io::Result<()> {
     Ok(())
 }
 
-/// Keep the memory-backed state available after a busy mount or shutdown error.
+/// Keep the service files available after a busy mount or shutdown error.
 #[doc(hidden)]
 pub fn retain_for_cleanup(run: &Path) -> Result<()> {
     let workspace = WORKSPACE
         .lock()
-        .expect("memory workspace mutex poisoned")
+        .expect("service workspace mutex poisoned")
         .upgrade();
     if let Some(workspace) = workspace {
-        let root = &workspace.path;
+        let root = workspace.directory.path();
         if fs::read_link(run.join(RUN_LINK)).as_deref().ok() == Some(root) {
             File::create(root.join(RETAIN))?;
         }
@@ -377,13 +430,39 @@ pub fn retain_for_cleanup(run: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Record the memory lease before a validated stale run is removed.
 #[doc(hidden)]
-pub fn stale_memory_workspace(run: &Path) -> Option<PathBuf> {
+pub fn open_stale_workspace(record: File) -> Result<Option<OwnedDirectory>> {
+    let binding = DirectoryBinding::from_file(record).context("read service storage record")?;
+    let root = binding.path();
+    anyhow::ensure!(
+        root.is_absolute()
+            && root
+                .file_name()
+                .is_some_and(|name| { name.as_bytes().starts_with(WORKSPACE_PREFIX.as_bytes()) }),
+        "invalid service storage location",
+    );
+    let workspace = match OwnedDirectory::open(root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("open service storage for checked cleanup"),
+    };
+    let metadata = workspace.directory.metadata()?;
+    anyhow::ensure!(
+        binding.matches(&metadata)
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "service storage changed at {}",
+        root.display(),
+    );
+    Ok(Some(workspace))
+}
+
+#[doc(hidden)]
+pub fn legacy_workspace(run: &Path) -> Option<PathBuf> {
     let root = fs::read_link(run.join(RUN_LINK)).ok()?;
     let run = run.canonicalize().ok()?;
-    let binding = RunBinding::load(&root)?;
-    if binding.path != run.as_os_str().as_bytes() || !binding.matches(&root) {
+    let binding = DirectoryBinding::read(&root.join(BINDING)).ok()??;
+    if binding.path() != run || !binding.owns_workspace(&root) {
         return None;
     }
     Some(root)
@@ -391,12 +470,12 @@ pub fn stale_memory_workspace(run: &Path) -> Option<PathBuf> {
 
 /// A stale workspace owner begins teardown as soon as its run disappears.
 #[doc(hidden)]
-pub fn wait_for_stale_memory(root: &Path) -> Result<()> {
+pub fn wait_for_stale_workspace(root: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while root.try_exists()? {
         anyhow::ensure!(
             Instant::now() < deadline,
-            "memory storage remains at {}",
+            "service storage remains at {}",
             root.display()
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -404,83 +483,69 @@ pub fn wait_for_stale_memory(root: &Path) -> Result<()> {
     Ok(())
 }
 
-enum Storage {
-    Tmpfs(tempfile::TempDir),
-    #[cfg(target_os = "macos")]
-    RamVolume(darwin::Volume),
+const WORKSPACE_PREFIX: &str = ".git-on-service-";
+
+fn service_workspace() -> Result<OwnedDirectory> {
+    if let Some(root) = std::env::var_os("GIT_ON_SERVICE_TMPDIR") {
+        return on_tmpfs(Path::new(&root))
+            .context("GIT_ON_SERVICE_TMPDIR must name a writable tmpfs directory");
+    }
+    let fallback = crate::platform::temporary_base();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+    workspace_in(
+        [
+            Some(Path::new("/dev/shm")),
+            runtime
+                .as_deref()
+                .map(Path::new)
+                .filter(|path| path.is_absolute()),
+            Some(&fallback),
+        ]
+        .into_iter()
+        .flatten(),
+        &fallback,
+    )
 }
 
-impl Storage {
-    fn new(_caller_left: impl Fn() -> bool) -> Result<Self> {
-        if let Some(root) = std::env::var_os("GIT_ON_SERVICE_TMPDIR") {
-            return Self::on_tmpfs(Path::new(&root))
-                .context("GIT_ON_SERVICE_TMPDIR must name a writable memory filesystem");
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-            Self::linux_tmpfs(runtime.as_deref().map(Path::new))
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Self::RamVolume(darwin::Volume::new(_caller_left)?))
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn linux_tmpfs(runtime: Option<&Path>) -> Result<Self> {
-        let mut candidates = std::iter::once(Path::new("/dev/shm"))
-            .chain(runtime.filter(|path| path.is_absolute()))
-            .filter_map(|path| {
-                let root = path.canonicalize().ok()?;
-                let stats = tmpfs_stats(&root).ok()?;
-                let block_size = if stats.f_frsize > 0 {
-                    stats.f_frsize
-                } else {
-                    stats.f_bsize
-                };
-                let free = u128::from(stats.f_bavail) * u128::try_from(block_size).ok()?;
-                Some((free, root))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(available, _)| std::cmp::Reverse(*available));
-        candidates.dedup_by(|a, b| a.1 == b.1);
-        candidates
-            .into_iter()
-            .find_map(|(_, root)| Self::on_tmpfs(&root).ok())
-            .context("no writable service tmpfs; set GIT_ON_SERVICE_TMPDIR to a tmpfs directory")
-    }
-
-    fn on_tmpfs(root: &Path) -> Result<Self> {
-        let root = root.canonicalize()?;
-        tmpfs_stats(&root)?;
-        let dir = private_directory("git-on-", &root)?;
-        tmpfs_stats(dir.path())?;
-        Ok(Self::Tmpfs(dir))
-    }
-
-    fn path(&self) -> &Path {
-        match self {
-            Self::Tmpfs(dir) => dir.path(),
+fn workspace_in<'a>(
+    candidates: impl Iterator<Item = &'a Path>,
+    fallback: &Path,
+) -> Result<OwnedDirectory> {
+    let mut candidates = candidates
+        .filter_map(|path| {
+            let root = path.canonicalize().ok()?;
+            let stats = tmpfs_stats(&root).ok()?;
+            #[cfg(target_os = "linux")]
+            let block_size = if stats.f_frsize > 0 {
+                stats.f_frsize
+            } else {
+                stats.f_bsize
+            };
             #[cfg(target_os = "macos")]
-            Self::RamVolume(volume) => volume.mountpoint(),
-        }
+            let block_size = stats.f_bsize;
+            let free = u128::from(stats.f_bavail) * block_size as u128;
+            Some((free, root))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(available, _)| std::cmp::Reverse(*available));
+    candidates.dedup();
+    if let Some(directory) = candidates
+        .into_iter()
+        .find_map(|(_, root)| on_tmpfs(&root).ok())
+    {
+        return Ok(directory);
     }
-
-    fn try_close(&mut self) -> Result<bool> {
-        #[cfg(target_os = "macos")]
-        if let Self::RamVolume(volume) = self {
-            return volume.try_detach();
-        }
-        Ok(true)
-    }
+    let fallback = fallback.canonicalize()?;
+    OwnedDirectory::create(&fallback, WORKSPACE_PREFIX)
+        .with_context(|| format!("create service directory under {}", fallback.display()))
 }
 
-fn private_directory(prefix: &str, root: &Path) -> io::Result<tempfile::TempDir> {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(root)
+fn on_tmpfs(root: &Path) -> Result<OwnedDirectory> {
+    let root = root.canonicalize()?;
+    tmpfs_stats(&root)?;
+    let dir = OwnedDirectory::create(&root, WORKSPACE_PREFIX)?;
+    tmpfs_stats(dir.path())?;
+    Ok(dir)
 }
 
 fn tmpfs_stats(path: &Path) -> Result<libc::statfs> {
@@ -520,7 +585,7 @@ impl CaptureFile {
             }
         }
         let workspace = Workspace::get()?;
-        let file = tempfile::tempfile_in(&workspace.path)?;
+        let file = tempfile::tempfile_in(workspace.directory.path())?;
         Ok(Self {
             file,
             _workspace: Some(workspace),
@@ -536,13 +601,56 @@ impl CaptureFile {
     }
 }
 
-#[cfg(target_os = "macos")]
-mod darwin;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn workspace_uses_the_system_temp_directory_without_a_tmpfs_candidate() -> Result<()> {
+        let fallback = tempfile::tempdir()?;
+        let workspace = workspace_in(std::iter::empty(), fallback.path())?;
+        let path = workspace.path().to_path_buf();
+        assert_eq!(
+            path.parent(),
+            Some(fallback.path().canonicalize()?.as_path())
+        );
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o700);
+        drop(workspace);
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cleanup_recognizes_a_previous_runner_binding() -> Result<()> {
+        let run = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let path = run.path().canonicalize()?;
+        DirectoryBinding::new(&path)?.write(&workspace.path().join(BINDING))?;
+        symlink(workspace.path(), path.join(".git-on-memory"))?;
+
+        assert_eq!(legacy_workspace(&path).as_deref(), Some(workspace.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn an_interrupted_write_does_not_publish_a_partial_recovery_record() -> Result<()> {
+        let run = tempfile::tempdir()?;
+        let record = run
+            .path()
+            .join(OsStr::from_bytes(WORKSPACE_BINDING.to_bytes()));
+        assert!(publish_record(&record, |file| {
+            file.write_all(b"{\"path\":")?;
+            Err(io::Error::other("fixture interrupted write"))
+        })
+        .is_err());
+        assert!(!record.exists());
+
+        let binding = DirectoryBinding::new(run.path())?;
+        binding.write(&record)?;
+        assert!(DirectoryBinding::read(&record)?.as_ref() == Some(&binding));
+        Ok(())
+    }
 
     #[test]
     fn cancellation_ends_a_workspace_handshake_with_no_response() -> Result<()> {

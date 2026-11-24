@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -242,8 +243,8 @@ class SshRegressionTests(unittest.TestCase):
         directory = next(f.root.glob('*/ssh-control')).parent
         record_path = directory / 'ssh-control-owner'
         record = json.loads(record_path.read_text())
-        memory = (directory / '.git-on-memory').resolve(strict=True)
-        self.assertTrue(record_path.resolve().is_relative_to(memory))
+        workspace = (directory / '.git-on-memory').resolve(strict=True)
+        self.assertTrue(record_path.resolve().is_relative_to(workspace))
         self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
         control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
         checked = subprocess.run(control, capture_output=True, check=True, timeout=5)
@@ -298,7 +299,7 @@ class SshRegressionTests(unittest.TestCase):
                                      env=f.env, capture_output=True, timeout=10)
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
             self.assertFalse(directory.exists())
-            self.assertFalse(memory.exists(), 'checked cleanup retained the service memory')
+            self.assertFalse(workspace.exists(), 'checked cleanup retained the service directory')
             self.assertTrue(select.select([descriptor], [], [], 2)[0])
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=10)
@@ -740,9 +741,9 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
     def test_proxy_jump_leaves_its_known_hosts_file_unchanged(self):
         f = self.f
         url = f.ssh(protocol_v2=True)
-        runtime = f.root / 'runtime space'
-        runtime.mkdir()
-        f.env['TMPDIR'] = str(runtime)
+        runtime = tempfile.TemporaryDirectory(prefix='go ssh-', dir='/tmp')
+        self.addCleanup(runtime.cleanup)
+        f.env['TMPDIR'] = runtime.name
         port = urlsplit(url).port
         known = f.root / 'known-jump-hosts'
         known.touch()

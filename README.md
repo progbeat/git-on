@@ -88,7 +88,9 @@ git on main --verify --write-policy=all -- python script.py
 ```
 
 `--verify` checks the selected commit's signature. With an annotated tag, it
-checks the tag's signature instead. Verification failure stops execution.
+checks the exact tag object and runs the tree selected by its recorded target.
+Verification failure stops execution. Git's configured verifier uses its usual
+profile and may make its ordinary changes there.
 
 Use a commit hash in place of `main` to pin the source and require verification
 together.
