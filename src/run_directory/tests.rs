@@ -1038,6 +1038,7 @@ fn has_nfs_placeholder(directory: &File) -> bool {
 fn deferred_nfs_cleanup_preserves_command_status() {
     use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
 
+    let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     for late_close in [false, true] {
         let (_root, dir, run) = reserved_run();
         let RunLock::Sibling(record) = &run.location else {
