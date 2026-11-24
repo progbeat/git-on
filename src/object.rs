@@ -80,8 +80,12 @@ pub(crate) fn check_transfer() -> Result<()> {
 
 pub(crate) fn object_hash(kind: ObjectType, size: usize) -> Sha1 {
     let mut hash = Sha1::new();
-    hash.update(format!("{} {size}\0", kind.str()).as_bytes());
+    hash.update(object_header(kind, size).as_bytes());
     hash
+}
+
+pub(crate) fn object_header(kind: ObjectType, size: usize) -> String {
+    format!("{} {size}\0", kind.str())
 }
 
 pub(crate) fn finish_sha1(hash: Sha1) -> Result<[u8; 20]> {

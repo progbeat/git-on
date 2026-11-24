@@ -1989,6 +1989,135 @@ print(Path('deep/file').read_text(), end='')
         commit=f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'commit-tree','-S',f.tree,data=b'signed fixture\n')
         f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'tag','-s','-m','signed tag','signed',commit)
         return commit,allowed
+
+    def test_eager_signed_copy_streams_for_both_url_and_origin(self):
+        f = self.f
+        signed, allowed = self.signing()
+        tag = f.git('rev-parse', 'refs/tags/signed')
+        f.git('update-ref', 'refs/heads/main', signed)
+        global_config = f.root / 'gitconfig'
+        inactive = f.root / 'inactive-signing-policy'
+        inactive.write_text('[gpg]\n\tminTrustLevel = invalid\n')
+        global_config.write_text(f'[includeIf "gitdir:**/verify-*"]\n\tpath = "{inactive}"\n')
+        f.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        url = f.https()
+        self.addCleanup(f.server.shutdown)
+        caller = f.root / 'caller'
+        f.git('init', '--quiet', caller, at=f.root)
+        f.git('remote', 'add', 'origin', url, at=caller)
+        f.git('config', 'tag.gpgsign', 'true', at=caller)
+        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',))
+        for source, revision, cwd, operation, oid, status in (
+            (url, 'main', f.cwd, 'verify-commit', signed, 0),
+            (url, 'signed', caller, 'verify-tag', tag, 0),
+            ('origin', 'signed', caller, 'verify-tag', tag, 0),
+            ('origin', 'refs/tags/signed', caller, 'verify-tag', tag, 125),
+        ):
+            with self.subTest(source=source, revision=revision, status=status):
+                if status:
+                    allowed.write_text('')
+                start = len(f.requests)
+                log.write_text('')
+                with tempfile.TemporaryFile(dir=f.root) as metrics:
+                    fd = metrics.fileno()
+                    result = subprocess.run(
+                        [OPTIONS.binary, source, revision, '--verify', '--backend=copy',
+                         '--write-policy=all', '--', 'cat', 'deep/file'],
+                        cwd=cwd, env=dict(env, GIT_ON_TEST_METRICS_FD=str(fd)),
+                        pass_fds=(fd,), capture_output=True, timeout=20,
+                    )
+                    calls = git_invocations(log)
+                    self.assertFalse([call for call in calls if 'fetch' in call['argv']], calls)
+                    expected = b'' if status else b'expected\n'
+                    self.assertEqual((result.returncode, result.stdout), (status, expected), result.stderr)
+                    if not status:
+                        metrics.seek(0)
+                        self.assertEqual(json.load(metrics)['remote_repositories_created'], 0)
+                verifies = [call for call in calls if operation in call['argv']]
+                self.assertEqual([call['argv'][-1] for call in verifies], [oid], calls)
+                self.assertFalse(Path(verifies[0]['env']['GIT_OBJECT_DIRECTORY']).exists())
+                self.assertEqual([request['wants'] for request in f.requests[start:] if request['wants']],
+                                 [[oid]])
+                if status:
+                    self.assertIn(b'execution forbidden', result.stderr)
+                assert_no_run_state(self, f.root)
+
+    def test_signed_file_selection_keeps_lazy_transport(self):
+        f = self.f
+        self.signing()
+        tag = f.git('rev-parse', 'refs/tags/signed')
+        f.env, log = record_git_invocations(f.root, f.env)
+        process = f.probe(f.repo.as_uri(), 'signed', verify=True)
+        initial = f.line(process)
+        self.assertEqual(initial['tree'], f.tree)
+        self.assertTrue({f.blob, f.other}.isdisjoint(initial['objects']))
+        value, report = f.operation(process, 'read deep/file')
+        self.assertEqual(value['data'], 'expected\n')
+        self.assertIn(f.blob, report['objects'])
+        self.assertNotIn(f.other, report['objects'])
+        f.finish(process)
+        self.assertEqual(report['metrics']['remote_repositories_created'], 0)
+        calls = git_invocations(log)
+        self.assertFalse([args for args in calls if 'fetch' in args], calls)
+        self.assertEqual([args[-1] for args in calls if 'verify-tag' in args], [tag], calls)
+
+        if OPTIONS.require_nfs:
+            # Lazy selection accepts this fetch setting. The injected mount
+            # failure makes copy use its native exact-OID compatibility path.
+            log.write_text('')
+            env = dict(f.env, GIT_ON_TEST_NFS_MOUNT_ERROR='1', GIT_CONFIG_COUNT='3',
+                       GIT_CONFIG_KEY_2='fetch.parallel', GIT_CONFIG_VALUE_2='1')
+            result = subprocess.run(
+                [OPTIONS.binary, f.repo.as_uri(), 'signed', '--verify',
+                 '--write-policy=all', '--', 'cat', 'deep/file'],
+                cwd=f.cwd, env=env, capture_output=True, timeout=20,
+            )
+            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+            fetches = [args for args in git_invocations(log) if 'fetch' in args]
+            self.assertEqual([args[-1] for args in fetches], [tag], fetches)
+            assert_no_run_state(self, f.root)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'automatic tmpfs selection on Linux')
+    def test_streamed_verifier_retries_when_automatic_tmpfs_fills(self):
+        from filesystem_quota import private_mount_namespace
+
+        f = self.f
+        self.signing()
+        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',))
+        env['XDG_RUNTIME_DIR'] = str(f.root)
+        keys = ('PATH', 'TMPDIR', 'XDG_RUNTIME_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
+                'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+                'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1')
+        settings = [f'{key}={env[key]}' for key in keys]
+        namespace, uid, gid = private_mount_namespace(self)
+        run_on_tmpfs = """
+mount -t tmpfs -o "$1" tmpfs /dev/shm
+uid=$2 gid=$3
+shift 3
+if [ "$uid" -ne 0 ]; then
+    exec setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
+fi
+exec "$@"
+"""
+        for options in ('size=1m,nr_inodes=2', 'size=4k'):
+            with self.subTest(options=options):
+                log.write_text('')
+                result = subprocess.run(
+                    [*namespace, 'sh', '-ec', run_on_tmpfs,
+                     'verify-quota', options, str(uid), str(gid), 'env', *settings, OPTIONS.binary,
+                     f.repo.as_uri(), 'signed', '--verify', '--backend=copy',
+                     '--write-policy=all', '--', 'cat', 'deep/file'],
+                    cwd=f.cwd, env=env, capture_output=True, timeout=25,
+                )
+                self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+                calls = git_invocations(log)
+                self.assertFalse([call for call in calls if 'fetch' in call['argv']], calls)
+                objects, = [Path(call['env']['GIT_OBJECT_DIRECTORY'])
+                            for call in calls if 'verify-tag' in call['argv']]
+                self.assertTrue(objects.resolve().is_relative_to(f.root.resolve()))
+                self.assertFalse(objects.exists())
+                assert_no_run_state(self, f.root)
+
     def test_review_peeled_tag_advertisement_rows_are_not_selectable_refs(self):
         f=self.f; signed,_=self.signing()
         url=f.https(); self.addCleanup(f.server.shutdown)
@@ -2517,7 +2646,6 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         different = f.git('commit-tree', different_tree, data=b'distinct tree\n')
         f.git('tag', '-a', '-m', 'replacement tag', 'replacement', different)
         replacement = f.git('rev-parse', 'refs/tags/replacement')
-        f.git('update-ref', 'refs/heads/main', signed)
 
         native = shutil.which('git', path=f.env['PATH'])
         tools = f.root / 'git-tools'
@@ -2529,38 +2657,56 @@ import json, os, subprocess, sys
 from pathlib import Path
 
 args = sys.argv[1:]
+if 'fetch' in args:
+    with open({str(log)!r}, 'a') as output:
+        output.write(json.dumps(['fetch']) + '\\n')
 for operation in ('verify-commit', 'verify-tag'):
     if operation in args:
+        if objects := os.environ.get('GIT_OBJECT_DIRECTORY'):
+            oid = args[-1]
+            files = [str(path.relative_to(objects)) for path in Path(objects).rglob('*')
+                     if path.is_file()]
+            assert files == [f'{{oid[:2]}}/{{oid[2:]}}'], files
         result = subprocess.run([{native!r}, *args])
         if result.returncode == 0:
             with open({str(log)!r}, 'a') as output:
-                output.write(json.dumps(args[args.index(operation):]) + '\\n')
+                output.write(json.dumps([operation, args[-1]]) + '\\n')
             if obsolete := os.environ.get('FIXTURE_REMOVE_OBJECT'):
-                Path(obsolete).unlink()
+                if obsolete == 'staged':
+                    (Path(objects) / files[0]).unlink()
+                else:
+                    Path(obsolete).unlink()
             else:
-                subprocess.run([{native!r}, 'update-ref', os.environ['FIXTURE_MOVE_REF'],
-                                os.environ['FIXTURE_MOVE_TO']], check=True)
+                source_env = {{key: value for key, value in os.environ.items()
+                              if key != 'GIT_OBJECT_DIRECTORY'}}
+                subprocess.run([{native!r}, '-C', {str(f.repo)!r}, 'update-ref',
+                                os.environ['FIXTURE_MOVE_REF'],
+                                os.environ['FIXTURE_MOVE_TO']], check=True, env=source_env)
         sys.exit(result.returncode)
 os.execv({native!r}, [{native!r}, *args])
 """)
         git.chmod(0o700)
-        for reference, operation, oid, destination in (
-            ('refs/heads/main', 'verify-commit', signed, different),
-            ('refs/tags/signed', 'verify-tag', tag, replacement),
-            ('refs/tags/replacement', 'verify-tag', tag, None),
+        for source, reference, operation, oid, destination in (
+            ([], 'refs/heads/main', 'verify-commit', signed, different),
+            ([], 'refs/tags/signed', 'verify-tag', tag, replacement),
+            ([f.repo.as_uri()], 'refs/tags/signed', 'verify-tag', tag, replacement),
+            ([f.repo.as_uri()], 'refs/tags/signed', 'verify-tag', tag, None),
+            ([], 'refs/tags/replacement', 'verify-tag', tag, None),
         ):
-            with self.subTest(operation=operation, reference=reference, destination=destination):
+            with self.subTest(source=source, operation=operation, reference=reference):
                 log.unlink(missing_ok=True)
+                f.git('update-ref', reference, oid)
                 env = dict(f.env, PATH=str(tools) + os.pathsep + f.env['PATH'])
                 if destination is None:
-                    f.git('update-ref', reference, tag)
-                    env['FIXTURE_REMOVE_OBJECT'] = str(f.repo / 'objects' / signed[:2] / signed[2:])
+                    env['FIXTURE_REMOVE_OBJECT'] = (
+                        'staged' if source else str(f.repo / 'objects' / signed[:2] / signed[2:])
+                    )
                 else:
                     env.update(FIXTURE_MOVE_REF=reference, FIXTURE_MOVE_TO=destination)
                 result = subprocess.run(
-                    [OPTIONS.binary, reference, '--verify', '--backend=copy', '--write-policy=all',
+                    [OPTIONS.binary, *source, reference, '--verify', '--backend=copy', '--write-policy=all',
                      '--', 'cat', 'deep/file'],
-                    cwd=f.repo, env=env, capture_output=True, timeout=20,
+                    cwd=f.cwd if source else f.repo, env=env, capture_output=True, timeout=20,
                 )
                 self.assertEqual(git_invocations(log), [[operation, oid]])
                 if destination is None:

@@ -29,12 +29,13 @@
   native ref advertisement trace with bounded memory.
 - Use Git's configured signature verifier in its normal environment. A signed
   annotated tag selects the tree recorded by the verified tag object even
-  when the tag ref moves.
+  when the tag ref moves. For supported remote copy runs, verify the streamed
+  commit or tag with Git without staging a pack or index.
 - Stream the first filtered fetch from compatible local paths and `file://`
   URLs without staging a pack or index.
 - Decode the shallow snapshot pack in memory for compatible HTTPS, SSH, and
   local file transport copy runs selected by a full Git OID, an unambiguous
-  branch, or `HEAD`.
+  branch or tag, or `HEAD`.
   HTTPS copy can stream over HTTP/1.1 as well as HTTP/2 and can query refs before
   retrying a refused first fetch by full OID. Preserve the selected OID when
   HTTPS switches to native Git or mounting falls back to copy.

@@ -494,6 +494,14 @@ pub fn wait_for_stale_workspace(root: &Path) -> Result<()> {
 
 const WORKSPACE_PREFIX: &str = ".git-on-service-";
 
+pub(crate) fn io_out_of_space(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
+    })
+}
+
 fn service_workspace() -> Result<OwnedDirectory> {
     if let Some(root) = std::env::var_os("GIT_ON_SERVICE_TMPDIR") {
         return on_tmpfs(Path::new(&root))

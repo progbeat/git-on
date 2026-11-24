@@ -492,6 +492,8 @@ jobs:
             RemoteTests.test_native_fetch_honors_empty_tmpdir \
             RemoteTests.test_native_fetch_keeps_case_distinct_destination_names \
             RemoteTests.test_native_openpgp_verification_uses_git_configuration \
+            RemoteTests.test_eager_signed_copy_streams_for_both_url_and_origin \
+            RemoteTests.test_signed_file_selection_keeps_lazy_transport \
             RemoteTests.test_native_verifier_moving_ref_keeps_exact_distinct_tree \
             RemoteTests.test_remote_verifier_keeps_the_callers_git_configuration \
             RemoteTests.test_eager_copy_rejects_configuration_rejected_by_native_fetch \

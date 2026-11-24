@@ -2,7 +2,7 @@
 use crate::{
     git::Git,
     raw_blob::{ReceivedObject, Transfer},
-    service_storage::Directory,
+    service_storage::{io_out_of_space, Directory},
     transport,
 };
 use anyhow::{bail, Context, Result};
@@ -245,21 +245,21 @@ enum NativeRevision<'a> {
 #[derive(Clone, Copy)]
 enum SnapshotTarget<'a> {
     Object(Oid),
-    Branch(&'a transport::BranchQuery),
+    Ref(&'a transport::RefQuery),
 }
 
 impl<'a> SnapshotTarget<'a> {
-    fn branch(self) -> Option<&'a transport::BranchQuery> {
+    fn reference(self) -> Option<&'a transport::RefQuery> {
         match self {
             Self::Object(_) => None,
-            Self::Branch(query) => Some(query),
+            Self::Ref(query) => Some(query),
         }
     }
 
     fn oid(self, selected: Option<Oid>) -> Option<Oid> {
         match self {
             Self::Object(oid) => Some(oid),
-            Self::Branch(_) => selected,
+            Self::Ref(_) => selected,
         }
     }
 }
@@ -451,16 +451,11 @@ impl Remote {
             raw_blobs,
             native_storage: None,
         };
-        let oid = remote.select_for_execution(revision, multi_remote, verify)?;
+        let oid = remote.select_for_execution(revision, multi_remote)?;
         Ok((remote, oid))
     }
 
-    fn select_for_execution(
-        &mut self,
-        revision: &OsStr,
-        multi_remote: bool,
-        verify: bool,
-    ) -> Result<Oid> {
+    fn select_for_execution(&mut self, revision: &OsStr, multi_remote: bool) -> Result<Oid> {
         if multi_remote {
             // A remote group has no single advertisement. Native Git handles
             // the explicit revision before opening any member's transport.
@@ -494,13 +489,12 @@ impl Remote {
         let select_ref_directly = !native_selection
             && exact.is_none()
             && (!cfg!(target_os = "macos") || stream_revision.as_bytes().is_ascii());
-        let branch = select_ref_directly
-            .then(|| transport::BranchQuery::for_snapshot(stream_revision))
+        let reference = select_ref_directly
+            .then(|| transport::RefQuery::for_snapshot(stream_revision))
             .flatten();
         let stream_target = exact
             .map(SnapshotTarget::Object)
-            .or_else(|| branch.as_ref().map(SnapshotTarget::Branch))
-            .filter(|_| !verify);
+            .or_else(|| reference.as_ref().map(SnapshotTarget::Ref));
         let mut selected_for_native = None;
         if self.materializing {
             // Native fetch owns refspec selection and configured ref updates.
@@ -517,19 +511,13 @@ impl Remote {
             let oid = self.fetch_selected(revision, self.socket_owner.is_none(), false)?;
             return Ok(oid);
         }
-        if verify {
-            // Native signature verification takes an object name in a
-            // Git repository and uses the caller's configured trust policy.
-            self.prepare_native_repository()?;
-        }
-        // Select an exact ID or unambiguous branch on the same channel used
+        // Select an exact ID or unambiguous reference on the same channel used
         // for mounting and later demands. Other refspecs use native Git.
-        let branch = branch.as_ref().filter(|_| stream_revision != "HEAD");
-        if exact.is_some() || branch.is_some() {
-            let selection = branch.cloned().map_or(
-                crate::http2::Selection::Exact,
-                crate::http2::Selection::Branch,
-            );
+        let reference = reference.as_ref().filter(|_| stream_revision != "HEAD");
+        if exact.is_some() || reference.is_some() {
+            let selection = reference
+                .cloned()
+                .map_or(crate::http2::Selection::Exact, crate::http2::Selection::Ref);
             let selected = self.open_http2_pool(selection)?.or(exact);
             if let (Some(oid), Some(pool)) = (selected, &self.demand_pool) {
                 self.http2_checked = true;
@@ -544,7 +532,7 @@ impl Remote {
                 drop(self.demand_pool.take());
                 selected_for_native = Some(oid);
             }
-            if let Some(oid) = self.select_ssh(exact, branch)? {
+            if let Some(oid) = self.select_ssh(exact, reference)? {
                 return Ok(oid);
             }
         }
@@ -615,8 +603,9 @@ impl Remote {
             .flat_map(|selection| selection.metadata.iter().copied())
     }
     pub(crate) fn verify_selection(&self, oid: Oid, kind: git2::ObjectType) -> Result<()> {
-        self.native_repository()
-            .context("native Git verification repository missing")?;
+        if let Some(ReceivedObject::Verified { object, .. }) = self.raw_blobs.received(oid) {
+            return self.git.verify_streamed_object(&self.run, &object);
+        }
         let objects = self
             .selection_pack
             .as_ref()
@@ -1298,18 +1287,17 @@ impl Remote {
     }
 
     fn fetch_snapshot(&mut self, target: SnapshotTarget<'_>) -> Result<SnapshotPreparation> {
-        let branch = target.branch();
-        let selection = branch.cloned().map_or(
-            crate::http2::Selection::Exact,
-            crate::http2::Selection::Branch,
-        );
+        let reference = target.reference();
+        let selection = reference
+            .cloned()
+            .map_or(crate::http2::Selection::Exact, crate::http2::Selection::Ref);
         let https = self.with_http2_configuration(|configuration, scratch| {
             let ready = crate::http2::Client::negotiate(
                 configuration,
                 Default::default(),
                 selection,
                 transport::FetchMode::Snapshot {
-                    selecting_ref: branch.is_some(),
+                    selecting_ref: reference.is_some(),
                 },
             );
             crate::object::check_transfer()?;
@@ -1363,7 +1351,7 @@ impl Remote {
         target: SnapshotTarget<'_>,
     ) -> Result<Option<(Oid, crate::pack_stream::Received)>> {
         let mode = transport::FetchMode::Snapshot {
-            selecting_ref: target.branch().is_some(),
+            selecting_ref: target.reference().is_some(),
         };
         let Some((session, oid)) = self.open_file_session(target, mode)? else {
             return Ok(None);
@@ -1377,7 +1365,7 @@ impl Remote {
 
     fn select_file(&mut self, target: SnapshotTarget<'_>) -> Result<Option<Oid>> {
         let mode = transport::FetchMode::FilteredSelection {
-            selecting_ref: target.branch().is_some(),
+            selecting_ref: target.reference().is_some(),
         };
         let Some((session, oid)) = self.open_file_session(target, mode)? else {
             return Ok(None);
@@ -1416,7 +1404,7 @@ impl Remote {
             return Ok(None);
         };
         let ready = match transport::StartingSession::upload_pack(command, None) {
-            Ok(session) => session.negotiate_selection(target.branch(), mode),
+            Ok(session) => session.negotiate_selection(target.reference(), mode),
             Err(_) => Ok(None),
         };
         crate::object::check_transfer()?;
@@ -1455,10 +1443,10 @@ impl Remote {
             return Ok(None);
         };
         let mode = transport::FetchMode::Snapshot {
-            selecting_ref: target.branch().is_some(),
+            selecting_ref: target.reference().is_some(),
         };
         let ready = match transport::StartingSession::spawn(command, false, None) {
-            Ok(session) => session.negotiate_selection(target.branch(), mode),
+            Ok(session) => session.negotiate_selection(target.reference(), mode),
             Err(_) => Ok(None),
         };
         self.record_socket_owner()?;
@@ -1669,7 +1657,7 @@ impl Remote {
     fn select_ssh(
         &mut self,
         exact: Option<Oid>,
-        branch: Option<&crate::transport::BranchQuery>,
+        reference: Option<&crate::transport::RefQuery>,
     ) -> Result<Option<Oid>> {
         let Some(command) = self.direct_ssh_command()? else {
             return Ok(None);
@@ -1681,8 +1669,8 @@ impl Remote {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "/bin/false")
             .env("SSH_ASKPASS", "/bin/false");
-        if let Some(branch) = branch.filter(|_| !self.git.sets_protocol_version()) {
-            return self.select_ssh_branch(branch, command, additional);
+        if let Some(reference) = reference.filter(|_| !self.git.sets_protocol_version()) {
+            return self.select_ssh_ref(reference, command, additional);
         }
         let mut candidates: Vec<_> = transport::StartingSession::spawn(command, false, None)
             .into_iter()
@@ -1731,9 +1719,9 @@ impl Remote {
             self.socket_owner.is_some(),
             "OpenSSH did not create the owned control socket"
         );
-        let oid = match (exact, branch) {
+        let oid = match (exact, reference) {
             (Some(oid), _) => oid,
-            (None, Some(branch)) => match session.select_branch(branch) {
+            (None, Some(reference)) => match session.select_ref(reference) {
                 Ok(Some(oid)) => oid,
                 _ => {
                     crate::object::check_transfer()?;
@@ -1745,9 +1733,9 @@ impl Remote {
         self.fetch_selected_ssh(oid, session, connection, candidates)
     }
 
-    fn select_ssh_branch(
+    fn select_ssh_ref(
         &mut self,
-        branch: &transport::BranchQuery,
+        reference: &transport::RefQuery,
         mut command: Command,
         additional: Command,
     ) -> Result<Option<Oid>> {
@@ -1763,7 +1751,7 @@ impl Remote {
         let picked = std::thread::scope(|scope| {
             let (send, receive) = mpsc::sync_channel(1);
             let advertisement = scope.spawn(move || {
-                let _ = send.send(starter.advertised_branch(branch).ok().flatten());
+                let _ = send.send(starter.advertised_ref(reference).ok().flatten());
             });
             let picked = (|| -> Result<_> {
                 let connection = loop {
@@ -1788,7 +1776,7 @@ impl Remote {
                     {
                         if let Ok(Some(primary)) = candidates.swap_remove(index).negotiate() {
                             let result =
-                                Self::resolve_ssh_branch(primary, &mut candidates, branch, receive);
+                                Self::resolve_ssh_ref(primary, &mut candidates, reference, receive);
                             crate::object::check_transfer()?;
                             return Ok(result
                                 .ok()
@@ -1825,20 +1813,20 @@ impl Remote {
         self.fetch_selected_ssh(oid, session, Some(connection), candidates)
     }
 
-    fn resolve_ssh_branch(
+    fn resolve_ssh_ref(
         mut primary: transport::Session,
         spares: &mut Vec<transport::StartingSession>,
-        branch: &transport::BranchQuery,
+        reference: &transport::RefQuery,
         advertisement: mpsc::Receiver<Option<Oid>>,
     ) -> Result<Option<(transport::Session, Oid)>> {
         match advertisement.try_recv() {
             Ok(Some(oid)) => return Ok(Some((primary, oid))),
             Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
-                return Ok(primary.select_branch(branch)?.map(|oid| (primary, oid)));
+                return Ok(primary.select_ref(reference)?.map(|oid| (primary, oid)));
             }
             Err(mpsc::TryRecvError::Empty) => (),
         }
-        primary.request_branch(branch)?;
+        primary.request_ref(reference)?;
         let mut advertised = None;
         while !primary.branch_ready()? {
             if advertised.is_none() {
@@ -1859,7 +1847,7 @@ impl Remote {
                 }
             }
         }
-        Ok(primary.read_branch(branch)?.map(|oid| (primary, oid)))
+        Ok(primary.read_ref(reference)?.map(|oid| (primary, oid)))
     }
 
     fn fetch_selected_ssh(
@@ -2628,14 +2616,6 @@ fn git_alternate_path(path: &Path) -> OsString {
     }
     quoted.push(b'"');
     OsString::from_vec(quoted)
-}
-
-fn io_out_of_space(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
-    })
 }
 
 fn received_pack_bytes(directory: &Path) -> Result<u64> {

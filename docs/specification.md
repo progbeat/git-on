@@ -68,6 +68,10 @@ the command after `--`.
   and verification reuse the received objects in place.
   A pack write that fills an automatically selected `tmpfs` can retry on
   the run filesystem before native Git records its selection.
+- Signature verification of a streamed remote snapshot exposes the selected
+  commit or tag as a temporary loose object. The transfer keeps its pack,
+  trees, and file contents out of the verifier's object directory. Staging can
+  retry in the run directory if the automatically selected `tmpfs` fills.
 - Native resolution and fetch disable hooks and local filesystem monitors. Credential
   lookup reads existing credentials. An authentication result does not save,
   erase, or replace stored credentials, host keys, or cookies.
@@ -92,7 +96,7 @@ is part of this bug fix; it does not require a major version increment.
   required for local resolution as well as remote operations.
 - With two operands, native Git resolves configured remotes, URLs and local
   paths. The [reusable transport](remote.md#object-demand-and-cache-lifetime)
-  can select an unambiguous branch or full object ID. A source-only force
+  can select an unambiguous branch or tag or a full object ID. A source-only force
   refspec can use the same selection when default fetch mappings make a private
   destination update unnecessary. The compatibility path
   passes the exact repository and revision/refspec arguments to native

@@ -54,16 +54,16 @@ name alone proves nothing about demand.
 Where protocol v2 and the caller's policy permit, exact demands reuse
 invocation-owned channels. Native Git resolves the original repository and
 prepares the OpenSSH arguments. Local paths and `file://` URLs can stream a
-full OID, an unambiguous branch, or `HEAD` from `upload-pack` from the first
+full OID, an unambiguous branch or tag, or `HEAD` from `upload-pack` from the first
 filtered fetch. Git's `fetch-pack --diag-url` resolves paths that need URL
 parsing. Its private Git directory is also available to the compatibility
 path. The stream does not write a pack or index there. Named selections
 on file sources advertising `ref-in-want` use native fetch, as do file sources
 with unknown formats. For every transport, native Git applies caller settings
 outside the streaming path when it selects the initial revision.
-A full SHA-1 object ID or unambiguous branch can use the reusable HTTPS channel
+A full SHA-1 object ID or unambiguous branch or tag can use the reusable HTTPS channel
 for the initial fetch after the server advertises filtering. Lazy HTTPS resolves
-a named branch with `ls-refs` and requests the resulting OID, including when the
+a named ref with `ls-refs` and requests the resulting OID, including when the
 server advertises `ref-in-want`. With a full OID, the first fetch can handle
 the POST authentication challenge directly. A non-pack reply to the first
 fetch can require a ref query to finish authentication before retrying the
@@ -74,7 +74,7 @@ as its effective URL. With default fetch mappings, an unambiguous source-only
 force refspec such as `+main` uses the same stream as `main`. Explicit
 destinations, custom fetch mappings and remote groups use native Git.
 An SSH identity that
-authenticates without a prompt can select the branch or exact object ID and
+authenticates without a prompt can select the ref or exact object ID and
 fetch the root tree over one owned channel. Other refspecs use native Git's
 selection with the caller's credentials, proxies and TLS policy.
 Interactive preparation uses native fetch with job-control supervision. Git-on
@@ -205,7 +205,7 @@ The native Git compatibility path can use temporary pack files.
 Explicit-all eager materialization needs the entire selected tree. Fetch the
 selected revision once with depth one and without an object filter. Reusable
 HTTPS, SSH, local paths and `file://` URLs can use a full OID, an unambiguous
-branch, or the advertised `HEAD`. The file transport uses the
+branch or tag, or the advertised `HEAD`. The file transport uses the
 installed Git's `upload-pack` under its default transport policy. HTTPS
 accepts HTTP/2, HTTP/1.1, and HTTP/1.0 responses for this one-time transfer.
 For SSH and `file://`, close the request stream after sending the fetch and
@@ -214,7 +214,8 @@ and write verified file contents to their
 destination paths. If automatic mount setup fails and copying is allowed, the
 same transfer can use the already selected OID. Native Git handles competing
 refs, named fetches on servers advertising `ref-in-want`, other refspecs,
-custom fetch mappings, and signature verification. Explicit
+and custom fetch mappings. Signature and trust settings leave the transport
+choice to the same rules as a run without `--verify`. Explicit
 Git settings outside those handled by the streaming path go through native
 fetch, including settings that Git validates before accepting a pack.
 In that path, retain the compressed pack and decode
@@ -234,11 +235,14 @@ repository- or user-scoped credentials and other authentication challenges.
   directory path to libgit2 as bytes.
 - Native ref negotiation or escaped file-URL diagnostics can use the same
   private repository context.
-- Verification of a remote object uses a private repository to expose that
-  object to Git. Local signature verification uses the caller's repository.
-  When a SHA-256 caller verifies a remote SHA-1 object, a private config
-  directory carries its repository-local verifier settings into the SHA-1
-  context and reuses the existing object directory.
+- For a streamed snapshot, Git-on exposes only the selected commit or tag
+  as a loose object in its temporary service directory for native verification.
+  Git uses the caller's repository context when available. Outside a repository,
+  it uses minimal bare repository metadata and the configuration already
+  evaluated in the caller's context.
+  A private config directory carries a SHA-256 caller's repository-local
+  verifier settings into the SHA-1 context. Local verification uses the caller's
+  object database.
 - An object-location bridge adapts byte paths or nested alternates to libgit2
   when needed. Linux can use an open directory descriptor for byte paths.
   Git's quoted or relative alternate forms may use `git cat-file` for headers
@@ -248,8 +252,8 @@ repository- or user-scoped credentials and other authentication challenges.
   An alternate index may require a private copy of its referenced base to
   preserve Git's lookup order.
 
-Standard streamed HTTPS, SSH, and plain local paths use no temporary Git
-repository unless native verification or a compatibility operation needs one.
+Standard streamed HTTPS, SSH, and plain local paths use no temporary fetch
+repository. Compatibility operations can require one.
 This includes `origin` with the standard tracking refspec when its resolved URL
 streams. Credential lookup uses a directory only for any files it needs.
 See [temporary storage](usage.md#temporary-storage) for filesystem selection.
@@ -313,8 +317,8 @@ local and remote snapshots.
 
 Each remote invocation owns an invocation-local object store. The direct
 reusable HTTPS and SSH startup paths keep the selected commit or tag and its
-root tree in memory. Native fetch, signature verification and native interactive
-preparation can use a private temporary bare repository.
+root tree in memory. Native fetch and native interactive preparation can use
+a private temporary bare repository.
 The streamed HTTPS credential lookup uses the caller's configuration and
 working directory. Reusable fetches keep verified Git objects in memory.
 Demanded objects remain available until cleanup,
@@ -444,7 +448,11 @@ All runs use native Git to interpret positional operands. Local execution resolv
 the unchanged revision in the caller's repository, then the object loader reads
 that pinned object through bundled libgit2. Remote execution resolves the selected
 object using the [transport rules above](#object-demand-and-cache-lifetime).
-`--verify` adds native Git's signature check to either mode.
+`--verify` adds native Git's signature check to either mode. A streamed copy
+keeps the snapshot in memory through verification and materializes it from
+the same transfer. For a streamed tag, Git-on compares the target in the
+payload verified by Git with the target in the received object. It checks the
+temporary object against the selected OID before using the snapshot.
 
 `--verify` resolves one commit or annotated tag OID, then calls native
 `git verify-commit OID` or `git verify-tag OID`. Native Git's exit status decides

@@ -170,7 +170,8 @@ and the visible checkout in `copy` mode.
 
 Git-on keeps native Git's selection record and private refs in the run
 directory. It creates a private service directory on demand for incoming
-objects, pack indexes, and transport or diagnostic files. It chooses
+objects, pack indexes, a streamed commit or tag for native verification, and
+transport or diagnostic files. It chooses
 the writable `tmpfs` with the most available space among `/dev/shm`,
 `XDG_RUNTIME_DIR`, and the system temporary directory. If none is writable
 `tmpfs`, it uses the system temporary directory, usually `TMPDIR`. Set

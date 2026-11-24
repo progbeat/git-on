@@ -576,7 +576,7 @@ enum FetchPreparation {
 #[derive(Clone, Copy)]
 enum InitialFetch {
     Exact,
-    Branch,
+    Ref,
     AfterRefProbe,
 }
 
@@ -726,7 +726,7 @@ pub(crate) struct Client {
 
 pub(crate) enum Selection {
     Exact,
-    Branch(transport::BranchQuery),
+    Ref(transport::RefQuery),
     Demand,
 }
 
@@ -765,7 +765,7 @@ impl Client {
             allow_http1: matches!(mode, transport::FetchMode::Snapshot { .. }),
             initial_fetch: match &selection {
                 Selection::Exact => Some(InitialFetch::Exact),
-                Selection::Branch(_) => Some(InitialFetch::Branch),
+                Selection::Ref(_) => Some(InitialFetch::Ref),
                 Selection::Demand => None,
             },
             multi,
@@ -787,27 +787,27 @@ impl Client {
         if !transport::read_http_capabilities(bytes, mode)? {
             return Ok(None);
         }
-        let branch = match &selection {
+        let reference = match &selection {
             // An exact OID only needs the capability advertisement. The
             // first fetch can authenticate before decoding any pack bytes.
             Selection::Exact => return Ok(Some((client, None))),
-            Selection::Branch(branch) => Some(branch),
+            Selection::Ref(reference) => Some(reference),
             // A pool opened after native selection checks POST access
             // before it takes over reads of the already mounted snapshot.
             Selection::Demand => None,
         };
         Ok(client
-            .query_refs(branch)?
+            .query_refs(reference)?
             .map(|selected| (client, selected)))
     }
 
     fn query_refs(
         &mut self,
-        branch: Option<&transport::BranchQuery>,
+        reference: Option<&transport::RefQuery>,
     ) -> Result<Option<Option<Oid>>> {
         let response = self.discovery(
             "git-upload-pack",
-            Some(transport::reference_request(branch)?),
+            Some(transport::reference_request(reference)?),
         )?;
         if response.response_code()? != 200
             || !response.get_ref().supports_protocol()
@@ -818,8 +818,8 @@ impl Client {
         let Body::Discovery(bytes) = &response.get_ref().body else {
             unreachable!()
         };
-        let selected = transport::read_http_branch(bytes, branch)?;
-        Ok((branch.is_none() || selected.is_some()).then_some(selected))
+        let selected = transport::read_http_ref(bytes, reference)?;
+        Ok((reference.is_none() || selected.is_some()).then_some(selected))
     }
 
     fn easy(&self, service: &str, body: Body, request: Option<Vec<u8>>) -> Result<Easy2<Response>> {

@@ -1,4 +1,4 @@
-//! Invocation-owned native transports. Protocol v2 permits branch selection
+//! Invocation-owned native transports. Protocol v2 permits reference selection
 //! and successive exact-object requests on the same channel.
 use crate::{platform::child_exited, service_storage::CaptureFile};
 use anyhow::{bail, ensure, Context, Result};
@@ -708,8 +708,8 @@ impl StartingSession {
         Ok(sockets.iter().position(|socket| socket.revents != 0))
     }
 
-    pub(crate) fn advertised_branch(mut self, query: &BranchQuery) -> Result<Option<Oid>> {
-        let selected = read_selected_branch(&mut self.0.output, Some(query), true)?;
+    pub(crate) fn advertised_ref(mut self, query: &RefQuery) -> Result<Option<Oid>> {
+        let selected = read_selected_ref(&mut self.0.output, Some(query), true)?;
         let _ = self.0.input.write_all(b"0000");
         Ok(selected)
     }
@@ -746,15 +746,15 @@ impl StartingSession {
 
     pub(crate) fn negotiate_selection(
         mut self,
-        branch: Option<&BranchQuery>,
+        reference: Option<&RefQuery>,
         mode: FetchMode,
     ) -> Result<Option<(Session, Option<Oid>)>> {
         self.0.observe_leader()?;
         if self.0.handshake(false, mode).unwrap_or(false) {
-            match branch {
+            match reference {
                 None => return Ok(Some((self.0, None))),
                 Some(query) => {
-                    if let Ok(Some(oid)) = self.0.select_branch(query) {
+                    if let Ok(Some(oid)) = self.0.select_ref(query) {
                         return Ok(Some((self.0, Some(oid))));
                     }
                 }
@@ -843,12 +843,12 @@ impl Session {
         line.pop();
         Ok(line)
     }
-    pub(crate) fn select_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
-        self.request_branch(query)?;
-        self.read_branch(query)
+    pub(crate) fn select_ref(&mut self, query: &RefQuery) -> Result<Option<Oid>> {
+        self.request_ref(query)?;
+        self.read_ref(query)
     }
 
-    pub(crate) fn request_branch(&mut self, query: &BranchQuery) -> Result<()> {
+    pub(crate) fn request_ref(&mut self, query: &RefQuery) -> Result<()> {
         self.input.write_all(&reference_request(Some(query))?)?;
         Ok(())
     }
@@ -870,8 +870,8 @@ impl Session {
         }
     }
 
-    pub(crate) fn read_branch(&mut self, query: &BranchQuery) -> Result<Option<Oid>> {
-        read_selected_branch(&mut self.output, Some(query), false)
+    pub(crate) fn read_ref(&mut self, query: &RefQuery) -> Result<Option<Oid>> {
+        read_selected_ref(&mut self.output, Some(query), false)
     }
     pub(crate) fn fetch_stream(
         &mut self,
@@ -1164,16 +1164,16 @@ fn read_v2_capabilities(input: &mut impl Read, mode: FetchMode) -> Result<bool> 
 }
 
 #[derive(Clone)]
-pub(crate) struct BranchQuery {
-    wanted: String,
+pub(crate) struct RefQuery {
+    selectable: Vec<String>,
     alternatives: Vec<String>,
 }
 
-impl BranchQuery {
+impl RefQuery {
     pub(crate) fn for_snapshot(revision: &std::ffi::OsStr) -> Option<Self> {
         if revision == "HEAD" {
             Some(Self {
-                wanted: "HEAD".into(),
+                selectable: vec!["HEAD".into()],
                 alternatives: Vec::new(),
             })
         } else {
@@ -1191,39 +1191,48 @@ impl BranchQuery {
         {
             return None;
         }
-        let wanted = if revision.starts_with("refs/heads/") {
-            revision.to_owned()
-        } else {
-            if revision.starts_with("refs/") {
-                return None;
-            }
-            format!("refs/heads/{revision}")
-        };
-        git2::Reference::is_valid_name(&wanted).then(|| {
-            // Match Git's DWIM rules conservatively. Any competing ref leaves
-            // the selection to native Git.
-            let mut alternatives = vec![
-                revision.to_owned(),
-                format!("refs/{revision}"),
-                format!("refs/heads/{revision}"),
-                format!("refs/tags/{revision}"),
-                format!("refs/remotes/{revision}"),
-                format!("refs/remotes/{revision}/HEAD"),
-            ];
-            alternatives.retain(|other| *other != wanted);
-            Self {
-                wanted,
-                alternatives,
-            }
-        })
+        let head = format!("refs/heads/{revision}");
+        let tag = format!("refs/tags/{revision}");
+        let selectable =
+            if revision.starts_with("refs/heads/") || revision.starts_with("refs/tags/") {
+                vec![revision.to_owned()]
+            } else {
+                if revision.starts_with("refs/") {
+                    return None;
+                }
+                vec![head.clone(), tag.clone()]
+            };
+        selectable
+            .iter()
+            .all(|name| git2::Reference::is_valid_name(name))
+            .then(|| {
+                // Match Git's DWIM rules conservatively. Any competing ref leaves
+                // the selection to native Git.
+                let mut alternatives = vec![
+                    revision.to_owned(),
+                    format!("refs/{revision}"),
+                    head,
+                    tag,
+                    format!("refs/remotes/{revision}"),
+                    format!("refs/remotes/{revision}/HEAD"),
+                ];
+                alternatives.retain(|other| !selectable.contains(other));
+                Self {
+                    selectable,
+                    alternatives,
+                }
+            })
     }
 
     fn prefixes(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.wanted.as_str()).chain(self.alternatives.iter().map(String::as_str))
+        self.selectable
+            .iter()
+            .chain(&self.alternatives)
+            .map(String::as_str)
     }
 }
 
-pub(crate) fn reference_request(query: Option<&BranchQuery>) -> Result<Vec<u8>> {
+pub(crate) fn reference_request(query: Option<&RefQuery>) -> Result<Vec<u8>> {
     let mut request = Vec::new();
     request_packet(&mut request, b"command=ls-refs\n")?;
     request.extend_from_slice(b"0001");
@@ -1238,18 +1247,15 @@ pub(crate) fn reference_request(query: Option<&BranchQuery>) -> Result<Vec<u8>> 
     Ok(request)
 }
 
-pub(crate) fn read_http_branch(
-    mut input: &[u8],
-    query: Option<&BranchQuery>,
-) -> Result<Option<Oid>> {
-    let selected = read_selected_branch(&mut input, query, false)?;
+pub(crate) fn read_http_ref(mut input: &[u8], query: Option<&RefQuery>) -> Result<Option<Oid>> {
+    let selected = read_selected_ref(&mut input, query, false)?;
     check_http_end(input)?;
     Ok(selected)
 }
 
-fn read_selected_branch(
+fn read_selected_ref(
     input: &mut impl Read,
-    query: Option<&BranchQuery>,
+    query: Option<&RefQuery>,
     full_advertisement: bool,
 ) -> Result<Option<Oid>> {
     let mut selected = None;
@@ -1273,7 +1279,11 @@ fn read_selected_branch(
                     let mut fields = packet_text(reference).split(|&byte| byte == b' ');
                     let id = fields.next().unwrap_or_default();
                     let name = fields.next().unwrap_or_default();
-                    if name == query.wanted.as_bytes() {
+                    if query
+                        .selectable
+                        .iter()
+                        .any(|candidate| candidate.as_bytes() == name)
+                    {
                         ambiguous |= selected.is_some();
                         ensure!(
                             id.len() == 40 && id.iter().all(u8::is_ascii_hexdigit),
@@ -1550,8 +1560,8 @@ mod tests {
         }
     }
     #[test]
-    fn branch_selection_ignores_longer_prefixes_and_leaves_ambiguities_to_git() {
-        let query = BranchQuery::new(std::ffi::OsStr::new("release/candidate")).unwrap();
+    fn ref_selection_ignores_longer_prefixes_and_leaves_ambiguities_to_git() {
+        let query = RefQuery::new(std::ffi::OsStr::new("release/candidate")).unwrap();
         let mut response = Vec::new();
         let selected = Oid::from_bytes(&[3; 20]).unwrap();
         let other = Oid::from_bytes(&[4; 20]).unwrap();
@@ -1562,7 +1572,7 @@ mod tests {
             text_packet(&mut response, format!("{oid} {name}").as_bytes(), true);
         }
         assert_eq!(
-            read_http_branch(&[response.as_slice(), b"00000002"].concat(), Some(&query)).unwrap(),
+            read_http_ref(&[response.as_slice(), b"00000002"].concat(), Some(&query)).unwrap(),
             Some(selected)
         );
         text_packet(
@@ -1572,7 +1582,7 @@ mod tests {
         );
         response.extend_from_slice(b"0000");
         let (mut session, _peer) = peer_response(&response);
-        assert_eq!(session.select_branch(&query).unwrap(), None);
+        assert_eq!(session.select_ref(&query).unwrap(), None);
     }
 
     #[test]

@@ -3,8 +3,12 @@ use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid};
 use std::{
     ffi::{OsStr, OsString},
-    io::BufRead,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    fs::{self, File},
+    io::{self, BufRead, Read, Write},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -491,6 +495,108 @@ impl Git {
         self.verify_in_object_directory(dir, oid, kind, None)
     }
 
+    pub(crate) fn verify_streamed_object(
+        &self,
+        run: &Path,
+        object: &crate::pack_stream::VerifiedObject,
+    ) -> Result<()> {
+        let operation = signature_verifier(object.kind())?;
+        // Verification finishes before copy fallback can create run-bound storage.
+        use crate::service_storage::{io_out_of_space, Directory};
+        match Directory::new("verify-") {
+            Ok(directory) => match self.stage_verifier_object(directory.path(), object) {
+                Ok(loose) => {
+                    return self.verify_staged_object(directory.path(), loose, object, operation);
+                }
+                Err(error) if directory.can_fall_back_to(run) && io_out_of_space(&error) => {}
+                Err(error) => return Err(error),
+            },
+            Err(error)
+                if std::env::var_os("GIT_ON_SERVICE_TMPDIR").is_none()
+                    && io_out_of_space(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let fallback = tempfile::Builder::new().prefix("verify-").tempdir_in(run)?;
+        let loose = self.stage_verifier_object(fallback.path(), object)?;
+        self.verify_staged_object(fallback.path(), loose, object, operation)
+    }
+
+    fn stage_verifier_object(
+        &self,
+        dir: &Path,
+        object: &crate::pack_stream::VerifiedObject,
+    ) -> Result<PathBuf> {
+        if self.original_dir.is_none() {
+            // Outside a repository, Git needs a bare context even for an OID.
+            fs::create_dir(dir.join("refs"))?;
+            fs::write(dir.join("HEAD"), "ref: refs/heads/master\n")?;
+            fs::write(dir.join("config"), "[core]\n\tbare = true\n")?;
+            let mut config = Vec::new();
+            for (key, value) in &self.config {
+                append_config_entry(
+                    &mut config,
+                    key.as_bytes(),
+                    value.as_deref().map(OsStr::as_bytes),
+                )?;
+            }
+            fs::write(dir.join("caller-config"), config)?;
+        }
+        let oid = object.oid().to_string();
+        let fanout = dir.join("objects").join(&oid[..2]);
+        fs::create_dir_all(&fanout)?;
+        let loose = fanout.join(&oid[2..]);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(File::create_new(&loose)?, flate2::Compression::fast());
+        encoder.write_all(
+            crate::object::object_header(object.kind(), object.data().len()).as_bytes(),
+        )?;
+        crate::object::write_verified_buffer(object.data(), &mut encoder)?;
+        encoder.finish()?;
+        Ok(loose)
+    }
+
+    fn verify_staged_object(
+        &self,
+        dir: &Path,
+        loose: PathBuf,
+        object: &crate::pack_stream::VerifiedObject,
+        operation: &str,
+    ) -> Result<()> {
+        let before = fs::symlink_metadata(&loose)?;
+        self.run_verifier(dir, object.oid(), operation, None, Some(object))?;
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&loose)
+            .context("reopen streamed verification object")?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            before.is_file()
+                && (
+                    before.dev(),
+                    before.ino(),
+                    before.ctime(),
+                    before.ctime_nsec()
+                ) == (after.dev(), after.ino(), after.ctime(), after.ctime_nsec()),
+            "streamed verification object changed"
+        );
+        let mut decoder = flate2::read::ZlibDecoder::new(file);
+        let header = crate::object::object_header(object.kind(), object.data().len());
+        let mut actual = vec![0; header.len()];
+        decoder.read_exact(&mut actual)?;
+        anyhow::ensure!(
+            actual == header.as_bytes(),
+            "streamed verification object header changed"
+        );
+        crate::object::copy_verified(
+            decoder,
+            io::sink(),
+            object.kind(),
+            object.data().len(),
+            object.oid(),
+        )
+    }
+
     pub(crate) fn verify_in_object_directory(
         &self,
         dir: &Path,
@@ -498,13 +604,17 @@ impl Git {
         kind: git2::ObjectType,
         objects: Option<&Path>,
     ) -> Result<()> {
-        let operation = match kind {
-            git2::ObjectType::Commit => "verify-commit",
-            git2::ObjectType::Tag => "verify-tag",
-            _ => bail!(
-                "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
-            ),
-        };
+        self.run_verifier(dir, oid, signature_verifier(kind)?, objects, None)
+    }
+
+    fn run_verifier(
+        &self,
+        dir: &Path,
+        oid: Oid,
+        operation: &str,
+        objects: Option<&Path>,
+        streamed: Option<&crate::pack_stream::VerifiedObject>,
+    ) -> Result<()> {
         let different_format = self
             .original_dir
             .as_deref()
@@ -522,22 +632,42 @@ impl Git {
         };
         let mut command =
             self.verification_command(dir, objects, config.as_ref().map(tempfile::TempDir::path));
-        command.arg(operation).arg(oid.to_string());
+        if self.original_dir.is_none() && streamed.is_some() {
+            // The private bare Git dir must not activate a new conditional include.
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", dir.join("caller-config"))
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS");
+        }
+        let tag = streamed.filter(|object| object.kind() == ObjectType::Tag);
+        command.arg(operation);
+        if tag.is_some() {
+            command.arg("--verbose");
+        }
+        command.arg(oid.to_string());
         // Native Git owns acceptance, including the caller's configured trust threshold.
         // Its default can accept unknown-trust OpenPGP; a git-on threshold here
         // would silently replace that policy.
-        let status = run_captured(
+        let output = run_captured(
             command,
-            false,
+            tag.is_some(),
             false,
             None,
             None,
             false,
             CaptureMode::Foreground,
-        )?
-        .status;
-        if !status.success() {
+        )?;
+        if !output.status.success() {
             bail!("native Git {operation} failed for {oid}; execution forbidden");
+        }
+        if let Some(tag) = tag {
+            let target = |data: &[u8]| crate::object::selected_child(ObjectType::Tag, data);
+            // In verbose mode Git returns the payload used for signature verification.
+            anyhow::ensure!(
+                target(&output.stdout)? == target(tag.data())?,
+                "native Git verified a different tag target"
+            );
         }
         Ok(())
     }
@@ -603,6 +733,28 @@ fn is_config_include(key: &[u8]) -> bool {
     key.starts_with(b"include.") || key.starts_with(b"includeif.")
 }
 
+fn append_config_entry(config: &mut Vec<u8>, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    let (section, name) = key.split_once_byte(b'.');
+    let name = name.context("Git configuration key has no section")?;
+    config.push(b'[');
+    config.extend_from_slice(section);
+    let name = if let Some(dot) = name.iter().rposition(|&byte| byte == b'.') {
+        config.push(b' ');
+        quote_config(config, &name[..dot], false);
+        &name[dot + 1..]
+    } else {
+        name
+    };
+    config.extend_from_slice(b"]\n\t");
+    config.extend_from_slice(name);
+    if let Some(value) = value {
+        config.extend_from_slice(b" = ");
+        quote_config(config, value, true);
+    }
+    config.push(b'\n');
+    Ok(())
+}
+
 fn prepare_verifier_config(cwd: &Path, source: &Path, git_dir: &Path) -> Result<tempfile::TempDir> {
     let source_dir = source
         .parent()
@@ -624,29 +776,16 @@ fn prepare_verifier_config(cwd: &Path, source: &Path, git_dir: &Path) -> Result<
             .then(|| relocate_condition(key, source_dir))
             .flatten();
         let key = relocated_key.as_deref().unwrap_or(key);
-        let (section, name) = key.split_once_byte(b'.');
-        let name = name.context("Git configuration key has no section")?;
-        config.push(b'[');
-        config.extend_from_slice(section);
-        let name = if let Some(dot) = name.iter().rposition(|&byte| byte == b'.') {
-            config.push(b' ');
-            quote_config(&mut config, &name[..dot], false);
-            &name[dot + 1..]
-        } else {
-            name
-        };
-        config.extend_from_slice(b"]\n\t");
-        config.extend_from_slice(name);
-        if let Some(value) = value {
-            config.extend_from_slice(b" = ");
-            if include && !value.starts_with(b"~") && !value.starts_with(b"%(prefix)/") {
-                let path = source_dir.join(OsStr::from_bytes(value));
-                quote_config(&mut config, path.as_os_str().as_bytes(), true);
-            } else {
-                quote_config(&mut config, value, true);
-            }
-        }
-        config.push(b'\n');
+        let relocated_path = value
+            .filter(|value| {
+                include && !value.starts_with(b"~") && !value.starts_with(b"%(prefix)/")
+            })
+            .map(|value| source_dir.join(OsStr::from_bytes(value)));
+        let value = relocated_path
+            .as_deref()
+            .map(|path| path.as_os_str().as_bytes())
+            .or(value);
+        append_config_entry(&mut config, key, value)?;
     }
     // Give verification its own local configuration scope without changing
     // the fetch repository's settings or copying any fetched objects.
@@ -737,6 +876,9 @@ fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>, materializing: bool
         b"core.repositoryformatversion" | b"core.hookspath" | b"core.fsmonitor" => true,
         // This setting controls integration by pull after fetching.
         b"pull.rebase" => true,
+        // Signing and trust settings are evaluated by the verifier.
+        b"commit.gpgsign" | b"tag.gpgsign" | b"tag.forcesignannotated" => true,
+        key if key.starts_with(b"gpg.") => true,
         b"core.askpass" | b"core.sshcommand" | b"user.name" | b"user.email"
         | b"user.signingkey" => value.is_some(),
         b"core.bare"
@@ -780,6 +922,16 @@ fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>, materializing: bool
             value.is_some() && (key.ends_with(b".remote") || key.ends_with(b".merge"))
         }
         _ => false,
+    }
+}
+
+fn signature_verifier(kind: ObjectType) -> Result<&'static str> {
+    match kind {
+        ObjectType::Commit => Ok("verify-commit"),
+        ObjectType::Tag => Ok("verify-tag"),
+        _ => bail!(
+            "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
+        ),
     }
 }
 
