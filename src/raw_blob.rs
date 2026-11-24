@@ -374,6 +374,7 @@ impl RawBlob {
         self.read_range(offset, size, false).map(ReadData::into_vec)
     }
     pub(crate) fn read_shared(&self, offset: u64, size: u32) -> Result<ReadData> {
+        // macOS NFS can send separate ranges. Linux FUSE needs one reply slice.
         self.read_range(offset, size, cfg!(target_os = "macos"))
     }
     fn read_range(&self, offset: u64, size: u32, scatter: bool) -> Result<ReadData> {
@@ -1121,6 +1122,8 @@ pub(crate) struct RawBlobs {
 struct PackDecodes {
     active: Mutex<usize>,
     ready: Condvar,
+    #[cfg(test)]
+    wait_notice: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 pub(crate) struct PackDecode(Arc<PackDecodes>);
@@ -1144,7 +1147,10 @@ pub(crate) enum ReceivedObject {
         object: crate::pack_stream::VerifiedObject,
         transfer: Option<Arc<Transfer>>,
     },
-    Packed(Arc<tempfile::TempDir>),
+    Packed {
+        directory: Arc<tempfile::TempDir>,
+        size: usize,
+    },
 }
 
 impl Drop for PackDecode {
@@ -1207,6 +1213,13 @@ impl RawBlobs {
         *self.pack_decodes.active.lock().unwrap()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pack_decode_wait_notice(&self) -> mpsc::Receiver<()> {
+        let (notice, waiting) = mpsc::channel();
+        *self.pack_decodes.wait_notice.lock().unwrap() = Some(notice);
+        waiting
+    }
+
     pub(crate) fn reserve_pack_decode(
         &self,
         priority: impl Fn() -> PackDecodePriority,
@@ -1233,6 +1246,10 @@ impl RawBlobs {
                 if *active < limit {
                     break;
                 }
+            }
+            #[cfg(test)]
+            if let Some(notice) = slots.wait_notice.lock().unwrap().take() {
+                let _ = notice.send(());
             }
             (active, _) = slots
                 .ready
@@ -1331,7 +1348,7 @@ impl RawBlobs {
                                 *transfer = None;
                             }
                         }
-                        packed @ ReceivedObject::Packed(_) => {
+                        packed @ ReceivedObject::Packed { .. } => {
                             *packed = ReceivedObject::Verified {
                                 object: extra,
                                 transfer: source.cloned(),
@@ -1404,13 +1421,21 @@ impl RawBlobs {
         required
     }
 
-    pub(crate) fn remember_packed(&self, oid: Oid, directory: &Arc<tempfile::TempDir>) {
+    pub(crate) fn remember_packed(
+        &self,
+        oid: Oid,
+        directory: &Arc<tempfile::TempDir>,
+        size: usize,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.objects.get(&oid).is_some_and(Descriptor::available) {
             state
                 .received
                 .entry(oid)
-                .or_insert_with(|| ReceivedObject::Packed(directory.clone()));
+                .or_insert_with(|| ReceivedObject::Packed {
+                    directory: directory.clone(),
+                    size,
+                });
         }
     }
 

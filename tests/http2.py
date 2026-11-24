@@ -32,9 +32,9 @@ from h2.connection import H2Connection
 from h2.events import DataReceived, RequestReceived, StreamEnded, StreamReset
 
 REJECTION_CHALLENGE = 'Basic realm="git-on-rejected"'
-REJECTION_INPUT = shlex.quote('wwwauth[]=' + REJECTION_CHALLENGE)
 
 from remote import ARGS, OPTIONS, Fixture
+from support.git_invocations import git_invocations, record_git_invocations
 
 
 class Multiplexer(socketserver.ThreadingTCPServer):
@@ -234,6 +234,74 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
 
 
 class Http2Tests(unittest.TestCase):
+    def test_https_reads_credentials_and_streams_default_origin_without_a_repository(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        backend = fixture.https()
+        self.addCleanup(fixture.server.shutdown)
+        token = base64.b64encode(b'fixture:example-password').decode()
+        proxy = Multiplexer(fixture, backend, 'Basic ' + token)
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        fixture.git('init', '--quiet', at=fixture.cwd)
+        fixture.git('remote', 'add', 'origin', url, at=fixture.cwd)
+        config = fixture.cwd / '.git/config'
+        original_config = config.read_bytes()
+        credentials = fixture.root / 'persistent-credentials'
+        original_credentials = b'username=fixture\npassword=example-password\n'
+        credentials.write_bytes(original_credentials)
+        helper = fixture.root / 'read credential'
+        quoted = shlex.quote(str(credentials))
+        helper.write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            f'get) if test "$FIXTURE_DENIED" = 1; then '
+            f'printf "%s\\n" username=fixture password=wrong; else cat {quoted}; fi ;;\n'
+            f'store) printf changed > {quoted} ;;\n'
+            f'erase) rm -f -- {quoted} ;;\n'
+            'esac\n'
+        )
+        helper.chmod(0o700)
+        environment, invocations = record_git_invocations(fixture.root, fixture.env)
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse' if OPTIONS.require_fuse else 'copy'
+        policy = 'all' if backend == 'copy' else 'none'
+        expected = fixture.tree.encode() + b'\nexpected\n'
+        for source, native, denied in (
+            (url, False, False), ('origin', False, False), (url, False, True),
+            (url, True, False), (url, True, True),
+        ):
+            with self.subTest(source=source, native=native, denied=denied), tempfile.TemporaryFile() as metrics:
+                invocations.write_text('')
+                credentials.write_bytes(original_credentials)
+                env = dict(
+                    environment,
+                    GIT_CONFIG_COUNT='2' if native else '1',
+                    GIT_CONFIG_KEY_0=f'credential.{url}.helper' if native else 'credential.helper',
+                    GIT_CONFIG_VALUE_0='!exec ' + shlex.quote(str(helper)),
+                    GIT_CONFIG_KEY_1='fetch.prune', GIT_CONFIG_VALUE_1='false',
+                    GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/bin/false', FIXTURE_DENIED=str(int(denied)),
+                    GIT_ON_TEST_METRICS_FD=str(metrics.fileno()),
+                )
+                run = subprocess.run(
+                    [OPTIONS.binary, source, 'main', f'--backend={backend}', f'--write-policy={policy}',
+                     '--', 'sh', '-c', 'printf "%s\\n" "$GIT_ON_TREE_OID"; cat deep/file'],
+                    cwd=fixture.cwd, env=env, capture_output=True, timeout=20, pass_fds=(metrics.fileno(),),
+                )
+                self.assertEqual(run.returncode, 125 if denied else 0, run.stderr)
+                self.assertEqual(run.stdout, b'' if denied else expected)
+                calls = git_invocations(invocations)
+                self.assertTrue(calls)
+                if not denied:
+                    self.assertEqual(any('fetch' in args for args in calls), native, calls)
+                self.assertEqual(credentials.read_bytes(), original_credentials)
+                self.assertEqual(config.read_bytes(), original_config)
+                if not denied:
+                    metrics.seek(0)
+                    report = json.load(metrics)
+                    self.assertEqual(report['remote_repositories_created'] > 0, native, report)
+                    self.assertEqual(report['remote_http2_fetch_operations'] > 0, not native, report)
+
     def test_copy_streams_http1_pack_with_discovery_and_ref_retry(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -365,14 +433,14 @@ class Http2Tests(unittest.TestCase):
                             GIT_CONFIG_COUNT='2',
                             GIT_CONFIG_KEY_0='remote.origin.url', GIT_CONFIG_VALUE_0=url,
                             GIT_CONFIG_KEY_1='remote.origin.fetch',
-                            GIT_CONFIG_VALUE_1='+refs/heads/*:refs/remotes/origin/*',
+                            GIT_CONFIG_VALUE_1='+refs/heads/*:refs/remotes/custom/*',
                         )
                         process = fixture.probe('origin', 'main')
                         self.assertEqual(fixture.line(process)['tree'], fixture.tree)
                         repositories = list(fixture.root.glob('*/remote-repository'))
                         self.assertEqual(len(repositories), 1, repositories)
                         tracked = fixture.git('--git-dir', str(repositories[0]), 'rev-parse',
-                                              'refs/remotes/origin/main')
+                                              'refs/remotes/custom/main')
                         self.assertEqual(tracked, fixture.commit)
                         fixture.finish(process)
                     finally:
@@ -448,8 +516,7 @@ class Http2Tests(unittest.TestCase):
                     fixture.env, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='credential.helper',
                     GIT_CONFIG_VALUE_0=(
                         f'!f() {{ if test "$1" = get; then '
-                        f'if grep -qx get {quoted} && ! grep -qx store {quoted}; then '
-                        "echo quit=1; else echo username=fixture; echo password=example-password; fi; fi; "
+                        'echo username=fixture; echo password=example-password; fi; '
                         f'echo "$1" >>{quoted}; }}; f'
                     ),
                 )
@@ -473,7 +540,9 @@ class Http2Tests(unittest.TestCase):
                 self.assertTrue(any(b'command=ls-refs\n' in request for request in requests[1:]))
                 if scenario == 'held-downgrade':
                     self.assertTrue(proxy.http1_headers_sent.is_set())
-                self.assertEqual(operations.read_text().splitlines()[:2], ['get', 'store'])
+                calls = operations.read_text().splitlines()
+                self.assertTrue(calls)
+                self.assertEqual(set(calls), {'get'})
 
     def test_basic_credential_continuation_for_copy_and_lazy_reads(self):
         capabilities = subprocess.run(['git', 'credential', 'capability'], capture_output=True)
@@ -537,6 +606,7 @@ class Http2Tests(unittest.TestCase):
         helper = fixture.root / 'credential-helper.py'
         helper.write_text(
             'import base64\n'
+            'import os\n'
             'import sys\n'
             'from pathlib import Path\n'
             'log, mode, operation = sys.argv[1:]\n'
@@ -561,6 +631,8 @@ class Http2Tests(unittest.TestCase):
             '    if f"authtype={scheme}" not in values or not any(v.startswith("credential=") for v in values):\n'
             '        Path(log).write_text("lost encoded credential before approval\\n")\n'
             'if operation == "get":\n'
+            '    with Path(log + ".scratch").open("a") as scratch:\n'
+            '        scratch.write(os.environ.get("TMPDIR", "") + "\\n")\n'
             '    print("capability[]=state")\n'
             '    if state == "-" and Path(log).read_text().count("get -\\n") > 1:\n'
             '        print("quit=1")\n'
@@ -621,16 +693,40 @@ class Http2Tests(unittest.TestCase):
                 ))
                 if not kind.startswith('native'):
                     self.assertEqual(result.stdout, b'expected\n')
-                expected = ['get -', 'get first', 'store second']
+                expected = ['get -', 'get first']
+                if kind.startswith('native'):
+                    expected.append('store second')
                 if challenge_refs:
-                    expected.insert(1, 'store first')
                     want = (fixture.commit.encode(),)
                     self.assertEqual(ref_recovery[:4], [(403, want), (401, ()), (200, ()), (200, want)])
                 elif kind.startswith('lazy'):
                     self.assertEqual(ref_requests, [])
                 self.assertEqual(operations.read_text().splitlines(), expected)
+                if kind == 'copy':
+                    scratch_paths = operations.with_suffix('.scratch').read_text().splitlines()
+                    self.assertEqual(len(scratch_paths), 2)
+                    self.assertEqual(scratch_paths[0], scratch_paths[1])
 
     def test_copy_materializes_one_shallow_pack_over_https_and_ssh(self):
+        self.check_eager_copy(('https', 'ssh', 'branch-https', 'branch-ssh', 'head-https'))
+
+    def test_copy_preserves_native_fetch_policy(self):
+        self.check_eager_copy((
+            'ambiguous-https', 'proxy-ca', 'user-agent', 'native-dumb',
+            'pack.indexversion', 'pack.writereverseindex', 'session-id', 'ref-in-want',
+        ))
+
+    def test_copy_preserves_https_credential_lookup(self):
+        self.check_eager_copy((
+            'authenticated', 'scoped-auth', 'path-auth', 'auth-rejected',
+            'auth-quit', 'auth-quit-traced', 'netrc',
+        ))
+
+    @unittest.skipUnless(OPTIONS.require_nfs, 'requires the macOS mount-to-copy fallback')
+    def test_auto_copy_fallback_keeps_the_selected_snapshot(self):
+        self.check_eager_copy(('auto-https', 'auto-ssh'))
+
+    def check_eager_copy(self, transports):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         link = fixture.git('hash-object', '-w', '--stdin', data=b'deep/file')
@@ -639,16 +735,22 @@ class Http2Tests(unittest.TestCase):
         fixture.commit = fixture.git('commit-tree', fixture.tree, data=b'eager copy fixture\n')
         fixture.git('update-ref', 'refs/heads/main', fixture.commit)
         fixture.git('config', 'uploadpack.allowFilter', 'false')
-        fixture.git('update-server-info')
+        if 'native-dumb' in transports:
+            fixture.git('update-server-info')
         backend = fixture.https()
         self.addCleanup(fixture.server.shutdown)
         proxy = Multiplexer(fixture, backend, None)
         alias_wants = []
         required_user_agent = None
+        advance_after_selection = None
         default_user_agent = 'git/' + fixture.git('--version').removeprefix('git version ')
         upstream = proxy.forward
 
         def forward_with_alias(method, path, headers, body):
+            nonlocal advance_after_selection
+            if advance_after_selection and f'want {fixture.tree}\n'.encode() in body:
+                fixture.git('update-ref', 'refs/heads/main', advance_after_selection, fixture.commit)
+                advance_after_selection = None
             if required_user_agent and b'want ' in body and not any(
                     key.lower() == 'user-agent' and value == required_user_agent
                     for key, value in headers.items()):
@@ -671,44 +773,37 @@ class Http2Tests(unittest.TestCase):
         self.addCleanup(proxy.shutdown)
 
         code = r"""
+import os
 from pathlib import Path
 import sys
 assert Path('deep/file').read_bytes() == b'expected\n'
 assert Path('other').read_bytes() == b'unrelated payload\n'
 assert Path('link').readlink() == Path('deep/file')
 repository = Path.cwd().parent / 'remote-repository'
-if sys.argv[1] == 'credential-context':
-    assert not any(path.is_file() for path in (repository / 'objects').rglob('*'))
-elif sys.argv[1] == 'absent':
+if sys.argv[1] == 'absent':
     assert not repository.exists()
+print(os.environ['GIT_ON_TREE_OID'])
 """
         https = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
-        ssh = fixture.ssh(protocol_v2=True, max_sessions=1)
-        fallbacks = [('auto-https', https), ('auto-ssh', ssh)] if OPTIONS.require_nfs else []
+        ssh = (fixture.ssh(protocol_v2=True, max_sessions=1)
+               if any(transport.endswith('ssh') for transport in transports) else None)
         pack_config = {'pack.indexversion': '3', 'pack.writereverseindex': 'invalid'}
         native_cases = {
             'ambiguous-https', 'ref-in-want', 'session-id', 'scoped-auth', 'path-auth',
             'proxy-ca', 'user-agent', *pack_config,
         }
-        for transport, url in [
-            ('https', https), ('ssh', ssh),
-            ('branch-https', https), ('branch-ssh', ssh), ('head-https', https + '//'),
-            ('ambiguous-https', https), *fallbacks,
-            ('authenticated', https), ('scoped-auth', https), ('path-auth', https),
-            ('auth-rejected', https), ('auth-quit', https), ('auth-quit-traced', https), ('netrc', https),
-            ('proxy-ca', https), ('user-agent', https),
-            ('native-dumb', https),
-            *((key, https) for key in pack_config),
-            ('session-id', https), ('ref-in-want', https),
-        ]:
+        for transport in transports:
             with self.subTest(transport=transport), tempfile.TemporaryFile() as metrics, \
                     tempfile.TemporaryDirectory(dir='/tmp', prefix='go-copy-') as runtime, \
                     ExitStack() as cleanup:
+                url = ssh if transport.endswith('ssh') else https
+                if transport == 'head-https':
+                    url += '//'
+                proxy.authorization = None
+                proxy.authenticate_wants_only = False
                 proxy.gzip_pack = transport == 'https'
                 env = dict(fixture.env, TMPDIR=runtime, GIT_ON_TEST_METRICS_FD=str(metrics.fileno()))
                 required_user_agent = default_user_agent if transport == 'https' else None
-                if transport == 'https':
-                    env['GIT_TRACE_PACKET'] = '0'
                 if transport == 'user-agent':
                     required_user_agent = 'git-on-fixture/1'
                     env['GIT_USER_AGENT'] = required_user_agent
@@ -717,6 +812,7 @@ elif sys.argv[1] == 'absent':
                     env['GIT_TRACE2'] = '1'
                 native_error = None
                 native_fetches = 0
+                selected_tree = fixture.tree
                 source = url
                 revision = fixture.commit
                 if transport in ('branch-https', 'branch-ssh', 'ambiguous-https', 'ref-in-want'):
@@ -726,7 +822,14 @@ elif sys.argv[1] == 'absent':
                 fallback = transport.startswith('auto-')
                 if fallback:
                     fixture.git('config', 'uploadpack.allowFilter', 'true')
+                    cleanup.callback(fixture.git, 'config', 'uploadpack.allowFilter', 'false')
                     env['GIT_ON_TEST_NFS_MOUNT_ERROR'] = '1'
+                    if transport == 'auto-https':
+                        revision = 'main'
+                        moved_tree = fixture.git('mktree', data=f'100644 blob {fixture.other}\tmoved\n'.encode())
+                        moved = fixture.git('commit-tree', moved_tree, '-p', fixture.commit, data=b'moved main\n')
+                        advance_after_selection = moved
+                        cleanup.callback(fixture.git, 'update-ref', 'refs/heads/main', fixture.commit)
                     if transport == 'auto-ssh':
                         starts = fixture.root / 'auto-ssh-channel-starts'
                         fixture.force_upload_pack(
@@ -735,7 +838,6 @@ elif sys.argv[1] == 'absent':
                             f'exec git upload-pack {shlex.quote(str(fixture.repo))}\n'
                         )
                 elif auth_quit or transport in ('authenticated', 'scoped-auth', 'path-auth', 'auth-rejected'):
-                    fixture.git('config', 'uploadpack.allowFilter', 'false')
                     token = base64.b64encode(b'fixture:example-password').decode()
                     proxy.authorization = 'Basic ' + token
                     proxy.authenticate_wants_only = True
@@ -756,8 +858,7 @@ elif sys.argv[1] == 'absent':
                             f'grep -Fxq {challenge} || return 1; '
                             f'{quit_once}'
                             f'echo username=fixture; echo password={password}; '
-                            f'elif test "$1" = erase && grep -Fxq {REJECTION_INPUT}; '
-                            f'then echo challenge >>{shlex.quote(str(operations))}; fi; }}; f'
+                            'fi; }; f'
                         ),
                     )
                     if auth_quit or transport == 'auth-rejected':
@@ -766,10 +867,10 @@ elif sys.argv[1] == 'absent':
                         env.update(GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_1='credential.useHttpPath',
                                    GIT_CONFIG_VALUE_1='true')
                 elif transport == 'proxy-ca':
-                    proxy.authorization = None
                     env['GIT_PROXY_SSL_CAINFO'] = fixture.env['GIT_SSL_CAINFO']
                 elif transport == 'netrc':
                     proxy.authorization = 'Basic ' + base64.b64encode(b'fixture:netrc-fixture').decode()
+                    proxy.authenticate_wants_only = True
                     home = Path(runtime) / 'home'
                     home.mkdir()
                     netrc = home / '.netrc'
@@ -791,16 +892,21 @@ elif sys.argv[1] == 'absent':
                                GIT_CONFIG_VALUE_0=pack_config[transport])
                 elif transport == 'session-id':
                     fixture.git('config', 'transfer.advertiseSID', 'true')
+                    cleanup.callback(fixture.git, 'config', '--unset', 'transfer.advertiseSID')
                     env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='transfer.advertiseSID',
                                GIT_CONFIG_VALUE_0='true')
                 elif transport == 'ambiguous-https':
-                    tag = fixture.git('commit-tree', fixture.tree, data=b'competing tag\n')
+                    tag_tree = fixture.git(
+                        'mktree', data=entries + f'100644 blob {fixture.other}\ttag-only\n'.encode()
+                    )
+                    tag = fixture.git('commit-tree', tag_tree, data=b'competing tag\n')
                     fixture.git('update-ref', 'refs/tags/main', tag)
                     cleanup.callback(fixture.git, 'update-ref', '-d', 'refs/tags/main', tag)
                 elif transport == 'ref-in-want':
-                    proxy.authorization = None
                     fixture.git('config', 'uploadpack.allowRefInWant', 'true')
+                    cleanup.callback(fixture.git, 'config', '--unset', 'uploadpack.allowRefInWant')
                     fixture.denied_oids.add(fixture.commit)
+                    cleanup.callback(fixture.denied_oids.remove, fixture.commit)
                 if transport in pack_config or transport in (
                         'https', 'ambiguous-https', 'ref-in-want', 'netrc', 'user-agent'):
                     before_oracle = len(proxy.authorized_fetch_packets)
@@ -819,15 +925,14 @@ elif sys.argv[1] == 'absent':
                         self.assertEqual(native.returncode, 0, native.stderr)
                         selected = fixture.git('--git-dir', str(oracle), 'rev-parse', 'FETCH_HEAD')
                         self.assertEqual(selected, tag)
+                        selected_tree = fixture.git('--git-dir', str(oracle), 'rev-parse', 'FETCH_HEAD^{tree}')
+                        self.assertNotEqual(selected_tree, fixture.tree)
                     elif native.returncode:
                         native_error = native.stderr.splitlines()[-1]
                         native_fetches = len(proxy.authorized_fetch_packets) - before_oracle
                 fetches_before = len(proxy.authorized_fetch_packets)
                 upstream_before = len(fixture.requests)
-                if transport == 'authenticated':
-                    repository_usage = 'credential-context'
-                else:
-                    repository_usage = 'native' if transport in native_cases else 'absent'
+                repository_usage = 'native' if transport in native_cases else 'absent'
                 run = subprocess.run(
                     [OPTIONS.binary, source, revision,
                      '--backend=' + ('auto' if fallback else 'copy'), '--write-policy=all',
@@ -840,11 +945,12 @@ elif sys.argv[1] == 'absent':
                     self.assertIn(native_error, run.stderr)
                     self.assertEqual(len(proxy.authorized_fetch_packets) - fetches_before, native_fetches)
                     if transport == 'auth-rejected':
-                        self.assertEqual(operations.read_text().splitlines(), ['get', 'erase', 'challenge'])
+                        self.assertEqual(operations.read_text().splitlines(), ['get'])
                     elif auth_quit:
                         self.assertEqual(operations.read_text().splitlines(), ['get'])
                     continue
                 self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout.strip(), selected_tree.encode())
                 metrics.seek(0)
                 report = json.load(metrics)
                 if transport == 'session-id':
@@ -880,14 +986,17 @@ elif sys.argv[1] == 'absent':
                 if transport == 'auto-https':
                     requests = proxy.authorized_fetch_packets[fetches_before:]
                     self.assertEqual(sum(b'filter tree:0\n' in packet for packet in requests), 2)
-                    self.assertEqual(sum(b'filter ' not in packet for packet in requests), 1)
+                    [full_copy] = [packet for packet in requests if b'filter ' not in packet]
+                    self.assertEqual(fixture.git('rev-parse', 'main'), moved)
+                    self.assertIn(f'want {fixture.commit}\n'.encode(), full_copy)
                 if transport == 'auto-ssh':
                     self.assertEqual(starts.read_text().splitlines(), ['start'])
                 if transport in ('authenticated', 'scoped-auth', 'path-auth'):
-                    self.assertEqual(operations.read_text().splitlines(), ['get', 'store'])
+                    self.assertEqual(operations.read_text().splitlines(), ['get'])
                 if transport == 'netrc':
                     self.assertFalse(operations.exists())
-        self.assertEqual(proxy.unauthenticated_wants, {fixture.commit.encode()})
+        if 'authenticated' in transports:
+            self.assertEqual(proxy.unauthenticated_wants, {fixture.commit.encode()})
 
     def test_eager_https_shows_actual_pack_progress(self):
         fixture = Fixture()
@@ -1000,10 +1109,7 @@ elif sys.argv[1] == 'absent':
             GIT_CONFIG_KEY_0='credential.helper',
             GIT_CONFIG_VALUE_0=(
                 f'!f() {{ echo "$1" >>{shlex.quote(str(operations))}; '
-                f'if test "$1" = erase && grep -Fxq {REJECTION_INPUT}; then '
-                f'echo challenge >>{shlex.quote(str(operations))}; fi; '
-                "if git rev-parse --absolute-git-dir >/dev/null 2>&1; "
-                "then echo username=fixture; else echo username=other-fixture; fi; "
+                "echo username=fixture; "
                 "echo password=example-password; }; f"
             ),
         )
@@ -1014,8 +1120,7 @@ elif sys.argv[1] == 'absent':
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
-objects = Path.cwd().parent / 'remote-repository' / 'objects'
-assert objects.is_dir() and not any(path.is_file() for path in objects.rglob('*'))
+assert not (Path.cwd().parent / 'remote-repository').exists()
 with ThreadPoolExecutor(1) as pool:
     held = pool.submit(Path('other').read_bytes)
     while not Path({str(gate)!r}).exists():
@@ -1075,7 +1180,7 @@ with ThreadPoolExecutor(1) as pool:
             Counter([fixture.commit, fixture.tree, fixture.subtree, fixture.blob, fixture.other]),
         )
         with self.subTest(credentials='approved'):
-            self.assertEqual(operations.read_text().splitlines(), ['get', 'store'])
+            self.assertEqual(operations.read_text().splitlines(), ['get'])
 
         operations.write_text('')
         env = dict(fixture.env, GIT_CONFIG_VALUE_0=fixture.env['GIT_CONFIG_VALUE_0'].replace(
@@ -1090,7 +1195,7 @@ with ThreadPoolExecutor(1) as pool:
             self.assertEqual(denied.returncode, 125, denied.stderr)
             self.assertEqual(denied.stdout, b'')
             self.assertIn(b'Git HTTPS authentication failed', denied.stderr)
-            self.assertEqual(operations.read_text().splitlines(), ['get', 'erase', 'challenge'])
+            self.assertEqual(operations.read_text().splitlines(), ['get'])
 
         for key, wants_only in ((f'credential.{url}.helper', True), ('credential.helper', False)):
             with self.subTest(credential=key, wants_only=wants_only):
@@ -1104,37 +1209,9 @@ with ThreadPoolExecutor(1) as pool:
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, b'expected\n')
-                self.assertIn('store', operations.read_text().splitlines())
+                self.assertEqual(set(operations.read_text().splitlines()), {'get'})
                 if not wants_only:
                     self.assertFalse(proxy.unauthenticated_wants)
-
-        proxy.authenticate_wants_only = True
-        hook_dir = fixture.root / 'branch-hooks'
-        hook_dir.mkdir()
-        hook = hook_dir / 'reference-transaction'
-        hook.write_text(
-            '#!/bin/sh\n'
-            'if test "$1" = prepared && grep -q " refs/remotes/origin/main$"; then\n'
-            '  echo "fixture refused tracking ref" >&2\n'
-            '  exit 1\n'
-            'fi\n'
-        )
-        hook.chmod(0o700)
-        env = dict(
-            fixture.env, GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_0=f'credential.{url}.helper',
-            GIT_CONFIG_KEY_1='remote.origin.url', GIT_CONFIG_VALUE_1=url,
-            GIT_CONFIG_KEY_2='remote.origin.fetch',
-            GIT_CONFIG_VALUE_2='+refs/heads/*:refs/remotes/origin/*',
-            GIT_CONFIG_KEY_3='core.hooksPath', GIT_CONFIG_VALUE_3=str(hook_dir),
-        )
-        result = subprocess.run(
-            [OPTIONS.binary, 'origin', 'main', backend_flag, '--write-policy=none',
-             '--', 'echo', 'command-ran'],
-            cwd=fixture.cwd, env=env, capture_output=True, timeout=15,
-        )
-        self.assertEqual(result.returncode, 125, result)
-        self.assertEqual(result.stdout, b'')
-        self.assertIn(b'fixture refused tracking ref', result.stderr)
 
 
 if __name__ == '__main__':

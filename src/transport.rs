@@ -1,9 +1,11 @@
 //! Invocation-owned native transports. Protocol v2 permits branch selection
 //! and successive exact-object requests on the same channel.
+use crate::service_memory::CaptureFile;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
 use std::{
-    fs::{self, File},
+    collections::VecDeque,
+    fs,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
@@ -19,6 +21,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    thread::JoinHandle,
 };
 
 fn invalid(message: &str) -> anyhow::Error {
@@ -46,18 +49,38 @@ pub(crate) fn child_exited(pid: u32) -> io::Result<bool> {
             libc::P_PID,
             pid,
             &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
         )
     };
-    if result == 0 {
-        Ok(crate::platform::siginfo_pid(&info) != 0)
-    } else {
+    if result != 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::Interrupted {
-            Ok(false)
-        } else {
-            Err(error)
+            return Ok(false);
         }
+        return Err(error);
+    }
+    Ok(crate::platform::siginfo_pid(&info) != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn observe_exit_after_darwin_group_denial(pid: u32) -> bool {
+    use std::time::{Duration, Instant};
+
+    // Darwin can return EPERM while the leader is exiting, just before
+    // waitid can observe it. A genuine denial must not block shutdown.
+    let wakeup = crate::git::ChildExitWakeup::new(pid);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match child_exited(pid) {
+            Ok(false) => (),
+            Ok(true) => return true,
+            Err(_) => return false,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(1) {
+            return false;
+        }
+        wakeup.wait(remaining.min(Duration::from_millis(10)), None, [None; 2]);
     }
 }
 
@@ -160,36 +183,76 @@ impl Owner {
     }
 
     fn stop_with_status(&self) -> Result<Option<ExitStatus>> {
-        let mut child = self
+        let mut owned = self
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("transport owner poisoned"))?;
-        let Some(child) = child.take() else {
+        let Some(child) = owned.as_ref() else {
             return Ok(None);
         };
         let exited = child_exited(child.id()).unwrap_or(false);
-        let status = Self::kill_and_reap(child, exited)?;
+        let (status, exited) = Self::kill_and_reap(&mut owned, exited)?;
         // SIGKILL can be our own cancellation. Any other terminal signal or
         // status belongs to the process, including an already observed SIGKILL.
         Ok((exited || status.signal() != Some(libc::SIGKILL)).then_some(status))
     }
 
-    fn kill_and_reap(mut child: Child, exited: bool) -> Result<std::process::ExitStatus> {
-        let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-        let error = (killed != 0).then(io::Error::last_os_error);
-        let exited = exited
-            || (error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::EPERM)
-                && child_exited(child.id()).unwrap_or(false));
-        let status = child.wait().context("wait for owned demand transport")?;
-        if let Some(error) = error {
+    fn stop_group(pid: u32) -> Option<io::Error> {
+        let killed = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        (killed != 0).then(io::Error::last_os_error)
+    }
+
+    fn kill_and_reap(owned: &mut Option<Child>, exited: bool) -> Result<(ExitStatus, bool)> {
+        let error = Self::stop_group(owned.as_ref().expect("owned transport").id());
+        Self::reap_after_group_signal(owned, exited, error)
+    }
+
+    fn reap_after_group_signal(
+        owned: &mut Option<Child>,
+        mut exited: bool,
+        error: Option<io::Error>,
+    ) -> Result<(ExitStatus, bool)> {
+        let pid = owned.as_ref().expect("owned transport").id();
+        let error =
+            if !exited && error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::EPERM) {
+                #[cfg(target_os = "macos")]
+                {
+                    exited = observe_exit_after_darwin_group_denial(pid);
+                    if exited {
+                        // The unreaped leader still reserves the group ID.
+                        Self::stop_group(pid)
+                    } else {
+                        error
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    exited = child_exited(pid).unwrap_or(false);
+                    error
+                }
+            } else {
+                error
+            };
+        let error = error.filter(|error| {
             let errno = error.raw_os_error();
-            // Darwin can return EPERM for a group containing only its
-            // unreaped leader. A live same-user member receives the signal.
-            if errno != Some(libc::ESRCH) && !(exited && errno == Some(libc::EPERM)) {
+            // A group containing only its unreaped leader can return EPERM.
+            errno != Some(libc::ESRCH) && !(exited && errno == Some(libc::EPERM))
+        });
+        if !exited {
+            if let Some(error) = error {
+                // Leave the child owned so Drop can retry shutdown.
                 return Err(error).context("stop owned demand transport group");
             }
         }
-        Ok(status)
+        let status = owned
+            .take()
+            .expect("owned transport")
+            .wait()
+            .context("wait for owned demand transport")?;
+        if let Some(error) = error {
+            return Err(error).context("stop owned demand transport group");
+        }
+        Ok((status, exited))
     }
 
     fn finish(
@@ -227,7 +290,7 @@ impl Owner {
             if exited {
                 // Bytes written by the leader are now drained or rejected.
                 // Its PID still reserves the group while we stop descendants.
-                return Self::kill_and_reap(owned.take().expect("owned transport"), true);
+                return Self::kill_and_reap(&mut owned, true).map(|(status, _)| status);
             }
             wakeup.wait(std::time::Duration::from_millis(10), None, [fd, None]);
         }
@@ -313,6 +376,22 @@ impl BatchProcess {
     pub(crate) fn stop(&self) -> Result<()> {
         self.owner.stop()
     }
+
+    pub(crate) fn finish(&self) -> Result<()> {
+        ensure!(
+            self.output.buffer().is_empty(),
+            "unexpected data after the last Git object"
+        );
+        shutdown_request(&self.input.0)?;
+        let status = self.owner.finish(&self.output.get_ref().socket, true, || {
+            Ok(check_transfer(&self.input.1)?)
+        })?;
+        ensure!(
+            status.success(),
+            "native Git object reader exited with {status}"
+        );
+        Ok(())
+    }
 }
 
 pub(crate) struct SshSocket {
@@ -377,7 +456,13 @@ impl Connection {
     }
 
     fn open(&self, stop: Stop, additional: bool) -> Result<Option<Session>> {
-        Session::connect_with_stop(self.command(additional)?, self.helper, stop)
+        let command = self.command(additional)?;
+        let starting = if self.helper || self.is_ssh() {
+            StartingSession::spawn(command, self.helper, stop)?
+        } else {
+            StartingSession::upload_pack(command, stop)?
+        };
+        starting.negotiate()
     }
 
     fn command(&self, additional: bool) -> Result<Command> {
@@ -410,9 +495,157 @@ pub(crate) struct Session {
     owner: Owner,
     input: Output,
     output: BufReader<Input>,
-    errors: File,
+    errors: Diagnostics,
     stateless: bool,
     completed_fetch: AtomicBool,
+}
+
+const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+
+enum Diagnostics {
+    File(CaptureFile),
+    Channel(DiagnosticChannel),
+}
+
+impl Diagnostics {
+    fn file() -> Result<(Self, Stdio)> {
+        Self::capture(CaptureFile::new()?)
+    }
+
+    fn capture(errors: CaptureFile) -> Result<(Self, Stdio)> {
+        let writer = errors.file.try_clone()?.into();
+        Ok((Self::File(errors), writer))
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(capture) => {
+                capture.file.set_len(0)?;
+                capture.file.rewind()
+            }
+            Self::Channel(channel) => {
+                let mut buffer = channel.buffer.lock().unwrap();
+                buffer.receive_pending()?;
+                buffer.bytes.clear();
+                Ok(())
+            }
+        }
+    }
+
+    fn tail(&mut self) -> Vec<u8> {
+        match self {
+            Self::File(capture) => {
+                let mut file = &capture.file;
+                let mut bytes = Vec::new();
+                let length = file.metadata().map_or(0, |metadata| metadata.len());
+                let _ = file.seek(io::SeekFrom::Start(
+                    length.saturating_sub(DIAGNOSTIC_LIMIT as u64),
+                ));
+                let _ = file.take(DIAGNOSTIC_LIMIT as u64).read_to_end(&mut bytes);
+                bytes
+            }
+            Self::Channel(channel) => {
+                let mut buffer = channel.buffer.lock().unwrap();
+                let _ = buffer.receive_pending();
+                buffer.bytes.iter().copied().collect()
+            }
+        }
+    }
+}
+
+struct DiagnosticChannel {
+    buffer: Arc<Mutex<DiagnosticBuffer>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct DiagnosticBuffer {
+    reader: UnixStream,
+    bytes: VecDeque<u8>,
+}
+
+impl DiagnosticChannel {
+    fn open() -> io::Result<(Diagnostics, Stdio)> {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        let fd = reader.as_raw_fd();
+        let buffer = Arc::new(Mutex::new(DiagnosticBuffer {
+            reader,
+            bytes: VecDeque::new(),
+        }));
+        let shared = buffer.clone();
+        let worker = std::thread::Builder::new()
+            .name("upload-pack-stderr".into())
+            .spawn(move || {
+                let mut poll = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    if unsafe { libc::poll(&mut poll, 1, -1) } < 0
+                        && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                    if !matches!(shared.lock().unwrap().receive(DIAGNOSTIC_LIMIT), Ok(true)) {
+                        break;
+                    }
+                }
+            })?;
+        Ok((
+            Diagnostics::Channel(Self {
+                buffer,
+                worker: Some(worker),
+            }),
+            Stdio::from(OwnedFd::from(writer)),
+        ))
+    }
+}
+
+impl Drop for DiagnosticChannel {
+    fn drop(&mut self) {
+        let _ = self
+            .buffer
+            .lock()
+            .unwrap()
+            .reader
+            .shutdown(std::net::Shutdown::Read);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl DiagnosticBuffer {
+    fn receive_pending(&mut self) -> io::Result<()> {
+        let mut pending: libc::c_int = 0;
+        if unsafe { libc::ioctl(self.reader.as_raw_fd(), libc::FIONREAD, &mut pending) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.receive(pending as usize)?;
+        Ok(())
+    }
+
+    // Keep only the latest diagnostics, draining independently of the
+    // protocol data so a verbose child cannot block the requested transfer.
+    fn receive(&mut self, mut remaining: usize) -> io::Result<bool> {
+        let mut chunk = [0; 8192];
+        while remaining != 0 {
+            let limit = chunk.len().min(remaining);
+            let count = match self.reader.read(&mut chunk[..limit]) {
+                Ok(0) => return Ok(false),
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            let discard = (self.bytes.len() + count).saturating_sub(DIAGNOSTIC_LIMIT);
+            self.bytes.drain(..discard);
+            self.bytes.extend(&chunk[..count]);
+            remaining -= count;
+        }
+        Ok(true)
+    }
 }
 
 pub(crate) struct StartingSession(Session);
@@ -445,10 +678,24 @@ pub(crate) enum FetchMode {
 }
 
 impl StartingSession {
-    pub(crate) fn spawn(mut command: Command, helper: bool, stop: Stop) -> Result<Self> {
+    pub(crate) fn spawn(command: Command, helper: bool, stop: Stop) -> Result<Self> {
         check_transfer(&stop)?;
-        let errors = crate::git::capture_file()?;
-        command.stderr(errors.try_clone()?);
+        Self::start(command, helper, stop, Diagnostics::file()?)
+    }
+
+    pub(crate) fn upload_pack(command: Command, stop: Stop) -> Result<Self> {
+        check_transfer(&stop)?;
+        Self::start(command, false, stop, DiagnosticChannel::open()?)
+    }
+
+    fn start(
+        mut command: Command,
+        helper: bool,
+        stop: Stop,
+        (errors, writer): (Diagnostics, Stdio),
+    ) -> Result<Self> {
+        check_transfer(&stop)?;
+        command.stderr(writer);
         let (child, input, output) =
             spawn_piped(command, stop).context("start invocation demand transport")?;
         Ok(Self(Session {
@@ -569,14 +816,7 @@ impl Session {
     /// before any fetch. Errors after a fetch request must never retry it.
     #[cfg(test)]
     pub(crate) fn connect(command: Command, helper: bool) -> Result<Option<Self>> {
-        Self::connect_with_stop(command, helper, None)
-    }
-    pub(crate) fn connect_with_stop(
-        command: Command,
-        helper: bool,
-        stop: Stop,
-    ) -> Result<Option<Self>> {
-        StartingSession::spawn(command, helper, stop)?.negotiate()
+        StartingSession::start(command, helper, None, DiagnosticChannel::open()?)?.negotiate()
     }
     pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         self.input.1 = Some(stop.clone());
@@ -674,8 +914,7 @@ impl Session {
             if !self.stateless && self.output.get_ref().leader.is_none() {
                 self.observe_leader()?;
             }
-            self.errors.set_len(0)?;
-            self.errors.rewind()?;
+            self.errors.clear()?;
             self.input.write_all(&fetch_request(oids, mode)?)?;
             if last_request {
                 // This is the final request. Let the peer close its channel
@@ -839,15 +1078,7 @@ impl Session {
         self.stderr_tail()
     }
     fn stderr_tail(&mut self) -> String {
-        let mut bytes = Vec::new();
-        let length = self.errors.metadata().map_or(0, |metadata| metadata.len());
-        let _ = self
-            .errors
-            .seek(io::SeekFrom::Start(length.saturating_sub(65536)));
-        let _ = Read::by_ref(&mut self.errors)
-            .take(65536)
-            .read_to_end(&mut bytes);
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&self.errors.tail()).into_owned()
     }
 }
 
@@ -1138,6 +1369,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn batch_checks_the_exit_after_its_last_response() -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "read request; printf 'response\\n'; /bin/cat >/dev/null; exit 7",
+        ]);
+        let mut decoder = BatchProcess::spawn(command)?;
+        let response = decoder.exchange(b"request\n", |input| {
+            let mut response = String::new();
+            input.read_line(&mut response)?;
+            Ok(response)
+        })?;
+        assert_eq!(response, "response\n");
+        let error = decoder.finish().unwrap_err();
+        assert!(error.to_string().contains("exit status: 7"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn destination_failure_stops_a_batch_reader_before_the_rest_of_the_object() -> Result<()> {
+        use std::time::Duration;
+        let directory = tempfile::tempdir()?;
+        let release = directory.path().join("continue");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s blob 8\\nx' \"$2\"; while [ ! -f \"$1\" ]; do sleep 0.02; done",
+            "batch-reader",
+        ]);
+        let oid = git2::Oid::zero();
+        command.arg(&release).arg(oid.to_string());
+        let mut decoder = BatchProcess::spawn(command)?;
+        let (failed, failure) = std::sync::mpsc::channel();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(move || {
+                let result = decoder
+                    .exchange(format!("{oid}\n").as_bytes(), |input| {
+                        crate::git::receive_batch_object(
+                            oid,
+                            crate::git::BatchRead::Materialize,
+                            input,
+                            |_, _, data| {
+                                let mut prefix = [0];
+                                data.read_exact(&mut prefix)?;
+                                assert_eq!(prefix, *b"x");
+                                failed.send(())?;
+                                Err::<(), _>(io::Error::from_raw_os_error(libc::ENOSPC).into())
+                            },
+                        )
+                    })
+                    .and_then(std::convert::identity);
+                let _ = done.send(result);
+            });
+            let result = failure
+                .recv_timeout(Duration::from_secs(5))
+                .and_then(|()| outcome.recv_timeout(Duration::from_secs(5)));
+            fs::File::create(&release)?;
+            let error = result
+                .context("destination failure waited for the remaining object data")?
+                .expect_err("destination failure must reach the materializer");
+            assert_eq!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error),
+                Some(libc::ENOSPC),
+                "{error:#}"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_stop_preserves_exit_when_darwin_reports_eperm_before_waitid() -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 17"]);
+        let (child, _request, _reply) = spawn_piped(command, None)?;
+        let (status, exited) = Owner::reap_after_group_signal(
+            &mut Some(child),
+            false,
+            Some(io::Error::from_raw_os_error(libc::EPERM)),
+        )?;
+        assert_eq!(status.code(), Some(17));
+        assert!(exited);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_stop_returns_darwin_eperm_while_the_leader_is_alive() -> Result<()> {
+        let (child, request, _reply) = spawn_piped(Command::new("/bin/cat"), None)?;
+        let mut owned = Some(child);
+        let (release, hold) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // Bound the red test too. The child otherwise waits for EOF.
+                let _ = hold.recv_timeout(std::time::Duration::from_secs(2));
+                drop(request);
+            });
+            let result = Owner::reap_after_group_signal(
+                &mut owned,
+                false,
+                Some(io::Error::from_raw_os_error(libc::EPERM)),
+            );
+            let _ = release.send(());
+            result
+        });
+        let mut child = owned.context("signal denial discarded the live child")?;
+        assert!(child.wait()?.success());
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EPERM)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_expired_channel_leaves_copy_free_to_open_a_new_one() -> Result<()> {
         let mut command = Command::new("/bin/sh");
         command.args([
@@ -1204,7 +1556,7 @@ mod tests {
                 leader: None,
                 close_after_command: None,
             }),
-            errors: tempfile::tempfile().unwrap(),
+            errors: Diagnostics::File(CaptureFile::fixture(tempfile::tempfile().unwrap())),
             stateless: false,
             completed_fetch: AtomicBool::new(false),
         };
@@ -1458,32 +1810,24 @@ mod tests {
     }
 
     #[test]
-    fn native_error_tail_has_bounded_memory() {
-        let (input, _input_peer) = UnixStream::pair().unwrap();
-        let (output, _output_peer) = UnixStream::pair().unwrap();
-        let mut errors = tempfile::tempfile().unwrap();
-        errors.write_all(&vec![b'x'; 256 * 1024]).unwrap();
-        errors.write_all(b"actual failure").unwrap();
-        let mut session = Session {
-            owner: Owner(Mutex::new(None)),
-            input: Output(Arc::new(input), None),
-            output: BufReader::new(Input {
-                socket: output,
-                stop: None,
-                leader: None,
-                close_after_command: None,
-            }),
-            errors,
-            stateless: false,
-            completed_fetch: AtomicBool::new(false),
-        };
-        let message = session.error_text();
-        assert!(
-            message.len() <= 65536,
-            "unbounded diagnostic retained {} bytes",
-            message.len()
-        );
-        assert!(message.ends_with("actual failure"));
+    fn native_error_tail_has_bounded_memory() -> Result<()> {
+        let capture = Diagnostics::capture(CaptureFile::fixture(tempfile::tempfile()?))?;
+        for (mut diagnostics, writer) in [capture, DiagnosticChannel::open()?] {
+            let status = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "dd if=/dev/zero bs=8192 count=64 >&2 2>/dev/null; printf 'actual failure' >&2",
+                ])
+                .stderr(writer)
+                .status()?;
+            assert!(status.success());
+            let message = diagnostics.tail();
+            assert_eq!(message.len(), DIAGNOSTIC_LIMIT);
+            assert!(message.ends_with(b"actual failure"));
+            diagnostics.clear()?;
+            assert!(diagnostics.tail().is_empty());
+        }
+        Ok(())
     }
 }
 #[test]

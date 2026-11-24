@@ -138,11 +138,10 @@ Submodules fail when their metadata is accessed; Git LFS pointer blobs fail when
 contents are read. Unused unsupported entries do not prevent starting a command or
 reading unrelated files. Directory listings can show submodule names. They are never
 silently treated as usable checked-out content. Snapshot reads use committed bytes
-without checkout filters or a synthetic `.git` working copy. Native Git fetch
-uses inherited Git configuration and may invoke its configured hooks while
-updating refs in the private repository. Like configured credential/transport
-helpers and the executed command, those programs run with the caller's identity
-and can access host paths outside the mount. Git SHA-256
+without checkout filters or a synthetic `.git` working copy. Native Git uses
+inherited configuration subject to the [service-state contract](specification.md#service-state).
+Hooks and the local filesystem monitor are disabled during preparation.
+Credential lookup leaves the existing store intact. Git SHA-256
 repositories are not currently supported by the bundled libgit2.
 
 ## Standard streams and temporary writes
@@ -163,10 +162,25 @@ its own private directory under `TMPDIR/git-on`. With no `TMPDIR`, it uses the
 system temporary directory. Git-on uses ordinary filesystem-backed storage
 without a separate quota. On a shared temporary filesystem, a run uses a
 hidden private group if another unprivileged user owns the usual name.
-If the system's temporary location is
-itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesystem
-capacity and operating-system resource limits still apply. Temporary directories are
-private to the current user.
+This location also holds blobs evicted from the in-memory LRU. Select
+`TMPDIR` according to the space you need for those blobs, the writable layer,
+and the visible checkout in `copy` mode.
+
+### Temporary storage
+
+Native Git packs, indexes, verification scratch and regular diagnostic
+files use separate memory-backed storage. On Linux, Git-on selects the writable
+tmpfs with the most available space among `/dev/shm` and `XDG_RUNTIME_DIR`.
+Native fetch needs room there for its pack and indexes.
+On macOS it creates an invocation-owned, case-sensitive RAM volume when a
+tool needs regular files. Git-on mounts the verified device directly where
+macOS permits user-owned HFS mounts. The sparse volume has the host's RAM as its
+logical capacity and allocates backing memory as blocks are written. Set
+`GIT_ON_SERVICE_RAM_MIB` to choose a smaller capacity, or set
+`GIT_ON_SERVICE_TMPDIR` to use an existing writable tmpfs on either platform.
+The memory filesystem capacity applies to tools that need it. Git-on reports
+an error if required memory storage is unavailable. The operating system can
+page memory to swap according to its own policy.
 
 git-on unmounts and removes temporary writes after the command finishes.
 `--keep` and `-k` were removed in 1.3.0. Use explicit external paths for required
@@ -200,9 +214,9 @@ git on --cleanup /path/to/stale-temporary-directory
 ```
 
 Pass the individual run directory. Cleanup also accepts run directories
-from older versions. It refuses an active locked run, unmounts only a
-matching git-on filesystem, and checks the target of any pin recorded by an
-older release before releasing it. A busy stale mount requires stopping
+from older versions. It refuses an active locked run and unmounts only a
+matching git-on filesystem. Pins left by older versions remain in the source
+repository. A busy stale mount requires stopping
 processes using it first.
 Cleanup does not kill processes by stale PID.
 

@@ -14,16 +14,19 @@
   shared directory after the last run cleans up. Derive stale mount identity
   from the run directory and keep native remote snapshots without Git pin refs.
   Use the private group when a regular file already occupies `TMPDIR/git-on`.
-  Reclaim run files if the filesystem runs out of space while parking the
-  cleanup marker.
+  Use a writable ownership marker for run and recovery locks on NFS.
+  New runs without a persistent directory identity require manual recovery.
+  Deferred NFS cleanup preserves the command's exit status. Reclaim run
+  files if space runs out while parking a legacy cleanup marker.
 - Make verified blobs readable while their Git pack is still arriving in
   streaming HTTPS and SSH sessions.
 - Decode full objects and deltas from reusable HTTPS and SSH sessions in
   memory from the first fetch. Stream native decoder requests and borrow cached
   blob ranges when serving reads.
 - Keep direct reusable HTTPS and SSH startup metadata in verified in-memory
-  buffers. Native fetches and signature verification use a temporary Git
-  repository. Scan the native ref advertisement trace with bounded memory.
+  buffers. Keep native Git packs, indexes, and signature verification scratch
+  on a separate memory filesystem. Scan the native ref advertisement trace
+  with bounded memory.
 - Stream the first filtered fetch from compatible local paths and `file://`
   URLs without staging a pack or index.
 - Decode the shallow snapshot pack in memory for compatible HTTPS, SSH, and
@@ -45,6 +48,9 @@
   Reuse a native Git object reader for alternate stores that need it.
   If external Git maintenance removes an unread object, the operation that
   needs it reports a source read error.
+- Disable Git hooks and filesystem monitors during preparation. Keep stored
+  HTTPS credentials and legacy source refs unchanged. A configured remote
+  using the default branch mapping can stream without a temporary Git repository.
 - Create a private file on the first content change, using filesystem cloning
   when available. Private files use ordinary I/O, including Linux FUSE
   passthrough on eligible opens. Reads of immutable cached data keep their

@@ -121,8 +121,6 @@ impl Configuration {
 pub(crate) struct Credentials {
     response: Vec<u8>,
     authorization: Authorization,
-    verdict: Option<CredentialVerdict>,
-    approved: bool,
     continuing: bool,
 }
 
@@ -137,18 +135,9 @@ enum Authorization {
     },
 }
 
-type CredentialVerdict = Box<dyn Fn(&[u8], bool, &[Vec<u8>]) -> Result<()> + Send>;
-
 impl Credentials {
     pub(crate) fn continues_encoded_authentication(&self) -> bool {
         self.continuing && matches!(self.authorization, Authorization::Encoded { .. })
-    }
-
-    pub(crate) fn on_verdict(
-        &mut self,
-        handler: impl Fn(&[u8], bool, &[Vec<u8>]) -> Result<()> + Send + 'static,
-    ) {
-        self.verdict = Some(Box::new(handler));
     }
 }
 
@@ -174,6 +163,7 @@ pub(crate) fn credentials(
     url: &str,
     challenges: &[Vec<u8>],
     previous: Option<&Credentials>,
+    scratch: &mut Option<crate::service_memory::Directory>,
 ) -> Result<Option<Credentials>> {
     command
         .args(["-c", "credential.interactive=false", "credential", "fill"])
@@ -206,6 +196,11 @@ pub(crate) fn credentials(
         return Ok(None);
     }
     request.push(b'\n');
+    let scratch = match scratch {
+        Some(directory) => directory,
+        None => scratch.insert(crate::service_memory::Directory::new("credential-")?),
+    };
+    command.env("TMPDIR", scratch.path());
     let (output, mut values) =
         crate::git::run_with_output(command, Some(&mut request.as_slice()), |stream| {
             let mut values = Vec::new();
@@ -251,7 +246,7 @@ pub(crate) fn credentials(
         } else if line == b"continue=1" {
             continuing = true;
         } else if line.starts_with(b"path=") {
-            // A fresh verdict must see the same host-only context.
+            // The reusable client uses host-scoped credentials.
             return Ok(None);
         }
     }
@@ -301,8 +296,6 @@ pub(crate) fn credentials(
     Ok(Some(Credentials {
         response: values,
         authorization,
-        verdict: None,
-        approved: false,
         continuing,
     }))
 }
@@ -396,37 +389,6 @@ fn auth_token_len(bytes: &[u8]) -> usize {
         .iter()
         .position(|byte| !byte.is_ascii_alphanumeric() && !b"!#$%&'*+-.^_\x60|~".contains(byte))
         .unwrap_or(bytes.len())
-}
-
-pub(crate) fn report_credentials(
-    mut command: Command,
-    response: &[u8],
-    accepted: bool,
-    challenges: &[Vec<u8>],
-) -> Result<()> {
-    use std::io::Write;
-    command.args(["credential", if accepted { "approve" } else { "reject" }]);
-    // Git's HTTP transport attaches the most recent challenge when
-    // notifying helpers. Discard anything echoed by fill before replay.
-    let response = response
-        .strip_suffix(b"\n\n")
-        .map_or(response, |_| &response[..response.len() - 1]);
-    let mut suffix = Vec::new();
-    if !response.ends_with(b"\n") {
-        suffix.push(b'\n');
-    }
-    append_authentication_challenges(&mut suffix, challenges);
-    suffix.push(b'\n');
-    let mut input = response.chain(suffix.as_slice());
-    let (result, _) = crate::git::run_with_output(command, Some(&mut input), |output| {
-        io::copy(output, &mut io::sink())?;
-        Ok(())
-    })?;
-    if !result.stderr.is_empty() {
-        let _drawing = crate::terminal_ui::native_terminal_lease(true);
-        io::stderr().write_all(&result.stderr)?;
-    }
-    Ok(())
 }
 
 // Bound queued wire bytes per receiving stream independently of the number
@@ -960,35 +922,21 @@ impl Client {
             self.apply_request_headers(&mut response, post)?;
             response = self.perform(response)?;
         }
-        self.report_authentication(&response)?;
+        self.check_authentication(&response)?;
         Ok(response)
     }
 
-    fn report_authentication(&mut self, response: &Easy2<Response>) -> Result<()> {
-        if response.get_ref().authentication != Some(self.auth_generation) {
+    fn check_authentication(&self, response: &Easy2<Response>) -> Result<()> {
+        if response.get_ref().authentication != Some(self.auth_generation)
+            || response.response_code()? != 401
+        {
             return Ok(());
         }
-        let Some(auth) = self.auth.as_mut() else {
-            return Ok(());
-        };
-        let Some(verdict) = auth.verdict.as_ref() else {
-            return Ok(());
-        };
-        let accepted = match response.response_code()? {
-            200..=299 if !auth.approved => true,
-            401 if auth.continuing => return Err(NativeAuthentication.into()),
-            401 => false,
-            _ => return Ok(()),
-        };
-        let challenges = &response.get_ref().challenges;
-        if !accepted {
-            let verdict = auth.verdict.take().unwrap();
-            verdict(&auth.response, false, challenges).context(AuthenticationRejected)?;
-            return Err(AuthenticationRejected.into());
+        match self.auth.as_ref() {
+            Some(auth) if auth.continuing => Err(NativeAuthentication.into()),
+            Some(_) => Err(AuthenticationRejected.into()),
+            None => Ok(()),
         }
-        verdict(&auth.response, true, challenges)?;
-        auth.approved = true;
-        Ok(())
     }
 
     fn authenticate(&mut self, response: &Easy2<Response>) -> Result<bool> {
@@ -1239,7 +1187,7 @@ impl Client {
             }
         }
         let network = self
-            .report_authentication(&response)
+            .check_authentication(&response)
             .and_then(|()| self.check_response(&mut response, outcome));
         let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
         match body {
@@ -1279,7 +1227,7 @@ impl Client {
     ) -> Result<()> {
         match preparation {
             FetchPreparation::NativeHttp1 => {
-                self.report_authentication(&response)?;
+                self.check_authentication(&response)?;
                 return Err(Http1Required.into());
             }
             FetchPreparation::ProbeAuthentication => {
@@ -1375,8 +1323,6 @@ mod tests {
                     user: 0..1,
                     password: 2..3,
                 },
-                verdict: None,
-                approved: true,
                 continuing: false,
             }),
             auth_generation: 1,
@@ -1414,39 +1360,6 @@ mod tests {
         delayed.authentication = None;
         delayed.encoded_continuation = false;
         assert!(client.authenticate_response(401, &delayed).unwrap());
-    }
-
-    #[test]
-    fn credential_verdict_uses_only_the_latest_http_challenges() {
-        // Git 2.45.1 echoes the earlier WWW-Authenticate headers from fill.
-        let mut fill = Command::new("/bin/sh");
-        fill.args([
-            "-c",
-            "cat >/dev/null; printf '%s\\n' protocol=https host=example.invalid username=user password=fixture 'wwwauth[]=Basic realm=\"old\"'",
-        ]);
-        let credentials = credentials(
-            fill,
-            "https://example.invalid/repository",
-            &[b"Basic realm=\"old\"".to_vec()],
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let outcome = directory.path().join("verdict");
-        let mut reject = Command::new("/bin/sh");
-        reject.args(["-c", "cat >\"$1\"", "--"]).arg(&outcome);
-        report_credentials(
-            reject,
-            &credentials.response,
-            false,
-            &[b"Basic realm=\"new\"".to_vec()],
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read(outcome).unwrap(),
-            b"protocol=https\nhost=example.invalid\nusername=user\npassword=fixture\nwwwauth[]=Basic realm=\"new\"\n\n"
-        );
     }
 
     fn framed_blob() -> (Oid, Vec<u8>, Vec<u8>) {
@@ -1623,7 +1536,9 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let pack = pack_stream::Response::new(scratch, vec![], Box::new(|_| unreachable!()));
+            let wait_for_slot_wait = scratch.pack_decode_wait_notice();
+            let pack =
+                pack_stream::Response::new(scratch.clone(), vec![], Box::new(|_| unreachable!()));
             let (_read, wake) = UnixStream::pair().unwrap();
             let mut decoder =
                 Decoder::start(Box::new(pack), Arc::default(), Arc::new(wake), None).unwrap();
@@ -1631,13 +1546,10 @@ mod tests {
             decoder
                 .feed(b"000dpackfile\n0014\x01PACK\0\0\0\x02\0\0\0\x01\xb1\x80\x20")
                 .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            while decoder.buffered.load(Ordering::Acquire) != 0
-                && std::time::Instant::now() < deadline
-            {
-                thread::yield_now();
-            }
-            let entered = decoder.buffered.load(Ordering::Acquire) == 0;
+            // The sender owns the slot mutex until it enters the condvar wait.
+            let active_when_waiting = wait_for_slot_wait
+                .recv_timeout(Duration::from_secs(3))
+                .map(|()| scratch.active_pack_decodes());
             let (finished, wait_for_finish) = mpsc::channel();
             let join = thread::spawn(move || {
                 if let Some(failure) = failure {
@@ -1651,9 +1563,13 @@ mod tests {
                 }
             });
             let cancelled = wait_for_finish.recv_timeout(Duration::from_secs(1));
+            let permits = occupied.len();
             drop(occupied);
             join.join().unwrap();
-            assert!(entered, "decoder did not start consuming the pack");
+            assert_eq!(
+                active_when_waiting.expect("decoder did not wait for a slot"),
+                permits
+            );
             assert_eq!(
                 cancelled
                     .expect("decoder waited for a different stream's buffer")

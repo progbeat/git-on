@@ -8,7 +8,6 @@ import io
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import tempfile
 import unittest
@@ -74,6 +73,11 @@ class RecordingDestinationTests(unittest.TestCase):
         return error, dependencies, opened, recorder
 
     def successful_recording(self, replace_stage=None):
+        make = self.root / "fixture-make"
+        make.write_text('#!/bin/sh\nprintf "%s\\n" "$1"\n')
+        make.chmod(0o700)
+        real_popen = MOD.subprocess.Popen
+
         def successful_vhs(*args, **kwargs):
             stage = Path(os.readlink(kwargs["cwd"]))
             (stage / "demo.gif").write_bytes(b"owned animation fixture")
@@ -81,14 +85,15 @@ class RecordingDestinationTests(unittest.TestCase):
             kwargs["stdout"].flush()
             runtime = Path(kwargs["env"]["TMPDIR"])
             wrapper = Path(kwargs["env"]["PATH"].split(os.pathsep)[0]) / "make"
-            self.assertIn(f'exec {shlex.quote(os.path.abspath("fixture-tool"))} "$@"',
-                          wrapper.read_text())
+            with patch.object(MOD.subprocess, "Popen", real_popen):
+                output = MOD.subprocess.check_output(
+                    [wrapper, "compiled"], env=dict(kwargs["env"], GIT_ON_TREE_OID=MOD.TREE), timeout=5)
+            self.assertEqual(output, b"compiled\n")
             run = runtime / "git-on" / "rUn001"
             (run / "mount").mkdir(parents=True)
             executable = run / "mount/sl"
             executable.write_bytes(b"generated SL fixture")
             executable.chmod(0o755)
-            Path(kwargs["env"]["GIT_ON_DEMO_TREE"]).write_text(MOD.TREE + "\n")
 
             class SuccessfulVhs:
                 returncode = None
@@ -110,7 +115,10 @@ class RecordingDestinationTests(unittest.TestCase):
             return SuccessfulVhs()
 
         with redirect_stdout(io.StringIO()):
-            return self.attempt_recording(recorder_failure=successful_vhs)
+            return self.attempt_recording(
+                dependency_probe=lambda name: str(make) if name == "make" else "fixture-tool",
+                recorder_failure=successful_vhs,
+            )
 
     def assert_rejected_before_probes(self, attempt):
         error, dependencies, opened, recorder = attempt

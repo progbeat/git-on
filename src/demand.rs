@@ -2780,9 +2780,8 @@ mod tests {
                     .collect::<String>(),
             )
             .arg(&eof);
-        let mut idle = StartingSession::spawn(command, false, None)?
-            .negotiate()?
-            .context("idle SSH fixture must negotiate")?;
+        let mut idle =
+            Session::connect(command, false)?.context("idle SSH fixture must negotiate")?;
         let response = pack_stream::Response::new(cache.clone(), vec![oid], Box::new(|_| Ok(())));
         idle.fetch_stream(&[oid], crate::transport::FetchMode::Filtered, response)?;
         let mut pool = Pool::prepare_native(&connection, &cache, vec![])?;
@@ -2887,8 +2886,7 @@ mod tests {
             .arg(&pid_file)
             .arg(if stateless { "stateless" } else { "persistent" })
             .arg(if signaled { "signal" } else { "exit" });
-        let session = StartingSession::spawn(command, stateless, None)?
-            .negotiate()?
+        let session = Session::connect(command, stateless)?
             .context("local transport fixture must negotiate")?;
         let connection = Connection::new(Command::new("/usr/bin/false"), stateless, None);
         let mut pool = Pool {

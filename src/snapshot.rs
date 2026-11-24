@@ -15,7 +15,7 @@ use std::{
         fs::symlink,
     },
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Mutex, MutexGuard, TryLockError, Weak},
 };
 
 pub const BLOB_CACHE_BYTES: usize = crate::raw_blob::MEMORY_BUDGET;
@@ -128,7 +128,7 @@ pub struct Entry {
 enum LocalObjectAnchor {
     Native(Box<NativeLocalObjects>),
     Temporary {
-        _directory: tempfile::TempDir,
+        _directory: crate::service_memory::Directory,
     },
     #[cfg(target_os = "linux")]
     Descriptor {
@@ -186,7 +186,12 @@ impl NativeLocalObjects {
             // process would otherwise see later changes to an alternate path.
             let absent = Oid::zero();
             let _ = contents.exchange(format!("{absent}\n").as_bytes(), |input| {
-                Self::receive(absent, true, input, |_, _, _| Ok(()))
+                crate::git::receive_batch_object(
+                    absent,
+                    crate::git::BatchRead::ReusableContents,
+                    input,
+                    |_, _, _| Ok(()),
+                )
             })?;
             NativeObjectBatch {
                 contents,
@@ -216,7 +221,9 @@ impl NativeLocalObjects {
     }
 
     fn header(&self, oid: Oid) -> Result<(usize, ObjectType)> {
-        self.cat_file(oid, false, |size, kind, _| Ok((size, kind)))
+        self.cat_file(oid, crate::git::BatchRead::Header, |size, kind, _| {
+            Ok((size, kind))
+        })
     }
 
     fn read<T>(
@@ -224,7 +231,7 @@ impl NativeLocalObjects {
         oid: Oid,
         consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
     ) -> Result<T> {
-        self.cat_file(oid, true, consume)
+        self.cat_file(oid, crate::git::BatchRead::ReusableContents, consume)
     }
 
     fn bytes(&self, oid: Oid, expected: ObjectType) -> Result<Vec<u8>> {
@@ -251,11 +258,12 @@ impl NativeLocalObjects {
     fn cat_file<T>(
         &self,
         oid: Oid,
-        body: bool,
+        mode: crate::git::BatchRead,
         consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
     ) -> Result<T> {
         let mut batch = self.batch.lock().unwrap();
         let NativeObjectBatch { contents, headers } = &mut *batch;
+        let body = mode.has_contents();
         let (process, request) = if let Some(headers) = headers {
             (if body { contents } else { headers }, format!("{oid}\n"))
         } else {
@@ -263,57 +271,22 @@ impl NativeLocalObjects {
             (contents, format!("{verb} {oid}\n"))
         };
         process.exchange(request.as_bytes(), |input| {
-            Self::receive(oid, body, input, consume)
+            crate::git::receive_batch_object(oid, mode, input, consume)
         })?
     }
 
-    fn receive<T>(
-        oid: Oid,
-        body: bool,
-        mut input: &mut dyn BufRead,
-        consume: impl FnOnce(usize, ObjectType, &mut dyn BufRead) -> Result<T>,
-    ) -> Result<Result<T>> {
-        let mut header = String::new();
-        (&mut input).take(128).read_line(&mut header)?;
-        anyhow::ensure!(header.ends_with('\n'), "invalid native Git object header");
-        let mut fields = header.split_ascii_whitespace();
-        anyhow::ensure!(
-            fields.next().and_then(|value| Oid::from_str(value).ok()) == Some(oid),
-            "native Git returned a different object"
-        );
-        let kind = fields.next().context("missing native Git object type")?;
-        if kind == "missing" && fields.next().is_none() {
-            return Ok(Err(anyhow::anyhow!("missing local Git object {oid}")));
-        }
-        let kind = ObjectType::from_str(kind).context("invalid native Git object type")?;
-        let size: usize = fields.next().context("missing Git object size")?.parse()?;
-        anyhow::ensure!(fields.next().is_none(), "invalid native Git object header");
-        let mut data = (&mut input).take(if body { size as u64 } else { 0 });
-        let value = consume(size, kind, &mut data);
-        if body {
-            // A consumer error need not invalidate the local object store.
-            // Finish the response so the next request starts at its header.
-            if let Err(error) = &value {
-                if crate::object::is_cancelled(error) {
-                    return Err(anyhow::anyhow!(crate::object::OperationCancelled));
-                }
-                io::copy(&mut data, &mut io::sink())?;
-            }
-            anyhow::ensure!(data.limit() == 0, "truncated native Git object");
-            let mut newline = [0];
-            input.read_exact(&mut newline)?;
-            anyhow::ensure!(newline == *b"\n", "invalid native Git object delimiter");
-        }
-        Ok(value)
+    fn stop(&self) -> Result<()> {
+        self.close(crate::transport::BatchProcess::stop)
     }
 
-    fn stop(&self) -> Result<()> {
+    fn finish(&self) -> Result<()> {
+        self.close(crate::transport::BatchProcess::finish)
+    }
+
+    fn close(&self, close: fn(&crate::transport::BatchProcess) -> Result<()>) -> Result<()> {
         let batch = self.batch.lock().unwrap();
-        let contents = batch.contents.stop();
-        let headers = batch
-            .headers
-            .as_ref()
-            .map_or(Ok(()), crate::transport::BatchProcess::stop);
+        let contents = close(&batch.contents);
+        let headers = batch.headers.as_ref().map_or(Ok(()), close);
         contents.and(headers)
     }
 
@@ -352,10 +325,14 @@ fn needs_native_alternates(path: &Path, depth: usize, visited: &mut HashSet<Path
         return false;
     }
     bytes.split(|&byte| byte == b'\n').any(|line| {
+        // Native Git ignores a CR inside a comment. libgit2 starts a new line.
+        if line.contains(&b'\r') {
+            return true;
+        }
         if line.is_empty() || line.starts_with(b"#") {
             return false;
         }
-        if !matches!(line[0], b'/' | b'.') || line.contains(&b'\r') || line.contains(&0) {
+        if !matches!(line[0], b'/' | b'.') || line.contains(&0) {
             return true;
         }
         needs_native_alternates(&path.join(OsStr::from_bytes(line)), depth + 1, visited)
@@ -518,10 +495,15 @@ fn configure_local_object_database(
     }
     // A repository of aliases preserves the extra traversal step for nested
     // locations and adapts byte paths to git2's UTF-8 alternate API.
-    let bridge = tempfile::Builder::new()
-        .prefix("local-object-bridge-")
-        .tempdir_in(run_directory)?;
-    let private = Repository::init_bare(bridge.path())?;
+    let bridge = crate::service_memory::Directory::new("local-object-bridge-")?;
+    bridge.link(
+        run_directory,
+        bridge.path().file_name().unwrap(),
+        Path::new(""),
+    )?;
+    let mut options = git2::RepositoryInitOptions::new();
+    options.bare(true).external_template(false);
+    let private = Repository::init_opts(bridge.path(), &options)?;
     let mut aliases = String::new();
     for (index, location) in locations.into_iter().enumerate() {
         let name = format!("alternate-{index}");
@@ -606,9 +588,12 @@ fn configure_byte_primary(
 
     // Make the selected store the object directory itself. Registering it
     // through an alternates list would lose one level of primary traversal.
-    let bridge = tempfile::Builder::new()
-        .prefix("local-object-bridge-")
-        .tempdir_in(run_directory)?;
+    let bridge = crate::service_memory::Directory::new("local-object-bridge-")?;
+    bridge.link(
+        run_directory,
+        bridge.path().file_name().unwrap(),
+        Path::new(""),
+    )?;
     fs::create_dir(bridge.path().join("refs"))?;
     fs::write(bridge.path().join("HEAD"), b"ref: refs/heads/main\n")?;
     symlink(primary, bridge.path().join("objects"))?;
@@ -633,6 +618,8 @@ pub struct SnapshotMetrics {
     pub remote_prefetched_blobs: u64,
     /// Native Git's retained received packs, possibly normalized by index-pack.
     pub remote_native_pack_bytes: u64,
+    #[cfg(feature = "test-metrics")]
+    pub remote_repositories_created: u64,
     /// Exact received Git pack payloads on invocation-owned demand sessions.
     /// Neither counter includes protocol framing, TLS or other wire overhead.
     pub remote_session_pack_bytes: u64,
@@ -1131,7 +1118,7 @@ impl Snapshot {
             )?;
             (None, Some(remote), oid, None, None)
         } else {
-            let (git, oid) = crate::git::Git::capture_snapshot(repo_path, treeish)?;
+            let (git, oid) = crate::git::Git::capture_snapshot(repo_path, treeish, verify)?;
             // Native Git resolved the operand in the caller's object namespace.
             // Keep that environment for subsequent lazy libgit2 object reads.
             let repo = Repository::open_ext(
@@ -1216,6 +1203,19 @@ impl Snapshot {
             .pack_verification
             .as_ref()
             .map_or(Ok(()), crate::demand::PackVerification::wait)
+    }
+
+    /// Check the native reader for a completed mount. An occupied snapshot
+    /// can belong to an escaped reader which the caller is about to cancel.
+    pub fn finish_idle_native_reader(&self) -> Result<()> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("snapshot object cache poisoned"),
+        };
+        state
+            .native_local()
+            .map_or(Ok(()), NativeLocalObjects::finish)
     }
 
     /// The native mount is ready and startup can no longer fall back to copy.
@@ -1439,6 +1439,16 @@ impl Snapshot {
         }
         Ok(())
     }
+
+    pub(crate) fn finish_materialization(&self) -> Result<()> {
+        let mut state = self.state()?;
+        if let Some(remote) = &mut state.remote {
+            return remote.finish_materialized_pack();
+        }
+        state
+            .native_local()
+            .map_or(Ok(()), NativeLocalObjects::finish)
+    }
     pub(crate) fn prepare_materialization(
         &self,
         children: &[(&OsStr, Entry)],
@@ -1540,10 +1550,14 @@ impl Snapshot {
             return Ok(size);
         }
         if let Some(native) = state.native_local() {
-            let size = native.read(oid, |size, kind, input| {
-                State::copy_blob_reader(oid, size, kind, input, output)?;
-                Ok(size)
-            })?;
+            let size = native.cat_file(
+                oid,
+                crate::git::BatchRead::Materialize,
+                |size, kind, input| {
+                    State::copy_blob_reader(oid, size, kind, input, output)?;
+                    Ok(size)
+                },
+            )?;
             state.metrics.blob_loads += 1;
             state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
             state.metrics.streamed_blob_loads += u64::from(size > crate::raw_blob::BLOCK);
@@ -1716,6 +1730,10 @@ impl Snapshot {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut metrics = state.metrics.clone();
         if let Some(remote) = &state.remote {
+            #[cfg(feature = "test-metrics")]
+            {
+                metrics.remote_repositories_created = remote.repositories_created;
+            }
             metrics.remote_fetches = remote.completed_fetches();
             metrics.remote_fetch_operations = remote.fetch_operations();
             metrics.remote_decode_operations = remote.decode_operations();
@@ -1923,6 +1941,40 @@ mod tests {
             loose.len(),
             "a stream skipped its OID verification"
         );
+        drop(probe);
+        #[cfg(target_os = "linux")]
+        {
+            let repo = Repository::open(tmp.path()).unwrap();
+            let sig = Signature::now("Test", "test@example.test").unwrap();
+            let revision = repo
+                .commit(
+                    Some("refs/heads/native-verified"),
+                    &sig,
+                    &sig,
+                    "native pack",
+                    &repo.find_tree(tree).unwrap(),
+                    &[],
+                )
+                .unwrap();
+            let run = tempfile::tempdir().unwrap();
+            let probe = crate::object::HashProbe::start(tree);
+            let (remote, selected) = crate::remote::Remote::open_for_execution(
+                tmp.path(),
+                tmp.path().as_os_str(),
+                OsStr::new("native-verified:refs/heads/private-copy"),
+                run.path(),
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(selected, revision);
+            assert!(remote.raw_blobs.get(tree).unwrap().is_some());
+            assert_eq!(
+                probe.bytes(),
+                0,
+                "native import hashed the borrowed tree again"
+            );
+        }
         // Native verification only authenticates the owned import buffer.
         // A later disk read must still reject changed bytes against its
         // trusted block digests, even when the original OID was checked in C.

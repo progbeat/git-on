@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 
+from support.git_invocations import git_invocations, record_git_invocations
+
 BINARY = Path(sys.argv.pop(1)).resolve()
 # On Linux the fixture hides fusermount3. Darwin 25+ supplies NFS independently
 # of PATH, so exercise the same copy backend explicitly there.
@@ -66,18 +68,18 @@ class MaterializedTests(unittest.TestCase):
         alternate = self.root / 'alternate-objects'
         (alternate / oid[:2]).mkdir(parents=True)
         (objects / oid[:2] / oid[2:]).rename(alternate / oid[:2] / oid[2:])
-        trace = self.root / 'git-events.jsonl'
-        self.env.update(GIT_TRACE2_EVENT=str(trace), GIT_ALTERNATE_OBJECT_DIRECTORIES=str(alternate))
+        self.env, log = record_git_invocations(self.root, self.env)
+        self.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = str(alternate)
         result = self.invoke(
             "from pathlib import Path; print(Path('tracked').read_bytes().hex())",
             '--write-policy=all',
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'636f6d6d697474656400ff0d0a\n')
-        starts = [event['argv'] for event in map(json.loads, trace.read_text().splitlines())
-                  if event['event'] == 'start']
+        starts = git_invocations(log)
         self.assertTrue(starts)
         self.assertEqual([args for args in starts if 'cat-file' in args], [])
+        self.assertEqual([args for args in starts if 'config' in args and '--list' in args], [])
         self.clean()
 
     def test_default_and_protected_policies_are_never_relaxed(self):
@@ -178,22 +180,45 @@ print('large file verified')
         self.git('config','uploadpack.allowAnySHA1InWant','true')
         return self.repo.as_uri(),command
 
-    def test_large_remote_materialization_fits_checkout_disk_budget(self):
-        source,command=self.remote_materialization_fixture()
-        clone=self.root/'clone'
-        result=subprocess.run(['git','clone','--quiet',source,str(clone)],env=self.env,capture_output=True,timeout=20)
-        self.assertEqual(result.returncode,0,result.stderr)
-        direct=subprocess.run(command,cwd=clone,env=self.env,capture_output=True,timeout=20)
-        self.assertEqual(direct.returncode,0,direct.stderr)
-        result=subprocess.run([str(BINARY),*COPY_ARGS,source,'HEAD','--write-policy=all','--',*command],
-                              cwd=self.repo,env=self.env,capture_output=True,timeout=20)
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(result.stdout,direct.stdout)
+    def test_native_remote_copy_reuses_one_decoder_for_a_pack(self):
+        import hashlib
+
+        paths = ['payload-a', 'payload-b', 'payload-c']
+        expected = []
+        for name in paths:
+            data = shake_256(name.encode()).digest(80 * 1024)
+            (self.repo / name).write_bytes(data)
+            expected.append(hashlib.sha256(data).hexdigest())
+        with (self.repo / '.gitattributes').open('a') as attributes:
+            attributes.write('payload-* -text\n')
+        self.git('add', '.gitattributes', *paths)
+        self.git('commit', '-qm', 'native packed blobs')
+        self.git('config', 'fetch.prune', 'false')
+        self.before = self.git('status', '--porcelain')
+        environment, log = record_git_invocations(self.root, self.env)
+        result = subprocess.run(
+            [str(BINARY), *COPY_ARGS, self.repo.as_uri(), 'HEAD', '--write-policy=all', '--',
+             sys.executable, '-c',
+             'import hashlib, pathlib, sys\n'
+             'for path in sys.argv[1:]: print(hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest())',
+             *paths],
+            cwd=self.repo, env=environment, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode().splitlines(), expected)
+        calls = git_invocations(log)
+        self.assertEqual(len([args for args in calls if 'fetch' in args]), 1, calls)
+        readers = [args for args in calls if 'cat-file' in args]
+        self.assertEqual(len(readers), 1, readers)
+        self.assertIn('--batch-command', readers[0])
         self.clean()
 
-    def test_file_snapshot_streams_commit_metadata_with_default_fetch_policy(self):
+    def commit_with_large_message(self):
         message = base64.b64encode(shake_256(b'commit metadata fixture').digest(512 * 1024))
         self.git('commit', '--allow-empty', '-q', '-F', '-', data=message)
+
+    def test_file_snapshot_streams_with_default_fetch_policy(self):
+        self.git('config', 'pull.rebase', 'true')
         source = self.repo.as_uri()
         args = [
             BINARY, source, 'HEAD', '--backend=copy', '--write-policy=all', '--',
@@ -213,15 +238,17 @@ print('large file verified')
                 self.assertEqual(result.stdout.splitlines(),
                                  [str(bool(config)).encode(), b'636f6d6d697474656400ff0d0a'])
                 self.clean()
-        if sys.platform == 'linux':
-            from filesystem_quota import compare_on_tmpfs
-            command = [
-                sys.executable, '-I', '-S', '-c',
-                "from pathlib import Path; assert Path('tool').is_file(); print('ready')",
-            ]
-            compare_on_tmpfs(self, self.root, BINARY, self.repo, self.env['PATH'], command,
-                             size_mib=1, source=source, checkout_copies=2)
-            self.clean()
+
+    @unittest.skipUnless(sys.platform == 'linux', 'private tmpfs quota requires Linux mount namespaces')
+    def test_native_fetch_with_large_commit_metadata_fits_two_checkouts(self):
+        from filesystem_quota import compare_on_tmpfs
+        self.commit_with_large_message()
+        command = [sys.executable, '-I', '-S', '-c',
+                   "from pathlib import Path; assert Path('tool').is_file(); print('ready')"]
+        compare_on_tmpfs(self, self.root, BINARY, self.repo, self.env['PATH'], command,
+                         size_mib=1, source=self.repo.as_uri(), checkout_copies=2,
+                         git_config={'fetch.parallel': '1'})
+        self.clean()
 
     @unittest.skipUnless(sys.platform=='linux','private tmpfs quota requires Linux mount namespaces')
     def test_large_remote_materialization_succeeds_on_nine_mib_tmpfs(self):
@@ -232,14 +259,18 @@ print('large file verified')
 
     def test_command_status_and_signal_cleanup(self):
         code = f"""
-import subprocess, sys
+import os, subprocess, sys
 from pathlib import Path
 run = Path.cwd().parent
 for name in ('.state', '.state-new', '.lock'):
     assert not (run / name).exists(), name
-assert (run / '.git-on-lock-v2').stat().st_size == 0
+record = run.with_name(f'.git-on-run-{{os.geteuid():x}}-{{run.name}}')
+[marker] = record.glob('.git-on-lock-v2-*')
+expected = (b'run is active or locked',)
+if marker.name.startswith('.git-on-lock-v2-u'):
+    expected = (b'persistent run directory identity', b'does not match its ownership record')
 cleanup = subprocess.run([{str(BINARY)!r}, '--cleanup', str(run)], capture_output=True, timeout=5)
-assert cleanup.returncode != 0 and b'run is active or locked' in cleanup.stderr, cleanup
+assert cleanup.returncode != 0 and any(reason in cleanup.stderr for reason in expected), cleanup
 assert Path('tracked').is_file()
 print(run)
 sys.exit(23)

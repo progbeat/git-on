@@ -1125,21 +1125,18 @@ mod tests {
     fn interleaved_delta_chains_apply_each_entry_once() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = RawBlobs::new(directory.path()).unwrap();
-        let size = 256 * 1024;
-        let depth = 4;
-        let mut bases = [vec![b'a'; size], vec![b'b'; size]];
+        let mut bases = [[0, b'a'], [0, b'b']];
         let mut oids = bases
             .each_ref()
             .map(|data| Oid::hash_object(ObjectType::Blob, data).unwrap());
-        let mut pack = b"PACK\0\0\0\x02\0\0\0\x0a".to_vec();
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x06".to_vec();
         for base in &bases {
             pack.extend_from_slice(&pack_entry(3, &[], base));
         }
-        for byte in 0..depth {
+        for byte in 1..=2 {
             for (base, oid) in bases.iter_mut().zip(&mut oids) {
-                let instructions = [
-                    0x80, 0x80, 0x10, 0x80, 0x80, 0x10, 1, byte, 0xf1, 1, 0xff, 0xff, 3,
-                ];
+                // Replace the first byte and copy the second byte from the base.
+                let instructions = [2, 2, 1, byte, 0x91, 1, 1];
                 pack.extend_from_slice(&pack_entry(7, oid.as_bytes(), &instructions));
                 base[0] = byte;
                 *oid = Oid::hash_object(ObjectType::Blob, base).unwrap();
@@ -1159,7 +1156,7 @@ mod tests {
         let mut received = response.pack.finish().unwrap();
         received.cache_extras(&scratch, None, |_| {});
         assert_eq!(verified_extra(&scratch, oids[1]).data(), bases[1]);
-        assert_eq!(DELTA_APPLICATIONS.get(), usize::from(depth) * 2);
+        assert_eq!(DELTA_APPLICATIONS.get(), 4);
     }
 
     #[test]
@@ -1171,11 +1168,16 @@ mod tests {
         let directory = Arc::new(tempfile::tempdir_in(root.path()).unwrap());
         let packed = directory.path().join("pack");
         std::fs::write(&packed, base).unwrap();
-        scratch.remember_packed(oid, &directory);
+        scratch.remember_packed(oid, &directory, base.len());
         drop(directory);
-        let Some(ReceivedObject::Packed(selected)) = scratch.received(oid) else {
+        let Some(ReceivedObject::Packed {
+            directory: selected,
+            size,
+        }) = scratch.received(oid)
+        else {
             panic!("expected a native pack source");
         };
+        assert_eq!(size, base.len());
 
         let wanted = Oid::hash_object(ObjectType::Blob, b"wanted").unwrap();
         let mut response = Response::new(scratch.clone(), vec![wanted], Box::new(|_| Ok(())));

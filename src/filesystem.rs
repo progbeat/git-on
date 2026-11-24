@@ -16,10 +16,13 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
 const PREFETCH_SCAN_LIMIT: usize = 512;
+static EMPTY_BLOB_OID: LazyLock<Oid> = LazyLock::new(|| {
+    Oid::hash_object(git2::ObjectType::Blob, b"").expect("hash the empty Git blob")
+});
 
 pub(crate) type FsResult<T> = std::result::Result<T, i32>;
 fn errno(e: std::io::Error) -> i32 {
@@ -1265,9 +1268,18 @@ impl Overlay {
             self.ensure_size(ino)?;
         }
         let node = self.node(ino)?;
-        if node.oid.is_some() && !node.size_pending && node.attr.size == size {
+        let unchanged = node.oid.is_some_and(|oid| {
+            if node.size_pending {
+                // Zero truncation can discard a cold blob without requesting it.
+                size == 0 && oid == *EMPTY_BLOB_OID
+            } else {
+                node.attr.size == size
+            }
+        });
+        if unchanged {
             self.copy_metadata_up(ino)?;
             let n = self.node_mut(ino)?;
+            n.size_pending = false;
             n.attr.mtime = SystemTime::now();
             n.attr.ctime = n.attr.mtime;
             return Ok(());
@@ -2421,6 +2433,9 @@ mod tests {
         builder.insert(".gitignore", ignore, 0o100644).unwrap();
         let content = repo.blob(b"pinned content\n").unwrap();
         builder.insert("tracked.tmp", content, 0o100755).unwrap();
+        builder
+            .insert("empty.tmp", repo.blob(b"").unwrap(), 0o100644)
+            .unwrap();
         let link = repo.blob(b"tracked.tmp").unwrap();
         builder.insert("link", link, 0o120000).unwrap();
         let tree = builder.write().unwrap();
@@ -2992,6 +3007,14 @@ mod tests {
     #[test]
     fn unchanged_size_truncate_retains_source_and_later_write_works_after_unlink() {
         let (_temp, mut fs) = fixture_policy(WritePolicy::All);
+        let empty = fs.ensure_entry(Path::new("empty.tmp"), false).unwrap();
+        assert!(fs.nodes[&empty].size_pending);
+        let empty_handle = fs.open_file(empty, libc::O_RDWR | libc::O_TRUNC).unwrap();
+        assert!(fs.unchanged_source_data(empty));
+        assert!(fs.read_data(empty, empty_handle, 0, 1).unwrap().is_empty());
+        fs.release_handle(empty, empty_handle).unwrap();
+        assert!(!fs.backing.join(empty.to_string()).exists());
+
         let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
         let reader = fs.open_file(ino, libc::O_RDONLY).unwrap();
         let writer = fs.open_file(ino, libc::O_RDWR).unwrap();

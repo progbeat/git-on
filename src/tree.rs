@@ -30,6 +30,8 @@ impl Directory {
         // Parsing and hashing consume exactly the same stream. Neither entries
         // nor negative lookup results become observable before full OID trust.
         input.finish(oid)?;
+        #[cfg(test)]
+        crate::object::HashProbe::record(oid, size);
         Ok(directory)
     }
     pub(crate) fn from_verified(object: &crate::pack_stream::VerifiedObject) -> Result<Self> {

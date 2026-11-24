@@ -30,6 +30,15 @@ impl HashProbe {
     pub(crate) fn bytes(&self) -> usize {
         HASH_PROBE.with(|probe| probe.get().expect("active hash probe").1)
     }
+    pub(crate) fn record(oid: Oid, bytes: usize) {
+        HASH_PROBE.with(|probe| {
+            if let Some((tracked, total)) = probe.get() {
+                if tracked == oid {
+                    probe.set(Some((tracked, total + bytes)));
+                }
+            }
+        });
+    }
 }
 #[cfg(test)]
 impl Drop for HashProbe {
@@ -249,13 +258,7 @@ impl<W: Write> Write for VerifiedWriter<W> {
         let count = self.output.write(bytes)?;
         self.hash.update(&bytes[..count]);
         #[cfg(test)]
-        HASH_PROBE.with(|probe| {
-            if let Some((tracked, total)) = probe.get() {
-                if tracked == self.oid {
-                    probe.set(Some((tracked, total + count)));
-                }
-            }
-        });
+        HashProbe::record(self.oid, count);
         self.remaining -= count;
         Ok(count)
     }

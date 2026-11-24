@@ -108,10 +108,10 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
         streamed=metrics.get('streamed_blob_loads',0)
         assert 0<=streamed<=count,metrics
         if backend=='materialized':
-            # Eager streaming decodes its one shallow pack. Native Git counts
-            # only the individual large packed blobs streamed by cat-file.
+            # Eager streaming decodes its one shallow pack. Native Git shares
+            # one cat-file process for the streamed blobs in its packed fetch.
             assert session_decodes==session_fetches,metrics
-            assert metrics['remote_decode_operations']==streamed,metrics
+            assert metrics['remote_decode_operations']==int(streamed>0),metrics
             if session_fetches:assert streamed==0,metrics
         else:
             # The direct session also decodes the selected commit and root tree.

@@ -18,6 +18,7 @@ import sys
 import time
 import unittest
 import uuid
+from urllib.parse import urlsplit
 
 SPEC = importlib.util.spec_from_file_location('git_on_remote_fixtures', Path(__file__).with_name('remote.py'))
 remote = importlib.util.module_from_spec(SPEC)
@@ -241,6 +242,8 @@ class SshRegressionTests(unittest.TestCase):
         directory = next(f.root.glob('*/ssh-control')).parent
         record_path = directory / 'ssh-control-owner'
         record = json.loads(record_path.read_text())
+        memory = (directory / '.git-on-memory').resolve(strict=True)
+        self.assertTrue(record_path.resolve().is_relative_to(memory))
         self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
         control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
         checked = subprocess.run(control, capture_output=True, check=True, timeout=5)
@@ -295,6 +298,7 @@ class SshRegressionTests(unittest.TestCase):
                                      env=f.env, capture_output=True, timeout=10)
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
             self.assertFalse(directory.exists())
+            self.assertFalse(memory.exists(), 'checked cleanup retained the service memory')
             self.assertTrue(select.select([descriptor], [], [], 2)[0])
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=10)
@@ -582,8 +586,195 @@ class SshRegressionTests(unittest.TestCase):
         # OpenSSH -J none is a native direct-host configuration. Inserting a
         # ProxyCommand=false fallback guard wrongly conflicts even with -J none.
         f.env['GIT_SSH_COMMAND'] += ' -J none'
+        runtime = f.root / 'runtime space'
+        runtime.mkdir()
+        f.env['TMPDIR'] = str(runtime)
         self.loaded_read(url)
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
+        self.assertEqual(list(runtime.iterdir()), [])
+
+    def test_default_ssh_configuration_is_opened_by_the_native_client(self):
+        f = self.f
+        url = f.ssh(protocol_v2=True)
+        native, *fixture_options = shlex.split(f.env.pop('GIT_SSH_COMMAND'))
+        client = shutil.which(native)
+        wrapper = f.root / 'default-client'
+        wrapper.write_text(f'''#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+if '-F' in args:
+    sys.exit('expected native SSH configuration discovery')
+if sys.platform == 'darwin' and 'UseKeychain=no' in args and 'IgnoreUnknown=UseKeychain' not in args:
+    sys.stderr.write('command-line: line 0: Bad configuration option: usekeychain\\n')
+    sys.exit(255)
+prefix = ['-o', 'StrictHostKeyChecking=accept-new'] if os.environ.get('FIXTURE_HOST_POLICY') else []
+os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
+''')
+        wrapper.chmod(0o700)
+        f.env['GIT_SSH'] = str(wrapper)
+        self.loaded_read(url)
+        host_file = f.root / 'known_hosts'
+        host_file.write_bytes(b'')
+        result = subprocess.run(
+            [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
+             '--', 'cat', 'deep/file'],
+            cwd=f.cwd, env=dict(f.env, FIXTURE_HOST_POLICY='1'),
+            capture_output=True, timeout=15,
+        )
+        self.assertEqual(host_file.read_bytes(), b'')
+        self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
+        self.assertIn(b'stricthostkeychecking', result.stderr.lower())
+
+    def test_ssh_config_probe_does_not_wait_for_a_descendants_stderr(self):
+        f = self.f
+        url = f.ssh(protocol_v2=True)
+        gate = f.root / 'hold-stderr'
+        started = f.root / 'probe-descendant'
+        gate.touch()
+        native, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
+        wrapper = f.root / 'probe-client'
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = -G ]; then\n'
+            f'  ( : > {shlex.quote(str(started))}; '
+            f'while [ -e {shlex.quote(str(gate))} ]; do sleep 0.02; done ) </dev/null &\n'
+            'fi\n'
+            f'exec {shlex.quote(shutil.which(native))} "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        f.env['GIT_SSH_COMMAND'] = shlex.join([str(wrapper), *options])
+        try:
+            result = subprocess.run(
+                [remote.OPTIONS.binary, url, 'main', '--backend=copy', '--write-policy=all',
+                 '--', 'cat', 'deep/file'],
+                cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
+            )
+            self.assertTrue(started.exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b'expected\n')
+        finally:
+            gate.unlink()
+
+    def test_check_host_ip_preserves_the_caller_host_files(self):
+        f = self.f
+        url = f.ssh()
+        port = urlsplit(url).port
+        alias = b'fixture-address-check'
+        address = f'[::ffff:127.0.0.1]:{port}'.encode()
+        host = (f.root / 'host.pub').read_bytes()
+        known = f.root / 'known hosts'
+        second = f.root / 'other-hosts'
+        second.touch()
+        escaped = str(known).replace(' ', r'\ ')
+        config = f.root / 'host.conf'
+        address_config = ('Host *\n HostName ::ffff:127.0.0.1\n'
+                          ' HostKeyAlias fixture-address-check\n CheckHostIP yes\n')
+        config.write_text(address_config)
+        command = [
+            'ssh', '-F', str(config), '-i', str(f.root / 'identity'),
+            '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+        ]
+        f.env['GIT_SSH_COMMAND'] = shlex.join([
+            *command, '-vqo', f'UserKnownHostsFile="{known}" {second}',
+        ])
+        known.write_bytes(alias + b' ' + host)
+
+        # A native read demonstrates the actual OpenSSH update on this host.
+        native = subprocess.run(['git', 'ls-remote', url, 'HEAD'], cwd=f.cwd,
+                                env=f.env, capture_output=True, timeout=10)
+        self.assertEqual(native.returncode, 0, native.stderr)
+        self.assertIn(address + b' ', known.read_bytes())
+        original = alias + b' ' + host
+        known.write_bytes(original)
+
+        code = "from pathlib import Path; print(Path('deep/file').read_text(), end='')"
+        git_on = [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
+                  '--', sys.executable, '-I', '-S', '-c', code]
+        result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+        self.assertEqual(known.read_bytes(), original)
+        self.assertEqual(second.read_bytes(), b'')
+
+        wrong = address + b' ' + (f.root / 'identity.pub').read_bytes()
+        second.write_bytes(wrong)
+        config.write_text(address_config + f' UserKnownHostsFile "{known}" {second}\n'
+                          f'Host unused\n UserKnownHostsFile {escaped} "{second}"\n')
+        f.env['GIT_SSH_COMMAND'] = shlex.join(command)
+        result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(b'host key', result.stderr.lower())
+        self.assertFalse(result.stdout)
+        self.assertEqual(known.read_bytes(), original)
+        self.assertEqual(second.read_bytes(), wrong)
+
+    def test_proxy_jump_leaves_its_known_hosts_file_unchanged(self):
+        f = self.f
+        url = f.ssh(protocol_v2=True)
+        runtime = f.root / 'runtime space'
+        runtime.mkdir()
+        f.env['TMPDIR'] = str(runtime)
+        port = urlsplit(url).port
+        known = f.root / 'known-jump-hosts'
+        known.touch()
+        config = f.root / 'jump-config'
+        config.write_text(
+            'IgnoreUnknown GitOnFixtureOption\nGitOnFixtureOption yes\n'
+            f'Host fixture-jump\n HostName ::ffff:127.0.0.1\n Port {port}\n'
+            f' IdentityFile {f.root / "identity"}\n IdentitiesOnly yes\n'
+            f' UserKnownHostsFile {known}\n HostKeyAlias fixture-jump\n'
+            ' StrictHostKeyChecking accept-new\n CheckHostIP yes\n'
+        )
+        command = f.env['GIT_SSH_COMMAND'].replace('-F /dev/null', '-F ' + shlex.quote(str(config)))
+        args = [str(remote.OPTIONS.binary), url, f.commit, '--backend=copy', '--write-policy=all',
+                '--', 'cat', 'deep/file']
+        trusted = b'fixture-jump ' + (f.root / 'host.pub').read_bytes()
+        proxy = shlex.join(['ssh', '-F', str(config), '-W', '[%h]:%p', 'fixture-jump'])
+        for mode, option in (
+            ('ProxyJump', ['-J', 'fixture-jump']),
+            ('ProxyCommand', ['-o', 'ProxyCommand=' + proxy]),
+        ):
+            with self.subTest(mode=mode):
+                f.env['GIT_SSH_COMMAND'] = command + ' ' + shlex.join(option)
+                known.write_bytes(b'')
+                refused = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+                self.assertEqual(known.read_bytes(), b'')
+                self.assertEqual(refused.returncode, 125, (refused.stdout, refused.stderr))
+                known.write_bytes(trusted)
+                loaded = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+                self.assertEqual((loaded.returncode, loaded.stdout), (0, b'expected\n'), loaded.stderr)
+                self.assertEqual(known.read_bytes(), trusted)
+
+        f.env['GIT_SSH_COMMAND'] = command + ' -J fixture-jump'
+        known.write_bytes(trusted)
+        _, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
+        wrapper = f.root / 'forwarding ssh'
+        with config.open('a') as output:
+            output.write('Host * !fixture-jump\n ProxyJump fixture-jump\n ProxyUseFdpass yes\n')
+        self.assertEqual(options[-2:], ['-J', 'fixture-jump'])
+        native = shlex.join([shutil.which('ssh'), *options[:-2]])
+        wrapper.write_text(f'#!/bin/sh\nexec {native} "$@"\n')
+        wrapper.chmod(0o700)
+        del f.env['GIT_SSH_COMMAND']
+        f.env['GIT_SSH'] = str(wrapper)
+        loaded = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+        self.assertEqual((loaded.returncode, loaded.stdout), (0, b'expected\n'), loaded.stderr)
+        self.assertEqual(known.read_bytes(), trusted)
+
+        if nc := shutil.which('nc.openbsd') or shutil.which('nc'):
+            del f.env['GIT_SSH']
+            help_text = subprocess.run([nc, '-h'], capture_output=True, timeout=5).stderr.lower()
+            modes = ('no', 'yes') if b'pass socket' in help_text else ('no',)
+            for fdpass in modes:
+                with self.subTest(nc_fdpass=fdpass):
+                    flags = ['-F'] if fdpass == 'yes' else []
+                    relay = shlex.join([nc, *flags, '%h', '%p'])
+                    f.env['GIT_SSH_COMMAND'] = command + ' ' + shlex.join([
+                        '-o', 'ProxyUseFdpass=' + fdpass, '-o', 'ProxyCommand=' + relay,
+                    ])
+                    loaded = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+                    self.assertEqual((loaded.returncode, loaded.stdout), (0, b'expected\n'), loaded.stderr)
+                    self.assertEqual(known.read_bytes(), trusted)
 
     def test_user_master_flag_clusters_cannot_become_option_terminator(self):
         f = self.f

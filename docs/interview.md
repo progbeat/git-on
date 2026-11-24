@@ -121,3 +121,11 @@ uses the saved record to find the ref and check its target.
 **Answer:** I do not understand what this has to do with git on. Git on is for
 temporary materialization and must have no permanent effect on repositories or
 on the system as a whole.
+
+**Question:** The earlier task permitted service writes to disk only for LRU
+eviction. The new task permits temporary repositories and asks to remove packs
+and indexes where compatibility allows. Can PR #41 retain disk-backed private
+packs and indexes for nonstandard refspecs and settings that still require
+native Git?
+
+**Answer:** No. Apply the “disk only on LRU eviction” rule in this PR.

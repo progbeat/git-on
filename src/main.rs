@@ -3,26 +3,20 @@ use git_on::{
     backend::Backend,
     filesystem::Overlay,
     git::set_foreground as foreground,
-    platform::{
-        create_temporary_entry, ensure_unmounted, grouped_run, mount_is_ours,
-        remove_empty_temporary_group, run_identity, same_run_directory, ssh_control_path,
-        usable_run_group, RUN_LOCK_NAME,
-    },
+    platform::{mount_is_ours, remove_empty_temporary_group, ssh_control_path},
     policy::WritePolicy,
     snapshot::Snapshot,
 };
-use serde::Deserialize;
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
     iterator::Signals,
 };
 use std::{
     env,
-    ffi::{CStr, CString, OsString},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
-    os::fd::FromRawFd,
+    io::{self, Write},
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -31,521 +25,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "test-metrics")]
+use std::os::fd::FromRawFd;
+
 mod cli;
+mod run_directory;
 
-// Legacy invocations put mount and pin identities in a separate file.
-#[derive(Deserialize)]
-#[cfg_attr(all(test, target_os = "linux"), derive(serde::Serialize))]
-struct Recovery {
-    format: String,
-    id: String,
-    git_dir: Option<PathBuf>,
-    tree_oid: Option<String>,
-    pin_ref: Option<String>,
-    #[cfg(target_os = "macos")]
-    nfs_socket: Option<PathBuf>,
-}
-#[cfg(target_os = "macos")]
-impl Recovery {
-    fn nfs_socket_path(&self) -> Option<PathBuf> {
-        self.nfs_socket
-            .clone()
-            .or_else(|| git_on::platform::legacy_nfs_socket(&self.id))
-    }
-}
+use run_directory::{private_dir, LockedRun, PendingGroupCleanup};
 
-#[cfg(all(test, target_os = "macos"))]
-#[test]
-fn legacy_recovery_without_a_socket_record_uses_the_flat_path() {
-    let id = uuid::Uuid::new_v4().to_string();
-    let state: Recovery = serde_json::from_value(serde_json::json!({
-        "format": "git-on-temp-v1",
-        "id": id,
-    }))
-    .unwrap();
-    assert!(state.nfs_socket.is_none());
-    assert_eq!(
-        state.nfs_socket_path(),
-        Some(PathBuf::from(format!("/private/tmp/git-on-nfs-{id}/s")))
-    );
-}
-
-const PENDING_RUN_LOCK: &CStr = c".git-on-lock-new";
-const RETIRING_LOCK_PREFIX: &str = ".git-on-remove-";
-
-fn private_dir(path: &Path) -> Result<()> {
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    Ok(())
-}
-fn open_marker(
-    directory: libc::c_int,
-    name: &CStr,
-    flags: libc::c_int,
-    mode: libc::c_int,
-) -> std::io::Result<File> {
-    let fd = unsafe {
-        libc::openat(
-            directory,
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            mode,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-fn open_run_lock(directory: libc::c_int, name: &CStr, owned: bool) -> Result<File> {
-    let f = open_marker(directory, name, libc::O_RDWR, 0)?;
-    let metadata = f.metadata()?;
-    anyhow::ensure!(metadata.is_file(), "invalid recovery lock type");
-    if owned {
-        anyhow::ensure!(
-            metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o777 == 0o600
-                && metadata.nlink() == 1
-                && metadata.len() == 0,
-            "invalid private run lock"
-        );
-    }
-    lock_file(&f)?;
-    Ok(f)
-}
-fn open_legacy_lock(dir: &Path) -> Result<File> {
-    let name = CString::new(dir.join(".lock").as_os_str().as_encoded_bytes())?;
-    open_run_lock(libc::AT_FDCWD, &name, false)
-}
-fn lock_file(file: &File) -> Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Err(error).context("run is active or locked");
-    }
-    Err(error).context("lock temporary run")
-}
-fn create_run_marker(dir: libc::c_int, path: &CStr) -> std::io::Result<File> {
-    open_marker(
-        dir,
-        path,
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    )
-}
-fn marker_entry(dir: libc::c_int, name: &CStr) -> std::io::Result<Option<libc::stat>> {
-    let mut entry = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            dir,
-            name.as_ptr(),
-            entry.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        let error = std::io::Error::last_os_error();
-        return if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    Ok(Some(unsafe { entry.assume_init() }))
-}
-fn marker_matches(dir: libc::c_int, name: &CStr, lock: &File) -> std::io::Result<bool> {
-    let Some(entry) = marker_entry(dir, name)? else {
-        return Ok(false);
-    };
-    let held = lock.metadata()?;
-    #[cfg(target_os = "linux")]
-    let dev = entry.st_dev;
-    #[cfg(target_os = "macos")]
-    let dev = entry.st_dev as u64;
-    Ok(dev == held.dev() && entry.st_ino == held.ino())
-}
-fn new_run_lock(dir: &File, acquire: impl FnOnce(&File) -> Result<()>) -> Result<File> {
-    let dir = dir.as_raw_fd();
-    let path = PENDING_RUN_LOCK;
-    let lock = create_run_marker(dir, path).context("create temporary run lock")?;
-    let published = acquire(&lock).and_then(|()| {
-        // Publish the ownership marker only after obtaining its lock.
-        anyhow::ensure!(
-            marker_matches(dir, path, &lock)?,
-            "temporary run marker changed before publication"
-        );
-        let result = unsafe { libc::renameat(dir, path.as_ptr(), dir, RUN_LOCK_NAME.as_ptr()) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error()).context("publish temporary run lock")
-        }
-    });
-    if let Err(error) = published {
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-        {
-            // A recovery process already holds the unfinished marker.
-            return Err(error);
-        }
-        if marker_matches(dir, path, &lock)?
-            && unsafe { libc::unlinkat(dir, path.as_ptr(), 0) } != 0
-        {
-            return Err(error).context(format!(
-                "remove unfinished run lock: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        return Err(error);
-    }
-    Ok(lock)
-}
-fn try_owned_run_lock(directory: &File, name: &CStr) -> Result<Option<File>> {
-    match open_run_lock(directory.as_raw_fd(), name, true) {
-        Ok(lock) => Ok(Some(lock)),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-struct LockedRun {
-    directory: File,
-    lock: File,
-    id: String,
-    marker: &'static CStr,
-    parked: bool,
-}
-
-fn lock_existing_run(dir: &Path) -> Result<Option<LockedRun>> {
-    let Some((directory, id)) = run_identity(dir)? else {
-        return Ok(None);
-    };
-    let group = open_removal_group(dir)?;
-    let ready = retiring_lock_name(dir, &id, RUN_LOCK_NAME);
-    let pending = retiring_lock_name(dir, &id, PENDING_RUN_LOCK);
-    let paths = [
-        (&directory, RUN_LOCK_NAME, RUN_LOCK_NAME, false),
-        (&directory, PENDING_RUN_LOCK, PENDING_RUN_LOCK, false),
-        (&group, ready.as_c_str(), RUN_LOCK_NAME, true),
-        (&group, pending.as_c_str(), PENDING_RUN_LOCK, true),
-    ];
-    // The directory exists briefly before startup can acquire its lock and
-    // create the pending marker. Leave a run without an ownership claim alone.
-    let mut claimed = false;
-    for &(parent, path, _, _) in &paths {
-        if marker_entry(parent.as_raw_fd(), path)?.is_some() {
-            claimed = true;
-            break;
-        }
-    }
-    if !claimed {
-        return Ok(None);
-    }
-    lock_file(&directory)?;
-    anyhow::ensure!(
-        same_run_directory(dir, &directory)?,
-        "temporary run changed while locking it"
-    );
-    for &(parent, path, marker, parked) in &paths {
-        if let Some(lock) = try_owned_run_lock(parent, path)? {
-            return Ok(Some(LockedRun {
-                directory,
-                lock,
-                id,
-                marker,
-                parked,
-            }));
-        }
-    }
-    Ok(None)
-}
-
-fn open_removal_group(dir: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(dir.parent().unwrap())
-        .context("open temporary run group")
-}
-fn retiring_lock_name(dir: &Path, id: &str, marker: &CStr) -> CString {
-    let basename = dir
-        .file_name()
-        .unwrap()
-        .to_str()
-        .expect("validated run basename");
-    let kind = if marker == PENDING_RUN_LOCK {
-        "pending"
-    } else {
-        "ready"
-    };
-    CString::new(format!("{RETIRING_LOCK_PREFIX}{basename}-{kind}-{id}")).unwrap()
-}
-fn unlink_marker(directory: &File, marker: &CStr) -> std::io::Result<()> {
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), marker.as_ptr(), 0) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn park_run_marker(from: libc::c_int, marker: &CStr, to: libc::c_int, parked: &CStr) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::renameat2(
-            from,
-            marker.as_ptr(),
-            to,
-            parked.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::renameatx_np(
-            from,
-            marker.as_ptr(),
-            to,
-            parked.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if !matches!(
-        error.kind(),
-        std::io::ErrorKind::Unsupported
-            | std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::AlreadyExists
-    ) && error.raw_os_error() != Some(libc::ENOSYS)
-    {
-        return Err(error.into());
-    }
-    park_run_marker_with_reservation(from, marker, to, parked)
-}
-
-fn park_run_marker_with_reservation(
-    from: libc::c_int,
-    marker: &CStr,
-    to: libc::c_int,
-    parked: &CStr,
-) -> Result<()> {
-    // If the filesystem lacks exclusive rename, reserve the destination
-    // ourselves under the held directory flock. Mode zero is independent
-    // of the caller's umask and identifies an interrupted reservation.
-    if let Err(error) = open_marker(to, parked, libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL, 0) {
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
-        }
-    }
-    let reservation = marker_entry(to, parked)?.context("parking reservation disappeared")?;
-    anyhow::ensure!(
-        reservation.st_mode & (libc::S_IFMT | 0o7777) == libc::S_IFREG
-            && reservation.st_uid == unsafe { libc::geteuid() }
-            && reservation.st_nlink == 1
-            && reservation.st_size == 0,
-        "parking path is not an owned reservation"
-    );
-    if unsafe { libc::renameat(from, marker.as_ptr(), to, parked.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-impl LockedRun {
-    fn remove(&self, dir: &Path) -> Result<()> {
-        self.remove_with_parking(dir, park_run_marker)
-    }
-
-    fn remove_with_parking(
-        &self,
-        dir: &Path,
-        mut park: impl FnMut(libc::c_int, &CStr, libc::c_int, &CStr) -> Result<()>,
-    ) -> Result<()> {
-        let unfinished = self.marker == PENDING_RUN_LOCK;
-        if unfinished {
-            for entry in fs::read_dir(dir)? {
-                anyhow::ensure!(
-                    !self.parked && entry?.file_name().as_encoded_bytes() == self.marker.to_bytes(),
-                    "unfinished run contains other files"
-                );
-            }
-        }
-        let group = open_removal_group(dir)?;
-        anyhow::ensure!(
-            usable_run_group(dir.parent().unwrap(), &group.metadata()?),
-            "temporary run group changed during cleanup"
-        );
-        let parked_name = retiring_lock_name(dir, &self.id, self.marker);
-        anyhow::ensure!(
-            same_run_directory(dir, &self.directory)?,
-            "temporary run changed during cleanup"
-        );
-        if !self.parked {
-            anyhow::ensure!(
-                marker_matches(self.directory.as_raw_fd(), self.marker, &self.lock)?,
-                "temporary run marker changed during cleanup"
-            );
-            let mut park_marker = || {
-                park(
-                    self.directory.as_raw_fd(),
-                    self.marker,
-                    group.as_raw_fd(),
-                    &parked_name,
-                )
-            };
-            if let Err(error) = park_marker() {
-                let capacity_error = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
-                });
-                if unfinished || !capacity_error {
-                    return Err(error).context("park temporary run marker");
-                }
-
-                // Filesystems without exclusive rename may need an inode for
-                // the parking reservation. Reclaim run contents while the
-                // original ownership marker is still in place and locked.
-                anyhow::ensure!(
-                    same_run_directory(dir, &self.directory)?
-                        && marker_matches(self.directory.as_raw_fd(), self.marker, &self.lock)?,
-                    "temporary run or marker changed before reclaiming space"
-                );
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    if entry.file_name().as_encoded_bytes() == self.marker.to_bytes() {
-                        continue;
-                    }
-                    if entry.file_type()?.is_dir() {
-                        fs::remove_dir_all(entry.path())?;
-                    } else {
-                        fs::remove_file(entry.path())?;
-                    }
-                }
-                anyhow::ensure!(
-                    same_run_directory(dir, &self.directory)?
-                        && marker_matches(self.directory.as_raw_fd(), self.marker, &self.lock)?,
-                    "temporary run or marker changed while reclaiming space"
-                );
-                park_marker().context("park temporary run marker after reclaiming space")?;
-            }
-        }
-        anyhow::ensure!(
-            same_run_directory(dir, &self.directory)?
-                && marker_matches(group.as_raw_fd(), &parked_name, &self.lock)?,
-            "temporary run or parked marker changed during cleanup"
-        );
-        if unfinished {
-            fs::remove_dir(dir)?;
-        } else {
-            fs::remove_dir_all(dir)?;
-        }
-        anyhow::ensure!(
-            marker_matches(group.as_raw_fd(), &parked_name, &self.lock)?,
-            "parked temporary run marker changed during cleanup"
-        );
-        unlink_marker(&group, &parked_name).context("remove parked temporary run marker")?;
-        Ok(())
-    }
-}
-fn cleanup_orphaned_run_marker(dir: &Path) -> Result<bool> {
-    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
-        return Ok(false);
-    };
-    let parent = fs::canonicalize(
-        dir.parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?;
-    let dir = parent.join(name);
-    if !grouped_run(&dir)
-        || !name
-            .strip_prefix('g')
-            .is_some_and(|tail| tail.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return Ok(false);
-    }
-    let group = open_removal_group(&dir)?;
-    if !usable_run_group(&parent, &group.metadata()?) {
-        return Ok(false);
-    }
-    let prefix = format!("{RETIRING_LOCK_PREFIX}{name}-");
-    let mut removed = false;
-    for entry in fs::read_dir(&parent)? {
-        let entry = entry?.file_name();
-        let Some(identity) = entry
-            .to_str()
-            .and_then(|entry| entry.strip_prefix(&prefix))
-            .and_then(|tail| {
-                tail.strip_prefix("ready-")
-                    .or_else(|| tail.strip_prefix("pending-"))
-            })
-        else {
-            continue;
-        };
-        if uuid::Uuid::parse_str(identity).is_err() {
-            continue;
-        }
-        let marker = CString::new(entry.as_encoded_bytes())?;
-        if let Some(lock) = try_owned_run_lock(&group, &marker)? {
-            anyhow::ensure!(
-                matches!(fs::symlink_metadata(&dir), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-                    && marker_matches(group.as_raw_fd(), &marker, &lock)?,
-                "temporary run or marker changed during cleanup"
-            );
-            unlink_marker(&group, &marker)?;
-            removed = true;
-        }
-    }
-    if removed {
-        remove_empty_temporary_group(&parent)?;
-    }
-    Ok(removed)
-}
-fn read_recovery(dir: &Path) -> Result<Option<Recovery>> {
-    let file = match File::options()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join(".state"))
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("open recovery record"),
-    };
-    anyhow::ensure!(file.metadata()?.is_file(), "invalid recovery record type");
-    Ok(Some(serde_json::from_reader(file)?))
-}
 fn kill_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
     }
-}
-fn release_pin(m: &Recovery) -> Result<()> {
-    if let (Some(repo), Some(pin), Some(oid)) = (&m.git_dir, &m.pin_ref, &m.tree_oid) {
-        if pin != &format!("refs/git-on/{}", m.id) {
-            bail!("invalid pin reference");
-        }
-        let repo = git2::Repository::open(repo)?;
-        match repo.find_reference(pin) {
-            Ok(mut r) => {
-                if r.target().map(|x| x.to_string()).as_ref() != Some(oid) {
-                    bail!("pin changed; refusing deletion");
-                }
-                r.delete()?;
-            }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
-            Err(e) => return Err(e.into()),
-        };
-    }
-    Ok(())
 }
 struct Terminal {
     tty: Option<File>,
@@ -666,7 +157,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
                 git_on::git::cancel_by_signal(signal);
                 kill_group(child.id(), libc::SIGKILL);
                 child.wait().context("reap cancelled unmount helper")?;
-                bail!("clean unmount cancelled by signal {signal}; recovery state preserved for --cleanup");
+                bail!("clean unmount cancelled by signal {signal}");
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -682,7 +173,10 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            bail!("mount is busy or unmount failed; recovery state preserved for --cleanup");
+            bail!(
+                "mount is busy or unmount failed at {}",
+                mountpoint.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -900,7 +394,7 @@ fn mount_overlay(
             if let Err(cleanup) = mounted.finish() {
                 return Err(anyhow::anyhow!("{attach:#}; cleanup: {cleanup:#}"));
             }
-            ensure_unmounted(dir)?;
+            git_on::platform::ensure_unmounted(dir, None)?;
             remove_partial_nfs(id, nfs_socket)?;
             if allow_fallback && !filesystem_failed && git_on::git::cancelled_signal().is_none() {
                 Ok(None)
@@ -1001,68 +495,6 @@ fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
     }
     Ok(())
 }
-fn cleanup(dir: &Path) -> Result<()> {
-    let dir = match fs::canonicalize(dir) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if cleanup_orphaned_run_marker(dir)? {
-                return Ok(());
-            }
-            return Err(error.into());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let owned = lock_existing_run(&dir)?;
-    let (_legacy_lock, legacy, id) = match &owned {
-        Some(locked) if locked.marker == PENDING_RUN_LOCK => {
-            locked.remove(&dir)?;
-            remove_empty_temporary_group(dir.parent().unwrap())?;
-            return Ok(());
-        }
-        Some(locked) => (None, None, locked.id.clone()),
-        None => {
-            let lock = open_legacy_lock(&dir)?;
-            let state = read_recovery(&dir)?.context("missing recovery record")?;
-            anyhow::ensure!(
-                state.format == "git-on-temp-v1",
-                "unrecognized temporary directory"
-            );
-            let id = state.id.clone();
-            (Some(lock), Some(state), id)
-        }
-    };
-    #[cfg(target_os = "macos")]
-    let nfs_socket = legacy.as_ref().and_then(Recovery::nfs_socket_path);
-    if mount_is_ours(
-        &dir,
-        &id,
-        #[cfg(target_os = "macos")]
-        nfs_socket.as_deref(),
-    )? {
-        #[cfg(target_os = "linux")]
-        clean_unmount(&dir.join("mount"))?;
-        #[cfg(target_os = "macos")]
-        unmount_dead_server(&dir.join("mount"))?;
-    }
-    ensure_unmounted(&dir)?;
-    git_on::remote::stop_connection(&ssh_control_path(&dir))?;
-    #[cfg(target_os = "macos")]
-    git_on::platform::cleanup_nfs_socket(&id, nfs_socket.as_deref())?;
-    git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
-    if let Some(legacy) = &legacy {
-        release_pin(legacy)?;
-    }
-    if let Some(locked) = &owned {
-        locked.remove(&dir)?;
-    } else {
-        fs::remove_dir_all(&dir)?;
-    }
-    if grouped_run(&dir) {
-        remove_empty_temporary_group(dir.parent().unwrap())
-            .context("remove temporary git-on group")?;
-    }
-    Ok(())
-}
 fn supervise(
     child: &mut std::process::Child,
     signals: &mut Signals,
@@ -1107,7 +539,6 @@ fn supervise(
 }
 #[cfg(feature = "test-metrics")]
 fn report_metrics(snapshot: &Snapshot, backend: Option<&str>) -> Result<()> {
-    use std::io::Write;
     if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
         let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
         if fd < 3 {
@@ -1146,59 +577,18 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         )
     };
     let parent = fs::canonicalize(temporary).with_context(explain_temp_error)?;
-    let temp = loop {
-        let entropy = uuid::Uuid::new_v4().to_string();
-        let name = format!("g{}", &entropy[..5]);
-        // Keep the same Unix socket path length as the previous flat layout.
-        match create_temporary_entry(&parent, &name) {
-            Ok(temp) => break temp,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error).with_context(explain_temp_error),
-        }
-    };
-    let group = temp.parent().unwrap();
-    let initialized = (|| -> Result<_> {
-        let dir = fs::canonicalize(&temp)?;
-        let (directory, id) = run_identity(&dir)?.context("invalid temporary run attributes")?;
-        lock_file(&directory)?;
-        let lock = new_run_lock(&directory, lock_file)?;
-        anyhow::ensure!(
-            same_run_directory(&dir, &directory)?,
-            "temporary run changed while locking it"
-        );
-        Ok((
-            dir,
-            LockedRun {
-                directory,
-                lock,
-                id,
-                marker: RUN_LOCK_NAME,
-                parked: false,
-            },
-        ))
-    })();
-    let result = match initialized {
-        Ok((dir, locked)) => execute_in_group(invoked, run, dir, &locked, &mut signals),
-        Err(error) => {
-            let _ = fs::remove_dir(&temp);
-            Err(error)
-        }
-    };
-    let cleanup = remove_empty_temporary_group(group)
-        .with_context(|| format!("remove temporary git-on group {}", group.display()));
-    let status = result?;
-    cleanup?;
-    Ok(status)
+    let (dir, locked) = run_directory::create(&parent).with_context(explain_temp_error)?;
+    execute_in_group(invoked, run, dir, locked, &mut signals)
 }
 
 fn execute_in_group(
     invoked: Instant,
     run: cli::RunArgs<'_>,
     dir: PathBuf,
-    locked: &LockedRun,
+    locked: LockedRun,
     signals: &mut Signals,
 ) -> Result<ExitStatus> {
-    let id = locked.id.as_str();
+    let id = locked.id();
     let cli::RunArgs {
         tree,
         repository: source,
@@ -1368,6 +758,9 @@ fn execute_in_group(
         let outcome = outcome.and_then(|status| {
             if status.success() && git_on::git::cancelled_signal().is_none() {
                 snapshot.verify_used_packs()?;
+                if session.is_some() {
+                    snapshot.finish_idle_native_reader()?;
+                }
             }
             Ok(status)
         });
@@ -1415,51 +808,72 @@ fn execute_in_group(
                 )
             });
         }
+        locked.check_directory(&dir)?;
         if mount_is_ours(
             &dir,
             id,
             #[cfg(target_os = "macos")]
             nfs_socket.as_deref(),
         )? {
-            bail!(
-                "temporary mount remains at {}; use --cleanup after stopping its users",
-                dir.display()
-            );
+            return Err(locked.remaining_mount_error(&dir));
         }
-        ensure_unmounted(&dir)?;
+        locked.check_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
         git_on::remote::stop_connection(&ssh_control_path(&dir))?;
         #[cfg(target_os = "macos")]
         if let Some(socket) = nfs_socket.as_deref() {
             git_on::platform::cleanup_nfs_socket(id, Some(socket))?;
         }
-        git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
-        if dir.join("remote-repository").exists() {
-            fs::remove_dir_all(dir.join("remote-repository"))?;
-        }
-        match fs::remove_file(dir.join(git_on::remote::SSH_CONTROL_OWNER_FILE)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("remove SSH recovery identity"),
-        }
-        locked.remove(&dir)?;
+        locked.prepare_cleanup()?;
+        // Workers and mounts are gone. Release cached object descriptors
+        // before deleting their backing files, including on NFS clients.
+        locked.check_directory(&dir)?;
+        drop(observed.take());
         Ok(())
-    })();
+    })()
+    .and_then(|()| locked.remove(&dir))
+    .map(|_| ());
 
+    finish_execution(&dir, result, cleanup_result, observed)
+}
+
+fn finish_execution(
+    dir: &Path,
+    mut result: Result<ExitStatus>,
+    cleanup_result: Result<()>,
+    observed: Option<Snapshot>,
+) -> Result<ExitStatus> {
     if let Err(e) = cleanup_result {
+        if e.is::<PendingGroupCleanup>() {
+            // A command that completed still owns its exit status. A later
+            // --cleanup reports a pending result until the open file closes.
+            let _ = writeln!(io::stderr().lock(), "git-on: {e:#}");
+            return result;
+        }
         // Keep the private object files available to a later checked cleanup.
-        if let Some(snapshot) = observed.take() {
+        if let Some(snapshot) = observed {
+            if let Err(error) = git_on::service_memory::retain_for_cleanup(dir) {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "git-on: retain memory for cleanup: {error:#}"
+                );
+            }
             std::mem::forget(snapshot);
         }
         if git_on::git::cancelled_signal().is_some() {
-            eprintln!("git-on: {e:#}");
+            let _ = writeln!(io::stderr().lock(), "git-on: {e:#}");
         }
         result = Err(match result {
             Ok(_) => e,
             Err(a) => anyhow::anyhow!("{a:#}; cleanup: {e:#}"),
         });
     }
-    result
+    let group = dir.parent().unwrap();
+    let cleanup = remove_empty_temporary_group(group)
+        .with_context(|| format!("remove temporary git-on group {}", group.display()));
+    let status = result?;
+    cleanup?;
+    Ok(status)
 }
 fn subscribe_signals() -> std::io::Result<Signals> {
     git_on::git::initialize_cancellation()?;
@@ -1474,6 +888,15 @@ fn subscribe_signals() -> std::io::Result<Signals> {
 }
 fn main() {
     let invoked = Instant::now();
+    if let Some(status) = git_on::service_memory::invoke() {
+        std::process::exit(status);
+    }
+    if let Some(status) = git_on::remote::invoke_ssh_launcher() {
+        std::process::exit(status);
+    }
+    if let Some(status) = git_on::git::invoke_verifier() {
+        std::process::exit(status);
+    }
     if let Some(status) = git_on::terminal_ui::invoke_askpass() {
         std::process::exit(status);
     }
@@ -1483,7 +906,7 @@ fn main() {
         unsafe { git_on::object::configure_pack_descriptors() }?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
-                cleanup(Path::new(&directory))?;
+                run_directory::cleanup(Path::new(&directory))?;
                 Ok(ExitStatus::from_raw(0))
             }
             Ok(cli::Invocation::Run(run)) => execute(invoked, run),
@@ -1512,7 +935,7 @@ fn main() {
                 }
                 std::process::exit(128 + signal);
             }
-            eprintln!("git-on: {e:#}");
+            let _ = writeln!(io::stderr().lock(), "git-on: {e:#}");
             std::process::exit(125);
         }
     }
@@ -1524,7 +947,7 @@ mod tests {
     use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
-    static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn clean_unmount_waits_for_active_helper_but_bounds_completed_failures() {
@@ -1542,6 +965,7 @@ mod tests {
         assert!(error
             .to_string()
             .contains("mount is busy or unmount failed"));
+        assert!(!error.to_string().contains("--cleanup"));
         assert!(start.elapsed() < Duration::from_secs(6));
     }
 
@@ -1691,177 +1115,6 @@ mod tests {
                 }
             }
         }
-    }
-    fn recovery() -> Recovery {
-        Recovery {
-            format: "git-on-temp-v1".into(),
-            id: "unit-test".into(),
-            git_dir: None,
-            tree_oid: None,
-            pin_ref: None,
-        }
-    }
-    #[test]
-    fn recovery_refuses_active_runs_and_removes_disposable_state() {
-        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("temp");
-        private_dir(&dir).unwrap();
-        File::create(dir.join(".lock")).unwrap();
-        let held = open_legacy_lock(&dir).unwrap();
-        fs::write(dir.join(".state"), serde_json::to_vec(&recovery()).unwrap()).unwrap();
-        assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
-        drop(held);
-        cleanup(&dir).unwrap();
-        assert!(!dir.exists());
-    }
-    #[test]
-    fn recovery_does_not_compete_for_a_run_without_a_marker() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_temporary_entry(root.path(), "g123ab").unwrap();
-        let (directory, _) = run_identity(&dir).unwrap().unwrap();
-        lock_file(&directory).unwrap();
-        // Startup has obtained the directory lock but has not published
-        // even a pending marker. Recovery has no ownership claim yet.
-        assert!(lock_existing_run(&dir).unwrap().is_none());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-    }
-    #[test]
-    fn portable_marker_parking_retries_an_owned_reservation() {
-        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_temporary_entry(root.path(), "g123ab").unwrap();
-        let (directory, id) = run_identity(&dir).unwrap().unwrap();
-        lock_file(&directory).unwrap();
-        let lock = new_run_lock(&directory, lock_file).unwrap();
-        let group = open_removal_group(&dir).unwrap();
-        let parked = retiring_lock_name(&dir, &id, RUN_LOCK_NAME);
-        let path = dir.parent().unwrap().join(parked.to_str().unwrap());
-        let from = directory.as_raw_fd();
-        let to = group.as_raw_fd();
-
-        fs::write(&path, b"fixture content").unwrap();
-        assert!(park_run_marker_with_reservation(from, RUN_LOCK_NAME, to, &parked).is_err());
-        assert!(marker_matches(from, RUN_LOCK_NAME, &lock).unwrap());
-        assert_eq!(fs::read(&path).unwrap(), b"fixture content");
-        fs::remove_file(&path).unwrap();
-        let reservation = open_marker(
-            to,
-            &parked,
-            libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
-            0,
-        )
-        .unwrap();
-        assert_eq!(reservation.metadata().unwrap().mode() & 0o777, 0);
-        drop(reservation);
-
-        park_run_marker(from, RUN_LOCK_NAME, to, &parked).unwrap();
-        assert!(marker_matches(to, &parked, &lock).unwrap());
-        assert!(!marker_matches(from, RUN_LOCK_NAME, &lock).unwrap());
-        drop((directory, group, lock));
-        cleanup(&dir).unwrap();
-        assert!(!dir.exists());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn removal_reclaims_inodes_before_retrying_marker_parking() {
-        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_temporary_entry(root.path(), "g123ab").unwrap();
-        let (directory, id) = run_identity(&dir).unwrap().unwrap();
-        lock_file(&directory).unwrap();
-        let run = LockedRun {
-            lock: new_run_lock(&directory, lock_file).unwrap(),
-            directory,
-            id,
-            marker: RUN_LOCK_NAME,
-            parked: false,
-        };
-        let contents = dir.join("files");
-        fs::create_dir(&contents).unwrap();
-        fs::write(contents.join("checkout"), b"temporary contents").unwrap();
-        let mut attempts = 0;
-        run.remove_with_parking(&dir, |from, marker, to, parked| {
-            attempts += 1;
-            assert!(marker_matches(from, marker, &run.lock).unwrap());
-            if contents.exists() {
-                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
-            }
-            park_run_marker_with_reservation(from, marker, to, parked)
-        })
-        .unwrap();
-        assert_eq!(attempts, 2);
-        assert!(!dir.exists());
-        assert_eq!(fs::read_dir(dir.parent().unwrap()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn new_run_is_recoverable_only_once_its_lock_is_held() {
-        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_temporary_entry(root.path(), "g123ab").unwrap();
-        let (directory, _) = run_identity(&dir).unwrap().unwrap();
-        assert!(cleanup(&dir).is_err());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-
-        let failed = new_run_lock(&directory, |_| {
-            Err(std::io::Error::from_raw_os_error(libc::ENOLCK).into())
-        })
-        .unwrap_err();
-        assert_eq!(
-            failed
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(libc::ENOLCK)
-        );
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-
-        let held = new_run_lock(&directory, lock_file).unwrap();
-        assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
-        drop(held);
-        cleanup(&dir).unwrap();
-        assert!(!dir.exists());
-    }
-    #[test]
-    fn startup_cannot_publish_a_replacement_pending_marker() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_temporary_entry(root.path(), "g123ab").unwrap();
-        let (directory, _) = run_identity(&dir).unwrap().unwrap();
-        let replaced = new_run_lock(&directory, |original| {
-            unlink_marker(&directory, PENDING_RUN_LOCK)?;
-            let mut replacement = create_run_marker(directory.as_raw_fd(), PENDING_RUN_LOCK)?;
-            use std::io::Write;
-            replacement.write_all(b"replacement")?;
-            lock_file(original)
-        })
-        .unwrap_err();
-        assert!(format!("{replaced:#}").contains("marker changed"));
-        assert_eq!(
-            fs::read(dir.join(".git-on-lock-new")).unwrap(),
-            b"replacement"
-        );
-        assert!(!dir.join(".git-on-lock-v2").exists());
-    }
-    #[test]
-    fn recovery_releases_only_its_own_pin() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(root.path().join("repo")).unwrap();
-        let oid = repo.treebuilder(None).unwrap().write().unwrap();
-        let mut state = recovery();
-        state.git_dir = Some(repo.path().into());
-        state.tree_oid = Some(oid.to_string());
-        state.pin_ref = Some("refs/git-on/unit-test".into());
-        repo.reference(state.pin_ref.as_ref().unwrap(), oid, false, "test")
-            .unwrap();
-        release_pin(&state).unwrap();
-        assert!(repo
-            .find_reference(state.pin_ref.as_ref().unwrap())
-            .is_err());
-        state.pin_ref = Some("refs/heads/master".into());
-        assert!(release_pin(&state).is_err());
     }
     #[test]
     fn event_supervisor_preserves_exit_and_signal() {

@@ -78,7 +78,7 @@ Readers can receive a verified object while the rest of the pack is still in
 flight. Native Git fetches can use temporary pack files. Native decoder
 requests, Git's configuration and discovery output,
 and `mount_nfs` diagnostics pass through streams. Capture for
-operations that can invoke detached hooks or SSH proxies uses a seekable handle
+operations that can invoke detached helpers or SSH proxies uses a seekable handle
 so inherited output remains writable after the native Git process exits.
 On Linux the handle uses an anonymous memory file when available. Lazy
 decoding fills the object buffer in RAM and verifies the full Git OID before
@@ -112,9 +112,10 @@ The host enforces inherited process resource limits. See the
 supported workload.
 Successful cleanup releases all invocation-owned storage. Failed cleanup
 follows the documented recovery contract.
-Before deleting its run directory, the runner moves the locked ownership
-marker into the private temporary group. A retry can reuse that inode even
-when the first removal encountered an I/O error.
+The writable ownership marker stays in a private directory beside the run
+until deletion finishes. A retry can reuse that marker after an I/O error.
+Recovery also accepts older grouped records whose markers were moved there
+during removal.
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Native package and macOS behavior regressions for the test workflow."""
+import ast
 import os
 import json
 from pathlib import Path
@@ -18,6 +19,25 @@ WORKFLOW=(subprocess.check_output(['git','show',os.environ['GIT_ON_CI_BEFORE_REF
 def job(name):return re.search(r'^  '+name+r':\n(.*?)(?=^  [\w-]+:\n|\Z)',WORKFLOW,re.M|re.S)[1]
 
 
+def explicit_python_selectors(workflow):
+    def unfold(match):
+        lines = textwrap.dedent(match[2]).splitlines()
+        command = [lines[0]]
+        for before, after in zip(lines, lines[1:]):
+            same_paragraph = before and after and not before[0].isspace() and not after[0].isspace()
+            command.extend((' ' if same_paragraph else '\n', after))
+        return ''.join(command) + '\n'
+
+    commands = re.sub(
+        r'^([ ]+)run: >[+-]? *(?:#[^\n]*)?\n((?:(?:\1 +[^\n]*| *)\n)+)',
+        unfold, workflow + '\n', flags=re.M,
+    ).replace('\\\n', ' ')
+    for script, arguments in re.findall(r'\btests/([\w]+\.py)\b([^\n]*)', commands):
+        selectors = re.findall(r'\b([A-Za-z_]\w*)\.(test_\w+)\b', arguments)
+        if selectors:
+            yield script, selectors
+
+
 class CiContractTests(unittest.TestCase):
     def test_python_regression_suites_are_registered(self):
         # These standalone suites use explicit workflow commands, not discovery.
@@ -25,6 +45,26 @@ class CiContractTests(unittest.TestCase):
         for suite in sorted((ROOT/'tests').glob('test_*.py')):
             with self.subTest(suite=suite.name):
                 self.assertIn('tests/'+suite.name,WORKFLOW)
+
+    def test_explicit_python_test_selectors_exist(self):
+        for script, selectors in explicit_python_selectors(WORKFLOW):
+            module = ast.parse((ROOT / 'tests' / script).read_text())
+            methods = {
+                (node.name, method.name)
+                for node in module.body if isinstance(node, ast.ClassDef)
+                for method in node.body if isinstance(method, ast.FunctionDef)
+            }
+            for cls, method in selectors:
+                self.assertTrue((cls, method) in methods, f'{script} has no {cls}.{method}')
+
+    def test_folded_commands_expose_their_selectors(self):
+        workflow = (
+            '        run: >-\n'
+            '          python3 tests/remote.py --require-fuse\n'
+            '          RemoteTests.test_missing\n'
+        )
+        self.assertEqual(list(explicit_python_selectors(workflow)),
+                         [('remote.py', [('RemoteTests', 'test_missing')])])
 
     def test_package_requires_real_linux_and_macos_builds(self):
         body=job('package-build')

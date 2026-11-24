@@ -110,25 +110,42 @@ def ssh_branch_pack(root):
 def ssh_eof_pack(root, failed):
     repository = root / 'server.git'
     closing = set((root / 'closing').read_bytes().splitlines())
+    channel = os.environ.get('GIT_ON_FIXTURE_CHANNEL')
+    expire = root / 'expire-spares'
+    startup = channel and not expire.exists()
     try:
         (root / 'initial-channel').mkdir()
     except FileExistsError:
-        pass
+        initial = False
     else:
+        initial = True
         # Induce the normal slow-start path with negotiated spare channels.
-        time.sleep(.35)
+        if startup:
+            assert await_file(root / 'spare-advertised', 8)
+        else:
+            time.sleep(.35)
     with subprocess.Popen(['git', 'upload-pack', repository], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE) as git:
         try:
             for packet in packets(git.stdout):
                 sys.stdout.buffer.write(packet)
             sys.stdout.buffer.flush()
-            if (root / 'expire-spares').is_file() and not select.select([0], [], [], .45)[0]:
-                (root / f'expired-{os.getpid()}').touch()
-                return 0
-            while request := b''.join(packets(sys.stdin.buffer)):
+            if startup:
+                (root / f'advertised-{channel}').touch()
+                if not initial:
+                    (root / 'spare-advertised').touch()
+            while True:
+                if startup:
+                    while not select.select([0], [], [], .02)[0]:
+                        if expire.exists():
+                            return 0
+                request = b''.join(packets(sys.stdin.buffer))
+                if not request:
+                    break
                 wants = re.findall(rb'want ([0-9a-f]{40})', request)
                 wanted = wants[0]
+                if channel:
+                    (root / f'want-{wanted.decode()}-{channel}').touch()
                 time.sleep(.1)
                 if wanted in closing and select.select([0], [], [], 1.2)[0]:
                     assert not os.read(0, 1), 'extra input on a terminal request'
@@ -143,6 +160,26 @@ def ssh_eof_pack(root, failed):
         finally:
             git.stdin.close()
     return 0
+
+
+def read_after_ssh_expiry(root):
+    deadline = time.monotonic() + 8
+    while len(channels := list(root.glob('advertised-*'))) < 2:
+        assert time.monotonic() < deadline, 'both startup channels must advertise'
+        time.sleep(.02)
+    (root / 'expire-spares').touch()
+    # The local OpenSSH clients have consumed the server's normal exit. A
+    # zombie is also eligible for git-on's non-reaping child check.
+    pids = ','.join(path.name.split('-')[1] for path in channels)
+    while True:
+        status = subprocess.run(['ps', '-o', 'stat=', '-p', pids], capture_output=True, text=True)
+        assert status.returncode in (0, 1) and not status.stderr, status.stderr
+        states = status.stdout.split()
+        if all(state.startswith('Z') for state in states):
+            break
+        assert time.monotonic() < deadline, (pids, states)
+        time.sleep(.02)
+    os.execvp('cat', ['cat', 'deep/file'])
 
 
 def pack_entry(kind, data):
@@ -197,10 +234,19 @@ def mount_flag():
 
 
 class StreamingTests(unittest.TestCase):
-    def sparse_ssh_fixture(self, failed=False):
+    def sparse_ssh_fixture(self, failed=False, expire=False):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
-        url = fixture.ssh(protocol_v2=True, max_sessions=5)
+        url = fixture.ssh(protocol_v2=True, max_sessions=2 if expire else 5,
+                          accept_env=('GIT_ON_FIXTURE_CHANNEL',) if expire else ())
+        if expire:
+            wrapper = fixture.root / 'ssh'
+            wrapper.write_text(
+                '#!/bin/sh\nexport GIT_ON_FIXTURE_CHANNEL=$$\n'
+                'exec /usr/bin/ssh -o SendEnv=GIT_ON_FIXTURE_CHANNEL "$@"\n'
+            )
+            wrapper.chmod(0o700)
+            fixture.env['GIT_SSH_COMMAND'] = str(wrapper) + fixture.env['GIT_SSH_COMMAND'][3:]
         closing = [fixture.subtree, fixture.blob]
         (fixture.root / 'closing').write_text('\n'.join(closing))
         shim = [sys.executable, str(Path(__file__).resolve()), '--ssh-eof',
@@ -231,22 +277,24 @@ class StreamingTests(unittest.TestCase):
                                     f'SSH stdin remained open while pack for {oid} was in flight')
                 self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
-    def test_sparse_ssh_ignores_standbys_that_expired_before_the_first_lookup(self):
-        fixture, url, closing = self.sparse_ssh_fixture()
-        (fixture.root / 'expire-spares').touch()
-        result = self.run_sparse_ssh(fixture, url, ['/bin/sh', '-c', 'sleep 1.1; exec cat deep/file'])
-        self.assertTrue(list(fixture.root.glob('expired-*')), 'no standby timed out')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b'expected\n')
-        self.assertFalse(any((fixture.root / oid).exists() for oid in closing))
-        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
-
     def test_first_cold_ssh_directory_enumeration_keeps_channels_reusable(self):
         fixture, url, _ = self.sparse_ssh_fixture()
         result = self.run_sparse_ssh(fixture, url, ['ls', '-1', 'deep'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'file\n')
         self.assertFalse((fixture.root / fixture.subtree).exists(), 'SSH stdin closed during readdir')
+
+    def test_expired_ssh_standbys_are_replaced_through_the_same_master(self):
+        fixture, url, _ = self.sparse_ssh_fixture(expire=True)
+        result = self.run_sparse_ssh(fixture, url, [
+            sys.executable, str(Path(__file__).resolve()), '--ssh-after-expiry', str(fixture.root),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+        expired = {path.name.rsplit('-', 1)[1] for path in fixture.root.glob('advertised-*')}
+        [request] = fixture.root.glob(f'want-{fixture.subtree}-*')
+        self.assertNotIn(request.name.rsplit('-', 1)[1], expired)
+        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
     def ssh_branch_fixture(self):
         fixture = fixture_in_short_tmp()
@@ -648,5 +696,7 @@ if __name__ == '__main__':
         ssh_branch_pack(Path(sys.argv[2]))
     elif sys.argv[1:2] == ['--ssh-eof']:
         sys.exit(ssh_eof_pack(Path(sys.argv[2]), sys.argv[3].encode()))
+    elif sys.argv[1:2] == ['--ssh-after-expiry']:
+        read_after_ssh_expiry(Path(sys.argv[2]))
     else:
         unittest.main(argv=[sys.argv[0], *ARGS])

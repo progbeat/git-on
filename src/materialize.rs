@@ -1,13 +1,16 @@
 //! Eager, byte-preserving non-FUSE execution view for explicit write-policy=all.
-use crate::snapshot::{EntryKind, Snapshot};
+use crate::{
+    platform::{open_child_directory, DirectoryEntries},
+    snapshot::{EntryKind, Snapshot},
+};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
-    ffi::{CStr, CString},
+    ffi::CStr,
     fs::{self, OpenOptions},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStrExt,
-        fs::{symlink, OpenOptionsExt, PermissionsExt},
+        fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -15,9 +18,8 @@ use std::{
 /// After checking that no mount remains, restore only owned physical directory
 /// permissions. A child may have removed all owner access from its disposable
 /// view. Walk pinned directory descriptors; never traverse a snapshot symlink.
-pub fn prepare_cleanup(root: &Path) -> Result<()> {
-    let root = CString::new(root.as_os_str().as_bytes())?;
-    restore_at(libc::AT_FDCWD, &root)
+pub fn prepare_cleanup(run: &fs::File) -> Result<()> {
+    restore_at(run.as_raw_fd(), c"mount")
 }
 
 fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
@@ -46,83 +48,73 @@ fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
         stat.st_uid == unsafe { libc::geteuid() },
         "refusing to chmod a foreign directory"
     );
-    let mode = (stat.st_mode & 0o7777) | 0o700;
-    let open = || unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    let mut fd = open();
-    if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied {
-        // Opening a mode-000 directory first requires a no-follow chmod. This
-        // operation also refuses a symlink substituted between stat and chmod.
-        if unsafe { libc::fchmodat(parent, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("restore locked disposable directory");
+    let open = || open_child_directory(parent, name, libc::O_RDONLY);
+    let directory = match open() {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            restore_locked_directory(parent, name, &stat)?;
+            open()
         }
-        fd = open();
+        result => result,
     }
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("open disposable directory without following links");
+    .context("open disposable directory for cleanup")?;
+    let metadata = checked_directory_metadata(&directory, &stat)?;
+    if metadata.mode() & 0o700 != 0o700 {
+        directory.set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
     }
-    let directory = unsafe { fs::File::from_raw_fd(fd) };
-    use std::os::unix::fs::MetadataExt;
-    let metadata = directory.metadata()?;
+    let mut entries =
+        DirectoryEntries::from_file(directory).context("read disposable directory")?;
+    let directory = entries.as_raw_fd();
+    while let Some((name, kind)) = entries
+        .next_entry()
+        .context("enumerate disposable directory")?
+    {
+        if matches!(kind, libc::DT_DIR | libc::DT_UNKNOWN) {
+            restore_at(directory, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn checked_directory_metadata(file: &fs::File, expected: &libc::stat) -> Result<fs::Metadata> {
+    let metadata = file.metadata()?;
     #[cfg(target_os = "linux")]
-    let device = stat.st_dev;
+    let device = expected.st_dev;
     #[cfg(target_os = "macos")]
-    let device = stat.st_dev as u64;
+    let device = expected.st_dev as u64;
     ensure!(
-        metadata.ino() == stat.st_ino && metadata.dev() == device && metadata.uid() == stat.st_uid,
+        metadata.ino() == expected.st_ino
+            && metadata.dev() == device
+            && metadata.uid() == expected.st_uid,
         "disposable directory changed during cleanup"
     );
-    directory.set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
-    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("duplicate cleanup directory descriptor");
+    Ok(metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_locked_directory(parent: libc::c_int, name: &CStr, expected: &libc::stat) -> Result<()> {
+    // O_PATH pins and checks the actual mount without requiring read access.
+    let directory = open_child_directory(parent, name, libc::O_PATH)?;
+    let metadata = checked_directory_metadata(&directory, expected)?;
+    fs::set_permissions(
+        format!("/proc/self/fd/{}", directory.as_raw_fd()),
+        fs::Permissions::from_mode(metadata.mode() | 0o700),
+    )
+    .context("restore locked disposable directory")
+}
+
+#[cfg(target_os = "macos")]
+fn restore_locked_directory(parent: libc::c_int, name: &CStr, expected: &libc::stat) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(parent, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect cleanup parent");
     }
-    struct Entries(*mut libc::DIR);
-    impl Drop for Entries {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-    let entries = unsafe { libc::fdopendir(duplicate) };
-    if entries.is_null() {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(duplicate);
-        }
-        return Err(error).context("read disposable directory");
-    }
-    let entries = Entries(entries);
-    loop {
-        // readdir returns null for either EOF or error; clear/check errno.
-        #[cfg(target_os = "linux")]
-        let errno = unsafe { libc::__errno_location() };
-        #[cfg(target_os = "macos")]
-        let errno = unsafe { libc::__error() };
-        unsafe {
-            *errno = 0;
-        }
-        let entry = unsafe { libc::readdir(entries.0) };
-        if entry.is_null() {
-            if unsafe { *errno } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("enumerate disposable directory");
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            restore_at(directory.as_raw_fd(), name)?;
-        }
+    ensure!(
+        unsafe { stat.assume_init() }.st_dev == expected.st_dev,
+        "a mount remains below the disposable directory"
+    );
+    let mode = (expected.st_mode & 0o7777) | 0o700;
+    if unsafe { libc::fchmodat(parent, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("restore locked disposable directory");
     }
     Ok(())
 }
@@ -191,7 +183,8 @@ pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
-    )
+    )?;
+    snapshot.finish_materialization()
 }
 fn directory(
     snapshot: &Snapshot,

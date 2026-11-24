@@ -53,6 +53,27 @@ tests as skipped; this is not evidence that the filesystem works. `--uv` enables
 the dependency integration tests and must not be omitted when claiming complete
 coverage.
 
+To exercise shutdown after rereading a spilled blob on an NFS-backed temporary
+directory, run the real FUSE test with `TMPDIR` set to a writable NFS mount:
+
+```sh
+TMPDIR=/path/to/nfs python3 tests/integration.py --require-fuse \
+  MountTests.test_cleanup_after_reading_a_spilled_blob
+```
+
+This places the raw cache on NFS, where an open file can defer unlink. The FUSE
+mount still serves the snapshot to the child command.
+The real-FUSE CI job provisions loopback NFS from `nfs-kernel-server` in
+private namespaces. It checks command status, spill, legacy recovery, and
+focused Rust recovery checks on that backing filesystem. Build the bin test
+harness with `cargo test --locked --bin git-on --no-run` and pass its printed
+executable path as `test_binary`.
+
+```sh
+sudo unshare --mount --net --uts --propagation private \
+  /bin/sh tests/nfs_cleanup.sh target/debug/git-on "$(id -u)" "$(id -g)" "$test_binary"
+```
+
 ## Remote transport and native verification
 
 `tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
@@ -99,8 +120,9 @@ total deadline; these socket-pair checks are distinct from actual SSH and FUSE.
 The million fixture has exactly one million distinct seven-byte blobs at six
 digit paths; preparation verifies every leaf before measuring remote demand.
 
-The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
-mounts for remote writes, keep, cancellation, busy/stale recovery, external
+The `rust` CI job runs loader regressions. `real-fuse` runs the OpenSSH
+regressions and requires real mounts for remote writes, keep, cancellation,
+busy/stale recovery, external
 `git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
 FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub

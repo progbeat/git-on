@@ -43,6 +43,28 @@ separate from that contract; a requirement is not a claim of a passing test.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
+## Service state
+
+Git-on may read caller files and repositories and obtain data from remote
+sources. Git-on and the processes it starts for its own work must keep changes
+inside run-owned service storage. This applies during preparation, execution,
+normal teardown, failure, cancellation, and stale-run cleanup. The runner may
+write normal process output to the caller's stdout and stderr.
+
+- Source refs, indexes, object databases, Git configuration, and worktrees
+  retain their contents. The runner leaves no persistent clone and makes no
+  requests to write remote repository data.
+- Native compatibility paths may stage Git objects and indexes in a memory
+  filesystem when Git needs them for fetch or signature verification.
+- Native Git operations disable hooks and local filesystem monitors. Credential
+  lookup reads existing credentials. An authentication result does not save,
+  erase, or replace stored credentials, host keys, or cookies.
+- Cleanup can remove owned runtime data. Recovery metadata from an older
+  invocation does not authorize Git-on to write to a source repository.
+- The writable snapshot and actions of the command after `--` follow the
+  [filesystem policy](#filesystem-policy). This policy does not grant extra
+  write access to preparation or cleanup processes.
+
 ## Native Git argument compatibility
 
 This compatibility is part of the original command contract. Corrections that
@@ -58,12 +80,14 @@ is part of this bug fix; it does not require a major version increment.
   required for local resolution as well as remote operations.
 - With two operands, native Git resolves configured remotes, URLs and local
   paths. The [reusable transport](remote.md#object-demand-and-cache-lifetime)
-  can select an unambiguous branch or full object ID. The compatibility path
+  can select an unambiguous branch or full object ID. A source-only force
+  refspec can use the same selection when default fetch mappings make a private
+  destination update unnecessary. The compatibility path
   passes the exact repository and revision/refspec arguments to native
   `git fetch` in a private temporary Git repository for ref selection and
   precedence.
-  A colon in this second operand is fetch syntax; git-on must not reinterpret
-  it as a remote subtree selector or strip a `+` prefix.
+  That path keeps any `+` prefix. A colon in this operand is fetch syntax
+  and never selects a remote subtree.
 - Do not implement an additional repository/revision grammar, reject operands
   by character set or encoding, trim them, expand names, duplicate Git's
   ambiguity checks or introduce host-specific resolution. Delegate acceptance
@@ -76,8 +100,7 @@ is part of this bug fix; it does not require a major version increment.
   must yield a Git tree. These are checks of Git's result, not operand syntax.
   Signature verification examines the exact selected commit or annotated tag;
   a tree returned by `HEAD:path` has no signature to verify.
-- Caller refs, index and working files must stay untouched. Fetch destinations
-  are confined to the private repository. Existing object-demand, filter,
+- Fetch destinations are confined to the private repository. Existing object-demand, filter,
   cancellation, SSH ownership, cache and filesystem contracts still apply;
   materialization cannot bypass any Git resolution, verification or object error.
 - Git-on accesses the caller's local object database read-only and retains the
@@ -89,11 +112,9 @@ is part of this bug fix; it does not require a major version increment.
   Git-selected object database, including object directories and alternates.
   Relative object locations follow native Git's repository setup context,
   including worktree subdirectories, bare repositories and explicit `GIT_DIR`.
-  Native fetch can invoke configured Git hooks for its private ref updates;
-  git-on does not introduce a checkout or run checkout filters on snapshot
-  content. Hooks and other configured helpers are caller programs with host
-  access, like the explicitly executed command; their side effects are not
-  confined by the snapshot's write policy.
+  Native operations apply the [service-state invariant](#service-state) while
+  resolving and fetching objects. Git-on reads the snapshot directly from Git
+  objects and uses its own materializer for a disposable execution tree.
 - Regression tests must compare acceptance, selected objects and diagnostics
   against native Git in isolated fixture repositories. Include native ref
   spellings and prefixes, colliding branch/tag names, literal fetch refspecs,
@@ -135,22 +156,40 @@ The native mount and write-policy contracts apply to local and remote runs.
   storage in a per-run directory under `TMPDIR/git-on` (or the system temporary
   location's `git-on` directory). If another unprivileged user owns that group
   or an ordinary file occupies its name, git-on uses a private group for the current
-  user. Git-on creates no private memory filesystem
-  and imposes no disk quota. The underlying temporary filesystem's capacity and
-  operating-system limits apply.
+  user. The writable layer uses the underlying temporary filesystem's capacity
+  and operating-system limits. Its location is independent of private service
+  memory.
 - Completion unmounts the snapshot and removes the run's temporary files.
   The last run removes its empty group.
+  When an NFS client defers removal because a file is still open, git-on
+  reports the run path and preserves the command's exit status. The diagnostic
+  gives a later `--cleanup` command when automatic recovery can verify the
+  record, and identifies manual recovery when the surviving directory lacks
+  a persistent identity.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
 - Handle recoverable resource errors through ordinary operation or runner
   failures and orderly cleanup whenever possible. Manual stale-run recovery
   does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
-  cleanup. New runs publish an empty ownership file after acquiring its
-  exclusive lock. The mount identity comes from the private directory's
-  name, owner and inode. SSH recovery retains
-  the owned endpoint identity. Cleanup accepts older run records and checks a
-  recorded Git pin's target before releasing it.
+  cleanup. New runs lock an empty, writable ownership marker before creating
+  the run directory. The marker stays in a private sibling directory through
+  teardown. Its name records the identities of the run directory and the
+  locked marker before execution.
+  If startup is interrupted before binding, cleanup can reclaim a reservation
+  with no run directory. A surviving directory without a matching marker is
+  left for manual recovery.
+  Startup rollback and ordinary cleanup can retire that marker without
+  allocating another inode.
+  On Linux the marker records the directory's persistent handle and creation
+  time when available to distinguish inode reuse. Recovery compares the handles
+  when both are available and falls back to creation time when a handle is
+  unavailable. The first recorded identifier stays the mount identity.
+  On macOS automatic recovery of a new run requires the directory's birth time.
+  Live cleanup can use the open directory descriptor alone. Recovery
+  preserves existing directories whose binding it cannot verify. SSH recovery retains
+  the owned endpoint identity. Cleanup accepts older run records and
+  leaves recorded Git pins in the source repository.
   `git on --cleanup <temporary-directory>` must refuse active directories and
   unrelated mounts. It never terminates processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
@@ -163,6 +202,12 @@ needed to decode and retain a pack. Git-on leaves inherited process
 limits, including `RLIMIT_FSIZE`, to the host. It follows its own cache
 policy independently of those limits. The two-checkout budget concerns
 available filesystem space for Git-on and the command.
+When native Git or a verifier requires regular files, the available
+space on the service memory filesystem also bounds the invocation.
+This capacity is independent of the space available under `TMPDIR`.
+If both automatic Linux tmpfs choices are too small for a native pack
+and its indexes, select a larger writable tmpfs with
+`GIT_ON_SERVICE_TMPDIR`.
 
 ## Backend selection and materialization
 
@@ -319,7 +364,7 @@ No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
 hardware, software, storage, cache state, fixture shape, and the tested revision.
 
-## Storage and buffer requirements for the target design
+## Storage and buffer requirements
 
 1. When Git-on or a helper writes data that Git-on owns and keeps internal,
    it may write to disk only to spill blob contents evicted from the LRU
@@ -337,11 +382,12 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
    complexity. Where practical, compute and cache needed results as the data
    is processed, taking into account the capabilities of the libraries in use.
 
-The preceding sections describe the current behavior contract. Native Git
-compatibility can still stage packs in temporary storage when it applies the
-caller's fetch and transport policies. The target design must reconcile
-temporary Git repositories, pack staging and SSH crash recovery with these
-requirements.
+Native Git compatibility may require filesystem paths for private Git objects,
+pack indexes, diagnostics or verifier files. Those paths use a memory
+filesystem. Internal synchronization and recovery may use directory entries,
+empty locks and sockets alongside the writable layer. Those entries carry
+ownership and lifetime information without staging internal file contents
+there.
 
 ## Acceptance evidence
 

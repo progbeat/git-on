@@ -32,14 +32,10 @@ def _allocated():
 '''
 
 
-def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, source=None,
-                     write_policy='all', git_config=None, checkout_copies=1, tls_ca=None,
-                     revision='HEAD', runner_size_mib=None):
-    runner_size_mib = size_mib if runner_size_mib is None else runner_size_mib
-    assert 0 < runner_size_mib <= size_mib
+def private_mount_namespace(test):
     unshare=shutil.which('unshare')
     if not unshare:
-        if os.environ.get('GITHUB_ACTIONS')=='true':test.fail('unshare is required for quota coverage')
+        if os.environ.get('GITHUB_ACTIONS')=='true':test.fail('unshare is required for mount namespace coverage')
         test.skipTest('unshare is unavailable')
     prefix=[unshare,'--user','--map-root-user','--mount','--propagation','private']
     probe=subprocess.run([*prefix,'/bin/true'],capture_output=True)
@@ -54,6 +50,15 @@ def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, so
             if os.environ.get('GITHUB_ACTIONS')=='true':test.fail(reason)
             test.skipTest(reason)
         uid,gid=os.getuid(),os.getgid()
+    return prefix, uid, gid
+
+
+def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, source=None,
+                     write_policy='all', git_config=None, checkout_copies=1, tls_ca=None,
+                     revision='HEAD', runner_size_mib=None):
+    runner_size_mib = size_mib if runner_size_mib is None else runner_size_mib
+    assert 0 < runner_size_mib <= size_mib
+    prefix, uid, gid = private_mount_namespace(test)
     volume=root/'quota';volume.mkdir(exist_ok=True)
     test.assertEqual(list(volume.iterdir()),[],'quota mountpoint must be empty')
     driver=r'''

@@ -2,8 +2,9 @@
 use anyhow::{Context, Result};
 use git_on::snapshot::Snapshot;
 use std::{
-    env,
+    env, fs,
     io::{self, BufRead, Write},
+    os::unix::fs::PermissionsExt,
     path::Path,
 };
 fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
@@ -22,12 +23,23 @@ fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
+    if let Some(status) = git_on::service_memory::invoke() {
+        std::process::exit(status);
+    }
+    if let Some(status) = git_on::remote::invoke_ssh_launcher() {
+        std::process::exit(status);
+    }
+    if let Some(status) = git_on::git::invoke_verifier() {
+        std::process::exit(status);
+    }
     // Same process-start resource policy as the production CLI.
     unsafe { git_on::object::configure_pack_descriptors() }?;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let source = args.first().context("source required")?;
     let revision = args.get(1).context("revision required")?;
-    let run = tempfile::tempdir()?;
+    let run = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let loaded = Snapshot::load_source(
         &env::current_dir()?,
         (source != "local").then_some(source.as_os_str()),

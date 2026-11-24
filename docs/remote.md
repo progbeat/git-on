@@ -14,12 +14,11 @@ scp-style SSH URLs use native Git repository resolution and transport. Effective
 URL rewriting is applied once. Authentication and server capabilities still
 determine whether execution can proceed.
 
-Native fetches honor inherited Git configuration, including configured hooks.
-For example, a destination ref update can invoke `reference-transaction` through
-the caller's `core.hooksPath`. Native Git writes those destination refs in the
-private repository; hooks remain ordinary user programs with access to host
-paths outside the snapshot. Reading the snapshot performs no checkout and runs
-no checkout filters or worktree hooks.
+Native fetches apply inherited Git configuration within the
+[service-state contract](specification.md#service-state). Git-on disables
+hooks, including `reference-transaction` for updates in a private repository.
+Snapshot contents come directly from Git objects. Native Git never needs a
+worktree checkout to prepare them.
 
 Fetch syntax such as `heads/main`, `tags/release`, `+main` and
 `main:refs/heads/demo` is interpreted by Git. A destination ref is written only
@@ -67,9 +66,11 @@ server advertises `ref-in-want`. With a full OID, the first fetch can handle
 the POST authentication challenge directly. A non-pack reply to the first
 fetch can require a ref query to finish authentication before retrying the
 same OID. If HTTPS falls back to native Git before decoding the first pack,
-native fetch keeps any OID already selected by the reusable channel. Git selects
-branches of named remotes with configured fetch mappings and applies their tracking
-ref updates in the private repository. Git also handles configured remote groups.
+native fetch keeps any OID already selected by the reusable channel. A named
+remote with Git's usual branch-to-tracking map uses the same streamed selection
+as its effective URL. With default fetch mappings, an unambiguous source-only
+force refspec such as `+main` uses the same stream as `main`. Explicit
+destinations, custom fetch mappings and remote groups use native Git.
 An SSH identity that
 authenticates without a prompt can select the branch or exact object ID and
 fetch the root tree over one owned channel. Other refspecs use native Git's
@@ -90,12 +91,14 @@ object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
 an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
-For a supported host-scoped HTTP Basic challenge, native Git fills the
-credentials and reports approval or rejection to its helpers. Helpers can
+For a supported host-scoped HTTP Basic challenge, native Git reads existing
+credentials with `git credential fill` in the caller's context. Helpers can
 provide a username and password or continue an exchange with pre-encoded
-Authorization values as the server changes challenges. Other initial
-challenges and credential policies use native Git's HTTP exchange. Libcurl and
-the peer govern the active streams. The loader can briefly wait for
+Authorization values as the server changes challenges. Both streaming and
+native HTTPS dispatch only credential lookups. Stored credentials and cookie
+files retain their contents after either outcome. Other initial challenges
+and credential policies use native Git's HTTP exchange. Libcurl and the peer
+govern the active streams. The loader can briefly wait for
 overlapping demands after confirming a scan or observing consistently slow
 replies.
 Each foreground fetch can group up to 64 already pending OIDs.
@@ -107,8 +110,8 @@ When the native ref advertisement supplies capabilities, Git-on captures
 the packet trace in a private temporary file and scans bounded chunks for
 filter support. Detached writers can finish using their open descriptors.
 Later opens of the trace path go to the null device during the run.
-An explicitly configured `GIT_TRACE_PACKET` destination receives the captured
-advertisement when discovery finishes, including when filtering is unavailable.
+The runner can emit the captured advertisement to the caller's stdout or
+stderr. Paths to external trace files and pipes remain untouched.
 
 Native helpers start with four available channels. If each of the first eight
 successful transfers takes at least 64 milliseconds, the pool can use up to
@@ -209,17 +212,34 @@ and write verified file contents to their
 destination paths. If automatic mount setup fails and copying is allowed, the
 same transfer can use the already selected OID. Native Git handles competing
 refs, named fetches on servers advertising `ref-in-want`, other refspecs,
-configured fetch mappings and hooks, and signature verification. Explicit
+custom fetch mappings, and signature verification. Explicit
 Git settings outside those handled by the streaming path go through native
 fetch, including settings that Git validates before accepting a pack.
 In that path, retain the compressed pack and decode
-directly into destination files. Both paths reuse already prepared objects.
-Neither path needs server-side filtering or fetches the repository's complete
-history. The direct HTTPS path reports accepted or rejected Basic credentials
-through Git's configured helpers when both credential operations use the same
-host scope. Git receives the server's original challenge values. A rejected
-credential ends the exchange. Native Git handles repository- or user-scoped
-credentials and other authentication challenges.
+directly into destination files. Large blobs in the same staged pack share a
+single native batch decoder. Both paths reuse already prepared objects.
+Both paths ask for a shallow snapshot and can operate without server-side
+filtering. Git receives the server's original challenge values during
+credential lookup. A rejected credential ends the exchange. Native Git handles
+repository- or user-scoped credentials and other authentication challenges.
+
+A temporary Git repository serves native fetch and signature verification.
+Git's file-URL diagnostic can also need a Git repository to parse escaped
+local URLs. The pack reader opens the indexes Git already built from a
+separate object directory. For local revisions with nested alternates or
+byte paths, a read-only object-location bridge represents the source layout
+for libgit2. Index expressions such as `:path` use a private Git context
+that directs split-index timestamp updates to service storage. Native Git
+reads the primary index, its referenced base and objects from the source.
+An alternate index outside the Git directory may need a private copy of its
+referenced base to preserve Git's lookup order. Standard streamed HTTPS,
+SSH and plain local paths need no temporary Git repository, including during
+credential lookup. This includes `origin` with the standard tracking refspec
+when its resolved URL streams.
+
+Native object directories, verification scratch and any regular files used
+for diagnostics are memory-backed. See
+[temporary storage](usage.md#temporary-storage) for the platform settings.
 
 When materialization fetches missing objects by OID, at most 256 known object
 IDs from the current directory can share one native `fetch --stdin` and
@@ -282,9 +302,8 @@ Each remote invocation owns an invocation-local object store. The direct
 reusable HTTPS and SSH startup paths keep the selected commit or tag and its
 root tree in memory. Native fetch, signature verification and native interactive
 preparation can use a private temporary bare repository.
-When HTTPS challenges for credentials, Git's helper runs in its usual private
-repository context. Reusable fetches still keep their verified Git objects in
-memory.
+The streamed HTTPS credential lookup uses the caller's configuration and
+working directory. Reusable fetches keep verified Git objects in memory.
 Demanded objects remain available until cleanup,
 including after decoded memory-cache eviction.
 There is no global persistent object cache or cross-run reuse. A later invocation
@@ -324,8 +343,9 @@ verification or object errors. See [resource acceptance](resources.md).
 SIGKILL cannot run cleanup handlers. The runner does not request FUSE
 `auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected
 and fresh directory access fails with `ENOTCONN`. The command's separate process
-group and an established persistent SSH master can survive. Run directories,
-private objects remain. Kernel locks are released when their owning descriptors
+group and an established persistent SSH master can survive. The workspace
+keeps its memory-backed recovery data while a recorded SSH master or a
+retained run needs it. Kernel locks are released when their owning descriptors
 close. Stop the command and other mount users yourself,
 then run `git on --cleanup <temporary-directory>` to unmount and release recorded
 resources. Recovery never kills processes using stale PID records. A kill during
@@ -344,7 +364,9 @@ Authenticate OpenSSH during ref advertisement before mounting. Use a private
 ControlMaster socket. An unlocked agent needs zero key passphrase prompts; an
 ordinary selected encrypted identity authenticates once. Lazy fetches reuse the
 master, enable BatchMode and forbid replacement TCP connections. Connection loss
-fails clearly. Existing OpenSSH host-key policy controls first-contact prompts.
+fails clearly. OpenSSH uses the caller's existing trusted host keys.
+Unknown hosts require trust to be established before running Git-on.
+The runner disables host-key updates and forwarding.
 During native Git authentication, Ctrl-Z stops the invoking job and returns
 control to its shell. `fg` resumes preparation with the terminal; `bg` leaves the shell
 foregrounded, so another authentication read can stop the job until `fg`.
@@ -386,6 +408,27 @@ its socket identity is checked again. Older metadata-only client records lack a
 content fingerprint: close their live master with a trusted client before
 retrying cleanup. Legacy records without any selected-client entry can still
 close their identity-checked master through the same direct mux protocol.
+OpenSSH checks existing host keys at the destination and at each configured
+jump. Every hop uses the run's read-only host-key policy.
+With `CheckHostIP=yes`, OpenSSH checks existing address entries as usual.
+Git-on directs additions to `/dev/null` and keeps the configured files in
+the lookup order. A host-file setting that cannot be determined unambiguously
+stops SSH setup.
+OpenSSH discovers its default user and system configuration files in their
+original contexts. A launcher in service memory passes the read-only options
+to implicit jump clients and to `ProxyCommand ssh -W …` with literal
+OpenSSH options, including when an argv-forwarding wrapper changes the
+OpenSSH executable name. Literal `nc` network relays also work, including
+OpenSSH's documented `nc -X connect -x proxy %h %p` form. Proxy commands
+that require an arbitrary shell program are unsupported. An explicit
+`-F` profile keeps its user
+configuration context. When setting `GIT_ON_SERVICE_TMPDIR` for a proxied
+connection, choose a path OpenSSH can pass to its generated shell command
+without quoting.
+Apple's OpenSSH combines reading and storing passphrases in its
+`UseKeychain` option. Git-on keeps that option disabled for new connections
+to preserve the caller's Keychain. OpenSSH can use identities already
+available through the caller's agent or ask for a passphrase at startup.
 Multiple encrypted identities, separately authenticated jump hosts and
 interactive credential helpers can need extra initial interaction. The one-prompt guarantee covers a directly reachable
 host and one selected identity. Object loading during preparation can request
@@ -409,6 +452,20 @@ success, formats and trust. SSH, OpenPGP and other configured Git formats are no
 restricted by git-on. Configure `gpg.ssh.allowedSignersFile` through gitconfig or
 inherited `git -c`. No runner trust, fingerprint, signing or key-management
 interface exists.
+
+Git-on gives native Git a private directory for signature scratch files.
+When Git invokes a GnuPG verifier, Git-on copies its public keyrings and trust
+inputs into service storage. GnuPG selects its configuration, including
+version-specific options, from the private home. Configured keyring and trust
+paths resolve to copies there. Configured verifier programs can also read
+additional verification files at their original paths relative to that home.
+X.509 verification can use the caller's cached CRLs from a private copy.
+When a configured wrapper invokes GnuPG by name, Git-on also prepares the
+home the wrapper selects through `GNUPGHOME` or `--homedir`.
+Configured wrappers and other verifier programs must keep their own writes
+within the service directory supplied for verification.
+The verification agent uses private sockets.
+Verification diagnostics use the inherited diagnostic stream.
 
 Verify an annotated tag as that exact tag, then peel its recorded targets to a
 tree. The target commit need not carry a second signature. A lightweight tag

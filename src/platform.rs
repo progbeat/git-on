@@ -4,19 +4,16 @@ use anyhow::{bail, Context, Result};
 #[cfg(target_os = "linux")]
 use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsStr},
     fs, io,
-    os::unix::{
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
-    },
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 const TEMP_GROUP: &str = "git-on";
 const PRIVATE_GROUP_PREFIX: &str = ".go";
-// Reserved for a run that locks the directory itself. Keep the same owner-only
-// permissions as prior runs and distinguish them without an extra file.
+// The owner-only file whose exclusive lock protects a published run.
 pub const RUN_LOCK_NAME: &CStr = c".git-on-lock-v2";
 
 fn private_group_name(uid: u32) -> String {
@@ -65,23 +62,182 @@ fn usable_group(metadata: &fs::Metadata, uid: u32, owner_permissions: u32) -> bo
             || metadata.uid() == 0 && mode & 0o1777 == 0o1777)
 }
 
-fn removable_group(metadata: &fs::Metadata, uid: u32) -> bool {
-    metadata.uid() == uid && metadata.permissions().mode() & 0o1777 == 0o700
+fn removable_temporary_group(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o1777 == 0o700
 }
 
 pub fn create_temporary_entry(parent: &Path, name: &str) -> io::Result<PathBuf> {
-    create_entry_in_group(parent, name, true)
+    create_entry_in_group(parent, name, true, |_, directory, _, name| {
+        make_temporary_directory(directory, name)
+    })
+    .map(|(path, ())| path)
+}
+
+pub fn create_temporary_entry_with<T>(
+    parent: &Path,
+    name: &str,
+    create: impl FnMut(&Path, &fs::File, &fs::Metadata, &CStr) -> io::Result<T>,
+) -> io::Result<(PathBuf, T)> {
+    create_entry_in_group(parent, name, true, create)
+}
+
+pub fn reopen_temporary_group(
+    group: &Path,
+    expected: &fs::Metadata,
+) -> io::Result<Option<fs::File>> {
+    match temporary_group_handle(group) {
+        Ok((directory, opened)) => Ok(same_group(&opened, expected).then_some(directory)),
+        Err(_) if group_changed(group, expected) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn make_temporary_directory(directory: &fs::File, name: &CStr) -> io::Result<()> {
+    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub struct DirectoryEntries(*mut libc::DIR);
+
+/// Open a physical child without crossing a mount that appeared after the
+/// caller checked the run. Bind mounts need more than a device-number check.
+pub fn open_child_directory(
+    parent: RawFd,
+    name: &CStr,
+    access: libc::c_int,
+) -> io::Result<fs::File> {
+    let flags = access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    {
+        let mut options: libc::open_how = unsafe { std::mem::zeroed() };
+        options.flags = flags as u64;
+        options.resolve = libc::RESOLVE_NO_XDEV | libc::RESOLVE_BENEATH;
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                parent,
+                name.as_ptr(),
+                &options,
+                std::mem::size_of_val(&options),
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { fs::File::from_raw_fd(fd as RawFd) });
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
+        ) {
+            return Err(error);
+        }
+    }
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if cleanup_mount(parent)? != cleanup_mount(fd)? {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_mount(fd: RawFd) -> io::Result<u64> {
+    fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("missing mount ID for directory"))
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_mount(fd: RawFd) -> io::Result<[libc::c_char; libc::MAXPATHLEN as usize]> {
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd, &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.f_mntonname)
+}
+
+impl DirectoryEntries {
+    pub fn open(directory: &fs::File) -> io::Result<Self> {
+        // Use a stream position independent of the caller's descriptor.
+        Self::open_at(directory.as_raw_fd(), c".")
+    }
+
+    pub fn open_at(parent: RawFd, name: &CStr) -> io::Result<Self> {
+        Self::from_file(open_child_directory(parent, name, libc::O_RDONLY)?)
+    }
+
+    pub(crate) fn from_file(directory: fs::File) -> io::Result<Self> {
+        let stream = unsafe { libc::fdopendir(directory.as_raw_fd()) };
+        if stream.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let _ = directory.into_raw_fd(); // closedir owns the descriptor now.
+        Ok(Self(stream))
+    }
+
+    pub fn next_name(&mut self) -> io::Result<Option<&CStr>> {
+        Ok(self.next_entry()?.map(|(name, _)| name))
+    }
+
+    pub fn next_entry(&mut self) -> io::Result<Option<(&CStr, libc::c_uchar)>> {
+        #[cfg(target_os = "linux")]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { libc::__error() };
+        loop {
+            // readdir returns null at EOF and on failure.
+            let entry = unsafe {
+                *errno = 0;
+                libc::readdir(self.0)
+            };
+            if entry.is_null() {
+                let code = unsafe { *errno };
+                return if code == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::from_raw_os_error(code))
+                };
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                return Ok(Some((name, unsafe { (*entry).d_type })));
+            }
+        }
+    }
+}
+
+impl AsRawFd for DirectoryEntries {
+    fn as_raw_fd(&self) -> RawFd {
+        unsafe { libc::dirfd(self.0) }
+    }
+}
+
+impl Drop for DirectoryEntries {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
 }
 
 fn group_owner_matches(owner: u32, uid: u32, allow_shared_group: bool) -> bool {
     owner == uid || allow_shared_group && owner == 0
 }
 
-fn create_entry_in_group(
+fn create_entry_in_group<T>(
     parent: &Path,
     name: &str,
     allow_shared_group: bool,
-) -> io::Result<PathBuf> {
+    mut create: impl FnMut(&Path, &fs::File, &fs::Metadata, &CStr) -> io::Result<T>,
+) -> io::Result<(PathBuf, T)> {
     if name.is_empty()
         || !name
             .bytes()
@@ -93,6 +249,7 @@ fn create_entry_in_group(
     let name_c = CString::new(name).map_err(io::Error::other)?;
     let mut group = parent.join(TEMP_GROUP);
     let mut fallback = false;
+    let mut refreshed_stale_handle = false;
     loop {
         let created = match fs::DirBuilder::new().mode(0o700).create(&group) {
             Ok(()) => true,
@@ -140,28 +297,34 @@ fn create_entry_in_group(
         if !same_group(&opened, &metadata) {
             continue;
         }
-        let path = group.join(name);
-        // If the last invocation removed the empty group, mkdirat fails
-        // instead of creating an entry in a replacement at the same path.
-        if unsafe { libc::mkdirat(directory.as_raw_fd(), name_c.as_ptr(), 0o700) } == 0 {
-            return Ok(path);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            let _ = remove_empty_temporary_group(&group);
-            return Err(error);
+        // Operations relative to this handle cannot create an entry in a
+        // replacement group if another invocation removed our group.
+        match create(&group, &directory, &opened, &name_c) {
+            Ok(reservation) => return Ok((group.join(name), reservation)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && group_changed(&group, &opened) => {}
+            Err(error)
+                if error.raw_os_error() == Some(libc::ESTALE)
+                    && (!refreshed_stale_handle || group_changed(&group, &opened)) =>
+            {
+                // Reopen the group path on NFS after a stale directory fd.
+                refreshed_stale_handle = true;
+            }
+            Err(error) => {
+                let _ = remove_empty_temporary_group(&group);
+                return Err(error);
+            }
         }
     }
 }
 
 pub fn remove_empty_temporary_group(group: &Path) -> io::Result<()> {
-    let uid = unsafe { libc::geteuid() };
     let metadata = match fs::symlink_metadata(group) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if metadata.is_dir() && removable_group(&metadata, uid) {
+    if removable_temporary_group(&metadata) {
         match fs::remove_dir(group) {
             Ok(()) => {}
             Err(error)
@@ -200,19 +363,61 @@ pub fn usable_run_group(group: &Path, metadata: &fs::Metadata) -> bool {
     })
 }
 
-pub fn run_identity(dir: &Path) -> Result<Option<(fs::File, String)>> {
-    if !grouped_run(dir)
-        || !dir.file_name().is_some_and(|name| {
-            name.as_encoded_bytes()
-                .strip_prefix(b"g")
-                .is_some_and(|suffix| suffix.iter().all(u8::is_ascii_hexdigit))
-        })
-    {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunIdentity {
+    FileHandle {
+        handle: uuid::Uuid,
+        creation_time: Option<uuid::Uuid>,
+    },
+    CreationTime(uuid::Uuid),
+    Legacy(uuid::Uuid),
+    Unverified(uuid::Uuid),
+}
+
+impl RunIdentity {
+    pub fn primary(self) -> uuid::Uuid {
+        match self {
+            Self::FileHandle { handle, .. } => handle,
+            Self::CreationTime(id) | Self::Legacy(id) | Self::Unverified(id) => id,
+        }
+    }
+
+    pub fn matches(self, bound: Self) -> bool {
+        if let (
+            Self::FileHandle { handle: actual, .. },
+            Self::FileHandle {
+                handle: expected, ..
+            },
+        ) = (self, bound)
+        {
+            return actual == expected;
+        }
+
+        self.creation_time()
+            .is_some_and(|actual| bound.creation_time() == Some(actual))
+    }
+
+    fn creation_time(self) -> Option<uuid::Uuid> {
+        match self {
+            Self::FileHandle { creation_time, .. } => creation_time,
+            Self::CreationTime(id) => Some(id),
+            Self::Legacy(_) | Self::Unverified(_) => None,
+        }
+    }
+}
+
+pub fn run_identity(dir: &Path) -> Result<Option<(fs::File, Option<RunIdentity>)>> {
+    if !grouped_run(dir) {
+        return Ok(None);
+    }
+    let (prefix, suffix) = dir.file_name().unwrap().as_encoded_bytes().split_at(1);
+    if !matches!(prefix, b"g" | b"r") || !suffix.iter().all(u8::is_ascii_hexdigit) {
         return Ok(None);
     }
     let metadata = fs::symlink_metadata(dir)?;
     let mode = metadata.mode() & 0o1777;
     if mode != 0o700 {
+        anyhow::ensure!(prefix != b"r", "temporary run has unexpected permissions");
         return Ok(None);
     }
     let uid = unsafe { libc::geteuid() };
@@ -227,29 +432,177 @@ pub fn run_identity(dir: &Path) -> Result<Option<(fs::File, String)>> {
     if !same_group(&metadata, &opened) || opened.mode() & 0o1777 != mode {
         bail!("temporary run changed while opening it");
     }
+    let identity = run_ids(dir.file_name().unwrap(), &directory, &opened)?;
+    Ok(Some((directory, identity)))
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_ids(
+    name: &OsStr,
+    directory: &fs::File,
+    opened: &fs::Metadata,
+) -> io::Result<Option<RunIdentity>> {
+    let metadata = LinuxRunMetadata {
+        inode: opened.ino(),
+        uid: opened.uid(),
+        device: opened.dev(),
+        created: opened.created().ok(),
+    };
+    linux_run_ids(name, metadata, |identity| {
+        add_linux_file_handle(identity, directory)
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_ids(
+    name: &OsStr,
+    _directory: &fs::File,
+    opened: &fs::Metadata,
+) -> io::Result<Option<RunIdentity>> {
+    use std::os::macos::fs::MetadataExt;
+    Ok(darwin_run_id(
+        name,
+        opened.ino(),
+        opened.uid(),
+        (opened.st_birthtime(), opened.st_birthtime_nsec()),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_run_id(name: &OsStr, inode: u64, uid: u32, birth: (i64, i64)) -> Option<RunIdentity> {
+    // Darwin reports zero when the filesystem does not expose a birth time.
+    if name.as_encoded_bytes().first() == Some(&b'r') && birth == (0, 0) {
+        return None;
+    }
+    let mut identity = run_identity_hasher(name, inode, uid);
+    // Creation time distinguishes equal inodes across different incarnations.
+    identity.update(&birth.0.to_le_bytes());
+    identity.update(&birth.1.to_le_bytes());
+    Some(RunIdentity::CreationTime(finish_run_id(identity)))
+}
+
+fn run_identity_hasher(name: &OsStr, inode: u64, uid: u32) -> blake3::Hasher {
     let mut identity = blake3::Hasher::new_derive_key("git-on temporary run identity v2");
     // The name and inode survive an ancestor rename.
-    identity.update(&opened.ino().to_le_bytes());
+    identity.update(&inode.to_le_bytes());
     identity.update(&uid.to_le_bytes());
-    identity.update(dir.file_name().unwrap().as_encoded_bytes());
-    #[cfg(target_os = "linux")]
-    identity.update(&opened.dev().to_le_bytes());
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::macos::fs::MetadataExt;
-        // The short socket directory can outlive a reboot and its device
-        // renumbering. Creation time distinguishes equal inodes on volumes.
-        identity.update(&opened.st_birthtime().to_le_bytes());
-        identity.update(&opened.st_birthtime_nsec().to_le_bytes());
-    }
+    identity.update(name.as_encoded_bytes());
+    identity
+}
+
+fn finish_run_id(identity: blake3::Hasher) -> uuid::Uuid {
     let hash = identity.finalize();
-    let id = uuid::Uuid::from_bytes(hash.as_bytes()[..16].try_into().unwrap());
-    Ok(Some((directory, id.to_string())))
+    uuid::Uuid::from_bytes(hash.as_bytes()[..16].try_into().unwrap())
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxRunMetadata {
+    inode: u64,
+    uid: u32,
+    device: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_ids(
+    name: &OsStr,
+    metadata: LinuxRunMetadata,
+    add_handle: impl FnOnce(&mut blake3::Hasher) -> io::Result<()>,
+) -> io::Result<Option<RunIdentity>> {
+    let mut identity = run_identity_hasher(name, metadata.inode, metadata.uid);
+    if name.as_encoded_bytes().starts_with(b"g") {
+        // Preserve the device field used by the published g-prefix protocol.
+        identity.update(&metadata.device.to_le_bytes());
+        return Ok(Some(RunIdentity::Legacy(finish_run_id(identity))));
+    }
+    let creation = metadata.created.map(|created| {
+        let mut hash = identity.clone();
+        add_linux_creation_time(&mut hash, created);
+        finish_run_id(hash)
+    });
+    // The NFS client may present a different st_ino for the same handle.
+    let mut identity = blake3::Hasher::new_derive_key("git-on temporary run file handle");
+    identity.update(&metadata.uid.to_le_bytes());
+    identity.update(name.as_encoded_bytes());
+    match add_handle(&mut identity) {
+        Ok(()) => Ok(Some(RunIdentity::FileHandle {
+            handle: finish_run_id(identity),
+            creation_time: creation,
+        })),
+        Err(error)
+            if creation.is_some()
+                || matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                )
+                || matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOVERFLOW)) =>
+        {
+            Ok(creation.map(RunIdentity::CreationTime))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_linux_file_handle(identity: &mut blake3::Hasher, file: &fs::File) -> io::Result<()> {
+    const MAX_HANDLE_SIZE: usize = 128; // Linux MAX_HANDLE_SZ.
+    #[repr(C)]
+    struct FileHandle {
+        size: libc::c_uint,
+        kind: libc::c_int,
+        bytes: [u8; MAX_HANDLE_SIZE],
+    }
+    let mut handle = FileHandle {
+        size: MAX_HANDLE_SIZE as libc::c_uint,
+        kind: 0,
+        bytes: [0; MAX_HANDLE_SIZE],
+    };
+    let mut mount_id: libc::c_int = 0;
+    // The persistent handle distinguishes inode reuse and stays the same
+    // across remounts of the same NFS export.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            &mut handle as *mut FileHandle,
+            &mut mount_id as *mut libc::c_int,
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = handle
+        .bytes
+        .get(..handle.size as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid file handle length"))?;
+    identity.update(b"handle");
+    identity.update(&handle.kind.to_le_bytes());
+    identity.update(bytes);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_linux_creation_time(identity: &mut blake3::Hasher, created: std::time::SystemTime) {
+    let (before_epoch, timestamp) = match created.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => (false, duration),
+        Err(error) => (true, error.duration()),
+    };
+    identity.update(b"created");
+    identity.update(&[u8::from(before_epoch)]);
+    identity.update(&timestamp.as_secs().to_le_bytes());
+    identity.update(&timestamp.subsec_nanos().to_le_bytes());
 }
 
 pub fn same_run_directory(dir: &Path, locked: &fs::File) -> io::Result<bool> {
     let metadata = fs::symlink_metadata(dir)?;
     Ok(metadata.is_dir() && same_group(&metadata, &locked.metadata()?))
+}
+
+pub fn run_directory_matches(dir: &Path, expected: &fs::Metadata) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(dir)?;
+    Ok(metadata.is_dir() && same_group(&metadata, expected))
 }
 
 pub fn ssh_control_path(run: &Path) -> PathBuf {
@@ -360,7 +713,7 @@ pub fn mount_is_ours(
     #[cfg(target_os = "linux")]
     let expected = format!("git-on:{id}");
     let mut found = false;
-    for (path, source) in mounts()? {
+    for Mount { path, source, .. } in mounts()? {
         if path == point {
             #[cfg(target_os = "macos")]
             let matches = expected
@@ -385,8 +738,14 @@ pub fn reserve_nfs_socket(id: &str) -> io::Result<PathBuf> {
     // A new run derives its endpoint during cleanup. Reserve only in a
     // caller-owned group so an unrelated, inaccessible shared group cannot
     // be mistaken for one holding the endpoint.
-    create_entry_in_group(Path::new(NFS_SOCKET_BASE), &format!("nfs-{id}"), false)
-        .map(|dir| dir.join("s"))
+    create_entry_in_group(
+        Path::new(NFS_SOCKET_BASE),
+        &format!("nfs-{id}"),
+        false,
+        |_, directory, _, name| make_temporary_directory(directory, name),
+    )
+    .map(|(path, ())| path)
+    .map(|dir| dir.join("s"))
 }
 
 #[cfg(target_os = "macos")]
@@ -542,7 +901,7 @@ fn cleanup_nfs_socket_under(base: &Path, id: &str, recorded: Option<&Path>) -> R
         bail!("NFS socket directory has unexpected type or ownership");
     }
     let source = nfs_mount_source(&socket);
-    if mounts()?.iter().any(|(_, current)| *current == source) {
+    if mounts()?.iter().any(|mount| mount.source == source) {
         bail!("NFS socket still belongs to a system mount");
     }
     match fs::symlink_metadata(&socket) {
@@ -560,17 +919,50 @@ fn cleanup_nfs_socket_under(base: &Path, id: &str, recorded: Option<&Path>) -> R
     Ok(())
 }
 
-pub fn ensure_unmounted(dir: &Path) -> Result<()> {
-    for (path, _) in mounts()? {
-        if path.starts_with(dir) {
-            bail!("a mount remains below {}; refusing deletion", dir.display());
+pub fn ensure_unmounted(dir: &Path, sibling: Option<&Path>) -> Result<()> {
+    for Mount { path, .. } in mounts()? {
+        for root in std::iter::once(dir).chain(sibling) {
+            if path.starts_with(root) {
+                bail!(
+                    "a mount remains below {}; refusing deletion",
+                    root.display()
+                );
+            }
         }
     }
     Ok(())
 }
 
+struct Mount {
+    path: PathBuf,
+    source: String,
+    nfs: bool,
+    #[cfg(target_os = "linux")]
+    id: u64,
+}
+
+/// Read mount information without asking the backing filesystem for statistics.
+pub fn nfs_mount(_directory: &fs::File, _path: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let id = cleanup_mount(_directory.as_raw_fd())?;
+        Ok(mounts()?
+            .into_iter()
+            .find(|mount| mount.id == id)
+            .is_some_and(|mount| mount.nfs))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(mounts()?
+            .into_iter()
+            .filter(|mount| _path.starts_with(&mount.path))
+            .max_by_key(|mount| mount.path.as_os_str().len())
+            .is_some_and(|mount| mount.nfs))
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn mounts() -> Result<Vec<(PathBuf, String)>> {
+fn mounts() -> Result<Vec<Mount>> {
     let mut out = Vec::new();
     for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -580,16 +972,21 @@ fn mounts() -> Result<Vec<(PathBuf, String)>> {
             .context("invalid mountinfo")?;
         let path = fields.get(4).context("invalid mountinfo path")?;
         let source = fields.get(sep + 2).context("invalid mountinfo source")?;
-        out.push((
-            Path::new(std::ffi::OsStr::from_bytes(&decode_mount(path))).to_path_buf(),
-            source.to_string(),
-        ));
+        let kind = fields
+            .get(sep + 1)
+            .context("invalid mountinfo filesystem type")?;
+        out.push(Mount {
+            path: Path::new(std::ffi::OsStr::from_bytes(&decode_mount(path))).to_path_buf(),
+            source: source.to_string(),
+            nfs: matches!(*kind, "nfs" | "nfs4"),
+            id: fields[0].parse()?,
+        });
     }
     Ok(out)
 }
 
 #[cfg(target_os = "macos")]
-fn mounts() -> Result<Vec<(PathBuf, String)>> {
+fn mounts() -> Result<Vec<Mount>> {
     use std::{
         ffi::{CStr, OsStr},
         os::unix::ffi::OsStrExt,
@@ -611,16 +1008,18 @@ fn mounts() -> Result<Vec<(PathBuf, String)>> {
             .map(|entry| {
                 let path = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
                 let kind = unsafe { CStr::from_ptr(entry.f_fstypename.as_ptr()) };
-                let source = if kind.to_bytes() == b"nfs" {
+                let nfs = kind.to_bytes() == b"nfs";
+                let source = if nfs {
                     let from = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) };
                     from.to_string_lossy().into_owned()
                 } else {
                     String::new()
                 };
-                (
-                    Path::new(OsStr::from_bytes(path.to_bytes())).to_path_buf(),
+                Mount {
+                    path: Path::new(OsStr::from_bytes(path.to_bytes())).to_path_buf(),
                     source,
-                )
+                    nfs,
+                }
             })
             .collect(),
     )
@@ -705,6 +1104,119 @@ mod temporary_group_tests {
         let error = create_temporary_entry(temporary.path(), "123456").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
         assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn create_reopens_a_group_after_its_handle_goes_stale() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut replace = true;
+        let (path, ()) =
+            create_temporary_entry_with(temporary.path(), "r12345", |group, directory, _, name| {
+                if std::mem::take(&mut replace) {
+                    fs::remove_dir(group)?;
+                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                make_temporary_directory(directory, name)
+            })
+            .unwrap();
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn reopening_a_stale_group_skips_a_replacement_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let group = temporary.path().join("git-on");
+        fs::create_dir(&group).unwrap();
+        let expected = fs::metadata(&group).unwrap();
+        fs::rename(&group, temporary.path().join("old-group")).unwrap();
+        fs::write(&group, b"unrelated").unwrap();
+        assert!(reopen_temporary_group(&group, &expected).unwrap().is_none());
+        assert_eq!(fs::read(&group).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn unchanged_group_does_not_retry_missing_run_setup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut attempts = 0;
+        let result = create_temporary_entry_with(temporary.path(), "r12345", |_, _, _, _| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(attempts, 1);
+        assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_zero_birth_time_cannot_identify_a_new_run() {
+        let new = OsStr::new("r123ab");
+        assert_eq!(darwin_run_id(new, 42, 501, (0, 0)), None);
+        assert!(darwin_run_id(new, 42, 501, (0, 1)).is_some());
+        assert!(darwin_run_id(OsStr::new("g123ab"), 42, 501, (0, 0)).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_handle_survives_nfs_inode_and_device_number_changes() {
+        let ids = |name, inode, device| {
+            let metadata = LinuxRunMetadata {
+                inode,
+                uid: 501,
+                device,
+                created: Some(std::time::UNIX_EPOCH),
+            };
+            let identity = linux_run_ids(OsStr::new(name), metadata, |hash| {
+                hash.update(b"fixture directory handle");
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+            identity
+        };
+        for name in ["r12345", "run-marker"] {
+            let before = ids(name, 42, 19);
+            let after = ids(name, 43, 20);
+            assert_eq!(before.primary(), after.primary());
+            assert!(before.matches(after));
+        }
+        assert_ne!(ids("g12345", 42, 19), ids("g12345", 42, 20));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conflicting_directory_handles_override_matching_creation_time() {
+        let creation = uuid::Uuid::from_u128(1);
+        let bound = RunIdentity::FileHandle {
+            handle: uuid::Uuid::from_u128(2),
+            creation_time: Some(creation),
+        };
+        let replacement = RunIdentity::FileHandle {
+            handle: uuid::Uuid::from_u128(3),
+            creation_time: Some(creation),
+        };
+        assert!(!replacement.matches(bound));
+        assert!(RunIdentity::CreationTime(creation).matches(bound));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn denied_handle_lookup_without_creation_time_leaves_identity_unavailable() {
+        let metadata = LinuxRunMetadata {
+            inode: 42,
+            uid: 501,
+            device: 19,
+            created: None,
+        };
+        let identity = linux_run_ids(OsStr::new("r12345"), metadata, |_| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap();
+        assert!(identity.is_none());
     }
 
     #[test]
