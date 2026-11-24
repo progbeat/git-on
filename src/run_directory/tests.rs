@@ -77,6 +77,16 @@ fn try_reserve_test_run(parent: &Path, name: &str) -> std::io::Result<(PathBuf, 
     .map(|(_, run)| run)
 }
 
+fn reserved_run() -> (tempfile::TempDir, PathBuf, LockedRun) {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    (root, dir, run)
+}
+
+fn ownership_record(dir: &Path) -> PathBuf {
+    record_path(dir, &run_record_name("r123ab"))
+}
+
 fn fixture_has_run_identity(dir: &Path) -> bool {
     run_identity(dir).unwrap().unwrap().1.is_some()
 }
@@ -301,7 +311,7 @@ fn orphan_cleanup_retries_after_retiring_the_startup_marker() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("git-on/r123ab");
-    let record = record_path(&dir, &run_record_name("r123ab"));
+    let record = ownership_record(&dir);
     private_dir(dir.parent().unwrap()).unwrap();
     private_dir(&record).unwrap();
     let folder = File::open(record).unwrap();
@@ -489,7 +499,7 @@ fn startup_refuses_to_publish_a_replaced_marker() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("git-on/r123ab");
-    let record = record_path(&dir, &run_record_name("r123ab"));
+    let record = ownership_record(&dir);
     RUN_BIND_REPLACE_MARKER.set(true);
     let outcome = try_reserve_test_run(root.path(), "r123ab");
     let error = outcome
@@ -518,7 +528,7 @@ fn startup_refuses_a_run_moved_during_marker_binding() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("git-on/r123ab");
         let moved = dir.with_extension("moved");
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let record = ownership_record(&dir);
         let path = dir.clone();
         let destination = moved.clone();
         AFTER_RUN_BIND.set(Some(Box::new(move || {
@@ -575,7 +585,7 @@ fn startup_retains_the_record_if_the_run_mkdir_loses_its_reply() {
         assert!(diagnostic.contains("ownership record was retained for manual recovery"));
         assert_eq!(diagnostic.lines().last(), dir.to_str());
         assert!(dir.is_dir());
-        assert!(record_path(&dir, &run_record_name("r123ab"))
+        assert!(ownership_record(&dir)
             .join(OsStr::from_bytes(RUN_LOCK_NAME.to_bytes()))
             .is_file());
         assert!(cleanup(&dir).is_err());
@@ -717,7 +727,7 @@ fn deferred_removal_without_identity_reports_manual_recovery() {
         "{refused}"
     );
     assert!(dir.is_dir());
-    assert!(record_path(&dir, &run_record_name("r123ab")).is_dir());
+    assert!(ownership_record(&dir).is_dir());
     // Remove this fixture directly once the kernel completes the unlink.
     let group = open_removal_group(&dir).unwrap();
     let directory = File::open(&dir).unwrap();
@@ -772,17 +782,15 @@ fn retirement_succeeds_after_a_lost_unlink_reply() {
         (&RETRY_UNLINK_LOST_REPLY, libc::ETIMEDOUT),
         (&RETRY_UNLINK_LOST_REPLY, libc::ENOENT),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let (root, dir, run) = reserved_run();
+        let record = ownership_record(&dir);
         fault.set(Some(errno));
         assert!(run.remove(&dir).unwrap());
         assert!(!dir.exists());
         assert!(!record.exists());
     }
     for is_directory in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
+        let (root, dir, run) = reserved_run();
         if is_directory {
             fs::create_dir(dir.join("child")).unwrap();
         } else {
@@ -797,9 +805,8 @@ fn retirement_succeeds_after_a_lost_unlink_reply() {
 #[test]
 fn stale_marker_after_unlock_requires_a_peer_to_have_removed_the_record() {
     for peer_removed in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let (root, dir, run) = reserved_run();
+        let record = ownership_record(&dir);
         let path = dir.clone();
         AFTER_MARKER_UNLOCK.set(Some(Box::new(move || {
             if peer_removed {
@@ -822,10 +829,9 @@ fn stale_marker_after_unlock_requires_a_peer_to_have_removed_the_record() {
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn unconfirmed_nfs_removal_reports_the_run_for_recovery() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
-    let record = record_path(&dir, &run_record_name("r123ab"));
+    let record = ownership_record(&dir);
     RUN_RMDIR_LOST_REPLY.set(Some(libc::ETIMEDOUT));
     RUN_RMDIR_ATTRIBUTES_UNAVAILABLE.set(true);
     let result = run.remove(&dir);
@@ -846,8 +852,7 @@ fn cleanup_checks_disappearing_and_replaced_children() {
         Some(BeforeChildOpen::Stale { removed: true }),
         Some(BeforeChildOpen::Stale { removed: false }),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
+        let (root, dir, run) = reserved_run();
         let outside = dir.parent().unwrap().join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("retained"), b"preserve").unwrap();
@@ -860,7 +865,7 @@ fn cleanup_checks_disappearing_and_replaced_children() {
         if matches!(before_open, Some(BeforeChildOpen::Stale { removed: false })) {
             assert_eq!(io_errno(&outcome.unwrap_err()), Some(libc::ESTALE));
             assert!(dir.join("child").is_dir());
-            assert!(record_path(&dir, &run_record_name("r123ab")).is_dir());
+            assert!(ownership_record(&dir).is_dir());
         } else {
             assert!(outcome.unwrap());
             assert!(!dir.exists());
@@ -873,9 +878,8 @@ fn cleanup_checks_disappearing_and_replaced_children() {
 fn a_run_renamed_before_removal_keeps_its_recovery_marker() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     for replacement in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let (root, dir, run) = reserved_run();
+        let record = ownership_record(&dir);
         fs::write(dir.join("state"), b"retained").unwrap();
         if replacement && is_nfs(&run.directory).unwrap() {
             // On NFS, move the run after the retry has checked its identity.
@@ -912,8 +916,7 @@ fn a_run_renamed_before_removal_keeps_its_recovery_marker() {
 #[test]
 #[ignore = "requires an isolated Linux mount namespace with bind-mount permission"]
 fn cleanup_walk_leaves_a_late_bind_mount_untouched() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     let outside = root.path().join("outside");
     let mount = dir.join("mount");
     fs::create_dir(&outside).unwrap();
@@ -954,18 +957,16 @@ fn cleanup_walk_leaves_a_late_bind_mount_untouched() {
 
 #[test]
 fn retirement_retries_when_the_last_placeholder_has_gone() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     LAST_RETIREMENT_RMDIR_WAS_BUSY.set(true);
     assert!(run.remove(&dir).unwrap());
-    assert!(!record_path(&dir, &run_record_name("r123ab")).exists());
+    assert!(!ownership_record(&dir).exists());
 }
 
 #[test]
 #[ignore = "requires an NFS client that defers unlink of opened files"]
 fn nfs_retirement_closes_the_marker_before_unlink() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     ASSERT_MARKER_UNLINK_IS_IMMEDIATE.set(true);
     assert!(run.remove(&dir).unwrap());
@@ -1007,8 +1008,7 @@ fn long_path_descendant(directory: &File) -> File {
 
 #[test]
 fn cleanup_handles_a_deferred_name_beyond_the_absolute_path_limit() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     let ancestor = long_path_descendant(&run.directory);
     let placeholder = c".nfs0123456789abcdef00000001";
     assert_eq!(
@@ -1025,7 +1025,7 @@ fn cleanup_handles_a_deferred_name_beyond_the_absolute_path_limit() {
     drop(ancestor);
     assert!(run.remove(&dir).unwrap());
     assert!(!dir.exists());
-    assert!(!record_path(&dir, &run_record_name("r123ab")).exists());
+    assert!(!ownership_record(&dir).exists());
 }
 
 fn has_nfs_placeholder(directory: &File) -> bool {
@@ -1039,13 +1039,12 @@ fn deferred_nfs_cleanup_preserves_command_status() {
     use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
 
     for late_close in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
+        let (root, dir, run) = reserved_run();
         let RunLock::Sibling(record) = &run.location else {
             panic!("expected a sibling ownership record");
         };
         let can_recover = record.has_persistent_identity;
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let record = ownership_record(&dir);
         let pending = dir.join(".nfs0123456789abcdef00000001");
         File::create(&pending).unwrap();
         FORCE_NFS_REMOVAL.set(true);
@@ -1084,9 +1083,8 @@ fn deferred_nfs_cleanup_preserves_command_status() {
 fn nfs_cleanup_retries_late_entries_once() {
     let _serial = PROCESS_TEST_LOCK.lock().unwrap();
     for (name, insertions) in [(".nfs0123456789abcdef00000001", 1), ("late-entry", 3)] {
-        let root = tempfile::tempdir().unwrap();
-        let (dir, run) = reserve_test_run(root.path(), "r123ab");
-        let record = record_path(&dir, &run_record_name("r123ab"));
+        let (root, dir, run) = reserved_run();
+        let record = ownership_record(&dir);
         let can_recover = fixture_has_run_identity(&dir);
         FORCE_NFS_REMOVAL.set(true);
         EXTRA_ROOT_ENTRY_NAME.set(name);
@@ -1123,8 +1121,7 @@ fn nfs_cleanup_retries_late_entries_once() {
 #[test]
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn nfs_mount_information_survives_a_failed_filesystem_probe() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     let descendant = long_path_descendant(&run.directory);
     let fd = descendant.as_raw_fd();
@@ -1142,8 +1139,7 @@ fn nfs_mount_information_survives_a_failed_filesystem_probe() {
 #[test]
 #[ignore = "requires an NFS-backed TMPDIR"]
 fn nfs_removal_retries_when_the_open_file_closes_before_the_scan() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, run) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, run) = reserved_run();
     assert!(is_nfs(&run.directory).unwrap());
     let mut held = ["first", "second"].map(|name| {
         let child = dir.join(name);
@@ -1181,7 +1177,7 @@ fn nfs_removal_retries_when_the_open_file_closes_before_the_scan() {
     assert_eq!(closed.get(), 2);
     assert!(outcome.unwrap());
     assert!(!dir.exists());
-    assert!(!record_path(&dir, &run_record_name("r123ab")).exists());
+    assert!(!ownership_record(&dir).exists());
 }
 
 #[test]
@@ -1264,8 +1260,7 @@ fn legacy_recovery_skips_another_owners_records() {
 
 #[test]
 fn cleanup_preserves_the_run_if_its_group_loses_private_permissions() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, locked) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, locked) = reserved_run();
     let group = dir.parent().unwrap();
     let sentinel = dir.join("runtime");
     fs::write(&sentinel, b"owned contents").unwrap();
@@ -1277,13 +1272,12 @@ fn cleanup_preserves_the_run_if_its_group_loses_private_permissions() {
         .to_string()
         .contains("temporary run group changed"));
     assert_eq!(fs::read(sentinel).unwrap(), b"owned contents");
-    assert!(record_path(&dir, &run_record_name("r123ab")).is_dir());
+    assert!(ownership_record(&dir).is_dir());
 }
 
 #[test]
 fn cleanup_checks_the_original_directory_before_releasing_storage() {
-    let root = tempfile::tempdir().unwrap();
-    let (dir, locked) = reserve_test_run(root.path(), "r123ab");
+    let (root, dir, locked) = reserved_run();
     locked.check_directory(&dir).unwrap();
     let original = root.path().join("reserved");
     fs::rename(&dir, &original).unwrap();
@@ -1302,7 +1296,7 @@ fn cleanup_checks_the_original_directory_before_releasing_storage() {
     assert!(format!("{error:#}").contains("temporary run does not match its ownership record"));
 
     fs::remove_file(sentinel).unwrap();
-    let record = record_path(&dir, &run_record_name("r123ab"));
+    let record = ownership_record(&dir);
     let bound = fs::read_dir(&record)
         .unwrap()
         .next()

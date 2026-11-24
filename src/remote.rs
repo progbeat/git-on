@@ -77,7 +77,7 @@ pub fn invoke_ssh_launcher() -> Option<i32> {
             if !launching && before_host > 0 && options[before_host - 1] == "--" {
                 before_host -= 1;
             }
-            ssh_host_files::launch(&program, argv0, options, before_host)
+            ssh_host_files::launch(&program, argv0, &launcher, options, before_host)
         });
     let error = match settings {
         Err(error) => error,
@@ -211,6 +211,14 @@ struct ReceivedPack {
 enum PrivateRepository {
     Context(Repository),
     Objects(Repository),
+}
+impl PrivateRepository {
+    fn objects(&self) -> Option<&Repository> {
+        match self {
+            Self::Objects(repo) => Some(repo),
+            Self::Context(_) => None,
+        }
+    }
 }
 enum SnapshotTransport {
     Https { http2: bool },
@@ -579,10 +587,7 @@ impl Remote {
         Ok(oid)
     }
     pub(crate) fn native_repository(&self) -> Option<&Repository> {
-        match &self.repo {
-            Some(PrivateRepository::Objects(repo)) => Some(repo),
-            _ => None,
-        }
+        self.repo.as_ref().and_then(PrivateRepository::objects)
     }
     fn odb(&self) -> Result<Option<Odb<'_>>> {
         Ok(self.native_repository().map(Repository::odb).transpose()?)
@@ -2019,33 +2024,42 @@ impl Remote {
         let Some(received) = self.take_received()? else {
             return Ok(());
         };
-        let destination = Repository::open_bare(&self.dir)?;
-        let destination_odb = destination.odb()?;
+        let destination_odb = self
+            .repo
+            .as_ref()
+            .and_then(PrivateRepository::objects)
+            .context("missing native Git object database")?
+            .odb()?;
+        let cache = &mut self.raw_blobs;
         let mut requests = Vec::new();
         let mut failure = None;
         let iteration = received.odb.foreach(|oid| {
             let outcome = (|| -> Result<()> {
                 crate::object::check_transfer()?;
-                if wanted.is_some()
-                    && (self.raw_blobs.get(*oid)?.is_some() || destination_odb.exists(*oid))
+                if wanted.is_some() && (cache.get(*oid)?.is_some() || destination_odb.exists(*oid))
                 {
                     return Ok(());
                 }
                 let (size, kind) = received.odb.read_header(*oid)?;
                 if kind == git2::ObjectType::Blob {
-                    self.raw_blobs
-                        .remember_packed(*oid, &received.directory, size);
+                    cache.remember_packed(*oid, &received.directory, size);
                     if wanted.is_some_and(|wanted| wanted.contains(oid)) {
-                        writeln!(requests, "{oid}")?;
+                        requests.push(*oid);
                     }
                 } else if wanted.is_some()
-                    || (!destination_odb.exists(*oid) && self.raw_blobs.get(*oid)?.is_none())
+                    || (!destination_odb.exists(*oid) && cache.get(*oid)?.is_none())
                 {
                     let object = received.odb.read(*oid)?;
                     if kind == git2::ObjectType::Tree {
-                        self.raw_blobs.insert_odb_tree(*oid, &object)?;
+                        cache.insert_odb_tree(*oid, &object)?;
                     } else {
-                        self.publish_received(&destination, *oid, kind, size, object.data())?;
+                        let mut writer = destination_odb.writer(size, kind)?;
+                        crate::object::copy_verified(object.data(), &mut writer, kind, size, *oid)?;
+                        anyhow::ensure!(
+                            writer.finalize()? == *oid,
+                            "received metadata OID changed"
+                        );
+                        cache.forget_received(*oid);
                     }
                 }
                 Ok(())
@@ -2066,21 +2080,17 @@ impl Remote {
         if requests.is_empty() {
             return Ok(());
         }
-        drop(destination);
-        self.decode_received(received.directory.path(), &mut requests.as_slice())
+        self.decode_received(received.directory.path(), &requests)
     }
     fn import_packed_object(&mut self, oid: Oid, directory: &Path) -> Result<()> {
-        let request = format!("{oid}\n");
-        self.decode_received(directory, &mut request.as_bytes())?;
+        self.decode_received(directory, &[oid])?;
         anyhow::ensure!(
-            self.raw_blobs.get(oid)?.is_some()
-                || Repository::open_bare(&self.dir)?.odb()?.exists(oid),
+            self.raw_blobs.get(oid)?.is_some() || self.odb()?.is_some_and(|odb| odb.exists(oid)),
             "received pack omitted requested object {oid}"
         );
         Ok(())
     }
-    fn decode_received(&mut self, directory: &Path, requests: &mut dyn Read) -> Result<()> {
-        let destination = Repository::open_bare(&self.dir)?;
+    fn decode_received(&mut self, directory: &Path, requests: &[Oid]) -> Result<()> {
         let mut command = self.object_command();
         command
             .env("GIT_OBJECT_DIRECTORY", directory.join("objects"))
@@ -2091,16 +2101,53 @@ impl Remote {
                 "--batch",
                 "--buffer",
             ]);
-        let remote = &mut *self;
-        let (output, ()) = crate::git::run_with_output(command, Some(requests), move |input| {
-            remote.import_raw_output(&destination, input)
-        })
-        .context("decode received objects into run-local raw storage")?;
+        let mut stdin = Vec::new();
+        for oid in requests {
+            writeln!(stdin, "{oid}")?;
+        }
+        let cache = &mut self.raw_blobs;
+        let (output, omitted) =
+            crate::git::run_with_output(command, Some(&mut stdin.as_slice()), move |input| {
+                let mut input = BufReader::new(input);
+                for &oid in requests {
+                    crate::object::check_transfer()?;
+                    if input.fill_buf()?.is_empty() {
+                        return Ok(Some(oid));
+                    }
+                    crate::git::receive_batch_object(
+                        oid,
+                        crate::git::BatchRead::Materialize,
+                        &mut input,
+                        |size, kind, data| {
+                            anyhow::ensure!(
+                                kind == git2::ObjectType::Blob,
+                                "requested object is not a blob"
+                            );
+                            cache.insert_fetched(oid, size, &mut *data, None)?;
+                            // An overlapping fetch may already have published this OID.
+                            // Consume its response before reading the next header.
+                            while let length @ 1.. = data.fill_buf()?.len() {
+                                data.consume(length);
+                            }
+                            Ok(())
+                        },
+                    )??;
+                }
+                anyhow::ensure!(
+                    input.fill_buf()?.is_empty(),
+                    "native decoder sent an extra object"
+                );
+                Ok(None)
+            })
+            .context("decode received objects into run-local raw storage")?;
         if !output.status.success() {
             bail!(
                 "cannot decode received Git objects: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+        }
+        if let Some(oid) = omitted {
+            bail!("received pack omitted requested object {oid}");
         }
         self.decode_operations += 1;
         Ok(())
@@ -2134,66 +2181,6 @@ impl Remote {
         self.raw_blobs.forget_received(oid);
         if let Some(transfer) = transfer {
             transfer.mark_served();
-        }
-        Ok(())
-    }
-    fn publish_received(
-        &mut self,
-        destination: &Repository,
-        oid: Oid,
-        kind: git2::ObjectType,
-        size: usize,
-        input: impl Read,
-    ) -> Result<()> {
-        if kind == git2::ObjectType::Blob {
-            self.raw_blobs.insert_fetched(oid, size, input, None)?;
-        } else if kind == git2::ObjectType::Tree {
-            self.raw_blobs.insert_tree(oid, size, input)?;
-        } else {
-            // Native signature verification needs the selected commit or tag.
-            let odb = destination.odb()?;
-            let mut writer = odb.writer(size, kind)?;
-            crate::object::copy_verified(input, &mut writer, kind, size, oid)?;
-            anyhow::ensure!(writer.finalize()? == oid, "received metadata OID changed");
-            self.raw_blobs.forget_received(oid);
-        }
-        Ok(())
-    }
-    fn import_raw_output(&mut self, destination: &Repository, input: impl Read) -> Result<()> {
-        let mut input = BufReader::new(input);
-        loop {
-            crate::object::check_transfer()?;
-            let mut header = Vec::new();
-            let length = Read::by_ref(&mut input)
-                .take(128)
-                .read_until(b'\n', &mut header)?;
-            if length == 0 {
-                break;
-            }
-            anyhow::ensure!(
-                header.last() == Some(&b'\n'),
-                "invalid native Git batch header"
-            );
-            let header = std::str::from_utf8(&header[..length - 1])?;
-            let fields: Vec<_> = header.split(' ').collect();
-            anyhow::ensure!(
-                fields.len() == 3 && fields[0].len() == 40,
-                "invalid native Git object header"
-            );
-            let oid = Oid::from_str(fields[0])?;
-            let kind = match fields[1] {
-                "blob" => git2::ObjectType::Blob,
-                "tree" => git2::ObjectType::Tree,
-                "commit" => git2::ObjectType::Commit,
-                "tag" => git2::ObjectType::Tag,
-                _ => bail!("unknown received Git object type"),
-            };
-            let size: usize = fields[2].parse().context("native Git object size")?;
-            let payload = Read::by_ref(&mut input).take(size as u64);
-            self.publish_received(destination, oid, kind, size, payload)?;
-            let mut delimiter = [0];
-            input.read_exact(&mut delimiter)?;
-            anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
         }
         Ok(())
     }

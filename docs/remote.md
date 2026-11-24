@@ -223,12 +223,18 @@ filtering. Git receives the server's original challenge values during
 credential lookup. A rejected credential ends the exchange. Native Git handles
 repository- or user-scoped credentials and other authentication challenges.
 
+### Temporary Git contexts
+
 A temporary Git repository serves native fetch and signature verification.
 Git's file-URL diagnostic can also need a Git repository to parse escaped
 local URLs. The pack reader opens the indexes Git already built from a
 separate object directory. For local revisions with nested alternates or
 byte paths, a read-only object-location bridge represents the source layout
-for libgit2. Index expressions such as `:path` use a private Git context
+for libgit2 when needed. Git-on resolves indirect object paths before opening
+them and can use an open directory descriptor for byte paths on Linux.
+Git's quoted or relative on-disk alternate forms that libgit2 would interpret
+differently use native `git cat-file` for headers and verified payload streams.
+Index expressions such as `:path` use a private Git context
 that directs split-index timestamp updates to service storage. Native Git
 reads the primary index, its referenced base and objects from the source.
 An alternate index outside the Git directory may need a private copy of its
@@ -332,24 +338,11 @@ errors propagate before launch or through the lazy operation and runner
 failure as applicable. No failure reruns a started child or silently changes
 write policy.
 
-Active temporary objects and normal ignored writes have no runner disk quota;
-ordinary system disk limits apply. The block cache budget includes entry
-overhead. Completion removes any temporary remote repository and owned
-SSH connection. Write required results to explicit external paths. Busy mounts
-preserve recovery state for stale-run cleanup. Explicit-all materialization
-eagerly fetches every selected tree entry; it never bypasses authentication,
-verification or object errors. See [resource acceptance](resources.md).
-
-SIGKILL cannot run cleanup handlers. The runner does not request FUSE
-`auto_unmount`: after its FUSE descriptor closes, the mount remains disconnected
-and fresh directory access fails with `ENOTCONN`. The command's separate process
-group and an established persistent SSH master can survive. The workspace
-keeps its memory-backed recovery data while a recorded SSH master or a
-retained run needs it. Kernel locks are released when their owning descriptors
-close. Stop the command and other mount users yourself,
-then run `git on --cleanup <temporary-directory>` to unmount and release recorded
-resources. Recovery never kills processes using stale PID records. A kill during
-mount setup can leave the same disconnected mount even before the command starts.
+Completion removes the run's temporary repository and owned SSH connection.
+After abrupt termination, the workspace retains memory-backed recovery data
+while the recorded SSH master or a busy run needs it. See
+[foreground lifecycle and cleanup](usage.md#foreground-lifecycle-and-cleanup)
+and [resource limits](resources.md).
 
 ## Authentication
 
@@ -411,9 +404,10 @@ close their identity-checked master through the same direct mux protocol.
 OpenSSH checks existing host keys at the destination and at each configured
 jump. Every hop uses the run's read-only host-key policy.
 With `CheckHostIP=yes`, OpenSSH checks existing address entries as usual.
-Git-on directs additions to `/dev/null` and keeps the configured files in
-the lookup order. A host-file setting that cannot be determined unambiguously
-stops SSH setup.
+Git-on keeps the configured lookup order and directs additions to a private
+target. It uses `/dev/null` when the list has room and a memory-backed copy of
+the first file at OpenSSH's list limit. An ambiguous host-file setting stops
+SSH setup.
 OpenSSH discovers its default user and system configuration files in their
 original contexts. A launcher in service memory passes the read-only options
 to implicit jump clients and to `ProxyCommand ssh -W …` with literal

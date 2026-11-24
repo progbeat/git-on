@@ -784,6 +784,15 @@ impl State {
             .map(|remote| &remote.raw_blobs)
             .or(self.raw_blobs.as_ref())
     }
+    fn cached_object(&self, oid: Oid) -> Result<Option<crate::raw_blob::RawBlob>> {
+        self.raw_store().map_or(Ok(None), |raw| raw.get(oid))
+    }
+    fn record_blob_load(&mut self, size: u64, streamed: bool) {
+        self.metrics.blob_loads += 1;
+        self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size);
+        self.metrics.streamed_blob_loads +=
+            u64::from(streamed && size > crate::raw_blob::BLOCK as u64);
+    }
     fn tree(&mut self, oid: Oid) -> Result<Arc<Directory>> {
         if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
             if first {
@@ -842,19 +851,7 @@ impl State {
         }
         self.metrics.header_reads += 1;
         self.ensure(oid)?;
-        if let Some(raw) = self
-            .remote
-            .as_ref()
-            .map(|remote| remote.raw_blobs.get(oid))
-            .transpose()?
-            .flatten()
-            .or(self
-                .raw_blobs
-                .as_ref()
-                .map(|raw| raw.get(oid))
-                .transpose()?
-                .flatten())
-        {
+        if let Some(raw) = self.cached_object(oid)? {
             anyhow::ensure!(
                 raw.kind() == ObjectType::Blob,
                 "snapshot file does not reference a blob"
@@ -912,19 +909,12 @@ impl State {
                 .for_read(oid)?
                 .context("snapshot file does not reference a blob")?;
             if first {
-                self.metrics.blob_loads += 1;
-                self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(raw.len());
+                self.record_blob_load(raw.len(), false);
             } else {
                 self.metrics.cache_hits += 1;
             }
             raw
-        } else if let Some(raw) = self
-            .raw_blobs
-            .as_ref()
-            .map(|raw| raw.get(oid))
-            .transpose()?
-            .flatten()
-        {
+        } else if let Some(raw) = self.cached_object(oid)? {
             self.metrics.cache_hits += 1;
             raw
         } else {
@@ -960,11 +950,7 @@ impl State {
                         (raw.insert_odb_blob(oid, object)?, size, false)
                     }
                 };
-            self.metrics.blob_loads += 1;
-            self.metrics.blob_bytes = self.metrics.blob_bytes.saturating_add(size as u64);
-            if size > crate::raw_blob::BLOCK {
-                self.metrics.streamed_blob_loads += u64::from(streamed);
-            }
+            self.record_blob_load(size as u64, streamed);
             blob
         };
         anyhow::ensure!(
@@ -1469,19 +1455,16 @@ impl Snapshot {
     /// Call on the first actual read, then keep the reader for the open handle.
     pub fn set_spool_directory(&self, path: &Path) -> Result<()> {
         let mut state = self.state()?;
+        let storage = path.parent().context("missing private storage parent")?;
         // Own storage while the validated private directory exists.
         // Later upper-layer failures must not turn policy reads into unrelated
         // object-storage failures merely because that directory was removed.
         if state.remote.is_none() && state.raw_blobs.is_none() {
             // Named parts stay outside the execution view.
             // It remains inside the invocation's owned directory for recovery.
-            let storage = path.parent().context("missing private storage parent")?;
             state.raw_blobs = Some(crate::raw_blob::RawBlobs::new(storage)?);
         }
-        state.spool_directory = path
-            .parent()
-            .context("missing private storage parent")?
-            .to_path_buf();
+        state.spool_directory = storage.to_path_buf();
         Ok(())
     }
     pub fn open(&self, oid: Oid) -> Result<BlobReader> {
@@ -1504,21 +1487,7 @@ impl Snapshot {
         {
             state.ensure(oid)?;
         }
-        if state
-            .remote
-            .as_ref()
-            .map(|remote| remote.raw_blobs.get(oid))
-            .transpose()?
-            .flatten()
-            .is_some()
-            || state
-                .raw_blobs
-                .as_ref()
-                .map(|raw| raw.get(oid))
-                .transpose()?
-                .flatten()
-                .is_some()
-        {
+        if state.cached_object(oid)?.is_some() {
             let reader = state.open(oid)?;
             drop(state);
             let size = reader.len();
@@ -1544,9 +1513,7 @@ impl Snapshot {
         {
             let (size, streamed) =
                 remote.copy_materialized_blob(oid, output, State::validate_blob)?;
-            state.metrics.blob_loads += 1;
-            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size);
-            state.metrics.streamed_blob_loads += u64::from(streamed);
+            state.record_blob_load(size, streamed);
             return Ok(size);
         }
         if let Some(native) = state.native_local() {
@@ -1558,9 +1525,7 @@ impl Snapshot {
                     Ok(size)
                 },
             )?;
-            state.metrics.blob_loads += 1;
-            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
-            state.metrics.streamed_blob_loads += u64::from(size > crate::raw_blob::BLOCK);
+            state.record_blob_load(size as u64, true);
             return Ok(size as u64);
         }
         let odb = state
@@ -1586,11 +1551,7 @@ impl Snapshot {
             (size, false)
         };
         drop(odb);
-        state.metrics.blob_loads += 1;
-        state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size as u64);
-        if size > crate::raw_blob::BLOCK {
-            state.metrics.streamed_blob_loads += u64::from(streamed);
-        }
+        state.record_blob_load(size as u64, streamed);
         Ok(size as u64)
     }
     pub(crate) fn with_materialized_symlink_target<T>(
@@ -1616,8 +1577,7 @@ impl Snapshot {
             let size = object.len() as u64;
             drop(object);
             drop(odb);
-            state.metrics.blob_loads += 1;
-            state.metrics.blob_bytes = state.metrics.blob_bytes.saturating_add(size);
+            state.record_blob_load(size, false);
             return Ok(result);
         }
         drop(state);
@@ -1649,11 +1609,7 @@ impl Snapshot {
             transfer.mark_served();
         }
         remote.raw_blobs.forget_received(oid);
-        state.metrics.blob_loads += 1;
-        state.metrics.blob_bytes = state
-            .metrics
-            .blob_bytes
-            .saturating_add(object.data().len() as u64);
+        state.record_blob_load(object.data().len() as u64, false);
         Ok(Some(object))
     }
 

@@ -60,6 +60,15 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         tls.set_alpn_protocols(['h2', 'http/1.1'])
         self.socket = tls.wrap_socket(self.socket, server_side=True)
 
+    @property
+    def url(self):
+        return f'https://127.0.0.1:{self.server_address[1]}/server.git'
+
+    def start(self, cleanup):
+        cleanup(self.server_close)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+        cleanup(self.shutdown)
+
     def forward(self, method, path, headers, body):
         authorization = next((value for key, value in headers.items()
                               if key.lower() == 'authorization'), None)
@@ -234,17 +243,19 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
 
 
 class Http2Tests(unittest.TestCase):
-    def test_https_reads_credentials_and_streams_default_origin_without_a_repository(self):
+    def https_fixture(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         backend = fixture.https()
         self.addCleanup(fixture.server.shutdown)
+        return fixture, backend
+
+    def test_https_reads_credentials_and_streams_default_origin_without_a_repository(self):
+        fixture, backend = self.https_fixture()
         token = base64.b64encode(b'fixture:example-password').decode()
         proxy = Multiplexer(fixture, backend, 'Basic ' + token)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        proxy.start(self.addCleanup)
+        url = proxy.url
         fixture.git('init', '--quiet', at=fixture.cwd)
         fixture.git('remote', 'add', 'origin', url, at=fixture.cwd)
         config = fixture.cwd / '.git/config'
@@ -303,14 +314,10 @@ class Http2Tests(unittest.TestCase):
                     self.assertEqual(report['remote_http2_fetch_operations'] > 0, not native, report)
 
     def test_copy_streams_http1_pack_with_discovery_and_ref_retry(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         for scenario in ('http1', 'downgrade', 'ref-probe'):
             with self.subTest(scenario=scenario), ExitStack() as stack:
                 proxy = Multiplexer(fixture, backend, None)
-                stack.callback(proxy.server_close)
                 if scenario == 'downgrade':
                     proxy.switch_to_http1 = True
                 else:
@@ -326,9 +333,8 @@ class Http2Tests(unittest.TestCase):
                     return upstream(method, path, headers, body)
 
                 proxy.forward = forward
-                threading.Thread(target=proxy.serve_forever, daemon=True).start()
-                stack.callback(proxy.shutdown)
-                source = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+                proxy.start(stack.callback)
+                source = proxy.url
                 with tempfile.TemporaryFile() as metrics:
                     env = dict(fixture.env, GIT_ON_TEST_METRICS_FD=str(metrics.fileno()))
                     result = subprocess.run(
@@ -351,16 +357,11 @@ class Http2Tests(unittest.TestCase):
                     self.assertEqual(report['remote_native_pack_bytes'], 0, report)
 
     def test_lazy_https_respects_native_fetch_configuration(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         token = base64.b64encode(b'fixture:example-password').decode()
         proxy = Multiplexer(fixture, backend, 'Basic ' + token)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
-        source = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        proxy.start(self.addCleanup)
+        source = proxy.url
         oracle = fixture.root / 'native-fetch.git'
         fixture.git('init', '--bare', '--quiet', oracle, at=fixture.root)
         env = dict(fixture.env, GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='credential.helper',
@@ -384,15 +385,11 @@ class Http2Tests(unittest.TestCase):
                 self.assertIn(b'fetch.prune', result.stderr)
 
     def test_https_native_fallback_keeps_the_selected_revision(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         changed_subtree = fixture.git('mktree', data=f'100644 blob {fixture.other}\tfile\n'.encode())
         changed_tree = fixture.git('mktree', data=f'040000 tree {changed_subtree}\tdeep\n'.encode())
         moved = fixture.git('commit-tree', changed_tree, '-p', fixture.commit, data=b'moved ref\n')
         proxy = Multiplexer(fixture, backend, None)
-        self.addCleanup(proxy.server_close)
         upstream = proxy.forward
         wants = []
 
@@ -411,9 +408,8 @@ class Http2Tests(unittest.TestCase):
             return response
 
         proxy.forward = forward
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        proxy.start(self.addCleanup)
+        url = proxy.url
         for scenario in ('lazy', 'copy', 'mapped', 'remote-group', 'downgrade'):
             with self.subTest(scenario=scenario):
                 wants.clear()
@@ -475,17 +471,13 @@ class Http2Tests(unittest.TestCase):
                 self.assertEqual(wants[:2], [fixture.commit.encode()] * 2)
 
     def test_mount_can_recover_https_preparation(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         mount = 'nfs' if OPTIONS.require_nfs else 'fuse'
         token = base64.b64encode(b'fixture:example-password').decode()
         for scenario in ('403', '404', 'downgrade', 'held-downgrade'):
             with self.subTest(scenario=scenario), ExitStack() as stack:
                 denial = int(scenario) if scenario in ('403', '404') else None
                 proxy = Multiplexer(fixture, backend, 'Basic ' + token)
-                stack.callback(proxy.server_close)
                 upstream = proxy.forward
                 requests = []
 
@@ -507,8 +499,7 @@ class Http2Tests(unittest.TestCase):
                     return upstream(method, path, headers, body)
 
                 proxy.forward = forward
-                threading.Thread(target=proxy.serve_forever, daemon=True).start()
-                stack.callback(proxy.shutdown)
+                proxy.start(stack.callback)
                 stack.callback(proxy.release_http1_body.set)
                 operations = fixture.root / f'credentials-{scenario}'
                 quoted = shlex.quote(str(operations))
@@ -520,7 +511,7 @@ class Http2Tests(unittest.TestCase):
                         f'echo "$1" >>{quoted}; }}; f'
                     ),
                 )
-                url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+                url = proxy.url
                 with tempfile.TemporaryFile() as metrics:
                     env['GIT_ON_TEST_METRICS_FD'] = str(metrics.fileno())
                     result = subprocess.run(
@@ -549,14 +540,9 @@ class Http2Tests(unittest.TestCase):
         advertised = capabilities.stdout.splitlines()
         if b'capability state' not in advertised:
             self.skipTest('native Git lacks the credential state capability')
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         proxy = Multiplexer(fixture, backend, None)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
+        proxy.start(self.addCleanup)
         upstream = proxy.forward
         first = 'Basic ' + base64.b64encode(b'fixture:phase-one').decode()
         second = 'Basic ' + base64.b64encode(b'fixture:phase-two').decode()
@@ -651,7 +637,7 @@ class Http2Tests(unittest.TestCase):
         env = dict(fixture.env, HOME=str(fixture.root), GIT_CONFIG_COUNT='1',
                    GIT_CONFIG_KEY_0='credential.helper')
         env.pop('NETRC', None)
-        source = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        source = proxy.url
         oracle = fixture.root / 'oracle.git'
         fixture.git('init', '--bare', str(oracle), at=fixture.root)
         native = ['git', '--git-dir', oracle, 'fetch', '--no-tags', '--depth=1', '--', source, 'HEAD']
@@ -768,9 +754,7 @@ class Http2Tests(unittest.TestCase):
             return status, fields, payload
 
         proxy.forward = forward_with_alias
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
+        proxy.start(self.addCleanup)
 
         code = r"""
 import os
@@ -784,7 +768,7 @@ if sys.argv[1] == 'absent':
     assert not repository.exists()
 print(os.environ['GIT_ON_TREE_OID'])
 """
-        https = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        https = proxy.url
         ssh = (fixture.ssh(protocol_v2=True, max_sessions=1)
                if any(transport.endswith('ssh') for transport in transports) else None)
         pack_config = {'pack.indexversion': '3', 'pack.writereverseindex': 'invalid'}
@@ -999,14 +983,9 @@ print(os.environ['GIT_ON_TREE_OID'])
             self.assertEqual(proxy.unauthenticated_wants, {fixture.commit.encode()})
 
     def test_eager_https_shows_actual_pack_progress(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        backend = fixture.https()
-        self.addCleanup(fixture.server.shutdown)
+        fixture, backend = self.https_fixture()
         proxy = Multiplexer(fixture, backend, None)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
+        proxy.start(self.addCleanup)
 
         commit = fixture.git('commit-tree', fixture.tree, '-p', fixture.commit, data=b'child\n')
         fixture.git('update-ref', 'refs/heads/main', commit)
@@ -1034,7 +1013,7 @@ print(os.environ['GIT_ON_TREE_OID'])
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
         termios.tcsetwinsize(slave, (24, 100))
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        url = proxy.url
         try:
             command = [OPTIONS.binary, url, commit, '--backend=copy', '--write-policy=all',
                        '--', 'cat', 'deep/file']

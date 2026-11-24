@@ -696,6 +696,35 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         self.assertEqual(known.read_bytes(), original)
         self.assertEqual(second.read_bytes(), b'')
 
+        probes = f.root / 'ssh-probes'
+        wrapper = f.root / 'counting-ssh'
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            f'if test "$1" = -G; then echo probe >> {shlex.quote(str(probes))}; fi\n'
+            f'exec {shlex.quote(shutil.which("ssh"))} "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        entries = [f.root / f'known-{index}' for index in range(30)]
+        unrelated = ''.join(f'Host unused-{i}\n UserKnownHostsFile ~/.ssh/other-{i}\n'
+                            for i in range(12))
+        f.env['GIT_SSH_COMMAND'] = shlex.join([str(wrapper), *command[1:]])
+        for stanzas, extra in ((('', unrelated), []), (('',), entries)):
+            with self.subTest(host_files=2+len(extra)):
+                files = ' '.join([f'"{known}"', str(second), *map(str, extra)])
+                counts = []
+                for inactive in stanzas:
+                    settings = address_config + f' UserKnownHostsFile {files}\n' + inactive
+                    config.write_text(settings)
+                    probes.unlink(missing_ok=True)
+                    result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+                    self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+                    self.assertEqual(known.read_bytes(), original)
+                    self.assertEqual(second.read_bytes(), b'')
+                    self.assertFalse(any(path.exists() for path in extra))
+                    self.assertEqual(config.read_text(), settings)
+                    counts.append(len(probes.read_text().splitlines()))
+                self.assertEqual(len(set(counts)), 1, 'unrelated host stanzas launched extra ssh probes')
+
         wrong = address + b' ' + (f.root / 'identity.pub').read_bytes()
         second.write_bytes(wrong)
         config.write_text(address_config + f' UserKnownHostsFile "{known}" {second}\n'

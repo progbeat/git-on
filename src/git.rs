@@ -1452,23 +1452,9 @@ fn stop_request_operation(child: &mut std::process::Child, signal_target: i32) -
     // Let native Git roll back its locks. WNOWAIT preserves leader ownership
     // until every remaining group member has been killed, preventing PID reuse.
     let deadline = Instant::now() + Duration::from_millis(100);
-    loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id(),
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-        {
-            break;
-        }
-        if (result == 0 && crate::platform::siginfo_pid(&info) != 0) || Instant::now() >= deadline {
-            break;
-        }
+    while matches!(crate::platform::child_exited(child.id()), Ok(false))
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     unsafe {

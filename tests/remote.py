@@ -1913,10 +1913,20 @@ os.execv({native!r},[{native!r},*args])
         version = run(['gpg', '--no-options', '--version'], env=public_env).splitlines()[0].split()[-1]
         series = os.fsdecode(b'.'.join(version.split(b'.')[:2]))
         versioned_config = public_home / f'gpg.conf-{series}'
-        for name, regular, versioned in (
+        import pwd
+        configurations = [
             ('ignored options directive', keyring_options + f'options {f.root / "unused.conf"}\n', None),
             ('version-specific config', 'no-default-keyring\n', keyring_options),
-        ):
+        ]
+        try:
+            account = pwd.getpwuid(os.getuid())
+        except KeyError:
+            with self.subTest(configuration='named user home'):
+                self.skipTest('current UID has no passwd entry')
+        else:
+            named_path = f'~{account.pw_name}/{os.path.relpath(keyring, account.pw_dir)}'
+            configurations.insert(0, ('named user home', f'no-default-keyring\nkeyring "{named_path}"\n', None))
+        for name, regular, versioned in configurations:
             with self.subTest(configuration=name):
                 config.write_text(regular)
                 if versioned is not None:
@@ -1930,13 +1940,36 @@ os.execv({native!r},[{native!r},*args])
                     self.assertEqual(versioned_config.read_text(), versioned)
 
         inactive = public_home / 'gpg.conf-99.0'
-        inactive.write_text('keyring\n')
-        inactive.chmod(0)
+        invalid_ring = f.root / 'unusable-keyring'
+        invalid_ring.mkdir()
+        inactive_options = f'keyring "{invalid_ring}"\n'
+        inactive.write_text(inactive_options)
         run(native, env=public_env)
         process = f.probe('local', signed, verify=True)
         self.assertEqual(f.line(process)['tree'], f.tree)
         f.finish(process)
-        self.assertEqual(inactive.stat().st_mode & 0o777, 0)
+        self.assertEqual(inactive.read_text(), inactive_options)
+
+        # A configured program can bypass PATH delegation and choose its own options.
+        inactive.write_text(keyring_options)
+        versioned_config.write_text('no-default-keyring\n')
+        probe_log = f.root / 'unexpected-config-probe'
+        native_gpg = shlex.quote(shutil.which('gpg', path=f.env['PATH']))
+        f.env['GNUPGHOME'] = str(public_home)
+        f.git('config', 'gpg.program', str(wrapper))
+        for program in (native_gpg, 'gpg'):
+            with self.subTest(explicit_options=program):
+                wrapper.write_text(
+                    '#!/bin/sh\n'
+                    f'if test "$1" = --debug; then touch {shlex.quote(str(probe_log))}; fi\n'
+                    f'exec {program} --options "$GNUPGHOME/{inactive.name}" "$@"\n'
+                )
+                run(native, env=f.env)
+                process = f.probe('local', signed, verify=True)
+                self.assertEqual(f.line(process)['tree'], f.tree)
+                f.finish(process)
+                self.assertFalse(probe_log.exists())
+        inactive.write_text(inactive_options)
 
         custom = f.root / 'external-wrapper-keys' / 'verification'
         custom.parent.mkdir(mode=0o700)
@@ -1966,6 +1999,42 @@ os.execv({native!r},[{native!r},*args])
         process = f.probe('local', signed, verify=True)
         self.assertEqual(f.line(process)['tree'], f.tree)
         f.finish(process)
+        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+
+        invalid_home = f.root / 'not-a-gnupg-directory'
+        invalid_home.write_bytes(b'caller file')
+        alternate_config = alternate_home / 'gpg.conf'
+        alternate_config.write_text('no-default-keyring\nkeyring public.gpg\n')
+        wrapper.write_text(f'#!/bin/sh\nexec gpg --homedir {shlex.quote(str(alternate_home))} "$@"\n')
+        f.env['GNUPGHOME'] = str(invalid_home)
+        run(native, env=f.env)
+        process = f.probe('local', signed, verify=True)
+        self.assertEqual(f.line(process)['tree'], f.tree)
+        f.finish(process)
+        self.assertEqual(invalid_home.read_bytes(), b'caller file')
+        self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
+
+        (alternate_home / versioned_config.name).write_text(alternate_config.read_text())
+        alternate_config.write_text('no-default-keyring\n')
+        inaccessible_home = f.root / 'inaccessible-gnupg'
+        inaccessible_home.mkdir()
+        for inherited, mode in ((inaccessible_home, 0o000), (alternate_home, 0o300)):
+            with self.subTest(inherited_home=inherited.name):
+                if inherited == alternate_home:
+                    f.git('config', '--unset', 'gpg.program')
+                f.env['GNUPGHOME'] = str(inherited)
+                inherited.chmod(mode)
+                try:
+                    if os.access(inherited, os.R_OK):
+                        continue  # Root can still list the fixture.
+                    run(native, env=f.env)
+                    process = f.probe('local', signed, verify=True)
+                    self.assertEqual(f.line(process)['tree'], f.tree)
+                    f.finish(process)
+                    self.assertEqual(inherited.stat().st_mode & 0o777, mode)
+                finally:
+                    inherited.chmod(0o700)
+        self.assertEqual(list(inaccessible_home.iterdir()), [])
         self.assertEqual(alternate_keyring.read_bytes(), original_keyring)
 
     @unittest.skipUnless(shutil.which('gpgsm'), 'requires the native X.509 verifier')

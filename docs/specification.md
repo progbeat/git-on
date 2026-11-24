@@ -171,27 +171,14 @@ The native mount and write-policy contracts apply to local and remote runs.
 - Handle recoverable resource errors through ordinary operation or runner
   failures and orderly cleanup whenever possible. Manual stale-run recovery
   does not justify abrupt termination for an error that can be handled.
-- Abrupt process or machine termination and busy mounts may require stale-run
-  cleanup. New runs lock an empty, writable ownership marker before creating
-  the run directory. The marker stays in a private sibling directory through
-  teardown. Its name records the identities of the run directory and the
-  locked marker before execution.
-  If startup is interrupted before binding, cleanup can reclaim a reservation
-  with no run directory. A surviving directory without a matching marker is
-  left for manual recovery.
-  Startup rollback and ordinary cleanup can retire that marker without
-  allocating another inode.
-  On Linux the marker records the directory's persistent handle and creation
-  time when available to distinguish inode reuse. Recovery compares the handles
-  when both are available and falls back to creation time when a handle is
-  unavailable. The first recorded identifier stays the mount identity.
-  On macOS automatic recovery of a new run requires the directory's birth time.
-  Live cleanup can use the open directory descriptor alone. Recovery
-  preserves existing directories whose binding it cannot verify. SSH recovery retains
-  the owned endpoint identity. Cleanup accepts older run records and
-  leaves recorded Git pins in the source repository.
-  `git on --cleanup <temporary-directory>` must refuse active directories and
-  unrelated mounts. It never terminates processes based on stale PIDs.
+- Abrupt termination and busy mounts may require stale-run cleanup.
+  An empty, writable ownership marker locks the run from reservation to
+  teardown, including on NFS. Startup rollback and ordinary cleanup can
+  retire the marker without allocating another inode.
+  `git on --cleanup <temporary-directory>` accepts legacy records and unused
+  reservations. It refuses active runs and preserves directories, mounts, or
+  endpoints whose identity it cannot verify. Older Git pins remain in the
+  source repository. Cleanup never terminates processes based on stale PIDs.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 

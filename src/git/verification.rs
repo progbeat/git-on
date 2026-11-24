@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs,
     io::{self, Write},
     os::unix::{
@@ -45,24 +45,47 @@ impl Format {
     }
 }
 
-struct VerificationInputs {
-    format: Option<Format>,
-    copy_extra: bool,
-}
-
-struct DelegateContext<'a> {
+struct VerificationContext<'a> {
     cwd: &'a Path,
     source: Option<&'a Path>,
-    caller: Option<&'a Path>,
-    format: Format,
+    caller: Option<PathBuf>,
+    format: Option<Format>,
+    openpgp_config: Option<OsString>,
 }
 
-impl DelegateContext<'_> {
+impl<'a> VerificationContext<'a> {
+    fn new(
+        run: &Path,
+        cwd: &'a Path,
+        source: Option<&'a Path>,
+        format: Option<Format>,
+        program: &OsStr,
+    ) -> Result<Self> {
+        let openpgp_config = if format == Some(Format::X509) {
+            None
+        } else {
+            select_openpgp_config(run, cwd, source, program)?
+        };
+        Ok(Self {
+            cwd,
+            source,
+            caller: env::home_dir(),
+            format,
+            openpgp_config,
+        })
+    }
+
     fn key(&self) -> blake3::Hash {
         let mut hash = blake3::Hasher::new();
-        hash.update(self.format.program().as_bytes());
+        if let Some(format) = self.format {
+            hash.update(format.program().as_bytes());
+        }
         hash.update(&[0]);
-        for location in [Some(self.cwd), self.source, self.caller] {
+        if let Some(config) = &self.openpgp_config {
+            hash.update(config.as_bytes());
+        }
+        hash.update(&[0]);
+        for location in [Some(self.cwd), self.source, self.caller.as_deref()] {
             if let Some(location) = location {
                 hash.update(location.as_os_str().as_bytes());
             }
@@ -124,17 +147,11 @@ impl Scratch {
             });
             let cwd = command.get_current_dir().unwrap_or(Path::new("."));
             let source = resolve_home(cwd, env::var_os("GNUPGHOME"))?;
-            let caller = env::home_dir();
-            let home = prepare_home(
-                directory,
-                cwd,
-                VerificationInputs {
-                    format: None,
-                    copy_extra: custom_verifier,
-                },
-                source.as_deref(),
-                caller.as_deref(),
-            )?;
+            let program = configured_program(config, "gpg.openpgp.program", "gpg")
+                .unwrap_or(OsStr::new("gpg"));
+            let context =
+                VerificationContext::new(directory, cwd, source.as_deref(), None, program)?;
+            let home = prepare_home(directory, &context, custom_verifier)?;
             command
                 .env("GNUPGHOME", &home)
                 .env("XDG_RUNTIME_DIR", &home);
@@ -142,13 +159,7 @@ impl Scratch {
         }
         let executable = std::env::current_exe()?;
         for (name, key, variable, default) in VERIFIERS {
-            let configured = config
-                .iter()
-                .rev()
-                .find(|(setting, _)| {
-                    setting == key || (default == "gpg" && setting == "gpg.program")
-                })
-                .and_then(|(_, value)| value.as_deref());
+            let configured = configured_program(config, key, default);
             let helper = directory.join(name);
             symlink(&executable, &helper)?;
             let mut option = OsString::from(format!("{key}="));
@@ -164,6 +175,18 @@ impl Scratch {
         }
         Ok(())
     }
+}
+
+fn configured_program<'a>(
+    config: &'a [(OsString, Option<OsString>)],
+    key: &str,
+    default: &str,
+) -> Option<&'a OsStr> {
+    config
+        .iter()
+        .rev()
+        .find(|(setting, _)| setting == key || (default == "gpg" && setting == "gpg.program"))
+        .and_then(|(_, value)| value.as_deref())
 }
 
 impl Drop for Scratch {
@@ -245,22 +268,13 @@ pub fn invoke_verifier() -> Option<i32> {
             std::env::var_os(format!("{variable}_CONFIGURED")).as_deref() == Some(OsStr::new("1"));
         let cwd = env::current_dir()?;
         let format = Format::for_program(default);
-        let inputs = VerificationInputs {
-            format: Some(format),
-            copy_extra: configured,
-        };
         let source = resolve_home(&cwd, env::var_os("GNUPGHOME"))?;
-        let caller = env::home_dir();
-        let home = prepare_home(run, &cwd, inputs, source.as_deref(), caller.as_deref())?;
+        let context =
+            VerificationContext::new(run, &cwd, source.as_deref(), Some(format), &program)?;
+        let home = prepare_home(run, &context, configured)?;
         let mut command = Command::new(program);
         command.args(arguments);
         let _delegate = if configured {
-            let context = DelegateContext {
-                cwd: &cwd,
-                source: source.as_deref(),
-                caller: caller.as_deref(),
-                format,
-            };
             Some(configure_delegate(&mut command, run, &home, &context)?)
         } else {
             command
@@ -291,11 +305,26 @@ fn verifier_program_variable(name: &str) -> String {
     format!("GIT_ON_NATIVE_GNUPG_{name}")
 }
 
+fn resolve_program(cwd: &Path, program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    let executable = |candidate: &Path| {
+        candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    if program.as_bytes().contains(&b'/') {
+        let candidate = cwd.join(program);
+        return executable(&candidate).then_some(candidate);
+    }
+    env::split_paths(path)
+        .map(|path| cwd.join(path).join(program))
+        .find(|candidate| executable(candidate))
+}
+
 fn configure_delegate(
     command: &mut Command,
     run: &Path,
     home: &Path,
-    context: &DelegateContext<'_>,
+    context: &VerificationContext<'_>,
 ) -> Result<tempfile::TempDir> {
     let original = env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
     let tools = tempfile::Builder::new()
@@ -304,13 +333,7 @@ fn configure_delegate(
         .tempdir_in(run)?;
     let executable = env::current_exe()?;
     for name in VERIFIER_TOOLS {
-        let program = env::split_paths(&original)
-            .map(|path| context.cwd.join(path).join(name))
-            .find(|candidate| {
-                candidate
-                    .metadata()
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            });
+        let program = resolve_program(context.cwd, OsStr::new(name), &original);
         if let Some(program) = program {
             symlink(&executable, tools.path().join(name))?;
             command.env(verifier_program_variable(name), program);
@@ -347,7 +370,7 @@ fn run_delegate(
             }
         }
     }
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
     command.args(forwarded);
     let existing = env::var_os(DELEGATE_HOME).context("missing private GnuPG home")?;
     let inherited_home = source.as_deref() == Some(existing.as_os_str());
@@ -358,13 +381,7 @@ fn run_delegate(
     } else {
         resolve_home(&cwd, source)?
     };
-    let caller = env::home_dir();
-    let context = DelegateContext {
-        cwd: &cwd,
-        source: source.as_deref(),
-        caller: caller.as_deref(),
-        format,
-    };
+    let context = VerificationContext::new(run, &cwd, source.as_deref(), Some(format), &program)?;
     let key = context.key().to_hex();
     let same_context = env::var_os(DELEGATE_KEY).as_deref() == Some(OsStr::new(key.as_str()));
     let home = if inherited_home && same_context {
@@ -376,7 +393,7 @@ fn run_delegate(
     Ok(command.status()?)
 }
 
-fn delegated_home(run: &Path, context: &DelegateContext<'_>) -> Result<PathBuf> {
+fn delegated_home(run: &Path, context: &VerificationContext<'_>) -> Result<PathBuf> {
     // Keep the socket pathname inside GnuPG's Unix socket length limit.
     let key = context.key().to_hex();
     let directory = run.join(format!("{DELEGATE_PREFIX}{}", &key[..16]));
@@ -396,22 +413,18 @@ fn delegated_home(run: &Path, context: &DelegateContext<'_>) -> Result<PathBuf> 
     if !ready.try_exists()? {
         // An interrupted preparation can leave a partial copy before it
         // releases the lock. Only expose the home after the complete copy.
-        match fs::remove_dir_all(&home) {
+        match fs::remove_dir_all(&home).or_else(|error| {
+            if error.kind() == io::ErrorKind::NotADirectory {
+                fs::remove_file(&home)
+            } else {
+                Err(error)
+            }
+        }) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let inputs = VerificationInputs {
-            format: Some(context.format),
-            copy_extra: true,
-        };
-        prepare_home(
-            &directory,
-            context.cwd,
-            inputs,
-            context.source,
-            context.caller,
-        )?;
+        prepare_home(&directory, context, true)?;
         fs::File::create(ready)?;
     }
     Ok(home)
@@ -445,14 +458,191 @@ fn resolve_home(cwd: &Path, source_home: Option<OsString>) -> Result<Option<Path
     })
 }
 
-fn prepare_home(
+fn versioned_openpgp_config(name: &[u8]) -> bool {
+    name.strip_prefix(b"gpg.conf-")
+        .and_then(|version| version.first())
+        .is_some_and(u8::is_ascii_digit)
+}
+
+fn has_access(path: &Path, mode: libc::c_int) -> io::Result<bool> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    Ok(unsafe { libc::access(path.as_ptr(), mode) } == 0)
+}
+
+fn list_home(path: &Path) -> io::Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        // An unlistable directory can still allow lookup of known files.
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied && has_access(path, libc::X_OK)? =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn select_openpgp_config(
     run: &Path,
     cwd: &Path,
-    inputs: VerificationInputs,
     source: Option<&Path>,
-    caller: Option<&Path>,
+    program: &OsStr,
+) -> Result<Option<OsString>> {
+    let default = OsString::from("gpg.conf");
+    let Some(source) = source else {
+        return Ok(Some(default));
+    };
+    let entries = match list_home(source) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::NotADirectory
+                    | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(Some(default));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let can_list = entries.is_some();
+    if let Some(entries) = entries {
+        let mut has_versioned_config = false;
+        for entry in entries {
+            let entry = entry?;
+            if versioned_openpgp_config(entry.file_name().as_bytes())
+                && has_access(&entry.path(), libc::R_OK)?
+            {
+                has_versioned_config = true;
+                break;
+            }
+        }
+        if !has_versioned_config {
+            return Ok(Some(default));
+        }
+    }
+
+    let shadow = tempfile::Builder::new()
+        .prefix("c-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(run)?;
+    let Some(backend) = native_openpgp_backend(program, cwd, shadow.path(), !can_list)? else {
+        return Ok(None);
+    };
+    let result = Command::new(backend)
+        .current_dir(cwd)
+        .env("GNUPGHOME", shadow.path())
+        .env("XDG_RUNTIME_DIR", shadow.path())
+        .env("TMPDIR", shadow.path())
+        .args(["--no-options", "--with-colons", "--list-config", "version"])
+        .stdin(Stdio::null())
+        .output()?;
+    let Some(version) = result
+        .status
+        .success()
+        .then(|| std::str::from_utf8(&result.stdout).ok())
+        .flatten()
+        .and_then(|output| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("cfg:version:"))
+        })
+        .filter(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-_+".contains(&byte))
+        })
+    else {
+        return Ok(None);
+    };
+    // GnuPG tries the full version, then removes each suffix separated by a
+    // dot or dash. Looking up these names also works without directory listing.
+    let lengths =
+        std::iter::once(version.len()).chain(version.rmatch_indices(['.', '-']).map(|(i, _)| i));
+    for len in lengths {
+        let name = format!("gpg.conf-{}", &version[..len]);
+        if has_access(&source.join(&name), libc::R_OK)? {
+            return Ok(Some(name.into()));
+        }
+    }
+    Ok(Some(default))
+}
+
+fn native_openpgp_backend(
+    program: &OsStr,
+    cwd: &Path,
+    scratch: &Path,
+    use_default_for_unlistable_home: bool,
+) -> Result<Option<PathBuf>> {
+    let path = env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+    let result = match Command::new("gpgconf")
+        .current_dir(cwd)
+        .env("GNUPGHOME", scratch)
+        .env("XDG_RUNTIME_DIR", scratch)
+        .env("TMPDIR", scratch)
+        .args(["--list-dirs", "bindir"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(result) if result.status.success() => result,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(directory) = result.stdout.strip_suffix(b"\n") else {
+        return Ok(None);
+    };
+    let directory = Path::new(OsStr::from_bytes(directory));
+    if !directory.is_absolute() {
+        return Ok(None);
+    }
+    let backend = directory.join("gpg");
+    let Ok(actual) = backend.metadata() else {
+        return Ok(None);
+    };
+    // Never execute a configured wrapper to discover a GnuPG version. With
+    // an unlistable home, use the installed PATH delegate for known filenames.
+    let programs = std::iter::once(program)
+        .chain(use_default_for_unlistable_home.then_some(OsStr::new("gpg")));
+    let matches_installation = programs
+        .filter_map(|program| resolve_program(cwd, program, &path))
+        .filter_map(|program| program.metadata().ok())
+        .any(|expected| (actual.dev(), actual.ino()) == (expected.dev(), expected.ino()));
+    Ok(matches_installation.then_some(backend))
+}
+
+fn prepare_home(
+    run: &Path,
+    context: &VerificationContext<'_>,
+    copy_extra: bool,
 ) -> Result<PathBuf> {
     let home = run.join("keys");
+    let mut source = context.source;
+    let mut entries = match source.map(list_home).transpose() {
+        Ok(entries) => entries.flatten(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            source = None;
+            None
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotADirectory | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            // Preserve an unusable inherited home in private storage. A
+            // configured wrapper can still select a different home.
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&home)?;
+            return Ok(home);
+        }
+        Err(error) => return Err(error.into()),
+    };
     match fs::DirBuilder::new().mode(0o700).create(&home) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(home),
@@ -474,149 +664,175 @@ fn prepare_home(
     ] {
         copy_public_file(&source.join(name), &home.join(name))?;
     }
-    let entries = match fs::read_dir(source) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(home),
-        Err(error) => return Err(error.into()),
-    };
     let mut directories = Vec::new();
-    if inputs.copy_extra || inputs.format != Some(Format::OpenPgp) {
+    if entries.is_some() && (copy_extra || context.format != Some(Format::OpenPgp)) {
         let metadata = fs::metadata(source)?;
         directories.push((metadata.dev(), metadata.ino()));
     }
     let mut named_files = 0;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
+    let other_options = [
+        "gpgsm.conf",
+        "gpg-agent.conf",
+        "common.conf",
+        "keyboxd.conf",
+        "dirmngr.conf",
+    ]
+    .map(OsStr::new);
+    let default = OsStr::new("gpg.conf");
+    let selected = context.openpgp_config.as_deref().unwrap_or(default);
+    let alternate = (entries.is_none() && copy_extra && selected != default).then_some(default);
+    let mut known = std::iter::once(selected)
+        .chain(alternate)
+        .chain(other_options)
+        .chain(std::iter::once(OsStr::new("crls.d")));
+    loop {
+        let name = match &mut entries {
+            Some(entries) => entries.next().transpose()?.map(|entry| entry.file_name()),
+            None => known.next().map(OsString::from),
+        };
+        let Some(name) = name else { break };
         let filename = name.as_bytes();
-        // Preserve version-qualified names so GnuPG chooses the applicable file.
-        let versioned = filename
-            .strip_prefix(b"gpg.conf-")
-            .and_then(|version| version.first())
-            .is_some_and(u8::is_ascii_digit);
+        let openpgp = filename == b"gpg.conf" || versioned_openpgp_config(filename);
+        let explicit_default = alternate == Some(name.as_os_str());
         // Git dispatches verification by the signature format. Each GnuPG
         // verifier reads its own options, plus the shared helper configs.
-        if (inputs.format == Some(Format::OpenPgp) && matches!(filename, b"gpgsm.conf" | b"crls.d"))
-            || (inputs.format == Some(Format::X509) && (versioned || filename == b"gpg.conf"))
+        if (context.format == Some(Format::OpenPgp)
+            && matches!(filename, b"gpgsm.conf" | b"crls.d"))
+            || (openpgp
+                && (context.format == Some(Format::X509)
+                    || context
+                        .openpgp_config
+                        .as_deref()
+                        .is_some_and(|selected| name != selected && !explicit_default)))
         {
             continue;
         }
-        if !versioned
-            && !matches!(
-                filename,
-                b"gpg.conf"
-                    | b"gpgsm.conf"
-                    | b"gpg-agent.conf"
-                    | b"common.conf"
-                    | b"keyboxd.conf"
-                    | b"dirmngr.conf"
-            )
-        {
-            if inputs.copy_extra || filename == b"crls.d" {
-                copy_verifier_input(&entry, &home.join(name), &mut directories)?;
+        if !openpgp && !other_options.contains(&name.as_os_str()) {
+            if copy_extra || filename == b"crls.d" {
+                copy_verifier_input(source.join(&name), &home.join(name), &mut directories)?;
             }
             continue;
         }
-        let config = match read_public_file(&entry.path()) {
-            Ok(Some(config)) => config,
-            Ok(None) => continue,
-            Err(error)
-                if versioned
-                    && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                        matches!(
-                            error.kind(),
-                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                        )
-                    }) =>
-            {
-                // GnuPG chooses its first readable versioned configuration.
-                continue;
+        let original = source.join(&name);
+        let defer_selection = explicit_default || (openpgp && context.openpgp_config.is_none());
+        if defer_selection && !has_access(&original, libc::R_OK)? {
+            continue;
+        }
+        let target = home.join(&name);
+        let result = copy_options(
+            &original,
+            &target,
+            source,
+            context.cwd,
+            context.caller.as_deref(),
+            &mut named_files,
+        );
+        if let Err(error) = result {
+            if !defer_selection {
+                return Err(error);
             }
-            Err(error) => return Err(error),
-        };
-        let mut output = fs::File::create(home.join(&name))?;
-        for line in config.split_inclusive(|byte| *byte == b'\n') {
-            let trimmed = line.trim_ascii_start();
-            let end = trimmed
-                .iter()
-                .position(|byte| byte.is_ascii_whitespace())
-                .unwrap_or(trimmed.len());
-            let (option, parameters) = trimmed.split_at(end);
-            let option = option.strip_prefix(b"--").unwrap_or(option);
-            // GnuPG's "options" directive selects a file only on the command line.
-            match option {
-                b"log-file"
-                | b"logger-file"
-                | b"debug-log-file"
-                | b"status-file"
-                | b"logger-fd"
-                | b"status-fd"
-                | b"attribute-fd"
-                | b"attribute-file"
-                | b"output"
-                | b"write-env-file"
-                | b"extra-socket"
-                | b"browser-socket"
-                | b"pinentry-touch-file" => continue,
-                b"keyring" | b"primary-keyring" | b"trustdb-name" | b"policy-file" => {
-                    let value = parameters.trim_ascii();
-                    // GnuPG removes an opening double quote and an optional
-                    // closing double quote after trimming the option value.
-                    let value = value
-                        .strip_prefix(b"\"")
-                        .map_or(value, |quoted| quoted.strip_suffix(b"\"").unwrap_or(quoted));
-                    if value.is_empty() {
-                        output.write_all(line)?;
-                        continue;
-                    }
-                    let policy = option == b"policy-file";
-                    let (path, prefix) = if policy {
-                        (value, &[][..])
-                    } else {
-                        [b"gnupg-kbx:".as_slice(), b"gnupg-ring:"]
-                            .into_iter()
-                            .find_map(|prefix| {
-                                value.strip_prefix(prefix).map(|path| (path, prefix))
-                            })
-                            .unwrap_or((value, &[]))
-                    };
-                    let path = if policy {
-                        // gpgsm opens an explicit policy from its working directory.
-                        cwd.join(OsStr::from_bytes(path))
-                    } else if let Some(suffix) = path.strip_prefix(b"~/") {
-                        caller
-                            .context("resolve caller's GnuPG path")?
-                            .join(OsStr::from_bytes(suffix))
-                    } else if path.contains(&b'/') {
-                        cwd.join(OsStr::from_bytes(path))
-                    } else {
-                        source.join(OsStr::from_bytes(path))
-                    };
-                    let extension = if path.extension() == Some(OsStr::new("kbx")) {
-                        "kbx"
-                    } else {
-                        "gpg"
-                    };
-                    let private = format!("input-{named_files}.{extension}");
-                    named_files += 1;
-                    let destination = home.join(&private);
-                    copy_public_file(&path, &destination)?;
-                    output.write_all(option)?;
-                    output.write_all(b" ")?;
-                    output.write_all(prefix)?;
-                    let filename = if policy {
-                        destination.as_os_str().as_bytes()
-                    } else {
-                        private.as_bytes()
-                    };
-                    output.write_all(filename)?;
-                    output.write_all(b"\n")?;
-                }
-                _ => output.write_all(line)?,
-            }
+            // A wrapper can select a versioned file itself. Report staging
+            // errors only if its GnuPG parser actually reads that file.
+            fs::write(&target, b"git-on-could-not-prepare-verification-input\n")?;
         }
     }
     Ok(home)
+}
+
+fn copy_options(
+    original: &Path,
+    target: &Path,
+    source: &Path,
+    cwd: &Path,
+    caller: Option<&Path>,
+    named_files: &mut usize,
+) -> Result<()> {
+    let Some(config) = read_public_file(original)? else {
+        return Ok(());
+    };
+    let home = target
+        .parent()
+        .context("private verifier options directory")?;
+    let mut output = fs::File::create(target)?;
+    for line in config.split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.trim_ascii_start();
+        let end = trimmed
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(trimmed.len());
+        let (option, parameters) = trimmed.split_at(end);
+        let option = option.strip_prefix(b"--").unwrap_or(option);
+        // GnuPG's "options" directive selects a file only on the command line.
+        match option {
+            b"log-file"
+            | b"logger-file"
+            | b"debug-log-file"
+            | b"status-file"
+            | b"logger-fd"
+            | b"status-fd"
+            | b"attribute-fd"
+            | b"attribute-file"
+            | b"output"
+            | b"write-env-file"
+            | b"extra-socket"
+            | b"browser-socket"
+            | b"pinentry-touch-file" => continue,
+            b"keyring" | b"primary-keyring" | b"trustdb-name" | b"policy-file" => {
+                let value = parameters.trim_ascii();
+                // GnuPG removes an opening double quote and an optional
+                // closing double quote after trimming the option value.
+                let value = value
+                    .strip_prefix(b"\"")
+                    .map_or(value, |quoted| quoted.strip_suffix(b"\"").unwrap_or(quoted));
+                if value.is_empty() {
+                    output.write_all(line)?;
+                    continue;
+                }
+                let policy = option == b"policy-file";
+                let (path, prefix) = if policy {
+                    (value, &[][..])
+                } else {
+                    [b"gnupg-kbx:".as_slice(), b"gnupg-ring:"]
+                        .into_iter()
+                        .find_map(|prefix| value.strip_prefix(prefix).map(|path| (path, prefix)))
+                        .unwrap_or((value, &[]))
+                };
+                let path = if policy {
+                    // gpgsm opens an explicit policy from its working directory.
+                    cwd.join(OsStr::from_bytes(path))
+                } else if let Some(suffix) = path.strip_prefix(b"~/") {
+                    caller
+                        .context("resolve caller's GnuPG path")?
+                        .join(OsStr::from_bytes(suffix))
+                } else if path.starts_with(b"~") && path.contains(&b'/') {
+                    resolve_home(cwd, Some(OsString::from_vec(path.to_vec())))?
+                        .context("resolve named user's GnuPG path")?
+                } else if path.contains(&b'/') {
+                    cwd.join(OsStr::from_bytes(path))
+                } else {
+                    source.join(OsStr::from_bytes(path))
+                };
+                let extension = if path.extension() == Some(OsStr::new("kbx")) {
+                    "kbx"
+                } else {
+                    "gpg"
+                };
+                let private = format!("input-{named_files}.{extension}");
+                *named_files += 1;
+                let destination = home.join(&private);
+                copy_public_file(&path, &destination)?;
+                output.write_all(option)?;
+                output.write_all(b" ")?;
+                output.write_all(prefix)?;
+                // A wrapper may pass this options file to a delegate with
+                // another private home. The file still refers to this input.
+                output.write_all(destination.as_os_str().as_bytes())?;
+                output.write_all(b"\n")?;
+            }
+            _ => output.write_all(line)?,
+        }
+    }
+    Ok(())
 }
 
 fn public_file(path: &Path) -> Result<bool> {
@@ -659,16 +875,20 @@ fn excluded_verifier_input(name: &OsStr) -> bool {
 // Configured verifiers may open relative paths inside their home. Copy
 // regular inputs at those paths and leave caller keys, sockets and locks.
 fn copy_verifier_input(
-    entry: &fs::DirEntry,
+    source: PathBuf,
     target: &Path,
     directories: &mut Vec<(u64, u64)>,
 ) -> Result<()> {
-    if excluded_verifier_input(&entry.file_name()) {
+    if source.file_name().is_some_and(excluded_verifier_input) {
         return Ok(());
     }
-    let mut source = entry.path();
-    if entry.file_type()?.is_symlink() {
-        source = match fs::canonicalize(&source) {
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if optional_verifier_input(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let (source, metadata) = if metadata.is_symlink() {
+        let resolved = match fs::canonicalize(&source) {
             Ok(path) => path,
             Err(error)
                 if optional_verifier_input(&error) || error.raw_os_error() == Some(libc::ELOOP) =>
@@ -677,17 +897,19 @@ fn copy_verifier_input(
             }
             Err(error) => return Err(error.into()),
         };
-        if source
+        if resolved
             .components()
             .any(|part| excluded_verifier_input(part.as_os_str()))
         {
             return Ok(());
         }
-    }
-    let metadata = match fs::metadata(&source) {
-        Ok(metadata) => metadata,
-        Err(error) if optional_verifier_input(&error) => return Ok(()),
-        Err(error) => return Err(error.into()),
+        match fs::metadata(&resolved) {
+            Ok(metadata) => (resolved, metadata),
+            Err(error) if optional_verifier_input(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        (source, metadata)
     };
     if metadata.is_dir() {
         let identity = (metadata.dev(), metadata.ino());
@@ -702,7 +924,7 @@ fn copy_verifier_input(
         directories.push(identity);
         for child in children {
             let child = child?;
-            copy_verifier_input(&child, &target.join(child.file_name()), directories)?;
+            copy_verifier_input(child.path(), &target.join(child.file_name()), directories)?;
         }
         directories.pop();
     } else if metadata.is_file() && !target.try_exists()? {
@@ -745,11 +967,12 @@ mod tests {
             fs::write(cwd.path().join("issuer.policy"), value)?;
             let home = delegated_home(
                 scratch.path(),
-                &DelegateContext {
+                &VerificationContext {
                     cwd: cwd.path(),
                     source: Some(source.path()),
                     caller: None,
-                    format: Format::X509,
+                    format: Some(Format::X509),
+                    openpgp_config: Some("gpg.conf".into()),
                 },
             )?;
             let config = fs::read_to_string(home.join("gpgsm.conf"))?;
@@ -771,11 +994,12 @@ mod tests {
             fs::write(caller.path().join("public.gpg"), data)?;
             let home = delegated_home(
                 scratch.path(),
-                &DelegateContext {
+                &VerificationContext {
                     cwd: scratch.path(),
                     source: Some(source.path()),
-                    caller: Some(caller.path()),
-                    format: Format::OpenPgp,
+                    caller: Some(caller.path().to_path_buf()),
+                    format: Some(Format::OpenPgp),
+                    openpgp_config: Some("gpg.conf".into()),
                 },
             )?;
             let config = fs::read_to_string(home.join("gpg.conf"))?;
@@ -797,13 +1021,14 @@ mod tests {
         fs::write(cache.join("cache.lock"), b"caller lock")?;
         let private = prepare_home(
             scratch.path(),
-            source.path(),
-            VerificationInputs {
+            &VerificationContext {
+                cwd: source.path(),
+                source: Some(source.path()),
+                caller: None,
                 format: Some(Format::X509),
-                copy_extra: false,
+                openpgp_config: None,
             },
-            Some(source.path()),
-            None,
+            false,
         )?;
         assert_eq!(
             fs::read(private.join("crls.d/DIR.txt"))?,

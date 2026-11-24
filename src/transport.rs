@@ -1,6 +1,6 @@
 //! Invocation-owned native transports. Protocol v2 permits branch selection
 //! and successive exact-object requests on the same channel.
-use crate::service_memory::CaptureFile;
+use crate::{platform::child_exited, service_memory::CaptureFile};
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
 use std::{
@@ -40,26 +40,6 @@ fn check_transfer(stop: &Stop) -> io::Result<()> {
         ));
     }
     crate::object::check_transfer().map_err(io::Error::other)
-}
-
-pub(crate) fn child_exited(pid: u32) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-    Ok(crate::platform::siginfo_pid(&info) != 0)
 }
 
 #[cfg(target_os = "macos")]

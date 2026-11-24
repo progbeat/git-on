@@ -719,6 +719,21 @@ async fn checked_blocks_and_padding_reach_the_socket_in_order() {
         assert!(replay.capacity() <= 2 * BLOCK);
         assert!(replay.slices().flatten().eq(&received[4..]));
     }
+
+    use crate::raw_blob::{BlobBytes, ReadData};
+    const BUDGET: usize = 88;
+    let mut writer = Writer::default();
+    let shared = BlobBytes::from(vec![b'a'; 24]);
+    for data in [
+        ReadData::Shared(shared.clone(), 0..20),
+        ReadData::Shared(shared, 4..24),
+        ReadData::Shared(BlobBytes::from(vec![b'b'; 44]), 5..8),
+    ] {
+        writer.opaque_data(data, BUDGET - writer.wire_len() - 4);
+    }
+    let replay = writer.into_reply(Some(BUDGET));
+    assert_eq!(replay.data_slice_count(), 3);
+    assert!(replay.capacity() <= BUDGET);
 }
 
 #[tokio::test]

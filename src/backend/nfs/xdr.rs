@@ -227,7 +227,14 @@ impl Writer {
                 .sum(),
         };
         self.u32(data.len().try_into().expect("bounded XDR output"));
-        if allocation > data_budget {
+        let retained = self
+            .payloads
+            .iter()
+            .map(|part| part.capacity)
+            .sum::<usize>();
+        // Earlier ranges can share an allocation. Compare retained capacity
+        // against the reply budget after removing the already encoded fields.
+        if retained + allocation > self.payload_wire_len + data_budget {
             // Release oversized source owners as operations are encoded.
             for chunk in data.chunks() {
                 self.fixed(chunk);

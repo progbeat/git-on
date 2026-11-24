@@ -291,7 +291,7 @@ impl SshChannel {
     fn is_open(self) -> bool {
         matches!(
             self,
-            Self::Ready(pid) if crate::transport::child_exited(pid).is_ok_and(|exited| !exited)
+            Self::Ready(pid) if crate::platform::child_exited(pid).is_ok_and(|exited| !exited)
         )
     }
 }
@@ -2904,7 +2904,7 @@ mod tests {
 
         let pid = std::fs::read_to_string(pid_file)?.trim().parse()?;
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !crate::transport::child_exited(pid)? {
+        while !crate::platform::child_exited(pid)? {
             assert!(Instant::now() < deadline, "fixture did not exit");
             thread::sleep(Duration::from_millis(5));
         }

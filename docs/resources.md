@@ -90,32 +90,11 @@ I/O. A replay slot retains a compact encoding when the backing allocations
 would exceed its budget. The FUSE library accepts a single payload slice.
 Full blocks read for a contiguous reply can be authenticated in that buffer.
 An already resident block or an unaligned range is gathered as needed.
-The native ref capability check discards the ref listing and retains the
-separate packet trace for compatibility with detached helpers.
-Without environment alternates, Git-on can open a resolved, absolute primary
-object directory directly, including its own `info/alternates` and byte paths.
-An indirect primary path is resolved before libgit2 opens it. Linux can pass a
-directory descriptor to libgit2 when the resolved path contains non-UTF-8
-bytes. Flat UTF-8 environment alternates also configure libgit2 directly.
-Special alternate paths can still use temporary aliases for the git2 binding.
-When an `info/alternates` file uses Git's quoted syntax or a relative entry that
-libgit2 would resolve from the wrong directory, native `git cat-file` serves
-object headers and verified requested payloads through pipes. The invocation
-opens the selected primary store directly and uses its native alternates.
-The direct reusable HTTPS and SSH startup paths borrow verified commit or tag
-headers in memory. Native Git fetches, native preparation and signature
-verification can require a private temporary repository. Once the root is
-prepared, remote subtrees are kept as parsed directory metadata without
-writing loose tree objects.
-The host enforces inherited process resource limits. See the
-[resource assumptions](specification.md#resource-assumptions) for the
-supported workload.
-Successful cleanup releases all invocation-owned storage. Failed cleanup
-follows the documented recovery contract.
-The writable ownership marker stays in a private directory beside the run
-until deletion finishes. A retry can reuse that marker after an I/O error.
-Recovery also accepts older grouped records whose markers were moved there
-during removal.
+Native ref discovery retains the packet trace for detached helpers and
+discards the ref listing. Remote subtrees stay in parsed metadata.
+See [temporary Git contexts](remote.md#temporary-git-contexts) for native
+fetch, verification and local object database exceptions, and the
+[specification](specification.md#resource-assumptions) for inherited limits.
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects

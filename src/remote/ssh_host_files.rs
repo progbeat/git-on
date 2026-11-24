@@ -3,16 +3,18 @@ use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
-    fs,
+    fs, io,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         process::CommandExt,
     },
+    path::Path,
     process::{Command, Output, Stdio},
 };
 
 const HOST_FILES: &[u8] = b"userknownhostsfile";
 const HOST_FILE_DEFAULT: &[u8] = b"~/.ssh/known_hosts ~/.ssh/known_hosts2";
+const MAX_HOST_FILES: usize = 32;
 const DISABLE_KEYCHAIN: &str = "UseKeychain=no";
 
 pub(super) struct Launch {
@@ -23,6 +25,7 @@ pub(super) struct Launch {
 pub(super) fn launch(
     program: &OsStr,
     launcher: Option<&OsStr>,
+    launcher_path: &Path,
     args: Vec<OsString>,
     before_host: usize,
 ) -> Result<Launch> {
@@ -40,8 +43,15 @@ pub(super) fn launch(
         &settings.stderr,
         launcher,
     )?;
-    let (check_host_ip, host_files) =
-        keep_host_files_read_only(&probe, &args[..before_host], &inspection_args, &settings)?;
+    let (check_host_ip, host_files) = keep_host_files_read_only(
+        &probe,
+        &args[..before_host],
+        &inspection_args,
+        &settings,
+        launcher_path
+            .parent()
+            .context("missing private SSH directory")?,
+    )?;
     let mut options = Vec::new();
     if probe.disable_keychain {
         push_option(&mut options, DISABLE_KEYCHAIN);
@@ -145,6 +155,7 @@ fn keep_host_files_read_only(
     args: &[OsString],
     inspection_args: &[OsString],
     settings: &Output,
+    scratch: &Path,
 ) -> Result<(bool, Option<OsString>)> {
     match setting(settings, b"checkhostip") {
         Some(b"no") => return Ok((false, None)),
@@ -178,31 +189,117 @@ fn keep_host_files_read_only(
                 .map(<[u8]>::to_vec),
         );
     }
-    let expected = [b"/dev/null ", host_files].concat();
-    let mut chosen: Option<(OsString, Vec<Vec<u8>>)> = None;
+    let with_sink = [b"/dev/null ", host_files].concat();
+    let mut chosen: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
     for files in candidates {
-        let option = [b"UserKnownHostsFile=/dev/null ", files.as_slice()].concat();
-        let option = OsStr::from_bytes(&option);
-        let query = probe.inspect(inspection_args, Some(option));
-        if !query
-            .as_ref()
-            .is_ok_and(|query| setting(query, HOST_FILES) == Some(expected.as_slice()))
+        // Plain paths need no expansion or quote interpretation. Exclude
+        // unrelated host stanzas before asking ssh to re-read the config.
+        if files
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/.-_: \t".contains(byte))
+            && !files
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|word| !word.is_empty())
+                .eq(host_files.split(|&byte| byte == b' '))
         {
             continue;
         }
-        let words = file_words(&files).context("interpret the SSH host-file argument list")?;
+        let Some(words) = file_words(&files) else {
+            continue;
+        };
+        // A literal final component is independent of expansions in its directory.
+        let tail = words.last().and_then(|word| {
+            word.iter()
+                .rposition(|&byte| byte == b'/')
+                .map(|slash| &word[slash..])
+        });
+        if tail.is_some_and(|tail| {
+            !tail.iter().any(|byte| b"%${}~".contains(byte)) && !host_files.ends_with(tail)
+        }) {
+            continue;
+        }
+        let (prefix, expected) = if words.len() < MAX_HOST_FILES {
+            (
+                b"UserKnownHostsFile=/dev/null ".as_slice(),
+                with_sink.as_slice(),
+            )
+        } else {
+            (b"UserKnownHostsFile=".as_slice(), host_files)
+        };
+        let option = [prefix, files.as_slice()].concat();
+        let query = probe.inspect(inspection_args, Some(OsStr::from_bytes(&option)));
+        if !query
+            .as_ref()
+            .is_ok_and(|query| setting(query, HOST_FILES) == Some(expected))
+        {
+            continue;
+        }
         if let Some((_, previous)) = &chosen {
             anyhow::ensure!(
                 same_file_list(probe, inspection_args, previous, &words)?,
                 "ambiguous SSH UserKnownHostsFile with CheckHostIP=yes"
             );
         } else {
-            chosen = Some((option.to_owned(), words));
+            chosen = Some((option, words));
         }
     }
-    chosen
-        .map(|(option, _)| (true, Some(option)))
-        .context("cannot preserve SSH UserKnownHostsFile lookup with CheckHostIP=yes")
+    let (mut option, words) =
+        chosen.context("cannot preserve SSH UserKnownHostsFile lookup with CheckHostIP=yes")?;
+    if words.len() >= MAX_HOST_FILES {
+        option = replace_first_host_file(probe, inspection_args, scratch, host_files, &words)?;
+    }
+    Ok((true, Some(OsString::from_vec(option))))
+}
+
+fn replace_first_host_file(
+    probe: &Probe<'_>,
+    args: &[OsString],
+    scratch: &Path,
+    effective: &[u8],
+    words: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    // OpenSSH accepts 32 user files. Preserve the first file's entries
+    // at that limit by placing only its append target in service memory.
+    let (first, rest) = words.split_first().context("missing first SSH host file")?;
+    let source = inspect_file(probe, args, first)?;
+    let remaining = effective
+        .strip_prefix(source.as_slice())
+        .and_then(|value| value.strip_prefix(b" "))
+        .context("could not identify first SSH host file")?;
+    let mut private = tempfile::NamedTempFile::new_in(scratch)?;
+    match fs::File::open(OsStr::from_bytes(&source)) {
+        Ok(mut input) => {
+            io::copy(&mut input, private.as_file_mut())?;
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let path = private.path().as_os_str().as_bytes();
+    let mut option = b"UserKnownHostsFile=".to_vec();
+    let mut escaped = Vec::with_capacity(path.len());
+    for &byte in path {
+        if byte == b'%' {
+            escaped.push(byte);
+        }
+        escaped.push(byte);
+    }
+    quote_host_file(&mut option, &escaped);
+    for file in rest {
+        option.push(b' ');
+        quote_host_file(&mut option, file);
+    }
+    let expected = [path, b" ", remaining].concat();
+    let checked = probe.inspect(args, Some(OsStr::from_bytes(&option)))?;
+    anyhow::ensure!(
+        setting(&checked, HOST_FILES) == Some(&expected),
+        "could not preserve SSH host file order"
+    );
+    private.keep()?;
+    Ok(option)
 }
 
 fn same_file_list(
@@ -229,7 +326,17 @@ fn same_file_list(
 }
 
 fn inspect_file(probe: &Probe<'_>, args: &[OsString], file: &[u8]) -> Result<Vec<u8>> {
-    let mut option = b"UserKnownHostsFile=/dev/null \"".to_vec();
+    let mut option = b"UserKnownHostsFile=/dev/null ".to_vec();
+    quote_host_file(&mut option, file);
+    let settings = probe.inspect(args, Some(OsStr::from_bytes(&option)))?;
+    setting(&settings, HOST_FILES)
+        .and_then(|value| value.strip_prefix(b"/dev/null "))
+        .map(<[u8]>::to_vec)
+        .context("identify the SSH host-file path")
+}
+
+fn quote_host_file(option: &mut Vec<u8>, file: &[u8]) {
+    option.push(b'"');
     for &byte in file {
         if matches!(byte, b'\\' | b'"') {
             option.push(b'\\');
@@ -237,11 +344,6 @@ fn inspect_file(probe: &Probe<'_>, args: &[OsString], file: &[u8]) -> Result<Vec
         option.push(byte);
     }
     option.push(b'"');
-    let settings = probe.inspect(args, Some(OsStr::from_bytes(&option)))?;
-    setting(&settings, HOST_FILES)
-        .and_then(|value| value.strip_prefix(b"/dev/null "))
-        .map(<[u8]>::to_vec)
-        .context("identify the SSH host-file path")
 }
 
 // Extract boundaries from the original OpenSSH argument list. Only -G

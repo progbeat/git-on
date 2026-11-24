@@ -1045,6 +1045,28 @@ pub fn decode_mount(s: &str) -> Vec<u8> {
     out
 }
 
+/// Check for exit without reaping the child or releasing its PID.
+#[doc(hidden)]
+pub fn child_exited(pid: u32) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(siginfo_pid(&info) != 0)
+}
+
 pub fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
     #[cfg(target_os = "linux")]
     {

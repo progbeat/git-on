@@ -3,7 +3,7 @@ use git_on::{
     backend::Backend,
     filesystem::Overlay,
     git::set_foreground as foreground,
-    platform::{mount_is_ours, remove_empty_temporary_group, ssh_control_path},
+    platform::{child_exited, mount_is_ours, remove_empty_temporary_group, ssh_control_path},
     policy::WritePolicy,
     snapshot::Snapshot,
 };
@@ -431,25 +431,6 @@ fn mount_overlay(
     Ok(Some(mounted))
 }
 
-fn child_exited(pid: u32) -> Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(e.into());
-    }
-    Ok(git_on::platform::siginfo_pid(&info) != 0)
-}
 fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
     let (Some(parent_pgid), Some(fd)) = (terminal.parent, terminal.descriptor()) else {
         return Ok(());

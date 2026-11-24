@@ -1475,15 +1475,7 @@ impl RawBlobs {
         Some((directory, first))
     }
     pub(crate) fn insert(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
-        self.insert_blob(oid, size, true, None, || {
-            // Lazy reads assume each blob fits in RAM. Verifying the whole
-            // blob in memory lets even the first range read use that buffer
-            // before any spill.
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(size)?;
-            crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
-            Ok(BlobBytes::from(bytes))
-        })
+        self.insert_read_blob(oid, size, true, None, input)
     }
     pub(crate) fn insert_prepared_blob(&mut self, oid: Oid, bytes: Vec<u8>) -> Result<RawBlob> {
         // The local native reader authenticated the bytes and checked the
@@ -1511,7 +1503,18 @@ impl RawBlobs {
         input: impl Read,
         transfer: Option<Arc<Transfer>>,
     ) -> Result<RawBlob> {
-        self.insert_blob(oid, size, false, transfer, || {
+        self.insert_read_blob(oid, size, false, transfer, input)
+    }
+    fn insert_read_blob(
+        &mut self,
+        oid: Oid,
+        size: usize,
+        used: bool,
+        transfer: Option<Arc<Transfer>>,
+        input: impl Read,
+    ) -> Result<RawBlob> {
+        self.insert_blob(oid, size, used, transfer, || {
+            // The first range can use the verified allocation before any spill.
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             crate::object::copy_verified(input, &mut bytes, ObjectType::Blob, size, oid)?;
