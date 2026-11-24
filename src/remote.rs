@@ -471,7 +471,7 @@ impl Remote {
         // ref maps. Default tracking destinations are unnecessary here.
         let native_selection = self
             .git
-            .fetch_settings_require_native_git(self.materializing)
+            .fetch_settings_require_native_git(self.materializing, self.socket.is_some())
             || self.git.has_nonstandard_fetch_mapping(&self.source)?;
         // Force controls destination updates. An unambiguous source-only
         // selector needs no private ref update with the standard tracking map.
@@ -937,7 +937,9 @@ impl Remote {
         self.materializing = true;
         // The revision has already been resolved and possibly verified.
         // Request that exact object again without the lazy fetch filter.
-        if !self.git.fetch_settings_require_native_git(true)
+        if !self
+            .git
+            .fetch_settings_require_native_git(true, self.socket.is_some())
             && !self.git.has_nonstandard_fetch_mapping(&self.source)?
             && matches!(
                 self.fetch_snapshot(SnapshotTarget::Object(selected))?,

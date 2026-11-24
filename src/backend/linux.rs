@@ -206,7 +206,7 @@ fn empty(reply: ReplyEmpty, result: FsResult<()>) {
 }
 fn data(reply: ReplyData, result: FsResult<ReadData>) {
     match result {
-        // fuser exposes a single payload slice for a FUSE read reply.
+        // Linux reads prepare a single slice for fuser's read reply.
         Ok(data) => reply.data(&data.contiguous()),
         Err(e) => reply.error(Errno::from_i32(e)),
     }

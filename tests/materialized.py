@@ -229,14 +229,20 @@ print('large file verified')
         ]
         child_env = {k: v for k, v in self.env.items() if not k.startswith('GIT_CONFIG_')}
         child_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
-        for config in ({}, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'fetch.parallel',
-                            'GIT_CONFIG_VALUE_0': '1'}):
-            with self.subTest(native=bool(config)):
+        child_env, calls = record_git_invocations(self.root, child_env)
+        for key, value, native in ((None, None, False), ('ssh.variant', 'ssh', False),
+                                   ('fetch.parallel', '1', True)):
+            with self.subTest(configuration=key):
+                calls.write_text('')
+                config = ({} if key is None else
+                          {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': key,
+                           'GIT_CONFIG_VALUE_0': value})
                 result = subprocess.run(args, cwd=self.repo, env=child_env | config,
                                         capture_output=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(),
-                                 [str(bool(config)).encode(), b'636f6d6d697474656400ff0d0a'])
+                                 [str(native).encode(), b'636f6d6d697474656400ff0d0a'])
+                self.assertEqual(any('fetch' in args for args in git_invocations(calls)), native)
                 self.clean()
 
     @unittest.skipUnless(sys.platform == 'linux', 'private tmpfs quota requires Linux mount namespaces')

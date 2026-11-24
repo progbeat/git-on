@@ -217,17 +217,31 @@ fn validate_nc(args: &[Vec<u8>]) -> Result<()> {
     );
     let mut options = options.iter();
     while let Some(option) = options.next() {
-        let valid = match option.as_slice() {
-            b"-x" => options.next().is_some_and(|value| literal(value)),
-            b"-X" => options
-                .next()
-                .is_some_and(|value| matches!(value.as_slice(), b"4" | b"5" | b"connect")),
-            b"-w" => options.next().is_some_and(|value| numeric(value)),
-            _ => option.strip_prefix(b"-").is_some_and(|flags| {
-                !flags.is_empty() && flags.iter().all(|flag| b"46Fnv".contains(flag))
-            }),
+        let flags = option.strip_prefix(b"-").unwrap_or_default();
+        let value_index = flags
+            .iter()
+            .position(|flag| b"xXw".contains(flag))
+            .unwrap_or(flags.len());
+        let (switches, value_option) = flags.split_at(value_index);
+        let valid_value = if let Some((&flag, inline)) = value_option.split_first() {
+            let value = if inline.is_empty() {
+                options.next().map(Vec::as_slice)
+            } else {
+                Some(inline)
+            };
+            match (flag, value) {
+                (b'x', Some(value)) => literal(value),
+                (b'X', Some(value)) => matches!(value, b"4" | b"5" | b"connect"),
+                (b'w', Some(value)) => numeric(value),
+                _ => false,
+            }
+        } else {
+            true
         };
-        anyhow::ensure!(valid, "unsupported nc ProxyCommand option");
+        anyhow::ensure!(
+            !flags.is_empty() && switches.iter().all(|flag| b"46Fnv".contains(flag)) && valid_value,
+            "unsupported nc ProxyCommand option"
+        );
     }
     Ok(())
 }
@@ -336,5 +350,22 @@ mod tests {
             without_proxy_arguments(&args),
             ["-P", "-J", "-vq", "-p", "22"]
         );
+    }
+
+    #[test]
+    fn nc_proxy_value_options_accept_both_native_spellings() {
+        for (arguments, valid) in [
+            ("-w 5 -x proxy.example:1080 -X connect", true),
+            ("-w5 -xproxy.example:1080 -Xconnect", true),
+            ("-vw5 -nxproxy.example:1080 -4Xconnect", true),
+            ("-wfast", false),
+        ] {
+            let arguments: Vec<_> = arguments
+                .split_ascii_whitespace()
+                .chain(["%h", "%p"])
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect();
+            assert_eq!(validate_nc(&arguments).is_ok(), valid, "{arguments:?}");
+        }
     }
 }

@@ -698,6 +698,15 @@ assert not list((repo / 'objects/pack').glob('*'))
                 process = f.probe(source, revision)
                 self.assertEqual(f.line(process)['tree'], tree)
                 f.finish(process)
+        with self.subTest(configured_variant='ssh'):
+            f.env, calls = record_git_invocations(f.root, f.env)
+            f.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='ssh.variant',
+                         GIT_CONFIG_VALUE_0='ssh')
+            process = f.probe(source, '+main')
+            self.assertEqual(f.line(process)['tree'], f.tree)
+            f.finish(process)
+            self.assertTrue(any('fetch' in args and '--no-write-fetch-head' not in args
+                                for args in git_invocations(calls)))
     def test_fetch_branch_tag_collision_follows_native_precedence(self):
         f=self.f; source='file://'+str(f.repo)
         other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())

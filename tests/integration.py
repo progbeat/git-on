@@ -24,6 +24,8 @@ import termios
 import time
 import unittest
 
+from support.git_invocations import git_invocations, record_git_invocations
+
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser(description=__doc__)
 PARSER.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-on")
@@ -358,6 +360,8 @@ class CliTests(RepositoryTest):
         git(self.repo, "add", "large.bin")
         git(self.repo, "commit", "--quiet", "-m", "native pack exceeds the small tmpfs")
         runtime = Path(os.environ["GIT_ON_TEST_SERVICE_TMPFS"])
+        small = Path("/dev/shm").resolve()
+        small_before = set(small.iterdir())
         home = self.root / "home"
         home.mkdir()
         argv = [
@@ -365,16 +369,33 @@ class CliTests(RepositoryTest):
             "--write-policy=all", "--", sys.executable, "-I", "-S", "-c",
             "from hashlib import sha256; print(sha256(open('large.bin', 'rb').read()).hexdigest())",
         ]
-        env = {"HOME": str(home), "LC_ALL": "C"}
-        too_small, _ = self.invoke_argv(argv, extra_env=dict(env, XDG_RUNTIME_DIR=str(self.system_tmp)))
-        self.assertEqual((too_small.returncode, too_small.stdout), (125, b""), too_small.stderr)
-        self.assertIn(b"No space left on device", too_small.stderr)
-        self.assert_no_runtime_files()
-        result, _ = self.invoke_argv(argv, extra_env=dict(env, XDG_RUNTIME_DIR=str(runtime)))
-        self.assert_success(result)
-        self.assertEqual(result.stdout.strip(), hashlib.sha256(data).hexdigest().encode())
-        self.assertEqual(list(runtime.iterdir()), [])
-        self.assert_no_runtime_files()
+        env, calls = record_git_invocations(
+            self.root, dict(self.environment(), HOME=str(home), LC_ALL="C"),
+            include_env=("GIT_OBJECT_DIRECTORY",),
+        )
+        checksum = hashlib.sha256(data).hexdigest().encode() + b"\n"
+        cases = (
+            ("explicit", dict(GIT_ON_SERVICE_TMPDIR=str(small), XDG_RUNTIME_DIR=str(runtime)),
+             (small,), 125),
+            ("fallback", dict(XDG_RUNTIME_DIR=str(self.system_tmp)), (small, self.system_tmp), 0),
+            ("larger", dict(XDG_RUNTIME_DIR=str(runtime)), (runtime,), 0),
+        )
+        for selection, settings, roots, status in cases:
+            with self.subTest(selection=selection):
+                calls.write_text("")
+                result, _ = self.invoke_argv(argv, extra_env=env | settings)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, b"" if status else checksum)
+                if status:
+                    self.assertIn(b"No space left on device", result.stderr)
+                attempts = [Path(call["env"]["GIT_OBJECT_DIRECTORY"])
+                            for call in git_invocations(calls) if "fetch" in call["argv"]]
+                self.assertEqual(len(attempts), len(roots), attempts)
+                for attempt, root in zip(attempts, roots, strict=True):
+                    self.assertTrue(attempt.is_relative_to(root.resolve()), attempts)
+                self.assertEqual(set(small.iterdir()), small_before)
+                self.assertEqual(list(runtime.iterdir()), [])
+                self.assert_no_runtime_files()
 
     def test_help_and_version(self):
         for arg in ("--help", "-h", "--version"):

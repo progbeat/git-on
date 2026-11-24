@@ -309,9 +309,15 @@ impl Git {
         })
     }
 
-    pub(crate) fn fetch_settings_require_native_git(&self, materializing: bool) -> bool {
-        self.config.iter().any(|(key, value)| {
-            !streaming_fetch_config(key.as_bytes(), value.as_deref(), materializing)
+    pub(crate) fn fetch_settings_require_native_git(
+        &self,
+        materializing: bool,
+        ssh_transport: bool,
+    ) -> bool {
+        self.config.iter().any(|(key, value)| match key.as_bytes() {
+            // Explicit variant selection keeps SSH on its native fetch path.
+            b"ssh.variant" => ssh_transport,
+            key => !streaming_fetch_config(key, value.as_deref(), materializing),
         })
     }
 
@@ -548,12 +554,15 @@ impl Git {
             })
     }
     pub fn ssh_variant(&self) -> Option<OsString> {
-        std::env::var_os("GIT_SSH_VARIANT").or_else(|| {
-            self.config
-                .iter()
-                .rev()
-                .find_map(|(key, value)| (key == "ssh.variant").then(|| value.clone()).flatten())
-        })
+        std::env::var_os("GIT_SSH_VARIANT").or_else(|| self.configured_ssh_variant())
+    }
+
+    fn configured_ssh_variant(&self) -> Option<OsString> {
+        self.config
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "ssh.variant")
+            .map(|(_, value)| value.clone().unwrap_or_default())
     }
 }
 
@@ -1826,6 +1835,26 @@ printf 'clock\000'
             };
             assert!(!git.http2_compatible(), "{key}");
         }
+    }
+
+    #[test]
+    fn ssh_variant_uses_the_last_value_and_applies_only_to_ssh() {
+        let mut git = Git {
+            cwd: PathBuf::new(),
+            config: vec![
+                ("ssh.variant".into(), None),
+                ("ssh.variant".into(), Some("ssh".into())),
+            ],
+            original_dir: None,
+            original_worktree: None,
+        };
+        assert_eq!(git.configured_ssh_variant(), Some("ssh".into()));
+        for materializing in [false, true] {
+            assert!(git.fetch_settings_require_native_git(materializing, true));
+            assert!(!git.fetch_settings_require_native_git(materializing, false));
+        }
+        git.config.push(("ssh.variant".into(), None));
+        assert_eq!(git.configured_ssh_variant(), Some(OsString::new()));
     }
 
     #[test]
