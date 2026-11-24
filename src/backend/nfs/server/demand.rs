@@ -26,7 +26,8 @@ use tokio::{
 type SlotKey = (SessionId, u32);
 
 enum ObjectDemand {
-    Final(Oid, Option<u64>),
+    Blob(Oid, Option<u64>),
+    Directory(Oid),
     ParentTree(Oid),
 }
 
@@ -146,11 +147,12 @@ impl Server {
         demand: ObjectDemand,
         wake: &Arc<Notify>,
     ) -> Option<(PendingObject, bool)> {
-        let (oid, inode, recheck_lookup) = match demand {
-            ObjectDemand::Final(oid, inode) => (oid, inode, false),
-            ObjectDemand::ParentTree(oid) => (oid, None, true),
+        let (object, recheck_lookup) = match demand {
+            ObjectDemand::Blob(oid, inode) => (self.core.start_remote_demand(oid, inode), false),
+            ObjectDemand::Directory(oid) => (self.core.start_remote_tree_demand(oid), false),
+            ObjectDemand::ParentTree(oid) => (self.core.start_remote_tree_demand(oid), true),
         };
-        let object = self.core.start_remote_demand(oid, inode)?;
+        let object = object?;
         object.notify_when_ready(wake);
         Some((object, recheck_lookup))
     }
@@ -215,7 +217,7 @@ impl Server {
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
                 self.attribute_size_demand(ino, *mask)
-                    .map(|oid| ObjectDemand::Final(oid, Some(ino)))
+                    .map(|oid| ObjectDemand::Blob(oid, Some(ino)))
             }
             [PutFh(handle), GetAttr(parent_mask), Lookup(name), GetFh, GetAttr(mask)] => {
                 self.lookup_size_demand(credentials, handle, Some(*parent_mask), name, *mask)
@@ -249,7 +251,7 @@ impl Server {
         // Reserve only the exact object during admission under a different
         // UID. The regular RPC path applies permissions and read-ahead.
         let demand = match demand {
-            Some(ObjectDemand::Final(oid, _)) if !same_uid => Some(ObjectDemand::Final(oid, None)),
+            Some(ObjectDemand::Blob(oid, _)) if !same_uid => Some(ObjectDemand::Blob(oid, None)),
             demand => demand,
         };
         Some((id, demand))
@@ -270,7 +272,7 @@ impl Server {
         self.require_access(&Context::new(credentials), ino, libc::R_OK | libc::X_OK)
             .ok()?;
         self.core.begin_directory_enumeration();
-        Some(ObjectDemand::Final(oid, None))
+        Some(ObjectDemand::Directory(oid))
     }
 
     fn attribute_size_demand(&self, ino: u64, mask: Bitmap) -> Option<Oid> {
@@ -303,7 +305,7 @@ impl Server {
         {
             SourceLookup::Inode(ino) => self
                 .attribute_size_demand(ino, mask)
-                .map(|oid| ObjectDemand::Final(oid, Some(ino))),
+                .map(|oid| ObjectDemand::Blob(oid, Some(ino))),
             SourceLookup::Tree(oid) => Some(ObjectDemand::ParentTree(oid)),
         }
     }
@@ -340,7 +342,7 @@ mod tests {
         let parked = || [(session, 0)].into_iter();
         assert!(matches!(
             server.read_request(&request, parked()),
-            Some(((id, 1), Some(ObjectDemand::Final(_, None)))) if id == session
+            Some(((id, 1), Some(ObjectDemand::Blob(_, None)))) if id == session
         ));
         assert!(server
             .read_request(&request, [(session, 1)].into_iter())

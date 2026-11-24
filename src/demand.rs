@@ -83,6 +83,8 @@ struct Flight {
     // This is changed only while the queue is locked. Workers may observe
     // demand joining a speculative request after it has been submitted.
     required: AtomicBool,
+    // A lookup can classify a tree while its flight belongs to a decoder.
+    is_tree: AtomicBool,
 }
 
 #[derive(Default)]
@@ -130,6 +132,10 @@ impl Demand {
         self.0.required.load(Ordering::Relaxed)
     }
 
+    fn is_tree(&self) -> bool {
+        self.0.is_tree.load(Ordering::Relaxed)
+    }
+
     fn needs_exact_pack(&self, oid: Oid, cache: &RawBlobs, transfer: &Arc<Transfer>) -> bool {
         let state = self.0.state.lock().unwrap();
         if !state
@@ -174,7 +180,6 @@ struct QueuedDemand {
     demand: Demand,
     queued_at: Instant,
     prefetch_width: usize,
-    immediate: bool,
 }
 
 struct Work {
@@ -216,18 +221,31 @@ impl Work {
                 break item;
             }
         };
-        let limit = if speculative {
+        // A filtered response can omit a wanted tree or blob when another
+        // wanted tree contains it. Batch blobs and send each tree on its own.
+        let limit = if first.demand.is_tree() {
+            1
+        } else if speculative {
             first.prefetch_width
         } else {
             MAX_WANTS
         };
         let mut items = Vec::with_capacity((queue.len() + 1).min(limit));
+        let mut trees = Vec::new();
         items.push(first);
         while items.len() < limit {
             let Some(item) = queue.pop_front() else { break };
-            if !item.demand.ready() {
+            if item.demand.ready() {
+                continue;
+            }
+            if item.demand.is_tree() {
+                trees.push(item);
+            } else {
                 items.push(item);
             }
+        }
+        for tree in trees.into_iter().rev() {
+            queue.push_front(tree);
         }
         let readers = items
             .iter()
@@ -397,7 +415,6 @@ impl Queue {
             demand,
             queued_at: Instant::now(),
             prefetch_width: READ_AHEAD,
-            immediate: false,
         }
     }
 
@@ -509,7 +526,7 @@ impl Queue {
 
     fn http2_batch_wait(&self, now: Instant, transfer_active: bool) -> Option<Duration> {
         // The next pathname operation can depend on the contents of this tree.
-        if self.waiting.iter().any(|item| item.immediate) {
+        if self.waiting.iter().any(|item| item.demand.is_tree()) {
             return None;
         }
         self.batch_wait(now, transfer_active)
@@ -624,6 +641,7 @@ impl Queue {
                 && !self.dense()
                 && matches!(self.mode, ConnectionMode::Probing(1..))
                 && work.items.len() == 1
+                && self.waiting.iter().all(|item| item.demand.ready())
                 && self.ahead.is_empty()
                 && self.has_idle_ssh(index, ready_channels);
             if last_request {
@@ -1048,12 +1066,8 @@ impl Pool {
         Ok(())
     }
 
-    pub(crate) fn request(&self, oid: Oid) -> Result<Demand> {
-        self.request_with_batching(oid, false)
-    }
-
-    pub(crate) fn request_with_batching(&self, oid: Oid, immediate: bool) -> Result<Demand> {
-        self.request_with_lookup(oid, immediate, || self.scratch.lookup_demand(oid))
+    pub(crate) fn request(&self, oid: Oid, is_tree: bool) -> Result<Demand> {
+        self.request_with_lookup(oid, is_tree, || self.scratch.lookup_demand(oid))
     }
 
     pub(crate) fn fetch_ssh_snapshot(&self, oid: Oid) -> Result<Option<pack_stream::Received>> {
@@ -1076,7 +1090,7 @@ impl Pool {
     fn request_with_lookup(
         &self,
         oid: Oid,
-        immediate: bool,
+        is_tree: bool,
         lookup: impl FnOnce() -> DemandLookup,
     ) -> Result<Demand> {
         object::check_transfer()?;
@@ -1096,11 +1110,11 @@ impl Pool {
         let lookup = lookup();
         if lookup == DemandLookup::Missing {
             let demand = pending.unwrap_or_else(|| queue.foreground(oid));
-            if immediate {
-                if let Some(item) = queue.waiting.iter_mut().find(|item| item.oid == oid) {
-                    item.immediate = true;
-                }
+            if is_tree {
+                demand.0.is_tree.store(true, Ordering::Relaxed);
             }
+            #[cfg(feature = "test-metrics")]
+            report_test_demand(oid);
             self.wake();
             return Ok(demand);
         }
@@ -1223,6 +1237,21 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(feature = "test-metrics")]
+fn report_test_demand(oid: Oid) {
+    static DESCRIPTOR: OnceLock<Option<i32>> = OnceLock::new();
+    let descriptor = DESCRIPTOR.get_or_init(|| {
+        let fd = std::env::var("GIT_ON_TEST_DEMAND_FD").ok()?.parse().ok()?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        (fd >= 3 && flags >= 0 && flags & libc::O_NONBLOCK != 0).then_some(fd)
+    });
+    if let Some(fd) = descriptor {
+        // The integration test reads fixed-size SHA-1 OIDs from its own pipe.
+        let bytes = oid.as_bytes();
+        unsafe { libc::write(*fd, bytes.as_ptr().cast(), bytes.len()) };
     }
 }
 
@@ -2075,12 +2104,21 @@ mod tests {
     }
 
     #[test]
-    fn failed_speculation_requeues_the_live_waiter() {
+    fn failed_speculation_requeues_waiters_and_keeps_tree_separate() {
         let directory = tempfile::tempdir().unwrap();
-        let scratch = RawBlobs::new(directory.path()).unwrap();
-        let shared = Shared::default();
+        let pool = Pool {
+            shared: Arc::default(),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            workers: Mutex::default(),
+            wake: None,
+            ssh_snapshot: None,
+        };
+        let shared = &pool.shared;
         let used = Oid::from_bytes(&[1; 20]).unwrap();
         let unused = Oid::from_bytes(&[2; 20]).unwrap();
+        let mut entry = b"100644 file\0".to_vec();
+        entry.extend_from_slice(used.as_bytes());
+        let tree = Oid::hash_object(git2::ObjectType::Tree, &entry).unwrap();
         let (work, demand) = {
             let mut queue = shared.queue.lock().unwrap();
             for oid in [used, unused] {
@@ -2091,20 +2129,29 @@ mod tests {
             // The file became required after the speculative pack was sent.
             (work, queue.foreground(used))
         };
+        // The tree can join a decoder as an extra before a lookup needs it.
+        shared.join_pack_extra(&work.extras, tree);
+        let tree_demand = pool.request(tree, true).unwrap();
         shared.finish(
             work,
             Err(anyhow::anyhow!("prefetch refused")),
             Instant::now(),
             None,
-            &scratch,
+            &pool.scratch,
         );
-        let queue = shared.queue.lock().unwrap();
+        let mut queue = shared.queue.lock().unwrap();
         assert!(queue.failure.is_none());
         assert!(!queue.pending.contains_key(&unused));
-        assert_eq!(queue.waiting.len(), 1);
+        assert_eq!(queue.waiting.len(), 2);
         assert_eq!(queue.waiting[0].oid, used);
         assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
+        assert!(Arc::ptr_eq(&tree_demand.0, &queue.waiting[1].demand.0));
         assert!(!demand.ready());
+        let blob_pack = Work::take(&mut queue.waiting, false).unwrap().wants();
+        let tree_pack = Work::take(&mut queue.waiting, false).map(|work| work.wants());
+        drop(queue);
+        assert_eq!(blob_pack, [used]);
+        assert_eq!(tree_pack.as_deref(), Some([tree].as_slice()));
     }
 
     #[test]
@@ -2471,7 +2518,7 @@ mod tests {
         let report = pool.shared.report_http2_failure(&forecast, &pool.scratch);
         report(&error);
         assert!(!pool.scratch.available(oid));
-        let demand = pool.request(oid).unwrap();
+        let demand = pool.request(oid, false).unwrap();
         pool.shared
             .finish(forecast, Err(error), Instant::now(), None, &pool.scratch);
         assert!(pool.failure().is_none());
@@ -2897,7 +2944,7 @@ mod tests {
             ssh_snapshot: None,
         };
         pool.attach_primary(session, connection)?;
-        let demand = pool.request(oid)?;
+        let demand = pool.request(oid, false)?;
         assert!(matches!(demand.wait().take(), Some(Ok(Acquired::Stored))));
         let (blob, _) = scratch.clone().for_read(oid)?.unwrap();
         assert_eq!(blob.read(0, contents.len() as u32)?, contents);
@@ -3051,6 +3098,19 @@ mod tests {
         queue.busy.fill(false);
         queue.ssh_channels[0] = ready;
         queue.foreground(Oid::from_bytes(&[3; 20]).unwrap());
+        assert!(matches!(
+            queue.native_work(0, false),
+            Some(NativeWork::Fetch {
+                last_request: false,
+                ..
+            })
+        ));
+
+        queue.mount_reads = MountReads::Lookup;
+        queue.busy.fill(false);
+        let tree = queue.foreground(Oid::from_bytes(&[4; 20]).unwrap());
+        tree.0.is_tree.store(true, Ordering::Relaxed);
+        queue.foreground(Oid::from_bytes(&[5; 20]).unwrap());
         assert!(matches!(
             queue.native_work(0, false),
             Some(NativeWork::Fetch {
@@ -3352,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn required_http2_tree_does_not_wait_for_batching() {
+    fn required_http2_trees_skip_batching_delay_and_use_individual_packs() {
         let directory = tempfile::tempdir().unwrap();
         let pool = Pool {
             shared: Arc::default(),
@@ -3362,19 +3422,39 @@ mod tests {
             ssh_snapshot: None,
         };
         pool.shared.queue.lock().unwrap().mode = ConnectionMode::Wide;
-        let tree = Oid::hash_object(git2::ObjectType::Tree, b"").unwrap();
-        pool.request(tree).unwrap();
+        let blobs = [b"first", b"other", b"third"]
+            .map(|data| Oid::hash_object(git2::ObjectType::Blob, data).unwrap());
+        let mut child_entry = b"100644 file\0".to_vec();
+        child_entry.extend_from_slice(blobs[0].as_bytes());
+        let child = Oid::hash_object(git2::ObjectType::Tree, &child_entry).unwrap();
+        let mut parent_entry = b"40000 child\0".to_vec();
+        parent_entry.extend_from_slice(child.as_bytes());
+        let tree = Oid::hash_object(git2::ObjectType::Tree, &parent_entry).unwrap();
+        pool.request(tree, false).unwrap();
         {
             let queue = pool.shared.queue.lock().unwrap();
             let now = queue.waiting[0].queued_at;
             assert_eq!(queue.http2_batch_wait(now, true), Some(BATCH_WINDOW));
         }
-        pool.request_with_batching(tree, true).unwrap();
-        let queue = pool.shared.queue.lock().unwrap();
-        assert_eq!(queue.waiting.len(), 1);
-        let now = queue.waiting[0].queued_at;
-        assert_eq!(queue.http2_batch_wait(now, true), None);
-        assert_eq!(queue.batch_wait(now, true), Some(BATCH_WINDOW));
+        pool.request(tree, true).unwrap();
+        {
+            let queue = pool.shared.queue.lock().unwrap();
+            assert_eq!(queue.waiting.len(), 1);
+            let now = queue.waiting[0].queued_at;
+            assert_eq!(queue.http2_batch_wait(now, true), None);
+            assert_eq!(queue.batch_wait(now, true), Some(BATCH_WINDOW));
+        }
+        pool.request(blobs[0], false).unwrap();
+        pool.request(child, true).unwrap();
+        for &oid in &blobs[1..] {
+            pool.request(oid, false).unwrap();
+        }
+        let packs = {
+            let mut queue = pool.shared.queue.lock().unwrap();
+            std::iter::from_fn(|| Work::take(&mut queue.waiting, false).map(|work| work.wants()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(packs, [vec![tree], blobs.to_vec(), vec![child]]);
     }
 
     #[test]
@@ -3386,7 +3466,6 @@ mod tests {
             demand: Demand::default(),
             queued_at: now,
             prefetch_width: READ_AHEAD,
-            immediate: false,
         });
         assert_eq!(queue.batch_wait(now, true), None);
         queue.mode = ConnectionMode::Wide;
@@ -3400,7 +3479,6 @@ mod tests {
                 demand: Demand::default(),
                 queued_at: now,
                 prefetch_width: READ_AHEAD,
-                immediate: false,
             });
         }
         assert_eq!(queue.batch_wait(now, true), None);

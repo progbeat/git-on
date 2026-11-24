@@ -1726,7 +1726,6 @@ impl Overlay {
         )
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn start_remote_tree_demand(
         &self,
         oid: Oid,

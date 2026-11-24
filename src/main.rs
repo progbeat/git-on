@@ -581,10 +581,12 @@ fn execute_in_group(
     let mut measured_backend = None;
     let mut result = (|| -> Result<ExitStatus> {
         #[cfg(feature = "test-metrics")]
-        if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
-            let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
-            if fd < 3 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                bail!("invalid test metrics descriptor");
+        for key in ["GIT_ON_TEST_METRICS_FD", "GIT_ON_TEST_DEMAND_FD"] {
+            if let Some(fd) = env::var_os(key) {
+                let fd: i32 = fd.to_str().context("invalid test descriptor")?.parse()?;
+                if fd < 3 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                    bail!("invalid {key} descriptor");
+                }
             }
         }
         let progress = progress.insert(git_on::terminal_ui::StartupProgress::start(

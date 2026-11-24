@@ -521,7 +521,7 @@ impl Remote {
             let selected = self.open_http2_pool(selection)?.or(exact);
             if let (Some(oid), Some(pool)) = (selected, &self.demand_pool) {
                 self.http2_checked = true;
-                let batch = pool.request(oid)?.wait();
+                let batch = pool.request(oid, false)?.wait();
                 if !batch.requires_native_preparation() {
                     self.pool_checked = true;
                     self.finish_demand(&batch)?;
@@ -1082,6 +1082,10 @@ impl Remote {
         self.record_result(outcome)
     }
     pub fn ensure(&mut self, oid: Oid) -> Result<()> {
+        self.ensure_object(oid, false)
+    }
+
+    pub(crate) fn ensure_object(&mut self, oid: Oid, is_tree: bool) -> Result<()> {
         let outcome = (|| {
             if self.raw_blobs.claim(oid)? || self.odb()?.is_some_and(|odb| odb.exists(oid)) {
                 return Ok(());
@@ -1095,7 +1099,7 @@ impl Remote {
                 }
                 Some(ReceivedObject::Packed { .. }) => Ok(()),
                 None if self.selection_odb(oid).is_some() => Ok(()),
-                None => self.fetch(&[oid]),
+                None => self.fetch(&[oid], is_tree),
             }
         })();
         self.record_result(outcome)
@@ -1112,7 +1116,7 @@ impl Remote {
             if missing.is_empty() {
                 return Ok(());
             }
-            self.fetch(&missing)
+            self.fetch(&missing, false)
         })();
         self.record_result(outcome)
     }
@@ -1141,7 +1145,7 @@ impl Remote {
     pub(crate) fn start_demand<I: Iterator<Item = Oid>>(
         &mut self,
         oid: Oid,
-        immediate: bool,
+        is_tree: bool,
         candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Result<Option<crate::demand::Demand>> {
         let outcome = (|| {
@@ -1157,9 +1161,7 @@ impl Remote {
             let Some(pool) = &self.demand_pool else {
                 return Ok(None);
             };
-            let demand = wanted
-                .then(|| pool.request_with_batching(oid, immediate))
-                .transpose()?;
+            let demand = wanted.then(|| pool.request(oid, is_tree)).transpose()?;
             if let Some(candidates) = candidates.filter(|_| self.forecast_seen.insert(oid)) {
                 let odb = self.odb()?;
                 pool.prefetch(oid, candidates, |oid| {
@@ -1513,7 +1515,7 @@ impl Remote {
         }
         outcome
     }
-    fn fetch(&mut self, oids: &[Oid]) -> Result<()> {
+    fn fetch(&mut self, oids: &[Oid], is_tree: bool) -> Result<()> {
         // Session reuse bypasses command(), so reject incomplete invocations
         // before either transport can start another missing-object demand.
         if let Some(error) = self.failure() {
@@ -1524,7 +1526,7 @@ impl Remote {
         }
         if let ([oid], false) = (oids, self.materializing) {
             if let Some(pool) = &self.demand_pool {
-                let batch = pool.request(*oid)?.wait();
+                let batch = pool.request(*oid, is_tree)?.wait();
                 return self.finish_demand(&batch);
             }
             if self.fetch_in_session(*oid)? {

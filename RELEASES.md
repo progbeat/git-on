@@ -1,6 +1,8 @@
 # 1.5.3
 <!-- Bump: patch -->
 
+- Fetch each tree individually on a lazy remote mount so filtered Git
+  responses include every requested subdirectory and file.
 - For slow sequential reads, check SSH channel completion while the pack
   is arriving when another channel is ready. After the command exits, start
   closing SSH input while used packs finish validation.

@@ -3222,14 +3222,19 @@ with ThreadPoolExecutor(2) as pool:
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_concurrent_https_lookups_combine_only_requested_objects(self):
         f = self.f
-        sizes = list(range(21, 37))
+        sizes = list(range(21, 27))
         wanted = [f.git('hash-object', '-w', '--stdin', data=b'x' * size) for size in sizes]
+        # Only four directory warm-ups. With the selection and warm blob,
+        # this stays below the eight replies needed to expand the pool.
         directories = [f.git('mktree', data=f'100644 blob {oid}\tfile\n'.encode())
-                       for oid in wanted]
+                       for oid in wanted[:4]]
+        cold_tree = f.git('mktree', data=f'100644 blob {wanted[-1]}\tinside\n'.encode())
         entries = [f'040000 tree {oid}\td{index}'
                    for index, oid in enumerate(directories)]
-        entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\tunused',
+        entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\t-unused',
                         f'100644 blob {f.blob}\twarm-alias', f'040000 tree {directories[0]}\talias',
+                        f'040000 tree {cold_tree}\tcold', f'100644 blob {wanted[-1]}\ts-cold-file',
+                        f'100644 blob {wanted[4]}\tq-gate-file',
                         f'040000 tree {f.subtree}\tunvisited'))
         tree = f.git('mktree', data=('\n'.join(entries) + '\n').encode())
         commit = f.git('commit-tree', tree, data=b'concurrent lookups\n')
@@ -3248,7 +3253,7 @@ import time
 assert 'unvisited' in os.listdir('.')
 assert os.stat('warm').st_size == 9
 sizes = {sizes!r}
-parents = [Path(f'd{{index}}') for index in range(len(sizes))]
+parents = [Path(f'd{{index}}') for index in range(4)]
 alias = Path('alias')
 # Warm each parent with a lookup so this case measures foreground requests.
 for parent in [*parents, alias]:
@@ -3261,27 +3266,43 @@ def wait_for(name):
         assert time.monotonic() < deadline, name
         time.sleep(.01)
 
-def read(parent):
-    path = parent / 'file'
+def read(path):
     return path.stat().st_size, path.read_bytes()
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
-    first = pool.submit(read, parents[0])
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    first = pool.submit(read, parents[0] / 'file')
     wait_for('start-next')
-    second = pool.submit(read, parents[1])
-    duplicate = pool.submit(read, alias)
+    second = pool.submit(read, parents[1] / 'file')
+    duplicate = pool.submit(read, alias / 'file')
     wait_for('check-cached')
     assert os.stat('warm-alias').st_size == 9
     (control / 'cached-ready').touch()
-    rest = list(pool.map(read, parents[2:]))
-    assert [first.result(), second.result(), *rest] == [(size, b'x' * size) for size in sizes]
+    initial = [first, second]
+    for index in (2, 3):
+        wait_for(f'start-{{index}}')
+        initial.append(pool.submit(read, parents[index] / 'file'))
+    wait_for('start-mixed')
+    cold = pool.submit(os.listdir, 'cold')
+    cold_file = pool.submit(read, Path('s-cold-file'))
+    wait_for('start-gate-file')
+    gate_file = pool.submit(read, Path('q-gate-file'))
+    assert cold.result() == ['inside']
+    results = [future.result() for future in initial] + [gate_file.result(), cold_file.result()]
+    assert results == [(size, b'x' * size) for size in sizes]
     assert duplicate.result() == first.result()
 """
-        process = subprocess.Popen(
-            [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
-             sys.executable, '-I', '-S', '-c', command],
-            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        demands, notify = os.pipe()
+        self.addCleanup(os.close, demands)
+        try:
+            os.set_blocking(notify, False)
+            process = subprocess.Popen(
+                [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
+                 sys.executable, '-I', '-S', '-c', command],
+                cwd=f.cwd, env=dict(f.env, GIT_ON_TEST_DEMAND_FD=str(notify)), pass_fds=(notify,),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        finally:
+            os.close(notify)
         f.children.append(process)
         def next_stalled(message, timeout=10):
             try:
@@ -3297,19 +3318,34 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
         while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertTrue(ready.exists(), 'cached blob waited behind the transfers')
-        more_wants = next_stalled('concurrent sibling lookups did not reach HTTPS')
-        if len(more_wants) == 1:
-            next_stalled('a fourth exact demand did not reach HTTPS')
-        # Give concurrent callbacks time to reach the mount while the initial
-        # transfers are held. A free connection can batch those pending OIDs.
-        time.sleep(.2)
-        f.resume.set()
+        for index in (2, 3):
+            (f.root / f'start-{index}').touch()
+            self.assertEqual(next_stalled('another independent lookup did not reach HTTPS'), [wanted[index]])
+        (f.root / 'start-mixed').touch()
+        def wait_for_demands(*oids):
+            missing = set(oids)
+            deadline = time.monotonic() + 10
+            while missing:
+                self.assertTrue(select.select([demands], [], [], max(0, deadline-time.monotonic()))[0],
+                                f'demands did not reach the scheduler: {missing}')
+                oid = os.read(demands, 20)
+                self.assertEqual(len(oid), 20, 'demand observer closed')
+                missing.discard(oid.hex())
+        try:
+            wait_for_demands(cold_tree, wanted[-1])
+            # Queue this file after the alias is pending, so read-ahead
+            # cannot make the alias speculative.
+            (f.root / 'start-gate-file').touch()
+            wait_for_demands(wanted[4])
+        finally:
+            f.resume.set()
         _, errors = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 0, errors)
         batches = [request['wants'] for request in f.requests if request['wants']]
         self.assertCountEqual([oid for batch in batches for oid in batch],
-                              [commit, tree, f.blob, *directories, *wanted])
-        self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
+                              [commit, tree, f.blob, *directories, cold_tree, *wanted])
+        self.assertEqual([batch for batch in batches if cold_tree in batch], [[cold_tree]])
+        self.assertIn({wanted[4], wanted[-1]}, [set(batch) for batch in batches])
         assert_no_run_state(self, f.root)
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')

@@ -784,9 +784,9 @@ impl State {
         }
         Ok(child)
     }
-    fn ensure(&mut self, oid: Oid) -> Result<()> {
+    fn ensure(&mut self, oid: Oid, is_tree: bool) -> Result<()> {
         if let Some(remote) = &mut self.remote {
-            remote.ensure(oid)?;
+            remote.ensure_object(oid, is_tree)?;
         }
         Ok(())
     }
@@ -814,7 +814,7 @@ impl State {
             }
             return Ok(tree);
         }
-        self.ensure(oid)?;
+        self.ensure(oid, true)?;
         if let Some((tree, first)) = self.raw_store().and_then(|raw| raw.directory(oid)) {
             self.metrics.tree_reads += u64::from(first);
             return Ok(tree);
@@ -862,7 +862,7 @@ impl State {
             return Ok(size);
         }
         self.metrics.header_reads += 1;
-        self.ensure(oid)?;
+        self.ensure(oid, false)?;
         if let Some(raw) = self.cached_object(oid)? {
             anyhow::ensure!(
                 raw.kind() == ObjectType::Blob,
@@ -1152,12 +1152,12 @@ impl Snapshot {
         }
         let mut selected = oid;
         let tree_oid = loop {
-            state.ensure(selected)?;
+            state.ensure(selected, false)?;
             match state.object_kind(selected)? {
                 ObjectType::Tree => break selected,
                 ObjectType::Commit => {
                     let tree = state.selected_child(selected, ObjectType::Commit)?;
-                    state.ensure(tree)?;
+                    state.ensure(tree, true)?;
                     anyhow::ensure!(
                         state.object_kind(tree)? == ObjectType::Tree,
                         "snapshot root is not a Git tree"
@@ -1255,7 +1255,7 @@ impl Snapshot {
     pub(crate) fn start_remote_demand<I: Iterator<Item = Oid>>(
         &self,
         oid: Oid,
-        immediate: bool,
+        is_tree: bool,
         candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Option<PendingObject> {
         let mut state = self.state().ok()?;
@@ -1265,7 +1265,7 @@ impl Snapshot {
         let demand = state
             .remote
             .as_mut()?
-            .start_demand(oid, immediate, candidates)
+            .start_demand(oid, is_tree, candidates)
             .ok()??;
         Some(PendingObject {
             snapshot: self.clone(),
@@ -1494,7 +1494,7 @@ impl Snapshot {
             .as_ref()
             .is_some_and(|remote| remote.has_received_object(oid))
         {
-            state.ensure(oid)?;
+            state.ensure(oid, false)?;
         }
         if state.cached_object(oid)?.is_some() {
             let reader = state.open(oid)?;

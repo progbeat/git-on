@@ -271,7 +271,9 @@ native fetch/cat-file counters. Server-side Git subprocesses remain real work,
 included in waited CPU for local source fixtures.
 
 For filtered lazy execution, the server must advertise filtering before any
-object transfer. Rejection of a requested unadvertised OID names the OID and
+object transfer. Git-on sends each tree in its own request and can batch blobs.
+This keeps a tree filter from omitting another explicitly requested object
+inside that tree. Rejection of a requested unadvertised OID names the OID and
 includes Git's server diagnostic.
 
 Two-operand local-path and `file://` sources use upload-pack and require the same
