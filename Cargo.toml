@@ -21,6 +21,8 @@ required-features = ["test-metrics"]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+# The two legacy pin callbacks use the public Oid type from git2 0.20.
+git2-legacy = { package = "git2", version = "0.20", default-features = false }
 libgit2-sys = { version = "0.18", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 indicatif = "=0.18.3"

@@ -634,11 +634,13 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         gate.touch()
         native, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
         wrapper = f.root / 'probe-client'
+        gate_path = shlex.quote(str(gate))
+        started_path = shlex.quote(str(started))
         wrapper.write_text(
             '#!/bin/sh\n'
             'if [ "$1" = -G ]; then\n'
-            f'  ( : > {shlex.quote(str(started))}; '
-            f'while [ -e {shlex.quote(str(gate))} ]; do sleep 0.02; done ) </dev/null &\n'
+            f'  ( : > {started_path}; while [ -e {gate_path} ]; do sleep 0.02; done ) </dev/null &\n'
+            f'  while [ ! -e {started_path} ]; do sleep 0.02; done\n'
             'fi\n'
             f'exec {shlex.quote(shutil.which(native))} "$@"\n'
         )
@@ -650,11 +652,46 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
                  '--', 'cat', 'deep/file'],
                 cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
             )
+            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
             self.assertTrue(started.exists())
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, b'expected\n')
         finally:
             gate.unlink()
+
+    def test_ssh_match_exec_runs_during_inspection_and_connection(self):
+        f = self.f
+        url = f.ssh(protocol_v2=True)
+        calls = f.root / 'match-exec-calls'
+        predicate = f.root / 'match-predicate'
+        predicate.write_text(
+            '#!/bin/sh\n'
+            f'printf "%s\\n" "$FIXTURE_SSH_PHASE" >> {shlex.quote(str(calls))}\n'
+        )
+        predicate.chmod(0o700)
+        config = f.root / 'match.conf'
+        config.write_text(f'Match exec "{shlex.quote(str(predicate))}"\n')
+        native, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
+        options[options.index('-F') + 1] = str(config)
+        wrapper = f.root / 'probe-client'
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = -G ]; then FIXTURE_SSH_PHASE=probe; else FIXTURE_SSH_PHASE=connect; fi\n'
+            'export FIXTURE_SSH_PHASE\n'
+            f'exec {shlex.quote(shutil.which(native))} "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='go-ssh-') as runtime:
+            env = dict(f.env, TMPDIR=runtime, SHELL='/bin/sh',
+                       GIT_SSH_COMMAND=shlex.join([str(wrapper), *options]))
+            result = subprocess.run(
+                [remote.OPTIONS.binary, url, 'main', '--backend=copy', '--write-policy=all',
+                 '--', 'cat', 'deep/file'],
+                cwd=f.cwd, env=env, capture_output=True, timeout=10,
+            )
+            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
+            phases = calls.read_text().splitlines()
+            self.assertIn('probe', phases)
+            self.assertIn('connect', phases)
+            remote.assert_no_run_state(self, Path(runtime))
 
     def test_check_host_ip_preserves_the_caller_host_files(self):
         f = self.f

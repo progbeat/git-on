@@ -435,6 +435,13 @@ that require an arbitrary shell program are unsupported. An explicit
 `-F` profile keeps its user
 configuration context. The launcher and the private profile can use temporary
 paths containing spaces.
+
+OpenSSH evaluates `Match exec` while it reads configuration, including for
+`ssh -G`. Git-on can inspect the configuration multiple times when validating
+proxy or `CheckHostIP` settings. OpenSSH can also run these commands during
+connection setup. Effects of these explicitly configured local commands
+are covered by the [service-state exception](specification.md#service-state).
+
 Apple's OpenSSH combines reading and storing passphrases in its
 `UseKeychain` option. Git-on keeps that option disabled for new connections
 to preserve the caller's Keychain. OpenSSH can use identities already

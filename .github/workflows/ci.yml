@@ -513,6 +513,7 @@ jobs:
             RemoteTests.test_concurrent_https_lookups_combine_only_requested_objects \
             RemoteTests.test_review_real_mount_caught_run_odb_fault_forces_runner_failure
           python3 tests/ssh_regressions.py --binary target/debug/git-on \
+            SshRegressionTests.test_ssh_match_exec_runs_during_inspection_and_connection \
             SshRegressionTests.test_proxy_jump_leaves_its_known_hosts_file_unchanged
           GIT_ON_TEST_FSYNC_ERROR=1 cargo test --locked --lib --features test-metrics backend::nfs::tests::sync_errors_are_returned_in_rpc_replies -- --exact --ignored
       - name: Multiplex exact Git demands through real NFS

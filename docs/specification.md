@@ -56,6 +56,14 @@ object ID. Git and its configured verifier use the caller's effective
 configuration and the verifier's ordinary environment. Direct verification
 may write to its normal profile or to other paths selected by its configuration.
 Git and its verifier own those effects, including on failure or cancellation.
+
+An explicit `Match exec` directive in the effective OpenSSH configuration is
+also an exception. OpenSSH can run the configured local command during an
+`ssh -G` inspection before any connection and again during connection setup.
+The command uses its ordinary permissions and can write outside run-owned
+storage, including on runs that fail or are cancelled. OpenSSH's own host-key
+and credential storage follows the read-only rules below.
+
 Git-on cleans up the files it creates for the run. The write policy governs
 the command after `--`.
 

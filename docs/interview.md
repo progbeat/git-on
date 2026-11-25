@@ -135,3 +135,11 @@ supersede this answer for regular files required by native Git. They permit
 temporary disk storage when an existing writable tmpfs is unavailable.
 The [service-state contract](specification.md#service-state) permits the
 ordinary effects of Git's configured verifier during `--verify`.
+
+**Question:** Do you approve a narrow exception to the write rule for an
+explicit OpenSSH `Match exec` directive? OpenSSH can run the command during
+`ssh -G`, before connecting, and run it again during connection setup. A local
+review noted that the specification previously had an agreed exception only
+for the verifier.
+
+**Answer:** Document an exception for `Match exec`.

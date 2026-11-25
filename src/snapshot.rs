@@ -1069,8 +1069,32 @@ impl Snapshot {
         )
     }
 
-    /// Load a snapshot and retain its resolved tree in memory. The former run
-    /// ID and pin callback are accepted for source compatibility.
+    /// Load a local snapshot and retain its selected tree in memory.
+    ///
+    /// The former run ID and pin callback are accepted for source compatibility.
+    /// The callback takes the `Oid` type from git2 0.20. The loader ignores
+    /// the callback and its return value.
+    ///
+    /// Use git2 0.21 OIDs to read the returned snapshot. To pass an older OID
+    /// to [`open`](Self::open) or [`read`](Self::read), recreate it using
+    /// git2 0.21's `Oid::from_bytes(old.as_bytes())`.
+    pub fn load_with_pin_record<F>(
+        repo_path: &Path,
+        treeish: &OsStr,
+        run_id: &str,
+        _record: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&Path, &str, git2_legacy::Oid) -> Result<()>,
+    {
+        Self::load(repo_path, treeish, run_id)
+    }
+
+    /// Load a snapshot and retain its resolved tree in memory.
+    ///
+    /// The loader ignores the former run ID and pin callback. The callback
+    /// takes the `Oid` type from git2 0.20.
+    /// See [`load_with_pin_record`](Self::load_with_pin_record) for object reads.
     #[allow(clippy::too_many_arguments)]
     pub fn load_source_with_pin_record<F>(
         repo_path: &Path,
@@ -1083,7 +1107,7 @@ impl Snapshot {
         _record: F,
     ) -> Result<Self>
     where
-        F: FnMut(&Path, &str, Oid) -> Result<()>,
+        F: FnMut(&Path, &str, git2_legacy::Oid) -> Result<()>,
     {
         Self::load_source(
             repo_path,

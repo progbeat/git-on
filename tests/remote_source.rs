@@ -52,6 +52,11 @@ fn load_server(root: &Path, rev: &str, verify: bool) -> anyhow::Result<(Snapshot
     let source = format!("file://{}", root.join("server").display());
     load_operands(root, OsStr::new(&source), OsStr::new(rev), verify)
 }
+
+fn record_pin(_: &Path, _: &str, _: git2_legacy::Oid) -> anyhow::Result<()> {
+    panic!("loading a snapshot should leave Git references alone");
+}
+
 fn load_operands(
     root: &Path,
     source: &OsStr,
@@ -72,10 +77,27 @@ fn load_operands(
         false,
         &run,
         "test-pin",
-        |_, _, _| panic!("loading a snapshot should leave Git references alone"),
+        record_pin,
     )?;
     Ok((snapshot, run))
 }
+
+#[test]
+fn legacy_local_loader_accepts_the_pin_callback_without_creating_refs() {
+    let (temp, _, tree, _) = fixture();
+    let path = temp.path().join("server");
+    let snapshot =
+        Snapshot::load_with_pin_record(&path, OsStr::new("HEAD"), "legacy-local", record_pin)
+            .unwrap();
+    assert_eq!(snapshot.tree_oid, tree);
+    let repo = Repository::open_bare(&path).unwrap();
+    assert!(repo
+        .references_glob("refs/git-on/*")
+        .unwrap()
+        .next()
+        .is_none());
+}
+
 #[test]
 fn corrupted_remote_raw_reads_latch_failure_after_reader_or_handle_close() {
     use std::os::unix::fs::FileExt;

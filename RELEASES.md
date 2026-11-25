@@ -1,6 +1,13 @@
 # 1.5.3
 <!-- Bump: patch -->
 
+- Restore the legacy Rust `Snapshot::load_with_pin_record` signature.
+  Both pin-record loaders accept a git2 0.20 `Oid` callback. The loaders
+  ignore these callbacks and their return values. Use git2 0.21 OIDs for
+  `Snapshot::open` and `read`. A caller holding an older OID can recreate
+  it with git2 0.21’s `Oid::from_bytes(old.as_bytes())`.
+- Document when OpenSSH can run configured `Match exec` commands, including
+  during configuration inspection before connecting.
 - Resolve named SSH refs through native Git when a selection channel
   advertises `ref-in-want` so a lagging replica can serve the tag by name.
 - Fetch each tree individually on a lazy remote mount so filtered Git
