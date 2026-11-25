@@ -1,6 +1,8 @@
 # 1.5.3
 <!-- Bump: patch -->
 
+- Resolve named SSH refs through native Git when a selection channel
+  advertises `ref-in-want` so a lagging replica can serve the tag by name.
 - Fetch each tree individually on a lazy remote mount so filtered Git
   responses include every requested subdirectory and file.
 - For slow sequential reads, check SSH channel completion while the pack

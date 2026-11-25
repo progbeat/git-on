@@ -500,6 +500,7 @@ jobs:
             RemoteTests.test_eager_file_copy_selects_decomposed_ref_as_native_git \
             RemoteTests.test_decomposed_file_remote_uses_configured_fetch_mapping \
             RemoteTests.test_eager_ssh_preserves_native_ref_selection_with_packet_diagnostics \
+            RemoteTests.test_ssh_tag_uses_native_ref_in_want_selection \
             RemoteTests.test_native_local_alternates_do_not_fetch_missing_promisor_objects \
             RemoteTests.test_local_alternates_keep_the_primary_depth_alongside_env \
             RemoteTests.test_native_local_alternates_keep_the_resolved_environment_store \

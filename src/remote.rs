@@ -3,7 +3,7 @@ use crate::{
     git::Git,
     raw_blob::{ReceivedObject, Transfer},
     service_storage::{io_out_of_space, Directory},
-    transport,
+    transport::{self, SshSelection},
 };
 use anyhow::{bail, Context, Result};
 use git2::{Binding, IntoCString, Odb, Oid, Repository};
@@ -32,6 +32,9 @@ use std::{
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 const SSH_STANDBY_DELAY: Duration = Duration::from_millis(250);
 const SSH_STANDBY_CHANNELS: usize = 2;
+const SSH_REF_SELECTION: transport::FetchMode = transport::FetchMode::FilteredSelection {
+    selecting_ref: true,
+};
 const SSH_LAUNCHER: &str = "git-on-ssh-launcher";
 const SSH_READ_ONLY: &str = "StrictHostKeyChecking=yes UpdateHostKeys=no AddKeysToAgent=no ClearAllForwardings=yes ForwardAgent=no ForwardX11=no PermitLocalCommand=no Tunnel=no";
 
@@ -46,6 +49,18 @@ pub fn invoke_ssh_launcher() -> Option<i32> {
         || std::env::var_os("GIT_ON_SSH_LAUNCHER").as_deref() != Some(launcher.as_os_str())
     {
         return None;
+    }
+    if arguments.next_if(|arg| arg == "--shallow-fetch").is_some() {
+        let program = arguments.next()?;
+        let mut client = Command::new(program);
+        client
+            .args(arguments)
+            .env_remove("GIT_ON_SSH_SHALLOW_FETCH");
+        let result = transport::run_shallow_ssh_fetch(client, std::io::stdout().lock());
+        return Some(result.unwrap_or_else(|error| {
+            eprintln!("git-on: forward SSH fetch: {error:#}");
+            125
+        }));
     }
     let launching = arguments.next_if(|arg| arg == "--launch").is_some();
     let (program, git_arguments) = if launching {
@@ -532,8 +547,17 @@ impl Remote {
                 drop(self.demand_pool.take());
                 selected_for_native = Some(oid);
             }
-            if let Some(oid) = self.select_ssh(exact, reference)? {
-                return Ok(oid);
+            match self.select_ssh(exact, reference) {
+                Ok(Some(oid)) => return Ok(oid),
+                Ok(None) => (),
+                Err(error) if error.is::<transport::RefInWant>() => {
+                    if self.socket_owner.is_some() {
+                        // The native fetch channel checks filtering itself.
+                        // Avoid listing all refs on a separate replica.
+                        return self.fetch_selected(NativeRevision::Query(revision), false, false);
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         if let Some(target) = stream_target {
@@ -545,10 +569,7 @@ impl Remote {
         // Authentication and host-key interaction happen here, before mounting.
         let mut command = self.command(self.socket_owner.is_none())?;
         command
-            .args(["-c", "protocol.version=2"])
-            .arg("ls-remote")
-            .arg("--symref")
-            .arg("--")
+            .args(["-c", "protocol.version=2", "ls-remote", "--symref", "--"])
             .arg(&self.source)
             .stdin(Stdio::inherit());
         let outcome =
@@ -756,6 +777,7 @@ impl Remote {
             bail!("remote object transport previously failed: {error}");
         }
         let mut command = self.native_command();
+        command.env_remove("GIT_ON_SSH_SHALLOW_FETCH");
         if let (Some(socket), Some(ssh)) = (&self.socket, &self.ssh) {
             // Git appends argv to the outer function, so its argument count
             // gives the inner function a structural user/Git boundary. User
@@ -877,6 +899,10 @@ impl Remote {
                     command.args(["--keep", "--no-filter"]);
                 } else {
                     command.arg("--filter=tree:0");
+                    if remote.socket_owner.is_some() && matches!(revision, NativeRevision::Query(_))
+                    {
+                        command.env("GIT_ON_SSH_SHALLOW_FETCH", "1");
+                    }
                 }
                 crate::terminal_ui::configure_fetch(&mut command);
                 command
@@ -1674,6 +1700,11 @@ impl Remote {
         if let Some(reference) = reference.filter(|_| !self.git.sets_protocol_version()) {
             return self.select_ssh_ref(reference, command, additional);
         }
+        let mode = if reference.is_some() {
+            SSH_REF_SELECTION
+        } else {
+            transport::FetchMode::Filtered
+        };
         let mut candidates: Vec<_> = transport::StartingSession::spawn(command, false, None)
             .into_iter()
             .collect();
@@ -1687,8 +1718,10 @@ impl Remote {
                 if let Some(index) =
                     transport::StartingSession::wait_for_advertisement(&candidates)?
                 {
-                    if let Ok(Some(session)) = candidates.swap_remove(index).negotiate() {
-                        return Ok(Some(session));
+                    if let Ok(selection @ (SshSelection::Direct(_) | SshSelection::Native(_))) =
+                        candidates.swap_remove(index).negotiate_for(mode)
+                    {
+                        return Ok(selection);
                     }
                 } else if use_standby
                     && connection.is_none()
@@ -1710,12 +1743,19 @@ impl Remote {
                     }
                 }
             }
-            Ok(None)
+            Ok(SshSelection::Unavailable)
         })();
         self.record_socket_owner()?;
         crate::object::check_transfer()?;
-        let Some(mut session) = session? else {
-            return Ok(None);
+        let mut session = match session? {
+            SshSelection::Direct(session) => session,
+            SshSelection::Native(session) => {
+                // Stop pending opens before releasing a known session slot.
+                drop(candidates);
+                session.finish_discovery()?;
+                return Err(transport::RefInWant.into());
+            }
+            SshSelection::Unavailable => return Ok(None),
         };
         anyhow::ensure!(
             self.socket_owner.is_some(),
@@ -1762,7 +1802,7 @@ impl Remote {
                         break transport::Connection::new(additional, false, Some(socket));
                     }
                     if advertisement.is_finished() {
-                        return Ok(None);
+                        return Ok(SshSelection::Unavailable);
                     }
                     crate::object::check_transfer()?;
                     std::thread::sleep(Duration::from_millis(5));
@@ -1776,15 +1816,28 @@ impl Remote {
                     if let Some(index) =
                         transport::StartingSession::wait_for_advertisement(&candidates)?
                     {
-                        if let Ok(Some(primary)) = candidates.swap_remove(index).negotiate() {
-                            let result =
-                                Self::resolve_ssh_ref(primary, &mut candidates, reference, receive);
-                            crate::object::check_transfer()?;
-                            return Ok(result
-                                .ok()
-                                .flatten()
-                                .map(|(session, oid)| (connection, candidates, session, oid)));
-                        }
+                        // Let native Git resolve a name when this replica
+                        // requires ref-aware selection, before requesting any OID.
+                        let primary = match candidates
+                            .swap_remove(index)
+                            .negotiate_for(SSH_REF_SELECTION)
+                        {
+                            Ok(SshSelection::Direct(primary)) => primary,
+                            Ok(SshSelection::Native(session)) => {
+                                return Ok(SshSelection::Native(session));
+                            }
+                            _ => continue,
+                        };
+                        let result =
+                            Self::resolve_ssh_ref(primary, &mut candidates, reference, receive);
+                        crate::object::check_transfer()?;
+                        return match result {
+                            Ok(SshSelection::Direct((session, oid))) => {
+                                Ok(SshSelection::Direct((connection, candidates, session, oid)))
+                            }
+                            Ok(SshSelection::Native(session)) => Ok(SshSelection::Native(session)),
+                            _ => Ok(SshSelection::Unavailable),
+                        };
                     } else if !tried_replacement
                         && advertisement.is_finished()
                         && started.elapsed() >= SSH_STANDBY_DELAY
@@ -1803,13 +1856,20 @@ impl Remote {
                 // while its first upload-pack is still opening. Finish that
                 // channel before falling back on the authenticated socket.
                 let _ = advertisement.join();
-                Ok(None)
+                Ok(SshSelection::Unavailable)
             })();
             stop.store(true, Ordering::Relaxed);
             picked
         })?;
-        let Some((connection, candidates, session, oid)) = picked else {
-            return Ok(None);
+        let (connection, candidates, session, oid) = match picked {
+            SshSelection::Direct(selected) => selected,
+            SshSelection::Native(session) => {
+                // The starting channels and scoped v0 probe have stopped.
+                // Release this slot before native Git opens a new channel.
+                session.finish_discovery()?;
+                return Err(transport::RefInWant.into());
+            }
+            SshSelection::Unavailable => return Ok(None),
         };
         self.session_starts += 1;
         self.fetch_selected_ssh(oid, session, Some(connection), candidates)
@@ -1820,11 +1880,15 @@ impl Remote {
         spares: &mut Vec<transport::StartingSession>,
         reference: &transport::RefQuery,
         advertisement: mpsc::Receiver<Option<Oid>>,
-    ) -> Result<Option<(transport::Session, Oid)>> {
+    ) -> Result<SshSelection<(transport::Session, Oid)>> {
         match advertisement.try_recv() {
-            Ok(Some(oid)) => return Ok(Some((primary, oid))),
+            Ok(Some(oid)) => return Ok(SshSelection::Direct((primary, oid))),
             Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
-                return Ok(primary.select_ref(reference)?.map(|oid| (primary, oid)));
+                return Ok(primary
+                    .select_ref(reference)?
+                    .map_or(SshSelection::Unavailable, |oid| {
+                        SshSelection::Direct((primary, oid))
+                    }));
             }
             Err(mpsc::TryRecvError::Empty) => (),
         }
@@ -1841,15 +1905,25 @@ impl Remote {
             if let Some(oid) = advertised {
                 if let Some(index) = spares
                     .iter()
-                    .position(transport::StartingSession::filtered_v2_ready)
+                    .position(|spare| spare.ready_to_negotiate(SSH_REF_SELECTION))
                 {
-                    if let Ok(Some(secondary)) = spares.swap_remove(index).negotiate() {
-                        return Ok(Some((secondary, oid)));
+                    match spares.swap_remove(index).negotiate_for(SSH_REF_SELECTION) {
+                        Ok(SshSelection::Direct(secondary)) => {
+                            return Ok(SshSelection::Direct((secondary, oid)));
+                        }
+                        Ok(SshSelection::Native(session)) => {
+                            return Ok(SshSelection::Native(session));
+                        }
+                        _ => (),
                     }
                 }
             }
         }
-        Ok(primary.read_ref(reference)?.map(|oid| (primary, oid)))
+        Ok(primary
+            .read_ref(reference)?
+            .map_or(SshSelection::Unavailable, |oid| {
+                SshSelection::Direct((primary, oid))
+            }))
     }
 
     fn fetch_selected_ssh(
@@ -3093,12 +3167,97 @@ git_on_ssh_command() {
     if [ "$GIT_ON_SSH_INITIAL" = 1 ]; then
         exec "$GIT_ON_SSH_LAUNCHER" --launch "$executable" "$git_on_git_argc" "$@"
     fi
+    if [ "$GIT_ON_SSH_SHALLOW_FETCH" = 1 ]; then
+        exec "$GIT_ON_SSH_LAUNCHER" --shallow-fetch "$executable" "$@"
+    fi
     exec "$executable" "$@"
 }"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spare_ssh_channel_defers_named_selection_only_if_it_advertises_ref_in_want() {
+        for features in ["shallow filter", "shallow filter ref-in-want"] {
+            let directory = tempfile::tempdir().unwrap();
+            let requested = directory.path().join("requested");
+            let stop = Arc::new(AtomicBool::new(false));
+            let start = |features: &str, marker: Option<&Path>| {
+                let capability = format!("fetch={features}\n");
+                let advertisement = format!(
+                    "000eversion 2\n{:04x}{capability}0000",
+                    capability.len() + 4
+                );
+                let mut command = Command::new("/bin/sh");
+                command
+                    .args([
+                        "-c",
+                        r#"
+                        printf '%s' "$1"
+                        if [ "$#" -eq 2 ]; then read -r request; : > "$2"; fi
+                        while IFS= read -r line; do :; done
+                        "#,
+                        "upload-pack-fixture",
+                    ])
+                    .arg(advertisement)
+                    .args(marker);
+                transport::StartingSession::spawn(command, false, Some(stop.clone())).unwrap()
+            };
+            let SshSelection::Direct(primary) = start("shallow filter", Some(&requested))
+                .negotiate_for(SSH_REF_SELECTION)
+                .unwrap()
+            else {
+                panic!("the primary must negotiate filtered selection");
+            };
+            let mut spares = vec![start(features, None)];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !spares[0].ready_to_negotiate(SSH_REF_SELECTION) {
+                assert!(
+                    Instant::now() < deadline,
+                    "spare did not advertise eligibility"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let oid = Oid::from_bytes(&[1; 20]).unwrap();
+            let reference = transport::RefQuery::new(OsStr::new("refs/tags/release")).unwrap();
+            let (send, receive) = mpsc::channel();
+            let (done, completed) = mpsc::channel();
+            let selected = std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    // Make the v0 ref arrive only after the primary's ls-refs.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !requested.exists() {
+                        if Instant::now() >= deadline {
+                            stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = send.send(Some(oid));
+                    if completed.recv_timeout(Duration::from_secs(5)).is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                });
+                let selected = Remote::resolve_ssh_ref(primary, &mut spares, &reference, receive);
+                let _ = done.send(());
+                selected
+            });
+            assert!(spares.is_empty());
+            match selected.unwrap() {
+                SshSelection::Native(session) if features.contains("ref-in-want") => {
+                    assert!(!session.has_exited());
+                    session.finish_discovery().unwrap();
+                }
+                SshSelection::Direct((_, selected)) if !features.contains("ref-in-want") => {
+                    assert_eq!(selected, oid);
+                }
+                _ => panic!("unexpected SSH selection outcome for {features}"),
+            }
+        }
+    }
+
     #[test]
     fn mux_shutdown_rejects_invalid_greetings_before_termination() {
         for greeting in [

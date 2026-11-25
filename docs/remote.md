@@ -75,8 +75,12 @@ force refspec such as `+main` uses the same stream as `main`. Explicit
 destinations, custom fetch mappings and remote groups use native Git.
 An SSH identity that
 authenticates without a prompt can select the ref or exact object ID and
-fetch the root tree over one owned channel. Other refspecs use native Git's
-selection with the caller's credentials, proxies and TLS policy.
+fetch the root tree over one owned channel. For a lazy mount, a named SSH
+selection channel advertising `ref-in-want` hands selection to native Git.
+Git-on continues with the selected OID. On older servers that send the shallow
+response sections out of order, Git-on forwards them in the order native Git
+expects on the same SSH channel. Other refspecs use native Git's selection with
+the caller's credentials, proxies and TLS policy.
 Interactive preparation uses native fetch with job-control supervision. Git-on
 owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
 request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
@@ -122,7 +126,7 @@ connection is still being measured. SSH opens its channels through the same
 owned master and uses fewer when the server refuses an additional channel.
 On a slow SSH startup, up to two spare channels can begin negotiating protocol
 v2 as soon as the authenticated, owned socket exists. When the caller leaves
-the protocol version unconfigured, an unambiguous named branch can use a Git
+the protocol version unconfigured, an unambiguous branch or tag can use a Git
 v0 ref advertisement while filtered protocol v2 channels negotiate on the
 same master. A ready channel
 can fetch the selected commit while another channel awaits an `ls-refs` reply.

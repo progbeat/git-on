@@ -3737,11 +3737,84 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         f.git('update-ref', 'refs/tags/release', f.commit)
         url = f.ssh(protocol_v2=True)
         process = f.probe(url, 'release')
-        self.assertEqual(f.line(process)['tree'], f.tree)
+        selected = f.line(process)
+        self.assertEqual(selected['tree'], f.tree)
+        self.assertEqual(selected['metrics']['remote_fetch_operations'], 0)
         value, _ = f.operation(process, 'read deep/file')
         self.assertEqual(value['data'], 'expected\n')
         f.finish(process)
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
+
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_ssh_tag_uses_native_ref_in_want_selection(self):
+        f = self.f
+        stale = f.root / 'stale.git'
+        f.git('clone', '--bare', '--shared', '--quiet', f.repo, stale, at=f.root)
+        self.signing()
+        tag = f.git('rev-parse', 'refs/tags/signed')
+        f.git('update-ref', 'refs/tags/été', tag)
+        f.git('config', 'user.name', 'Stale Fixture', at=stale)
+        f.git('config', 'user.email', 'fixture@example.invalid', at=stale)
+        empty = f.git('mktree', data=b'', at=stale)
+        stale_commit = f.git('commit-tree', empty, data=b'stale snapshot\n', at=stale)
+        f.git('-c', 'user.signingkey=' + str(f.root / 'signature'),
+              'tag', '-sm', 'stale tag', 'signed', stale_commit, at=stale)
+        stale_tag = f.git('rev-parse', 'refs/tags/signed', at=stale)
+        f.git('config', 'uploadpack.allowRefInWant', 'true')
+        url = f.ssh(protocol_v2=True, max_sessions=1)
+        packets = f.root / 'replica-packets'
+        f.force_upload_pack(
+            'if [ "${GIT_PROTOCOL-}" != version=2 ]; then\n'
+            f'    exec git-upload-pack {shlex.quote(str(stale))}\n'
+            'fi\n'
+            f'export GIT_TRACE_PACKET={shlex.quote(str(packets))}\n'
+            f'exec git-upload-pack {shlex.quote(str(f.repo))}\n'
+        )
+        env, log = record_git_invocations(f.root, f.env)
+        backend = 'fuse' if OPTIONS.require_fuse else 'nfs'
+        explicit_v2 = dict(env, GIT_CONFIG_COUNT='3',
+                           GIT_CONFIG_KEY_2='protocol.version', GIT_CONFIG_VALUE_2='2')
+        for name, revision, settings in (
+            ('default', 'signed', env),
+            ('v2', 'signed', explicit_v2),
+            ('traced', 'été', dict(env, GIT_TRACE_PACKET='1')),
+        ):
+            with self.subTest(selection=name):
+                if name == 'traced':
+                    f.git('config', 'uploadpack.allowSidebandAll', 'true')
+                log.write_text('')
+                packets.write_text('')
+                if name == 'default':
+                    command = [OPTIONS.binary, url, revision, '--verify', '--backend=' + backend,
+                               '--write-policy=none', '--', 'cat', 'deep/file']
+                    read_file = None
+                else:
+                    command = [OPTIONS.probe, url, revision, '--verify']
+                    read_file = b'read deep/file\n'
+                result = subprocess.run(
+                    command, input=read_file, cwd=f.cwd, env=settings, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if name == 'default':
+                    self.assertEqual(result.stdout, b'expected\n')
+                else:
+                    self.assertEqual(json.loads(result.stdout.splitlines()[1])['data'], 'expected\n')
+                trace = packets.read_text()
+                self.assertIn('upload-pack< want-ref refs/tags/', trace)
+                self.assertIn(f'upload-pack> {tag} refs/tags/', trace)
+                self.assertNotIn(f'want {stale_tag}', trace)
+                self.assertNotIn(f'want {tag}', trace)
+                calls = git_invocations(log)
+                fetches = [args for args in calls if 'fetch' in args and '--no-write-fetch-head' not in args]
+                self.assertEqual([args[-1] for args in fetches], [revision])
+                self.assertTrue(all('--depth=1' in args and '--filter=tree:0' in args for args in fetches))
+                if name == 'v2':
+                    self.assertFalse(any('ls-remote' in args and '--symref' in args for args in calls))
+                if name == 'traced':
+                    self.assertIn(b'fetch> want-ref refs/tags/', result.stderr)
+                    self.assertIn('upload-pack< sideband-all', trace)
+                self.assertEqual([args[-1] for args in calls if 'verify-tag' in args], [tag])
+                assert_no_run_state(self, f.root)
 
     def test_mounted_ssh_reuses_native_upload_pack_setup(self):
         if not (OPTIONS.require_fuse or OPTIONS.require_nfs):

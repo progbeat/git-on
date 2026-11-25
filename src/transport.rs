@@ -6,7 +6,7 @@ use git2::Oid;
 use std::{
     collections::VecDeque,
     fs,
-    io::{self, BufRead, BufReader, Read, Seek, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::{
@@ -657,6 +657,23 @@ pub(crate) enum FetchMode {
     Snapshot { selecting_ref: bool },
 }
 
+#[derive(Debug)]
+pub(crate) struct RefInWant;
+
+impl std::fmt::Display for RefInWant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("named selection requires Git's ref-in-want support")
+    }
+}
+
+impl std::error::Error for RefInWant {}
+
+pub(crate) enum SshSelection<T> {
+    Direct(T),
+    Native(Session),
+    Unavailable,
+}
+
 impl StartingSession {
     pub(crate) fn spawn(command: Command, helper: bool, stop: Stop) -> Result<Self> {
         check_transfer(&stop)?;
@@ -714,9 +731,9 @@ impl StartingSession {
         Ok(selected)
     }
 
-    /// An optional spare must have a complete handshake before it can take
-    /// over from an in-flight ref query on another channel.
-    pub(crate) fn filtered_v2_ready(&self) -> bool {
+    /// A spare can enter the selection race once its advertisement is complete
+    /// and either supports selection or explicitly delegates it to Git.
+    pub(crate) fn ready_to_negotiate(&self, mode: FetchMode) -> bool {
         let mut preview = [0; 4096];
         let read = unsafe {
             libc::recv(
@@ -727,15 +744,25 @@ impl StartingSession {
             )
         };
         read > 0
-            && read_v2_capabilities(&mut &preview[..read as usize], FetchMode::Filtered)
-                .unwrap_or(false)
+            && match read_v2_capabilities(&mut &preview[..read as usize], mode) {
+                Ok(eligible) => eligible,
+                Err(error) => error.is::<RefInWant>(),
+            }
     }
 
-    pub(crate) fn negotiate(mut self) -> Result<Option<Session>> {
+    pub(crate) fn negotiate(self) -> Result<Option<Session>> {
+        match self.negotiate_for(FetchMode::Filtered)? {
+            SshSelection::Direct(session) => Ok(Some(session)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn negotiate_for(mut self, mode: FetchMode) -> Result<SshSelection<Session>> {
         let session = &mut self.0;
-        match session.handshake(session.stateless, FetchMode::Filtered) {
-            Ok(true) => Ok(Some(self.0)),
-            Ok(false) => Ok(None),
+        match session.handshake(session.stateless, mode) {
+            Ok(true) => Ok(SshSelection::Direct(self.0)),
+            Ok(false) => Ok(SshSelection::Unavailable),
+            Err(error) if error.is::<RefInWant>() => Ok(SshSelection::Native(self.0)),
             Err(error) => {
                 let diagnostic = session.error_text();
                 Err(error)
@@ -1000,6 +1027,10 @@ impl Session {
         self.finish_with(check_end, || Ok(check_transfer(&self.input.1)?))
     }
 
+    pub(crate) fn finish_discovery(self) -> Result<()> {
+        self.finish(false).map(|_| ())
+    }
+
     pub(crate) fn completed_fetch(&self) -> bool {
         self.completed_fetch.load(Ordering::Relaxed)
     }
@@ -1084,6 +1115,180 @@ pub(crate) fn packet_length(header: &[u8; 4]) -> Result<usize> {
     Ok(usize::from_str_radix(std::str::from_utf8(header)?, 16)?)
 }
 
+pub(crate) fn run_shallow_ssh_fetch(mut command: Command, output: impl Write) -> Result<i32> {
+    let (reader, writer) = UnixStream::pair()?;
+    command.stdout(Stdio::from(OwnedFd::from(writer)));
+    // Stay in native Git's process group for job control and cancellation.
+    let mut client = command.spawn()?;
+    drop(command);
+    let input = BufReader::new(Input {
+        socket: reader,
+        stop: None,
+        leader: Some(client.id()),
+        close_after_command: None,
+    });
+    let forwarded = forward_shallow_ssh_fetch(input, BufWriter::new(output));
+    if forwarded.is_err() {
+        let _ = client.kill();
+    }
+    let status = client.wait();
+    forwarded?;
+    Ok(status?.code().unwrap_or(1))
+}
+
+/// Older upload-pack versions put wanted-refs ahead of shallow-info. Forward
+/// both sections in Git's expected order on the original SSH channel, leaving
+/// the advertised OID, pack, and all Git selection decisions to the peer and
+/// native client.
+fn forward_shallow_ssh_fetch(mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let mut frame = Vec::new();
+    if !read_packet_frame(&mut input, &mut frame)? {
+        return Ok(());
+    }
+    let has_filter = |features: &[u8]| {
+        features
+            .split(u8::is_ascii_whitespace)
+            .any(|feature| feature == b"filter")
+    };
+    let v2 = packet_text(&frame[4..]) == b"version 2";
+    if !v2 {
+        if packet_text(&frame[4..]) == b"version 1" {
+            output.write_all(&frame)?;
+            if !read_packet_frame(&mut input, &mut frame)? {
+                output.flush()?;
+                return Ok(());
+            }
+        }
+        if frame != b"0000" && !fetch_frame_error(&frame) {
+            // A peer can respond with v0 or v1 to a v2 request. Check the
+            // capability suffix of its first advertisement on this channel.
+            let features = frame[4..].splitn(2, |byte| *byte == 0).nth(1);
+            ensure!(
+                features.is_some_and(has_filter),
+                "SSH fetch channel lacks object filtering"
+            );
+        }
+    }
+    output.write_all(&frame)?;
+    if v2 {
+        let mut advertised = false;
+        let mut filter = false;
+        while read_packet_frame(&mut input, &mut frame)? {
+            let text = fetch_frame_text(&frame);
+            if !advertised {
+                filter |= text.strip_prefix(b"fetch=").is_some_and(has_filter);
+                if frame == b"0000" {
+                    ensure!(filter, "SSH fetch channel lacks object filtering");
+                    advertised = true;
+                }
+            }
+            if advertised && text == b"wanted-refs" {
+                forward_wanted_refs(&mut input, &mut output, &mut frame)?;
+                break;
+            }
+            output.write_all(&frame)?;
+            if fetch_frame_error(&frame)
+                || advertised && matches!(text, b"shallow-info" | b"packfile")
+            {
+                break;
+            }
+            if frame == b"0000" || frame[4..].starts_with(b"\x02") {
+                output.flush()?;
+            }
+        }
+    }
+    output.flush()?;
+    loop {
+        let bytes = input.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        output.write_all(bytes)?;
+        // The SSH peer can await native Git's next request or EOF.
+        output.flush()?;
+        let length = bytes.len();
+        input.consume(length);
+    }
+}
+
+fn forward_wanted_refs(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    frame: &mut Vec<u8>,
+) -> Result<()> {
+    // Only the advertised refs need buffering. A wildcard refspec can
+    // receive many names for one OID, which native Git can select normally.
+    let mut wanted = Vec::new();
+    loop {
+        wanted.extend_from_slice(frame);
+        if frame == b"0001" {
+            break;
+        }
+        if frame.len() == 4 || fetch_frame_error(frame) || !read_fetch_frame(input, output, frame)?
+        {
+            output.write_all(&wanted)?;
+            return Ok(());
+        }
+    }
+    // Progress and empty channel-2 keepalives are out of band. A legacy
+    // server can send them before its next response section.
+    if read_fetch_frame(input, output, frame)? && fetch_frame_text(frame) == b"shallow-info" {
+        loop {
+            output.write_all(frame)?;
+            if frame.len() == 4 || fetch_frame_error(frame) || !read_packet_frame(input, frame)? {
+                break;
+            }
+        }
+        output.write_all(&wanted)?;
+    } else {
+        output.write_all(&wanted)?;
+        output.write_all(frame)?;
+    }
+    Ok(())
+}
+
+fn read_fetch_frame(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    frame: &mut Vec<u8>,
+) -> Result<bool> {
+    while read_packet_frame(input, frame)? {
+        if !frame[4..].starts_with(b"\x02") {
+            return Ok(true);
+        }
+        output.write_all(frame)?;
+        output.flush()?;
+    }
+    Ok(false)
+}
+
+fn fetch_frame_text(frame: &[u8]) -> &[u8] {
+    let data = &frame[4..];
+    packet_text(data.strip_prefix(b"\x01").unwrap_or(data))
+}
+
+fn fetch_frame_error(frame: &[u8]) -> bool {
+    frame[4..].starts_with(b"\x03") || fetch_frame_text(frame).starts_with(b"ERR ")
+}
+
+fn read_packet_frame(input: &mut impl BufRead, frame: &mut Vec<u8>) -> Result<bool> {
+    frame.clear();
+    if input.fill_buf()?.is_empty() {
+        return Ok(false);
+    }
+    let mut header = [0; 4];
+    input.read_exact(&mut header)?;
+    let length = packet_length(&header)?;
+    ensure!(
+        matches!(length, 0..=2 | 4..=65520),
+        "invalid SSH fetch packet length"
+    );
+    frame.resize(length.max(4), 0);
+    frame[..4].copy_from_slice(&header);
+    input.read_exact(&mut frame[4..])?;
+    Ok(true)
+}
+
 fn read_packet(input: &mut impl Read) -> Result<Packet> {
     let mut header = [0; 4];
     input
@@ -1154,8 +1359,10 @@ fn read_v2_capabilities(input: &mut impl Read, mode: FetchMode) -> Result<bool> 
             ensure!(fetch && filter, "demand transport lacks object filtering");
             Ok(true)
         }
-        // Native Git can request the advertised ref by name when the peer
-        // supports ref-in-want (for example, across load-balanced replicas).
+        // Native Git can request a ref by name across load-balanced replicas.
+        FetchMode::FilteredSelection {
+            selecting_ref: true,
+        } if fetch && shallow && filter && ref_in_want => Err(RefInWant.into()),
         FetchMode::FilteredSelection { selecting_ref } | FetchMode::Snapshot { selecting_ref } => {
             let filtered = matches!(mode, FetchMode::FilteredSelection { .. });
             Ok(fetch && shallow && (!filtered || filter) && !(selecting_ref && ref_in_want))
@@ -1357,6 +1564,125 @@ fn check_http_end(input: impl Read) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_fetch_forwards_legacy_sections_in_order_and_preserves_the_pack() -> Result<()> {
+        let advertisement = b"000eversion 2\n0019fetch=shallow filter\n00000000";
+        let mut wanted = Vec::new();
+        request_packet(&mut wanted, b"wanted-refs\n")?;
+        request_packet(
+            &mut wanted,
+            b"1111111111111111111111111111111111111111 refs/tags/signed\n",
+        )?;
+        wanted.extend_from_slice(b"0001");
+        let mut shallow = Vec::new();
+        request_packet(&mut shallow, b"shallow-info\n")?;
+        request_packet(
+            &mut shallow,
+            b"shallow 2222222222222222222222222222222222222222\n",
+        )?;
+        shallow.extend_from_slice(b"0001");
+        let pack = b"000dpackfile\n\x01PACK\x00\xff";
+        let correct = [advertisement.as_slice(), &shallow, &wanted, pack].concat();
+        let legacy = [advertisement.as_slice(), &wanted, &shallow, pack].concat();
+        let no_shallow = [advertisement.as_slice(), &wanted, pack].concat();
+        let mut band_wanted = Vec::new();
+        request_packet(&mut band_wanted, b"\x01wanted-refs\n")?;
+        request_packet(
+            &mut band_wanted,
+            b"\x011111111111111111111111111111111111111111 refs/tags/signed\n",
+        )?;
+        band_wanted.extend_from_slice(b"0001");
+        let band_shallow = b"0012\x01shallow-info\n0001";
+        let keepalive = b"0005\x02";
+        let with_keepalive = [
+            advertisement.as_slice(),
+            &band_wanted,
+            keepalive,
+            band_shallow,
+            pack,
+        ]
+        .concat();
+        let reordered_keepalive = [
+            advertisement.as_slice(),
+            keepalive,
+            band_shallow,
+            &band_wanted,
+            pack,
+        ]
+        .concat();
+        let mut large = Vec::new();
+        request_packet(&mut large, b"wanted-refs\n")?;
+        for index in 0..2500 {
+            let name =
+                format!("1111111111111111111111111111111111111111 refs/tags/long-{index:04}\n");
+            request_packet(&mut large, name.as_bytes())?;
+        }
+        large.extend_from_slice(b"0001");
+        let large_legacy = [advertisement.as_slice(), &large, &shallow, pack].concat();
+        let large_correct = [advertisement.as_slice(), &shallow, &large, pack].concat();
+        for (reply, expected) in [
+            (&legacy, &correct),
+            (&correct, &correct),
+            (&no_shallow, &no_shallow),
+            (&with_keepalive, &reordered_keepalive),
+            (&large_legacy, &large_correct),
+        ] {
+            let mut output = Vec::new();
+            forward_shallow_ssh_fetch(BufReader::with_capacity(3, reply.as_slice()), &mut output)?;
+            assert_eq!(&output, expected);
+        }
+        let unfiltered = b"000eversion 2\n0012fetch=shallow\n0000";
+        assert!(!read_v2_capabilities(
+            &mut unfiltered.as_slice(),
+            FetchMode::FilteredSelection {
+                selecting_ref: true
+            },
+        )?);
+        let error = forward_shallow_ssh_fetch(unfiltered.as_slice(), Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("channel lacks object filtering"));
+        for version in [b"".as_slice(), b"000eversion 1\n"] {
+            let mut advertisement = version.to_vec();
+            request_packet(
+                &mut advertisement,
+                b"1111111111111111111111111111111111111111 refs/tags/signed\0shallow filter\n",
+            )?;
+            advertisement.extend_from_slice(b"0000");
+            let mut output = Vec::new();
+            forward_shallow_ssh_fetch(advertisement.as_slice(), &mut output)?;
+            assert_eq!(output, advertisement);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_ssh_fetch_preserves_exit_with_an_inherited_stdout_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let release = directory.path().join("release");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"(while [ ! -e "$1" ]; do sleep 0.02; done) </dev/null & printf '0000'; exit 7"#,
+                "ssh-fixture",
+            ])
+            .arg(&release);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut output = Vec::new();
+                let result = run_shallow_ssh_fetch(command, &mut output);
+                let _ = send.send(result.map(|code| (code, output)));
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+            fs::File::create(&release)?;
+            assert_eq!(
+                result.context("waited for the inherited stdout writer")??,
+                (7, b"0000".to_vec())
+            );
+            Ok(())
+        })
+    }
 
     #[test]
     fn batch_checks_the_exit_after_its_last_response() -> Result<()> {
