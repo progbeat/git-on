@@ -3770,7 +3770,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
             f'export GIT_TRACE_PACKET={shlex.quote(str(packets))}\n'
             f'exec git-upload-pack {shlex.quote(str(f.repo))}\n'
         )
+        # OpenSSH appends a temporary suffix when binding the control socket.
+        runtime = tempfile.TemporaryDirectory(dir='/tmp', prefix='go-ssh-')
+        self.addCleanup(runtime.cleanup)
         env, log = record_git_invocations(f.root, f.env)
+        env['TMPDIR'] = runtime.name
         backend = 'fuse' if OPTIONS.require_fuse else 'nfs'
         explicit_v2 = dict(env, GIT_CONFIG_COUNT='3',
                            GIT_CONFIG_KEY_2='protocol.version', GIT_CONFIG_VALUE_2='2')
@@ -3814,7 +3818,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                     self.assertIn(b'fetch> want-ref refs/tags/', result.stderr)
                     self.assertIn('upload-pack< sideband-all', trace)
                 self.assertEqual([args[-1] for args in calls if 'verify-tag' in args], [tag])
-                assert_no_run_state(self, f.root)
+                assert_no_run_state(self, Path(runtime.name))
 
     def test_mounted_ssh_reuses_native_upload_pack_setup(self):
         if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
