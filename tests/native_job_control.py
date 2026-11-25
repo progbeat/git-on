@@ -13,6 +13,7 @@ import select
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -234,41 +235,57 @@ class NativeJobControlTests(unittest.TestCase):
         self.shell.send(b'\x03')
         self.assert_finished(130)
 
+    def assert_forced_askpass_fails(self, helper, *, materialized=False, compare_native=True):
+        f, shell = self.f, self.shell
+        argv = [shutil.which('env'), '-u', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE=force']
+        if helper is not None:
+            argv.append(f'SSH_ASKPASS={helper}')
+        if compare_native:
+            native = subprocess.run([*argv, 'git', 'ls-remote', self.url, 'HEAD'],
+                                    cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
+            self.assertNotEqual(native.returncode, 0, native.stdout)
+            self.assertIn(b'Permission denied (publickey)', native.stderr)
+        options = ['--verify']
+        if materialized:
+            tools = f.root / 'eager-auth-tools'
+            tools.mkdir()
+            for name in ('git', 'ssh'):
+                (tools / name).symlink_to(shutil.which(name))
+            argv.append(f'PATH={tools}')
+            options.append('--write-policy=all')
+        runner_file = f.root / 'forced-askpass-runner'
+        argv.extend(['/bin/sh', '-c', 'printf "%s" "$$" > "$1"; shift; exec "$@"',
+                     'fixture', str(runner_file), str(remote.OPTIONS.binary), self.url,
+                     'HEAD', *options, '--', '/bin/true'])
+        shell.send((shlex.join(argv) + '; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
+        shell.wait_for(lambda: runner_file.exists() and runner_file.stat().st_size > 0,
+                       'runner did not start')
+        runner = int(runner_file.read_text())
+        shell.groups.add(runner)
+        try:
+            output = shell.expect(shell.prompt, timeout=8)
+        except AssertionError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(runner, signal.SIGTERM)
+            shell.expect(shell.prompt)
+            shell.groups.remove(runner)
+            raise
+        shell.groups.remove(runner)
+        self.assertIn(b'\r\nASKPASS-STATUS:125\r\n', output)
+        self.assertIn(b'Permission denied (publickey)', output)
+        self.assertNotIn(b"identity': ", output)
+        self.assertEqual(remote.run_directories(f.root), [])
+
+    # Each test gets its own listener so failures from another case cannot
+    # make OpenSSH reject a new connection before authentication.
     def test_forced_askpass_failure_does_not_fall_back_to_terminal(self):
-        import subprocess
-        f=self.f;shell=self.shell
-        tools=f.root/'eager-auth-tools';tools.mkdir()
-        for name in ('git','ssh'):(tools/name).symlink_to(shutil.which(name))
-        for helper in ('empty','default'):
-            with self.subTest(helper=helper):
-                env=dict(f.env,SSH_ASKPASS_REQUIRE='force')
-                env.pop('SSH_ASKPASS',None)
-                if helper=='empty':env['SSH_ASKPASS']=''
-                native=subprocess.run(['git','ls-remote',self.url,'HEAD'],env=env,
-                                      capture_output=True,timeout=15)
-                self.assertNotEqual(native.returncode,0,native.stdout)
-                for backend in (('lazy','materialized') if helper=='empty' else ('lazy',)):
-                    runner_file=f.root/f'forced-askpass-{helper}-{backend}'
-                    argv=[shutil.which('env'),'-u','SSH_ASKPASS','SSH_ASKPASS_REQUIRE=force']
-                    if helper=='empty':argv.append('SSH_ASKPASS=')
-                    if backend=='materialized':argv.append('PATH='+str(tools))
-                    argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"',
-                                 'fixture',str(runner_file),str(remote.OPTIONS.binary),self.url,
-                                 'HEAD','--verify',*(['--write-policy=all'] if backend=='materialized' else []),'--','/bin/true'])
-                    shell.send((shlex.join(argv)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
-                    shell.wait_for(runner_file.exists,'runner did not start')
-                    shell.groups.add(int(runner_file.read_text()))
-                    try:output=shell.expect(shell.prompt,timeout=8)
-                    except AssertionError:
-                        with contextlib.suppress(ProcessLookupError):os.killpg(int(runner_file.read_text()),signal.SIGTERM)
-                        shell.expect(shell.prompt)
-                        shell.groups.clear()
-                        raise
-                    shell.groups.clear()
-                    self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
-                    self.assertNotIn(b"identity': ",output)
-                    self.assertEqual(remote.run_directories(f.root),[])
-                    if backend=='materialized':self.assertIn(b'Permission denied',output)
+        self.assert_forced_askpass_fails(None)
+
+    def test_empty_forced_askpass_does_not_fall_back_in_lazy_execution(self):
+        self.assert_forced_askpass_fails('', compare_native=False)
+
+    def test_empty_forced_askpass_does_not_fall_back_in_materialized_execution(self):
+        self.assert_forced_askpass_fails('', materialized=True)
 
 
 class HttpsCredentialTerminalTests(unittest.TestCase):
