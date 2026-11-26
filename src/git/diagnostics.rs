@@ -349,12 +349,9 @@ unsafe impl Send for DiagnosticThread {}
 
 impl DiagnosticThread {
     fn cancel(&self) {
-        let state = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                matches!(state, WAITING | WRITING).then_some(CANCELLED)
-            });
-        if state == Ok(WRITING) {
+        // States advance monotonically. Preserve a completed write.
+        let state = self.state.fetch_max(CANCELLED, Ordering::AcqRel);
+        if state == WRITING {
             unsafe { libc::pthread_cancel(self.handle) };
         }
     }

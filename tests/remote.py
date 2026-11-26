@@ -163,8 +163,8 @@ def exec_fixture_child(argv, cwd, env):
     os._exit(127)
 
 class Fixture:
-    def __init__(self, git_dir=None):
-        self.temp = tempfile.TemporaryDirectory(prefix='git-on-transport-')
+    def __init__(self, git_dir=None, *, temp_parent=None):
+        self.temp = tempfile.TemporaryDirectory(dir=temp_parent, prefix='git-on-transport-')
         self.root = Path(self.temp.name)
         self.repo = self.root / 'server.git'
         self.cwd = self.root / 'outside'
@@ -1464,40 +1464,100 @@ class RemoteTests(unittest.TestCase):
         from filesystem_quota import private_mount_namespace
 
         f = self.f
+        namespace, uid, gid = private_mount_namespace(self)
+        shared_memory = Path('/dev/shm').resolve()
+        fixture_root = f.root.resolve()
+        candidates = (fixture_root, Path('/var/tmp').resolve())
+        disk = next((path for path in candidates
+                     if not path.is_relative_to(shared_memory)
+                     and os.pathsep not in os.fspath(path)
+                     and os.access(path, os.W_OK | os.X_OK)
+                     and run(['stat', '-f', '-c', '%T', path]).strip() != b'tmpfs'), None)
+        if disk is None:
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                self.fail('tmpfs fallback test requires a disk-backed runtime directory')
+            self.skipTest('tmpfs fallback test requires a disk-backed runtime directory')
+        if (f.root != fixture_root or fixture_root.is_relative_to(shared_memory)
+                or os.pathsep in os.fspath(fixture_root)):
+            f = self.f = Fixture(temp_parent=disk)
+            self.addCleanup(f.close)
+        temporary = tempfile.TemporaryDirectory(dir=disk, prefix='go-verify-quota-')
+        self.addCleanup(temporary.cleanup)
+        runtime = Path(temporary.name).resolve()
+        programs = f.root / 'programs'
+        programs.mkdir()
+        binary = OPTIONS.binary
+        if binary.is_relative_to(shared_memory):
+            binary = programs / 'git-on'
+            shutil.copy2(OPTIONS.binary, binary)
         self.signing()
-        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',))
-        env['XDG_RUNTIME_DIR'] = str(f.root)
+        url = f.https()
+        native = shutil.which('git', path=f.env['PATH'])
+        self.assertIsNotNone(native, 'native Git is missing from the fixture PATH')
+        native = Path(native).absolute()
+        resolved_git = native.resolve()
+        native_git = programs / 'git'
+        if resolved_git.is_relative_to(shared_memory):
+            shutil.copy2(resolved_git, native_git)
+        else:
+            native_git.symlink_to(resolved_git)
+        # The recorder uses only the standard library. Its interpreter must
+        # stay visible when the fixture replaces /dev/shm.
+        interpreter = Path(sys.executable).resolve()
+        if interpreter.is_relative_to(shared_memory):
+            system_python = shutil.which('python3', path=os.defpath)
+            interpreter = Path(system_python).resolve() if system_python else None
+            if interpreter is None or interpreter.is_relative_to(shared_memory):
+                reason = 'no system Python interpreter outside /dev/shm'
+                if os.environ.get('GITHUB_ACTIONS') == 'true':
+                    self.fail(reason)
+                self.skipTest(reason)
+        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',),
+                                          interpreter=interpreter, native=native,
+                                          native_fallback=native_git)
+        env.update(TMPDIR=str(runtime), XDG_RUNTIME_DIR=str(runtime),
+                   GIT_CEILING_DIRECTORIES=str(f.root))
         keys = ('PATH', 'TMPDIR', 'XDG_RUNTIME_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
+                'GIT_SSL_CAINFO', 'GIT_CEILING_DIRECTORIES',
                 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
                 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1')
         settings = [f'{key}={env[key]}' for key in keys]
-        namespace, uid, gid = private_mount_namespace(self)
         run_on_tmpfs = """
 mount -t tmpfs -o "$1" tmpfs /dev/shm
 uid=$2 gid=$3
 shift 3
 if [ "$uid" -ne 0 ]; then
-    exec setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
+    set -- setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
 fi
-exec "$@"
+timeout --kill-after=3s 18s "$@"
+entries=$(ls -A /dev/shm)
+if [ -n "$entries" ]; then
+    printf 'files remain in private /dev/shm: %s\n' "$entries" >&2
+    exit 1
+fi
 """
-        for options in ('size=1m,nr_inodes=2', 'size=4k'):
+        quotas = (('size=4m', True), ('size=1m,nr_inodes=2', False), ('size=4k', False))
+        for options, expect_tmpfs in quotas:
             with self.subTest(options=options):
                 log.write_text('')
                 result = subprocess.run(
                     [*namespace, 'sh', '-ec', run_on_tmpfs,
-                     'verify-quota', options, str(uid), str(gid), 'env', *settings, OPTIONS.binary,
-                     f.https(), 'signed', '--verify', '--backend=copy',
+                     'verify-quota', options, str(uid), str(gid), 'env', *settings, binary,
+                     url, 'signed', '--verify', '--backend=copy',
                      '--write-policy=all', '--', 'cat', 'deep/file'],
-                    cwd=f.cwd, env=env, capture_output=True, timeout=25,
+                    cwd=f.cwd, env=env, capture_output=True, timeout=30,
                 )
                 self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
                 calls = git_invocations(log)
                 self.assertFalse([call for call in calls if 'fetch' in call['argv']], calls)
                 objects, = [Path(call['env']['GIT_OBJECT_DIRECTORY'])
                             for call in calls if 'verify-tag' in call['argv']]
-                self.assertTrue(objects.resolve().is_relative_to(f.root.resolve()))
-                self.assertFalse(objects.exists())
+                self.assertTrue(objects.parent.name.startswith('verify-'), objects)
+                if expect_tmpfs:
+                    self.assertTrue(objects.is_relative_to(shared_memory), objects)
+                else:
+                    self.assertEqual(objects.parents[2], runtime / 'git-on')
+                self.assertEqual(list(runtime.iterdir()), [])
                 assert_no_run_state(self, f.root)
 
     def test_review_peeled_tag_advertisement_rows_are_not_selectable_refs(self):
