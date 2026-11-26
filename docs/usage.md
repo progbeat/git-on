@@ -169,6 +169,9 @@ and the visible checkout in `copy` mode.
 
 ### Temporary storage
 
+SSH uses a Unix control socket under `TMPDIR`. On macOS, use a short path
+such as `/tmp` if OpenSSH reports `ControlPath too long`.
+
 Git-on creates a private service directory on demand for verification,
 local index resolution, credentials, and transport diagnostics. It chooses
 an existing writable `tmpfs` among `/dev/shm`, `XDG_RUNTIME_DIR`, and the

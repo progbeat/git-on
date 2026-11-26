@@ -3,6 +3,7 @@ use crate::{
     git::Git,
     raw_blob::{ReceivedObject, Transfer},
     service_storage::Directory,
+    snapshot::Preparation,
     transport,
 };
 use anyhow::{bail, Context, Result};
@@ -210,13 +211,14 @@ pub(crate) struct NetworkSource {
 }
 
 pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, verify: bool) -> Result<Source> {
+    let cwd = std::path::absolute(cwd).context("resolve the Git invocation directory")?;
     // Capture effective configuration first: even `git --version` can read
     // it. Preserve the first native operation's cancellation/TTY lifecycle.
     // Config includes use the caller's context for network verification.
     let git = if verify {
-        Git::capture(cwd)
+        Git::capture(&cwd)
     } else {
-        Git::capture_configuration(cwd)
+        Git::capture_configuration(&cwd)
     }
     .map_err(|error| {
         if error.chain().any(|cause| {
@@ -229,6 +231,10 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, verify: bool) -> Result
             error
         }
     })?;
+    anyhow::ensure!(
+        !git.has_remote_helper(source),
+        "external Git remote helpers are outside the direct transport profile"
+    );
     // Resolve named remotes and Git's URL rewrites before choosing a transport.
     let mut url = git.output(
         None,
@@ -247,24 +253,39 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, verify: bool) -> Result
             .iter()
             .position(|&byte| byte == b'/')
             .context("file URL requires an absolute repository path")?;
-        return Ok(Source::Local(decode_file_path(&file[start..])?));
+        return local_source(&git, &decode_file_path(&file[start..])?);
     }
     let text = String::from_utf8_lossy(&url);
     let separator = text
         .split_once(':')
         .filter(|(prefix, _)| !prefix.contains('/'));
-    if separator.is_none() {
+    let explicit_transport = separator.is_some_and(|(prefix, tail)| {
+        let mut name = prefix.bytes();
+        let scheme = name.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && name.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'));
+        // Git recognizes a helper URL even when the helper name is empty.
+        tail.starts_with(':') && (scheme || prefix.is_empty())
+            || tail.starts_with("//") && scheme
+            || prefix == "rsync"
+    });
+    let ssh_shorthand = separator.is_some() && !explicit_transport;
+    let path = OsStr::from_bytes(&url);
+    if separator.is_none() || ssh_shorthand && git.cwd.join(path).is_dir() {
         anyhow::ensure!(!url.is_empty(), "missing local repository path");
-        return Ok(Source::Local(cwd.join(OsStr::from_bytes(&url))));
+        let expanded;
+        let path = if url.starts_with(b"~") {
+            expanded = git.expand_config_path(path)?;
+            expanded.as_os_str()
+        } else {
+            path
+        };
+        return local_source(&git, Path::new(path));
     }
     anyhow::ensure!(
         !git.has_multiple_group_members(source),
         "select one remote; remote groups are outside the direct transport profile"
     );
-    let ssh = text.starts_with("ssh://")
-        || separator.is_some_and(|(prefix, tail)| {
-            !tail.starts_with("//") && (!tail.starts_with(':') || prefix.contains('['))
-        });
+    let ssh = text.starts_with("ssh://") || ssh_shorthand;
     anyhow::ensure!(
         ssh || text.starts_with("https://"),
         "remote transport must be direct HTTPS or OpenSSH"
@@ -275,6 +296,68 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, verify: bool) -> Result
         url: OsString::from_vec(url),
         ssh,
     }))
+}
+
+fn local_source(git: &Git, path: &Path) -> Result<Source> {
+    // Git strips trailing separators even when the target is a gitfile.
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(bytes.len().min(1), |index| index + 1);
+    let path = git.cwd.join(OsStr::from_bytes(&bytes[..end]));
+    if path.is_file() {
+        return resolve_git_directory(git, &path).map(Source::Local);
+    }
+    let with_git_suffix = path
+        .file_name()
+        .map(|name| {
+            let mut name = name.to_os_string();
+            name.push(".git");
+            path.with_file_name(name)
+        })
+        .filter(|candidate| candidate.exists());
+    let is_directory = path.is_dir();
+    // Prefer normal Git discovery in the explicitly supplied directory.
+    if is_directory && (with_git_suffix.is_none() || git.discovers_repository_at(&path)?) {
+        return Ok(Source::Local(path));
+    }
+    if let Some(candidate) = with_git_suffix {
+        if candidate.is_file() {
+            return resolve_git_directory(git, &candidate).map(Source::Local);
+        }
+        if candidate.is_dir() {
+            // A guessed suffix must identify the repository itself. Do not
+            // follow normal worktree discovery back into its parent.
+            let dot_git = candidate.join(".git");
+            if dot_git.exists() && resolve_git_directory(git, &dot_git).is_ok()
+                || resolve_git_directory(git, &candidate).is_ok()
+            {
+                return Ok(Source::Local(candidate));
+            }
+        }
+    }
+    anyhow::ensure!(
+        is_directory,
+        "local repository path is unavailable: {}",
+        path.display()
+    );
+    Ok(Source::Local(path))
+}
+
+fn resolve_git_directory(git: &Git, path: &Path) -> Result<PathBuf> {
+    let mut directory = git.output(
+        None,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--resolve-git-dir"),
+            path.as_os_str(),
+        ],
+    )?;
+    if directory.last() == Some(&b'\n') {
+        directory.pop();
+    }
+    Ok(git.cwd.join(OsString::from_vec(directory)))
 }
 
 fn decode_file_path(encoded: &[u8]) -> Result<PathBuf> {
@@ -312,13 +395,13 @@ impl Remote {
         let Source::Network(source) = resolve_source(cwd, source, false)? else {
             bail!("local repositories are loaded by Snapshot::load_source");
         };
-        Self::open_for_execution(source, revision, run, false)
+        Self::open_for_execution(source, revision, run, Preparation::MountOrCopy)
     }
     pub(crate) fn open_for_execution(
         source: NetworkSource,
         revision: &OsStr,
         run: &Path,
-        materialized: bool,
+        preparation: Preparation,
     ) -> Result<(Self, Oid)> {
         let run = std::path::absolute(run).context("resolve private run directory")?;
         let run = run.as_path();
@@ -375,6 +458,9 @@ impl Remote {
             .transpose()?;
         let raw_blobs = crate::raw_blob::RawBlobs::new(run)?;
         let pack_verification = crate::demand::PackVerification::new(&raw_blobs);
+        if preparation == Preparation::Mount {
+            pack_verification.preparing_mount();
+        }
         let mut remote = Self {
             git: Arc::new(git),
             native_git_version,
@@ -399,7 +485,7 @@ impl Remote {
             eager_pack_received: false,
             raw_blobs,
         };
-        let oid = remote.select_network(revision, materialized)?;
+        let oid = remote.select_network(revision, preparation == Preparation::Copy)?;
         Ok((remote, oid))
     }
 
@@ -866,7 +952,14 @@ impl Remote {
         // Warm spare channels alongside a slow selection. A fast handshake
         // can still be followed by a slow pack, so measure that request too.
         let warm = (spare.is_some() || started.elapsed() >= SSH_WARM_DELAY)
-            .then(|| crate::demand::Pool::prepare_native(&connection, &self.raw_blobs, true, spare))
+            .then(|| {
+                crate::demand::Pool::prepare_native(
+                    &connection,
+                    &self.raw_blobs,
+                    crate::demand::SSH_WARM_SPARES,
+                    spare,
+                )
+            })
             .transpose()?;
         let mut first = session;
         let fetching = Instant::now();
@@ -876,7 +969,8 @@ impl Remote {
             None => crate::demand::Pool::prepare_native(
                 &connection,
                 &self.raw_blobs,
-                fetching.elapsed() >= crate::demand::SLOW_REPLY,
+                crate::demand::SSH_WARM_SPARES
+                    * usize::from(fetching.elapsed() >= crate::demand::SLOW_REPLY),
                 None,
             )?,
         };

@@ -75,6 +75,57 @@ impl Git {
         })
     }
 
+    pub(crate) fn expand_config_path(&self, path: &OsStr) -> Result<OsString> {
+        let mut setting = OsString::from("git-on.sourcePath=");
+        setting.push(path);
+        let mut command = self.command(None);
+        command
+            .env_remove("GIT_CONFIG")
+            .arg("-c")
+            .arg(setting)
+            .args([
+                "config",
+                "--null",
+                "--type=path",
+                "--get",
+                "git-on.sourcePath",
+            ])
+            .stdin(Stdio::null());
+        let output = run_builtin(command).map_err(native_git_error)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "cannot expand local repository path {:?}: {}",
+            path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let mut expanded = output.stdout;
+        anyhow::ensure!(expanded.pop() == Some(0), "Git returned an invalid path");
+        Ok(OsString::from_vec(expanded))
+    }
+
+    pub(crate) fn discovers_repository_at(&self, path: &Path) -> Result<bool> {
+        let mut command = self.command(None);
+        command
+            .current_dir(path)
+            .env("LC_ALL", "C")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .stdin(Stdio::null());
+        let output = run_builtin(command).map_err(native_git_error)?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        anyhow::ensure!(
+            output
+                .stderr
+                .split(|&byte| byte == b'\n')
+                .any(|line| line.starts_with(b"fatal: not a git repository")),
+            "Git repository discovery at {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(false)
+    }
+
     pub(crate) fn capture_snapshot(cwd: &Path, revision: &OsStr) -> Result<(Self, Oid)> {
         let mut git = Self {
             cwd: cwd.to_path_buf(),
@@ -187,7 +238,7 @@ impl Git {
             let key = key.as_bytes();
             matches!(
                 selected_remote_option(key, source),
-                Some(b"uploadpack" | b"vcs" | b"serveroption")
+                Some(b"uploadpack" | b"serveroption")
             ) || key.starts_with(b"fsck.")
                 || key == b"fetch.fsckobjects"
                 || key == b"transfer.fsckobjects"
@@ -287,6 +338,12 @@ impl Git {
             .filter(|member| !member.is_empty())
             .nth(1)
             .is_some()
+    }
+
+    pub(crate) fn has_remote_helper(&self, source: &OsStr) -> bool {
+        self.config
+            .iter()
+            .any(|(key, _)| selected_remote_option(key.as_bytes(), source) == Some(b"vcs"))
     }
 
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {

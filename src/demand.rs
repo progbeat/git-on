@@ -20,6 +20,7 @@ use std::{
 
 const CONNECTIONS: usize = 16;
 const INITIAL_CONNECTIONS: usize = 4;
+pub(crate) const SSH_WARM_SPARES: usize = 2;
 const MAX_WANTS: usize = 64;
 const READ_AHEAD: usize = 4;
 const MAX_READ_AHEAD: usize = 256;
@@ -170,6 +171,7 @@ struct QueuedDemand {
     demand: Demand,
     queued_at: Instant,
     prefetch_width: usize,
+    request_alone: bool,
 }
 
 struct Work {
@@ -211,9 +213,7 @@ impl Work {
                 break item;
             }
         };
-        // A filtered response can omit a wanted tree or blob when another
-        // wanted tree contains it. Batch blobs and send each tree on its own.
-        let limit = if first.demand.is_tree() {
+        let limit = if first.request_alone {
             1
         } else if speculative {
             first.prefetch_width
@@ -221,21 +221,24 @@ impl Work {
             MAX_WANTS
         };
         let mut items = Vec::with_capacity((queue.len() + 1).min(limit));
-        let mut trees = Vec::new();
+        let mut deferred = Vec::new();
+        let wants_tree = first.demand.is_tree();
         items.push(first);
         while items.len() < limit {
             let Some(item) = queue.pop_front() else { break };
             if item.demand.ready() {
                 continue;
             }
-            if item.demand.is_tree() {
-                trees.push(item);
+            // Tree replies can unblock further path lookups. Keep them in
+            // their own pack so a large blob cannot delay those lookups.
+            if item.request_alone || item.demand.is_tree() != wants_tree {
+                deferred.push(item);
             } else {
                 items.push(item);
             }
         }
-        for tree in trees.into_iter().rev() {
-            queue.push_front(tree);
+        for item in deferred.into_iter().rev() {
+            queue.push_front(item);
         }
         let readers = items
             .iter()
@@ -264,6 +267,20 @@ impl Work {
             transfer: self.transfer.clone(),
             speculative: self.speculative,
         }
+    }
+
+    fn completed_pack(&self, omitted: &[Oid]) -> ActivePack {
+        let mut pack = self.active_pack();
+        if !omitted.is_empty() {
+            // A later retry can complete these same flights on another lane.
+            pack.readers = self
+                .readers
+                .iter()
+                .filter(|(oid, _)| !omitted.contains(oid))
+                .cloned()
+                .collect();
+        }
+        pack
     }
 }
 
@@ -336,6 +353,7 @@ impl ConnectionMode {
 enum MountReads {
     #[default]
     Preparing,
+    PreparingMount,
     Lookup,
     Enumeration,
 }
@@ -405,6 +423,7 @@ impl Queue {
             demand,
             queued_at: Instant::now(),
             prefetch_width: READ_AHEAD,
+            request_alone: false,
         }
     }
 
@@ -615,32 +634,34 @@ impl Queue {
             }
             // A new channel can take several round trips. Keep the queued
             // objects available while an already open channel might free up.
-            self.opening_ssh = Some(SshOpenAttempt {
-                speculative,
-                pending_standbys: if reconnecting {
-                    self.pending_standbys()
-                } else {
-                    0
-                },
-            });
-            NativeWork::Connect
+            return Some(self.open_ssh(index, speculative, reconnecting));
         } else {
             let work = Work::take(pending, speculative)?;
-            // A slow lookup can send EOF with the fetch and overlap SSH
-            // exit with the response. A tree lookup needs a second spare
-            // so the file can still use this path after more lookups.
-            let last_request = self.mount_reads == MountReads::Lookup
+            // Close a channel with its fetch when another is ready. During
+            // initial sparse lookups, a tree can use the last spare and ask
+            // for a replacement while that ready channel serves more reads.
+            let tree = work.items[0].demand.is_tree();
+            let preparing_root = self.mount_reads == MountReads::PreparingMount && tree;
+            let sparse = self.mount_reads == MountReads::Lookup
+                && !self.dense()
+                && matches!(self.mode, ConnectionMode::Probing(1..));
+            let spares = if (preparing_root || sparse)
                 && ready_ssh
                 && !speculative
-                && !self.dense()
-                && matches!(self.mode, ConnectionMode::Probing(1..))
                 && work.items.len() == 1
                 && self.waiting.iter().all(|item| item.demand.ready())
                 && self.ahead.is_empty()
-                && self
-                    .idle_ssh_channels(index, ready_channels)
-                    .nth(usize::from(work.items[0].demand.is_tree()))
-                    .is_some();
+            {
+                self.idle_ssh_channels(index, ready_channels)
+                    .take(2)
+                    .count()
+            } else {
+                0
+            };
+            let replenish =
+                sparse && tree && spares == 1 && self.initial_channels == 1 + SSH_WARM_SPARES;
+            let required_spares = if tree { 2 } else { 1 };
+            let last_request = spares >= required_spares || replenish;
             if last_request {
                 // Claim the lease under the queue lock. Concurrent requests
                 // must see this channel as spent before another can close.
@@ -650,10 +671,24 @@ impl Queue {
                 work,
                 failure: self.failure.clone(),
                 last_request,
+                replenish,
             }
         };
         self.busy[index] = true;
         Some(work)
+    }
+
+    fn open_ssh(&mut self, index: usize, speculative: bool, reconnecting: bool) -> NativeWork {
+        self.opening_ssh = Some(SshOpenAttempt {
+            speculative,
+            pending_standbys: if reconnecting {
+                self.pending_standbys()
+            } else {
+                0
+            },
+        });
+        self.busy[index] = true;
+        NativeWork::Connect
     }
 
     fn idle_ssh_channels(&self, index: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
@@ -836,6 +871,7 @@ enum NativeWork {
         work: Work,
         failure: Option<String>,
         last_request: bool,
+        replenish: bool,
     },
     Snapshot(SnapshotRequest, Option<String>),
 }
@@ -883,6 +919,10 @@ impl PackVerification {
 
     pub(crate) fn mounted(&self) {
         self.advance_mount_reads(MountReads::Lookup);
+    }
+
+    pub(crate) fn preparing_mount(&self) {
+        self.advance_mount_reads(MountReads::PreparingMount);
     }
 
     pub(crate) fn enumerating(&self) {
@@ -952,7 +992,7 @@ impl Pool {
     pub(crate) fn prepare_native(
         connection: &Connection,
         scratch: &RawBlobs,
-        warm_ssh: bool,
+        warm_ssh: usize,
         mut started_spare: Option<crate::transport::StartingSession>,
     ) -> Result<Self> {
         let mut pool = Self {
@@ -963,13 +1003,13 @@ impl Pool {
             ssh_snapshot: None,
         };
         {
-            let initial = if warm_ssh { 3 } else { 1 };
+            let initial = 1 + warm_ssh;
             let mut queue = pool.shared.queue.lock().unwrap();
             queue.initial_channels = initial;
             queue.starting[1..initial].fill(true);
         }
         for index in 1..CONNECTIONS {
-            let channel = if warm_ssh && index <= 2 {
+            let channel = if index <= warm_ssh {
                 InitialChannel::Standby(started_spare.take())
             } else {
                 InitialChannel::OnDemand
@@ -1353,6 +1393,9 @@ impl Shared {
                 }
             }),
         );
+        if work.items.len() > 1 && work.items.iter().any(|item| item.demand.is_tree()) {
+            response.allow_omitted_wants();
+        }
         let shared = self.clone();
         let extras = work.extras.clone();
         response.on_pending_extra(move |oid| shared.join_pack_extra(&extras, oid));
@@ -1423,6 +1466,7 @@ impl Shared {
                 self.prefetches.fetch_add(1, Ordering::Relaxed);
             }
             self.streamed_packs.fetch_add(1, Ordering::Relaxed);
+            pack.omitted
         });
 
         if let Some(index) = lane {
@@ -1461,9 +1505,25 @@ impl Shared {
             false
         });
         let result = match result {
-            Ok(()) => {
+            Ok(omitted) => {
                 queue.mode.record_reply(started.elapsed());
-                None
+                if work.items.is_empty() {
+                    None
+                } else if self.stop.load(Ordering::Relaxed) || queue.ssh_exit_checks.is_some() {
+                    Some(Err(object::OperationCancelled.into()))
+                } else if work.items.iter().all(|item| omitted.contains(&item.oid)) {
+                    for mut item in work.items {
+                        item.request_alone = true;
+                        queue.retry(item, false);
+                    }
+                    self.work.notify_all();
+                    return;
+                } else {
+                    let error =
+                        anyhow::anyhow!("verified Git response did not publish its requests");
+                    queue.failure.get_or_insert_with(|| error.to_string());
+                    Some(Err(error))
+                }
             }
             Err(error)
                 if !required
@@ -1666,6 +1726,9 @@ impl Shared {
         snapshots: Option<mpsc::Receiver<SnapshotRequest>>,
     ) -> Result<()> {
         let ssh = connection.is_ssh();
+        #[cfg(feature = "test-metrics")]
+        let await_startup_spares =
+            ssh && std::env::var("GIT_ON_TEST_WAIT_SSH_SPARES").as_deref() == Ok("1");
         let mut session = match channel {
             InitialChannel::Ready(session) => Some(session),
             InitialChannel::OnDemand => None,
@@ -1692,6 +1755,7 @@ impl Shared {
         let mut used = session.as_ref().is_some_and(Session::completed_fetch);
         let mut completed = Vec::<ActivePack>::new();
         let mut sent_shutdown_eof = false;
+        let mut replenish_spare = false;
         if let Some(session) = session.as_mut().filter(|_| ssh) {
             session.close_input_after_command(self.finishing_used_packs.clone());
         }
@@ -1738,8 +1802,23 @@ impl Shared {
                         queue = self.work.wait(queue).unwrap();
                         continue;
                     }
+                    #[cfg(feature = "test-metrics")]
+                    if await_startup_spares
+                        && queue.mount_reads < MountReads::Lookup
+                        && queue.starting.contains(&true)
+                    {
+                        queue = self.work.wait(queue).unwrap();
+                        continue;
+                    }
                     if let Some(request) = snapshots.as_ref().and_then(|r| r.try_recv().ok()) {
                         break NativeWork::Snapshot(request, queue.failure.clone());
+                    }
+                    if std::mem::take(&mut replenish_spare)
+                        && queue.mount_reads == MountReads::Lookup
+                        && queue.failure.is_none()
+                        && queue.opening_ssh.is_none()
+                    {
+                        break queue.open_ssh(index, true, true);
                     }
                     if let Some(delay) =
                         queue.batch_wait(Instant::now(), queue.busy.contains(&true))
@@ -1754,12 +1833,13 @@ impl Shared {
                 }
             };
             self.work.notify_all();
-            let (work, failure, last_request) = match next {
+            let (work, failure, last_request, replenish) = match next {
                 NativeWork::Fetch {
                     work,
                     failure,
                     last_request,
-                } => (work, failure, last_request),
+                    replenish,
+                } => (work, failure, last_request, replenish),
                 NativeWork::Snapshot(request, failure) => {
                     let received = (|| {
                         if let Some(error) = failure {
@@ -1866,34 +1946,40 @@ impl Shared {
                     }
                 })
             };
-            if let Err(error) = &result {
-                let mut queue = self.queue.lock().unwrap();
-                if ssh && queue.ssh_channels[index].is_ready() {
-                    queue.ssh_channels[index] = SshChannel::Spent;
-                }
-                if error.is::<crate::transport::FailedTransportExit>()
-                    || error.is::<crate::transport::FailedTransportCompletion>()
-                        && !object::is_cancelled(error)
-                {
-                    queue.record_channel_failure(used, &mut completed, error, scratch);
-                }
-                drop(queue);
-                // fetch_stream reaps a channel with an incomplete response.
-                session = None;
-                used = false;
-                completed.clear();
-            } else if last_request {
-                used = false;
-                completed.clear();
-            } else if !used {
-                let pack = work.active_pack();
-                if pack.supplied_data(scratch) {
-                    used = true;
+            match &result {
+                Err(error) => {
+                    let mut queue = self.queue.lock().unwrap();
+                    if ssh && queue.ssh_channels[index].is_ready() {
+                        queue.ssh_channels[index] = SshChannel::Spent;
+                    }
+                    if error.is::<crate::transport::FailedTransportExit>()
+                        || error.is::<crate::transport::FailedTransportCompletion>()
+                            && !object::is_cancelled(error)
+                    {
+                        queue.record_channel_failure(used, &mut completed, error, scratch);
+                    }
+                    drop(queue);
+                    // fetch_stream reaps a channel with an incomplete response.
+                    session = None;
+                    used = false;
                     completed.clear();
-                } else {
-                    completed.push(pack);
                 }
+                Ok(_) if last_request => {
+                    used = false;
+                    completed.clear();
+                }
+                Ok(received) if !used => {
+                    let pack = work.completed_pack(&received.omitted);
+                    if pack.supplied_data(scratch) {
+                        used = true;
+                        completed.clear();
+                    } else {
+                        completed.push(pack);
+                    }
+                }
+                Ok(_) => (),
             }
+            replenish_spare = replenish && result.is_ok();
             self.finish(work, result, started, Some(index), scratch);
         }
     }
@@ -2259,25 +2345,20 @@ mod tests {
     }
 
     fn pack_reply(entries: &[(git2::ObjectType, &[u8])], complete: bool) -> Vec<u8> {
+        pack_entries(
+            entries
+                .iter()
+                .map(|(kind, data)| pack_stream::pack_entry(*kind as u8, &[], data)),
+            complete,
+        )
+    }
+
+    fn pack_entries(entries: impl ExactSizeIterator<Item = Vec<u8>>, complete: bool) -> Vec<u8> {
         use sha1_checked::Digest;
 
         let mut pack = b"PACK\0\0\0\x02".to_vec();
         pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-        for (kind, data) in entries {
-            let mut size = data.len();
-            let mut header = (*kind as u8) << 4 | (size & 15) as u8;
-            size >>= 4;
-            while size != 0 {
-                pack.push(header | 0x80);
-                header = (size & 0x7f) as u8;
-                size >>= 7;
-            }
-            pack.push(header);
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(&mut pack, flate2::Compression::fast());
-            encoder.write_all(data).unwrap();
-            encoder.finish().unwrap();
-        }
+        pack.extend(entries.flatten());
         if complete {
             let checksum = sha1_checked::Sha1::digest(&pack);
             pack.extend_from_slice(&checksum);
@@ -2875,7 +2956,7 @@ mod tests {
         let mut idle = Session::connect(command)?.context("idle SSH fixture must negotiate")?;
         let response = pack_stream::Response::new(cache.clone(), vec![oid], Box::new(|_| Ok(())));
         idle.fetch_stream(&[oid], crate::transport::FetchMode::Filtered, response)?;
-        let mut pool = Pool::prepare_native(&connection, &cache, false, None)?;
+        let mut pool = Pool::prepare_native(&connection, &cache, 0, None)?;
         pool.attach_primary(idle, connection)?;
 
         let pending = b"served, trailer still pending";
@@ -3093,6 +3174,23 @@ mod tests {
             .spawn()
             .unwrap();
         let ready = SshChannel::Ready(candidate.id());
+        for (phase, spares, can_close) in [
+            (MountReads::Preparing, 2, false),
+            (MountReads::PreparingMount, 1, false),
+            (MountReads::PreparingMount, 2, true),
+        ] {
+            let mut preparing = Queue {
+                mount_reads: phase,
+                ..Queue::default()
+            };
+            preparing.ssh_channels[..=spares].fill(ready);
+            let root = preparing.foreground(Oid::from_bytes(&[7; 20]).unwrap());
+            root.0.is_tree.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                preparing.native_work(0, false),
+                Some(NativeWork::Fetch { last_request, replenish: false, .. }) if last_request == can_close
+            ));
+        }
         let mut queue = Queue {
             mode: ConnectionMode::Probing(1),
             mount_reads: MountReads::Lookup,
@@ -3154,6 +3252,25 @@ mod tests {
                 ..
             })
         ));
+
+        let mut sparse = Queue {
+            mode: ConnectionMode::Probing(1),
+            mount_reads: MountReads::Lookup,
+            initial_channels: 1 + SSH_WARM_SPARES,
+            ..Queue::default()
+        };
+        sparse.ssh_channels[..2].fill(ready);
+        let ancestor = sparse.foreground(Oid::from_bytes(&[6; 20]).unwrap());
+        ancestor.0.is_tree.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            sparse.native_work(0, false),
+            Some(NativeWork::Fetch {
+                last_request: true,
+                replenish: true,
+                ..
+            })
+        ));
+        assert!(sparse.ssh_channels[1].is_ready());
         drop(candidate.stdin.take());
         assert!(candidate.wait().unwrap().success());
     }
@@ -3448,7 +3565,7 @@ mod tests {
     }
 
     #[test]
-    fn required_http2_trees_skip_batching_delay_and_use_individual_packs() {
+    fn ready_tree_demands_are_grouped_without_waiting_for_blobs() {
         let directory = tempfile::tempdir().unwrap();
         let pool = Pool {
             shared: Arc::default(),
@@ -3490,7 +3607,117 @@ mod tests {
             std::iter::from_fn(|| Work::take(&mut queue.waiting, false).map(|work| work.wants()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(packs, [vec![tree], blobs.to_vec(), vec![child]]);
+        assert_eq!(packs, [vec![tree, child], blobs.to_vec()]);
+    }
+
+    #[test]
+    fn tree_pack_retries_omitted_descendant_without_changing_channel_attribution() -> Result<()> {
+        use git2::ObjectType::{Blob, Tree};
+        use pack_stream::pack_entry;
+
+        let directory = tempfile::tempdir()?;
+        let cache = RawBlobs::new(directory.path())?;
+        let shared = Arc::<Shared>::default();
+        let child = Oid::hash_object(Tree, b"")?;
+        let parent_data = [b"40000 child\0".as_slice(), child.as_bytes()].concat();
+        let parent = Oid::hash_object(Tree, &parent_data)?;
+        let other = Oid::hash_object(Blob, b"alternate")?;
+        let wanted_data = [b"100644 file\0".as_slice(), other.as_bytes()].concat();
+        let base_data = [b"100644 base\0".as_slice(), other.as_bytes()].concat();
+        let wanted = Oid::hash_object(Tree, &wanted_data)?;
+        let base = Oid::hash_object(Tree, &base_data)?;
+        let (work, alternate, child_read) = {
+            let mut queue = shared.queue.lock().unwrap();
+            queue
+                .foreground(parent)
+                .0
+                .is_tree
+                .store(true, Ordering::Relaxed);
+            queue.foreground(other);
+            let child_read = queue.foreground(child);
+            child_read.0.is_tree.store(true, Ordering::Relaxed);
+            queue
+                .foreground(wanted)
+                .0
+                .is_tree
+                .store(true, Ordering::Relaxed);
+            let Some(NativeWork::Fetch { work, .. }) = queue.native_work(0, false) else {
+                bail!("expected a foreground tree request");
+            };
+            let alternate = Work::take(&mut queue.waiting, false).unwrap();
+            (work, alternate, child_read)
+        };
+        assert_eq!(work.wants(), [parent, child, wanted]);
+        assert_eq!(alternate.wants(), [other]);
+
+        // The second lane's verified extras satisfy the included wants first.
+        let mut response = shared.response(&alternate, &[other], &cache);
+        response.write_http(&pack_reply(
+            &[
+                (Blob, b"alternate"),
+                (Tree, &parent_data),
+                (Tree, &wanted_data),
+            ],
+            true,
+        ))?;
+        shared.finish(
+            alternate,
+            response.finish_http(),
+            Instant::now(),
+            Some(1),
+            &cache,
+        );
+        // Three entries for three wants. The base is a fourth OID and is
+        // required to inflate the requested tree. The child tree is omitted.
+        let size = u8::try_from(wanted_data.len())?;
+        let delta = [[size, size, size].as_slice(), wanted_data.as_slice()].concat();
+        let mut response = shared.response(&work, &work.wants(), &cache);
+        response.write_http(&pack_entries(
+            [
+                pack_entry(2, &[], &parent_data),
+                pack_entry(7, base.as_bytes(), &delta),
+                pack_entry(2, &[], &base_data),
+            ]
+            .into_iter(),
+            true,
+        ))?;
+        let pack = response.finish_http()?;
+        assert_eq!(pack.omitted, [child]);
+        let original = work.completed_pack(&pack.omitted);
+        shared.finish(work, Ok(pack), Instant::now(), Some(0), &cache);
+        assert!(!child_read.ready());
+
+        let retried = {
+            let mut queue = shared.queue.lock().unwrap();
+            queue
+                .foreground(base)
+                .0
+                .is_tree
+                .store(true, Ordering::Relaxed);
+            queue.ssh_channels[0] = SshChannel::Spent;
+            queue.ssh_channels[1] = SshChannel::Ready(1);
+            let Some(NativeWork::Fetch { work, .. }) = queue.native_work(1, false) else {
+                bail!("expected a foreground singleton retry");
+            };
+            work
+        };
+        assert_eq!(retried.wants(), [child]);
+        let mut response = shared.response(&retried, &[child], &cache);
+        response.write_http(&pack_reply(&[(Tree, b"")], true))?;
+        shared.finish(
+            retried,
+            response.finish_http(),
+            Instant::now(),
+            Some(1),
+            &cache,
+        );
+        assert!(child_read.delivered());
+
+        let mut queue = shared.queue.lock().unwrap();
+        let error = anyhow::anyhow!("unused SSH channel exit failed");
+        queue.record_channel_failure(false, &mut vec![original], &error, &cache);
+        assert!(queue.recorded_failure().is_none());
+        Ok(())
     }
 
     #[test]
@@ -3502,6 +3729,7 @@ mod tests {
             demand: Demand::default(),
             queued_at: now,
             prefetch_width: READ_AHEAD,
+            request_alone: false,
         });
         assert_eq!(queue.batch_wait(now, true), None);
         queue.mode = ConnectionMode::Wide;
@@ -3515,6 +3743,7 @@ mod tests {
                 demand: Demand::default(),
                 queued_at: now,
                 prefetch_width: READ_AHEAD,
+                request_alone: false,
             });
         }
         assert_eq!(queue.batch_wait(now, true), None);

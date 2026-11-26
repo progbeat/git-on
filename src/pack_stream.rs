@@ -56,6 +56,7 @@ type PendingExtra = Box<dyn FnMut(Oid) + Send>;
 pub(crate) struct Received {
     pub(crate) bytes: u64,
     pub(crate) eager_verified_capacity: usize,
+    pub(crate) omitted: Vec<Oid>,
     extras: Vec<VerifiedObject>,
 }
 
@@ -114,6 +115,7 @@ impl<'a> Response<'a> {
                 count: None,
                 entries: 0,
                 entry: None,
+                allow_omitted: false,
                 accepts_surplus: false,
                 bases: None,
             },
@@ -144,6 +146,10 @@ impl<'a> Response<'a> {
 
     pub(crate) fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
         self.pack.stop = stop;
+    }
+
+    pub(crate) fn allow_omitted_wants(&mut self) {
+        self.pack.allow_omitted = true;
     }
 
     pub(crate) fn set_decode_priority(
@@ -323,6 +329,7 @@ struct Pack<'a> {
     count: Option<usize>,
     entries: usize,
     entry: Option<Entry>,
+    allow_omitted: bool,
     accepts_surplus: bool,
     bases: Option<PackBases>,
 }
@@ -593,9 +600,11 @@ impl Pack<'_> {
                 );
                 let count = u32::from_be_bytes(header[8..].try_into()?) as usize;
                 self.count = Some(count);
-                self.accepts_surplus = count > self.wants.len();
+                // A mixed filtered reply can have a missing want and a
+                // delta base even when its entry and want counts match.
+                self.accepts_surplus = self.allow_omitted || count > self.wants.len();
                 position = 12;
-                if count > 1 || self.snapshot.is_some() {
+                if count > 1 || self.snapshot.is_some() || self.allow_omitted {
                     self.bases = Some(PackBases::default());
                 }
                 count
@@ -821,7 +830,7 @@ impl Pack<'_> {
             self.count == Some(self.entries) && self.pending.len() == TRAILER,
             "incomplete Git pack entries"
         );
-        if let Some(oid) = self.wants.first() {
+        if let Some(oid) = self.wants.first().filter(|_| !self.allow_omitted) {
             bail!("remote did not supply requested object {oid}");
         }
         let (extras, eager_verified_capacity) = if let Some(bases) = self.bases.take() {
@@ -836,6 +845,11 @@ impl Pack<'_> {
         Ok(Received {
             bytes: self.bytes,
             eager_verified_capacity,
+            omitted: if self.allow_omitted {
+                self.wants
+            } else {
+                Vec::new()
+            },
             extras,
         })
     }
@@ -936,10 +950,28 @@ fn offset_base(bytes: &[u8], offset: usize) -> Result<Option<(usize, usize)>> {
 }
 
 #[cfg(test)]
+pub(crate) fn pack_entry(kind: u8, base: &[u8], data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut header = Vec::new();
+    let mut size = data.len() >> 4;
+    let mut byte = kind << 4 | (data.len() & 15) as u8;
+    while size != 0 {
+        header.push(byte | 128);
+        byte = (size & 127) as u8;
+        size >>= 7;
+    }
+    header.push(byte);
+    header.extend_from_slice(base);
+    let mut encoder = flate2::write::ZlibEncoder::new(header, flate2::Compression::fast());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::raw_blob::ReceivedObject;
-    use flate2::{write::ZlibEncoder, Compression};
     use std::io::Write;
 
     fn verified_extra(store: &RawBlobs, oid: Oid) -> VerifiedObject {
@@ -947,22 +979,6 @@ mod tests {
             Some(ReceivedObject { object, .. }) => object,
             _ => panic!("expected a verified extra Git object"),
         }
-    }
-
-    fn pack_entry(kind: u8, base: &[u8], data: &[u8]) -> Vec<u8> {
-        let mut header = Vec::new();
-        let mut size = data.len() >> 4;
-        let mut byte = kind << 4 | (data.len() & 15) as u8;
-        while size != 0 {
-            header.push(byte | 128);
-            byte = (size & 127) as u8;
-            size >>= 7;
-        }
-        header.push(byte);
-        header.extend_from_slice(base);
-        let mut encoder = ZlibEncoder::new(header, Compression::fast());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
     }
 
     fn blob_pack_header(size: usize) -> Vec<u8> {

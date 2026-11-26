@@ -32,9 +32,8 @@ The optional leading `+` and an explicit
 `:refs/...` suffix select the source. Network loads create no destination
 ref, and a configured remote's tracking map has no effect on this selection.
 Wildcard refspecs, remote groups and abbreviated OIDs are outside this profile.
-A colon in two-operand mode does not select a subdirectory of the tree.
-Use `HEAD:directory` with a local revision, or choose the working directory
-from the command.
+For network revisions, a colon separates the refspec source and destination.
+Choose the working directory from the command to run inside a network subtree.
 
 HTTP/1.x, Git protocol v0/v1, plain HTTP, `git://`, external Git remote helpers
 and proxies are unsupported. Use the canonical repository URL for HTTPS.
@@ -52,10 +51,15 @@ a diagnostic.
 `git on /path/to/repository REV -- COMMAND`, a `file://` URL, and a configured
 remote name that resolves to a local repository use the same revision and
 object reader as `git -C /path/to/repository on REV -- COMMAND`. Relative
-paths are resolved from the invocation directory. Git interprets `REV` as a
-local revision, including `HEAD:subdirectory`. The suffix after a colon is a
-tree path in a local revision. Writing a fetch-refspec destination is no
-longer part of the local-source form.
+paths are resolved from the invocation directory. An existing directory uses
+ordinary Git discovery, including the repository of an enclosing worktree.
+An existing directory such as `work:tree` takes precedence over OpenSSH's
+colon shorthand. Use an explicit `ssh://` URL to disambiguate a network source.
+Prefix a relative path with `./` if its name has the form `helper::address`.
+Git-on can try an omitted `.git` suffix when Git finds no repository from the
+given path. The suffixed path must identify a repository of its own. Local
+paths accept Git's `~/` expansion and gitfiles. Git interprets `REV` as a
+local revision, including `HEAD:subdirectory`.
 
 Git-on reads the original repository directly. Local loading needs no
 upload-pack settings, temporary fetch repository, or copy of the source's
@@ -82,13 +86,13 @@ name alone proves nothing about demand.
 SSH selects a ref and fetches the initial object on one owned channel.
 Later channels reuse the same OpenSSH master. When an authenticated channel
 waits for the Git advertisement, a spare can prepare on that master.
-A slow startup can also prepare spare channels while the first object arrives. The pool opens more channels
-when reads need them and continues using established channels if the server
-refuses an additional session. Before the first directory enumeration, a
-slow lookup can close the request side of one channel with its fetch while
-another channel stays ready. A tree lookup needs two ready spares so the file
-can still use this path after resolving its ancestors. The pack and SSH exit
-status must both confirm completion.
+A slow startup prepares spare channels while the first object arrives. The
+pool opens more channels when reads need them and continues using established
+channels when the server refuses a session. When execution requires a mount
+and two spares are ready, Git-on sends EOF with the startup root-tree
+request. It can also send EOF with an initial slow lookup and prepare a
+replacement while a ready channel serves subsequent requests. The pack and
+SSH exit status confirm completion.
 
 HTTPS uses one HTTP/2 connection per session. On a Basic authentication
 challenge, Git-on uses `git credential fill` in the caller's context, then uses
@@ -102,7 +106,9 @@ On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
 Directory enumeration can wait for its tree as well. Each foreground fetch
-can group up to 64 already pending OIDs.
+can group up to 64 already pending OIDs. Both transports group tree and blob
+requests into separate packs. If the server omits a requested descendant
+from a valid filtered pack, Git-on retries that OID on its own.
 
 An idle pool starts an ordinary request immediately. While a transfer is active,
 the queue can wait up to two milliseconds on a slow source or during a confirmed
@@ -193,10 +199,8 @@ transport starts. Count the work of fixture servers separately when
 comparing client operations.
 
 For filtered lazy execution, the server must advertise filtering before any
-object transfer. Git-on sends each tree in its own request and can batch blobs.
-This keeps a tree filter from omitting another explicitly requested object
-inside that tree. Rejection of a requested unadvertised OID names the OID and
-includes Git's server diagnostic.
+object transfer. Rejection of a requested unadvertised OID names the OID
+and includes Git's server diagnostic.
 
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes

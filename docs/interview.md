@@ -153,3 +153,12 @@ tree has no such path. Old network modes are also being retired.
 **Answer:** That promise was a bug. From the user's perspective Git-on
 materializes a tree without Git plumbing, so behavior that depends on the
 temporary bare repository falls outside the contract.
+
+**Question:** How should the retirement of older networking modes be
+reflected in the release? The decision about the temporary bare repository
+covers local refspecs. Version 1.5.2 separately documented proxy support
+and explicitly selected Git protocol v0/v1. Under the agreed transport
+profile those invocations now fail.
+
+**Answer:** Use 1.5.3. I never asked for that support. It was a mistake for
+the AI agent to add and document it without asking me.

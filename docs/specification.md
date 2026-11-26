@@ -100,8 +100,10 @@ defines the selection and fetch rules for HTTPS and SSH.
 - With two operands, use native Git to resolve a configured remote or
   repository URL once. A local path or `file://` URL selects the repository
   for the same revision resolution and object reads as `git -C PATH on REV`.
-  Preserve ordinary Git revision syntax, including `HEAD:subdir`. The local
-  mode has no fetch-refspec destinations.
+  For an existing directory, the explicitly selected path uses Git discovery
+  before any `.git` suffix fallback, including inside a worktree. Preserve
+  ordinary Git revision syntax, including `HEAD:subdir`. The local mode has
+  no fetch-refspec destinations.
 - Network sources use direct smart Git protocol v2 over HTTPS with HTTP/2 or
   OpenSSH. GitHub.com is the acceptance reference. Resolve a named revision
   once via `ls-refs` and fetch by the selected full SHA-1 OID. Network fetches

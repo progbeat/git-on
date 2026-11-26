@@ -17,6 +17,14 @@ use std::{
 
 pub const BLOB_CACHE_BYTES: usize = crate::raw_blob::MEMORY_BUDGET;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum Preparation {
+    Copy,
+    Mount,
+    MountOrCopy,
+}
+
 /// Recognize complete pointer files, not ordinary source/documentation which
 /// happens to start with the LFS version line. Keep this bounded even for large
 /// blobs. Format: https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
@@ -965,6 +973,30 @@ impl Snapshot {
         materialized: bool,
         run_directory: &Path,
     ) -> Result<Self> {
+        Self::load_source_for_execution(
+            repo_path,
+            source,
+            treeish,
+            verify,
+            if materialized {
+                Preparation::Copy
+            } else {
+                Preparation::MountOrCopy
+            },
+            run_directory,
+        )
+    }
+
+    /// Load a snapshot with the CLI's known mount-to-copy fallback policy.
+    #[doc(hidden)]
+    pub fn load_source_for_execution(
+        repo_path: &Path,
+        source: Option<&OsStr>,
+        treeish: &OsStr,
+        verify: bool,
+        preparation: Preparation,
+        run_directory: &Path,
+    ) -> Result<Self> {
         use crate::remote::Source;
         let source = match source {
             Some(source) => crate::remote::resolve_source(repo_path, source, verify)?,
@@ -976,7 +1008,7 @@ impl Snapshot {
                     source,
                     treeish,
                     run_directory,
-                    materialized,
+                    preparation,
                 )?;
                 (None, Some(remote), oid, None, None)
             }

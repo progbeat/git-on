@@ -4,9 +4,9 @@
 - Use direct Git protocol v2 for network loads. HTTPS requires HTTP/2 and
   SSH requires OpenSSH. Select `HEAD`, a full SHA-1 OID, a full ref, or an
   unambiguous branch or tag. Use a direct URL or configured remote and a
-  full ref if names compete. Older HTTP/Git transports, proxies, and native
-  network fetch fallbacks have been removed. Local paths and `file://` remain
-  supported.
+  full ref if names compete. Invocations that require HTTP/1.x, Git protocol
+  v0/v1, proxies, or native network fetch fallbacks now fail with a diagnostic.
+  Local paths and `file://` remain supported.
 - Read explicit local sources, including `file://` and named remotes, with
   the same revision semantics as `git -C PATH on REV`. Use `HEAD:subdir` to
   select a local subtree. Local revisions no longer write fetch destinations.
@@ -22,8 +22,8 @@
   it with git2 0.21’s `Oid::from_bytes(old.as_bytes())`.
 - Document when OpenSSH can run configured `Match exec` commands, including
   during configuration inspection before connecting.
-- Fetch each tree individually on a lazy remote mount so filtered Git
-  responses include every requested subdirectory and file.
+- Batch tree requests separately from blob requests on HTTPS and SSH. Retry
+  requested trees that a valid filtered pack omitted in individual requests.
 - For slow sequential reads, check SSH channel completion while the pack
   is arriving when another channel is ready. After the command exits, start
   closing SSH input while used packs finish validation.

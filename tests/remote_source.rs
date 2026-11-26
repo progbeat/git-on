@@ -98,9 +98,18 @@ fn direct_non_utf8_repository_paths_are_native_git_operands() {
 #[test]
 fn local_materialization_preserves_the_selected_tree_without_a_checkout() {
     let (temp, _, tree) = fixture();
-    let source = temp.path().join("server");
+    let cwd = std::env::current_dir().unwrap();
+    let mut root: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+    root.push(
+        temp.path()
+            .canonicalize()
+            .unwrap()
+            .strip_prefix("/")
+            .unwrap(),
+    );
+    std::fs::write(temp.path().join("gitfile"), b"gitdir: server\n").unwrap();
     let (snap, _) =
-        load_operands(temp.path(), source.as_os_str(), OsStr::new("main"), false).unwrap();
+        load_operands(&root, OsStr::new("./gitfile"), OsStr::new("main"), false).unwrap();
     let destination = temp.path().join("materialized");
     std::fs::create_dir(&destination).unwrap();
     git_on::materialize::materialize(&snap, &destination).unwrap();

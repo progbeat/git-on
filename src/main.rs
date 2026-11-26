@@ -5,7 +5,7 @@ use git_on::{
     git::set_foreground as foreground,
     platform::{child_exited, mount_is_ours, remove_empty_temporary_group, ssh_control_path},
     policy::WritePolicy,
-    snapshot::Snapshot,
+    snapshot::{Preparation, Snapshot},
 };
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
@@ -702,12 +702,19 @@ fn execute_in_group(
         };
         let materialized = selected == Backend::Copy
             || (allow_fallback && unavailable.as_ref().is_ok_and(Option::is_some));
-        let snapshot = Snapshot::load_source(
+        let preparation = if materialized {
+            Preparation::Copy
+        } else if cfg!(target_os = "macos") && allow_fallback {
+            Preparation::MountOrCopy
+        } else {
+            Preparation::Mount
+        };
+        let snapshot = Snapshot::load_source_for_execution(
             &env::current_dir()?,
             source.as_deref(),
             &tree,
             verify,
-            materialized,
+            preparation,
             &dir,
         )?;
         observed = Some(snapshot.clone());

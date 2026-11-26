@@ -40,6 +40,11 @@ and user guides. The older documentation described fetch destination refs in
 a temporary bare repository. Exposing that internal state was a bug. See the
 [author’s decision](interview.md).
 
+The author selected 1.5.3 as an explicit exception for the retirement of
+legacy network modes that had been added and documented without approval.
+The release notes identify the invocations that now fail. See the
+[author’s decision on older networking modes](interview.md).
+
 For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.
 

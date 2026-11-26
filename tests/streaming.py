@@ -114,6 +114,9 @@ def ssh_eof_pack(root, failed):
                 if channel:
                     (root / f'want-{wanted.decode()}-{channel}').touch()
                 time.sleep(.1)
+                expected_advertisements = root / 'expected-advertisements'
+                if wanted in closing and expected_advertisements.is_file():
+                    wait_for_ssh_channels(root, int(expected_advertisements.read_text()))
                 if wanted in closing and select.select([0], [], [], 1.2)[0]:
                     assert not os.read(0, 1), 'extra input on a terminal request'
                     (root / wanted.decode()).touch()
@@ -261,6 +264,21 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'file\n')
         self.assertFalse((fixture.root / fixture.subtree).exists(), 'SSH stdin closed during readdir')
+
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a real native mount')
+    def test_mount_closes_the_startup_ssh_channel_with_ready_spares(self):
+        fixture, url, _ = self.sparse_ssh_fixture()
+        (fixture.root / 'closing').write_text(fixture.tree)
+        (fixture.root / 'expected-advertisements').write_text('3')
+        backend = '--backend=auto' if OPTIONS.require_fuse else mount_flag()
+        result = subprocess.run(
+            [OPTIONS.binary, url, fixture.commit, backend, '--write-policy=all', '--', 'true'],
+            cwd=fixture.cwd, env=dict(fixture.env, GIT_ON_TEST_WAIT_SSH_SPARES='1'),
+            capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((fixture.root / fixture.tree).is_file(),
+                        'SSH stdin remained open while the startup tree pack was in flight')
 
     def test_expired_ssh_standbys_are_replaced_through_the_same_master(self):
         fixture, url, _ = self.sparse_ssh_fixture(expire=True)

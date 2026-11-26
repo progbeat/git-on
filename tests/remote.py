@@ -164,6 +164,10 @@ def exec_fixture_child(argv, cwd, env):
 
 class Fixture:
     def __init__(self, git_dir=None, *, temp_parent=None):
+        if temp_parent is None and sys.platform == 'darwin':
+            # A second temporary directory under macOS's system TMPDIR can
+            # exceed the Unix socket limit once OpenSSH adds its own suffix.
+            temp_parent = '/tmp'
         self.temp = tempfile.TemporaryDirectory(dir=temp_parent, prefix='git-on-transport-')
         self.root = Path(self.temp.name)
         self.repo = self.root / 'server.git'
@@ -474,12 +478,17 @@ class RemoteTests(unittest.TestCase):
         f.repo = local
         f.git('init', '--quiet', at=f.cwd)
         relative = '../' + local.name
+        without_suffix = local.with_suffix('')
+        gitfile = f.root / 'gitfile'
+        gitfile.write_text(f'gitdir: {local.name}\n')
+        home_path = '~/' + local.name
         f.git('remote', 'add', 'origin', relative, at=f.cwd)
+        f.git('remote', 'add', 'home-relative', home_path, at=f.cwd)
         f.git('config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/unused/*', at=f.cwd)
         f.git('config', 'remotes.origin', 'other another', at=f.cwd)
         before_refs = f.git('show-ref')
         before_config = (local / 'config').read_bytes()
-        environment, log = record_git_invocations(f.root, f.env)
+        environment, log = record_git_invocations(f.root, dict(f.env, HOME=str(f.root)))
         environment = git_on_environment(OPTIONS.binary, environment, f.root / 'local-cli-tools')
         command = [
             'HEAD:deep', '--backend=copy', '--write-policy=all',
@@ -492,9 +501,59 @@ class RemoteTests(unittest.TestCase):
             ('absolute', [OPTIONS.binary, local]),
             ('file URL', [OPTIONS.binary, local.as_uri()]),
             ('configured remote', [OPTIONS.binary, 'origin']),
+            ('home-relative path', [OPTIONS.binary, home_path]),
+            ('home-relative remote', [OPTIONS.binary, 'home-relative']),
+            ('omitted .git suffix', [OPTIONS.binary, str(without_suffix) + '/']),
+            ('file URL without .git suffix', [OPTIONS.binary, without_suffix.as_uri()]),
+            ('gitfile', [OPTIONS.binary, gitfile]),
+            ('gitfile with trailing slash', [OPTIONS.binary, str(gitfile) + '/']),
+            ('gitfile URL with trailing slash', [OPTIONS.binary, gitfile.as_uri() + '/']),
         ):
             with self.subTest(source=label):
                 self.assertEqual(run([*argv, *command], cwd=f.cwd, env=environment, timeout=20), expected)
+        without_suffix.mkdir()
+        self.assertEqual(run([OPTIONS.binary, without_suffix, *command], cwd=f.cwd,
+                             env=environment, timeout=20), expected)
+        nested = f.cwd / 'local_team::work'
+        nested.mkdir()
+        nested.with_suffix('.git').symlink_to(local, target_is_directory=True)
+        (nested / 'selected').write_text('caller subtree\n')
+        f.git('add', '--', f'{nested.name}/selected', at=f.cwd)
+        f.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+              'commit', '-qm', 'caller', at=f.cwd)
+        f.git('remote', 'add', 'nested', nested.name, at=f.cwd)
+        show_tree = ['HEAD:./', '--backend=copy', '--write-policy=all', '--',
+                     'sh', '-c', 'printf "%s\n" "$GIT_ON_TREE_OID"; cat selected']
+        expected = run(['git', '-C', nested, 'on', *show_tree], env=environment, timeout=20)
+        for source in (nested.name, nested.as_uri(), 'nested'):
+            with self.subTest(source=source):
+                self.assertEqual(run([OPTIONS.binary, source, *show_tree], cwd=f.cwd,
+                                     env=environment, timeout=20), expected)
+        missing = f.cwd / 'absent'
+        missing.with_suffix('.git').mkdir()
+        helper_url = 'ext::example'
+        (f.cwd / helper_url).mkdir()
+        (f.cwd / '::helper').mkdir()
+        (f.cwd / 'rsync:obsolete').mkdir()
+        f.git('remote', 'add', 'helper', helper_url, at=f.cwd)
+        f.git('remote', 'add', 'forced-helper', nested.as_uri(), at=f.cwd)
+        f.git('config', 'remote.forced-helper.vcs', 'ext', at=f.cwd)
+        for source, diagnostic in (
+            (missing, b'local repository path is unavailable'),
+            ('helper', b'remote transport must be direct HTTPS or OpenSSH'),
+            ('::helper', b'remote transport must be direct HTTPS or OpenSSH'),
+            ('rsync:obsolete', b'remote transport must be direct HTTPS or OpenSSH'),
+            ('forced-helper', b'external Git remote helpers are outside the direct transport profile'),
+        ):
+            with self.subTest(rejected_source=source):
+                result = subprocess.run(
+                    [OPTIONS.binary, source, 'HEAD', '--backend=copy', '--write-policy=all',
+                     '--', 'printf', 'command ran'],
+                    cwd=f.cwd, env=environment, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(result.stdout, b'')
+                self.assertIn(diagnostic, result.stderr)
         destination = 'refs/heads/private-copy'
         rejected = subprocess.run(
             [OPTIONS.binary, 'origin', f'main:{destination}', '--backend=copy',
@@ -2397,9 +2456,22 @@ print('caught-EIO-and-returned-success')
 
     @unittest.skipUnless(OPTIONS.require_nfs, 'tests automatic fallback after NFS startup')
     def test_auto_copy_reuses_selected_ssh_snapshot_with_one_session(self):
-        f = self.f
-        source = f.ssh(protocol_v2=True, max_sessions=1)
-        f.force_upload_pack('sleep 0.5\n' + f'exec git upload-pack {shlex.quote(str(f.repo))}\n')
+        for maximum in (1, 3):
+            with self.subTest(max_sessions=maximum):
+                f = self.f if maximum == 1 else Fixture()
+                if maximum > 1:
+                    self.addCleanup(f.close)
+                self.check_auto_ssh_copy_reuses_selection(f, maximum)
+
+    def check_auto_ssh_copy_reuses_selection(self, f, maximum):
+        source = f.ssh(protocol_v2=True, max_sessions=maximum)
+        (f.root / 'closing').write_text(f.commit)
+        (f.root / 'expected-advertisements').write_text(str(maximum))
+        shim = [sys.executable, str(Path(__file__).resolve().with_name('streaming.py')),
+                '--ssh-eof', str(f.root), '']
+        trace = shlex.quote(str(f.root / 'pack'))
+        f.force_upload_pack(f'export GIT_TRACE_PACKET={trace}-$$ GIT_ON_FIXTURE_CHANNEL=copy-$$\n'
+                            f'exec {shlex.join(shim)}\n')
         environment, invocations = record_git_invocations(f.root, f.env)
         with tempfile.TemporaryDirectory(dir='/tmp', prefix='go-copy-') as runtime, \
                 tempfile.TemporaryFile() as metrics:
@@ -2417,6 +2489,9 @@ print('caught-EIO-and-returned-success')
             self.assertGreater(report['remote_session_fetch_operations'], 0, report)
             self.assertFalse(any('fetch' in argv for argv in git_invocations(invocations)))
             self.assertEqual(report['remote_repositories_created'], 0, report)
+            commit_requests = [path.read_bytes().count(b'upload-pack< want ' + f.commit.encode())
+                               for path in f.root.glob('pack-*')]
+            self.assertEqual([count for count in commit_requests if count], [2], report)
             assert_no_run_state(self, Path(runtime))
 
     def test_eager_ssh_closes_input_before_receiving_the_pack(self):
