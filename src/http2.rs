@@ -1,5 +1,5 @@
 //! Git protocol v2 exact-object requests multiplexed by an invocation-owned
-//! libcurl multi handle. Native Git still selects and verifies the revision.
+//! libcurl multi handle. Git provides credential lookup and signature verification.
 use crate::{
     object::{check_transfer, OperationCancelled},
     pack_stream, transport,
@@ -14,7 +14,6 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     io::{self, Read},
-    ops::Range,
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::PathBuf,
     process::Command,
@@ -36,41 +35,7 @@ fn content_type_is(value: Option<&[u8]>, expected: &[u8]) -> bool {
         .is_some_and(|value| value.trim_ascii().eq_ignore_ascii_case(expected))
 }
 
-type CredentialProvider =
-    Box<dyn FnMut(&str, &[Vec<u8>], Option<&Credentials>) -> Result<Option<Credentials>> + Send>;
-
-#[derive(Debug)]
-pub(crate) struct AuthenticationRejected;
-
-impl std::fmt::Display for AuthenticationRejected {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        output.write_str("Git HTTPS authentication failed")
-    }
-}
-
-impl std::error::Error for AuthenticationRejected {}
-
-#[derive(Debug)]
-pub(crate) struct NativeAuthentication;
-
-impl std::fmt::Display for NativeAuthentication {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        output.write_str("Git HTTPS request requires native authentication")
-    }
-}
-
-impl std::error::Error for NativeAuthentication {}
-
-#[derive(Debug)]
-pub(crate) struct Http1Required;
-
-impl std::fmt::Display for Http1Required {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        output.write_str("Git upload-pack switched to HTTP/1.x")
-    }
-}
-
-impl std::error::Error for Http1Required {}
+type CredentialProvider = Box<dyn FnOnce(&str, &[Vec<u8>]) -> Result<Credentials> + Send>;
 
 pub(crate) struct Configuration {
     base: String,
@@ -83,9 +48,7 @@ impl Configuration {
     pub(crate) fn new(
         url: &OsStr,
         git_version: &str,
-        credential: impl FnMut(&str, &[Vec<u8>], Option<&Credentials>) -> Result<Option<Credentials>>
-            + Send
-            + 'static,
+        credential: impl FnOnce(&str, &[Vec<u8>]) -> Result<Credentials> + Send + 'static,
     ) -> Option<Self> {
         let url = url.to_str()?;
         let parsed = url::Url::parse(url).ok()?;
@@ -101,8 +64,6 @@ impl Configuration {
                 .all(|byte| byte == b' ' || byte.is_ascii_graphic())
             || !version.feature_ssl()
             || !version.feature_http2()
-            // Older defaults also send custom origin headers to CONNECT proxies.
-            || version.version_num() < 0x07_2a_01
         {
             return None;
         }
@@ -119,89 +80,39 @@ impl Configuration {
 }
 
 pub(crate) struct Credentials {
-    response: Vec<u8>,
-    authorization: Authorization,
-    continuing: bool,
-}
-
-enum Authorization {
-    Password {
-        user: Range<usize>,
-        password: Range<usize>,
-    },
-    Encoded {
-        scheme: Range<usize>,
-        value: Range<usize>,
-    },
-}
-
-impl Credentials {
-    pub(crate) fn continues_encoded_authentication(&self) -> bool {
-        self.continuing && matches!(self.authorization, Authorization::Encoded { .. })
-    }
-}
-
-fn append_authentication_challenges(request: &mut Vec<u8>, challenges: &[Vec<u8>]) -> bool {
-    let mut valid = true;
-    for challenge in challenges {
-        if challenge
-            .iter()
-            .any(|byte| matches!(*byte, 0 | b'\r' | b'\n'))
-        {
-            valid = false;
-            continue;
-        }
-        request.extend_from_slice(b"wwwauth[]=");
-        request.extend_from_slice(challenge);
-        request.push(b'\n');
-    }
-    valid
+    user: String,
+    password: String,
 }
 
 pub(crate) fn credentials(
     mut command: Command,
     url: &str,
     challenges: &[Vec<u8>],
-    previous: Option<&Credentials>,
-    scratch: &mut Option<crate::service_storage::Directory>,
-) -> Result<Option<Credentials>> {
-    command
-        .args(["-c", "credential.interactive=false", "credential", "fill"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/false")
-        .env("SSH_ASKPASS", "/bin/false");
-    // Git's URL parser clears credential fields it has already read.
-    let mut request =
-        format!("url={url}\ncapability[]=authtype\ncapability[]=state\n").into_bytes();
-    if let Some(previous) = previous {
-        // Match Git's next credential fill after it clears the old secrets.
-        for line in previous.response.split(|&byte| byte == b'\n') {
-            if [
-                b"username=".as_slice(),
-                b"state[]=",
-                b"oauth_refresh_token=",
-                b"authtype=",
-                b"ephemeral=",
-                b"continue=",
-            ]
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-            {
-                request.extend_from_slice(line);
-                request.push(b'\n');
-            }
-        }
+) -> Result<Credentials> {
+    if !crate::terminal_ui::preparing() {
+        command
+            .args(["-c", "credential.interactive=false"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false");
     }
-    if !append_authentication_challenges(&mut request, challenges) {
-        return Ok(None);
+    command.args(["credential", "fill"]);
+    let mut request = format!("url={url}\n").into_bytes();
+    for challenge in challenges {
+        ensure!(
+            !challenge
+                .iter()
+                .any(|byte| matches!(*byte, 0 | b'\r' | b'\n')),
+            "invalid Git HTTPS authentication challenge"
+        );
+        request.extend_from_slice(b"wwwauth[]=");
+        request.extend_from_slice(challenge);
+        request.push(b'\n');
     }
     request.push(b'\n');
-    let scratch = match scratch {
-        Some(directory) => directory,
-        None => scratch.insert(crate::service_storage::Directory::new("credential-")?),
-    };
+    let scratch = crate::service_storage::Directory::new("credential-")?;
     command.env("TMPDIR", scratch.path());
-    let (output, mut values) =
+    let (output, values) =
         crate::git::run_with_output(command, Some(&mut request.as_slice()), |stream| {
             let mut values = Vec::new();
             stream.take(65_537).read_to_end(&mut values)?;
@@ -211,184 +122,79 @@ pub(crate) fn credentials(
             );
             Ok(values)
         })?;
-    if !output.status.success() {
-        // Git uses the same exit code for a missing credential and a
-        // helper's explicit quit. Its quit diagnostic is untranslated and
-        // can be followed by trace output.
-        let helper = b"credential helper '";
-        if output.status.code() == Some(128)
-            && output
-                .stderr
-                .windows(helper.len())
-                .any(|part| part == helper)
-            && output
-                .stderr
-                .split(|&byte| byte == b'\n')
-                .any(|line| line.trim_ascii_end().ends_with(b"' told us to quit"))
-        {
-            return Err(AuthenticationRejected.into());
-        }
-        return Ok(None);
-    }
-    discard_returned_challenges(&mut values);
-    let Some((scheme, authority)) = url.split_once("://") else {
-        return Ok(None);
-    };
-    let expected = authority.split('/').next().unwrap_or_default();
-    let mut protocol = None;
-    let mut host = None;
-    let mut continuing = false;
-    for line in values.split(|&byte| byte == b'\n') {
-        if let Some(value) = line.strip_prefix(b"protocol=") {
-            protocol = Some(value);
-        } else if let Some(value) = line.strip_prefix(b"host=") {
-            host = Some(value);
-        } else if line == b"continue=1" {
-            continuing = true;
-        } else if line.starts_with(b"path=") {
-            // The reusable client uses host-scoped credentials.
-            return Ok(None);
-        }
-    }
-    if protocol != Some(scheme.as_bytes()) || host != Some(expected.as_bytes()) {
-        return Ok(None);
-    }
-    let mut fields = [None, None, None, None];
-    let mut offset = 0;
-    for record in values.split_inclusive(|&byte| byte == b'\n') {
-        let line = record.strip_suffix(b"\n").unwrap_or(record);
-        for (slot, prefix) in fields.iter_mut().zip([
-            b"username=".as_slice(),
-            b"password=",
-            b"authtype=",
-            b"credential=",
-        ]) {
-            if line.starts_with(prefix) {
-                *slot = Some(offset + prefix.len()..offset + line.len());
-            }
-        }
-        offset += record.len();
-    }
-    let authorization = match fields {
-        [_, _, Some(scheme), Some(value)] => {
-            let scheme_bytes = &values[scheme.clone()];
-            let credential = &values[value.clone()];
-            if scheme_bytes.is_empty()
-                || auth_token_len(scheme_bytes) != scheme_bytes.len()
-                || credential.is_empty()
-                || !credential
-                    .iter()
-                    .all(|byte| matches!(byte, b'\t' | b' '..=b'~'))
-            {
-                return Ok(None);
-            }
-            Authorization::Encoded { scheme, value }
-        }
-        [Some(user), Some(password), _, None]
-            if [user.clone(), password.clone()].iter().all(|range| {
-                std::str::from_utf8(&values[range.clone()]).is_ok_and(|value| !value.contains('\0'))
-            }) =>
-        {
-            Authorization::Password { user, password }
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(Credentials {
-        response: values,
-        authorization,
-        continuing,
-    }))
+    ensure!(output.status.success(), "Git HTTPS authentication failed");
+
+    parse_credentials(url, &values)
 }
 
-fn discard_returned_challenges(response: &mut Vec<u8>) {
-    let mut read = 0;
-    let mut kept = 0;
-    while read < response.len() {
-        let end = response[read..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map_or(response.len(), |length| read + length + 1);
-        if !response[read..end].starts_with(b"wwwauth[]=") {
-            if kept != read {
-                response.copy_within(read..end, kept);
-            }
-            kept += end - read;
-        }
-        read = end;
-    }
-    response.truncate(kept);
-}
+fn parse_credentials(url: &str, values: &[u8]) -> Result<Credentials> {
+    use url::Position::{AfterPort, BeforeHost};
 
-pub(crate) fn replayable_credential_challenge(
-    challenges: &[Vec<u8>],
-    encoded_continuation: bool,
-) -> bool {
-    // Encoded credentials let Git's helper supply the entire header for
-    // any subsequent challenge in the same already-started exchange.
-    replayable_basic_challenge(challenges) || (encoded_continuation && !challenges.is_empty())
-}
-
-fn replayable_basic_challenge(challenges: &[Vec<u8>]) -> bool {
-    // Several realms can offer the same scheme. The helper sees all the
-    // challenges and can continue its exchange without starting over.
-    !challenges.is_empty()
-        && challenges.iter().all(|challenge| {
-            let mut fields = challenge.splitn(2, u8::is_ascii_whitespace);
-            fields
-                .next()
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"basic"))
-                && fields.next().and_then(basic_parameters).is_some()
-        })
-}
-
-fn basic_parameters(mut parameters: &[u8]) -> Option<()> {
-    let mut realm = false;
-    loop {
-        let parameter = parameters.trim_ascii_start();
-        let (name, remainder) = parameter.split_at(auth_token_len(parameter));
-        if name.is_empty() {
-            return None;
-        }
-        let value = remainder
-            .trim_ascii_start()
-            .strip_prefix(b"=")?
-            .trim_ascii_start();
-        let tail = if let Some(quoted) = value.strip_prefix(b"\"") {
-            let mut escaped = false;
-            let end = quoted.iter().position(|&byte| {
-                let closing_quote = !escaped && byte == b'"';
-                escaped = !escaped && byte == b'\\';
-                closing_quote
-            })?;
-            &quoted[end + 1..]
-        } else {
-            let len = auth_token_len(value);
-            if len == 0 {
-                return None;
-            }
-            &value[len..]
-        };
-        if name.eq_ignore_ascii_case(b"realm") {
-            if realm {
-                return None;
-            }
-            realm = true;
-        }
-        let tail = tail.trim_ascii_start();
-        if tail.is_empty() {
-            return realm.then_some(());
-        }
-        // A comma can introduce another scheme. Requiring a parameter at
-        // the next iteration leaves such mixed exchanges to native Git.
-        parameters = tail.strip_prefix(b",")?;
-    }
-}
-
-fn auth_token_len(bytes: &[u8]) -> usize {
-    bytes
+    let url = url::Url::parse(url)?;
+    let host = url[BeforeHost..AfterPort].as_bytes();
+    let decoded_path = crate::git::decode_url_bytes(url.path().trim_start_matches('/').as_bytes());
+    let end = decoded_path
         .iter()
-        .position(|byte| !byte.is_ascii_alphanumeric() && !b"!#$%&'*+-.^_\x60|~".contains(byte))
-        .unwrap_or(bytes.len())
+        .rposition(|&byte| byte != b'/')
+        .map_or(usize::from(!decoded_path.is_empty()), |i| i + 1);
+    let path = &decoded_path[..end];
+    let mut user = None;
+    let mut password = None;
+    for line in values
+        .split(|&byte| byte == b'\n')
+        .take_while(|line| !line.is_empty())
+    {
+        if let Some(value) = line.strip_prefix(b"username=") {
+            user = Some(value);
+        } else if let Some(value) = line.strip_prefix(b"password=") {
+            password = Some(value);
+        } else if let Some(value) = line.strip_prefix(b"protocol=") {
+            ensure!(
+                value == url.scheme().as_bytes(),
+                "Git credential protocol differs from the repository URL"
+            );
+        } else if let Some(value) = line.strip_prefix(b"host=") {
+            ensure!(
+                value.eq_ignore_ascii_case(host),
+                "Git credential host differs from the repository URL"
+            );
+        } else if let Some(value) = line.strip_prefix(b"path=") {
+            ensure!(
+                value == path,
+                "Git credential path differs from the repository URL"
+            );
+        }
+    }
+    let field = |value: Option<&[u8]>| -> Result<String> {
+        let value = value.context("Git HTTPS authentication requires a username and password")?;
+        let value =
+            std::str::from_utf8(value).context("invalid UTF-8 in Git credential response")?;
+        ensure!(!value.contains('\0'), "invalid Git credential response");
+        Ok(value.to_owned())
+    };
+    // The client keeps these credentials on the original repository URL.
+    // git credential fill applies the configured host and path lookup.
+    Ok(Credentials {
+        user: field(user)?,
+        password: field(password)?,
+    })
+}
+
+fn basic_challenge(response: &Easy2<Response>) -> Result<bool> {
+    let mut schemes: libc::c_long = 0;
+    // Let libcurl parse the challenges it received, including lists within one
+    // header. The CURLINFO_LONG result requires a writable C long.
+    let result = unsafe {
+        curl_sys::curl_easy_getinfo(
+            response.raw(),
+            curl_sys::CURLINFO_HTTPAUTH_AVAIL,
+            &mut schemes as *mut libc::c_long,
+        )
+    };
+    if result != curl_sys::CURLE_OK {
+        return Err(curl::Error::new(result).into());
+    }
+    Ok(schemes as libc::c_ulong & curl_sys::CURLAUTH_BASIC != 0)
 }
 
 // Bound queued wire bytes per receiving stream independently of the number
@@ -407,6 +213,7 @@ fn note_failure<T>(report: Option<&ReportFailure>, result: &Result<T>) {
 
 enum Body {
     Discovery(Vec<u8>),
+    Refs(transport::HttpRefs),
     Snapshot(Box<pack_stream::Response<'static>>),
     PendingReply {
         pack: Box<pack_stream::Response<'static>>,
@@ -562,36 +369,14 @@ impl Drop for Decoder {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HttpProtocol {
-    Http1,
-    Http2,
-}
-
-enum FetchPreparation {
-    NativeHttp1,
-    ProbeAuthentication,
-}
-
-#[derive(Clone, Copy)]
-enum InitialFetch {
-    Exact,
-    Ref,
-    AfterRefProbe,
-}
-
 struct Response {
     // The easy handle borrows these bytes until its native cleanup finishes.
     request: Option<Vec<u8>>,
     body: Body,
     error: Option<io::Error>,
     stop: Arc<AtomicBool>,
-    authentication: Option<u64>,
-    encoded_continuation: bool,
-    protocol: Option<HttpProtocol>,
-    headers_complete: bool,
-    initial_fetch: Option<InitialFetch>,
-    allow_http1: bool,
+    authenticated: bool,
+    http2: bool,
     ok: bool,
     git_pack: bool,
     challenges: Vec<Vec<u8>>,
@@ -599,37 +384,7 @@ struct Response {
 
 impl Response {
     fn supports_protocol(&self) -> bool {
-        match self.protocol {
-            Some(HttpProtocol::Http2) => true,
-            Some(HttpProtocol::Http1) => self.allow_http1,
-            None => false,
-        }
-    }
-
-    fn fetch_preparation(
-        &self,
-        response_code: impl FnOnce() -> Result<u32, curl::Error>,
-    ) -> Option<FetchPreparation> {
-        if !self.headers_complete
-            || !matches!(self.body, Body::PendingReply { .. } | Body::Snapshot(_))
-        {
-            return None;
-        }
-        let initial = self.initial_fetch?;
-        let downgraded = !self.allow_http1 && self.protocol == Some(HttpProtocol::Http1);
-        let can_probe_auth = matches!(initial, InitialFetch::Exact);
-        if !downgraded && !can_probe_auth {
-            return None;
-        }
-        match response_code().ok()? {
-            200..=599 if downgraded => Some(FetchPreparation::NativeHttp1),
-            200 if self.git_pack && self.supports_protocol() => None,
-            401 | 407 => None,
-            // Some endpoints challenge ref queries after refusing a fetch.
-            // Retry with the original ref probe after a non-pack reply.
-            200..=599 if can_probe_auth => Some(FetchPreparation::ProbeAuthentication),
-            _ => None,
-        }
+        self.http2
     }
 }
 
@@ -663,6 +418,13 @@ impl Handler for Response {
                 self.error = Some(io::Error::other("Git HTTP discovery response is oversized"));
                 Ok(0)
             }
+            Body::Refs(refs) if valid_pack => match refs.feed(data) {
+                Ok(()) => Ok(data.len()),
+                Err(error) => {
+                    self.error = Some(io::Error::other(error));
+                    Ok(0)
+                }
+            },
             Body::Snapshot(pack) if valid_pack => match pack.write_http(data) {
                 Ok(()) => Ok(data.len()),
                 Err(error) => {
@@ -671,26 +433,23 @@ impl Handler for Response {
                 }
             },
             Body::Reply(decoder) if valid_pack => decoder.feed(data),
-            Body::Snapshot(_) | Body::Reply(_) | Body::PendingReply { .. } => Ok(data.len()),
+            Body::Refs(_) | Body::Snapshot(_) | Body::Reply(_) | Body::PendingReply { .. } => {
+                Ok(data.len())
+            }
         }
     }
 
     fn header(&mut self, data: &[u8]) -> bool {
         if data.starts_with(b"HTTP/") {
-            self.protocol = match data.split(|&byte| byte == b' ').next() {
-                Some(b"HTTP/2") => Some(HttpProtocol::Http2),
-                Some(b"HTTP/1.0" | b"HTTP/1.1") => Some(HttpProtocol::Http1),
-                _ => None,
-            };
+            self.http2 = data.split(|&byte| byte == b' ').next() == Some(b"HTTP/2");
             self.ok = data.split(u8::is_ascii_whitespace).nth(1) == Some(b"200");
             self.git_pack = false;
-            self.headers_complete = false;
             self.challenges.clear();
-            if let Body::Discovery(bytes) = &mut self.body {
-                bytes.clear();
+            match &mut self.body {
+                Body::Discovery(bytes) => bytes.clear(),
+                Body::Refs(refs) => refs.reset(),
+                _ => {}
             }
-        } else if matches!(data, b"\r\n" | b"\n") {
-            self.headers_complete = true;
         } else if let Some(colon) = data.iter().position(|&byte| byte == b':') {
             if data[..colon].eq_ignore_ascii_case(b"content-type") {
                 self.git_pack = content_type_is(Some(&data[colon + 1..]), PACK_RESULT);
@@ -713,10 +472,7 @@ pub(crate) struct Client {
     ca: Option<PathBuf>,
     user_agent: String,
     auth: Option<Credentials>,
-    auth_generation: u64,
     credential: Option<CredentialProvider>,
-    allow_http1: bool,
-    initial_fetch: Option<InitialFetch>,
     multi: Multi,
     active: HashMap<usize, Easy2Handle<Response>>,
     decoding: HashMap<usize, Decoder>,
@@ -727,7 +483,6 @@ pub(crate) struct Client {
 pub(crate) enum Selection {
     Exact,
     Ref(transport::RefQuery),
-    Demand,
 }
 
 impl Drop for Client {
@@ -749,7 +504,7 @@ impl Client {
         stop: Arc<AtomicBool>,
         selection: Selection,
         mode: transport::FetchMode,
-    ) -> Result<Option<(Self, Option<git2::Oid>)>> {
+    ) -> Result<(Self, Option<Oid>)> {
         let mut multi = Multi::new();
         multi.pipelining(false, true)?;
         // All submitted requests share the connection. libcurl applies the
@@ -760,66 +515,69 @@ impl Client {
             ca: config.ca,
             user_agent: config.user_agent,
             auth: None,
-            auth_generation: 0,
             credential: Some(config.credential),
-            allow_http1: matches!(mode, transport::FetchMode::Snapshot { .. }),
-            initial_fetch: match &selection {
-                Selection::Exact => Some(InitialFetch::Exact),
-                Selection::Ref(_) => Some(InitialFetch::Ref),
-                Selection::Demand => None,
-            },
             multi,
             active: HashMap::new(),
             decoding: HashMap::new(),
             retiring: Vec::new(),
             stop,
         };
-        let response = client.discovery("info/refs?service=git-upload-pack", None)?;
-        if response.response_code()? != 200
-            || !response.get_ref().supports_protocol()
-            || !content_type_is(response.content_type_bytes()?, ADVERTISEMENT)
-        {
-            return Ok(None);
-        }
+        let easy = client.easy(
+            "info/refs?service=git-upload-pack",
+            Body::Discovery(Vec::new()),
+            None,
+        )?;
+        let response = client.perform_with_authentication(easy)?;
+        ensure!(
+            response.get_ref().supports_protocol(),
+            "Git HTTPS requires HTTP/2"
+        );
+        let status = response.response_code()?;
+        ensure!(
+            status == 200,
+            "Git HTTPS advertisement returned HTTP {status}"
+        );
+        ensure!(
+            content_type_is(response.content_type_bytes()?, ADVERTISEMENT),
+            "expected a smart Git HTTPS advertisement"
+        );
         let Body::Discovery(bytes) = &response.get_ref().body else {
             unreachable!()
         };
-        if !transport::read_http_capabilities(bytes, mode)? {
-            return Ok(None);
-        }
-        let reference = match &selection {
-            // An exact OID only needs the capability advertisement. The
-            // first fetch can authenticate before decoding any pack bytes.
-            Selection::Exact => return Ok(Some((client, None))),
-            Selection::Ref(reference) => Some(reference),
-            // A pool opened after native selection checks POST access
-            // before it takes over reads of the already mounted snapshot.
-            Selection::Demand => None,
+        ensure!(
+            transport::read_http_capabilities(bytes, mode)?,
+            "server must support Git protocol v2 and the requested fetch capabilities"
+        );
+        let selected = match selection {
+            Selection::Exact => None,
+            Selection::Ref(reference) => Some(client.query_ref(reference)?),
         };
-        Ok(client
-            .query_refs(reference)?
-            .map(|selected| (client, selected)))
+        Ok((client, selected))
     }
 
-    fn query_refs(
-        &mut self,
-        reference: Option<&transport::RefQuery>,
-    ) -> Result<Option<Option<Oid>>> {
-        let response = self.discovery(
+    fn query_ref(&mut self, reference: transport::RefQuery) -> Result<Oid> {
+        let request = transport::reference_request(&reference)?;
+        let easy = self.easy(
             "git-upload-pack",
-            Some(transport::reference_request(reference)?),
+            Body::Refs(transport::HttpRefs::new(reference)),
+            Some(request),
         )?;
-        if response.response_code()? != 200
-            || !response.get_ref().supports_protocol()
-            || !content_type_is(response.content_type_bytes()?, PACK_RESULT)
-        {
-            return Ok(None);
-        }
-        let Body::Discovery(bytes) = &response.get_ref().body else {
+        let response = self.perform_with_authentication(easy)?;
+        let status = response.response_code()?;
+        ensure!(
+            status == 200,
+            "Git HTTPS ref selection returned HTTP {status}"
+        );
+        ensure!(
+            response.get_ref().supports_protocol()
+                && content_type_is(response.content_type_bytes()?, PACK_RESULT),
+            "invalid Git HTTP/2 ref reply"
+        );
+        let Body::Refs(refs) = &response.get_ref().body else {
             unreachable!()
         };
-        let selected = transport::read_http_ref(bytes, reference)?;
-        Ok((reference.is_none() || selected.is_some()).then_some(selected))
+        refs.finish()?
+            .context("remote ref did not select one object; use a full Git ref when names compete")
     }
 
     fn easy(&self, service: &str, body: Body, request: Option<Vec<u8>>) -> Result<Easy2<Response>> {
@@ -829,21 +587,18 @@ impl Client {
             body,
             error: None,
             stop: self.stop.clone(),
-            authentication: None,
-            encoded_continuation: false,
-            protocol: None,
-            headers_complete: false,
-            initial_fetch: None,
-            allow_http1: self.allow_http1,
+            authenticated: false,
+            http2: false,
             ok: false,
             git_pack: false,
             challenges: Vec::new(),
         });
         easy.url(&format!("{}/{service}", self.base))?;
+        easy.proxy("")?;
         easy.useragent(&self.user_agent)?;
         easy.http_version(HttpVersion::V2TLS)?;
         easy.netrc(NetRc::Optional)?;
-        easy.http_auth(Auth::new().auto(true))?;
+        easy.http_auth(Auth::new().basic(true))?;
         easy.accept_encoding("")?;
         easy.pipewait(true)?;
         easy.progress(true)?;
@@ -883,94 +638,49 @@ impl Client {
             headers.append("Accept: application/x-git-upload-pack-result")?;
         }
         if let Some(auth) = &self.auth {
-            let field = |range: &Range<usize>| std::str::from_utf8(&auth.response[range.clone()]);
-            match &auth.authorization {
-                Authorization::Password { user, password } => {
-                    easy.netrc(NetRc::Optional)?;
-                    easy.username(field(user)?)?;
-                    easy.password(field(password)?)?;
-                    easy.http_auth(Auth::new().basic(true))?;
-                }
-                Authorization::Encoded { scheme, value } => {
-                    // A complete header supersedes libcurl's own credentials.
-                    easy.netrc(NetRc::Ignored)?;
-                    easy.http_auth(&Auth::new())?;
-                    headers.append(&format!(
-                        "Authorization: {} {}",
-                        field(scheme)?,
-                        field(value)?
-                    ))?;
-                }
-            }
-            let response = easy.get_mut();
-            response.authentication = Some(self.auth_generation);
-            response.encoded_continuation = auth.continues_encoded_authentication();
+            easy.netrc(NetRc::Ignored)?;
+            easy.username(&auth.user)?;
+            easy.password(&auth.password)?;
+            easy.get_mut().authenticated = true;
         }
         easy.http_headers(headers)?;
         Ok(())
     }
 
-    fn discovery(&mut self, service: &str, request: Option<Vec<u8>>) -> Result<Easy2<Response>> {
-        let easy = self.easy(service, Body::Discovery(Vec::new()), request)?;
-        self.perform_with_authentication(easy)
-    }
-
     fn perform_with_authentication(&mut self, easy: Easy2<Response>) -> Result<Easy2<Response>> {
         let post = easy.get_ref().request.is_some();
         let mut response = self.perform(easy)?;
-        while self.authenticate(&response)? {
+        if self.authenticate(&response)? {
             self.apply_request_headers(&mut response, post)?;
             response = self.perform(response)?;
         }
-        self.check_authentication(&response)?;
+        Self::check_authentication(&response)?;
         Ok(response)
     }
 
-    fn check_authentication(&self, response: &Easy2<Response>) -> Result<()> {
-        if response.get_ref().authentication != Some(self.auth_generation)
-            || response.response_code()? != 401
-        {
-            return Ok(());
-        }
-        match self.auth.as_ref() {
-            Some(auth) if auth.continuing => Err(NativeAuthentication.into()),
-            Some(_) => Err(AuthenticationRejected.into()),
-            None => Ok(()),
-        }
+    fn check_authentication(response: &Easy2<Response>) -> Result<()> {
+        ensure!(
+            response.response_code()? != 401,
+            "Git HTTPS authentication failed"
+        );
+        Ok(())
     }
 
     fn authenticate(&mut self, response: &Easy2<Response>) -> Result<bool> {
-        self.authenticate_response(response.response_code()?, response.get_ref())
-    }
-
-    fn authenticate_response(&mut self, code: u32, headers: &Response) -> Result<bool> {
-        if code != 401
+        let headers = response.get_ref();
+        if response.response_code()? != 401
             || !headers.supports_protocol()
-            || !replayable_credential_challenge(&headers.challenges, headers.encoded_continuation)
+            || headers.authenticated
+            || !basic_challenge(response)?
         {
             return Ok(false);
         }
-        if let Some(auth) = &self.auth {
-            if headers.authentication != Some(self.auth_generation) {
-                // Other in-flight requests can finish after a credential
-                // transition. Replay them with the new credential state.
-                return Ok(true);
-            }
-            if !auth.continuing {
-                return Ok(false);
-            }
+        if let Some(fetch) = self.credential.take() {
+            self.auth = Some(fetch(&self.base, &headers.challenges)?);
         }
-        if let Some(mut fetch) = self.credential.take() {
-            self.auth = fetch(&self.base, &headers.challenges, self.auth.as_ref())?;
-            if let Some(auth) = &self.auth {
-                self.auth_generation += 1;
-                if auth.continuing {
-                    self.credential = Some(fetch);
-                }
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        // A concurrent request can receive its challenge after another
+        // request already supplied the session credential.
+        Ok(self.auth.is_some())
     }
 
     fn perform(&self, easy: Easy2<Response>) -> Result<Easy2<Response>> {
@@ -999,37 +709,17 @@ impl Client {
         &mut self,
         oid: Oid,
         response: pack_stream::Response<'static>,
-    ) -> Result<Option<(pack_stream::Received, bool)>> {
-        // Eager preparation has one transfer. Decode directly from curl's
-        // callback buffer instead of queueing immutable chunks for a worker.
-        let request = transport::fetch_request(
-            &[oid],
-            transport::FetchMode::Snapshot {
-                selecting_ref: false,
-            },
-        )?;
-        let mut easy = self.easy(
+    ) -> Result<pack_stream::Received> {
+        let request = transport::fetch_request(&[oid], transport::FetchMode::Snapshot)?;
+        let easy = self.easy(
             "git-upload-pack",
             Body::Snapshot(Box::new(response)),
             Some(request),
         )?;
-        easy.get_mut().initial_fetch = self.initial_fetch.take();
         let mut response = self.perform_with_authentication(easy)?;
-        if let Some(FetchPreparation::ProbeAuthentication) = response
-            .get_ref()
-            .fetch_preparation(|| response.response_code())
-        {
-            self.probe_exact_fetch_refs()?;
-            self.apply_request_headers(&mut response, true)?;
-            response = self.perform_with_authentication(response)?;
-        }
-        if matches!(response.response_code()?, 401 | 407) {
-            return Ok(None);
-        }
         self.check_response(&mut response, Ok(()))?;
-        let http2 = response.get_ref().protocol == Some(HttpProtocol::Http2);
         match std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new())) {
-            Body::Snapshot(pack) => pack.finish_http().map(|received| Some((received, http2))),
+            Body::Snapshot(pack) => pack.finish_http(),
             _ => unreachable!("expected eager pack response"),
         }
     }
@@ -1043,7 +733,7 @@ impl Client {
         report_failure: Option<ReportFailure>,
     ) -> Result<()> {
         let request = transport::fetch_request(oids, transport::FetchMode::Filtered)?;
-        let mut easy = self.easy(
+        let easy = self.easy(
             "git-upload-pack",
             Body::PendingReply {
                 pack: Box::new(response),
@@ -1052,7 +742,6 @@ impl Client {
             },
             Some(request),
         )?;
-        easy.get_mut().initial_fetch = self.initial_fetch.take();
         self.submit(token, easy)
     }
 
@@ -1090,32 +779,6 @@ impl Client {
         });
         for (token, outcome) in transfers {
             self.end_transfer(token?, outcome, &mut finished)?;
-        }
-
-        // The completed origin headers can require another preparation step
-        // while the server is still sending its body. CURLINFO_RESPONSE_CODE
-        // excludes the CONNECT response of an HTTPS proxy.
-        if !self.stop.load(Ordering::Relaxed) && check_transfer().is_ok() {
-            let fallbacks: Vec<_> = self
-                .active
-                .iter()
-                .filter_map(|(&token, handle)| {
-                    let preparation = handle
-                        .get_ref()
-                        .fetch_preparation(|| handle.response_code())?;
-                    Some((token, preparation))
-                })
-                .collect();
-            for (token, preparation) in fallbacks {
-                let handle = self
-                    .active
-                    .remove(&token)
-                    .expect("active Git HTTP/2 request");
-                let response = self.multi.remove2(handle)?;
-                if let Err(error) = self.complete_preparation(token, response, preparation) {
-                    finished.push((token, Err(error)));
-                }
-            }
         }
 
         // A decoder can reject a reply while its peer is still sending.
@@ -1160,35 +823,29 @@ impl Client {
             .remove(&token)
             .context("unknown Git HTTP/2 request")?;
         let mut response = self.multi.remove2(handle)?;
-        if !self.stop.load(Ordering::Relaxed)
+        if outcome.is_ok()
+            && !self.stop.load(Ordering::Relaxed)
             && check_transfer().is_ok()
             && matches!(&response.get_ref().body, Body::PendingReply { .. })
         {
-            if let Some(preparation) = response
-                .get_ref()
-                .fetch_preparation(|| response.response_code())
-            {
-                if let Err(error) = self.complete_preparation(token, response, preparation) {
-                    finished.push((token, Err(error)));
+            match self.authenticate(&response) {
+                Ok(true) => {
+                    let retry = self
+                        .apply_request_headers(&mut response, true)
+                        .and_then(|()| self.submit(token, response));
+                    if let Err(error) = retry {
+                        finished.push((token, Err(error)));
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            if outcome.is_ok()
-                && (response.get_ref().authentication != Some(self.auth_generation)
-                    || self.auth.as_ref().is_some_and(|auth| auth.continuing))
-                && matches!(response.response_code()?, 401 | 407)
-            {
-                // A challenge before any pack bytes reached the decoder can
-                // replay the same curl request with the auth options filled in.
-                if let Err(error) = self.retry_authentication(token, response) {
+                Ok(false) => {}
+                Err(error) => {
                     finished.push((token, Err(error)));
+                    return Ok(());
                 }
-                return Ok(());
             }
         }
-        let network = self
-            .check_authentication(&response)
-            .and_then(|()| self.check_response(&mut response, outcome));
+        let network = self.check_response(&mut response, outcome);
         let body = std::mem::replace(&mut response.get_mut().body, Body::Discovery(Vec::new()));
         match body {
             Body::Reply(mut decoder) => match decoder.end(network) {
@@ -1210,55 +867,13 @@ impl Client {
             Body::PendingReply { pack, .. } => {
                 finished.push((token, network.and_then(|()| pack.finish_http())));
             }
-            Body::Discovery(_) | Body::Snapshot(_) => {
+            Body::Refs(_) | Body::Discovery(_) | Body::Snapshot(_) => {
                 let result =
                     network.and_then(|()| Err(anyhow::anyhow!("missing Git HTTP/2 fetch body")));
                 finished.push((token, result));
             }
         }
         Ok(())
-    }
-
-    fn complete_preparation(
-        &mut self,
-        token: usize,
-        mut response: Easy2<Response>,
-        preparation: FetchPreparation,
-    ) -> Result<()> {
-        match preparation {
-            FetchPreparation::NativeHttp1 => {
-                self.check_authentication(&response)?;
-                return Err(Http1Required.into());
-            }
-            FetchPreparation::ProbeAuthentication => {
-                self.probe_exact_fetch_refs()?;
-            }
-        }
-        response.get_mut().initial_fetch = Some(InitialFetch::AfterRefProbe);
-        self.apply_request_headers(&mut response, true)?;
-        self.submit(token, response)
-    }
-
-    fn probe_exact_fetch_refs(&mut self) -> Result<()> {
-        // Startup submits its first OID before admitting other fetches.
-        ensure!(self.active.is_empty(), "ref probe overlaps another fetch");
-        match self.query_refs(None) {
-            Ok(Some(_)) => Ok(()),
-            Err(error)
-                if error.is::<AuthenticationRejected>() || crate::object::is_cancelled(&error) =>
-            {
-                Err(error)
-            }
-            _ => Err(NativeAuthentication.into()),
-        }
-    }
-
-    fn retry_authentication(&mut self, token: usize, mut response: Easy2<Response>) -> Result<()> {
-        if !self.authenticate(&response)? {
-            return Err(NativeAuthentication.into());
-        }
-        self.apply_request_headers(&mut response, true)?;
-        self.submit(token, response)
     }
 
     fn check_response(
@@ -1273,14 +888,14 @@ impl Client {
             return Err(OperationCancelled.into());
         }
         check_transfer()?;
-        let protocol = if self.allow_http1 { "HTTPS" } else { "HTTP/2" };
-        outcome.with_context(|| format!("receive Git {protocol} response"))?;
+        outcome.context("receive Git HTTP/2 response")?;
         let status = response.response_code()?;
-        ensure!(status == 200, "Git {protocol} fetch returned HTTP {status}");
+        Self::check_authentication(response)?;
+        ensure!(status == 200, "Git HTTP/2 fetch returned HTTP {status}");
         ensure!(
             response.get_ref().supports_protocol()
                 && content_type_is(response.content_type_bytes()?, PACK_RESULT),
-            "invalid Git {protocol} fetch response"
+            "invalid Git HTTP/2 fetch response"
         );
         Ok(())
     }
@@ -1303,65 +918,6 @@ mod tests {
         thread,
     };
 
-    #[test]
-    fn basic_parameters_distinguish_extensions_from_other_schemes() {
-        let basic = b"Basic REALM = \"a, \\\"quoted\\\" realm\", charset=UTF-8";
-        assert!(replayable_basic_challenge(&[basic.to_vec()]));
-        let mixed = b"Basic realm=\"a\", Digest realm=\"b\"";
-        assert!(!replayable_basic_challenge(&[mixed.to_vec()]));
-    }
-
-    #[test]
-    fn a_delayed_unauthenticated_stream_respects_its_own_challenge() {
-        let mut client = Client {
-            base: String::new(),
-            ca: None,
-            user_agent: String::new(),
-            auth: Some(Credentials {
-                response: b"u:p".to_vec(),
-                authorization: Authorization::Password {
-                    user: 0..1,
-                    password: 2..3,
-                },
-                continuing: false,
-            }),
-            auth_generation: 1,
-            credential: None,
-            allow_http1: false,
-            initial_fetch: None,
-            multi: Multi::new(),
-            active: HashMap::new(),
-            decoding: HashMap::new(),
-            retiring: Vec::new(),
-            stop: Arc::default(),
-        };
-        let mut delayed = Response {
-            request: None,
-            body: Body::Discovery(Vec::new()),
-            error: None,
-            stop: Arc::default(),
-            authentication: None,
-            encoded_continuation: false,
-            protocol: Some(HttpProtocol::Http2),
-            headers_complete: false,
-            initial_fetch: None,
-            allow_http1: false,
-            ok: false,
-            git_pack: false,
-            challenges: vec![b"Bearer realm=\"other\"".to_vec()],
-        };
-        assert!(!client.authenticate_response(401, &delayed).unwrap());
-        // A request that did send a continuation token can finish using
-        // the newer credential from that exchange.
-        delayed.authentication = Some(0);
-        delayed.encoded_continuation = true;
-        assert!(client.authenticate_response(401, &delayed).unwrap());
-        delayed.challenges = vec![b"Basic realm=\"same\"".to_vec()];
-        delayed.authentication = None;
-        delayed.encoded_continuation = false;
-        assert!(client.authenticate_response(401, &delayed).unwrap());
-    }
-
     fn framed_blob() -> (Oid, Vec<u8>, Vec<u8>) {
         use sha1_checked::{Digest, Sha1};
 
@@ -1379,6 +935,20 @@ mod tests {
         tail.extend_from_slice(&trailer);
         tail.extend_from_slice(b"0000");
         (oid, frame, tail)
+    }
+
+    #[test]
+    fn credential_scope_matches_native_git_url_components() -> Result<()> {
+        let url = "https://example.com:8443/project%20name/repo.git/";
+        let response = b"protocol=https\nhost=EXAMPLE.com:8443\npath=project name/repo.git\nusername=fixture\npassword=value\n";
+        let credentials = parse_credentials(url, response)?;
+        assert_eq!(credentials.user, "fixture");
+        assert!(
+            parse_credentials("https://example.com:8444/project%20name/repo.git", response)
+                .is_err()
+        );
+        assert!(parse_credentials("https://example.com:8443/another.git", response).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1472,12 +1042,8 @@ mod tests {
                 body: Body::Reply(decoder),
                 error: Some(io::Error::other("required transfer was reset")),
                 stop: stop.clone(),
-                authentication: None,
-                encoded_continuation: false,
-                protocol: Some(HttpProtocol::Http2),
-                headers_complete: false,
-                initial_fetch: None,
-                allow_http1: false,
+                authenticated: false,
+                http2: true,
                 ok: true,
                 git_pack: true,
                 challenges: Vec::new(),
@@ -1489,9 +1055,6 @@ mod tests {
             user_agent: String::new(),
             auth: None,
             credential: None,
-            allow_http1: false,
-            initial_fetch: None,
-            auth_generation: 0,
             multi,
             active: HashMap::from([(1, handle)]),
             decoding: HashMap::new(),
@@ -1604,12 +1167,8 @@ mod tests {
             },
             error: None,
             stop: Arc::default(),
-            authentication: None,
-            encoded_continuation: false,
-            protocol: Some(HttpProtocol::Http2),
-            headers_complete: false,
-            initial_fetch: None,
-            allow_http1: false,
+            authenticated: false,
+            http2: true,
             ok: true,
             git_pack: true,
             challenges: Vec::new(),

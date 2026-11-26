@@ -143,3 +143,13 @@ review noted that the specification previously had an agreed exception only
 for the verifier.
 
 **Answer:** Document an exception for `Match exec`.
+
+**Question:** Which version should PR #41 use? Cold reviews consider this a
+SemVer 2.0 blocker. The 1.5.2 documentation promised support for
+`git on PATH main:refs/heads/demo`. Under your latest instruction, both
+forms of local execution remain available, and that command fails if the
+tree has no such path. Old network modes are also being retired.
+
+**Answer:** That promise was a bug. From the user's perspective Git-on
+materializes a tree without Git plumbing, so behavior that depends on the
+temporary bare repository falls outside the contract.

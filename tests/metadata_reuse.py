@@ -56,7 +56,7 @@ def run(options):
                 stat_bytes=stat_abi_bytes(build_stat_observer(f.root/'stat-abi'))
                 child=f.root/'command.py';child.write_text(CHILD)
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.operations),str(stat_bytes)]
-                source='file://'+str(f.repo) if options.source=='remote' else str(f.repo)
+                source=f.https() if options.source=='remote' else None
                 env=dict(f.env)
                 backend_args = ['--backend=copy'] if options.backend=='materialized' else []
                 argv=[str(options.binary.resolve()),*backend_args]

@@ -19,19 +19,23 @@ WORKFLOW=(subprocess.check_output(['git','show',os.environ['GIT_ON_CI_BEFORE_REF
 def job(name):return re.search(r'^  '+name+r':\n(.*?)(?=^  [\w-]+:\n|\Z)',WORKFLOW,re.M|re.S)[1]
 
 
-def explicit_python_selectors(workflow):
+def unfold_run_commands(workflow):
     def unfold(match):
         lines = textwrap.dedent(match[2]).splitlines()
         command = [lines[0]]
         for before, after in zip(lines, lines[1:]):
             same_paragraph = before and after and not before[0].isspace() and not after[0].isspace()
             command.extend((' ' if same_paragraph else '\n', after))
-        return ''.join(command) + '\n'
+        return match[1] + 'run: ' + ''.join(command) + '\n'
 
-    commands = re.sub(
+    return re.sub(
         r'^([ ]+)run: >[+-]? *(?:#[^\n]*)?\n((?:(?:\1 +[^\n]*| *)\n)+)',
         unfold, workflow + '\n', flags=re.M,
-    ).replace('\\\n', ' ')
+    )
+
+
+def explicit_python_selectors(workflow):
+    commands = unfold_run_commands(workflow).replace('\\\n', ' ')
     for script, arguments in re.findall(r'\btests/([\w]+\.py)\b([^\n]*)', commands):
         selectors = re.findall(r'\b([A-Za-z_]\w*)\.(test_\w+)\b', arguments)
         if selectors:
@@ -65,6 +69,15 @@ class CiContractTests(unittest.TestCase):
         )
         self.assertEqual(list(explicit_python_selectors(workflow)),
                          [('remote.py', [('RemoteTests', 'test_missing')])])
+
+    def test_real_fuse_http2_command_keeps_all_its_arguments(self):
+        body = unfold_run_commands(job('real-fuse'))
+        command = (
+            '"$RUNNER_TEMP/http2-tests/bin/python" tests/integration.py '
+            '--binary target/release/git-on --require-fuse --uv'
+        )
+        self.assertIn('        run: ' + command + '\n', body)
+        self.assertNotIn('        run: ' + command + '\n', job('real-fuse'))
 
     def test_package_requires_real_linux_and_macos_builds(self):
         body=job('package-build')
@@ -181,19 +194,26 @@ elif sys.argv[1:3]==['apt-get','install']:
 
     def test_missing_intermediate_baseline_keeps_current_pack_scaling_gate(self):
         body=job('rust')
-        script=re.search(r'      - name: Measure distinct-object pack work.*?        run: ([^\n]+)',body,re.S)[1]
+        script=re.search(r'      - name: Measure distinct-object pack work.*?        run: ([^\n]+)',
+                         unfold_run_commands(body),re.S)[1]
+        self.assertNotIn('        run: ' + script + '\n', body)
         self.assertNotIn('git worktree',body,'historical red binaries are opt-in, not recurring builds')
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);tools=root/'tools';tools.mkdir();calls=root/'calls'
+            root = Path(directory)
+            calls = root / 'calls'
             subprocess.run(['git','init','--quiet',str(root/'repo')],check=True)
-            (tools/'python3').write_text('#!'+sys.executable+'\nimport json,os,sys\nopen(os.environ["CALLS"],"w").write(json.dumps(sys.argv[1:]))\n')
-            (tools/'python3').chmod(0o755)
+            interpreter = root / 'http2-tests' / 'bin' / 'python'
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text('#!'+sys.executable+'\nimport json,os,sys\nopen(os.environ["CALLS"],"w").write(json.dumps(sys.argv[1:]))\n')
+            interpreter.chmod(0o755)
             result=subprocess.run(['bash','-euo','pipefail','-c',script],cwd=root/'repo',capture_output=True,text=True,
-                env={**os.environ,'PATH':str(tools)+os.pathsep+os.environ['PATH'],'CALLS':str(calls)})
+                env={**os.environ,'CALLS':str(calls),'RUNNER_TEMP':str(root)})
             self.assertEqual(result.returncode,0,result.stderr)
             arguments=json.loads(calls.read_text())
-            self.assertEqual(arguments[:3],['tests/pack_scaling.py','--probe','target/debug/examples/source-probe'])
-            self.assertNotIn('--before-probe',arguments)
+            self.assertEqual(arguments, [
+                'tests/pack_scaling.py', '--probe', 'target/debug/examples/source-probe',
+                '--output', 'pack-scaling.jsonl',
+            ])
 
     def test_trigger_pins_the_tested_commit_and_never_moves_existing_tags(self):
         script=textwrap.dedent(re.search(r'        run: \|\n(.*)',job('release'),re.S)[1])

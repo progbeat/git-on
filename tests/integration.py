@@ -350,52 +350,6 @@ class CliTests(RepositoryTest):
                         if runner.poll() is None:runner.kill()
                         runner.communicate(timeout=10)
 
-    @unittest.skipUnless(os.environ.get("GIT_ON_TEST_SERVICE_TMPFS"), "requires two sized tmpfs mounts")
-    def test_native_copy_uses_larger_service_tmpfs(self):
-        import hashlib
-        import random
-
-        data = random.Random(42).randbytes(5 << 20)
-        (self.repo / "large.bin").write_bytes(data)
-        git(self.repo, "add", "large.bin")
-        git(self.repo, "commit", "--quiet", "-m", "native pack exceeds the small tmpfs")
-        runtime = Path(os.environ["GIT_ON_TEST_SERVICE_TMPFS"])
-        small = Path("/dev/shm").resolve()
-        small_before = set(small.iterdir())
-        home = self.root / "home"
-        home.mkdir()
-        argv = [
-            self.repo.as_uri(), "HEAD:refs/heads/private-copy", "--backend=copy",
-            "--write-policy=all", "--", sys.executable, "-I", "-S", "-c",
-            "from hashlib import sha256; print(sha256(open('large.bin', 'rb').read()).hexdigest())",
-        ]
-        env, calls = record_git_invocations(
-            self.root, dict(self.environment(), HOME=str(home), LC_ALL="C"),
-            include_env=("GIT_OBJECT_DIRECTORY",),
-        )
-        checksum = hashlib.sha256(data).hexdigest().encode() + b"\n"
-        cases = (
-            ("explicit", dict(GIT_ON_SERVICE_TMPDIR=str(small), XDG_RUNTIME_DIR=str(runtime)),
-             (small,), 125),
-            ("fallback", dict(XDG_RUNTIME_DIR=str(self.system_tmp)), (small, self.system_tmp), 0),
-            ("larger", dict(XDG_RUNTIME_DIR=str(runtime)), (runtime,), 0),
-        )
-        for selection, settings, roots, status in cases:
-            with self.subTest(selection=selection):
-                calls.write_text("")
-                result, _ = self.invoke_argv(argv, extra_env=env | settings)
-                self.assertEqual(result.returncode, status, result.stderr)
-                self.assertEqual(result.stdout, b"" if status else checksum)
-                if status:
-                    self.assertIn(b"No space left on device", result.stderr)
-                attempts = [Path(call["env"]["GIT_OBJECT_DIRECTORY"])
-                            for call in git_invocations(calls) if "fetch" in call["argv"]]
-                self.assertEqual(len(attempts), len(roots), attempts)
-                for attempt, root in zip(attempts, roots, strict=True):
-                    self.assertTrue(attempt.is_relative_to(root.resolve()), attempts)
-                self.assertEqual(set(small.iterdir()), small_before)
-                self.assertEqual(list(runtime.iterdir()), [])
-                self.assert_no_runtime_files()
 
     def test_help_and_version(self):
         for arg in ("--help", "-h", "--version"):
@@ -497,23 +451,17 @@ class CliTests(RepositoryTest):
         self.assertFalse(sentinel.exists())
         self.assert_no_runtime_files()
 
-    def test_git_rejection_of_an_option_looking_repository_path_is_preserved(self):
+    def test_option_looking_local_repository_is_read_as_a_path(self):
         (self.repo / "--source").symlink_to(self.repo, target_is_directory=True)
-        branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
-        native = subprocess.run(["git", "ls-remote", "--symref", "--", "--source"],
-                                cwd=self.repo, env=self.environment(), capture_output=True, timeout=10)
-        self.assertNotEqual(native.returncode, 0)
-        sentinel = self.root / "executed"
+        expected = git(self.repo, "-C", "--source", "show", "HEAD:tracked.txt")
         result, run = self.invoke_argv([
-            "--source", branch, "--", sys.executable, "-c",
-            f"open({str(sentinel)!r}, 'w').close()",
+            "--source", "HEAD", "--backend=copy", "--write-policy=all", "--",
+            sys.executable, "-c", "from pathlib import Path; print(Path('tracked.txt').read_text(), end='')",
         ])
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(native.stderr.strip(), result.stderr)
-        self.assertNotIn(b"Usage: git on", result.stderr)
-        self.assertFalse(sentinel.exists())
+        self.assert_success(result)
+        self.assertEqual(result.stdout.decode().strip(), expected)
         self.assertIsNone(run)
-        self.assertEqual(list(self.system_tmp.iterdir()), [])
+        self.assert_no_runtime_files()
 
     def test_control_modes_preserve_first_token_precedence_and_literal_paths(self):
         for args in (["--help", "--nope"], ["-h", "--version", "--"],
@@ -1020,20 +968,22 @@ for run_present in (False, True):
 
 @unittest.skipUnless(MOUNT_AVAILABLE, "real FUSE or NFS mount required")
 class MountTests(MountedRepositoryTest):
-    def lazy_native_stat_fixture(self):
+    def serve_repository(self):
+        from remote import Fixture
+
+        server = Fixture(self.repo / '.git')
+        self.addCleanup(server.close)
+        return server.https(), server.env['GIT_SSL_CAINFO']
+
+    def lazy_remote_stat_fixture(self):
         size=7*1024*1024
         (self.repo/'large').write_bytes(b'x'*size)
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','lazy native decode disk budget')
-        git(self.repo,'config','uploadpack.allowFilter','true')
-        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
-        # An explicit fsck policy retains native fetch/cat-file rather than the
-        # reusable protocol session. The oracle inherits the same Git setting.
-        config=dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
-        return self.repo.as_uri(),['stat','-c','%s','large'],config,size
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','lazy remote decode disk budget')
+        return self.serve_repository()
 
     @fuse_only
-    def test_lazy_native_stat_writes_one_decoded_payload(self):
-        source,_,config,_=self.lazy_native_stat_fixture()
+    def test_lazy_remote_stat_keeps_decoded_payload_in_memory(self):
+        source, ca = self.lazy_remote_stat_fixture()
         def write_bytes():
             return int(dict(line.split(': ',1) for line in Path('/proc/self/io').read_text().splitlines())['write_bytes'])
         before=write_bytes()
@@ -1053,12 +1003,12 @@ before=written()
 size=Path('large').stat().st_size
 assert size==7*1024*1024,size
 count=written()-before
-assert count<size+1024*1024,('stat wrote duplicate decoded payloads',count,size)
+assert count<1024*1024,('stat wrote decoded payloads',count,size)
 print(size)
 ''']
-        env=dict(self.environment(),**config)
+        env=dict(self.environment(), GIT_CONFIG_COUNT='0', GIT_SSL_CAINFO=ca)
         clone=self.root/'clone'
-        result=subprocess.run(['git','clone','--no-local','--quiet',source,str(clone)],
+        result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
                               env=env,capture_output=True,timeout=20)
         self.assert_success(result)
         direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
@@ -1069,11 +1019,12 @@ print(size)
         self.assert_no_runtime_files()
 
     @fuse_only
-    def test_lazy_native_stat_succeeds_on_nine_mib_tmpfs(self):
+    def test_lazy_remote_stat_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
-        source,command,_,_=self.lazy_native_stat_fixture()
+        source, ca = self.lazy_remote_stat_fixture()
+        command = ['stat', '-c', '%s', 'large']
         compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],command,
-                         source=source,write_policy='none',git_config={'fetch.fsckObjects':'false'})
+                         source=source,write_policy='none',tls_ca=ca)
         self.assert_no_runtime_files()
 
     source_mutations=('read','write','truncate','read-write','read-truncate','read-rewrite','read-truncate-extend','read-replace')
@@ -1154,36 +1105,31 @@ print('writable lifecycle verified')
 
     def test_remote_mutations_fit_checkout_disk_budget(self):
         template=self.writable_open_fixture(source='remote')
-        git(self.repo,'config','uploadpack.allowFilter','true')
-        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
-        source=self.repo.as_uri()
-        for native in (False,True):
-            config=(dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false') if native else {})
-            env=dict(self.environment(),**config)
-            for mutation in ('read-write','read-rewrite','read-truncate-extend','read-replace'):
-                with self.subTest(native=native,mutation=mutation):
-                    clone=self.root/f'clone-{native}-{mutation}'
-                    command=[*template[:-1],mutation]
-                    result=subprocess.run(['git','clone','--no-local','--quiet',source,str(clone)],
-                                          env=env,capture_output=True,timeout=20)
-                    self.assert_success(result)
-                    direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
-                    self.assert_success(direct)
-                    result,_=self.invoke_argv([source,'HEAD','--write-policy=all','--',*command],extra_env=config)
-                    self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
-                    self.assert_no_runtime_files()
+        source, ca = self.serve_repository()
+        config = {'GIT_CONFIG_COUNT': '0', 'GIT_SSL_CAINFO': ca}
+        env = dict(self.environment(), **config)
+        for mutation in ('read-write','read-rewrite','read-truncate-extend','read-replace'):
+            with self.subTest(mutation=mutation):
+                clone=self.root/f'clone-{mutation}'
+                command=[*template[:-1],mutation]
+                result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
+                                      env=env,capture_output=True,timeout=20)
+                self.assert_success(result)
+                direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
+                self.assert_success(direct)
+                result,_=self.invoke_argv([source,'HEAD','--write-policy=all','--',*command],extra_env=config)
+                self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+                self.assert_no_runtime_files()
 
     @fuse_only
     def test_remote_rewrite_and_replacement_succeed_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
         template=self.writable_open_fixture(source='remote')
-        git(self.repo,'config','uploadpack.allowFilter','true')
-        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
-        for native in (False,True):
-            for mutation in ('read-rewrite','read-replace'):
-                with self.subTest(native=native,mutation=mutation):
-                    compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*template[:-1],mutation],
-                                     source=self.repo.as_uri(),git_config={'fetch.fsckObjects':'false'} if native else {})
+        source, ca = self.serve_repository()
+        for mutation in ('read-rewrite', 'read-replace'):
+            with self.subTest(mutation=mutation):
+                compare_on_tmpfs(self, self.root, BINARY, self.repo, os.environ['PATH'],
+                                 [*template[:-1], mutation], source=source, tls_ca=ca)
         self.assert_no_runtime_files()
 
     def shared_source_fixture(self):
@@ -1279,8 +1225,7 @@ os.close(fd)
         self.add_spill_blobs(self.repo)
         git(self.repo,'add','.');git(self.repo,'commit','-qm','copy-up integrity')
         oid=git(self.repo,'rev-parse','HEAD:large')
-        git(self.repo,'config','uploadpack.allowFilter','true')
-        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        url, ca = self.serve_repository()
         command=[sys.executable,'-I','-S','-c',r'''
 import errno,os,sys
 from pathlib import Path
@@ -1308,9 +1253,10 @@ else:raise AssertionError('immutable read accepted a changed block')
 os.close(fd)
 print('private write and immutable read verified')
 ''',oid]
-        for source in ([],[self.repo.as_uri()]):
+        for source in ([], [url]):
             with self.subTest(source=source):
-                result,_=self.invoke_argv([*source,'HEAD','--write-policy=all','--',*command])
+                result,_=self.invoke_argv([*source, 'HEAD', '--write-policy=all', '--', *command],
+                                          extra_env={'GIT_CONFIG_COUNT': '0', 'GIT_SSL_CAINFO': ca})
                 self.assertEqual(result.returncode,125 if source else 0,result.stderr)
                 self.assertEqual(result.stdout,b'private write and immutable read verified\n')
                 self.assert_no_runtime_files()
@@ -1547,18 +1493,14 @@ assert p.read_bytes()==b'new'
         self.assertIsNone(run)
         self.assert_no_runtime_files()
 
-    def test_two_operands_fetch_literal_refspec_from_local_paths_into_a_private_snapshot(self):
-        git(self.repo, "config", "uploadpack.allowFilter", "true")
-        git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+    def test_two_operands_open_local_repository_without_creating_refs(self):
         branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
         before = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)")
         alias_name = b"repository space" if sys.platform == "darwin" else b"repository-\xff"
         raw_alias = self.root / os.fsdecode(alias_name)
         raw_alias.symlink_to(self.repo, target_is_directory=True)
-        cases = [(source, branch + ":refs/heads/private-copy")
-                 for source in (str(self.repo), ".", str(raw_alias))]
-        cases.append((str(self.repo), ""))
-        for source, revision in cases:
+        for source in (str(self.repo), ".", str(raw_alias)):
+            revision = branch
             with self.subTest(source=source, revision=revision):
                 result, run = self.invoke_argv([
                     source, revision, "--", sys.executable, "-c",
@@ -2031,8 +1973,7 @@ print('reread from spill')
             (directory / f'f{index:04d}').write_bytes(index.to_bytes(4, 'little') + b's' * (65536 - 4))
         git(self.repo, 'add', 'cache-spill')
         git(self.repo, 'commit', '--quiet', '-m', 'cache-only spill limit')
-        git(self.repo, 'config', 'uploadpack.allowFilter', 'true')
-        git(self.repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
+        source, ca = self.serve_repository()
         code = """
 import errno, os, resource
 with open('cache-spill/large', 'rb', buffering=0) as large:
@@ -2061,13 +2002,13 @@ with open('cache-spill/large', 'rb', buffering=0) as large:
     finally:
         resource.prlimit(runner, resource.RLIMIT_FSIZE, original)
 """
-        for source in ([], [self.repo.as_uri()]):
-            with self.subTest(source=source):
+        for operands in ([], [source]):
+            with self.subTest(source=operands):
                 try:
                     # Turn the write limit into EFBIG to exercise failed optional
                     # admission independently of the inherited signal policy.
-                    result = subprocess.run([str(BINARY), *source, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
-                                            cwd=self.repo, env=self.environment(), capture_output=True, timeout=60,
+                    result = subprocess.run([str(BINARY), *operands, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
+                                            cwd=self.repo, env=dict(self.environment(), GIT_CONFIG_COUNT='0', GIT_SSL_CAINFO=ca), capture_output=True, timeout=60,
                                             preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
                     self.assert_success(result)
                     self.assertEqual(result.stdout, b'checked bytes survived cache-only spill failure\n')

@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import time
 import unittest
 
@@ -51,12 +52,14 @@ def state(pid):
 class Shell:
     prompt = b'git-on-job-shell> '
 
-    def __init__(self, fixture):
+    def __init__(self, fixture, *, size=None):
         self.groups = set()
         self.pending = bytearray()
         self.transcript = bytearray()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            if size is not None:
+                termios.tcsetwinsize(0, size)
             env = dict(fixture.env, PS1=self.prompt.decode(), PS2='continuation> ', TERM='dumb')
             remote.exec_fixture_child(
                 [shutil.which('bash'), '--noprofile', '--norc', '-i'], fixture.cwd, env)
@@ -105,6 +108,9 @@ class Shell:
                     os.killpg(group, sig)
         with contextlib.suppress(OSError):
             self.send(b'exit\n')
+        # Hang up before reaping. On macOS the exiting controlling shell can
+        # otherwise wait for the master side of the terminal to close.
+        os.close(self.fd)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             child, _ = os.waitpid(self.pid, os.WNOHANG)
@@ -118,7 +124,6 @@ class Shell:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(self.pid, signal.SIGKILL)
             os.waitpid(self.pid, 0)
-        os.close(self.fd)
 
 
 class NativeJobControlTests(unittest.TestCase):
@@ -142,12 +147,13 @@ class NativeJobControlTests(unittest.TestCase):
         shell.groups.add(runner)
         native = []
         for child in children(runner):
-            transports = children(child)
-            if any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh' for pid in transports):
-                native.append((child, transports))
-        self.assertEqual(len(native), 1, 'expected one native Git process with an SSH transport')
-        (git, self.transport_pids), = native
-        self.runner, self.native_group = runner, os.getpgid(git)
+            transports = [child, *children(child)]
+            ssh = [pid for pid in transports if Path(f'/proc/{pid}/exe').resolve().name == 'ssh']
+            if ssh:
+                native.append((child, ssh))
+        self.assertEqual(len(native), 1, 'expected one owned SSH transport group')
+        (leader, self.transport_pids), = native
+        self.runner, self.native_group = runner, os.getpgid(leader)
         shell.groups.add(self.native_group)
         if not native_terminal:
             run, = remote.run_directories(self.f.root)
@@ -156,9 +162,9 @@ class NativeJobControlTests(unittest.TestCase):
             self.assertTrue(socket.is_socket())
             self.assertFalse(list(self.f.root.glob('.git-on-terminal-*')))
         self.assertEqual(os.getpgid(runner), runner)
-        self.assertEqual(self.native_group, git)
+        self.assertEqual(self.native_group, leader)
         self.assertNotEqual(self.native_group, runner)
-        self.assertEqual(os.getsid(git), shell.pid if native_terminal else git)
+        self.assertEqual(os.getsid(leader), shell.pid if native_terminal else leader)
         self.assertEqual(os.tcgetpgrp(shell.fd), self.native_group if native_terminal else runner)
 
     def stop_authentication(self):
@@ -174,7 +180,7 @@ class NativeJobControlTests(unittest.TestCase):
         self.assertIn(b'Stopped', output)
         self.assertEqual(state(self.runner), 'T')
         shell.wait_for(lambda: state(self.native_group)=='T',
-                       'native Git did not stop with the invoking job')
+                       'OpenSSH did not stop with the invoking job')
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
 
     def foreground(self):
@@ -314,7 +320,7 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         self.assertIn(b'\r\nASKPASS-STATUS:0\r\n',output)
         self.assertEqual(remote.run_directories(f.root),[])
 
-    def test_repeated_managed_credentials_keep_runner_in_foreground(self):
+    def test_managed_https_credential_lookup_keeps_runner_in_foreground(self):
         import base64
         f=remote.Fixture(); self.addCleanup(f.close)
         # Fork the shell before starting the fixture's HTTPS server thread.
@@ -337,7 +343,7 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                           ' token=subprocess.check_output([os.environ["GIT_ASKPASS"],"https-helper-token: "])\n'
                           ' sys.stdout.write("username=fixture\\npassword="+token.decode().strip()+"\\n")\n')
         helper.chmod(0o700)
-        # Lazy HTTPS preparation authenticates separate native Git processes.
+        # The direct HTTPS session authenticates during discovery.
         # Hide the FUSE helper so the test can stop before mounting.
         programs=f.root/'programs'; programs.mkdir()
         (programs/'git').symlink_to(shutil.which('git'))
@@ -364,7 +370,7 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         shell.groups.clear()
         self.assertIn(b'FUSE unavailable',output)
         self.assertIn(b'\r\nhttps-helper-status=125\r\n',output)
-        self.assertGreaterEqual(len(native_groups),2,'expected credentials in separate native processes')
+        self.assertEqual(len(native_groups),1,'expected one credential lookup per session')
         self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
         self.assertEqual(remote.run_directories(f.root),[],'HTTPS run leaked temporary storage')
 

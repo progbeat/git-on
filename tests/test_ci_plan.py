@@ -68,7 +68,7 @@ class CiPlanTests(unittest.TestCase):
             git('init','-q');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
             Path('source').write_text('committed');git('add','source');git('commit','-qm','fixture')
             head=git('rev-parse','HEAD');output=Path('pack-scaling.jsonl')
-            def observe(binary,count,before):
+            def observe(binary,count):
                 return next(r for r in pack_scaling_rows(head) if r['distinct_blobs']==count)
             with mock.patch('pack_scaling.exercise',side_effect=observe), \
                  mock.patch('pack_scaling.sys.platform','linux'), \
@@ -204,7 +204,7 @@ class CiPlanTests(unittest.TestCase):
             for validator in (lambda:validate_scale(plan,Path(directory)),lambda:validate_resources(plan,Path(directory)),lambda:validate_stress(Path(directory))):
                 with self.assertRaises(ValueError):validator()
 
-    def test_pack_report_requires_all_sizes_and_nonzero_observation(self):
+    def test_pack_report_requires_all_sizes_and_no_native_pack_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);path=root/'pack-scaling.jsonl'
             data=pack_scaling_rows(HEAD)
@@ -213,8 +213,13 @@ class CiPlanTests(unittest.TestCase):
             data.pop();write()
             with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
-            data[0]['pack_metadata_syscalls']=0;data.append(dict(data[0],distinct_blobs=512));write()
-            with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
+            data=pack_scaling_rows(HEAD)
+            for field in ('pack_metadata_syscalls','remote_fetch_operations','remote_repositories_created'):
+                record=data[0] if field=='pack_metadata_syscalls' else data[0]['metrics']
+                with self.subTest(field=field):
+                    record[field]=1;write()
+                    with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
+                    record[field]=0
 
     def test_resource_gate_requires_complete_current_cache_reports(self):
         plan=dict(head=HEAD,required=dict(scale=False,resources=True,stress=False,lazy=False))

@@ -944,7 +944,7 @@ mod tests {
 
     fn verified_extra(store: &RawBlobs, oid: Oid) -> VerifiedObject {
         match store.received(oid) {
-            Some(ReceivedObject::Verified { object, .. }) => object,
+            Some(ReceivedObject { object, .. }) => object,
             _ => panic!("expected a verified extra Git object"),
         }
     }
@@ -1157,45 +1157,6 @@ mod tests {
         received.cache_extras(&scratch, None, |_| {});
         assert_eq!(verified_extra(&scratch, oids[1]).data(), bases[1]);
         assert_eq!(DELTA_APPLICATIONS.get(), 4);
-    }
-
-    #[test]
-    fn publishing_a_verified_extra_preserves_an_already_selected_pack() {
-        let root = tempfile::tempdir().unwrap();
-        let scratch = RawBlobs::new(root.path()).unwrap();
-        let base = b"base";
-        let oid = Oid::hash_object(ObjectType::Blob, base).unwrap();
-        let directory = Arc::new(tempfile::tempdir_in(root.path()).unwrap());
-        let packed = directory.path().join("pack");
-        std::fs::write(&packed, base).unwrap();
-        scratch.remember_packed(oid, &directory, base.len());
-        drop(directory);
-        let Some(ReceivedObject::Packed {
-            directory: selected,
-            size,
-        }) = scratch.received(oid)
-        else {
-            panic!("expected a native pack source");
-        };
-        assert_eq!(size, base.len());
-
-        let wanted = Oid::hash_object(ObjectType::Blob, b"wanted").unwrap();
-        let mut response = Response::new(scratch.clone(), vec![wanted], Box::new(|_| Ok(())));
-        let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
-        pack.extend_from_slice(&pack_entry(3, &[], base));
-        pack.extend_from_slice(&pack_entry(3, &[], b"wanted"));
-        response.pack.write(&pack).unwrap();
-        response.pack.write(&Sha1::digest(&pack)).unwrap();
-        response
-            .pack
-            .finish()
-            .unwrap()
-            .cache_extras(&scratch, None, |_| {});
-
-        assert_eq!(verified_extra(&scratch, oid).data(), base);
-        assert_eq!(std::fs::read(selected.path().join("pack")).unwrap(), base);
-        drop(selected);
-        assert!(!packed.exists());
     }
 
     #[test]

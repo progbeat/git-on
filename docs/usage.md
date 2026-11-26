@@ -24,9 +24,10 @@ one local revision, or a repository followed by a revision. Recognized
 `--verify`, `--backend=auto|fuse|nfs|copy` and `--write-policy=none|ignored|untracked|all` options may
 appear anywhere before that separator, interspersed with the operands.
 `--keep` and `-k` before the separator return usage 2 with migration guidance. With one
-operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`. With two,
-native `git fetch` receives the unchanged repository and revision/refspec;
-`main:destination` is a fetch refspec, not a remote directory selector.
+operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`.
+With a local repository operand, `REV` has the same meaning as when using
+`git -C PATH on REV`. HTTPS and SSH follow the
+[network selection rules](remote.md#network-transport-profile).
 Everything after that first separator is literal command
 argv: git-on does not parse the command's options or any subsequent `--`.
 
@@ -42,8 +43,8 @@ git on HEAD:examples/uv-project -- uv run --locked main.py
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
 | `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
-| `git on /path/to/repo.git heads/main -- cmd` | Native Git fetch selects the branch from a local repository |
-| `git on origin +main:refs/heads/private-copy -- cmd` | Fetch refspec; destination exists only in the temporary repository |
+| `git on /path/to/repo.git HEAD:subdir -- cmd` | Select the local subtree as with `git -C /path/to/repo.git on HEAD:subdir -- cmd` |
+| `git on https://github.com/owner/repo.git refs/heads/main -- cmd` | Select the named branch over direct HTTPS |
 
 Missing `--`, missing revision operands, extra positional operands, malformed
 git-on options and missing/empty command names return 2 before Git resolution.
@@ -73,7 +74,7 @@ second `--` belongs to that executable.
 | `nfs` | Requires a macOS NFSv4.1 mount. |
 | `copy` | Eagerly creates a regular temporary directory. Requires explicit `--write-policy=all`. |
 
-For repository operands, native fetch semantics, cache bounds and signature verification,
+For repository operands, revision selection, cache bounds and signature verification,
 see [the remote guide](remote.md).
 
 The selected tree is resolved once to a full tree object ID. Commits, annotated tags
@@ -168,19 +169,13 @@ and the visible checkout in `copy` mode.
 
 ### Temporary storage
 
-Git-on keeps native Git's selection record and private refs in the run
-directory. It creates a private service directory on demand for incoming
-objects, pack indexes, a streamed commit or tag for native verification, and
-transport or diagnostic files. It chooses
-the writable `tmpfs` with the most available space among `/dev/shm`,
-`XDG_RUNTIME_DIR`, and the system temporary directory. If none is writable
-`tmpfs`, it uses the system temporary directory, usually `TMPDIR`. Set
-`GIT_ON_SERVICE_TMPDIR` to choose an existing writable `tmpfs` explicitly.
-If a pack write runs out of space on an automatically chosen `tmpfs`,
-Git-on can retry it once using the run filesystem before native Git records
-its selection. Git writes incoming packs and indexes directly to
-the directory Git-on reads for that fetch.
-An explicit `GIT_ON_SERVICE_TMPDIR` must have room for the native files.
+Git-on creates a private service directory on demand for verification,
+local index resolution, credentials, and transport diagnostics. It chooses
+an existing writable `tmpfs` among `/dev/shm`, `XDG_RUNTIME_DIR`, and the
+system temporary directory, or uses the system temporary directory if none
+is suitable. `GIT_ON_SERVICE_TMPDIR` can select an existing writable `tmpfs`
+explicitly. This variable does not move LRU spills or the execution tree.
+Git-on removes its service directory on completion.
 
 `--verify` uses the configured Git verifier and its ordinary environment.
 Verification can have the same effects as a direct Git invocation, including

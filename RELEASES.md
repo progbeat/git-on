@@ -1,6 +1,20 @@
 # 1.5.3
 <!-- Bump: patch -->
 
+- Use direct Git protocol v2 for network loads. HTTPS requires HTTP/2 and
+  SSH requires OpenSSH. Select `HEAD`, a full SHA-1 OID, a full ref, or an
+  unambiguous branch or tag. Use a direct URL or configured remote and a
+  full ref if names compete. Older HTTP/Git transports, proxies, and native
+  network fetch fallbacks have been removed. Local paths and `file://` remain
+  supported.
+- Read explicit local sources, including `file://` and named remotes, with
+  the same revision semantics as `git -C PATH on REV`. Use `HEAD:subdir` to
+  select a local subtree. Local revisions no longer write fetch destinations.
+  Native local object reads require Git with `--no-lazy-fetch` (Git 2.45+).
+  Complex alternates use the source reader without a temporary bare repository.
+  `Snapshot::source_git_dir()` reports the local Git directory or `None` for a network snapshot.
+- Remove system `git fetch` from preparation and lazy reads, along with
+  private fetch repositories, staged pack/index files, and packet trace replay.
 - Restore the legacy Rust `Snapshot::load_with_pin_record` signature.
   Both pin-record loaders accept a git2 0.20 `Oid` callback. The loaders
   ignore these callbacks and their return values. Use git2 0.21 OIDs for
@@ -8,8 +22,6 @@
   it with git2 0.21’s `Oid::from_bytes(old.as_bytes())`.
 - Document when OpenSSH can run configured `Match exec` commands, including
   during configuration inspection before connecting.
-- Resolve named SSH refs through native Git when a selection channel
-  advertises `ref-in-want` so a lagging replica can serve the tag by name.
 - Fetch each tree individually on a lazy remote mount so filtered Git
   responses include every requested subdirectory and file.
 - For slow sequential reads, check SSH channel completion while the pack
@@ -35,21 +47,14 @@
   memory from the first fetch. Stream native decoder requests and borrow cached
   blob ranges when serving reads.
 - Keep direct reusable HTTPS and SSH startup metadata in verified in-memory
-  buffers. Store the files required by native Git in a private directory on
-  an existing writable tmpfs or in the system temporary directory. Scan the
-  native ref advertisement trace with bounded memory.
+  buffers. Use an existing writable tmpfs or the system temporary directory
+  for the private files required by native verification and index resolution.
 - Use Git's configured signature verifier in its normal environment. A signed
   annotated tag selects the tree recorded by the verified tag object even
   when the tag ref moves. For supported remote copy runs, verify the streamed
   commit or tag with Git without staging a pack or index.
-- Stream the first filtered fetch from compatible local paths and `file://`
-  URLs without staging a pack or index.
-- Decode the shallow snapshot pack in memory for compatible HTTPS, SSH, and
-  local file transport copy runs selected by a full Git OID, an unambiguous
-  branch or tag, or `HEAD`.
-  HTTPS copy can stream over HTTP/1.1 as well as HTTP/2 and can query refs before
-  retrying a refused first fetch by full OID. Preserve the selected OID when
-  HTTPS switches to native Git or mounting falls back to copy.
+- Decode one shallow snapshot pack in memory for HTTPS and SSH copy runs.
+  Preserve the selected OID when automatic mounting falls back to copy.
 - Wake the startup indicator immediately when preparation finishes.
 - Skip the extra HTTPS ref query when mounting a full Git OID.
 - Let Linux FUSE reuse negative lookups of names in a read-only snapshot.

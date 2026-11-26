@@ -7,8 +7,10 @@ optional passthrough does not change that requirement.
 HTTPS uses the system libcurl and its TLS and HTTP/2 libraries. The Linux
 binary loads the distribution's `libcurl.so.4` at startup. On Ubuntu the
 `curl` package installs this dependency. macOS supplies libcurl as part of
-the operating system. The optimized transport requires TLS and HTTP/2 support
-in libcurl. Native Git handles HTTPS on builds that lack either capability.
+the operating system. HTTPS requires both TLS and HTTP/2 support in libcurl.
+
+Local object access uses Git's `--no-lazy-fetch` option from Git 2.45.
+Network execution requires Git 2.45.1 or newer.
 
 ## Apple Silicon
 

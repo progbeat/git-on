@@ -1,8 +1,8 @@
-//! One request queue for HTTP/2, native HTTPS helpers and owned SSH channels.
+//! One request queue for HTTP/2 and owned SSH channels.
 use crate::{
     object, pack_stream,
     raw_blob::{DemandLookup, RawBlobs, Transfer},
-    transport::{Connection, Session, StartingSession},
+    transport::{Connection, Session},
 };
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -11,7 +11,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, OnceLock, Weak,
     },
     thread::{self, JoinHandle},
@@ -60,16 +60,6 @@ impl Batch {
 
     pub(crate) fn take(&self) -> Option<Result<Acquired>> {
         self.result.lock().unwrap().take()
-    }
-
-    pub(crate) fn requires_native_preparation(&self) -> bool {
-        match &*self.result.lock().unwrap() {
-            Some(Err(error)) => {
-                error.is::<crate::http2::NativeAuthentication>()
-                    || error.is::<crate::http2::Http1Required>()
-            }
-            _ => false,
-        }
     }
 }
 
@@ -600,7 +590,10 @@ impl Queue {
         if needs_ssh_channel
             && prefer_ready_ssh
             && self.failure.is_none()
-            && self.has_idle_ssh(index, ready_channels)
+            && self
+                .idle_ssh_channels(index, ready_channels)
+                .next()
+                .is_some()
         {
             return None;
         }
@@ -633,8 +626,9 @@ impl Queue {
             NativeWork::Connect
         } else {
             let work = Work::take(pending, speculative)?;
-            // A slow sequential read can use a channel for its final response
-            // while another negotiated channel stays eligible for a new read.
+            // A slow lookup can send EOF with the fetch and overlap SSH
+            // exit with the response. A tree lookup needs a second spare
+            // so the file can still use this path after more lookups.
             let last_request = self.mount_reads == MountReads::Lookup
                 && ready_ssh
                 && !speculative
@@ -643,7 +637,10 @@ impl Queue {
                 && work.items.len() == 1
                 && self.waiting.iter().all(|item| item.demand.ready())
                 && self.ahead.is_empty()
-                && self.has_idle_ssh(index, ready_channels);
+                && self
+                    .idle_ssh_channels(index, ready_channels)
+                    .nth(usize::from(work.items[0].demand.is_tree()))
+                    .is_some();
             if last_request {
                 // Claim the lease under the queue lock. Concurrent requests
                 // must see this channel as spent before another can close.
@@ -659,8 +656,8 @@ impl Queue {
         Some(work)
     }
 
-    fn has_idle_ssh(&self, index: usize, limit: usize) -> bool {
-        (0..limit).any(|other| {
+    fn idle_ssh_channels(&self, index: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..limit).filter(move |&other| {
             // An idle channel's worker still owns its unreaped process.
             other != index && !self.busy[other] && self.ssh_channels[other].is_open()
         })
@@ -809,6 +806,7 @@ struct Shared {
     queue: Mutex<Queue>,
     work: Condvar,
     stop: Arc<AtomicBool>,
+    completing_used_packs: AtomicUsize,
     finishing_used_packs: Arc<AtomicBool>,
     additional_starts: AtomicU64,
     http2_fetches: AtomicU64,
@@ -824,6 +822,12 @@ struct Shared {
 struct Http2Batch {
     work: Work,
     started: Instant,
+}
+
+enum InitialChannel {
+    Ready(Session),
+    Standby(Option<crate::transport::StartingSession>),
+    OnDemand,
 }
 
 enum NativeWork {
@@ -855,7 +859,6 @@ pub(crate) struct Pool {
 pub(crate) struct PackVerification {
     pool: Arc<Mutex<ObservedPool>>,
     scratch: RawBlobs,
-    complete: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -869,7 +872,6 @@ impl PackVerification {
         Self {
             pool: Arc::default(),
             scratch: scratch.clone(),
-            complete: Arc::default(),
         }
     }
 
@@ -897,14 +899,24 @@ impl PackVerification {
         }
     }
 
-    pub(crate) fn wait(&self) -> Result<()> {
+    pub(crate) fn wait(&self, finish: bool) -> Result<()> {
         let Some(shared) = self.pool.lock().unwrap().shared.upgrade() else {
-            self.complete.store(true, Ordering::Release);
             return Ok(());
         };
-        shared.finishing_used_packs.store(true, Ordering::Release);
+        // Materialization also waits for packs that supplied data. Reserve
+        // completion capacity without closing channels or discarding work.
+        shared.completing_used_packs.fetch_add(1, Ordering::Release);
+        let result = self.wait_for_used_packs(&shared, finish);
+        shared.completing_used_packs.fetch_sub(1, Ordering::Release);
+        result
+    }
+
+    fn wait_for_used_packs(&self, shared: &Shared, finish: bool) -> Result<()> {
         let mut queue = shared.queue.lock().unwrap();
-        shared.work.notify_all();
+        if finish {
+            shared.finishing_used_packs.store(true, Ordering::Release);
+            shared.work.notify_all();
+        }
         loop {
             object::check_transfer()?;
             if let Some(error) = queue.recorded_failure() {
@@ -915,13 +927,14 @@ impl PackVerification {
                 .values()
                 .any(|pack| pack.supplied_data(&self.scratch))
             {
-                // Idle channels can confirm their exit while we unmount.
-                // Busy channels can still have abandoned requests. Their
-                // shutdown must not wait for unrelated responses.
-                queue.ssh_exit_checks = Some(queue.busy.map(|busy| !busy));
-                queue.cancel_queued();
-                self.complete.store(true, Ordering::Release);
-                shared.work.notify_all();
+                if finish {
+                    // Idle channels can confirm their exit while we unmount.
+                    // Busy channels can still have abandoned requests. Their
+                    // shutdown must not wait for unrelated responses.
+                    queue.ssh_exit_checks = Some(queue.busy.map(|busy| !busy));
+                    queue.cancel_queued();
+                    shared.work.notify_all();
+                }
                 return Ok(());
             }
             // Signals are handled independently of the transport's condition
@@ -933,23 +946,14 @@ impl PackVerification {
                 .0;
         }
     }
-
-    pub(crate) fn complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
-    }
 }
 
 impl Pool {
-    pub(crate) fn new(first: Session, connection: Connection, scratch: &RawBlobs) -> Result<Self> {
-        let mut pool = Self::prepare_native(&connection, scratch, Vec::new())?;
-        pool.attach_primary(first, connection)?;
-        Ok(pool)
-    }
-
     pub(crate) fn prepare_native(
         connection: &Connection,
         scratch: &RawBlobs,
-        standby: Vec<StartingSession>,
+        warm_ssh: bool,
+        mut started_spare: Option<crate::transport::StartingSession>,
     ) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::default(),
@@ -959,14 +963,18 @@ impl Pool {
             ssh_snapshot: None,
         };
         {
-            let initial = 1 + standby.len().min(CONNECTIONS - 1);
+            let initial = if warm_ssh { 3 } else { 1 };
             let mut queue = pool.shared.queue.lock().unwrap();
             queue.initial_channels = initial;
             queue.starting[1..initial].fill(true);
         }
-        let mut standby = standby.into_iter();
         for index in 1..CONNECTIONS {
-            pool.start(index, None, connection.clone(), standby.next(), None)?;
+            let channel = if warm_ssh && index <= 2 {
+                InitialChannel::Standby(started_spare.take())
+            } else {
+                InitialChannel::OnDemand
+            };
+            pool.start(index, channel, connection.clone(), None)?;
         }
         Ok(pool)
     }
@@ -984,14 +992,14 @@ impl Pool {
             self.ssh_snapshot = Some(send);
             receive
         });
-        self.start(0, Some(first), connection, None, snapshots)
+        self.start(0, InitialChannel::Ready(first), connection, snapshots)
     }
 
     pub(crate) fn http2(
         configuration: crate::http2::Configuration,
         selection: crate::http2::Selection,
         scratch: &RawBlobs,
-    ) -> Result<Option<(Self, Option<Oid>)>> {
+    ) -> Result<(Self, Option<Oid>)> {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
         write.set_nonblocking(true)?;
@@ -1011,17 +1019,13 @@ impl Pool {
                     crate::transport::FetchMode::Filtered,
                 );
                 match client {
-                    Ok(Some((client, selected))) => {
-                        if ready.send(Ok(Some(selected))).is_ok() {
+                    Ok((client, selected)) => {
+                        if ready.send(Ok(selected)).is_ok() {
                             worker_state.run_http2(client, read, worker_signal, &worker_scratch);
                         }
                     }
-                    Err(error) if error.is::<crate::http2::AuthenticationRejected>() => {
+                    Err(error) => {
                         let _ = ready.send(Err(error));
-                    }
-                    _ => {
-                        // Discovery sent no wants and reported no rejected credential.
-                        let _ = ready.send(Ok(None));
                     }
                 }
                 Ok(())
@@ -1037,7 +1041,7 @@ impl Pool {
             .recv()
             .context("Git HTTP/2 dispatcher stopped during discovery")??;
         object::check_transfer()?;
-        Ok(ready.map(|selected| (pool, selected)))
+        Ok((pool, ready))
     }
 
     fn wake(&self) {
@@ -1050,18 +1054,15 @@ impl Pool {
     fn start(
         &mut self,
         index: usize,
-        session: Option<Session>,
+        channel: InitialChannel,
         connection: Connection,
-        standby: Option<StartingSession>,
         snapshots: Option<mpsc::Receiver<SnapshotRequest>>,
     ) -> Result<()> {
         let shared = self.shared.clone();
         let scratch = self.scratch.clone();
         let worker = thread::Builder::new()
             .name(format!("git-on-native-{index}"))
-            .spawn(move || {
-                shared.worker(index, session, connection, &scratch, standby, snapshots)
-            })?;
+            .spawn(move || shared.worker(index, channel, connection, &scratch, snapshots))?;
         self.workers.get_mut().unwrap().push(worker);
         Ok(())
     }
@@ -1095,6 +1096,36 @@ impl Pool {
     ) -> Result<Demand> {
         object::check_transfer()?;
         let mut queue = self.shared.queue.lock().unwrap();
+        let demand = self.enqueue(&mut queue, oid, is_tree, lookup)?;
+        if !demand.ready() {
+            self.wake();
+        }
+        Ok(demand)
+    }
+
+    pub(crate) fn request_batch(
+        &self,
+        objects: impl Iterator<Item = (Oid, bool)>,
+    ) -> Result<Vec<Demand>> {
+        object::check_transfer()?;
+        let mut queue = self.shared.queue.lock().unwrap();
+        // Publish the whole group of cold objects to the scheduler at once.
+        let demands = objects
+            .map(|(oid, is_tree)| {
+                self.enqueue(&mut queue, oid, is_tree, || self.scratch.lookup_demand(oid))
+            })
+            .collect();
+        self.wake();
+        demands
+    }
+
+    fn enqueue(
+        &self,
+        queue: &mut Queue,
+        oid: Oid,
+        is_tree: bool,
+        lookup: impl FnOnce() -> DemandLookup,
+    ) -> Result<Demand> {
         if self.shared.stop.load(Ordering::Relaxed) || queue.ssh_exit_checks.is_some() {
             return Err(object::OperationCancelled.into());
         }
@@ -1115,7 +1146,6 @@ impl Pool {
             }
             #[cfg(feature = "test-metrics")]
             report_test_demand(oid);
-            self.wake();
             return Ok(demand);
         }
         let joins_flight = pending.is_some();
@@ -1332,7 +1362,8 @@ impl Shared {
         response.set_decode_priority(move |remaining| {
             use crate::raw_blob::PackDecodePriority;
 
-            if shared.finishing_used_packs.load(Ordering::Acquire) && active.supplied_data(&scratch)
+            if shared.completing_used_packs.load(Ordering::Acquire) != 0
+                && active.supplied_data(&scratch)
             {
                 PackDecodePriority::Completion
             } else if !speculative
@@ -1604,6 +1635,10 @@ impl Shared {
                 let batch = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
+                let pack = pack.with_context(|| {
+                    let oid = batch.work.items[0].oid;
+                    format!("Git HTTP/2 transfer for object {oid}")
+                });
                 self.finish(batch.work, pack, batch.started, None, scratch);
             }
             let timeout = delay.map_or(Duration::from_secs(1), |remaining| {
@@ -1625,27 +1660,38 @@ impl Shared {
     fn worker(
         self: &Arc<Self>,
         index: usize,
-        mut session: Option<Session>,
+        channel: InitialChannel,
         connection: Connection,
         scratch: &RawBlobs,
-        standby: Option<StartingSession>,
         snapshots: Option<mpsc::Receiver<SnapshotRequest>>,
     ) -> Result<()> {
         let ssh = connection.is_ssh();
+        let mut session = match channel {
+            InitialChannel::Ready(session) => Some(session),
+            InitialChannel::OnDemand => None,
+            InitialChannel::Standby(started) => {
+                let session = match started {
+                    Some(mut starting) => {
+                        starting.set_stop(self.stop.clone());
+                        starting.negotiate()
+                    }
+                    None => connection.connect_additional(self.stop.clone()),
+                }
+                .ok()
+                .flatten();
+                let mut queue = self.queue.lock().unwrap();
+                if let Some(session) = &session {
+                    queue.ssh_channels[index] = SshChannel::Ready(session.process_id());
+                    self.additional_starts.fetch_add(1, Ordering::Relaxed);
+                }
+                queue.finished_ssh_standby(index);
+                self.work.notify_all();
+                session
+            }
+        };
         let mut used = session.as_ref().is_some_and(Session::completed_fetch);
         let mut completed = Vec::<ActivePack>::new();
         let mut sent_shutdown_eof = false;
-        if let Some(mut standby) = standby {
-            standby.set_stop(self.stop.clone());
-            session = standby.negotiate().ok().flatten();
-            let mut queue = self.queue.lock().unwrap();
-            if let Some(session) = &session {
-                queue.ssh_channels[index] = SshChannel::Ready(session.process_id());
-                self.additional_starts.fetch_add(1, Ordering::Relaxed);
-            }
-            queue.finished_ssh_standby(index);
-            self.work.notify_all();
-        }
         if let Some(session) = session.as_mut().filter(|_| ssh) {
             session.close_input_after_command(self.finishing_used_packs.clone());
         }
@@ -1825,10 +1871,9 @@ impl Shared {
                 if ssh && queue.ssh_channels[index].is_ready() {
                     queue.ssh_channels[index] = SshChannel::Spent;
                 }
-                if !connection.is_stateless()
-                    && (error.is::<crate::transport::FailedTransportExit>()
-                        || error.is::<crate::transport::FailedTransportCompletion>()
-                            && !object::is_cancelled(error))
+                if error.is::<crate::transport::FailedTransportExit>()
+                    || error.is::<crate::transport::FailedTransportCompletion>()
+                        && !object::is_cancelled(error)
                 {
                     queue.record_channel_failure(used, &mut completed, error, scratch);
                 }
@@ -1840,7 +1885,7 @@ impl Shared {
             } else if last_request {
                 used = false;
                 completed.clear();
-            } else if !connection.is_stateless() && !used {
+            } else if !used {
                 let pack = work.active_pack();
                 if pack.supplied_data(scratch) {
                     used = true;
@@ -2322,7 +2367,7 @@ mod tests {
                     &scratch,
                 );
                 assert!(demand.ready());
-                let Some(crate::raw_blob::ReceivedObject::Verified { object, transfer }) =
+                let Some(crate::raw_blob::ReceivedObject { object, transfer }) =
                     scratch.received(oid)
                 else {
                     panic!("validated pack did not publish its extra");
@@ -2575,7 +2620,7 @@ mod tests {
         let error = anyhow::anyhow!("SSH channel exited with code 49");
         queue.record_channel_failure(false, &mut vec![active.clone()], &error, &scratch);
         assert!(queue.recorded_failure().is_none());
-        let Some(ReceivedObject::Verified { object, transfer }) = scratch.received(extra) else {
+        let Some(ReceivedObject { object, transfer }) = scratch.received(extra) else {
             panic!("verified extra missing");
         };
         scratch
@@ -2704,6 +2749,12 @@ mod tests {
 
     #[test]
     fn a_forecast_that_served_a_read_can_finish_with_all_decode_slots_busy() {
+        for finish in [false, true] {
+            check_used_forecast_completion(finish);
+        }
+    }
+
+    fn check_used_forecast_completion(finish: bool) {
         use git2::ObjectType::Blob;
 
         let directory = tempfile::tempdir().unwrap();
@@ -2751,35 +2802,30 @@ mod tests {
             .lock()
             .unwrap()
             .foreground(Oid::from_bytes(&[23; 20]).unwrap());
-        let (starting, started) = mpsc::channel();
-        let (finished, result) = mpsc::channel();
+        let waiting_for_slot = cache.pack_decode_wait_notice();
         thread::scope(|scope| {
             scope.spawn(move || {
-                starting.send(()).unwrap();
                 let outcome = pack
                     .write_http(&reply[split..])
                     .and_then(|()| pack.finish_http());
                 shared.finish(work, outcome, Instant::now(), None, &cache);
-                finished.send(()).unwrap();
             });
-            let began = started.recv_timeout(Duration::from_secs(2));
-            let early = result.recv_timeout(Duration::from_millis(150));
+            let blocked = waiting_for_slot.recv_timeout(Duration::from_secs(2));
             let (checked, check) = mpsc::channel();
-            scope.spawn(move || checked.send(verification.wait()).unwrap());
+            scope.spawn(move || {
+                let _ = checked.send(verification.wait(finish));
+            });
             let verified = check.recv_timeout(Duration::from_secs(2));
             drop(held);
             drop(ordinary);
-            began.unwrap();
-            assert!(
-                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
-                "forecast reserved the last slot while the command could still read"
-            );
+            blocked.expect("the forecast must wait for a decode slot");
             verified
-                .expect("a pack that served the command still needs its trailer")
+                .expect("a used pack could not obtain the completion slot")
                 .unwrap();
-            assert!(
+            assert_eq!(
                 unrelated.ready(),
-                "command exit left an unrelated reader queued"
+                finish,
+                "only command exit should cancel an unrelated reader"
             );
         });
     }
@@ -2793,7 +2839,6 @@ mod tests {
         let cache = RawBlobs::new(directory.path())?;
         let connection = Connection::new(
             Command::new("/usr/bin/false"),
-            false,
             Some(crate::transport::SshSocket {
                 // The worker already owns its channel. No new fetch in this
                 // test can open a connection.
@@ -2827,11 +2872,10 @@ mod tests {
                     .collect::<String>(),
             )
             .arg(&eof);
-        let mut idle =
-            Session::connect(command, false)?.context("idle SSH fixture must negotiate")?;
+        let mut idle = Session::connect(command)?.context("idle SSH fixture must negotiate")?;
         let response = pack_stream::Response::new(cache.clone(), vec![oid], Box::new(|_| Ok(())));
         idle.fetch_stream(&[oid], crate::transport::FetchMode::Filtered, response)?;
-        let mut pool = Pool::prepare_native(&connection, &cache, vec![])?;
+        let mut pool = Pool::prepare_native(&connection, &cache, false, None)?;
         pool.attach_primary(idle, connection)?;
 
         let pending = b"served, trailer still pending";
@@ -2853,7 +2897,7 @@ mod tests {
         let verification = PackVerification::new(&cache);
         verification.observe(&pool);
         thread::scope(|scope| {
-            let verifier = scope.spawn(|| verification.wait());
+            let verifier = scope.spawn(|| verification.wait(true));
             let deadline = Instant::now() + Duration::from_secs(2);
             while !eof.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
@@ -2877,15 +2921,12 @@ mod tests {
     }
 
     #[test]
-    fn only_persistent_channel_failure_affects_a_prior_completed_response() -> Result<()> {
-        for stateless in [false, true] {
-            check_exit_after_unused_fetch(stateless, false)?;
-            check_exit_after_unused_fetch(stateless, true)?;
-        }
-        Ok(())
+    fn failed_channel_exit_affects_a_prior_completed_response() -> Result<()> {
+        check_exit_after_unused_fetch(false)?;
+        check_exit_after_unused_fetch(true)
     }
 
-    fn check_exit_after_unused_fetch(stateless: bool, signaled: bool) -> Result<()> {
+    fn check_exit_after_unused_fetch(signaled: bool) -> Result<()> {
         use git2::ObjectType::Blob;
         use std::process::Command;
 
@@ -2907,21 +2948,12 @@ mod tests {
                 "-c",
                 r#"
             printf '%s\n' "$$" >"$3"
-            if [ "$4" = "stateless" ]; then
-                IFS= read -r capabilities
-                printf 'stateless-connect\n\n'
-                IFS= read -r connect
-                printf '\n'
-            fi
             printf '%b' "$1"
             while IFS= read -r packet; do
                 case "$packet" in *done) break;; esac
             done
             printf '%b' "$2"
-            if [ "$4" = "stateless" ]; then
-                printf '0002'
-            fi
-            if [ "$5" = "signal" ]; then
+            if [ "$4" = "signal" ]; then
                 kill -TERM "$$"
             fi
             exit 49
@@ -2931,11 +2963,10 @@ mod tests {
             .arg(encode(b"000eversion 2\n0019fetch=shallow filter\n0000"))
             .arg(encode(&pack_reply(&[(Blob, contents)], true)))
             .arg(&pid_file)
-            .arg(if stateless { "stateless" } else { "persistent" })
             .arg(if signaled { "signal" } else { "exit" });
-        let session = Session::connect(command, stateless)?
-            .context("local transport fixture must negotiate")?;
-        let connection = Connection::new(Command::new("/usr/bin/false"), stateless, None);
+        let session =
+            Session::connect(command)?.context("local transport fixture must negotiate")?;
+        let connection = Connection::new(Command::new("/usr/bin/false"), None);
         let mut pool = Pool {
             shared: Arc::default(),
             scratch: scratch.clone(),
@@ -2970,18 +3001,13 @@ mod tests {
         }
         let verification = PackVerification::new(&scratch);
         verification.observe(&pool);
-        let outcome = verification.wait();
-        if stateless {
-            outcome?;
+        let error = verification.wait(true).unwrap_err();
+        let expected = if signaled {
+            "signal: 15"
         } else {
-            let error = outcome.unwrap_err();
-            let expected = if signaled {
-                "signal: 15"
-            } else {
-                "exit status: 49"
-            };
-            assert!(format!("{error:#}").contains(expected), "{error:#}");
-        }
+            "exit status: 49"
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
         Ok(())
     }
 
@@ -3075,6 +3101,16 @@ mod tests {
         };
         queue.ssh_channels[0] = ready;
         queue.ssh_channels[INITIAL_CONNECTIONS] = ready;
+        let ancestor = queue.foreground(Oid::from_bytes(&[6; 20]).unwrap());
+        ancestor.0.is_tree.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            queue.native_work(0, false),
+            Some(NativeWork::Fetch {
+                last_request: false,
+                ..
+            })
+        ));
+        queue.busy[0] = false;
         queue.foreground(Oid::from_bytes(&[1; 20]).unwrap());
         assert!(matches!(
             queue.native_work(0, false),

@@ -75,7 +75,7 @@ Each spilled object has one raw file. The store retains one last-read file
 descriptor shared by its readers. Reusable HTTPS and SSH sessions decode full
 objects and deltas in RAM from the first pack.
 Readers can receive a verified object while the rest of the pack is still in
-flight. Native Git fetches can use temporary pack files. Native decoder
+flight. Native local object reader
 requests, Git's configuration and discovery output,
 and `mount_nfs` diagnostics pass through streams. Capture for
 operations that can invoke detached helpers or SSH proxies uses a seekable handle
@@ -90,11 +90,7 @@ I/O. A replay slot retains a compact encoding when the backing allocations
 would exceed its budget. The FUSE library accepts a single payload slice.
 Full blocks read for a contiguous reply can be authenticated in that buffer.
 An already resident block or an unaligned range is gathered as needed.
-Native ref discovery retains the packet trace for detached helpers and
-discards the ref listing. Remote subtrees stay in parsed metadata.
-See [temporary Git contexts](remote.md#temporary-git-contexts) for native
-fetch, verification and local object database exceptions, and the
-[specification](specification.md#resource-assumptions) for inherited limits.
+
 
 Explicit-all materialization verifies object bytes directly into the
 private execution tree, without a second complete raw copy. Loose objects
@@ -102,15 +98,12 @@ stream; packed/delta objects retain libgit2's required decoding. A repeated OID
 reuses a prepared file or symlink target across directories, authenticating the
 copied bytes against that original OID. File copies remain independent. The
 command starts only after every destination has passed verification and policy
-checks. Direct HTTPS, SSH, and `file://` materialization keep the decoded pack
-in RAM and release file buffers as they reach their destinations. Native Git fallback
-isolates each received compressed pack. Only the
-pack currently being decoded has an open ODB; it is released with its indexes
-after its last needed blob reaches the execution tree. Blobs up to 64 KiB use
-the ODB transfer; larger blobs stream from
-native Git through the same OID verifier into their destination, without a
-decoded raw spool. Repeated OIDs reuse verified files or symlink targets in the
-execution tree. Lazy FUSE reads retain the invocation-owned verified raw store.
+checks. Direct HTTPS and SSH materialization keep the decoded pack in RAM
+and release file buffers as they reach their destinations. Local
+materialization reads the original object database. Repeated OIDs reuse
+verified files or symlink targets in the execution tree. Lazy reads retain
+the invocation-owned verified raw store.
+
 
 On native mounts, metadata and namespace changes preserve the source OID.
 Writable opens, empty writes and unchanged-size truncation leave the source

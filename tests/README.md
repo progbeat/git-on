@@ -28,8 +28,12 @@ ratio or complete #20 acceptance. See [CI coverage](../docs/ci-performance.md).
 
 ```console
 cargo build --locked
-python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
-python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
+fixture_env=$(mktemp -d)
+trap 'rm -rf -- "$fixture_env"' EXIT
+python3 -m venv "$fixture_env"
+"$fixture_env/bin/python" -m pip install -r tests/requirements-http2.txt
+"$fixture_env/bin/python" tests/integration.py --binary target/debug/git-on --require-fuse --uv
+"$fixture_env/bin/python" tests/write_policy.py --binary target/debug/git-on --require-fuse
 ```
 
 Requirements: Linux, Git, Python 3.11+, `uv` (CI pins 0.8.22), a usable `/dev/fuse`,
@@ -79,15 +83,16 @@ sudo unshare --mount --net --uts --propagation private \
 `tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
 fixture certificates, identities, agents and signing keys. Native Git is the
 verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG;
-no user key or trust store is read or changed by these tests.
+no user key or trust store is read or changed by these tests. Use the Python
+environment with `tests/requirements-http2.txt` installed as shown above.
 
 ```console
 cargo build --locked --features test-metrics --example source-probe --bin git-on
-python3 tests/remote.py
-python3 tests/ssh_regressions.py
-python3 tests/native_job_control.py
-python3 tests/remote.py --require-fuse
-python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
+"$fixture_env/bin/python" tests/remote.py
+"$fixture_env/bin/python" tests/ssh_regressions.py
+"$fixture_env/bin/python" tests/native_job_control.py
+"$fixture_env/bin/python" tests/remote.py --require-fuse
+"$fixture_env/bin/python" tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
 ```
 
 The source probe exercises the production loader without a mount and records
@@ -127,6 +132,19 @@ busy/stale recovery, external
 FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
 availability is not required by these deterministic gates.
+
+For the live GitHub.com transport check, run the same read on both URLs with
+native Git and an SSH identity accepted by GitHub.
+
+```sh
+revision=7241600d3594980a32d70d6b749a1e7c70238842
+for source in https://github.com/progbeat/git-on.git git@github.com:progbeat/git-on.git; do
+    git on "$source" "$revision" --backend=copy --write-policy=all -- cat Cargo.toml | shasum -a 256
+done
+```
+
+Each run prints hash
+`366a84336f449c132dcf19ce8d1dba22324b9c7cda389b979f6b12841aa4f3fe`.
 
 ## Complete FUSE callback inventory
 
@@ -288,9 +306,9 @@ See [resource acceptance](../docs/resources.md), the
 [CI cost/coverage map](../docs/ci-performance.md), and the
 [dependency audit](../docs/crate-audit.md). Resource regressions remain in
 `remote.py`; optional `--before-resource-probe` replays exact-master failures.
-`pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
-32/128/512 distinct-object pack metadata work, and verifies the full available
-OID set once after both read passes. The probe's `--metrics-only` mode omits
+`pack_scaling.py --probe ...` uses Linux strace to check for zero private pack
+filesystem activity. It checks network requests for 32, 128 and 512 distinct
+blobs and verifies the available OID set once after both read passes. The probe's `--metrics-only` mode omits
 full-OID enumeration from repeated measurements. Report preparation and command
 time separately.
 

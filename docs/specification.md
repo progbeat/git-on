@@ -70,17 +70,15 @@ the command after `--`.
 - Resolution, fetch, snapshot preparation, and cleanup preserve source refs,
   indexes, object databases, Git configuration, and worktrees. These operations
   leave no persistent clone and make no requests to write remote repository data.
-- Native fetch keeps its selection record and private refs in the run
-  directory. Incoming Git objects, pack indexes, and temporary files required
-  by the transport prefer an existing writable `tmpfs`. Snapshot selection
-  and verification reuse the received objects in place.
-  A pack write that fills an automatically selected `tmpfs` can retry on
-  the run filesystem before native Git records its selection.
+- Local loading reads repository objects in place. Network loading decodes
+  packs in memory. Git-on never invokes system `git fetch`, creates a
+  temporary fetch repository, stages a pack or index, or writes a
+  fetch-refspec destination.
 - Signature verification of a streamed remote snapshot exposes the selected
   commit or tag as a temporary loose object. The transfer keeps its pack,
   trees, and file contents out of the verifier's object directory. Staging can
   retry in the run directory if the automatically selected `tmpfs` fills.
-- Native resolution and fetch disable hooks and local filesystem monitors. Credential
+- Native operations disable hooks and local filesystem monitors. Credential
   lookup reads existing credentials. An authentication result does not save,
   erase, or replace stored credentials, host keys, or cookies.
 - Cleanup can remove owned runtime data. Recovery metadata from an older
@@ -91,45 +89,29 @@ the command after `--`.
 
 ## Native Git argument compatibility
 
-This compatibility is part of the original command contract. Corrections that
-restore native Git argument semantics are bug fixes, not a new git-on grammar.
-Native Git is the resolution authority for both local and remote operands.
-Consequently, direct local `git-on` execution also requires Git on `PATH`, even
-where the former Git-free resolver accepted a revision. Retiring that resolver
-is part of this bug fix; it does not require a major version increment.
+Native Git supplies local revision resolution, effective repository URLs and
+configuration. The [network transport profile](remote.md#network-transport-profile)
+defines the selection and fetch rules for HTTPS and SSH.
 
-- With one operand, pass that exact `OsStr` as the revision argument to native
-  `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
-  including abbreviations, ancestry, reflogs and `HEAD:path`. Native Git is
-  required for local resolution as well as remote operations.
-- With two operands, native Git resolves configured remotes, URLs and local
-  paths. The [reusable transport](remote.md#object-demand-and-cache-lifetime)
-  can select an unambiguous branch or tag or a full object ID. A source-only force
-  refspec can use the same selection when default fetch mappings make a private
-  destination update unnecessary. The compatibility path
-  passes the exact repository and revision/refspec arguments to native
-  `git fetch` in a private temporary Git repository for ref selection and
-  precedence.
-  That path keeps any `+` prefix. A colon in this operand is fetch syntax
-  and never selects a remote subtree.
-- Do not implement an additional repository/revision grammar, reject operands
-  by character set or encoding, trim them, expand names, duplicate Git's
-  ambiguity checks or introduce host-specific resolution. Delegate acceptance
-  and diagnostics to the native Git operation, with argument boundaries that
-  prevent an operand from becoming an internal Git option. git-on's own option
-  and command-boundary checks remain its responsibility.
-- Resolve once before executing the command. The native fetch result must
-  identify one distinct selected object; a result with no object or multiple
-  different objects cannot identify the single snapshot. The selected object
-  must yield a Git tree. These are checks of Git's result, not operand syntax.
-  Signature verification uses the full OID of the selected commit or annotated
-  tag. For a tag, derive the snapshot from the target recorded in the verified
-  tag object. Later movements of the tag or branch name leave the selected
-  object unchanged. A failed check or an unavailable selected object before
-  tree preparation completes prevents the command from starting.
-- Fetch destinations are confined to the private repository. Existing object-demand, filter,
-  cancellation, SSH ownership, cache and filesystem contracts still apply;
-  materialization cannot bypass any Git resolution, verification or object error.
+- With one operand, pass the exact `OsStr` to native `git --no-lazy-fetch
+  rev-parse --verify --end-of-options`. Git interprets revisions including
+  abbreviations, ancestry, reflogs and `HEAD:path`. Git with
+  `--no-lazy-fetch` support must be on `PATH`.
+- With two operands, use native Git to resolve a configured remote or
+  repository URL once. A local path or `file://` URL selects the repository
+  for the same revision resolution and object reads as `git -C PATH on REV`.
+  Preserve ordinary Git revision syntax, including `HEAD:subdir`. The local
+  mode has no fetch-refspec destinations.
+- Network sources use direct smart Git protocol v2 over HTTPS with HTTP/2 or
+  OpenSSH. GitHub.com is the acceptance reference. Resolve a named revision
+  once via `ls-refs` and fetch by the selected full SHA-1 OID. Network fetches
+  create no private pack, index, or Git repository for object transfer.
+  Verification may need its own private Git context.
+- A fetch must identify one distinct selected object that yields a tree.
+  Signature verification uses the full OID of the selected commit or
+  annotated tag. For a tag, the recorded target in that object determines the
+  snapshot. Moving a tag or branch leaves the selection unchanged. A failed
+  verification or an unavailable selected object prevents execution.
 - Git-on accesses the caller's local object database read-only and retains the
   selected tree OID in memory for the invocation. If external repository
   maintenance removes an unread object, the operation that needs it reports the
@@ -143,10 +125,9 @@ is part of this bug fix; it does not require a major version increment.
   resolving and fetching objects. Git-on reads the snapshot directly from Git
   objects and uses its own materializer for a disposable execution tree.
 - Regression tests must compare acceptance, selected objects and diagnostics
-  against native Git in isolated fixture repositories. Include native ref
-  spellings and prefixes, colliding branch/tag names, literal fetch refspecs,
-  local paths, non-UTF-8 operands and invalid inputs. A short hash accepted by
-  local revision resolution must not be assumed accepted by remote fetch.
+  against native Git in isolated local fixtures. Include implicit and explicit
+  local sources, subtree syntax, non-UTF-8 paths, and invalid revisions.
+  Exercise the network profile against GitHub.com over both transports.
 
 ## Filesystem policy
 
@@ -378,11 +359,11 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
 
 ## Storage and buffer requirements
 
-1. Internally managed object buffers use disk for LRU eviction and for the
-   private regular files required by native Git compatibility. Git-on may
-   read existing repositories from disk. The visible execution tree from
-   `copy` and user writes, including copy-up and native-mount backing files,
-   may use disk.
+1. Internally managed object buffers use disk only when the LRU evicts them.
+   Git-on may read existing repositories from disk. The visible execution
+   tree from `copy` and user writes, including copy-up and native-mount
+   backing files, may use disk. Native verification or local index resolution
+   may require separate private files.
 2. Immutable data already in RAM is used without copying on every execution
    path. Components borrow existing buffers or transfer ownership of them
    without copying their contents.
@@ -393,7 +374,7 @@ hardware, software, storage, cache state, fixture shape, and the tested revision
    complexity. Where practical, compute and cache needed results as the data
    is processed, taking into account the capabilities of the libraries in use.
 
-Git-on creates private native Git object files, pack indexes, and regular
+Git-on creates private verifier and local index files, and regular
 diagnostic or transport files on demand. It uses existing filesystems for
 these files and removes them with the invocation. Internal synchronization
 and recovery may use directory entries, empty locks, and sockets alongside

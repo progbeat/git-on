@@ -2,9 +2,9 @@
 
 
 def pack_scaling_rows(head):
-    return [dict(head=head,working_tree_dirty=False,distinct_blobs=n,passes=2,baseline=False,
-                 metrics=dict(remote_fetches=n+2),pack_metadata_syscalls=n,
-                 pack_directory_bytes_enumerated=n*64) for n in (32,128,512)]
+    return [dict(head=head,working_tree_dirty=False,distinct_blobs=n,passes=2,requested_objects=n+2,
+                 metrics=dict(remote_fetches=n+2,remote_fetch_operations=0,remote_repositories_created=0),
+                 pack_metadata_syscalls=0) for n in (32,128,512)]
 
 
 def object_reuse_row(head,backend):

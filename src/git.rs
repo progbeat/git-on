@@ -13,7 +13,10 @@ use std::{
     process::{Command, Stdio},
 };
 
+pub(crate) mod diagnostics;
 mod index;
+#[cfg(test)]
+pub(crate) use diagnostics::full_output as full_test_output;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -148,26 +151,13 @@ impl Git {
             for (key, value) in &self.config {
                 if key == "core.repositoryformatversion"
                     || key.as_bytes().starts_with(b"extensions.")
-                    // The loose-object durability switch can override
-                    // core.fsync=none on Git-on's disposable fetches.
-                    || key == "core.fsyncobjectfiles"
                 {
                     continue;
                 }
                 let value = value.as_deref().unwrap_or(OsStr::new("true"));
                 let variable = format!("GIT_CONFIG_VALUE_{count}");
                 command.env(format!("GIT_CONFIG_KEY_{count}"), key);
-                if key.as_bytes().starts_with(b"credential.")
-                    && key.as_bytes().ends_with(b".helper")
-                {
-                    command.env(variable, credential_get_only(value));
-                } else if key.as_bytes().starts_with(b"http.")
-                    && key.as_bytes().ends_with(b".savecookies")
-                {
-                    command.env(variable, "false");
-                } else {
-                    command.env(variable, value);
-                }
+                command.env(variable, value);
                 count += 1;
             }
             command.env("GIT_CONFIG_COUNT", count.to_string());
@@ -192,21 +182,17 @@ impl Git {
             .args(["-c", "core.bare=true"]);
     }
 
-    pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
-        // Keep caller-defined server programs, server options and fsck policy
-        // on native fetch's complete compatibility path.
-        if packet_trace_destination().is_some()
-            || self.config.iter().any(|(key, value)| {
-                let key = key.as_bytes();
-                key.ends_with(b".uploadpack")
-                    || key.ends_with(b".vcs")
-                    || key.ends_with(b".serveroption")
-                    || key.starts_with(b"fsck.")
-                    || key == b"fetch.fsckobjects"
-                    || key == b"transfer.fsckobjects"
-                    || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
-            })
-        {
+    pub(crate) fn demand_session_compatible(&self, source: &OsStr) -> Result<bool> {
+        if self.config.iter().any(|(key, value)| {
+            let key = key.as_bytes();
+            matches!(
+                selected_remote_option(key, source),
+                Some(b"uploadpack" | b"vcs" | b"serveroption")
+            ) || key.starts_with(b"fsck.")
+                || key == b"fetch.fsckobjects"
+                || key == b"transfer.fsckobjects"
+                || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
+        }) {
             return Ok(false);
         }
 
@@ -214,7 +200,7 @@ impl Git {
             return Ok(true);
         };
         // Git exports its standard helper directory to external subcommands.
-        // A genuinely custom directory still selects the compatibility path.
+        // A custom directory can provide helpers outside the supported profile.
         let mut command = self.command(None);
         command
             .arg("--exec-path")
@@ -224,19 +210,19 @@ impl Git {
         Ok(result.status.success()
             && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
-    pub(crate) fn http2_compatible(&self) -> bool {
-        // Native Git remains responsible for explicit HTTP configuration
-        // and transport policy. Apply this before any libcurl discovery.
-        self.transport_policy_is_default("https")
-            && packet_trace_destination().is_none()
-            && std::env::var_os("SSLKEYLOGFILE").is_none()
-            && !self.config.iter().any(|(key, _)| {
+    pub(crate) fn http2_compatible(&self, source: &OsStr, url: &OsStr) -> Result<bool> {
+        if !self.transport_policy_is_default("https")
+            || std::env::var_os("SSLKEYLOGFILE").is_some()
+            || self.config.iter().any(|(key, _)| {
                 let key = key.as_bytes();
-                key.starts_with(b"http.")
-                    || key.starts_with(b"remote.")
-                        && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
+                key.strip_prefix(b"http.")
+                    .is_some_and(|option| !option.contains(&b'.'))
+                    || matches!(
+                        selected_remote_option(key, source),
+                        Some(b"proxy" | b"proxyauthmethod")
+                    )
             })
-            && !std::env::vars_os().any(|(key, _)| {
+            || std::env::vars_os().any(|(key, _)| {
                 let key = key.as_bytes();
                 key.starts_with(b"GIT_HTTP_")
                     || key.starts_with(b"GIT_PROXY_SSL_")
@@ -249,6 +235,34 @@ impl Git {
                             | b"GIT_USER_AGENT"
                     )
             })
+        {
+            return Ok(false);
+        }
+        if !self
+            .config
+            .iter()
+            .any(|(key, _)| key.as_bytes().starts_with(b"http."))
+        {
+            return Ok(true);
+        }
+        // Git knows its own URL matching rules for schemes, users, ports,
+        // wildcard hosts and path prefixes. Consult it only for scoped keys.
+        let mut command = native_git_command();
+        command
+            .current_dir(&self.cwd)
+            .env_remove("GIT_CONFIG")
+            .args(["config", "--includes", "--get-urlmatch", "http"])
+            .arg(url)
+            .stdin(Stdio::null());
+        let output = run_builtin(command).context("check URL-specific Git HTTP configuration")?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) if output.stderr.is_empty() => Ok(true),
+            _ => bail!(
+                "check URL-specific Git HTTP configuration: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
     }
     pub(crate) fn transport_policy_is_default(&self, protocol: &str) -> bool {
         let key = format!("protocol.{protocol}.allow");
@@ -258,97 +272,6 @@ impl Git {
             .any(|(configured, _)| configured == "protocol.allow" || configured == key.as_str())
             && std::env::var_os("GIT_ALLOW_PROTOCOL").is_none()
             && std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none()
-    }
-
-    pub(crate) fn sets_protocol_version(&self) -> bool {
-        self.config.iter().any(|(key, _)| key == "protocol.version")
-    }
-
-    pub(crate) fn credential_replay_has_host_scope(&self) -> bool {
-        self.config.iter().all(|(key, _)| {
-            let Some(credential) = key.as_bytes().strip_prefix(b"credential.") else {
-                return true;
-            };
-            if credential.rsplit(|&byte| byte == b'.').next() == Some(b"usehttppath") {
-                return false;
-            }
-            let Some(scope) = credential.rsplitn(2, |&byte| byte == b'.').nth(1) else {
-                return true;
-            };
-            // A fresh credential process can reapply these scopes after Git
-            // supplies the username and drops the repository path from fill.
-            std::str::from_utf8(scope)
-                .ok()
-                .filter(|scope| {
-                    scope.split_once("://").is_some_and(|(_, authority)| {
-                        let authority = authority.strip_suffix('/').unwrap_or(authority);
-                        !authority.contains(['/', '\\', '@', '%', '?', '#'])
-                    })
-                })
-                .and_then(|scope| url::Url::parse(scope).ok())
-                .is_some_and(|scope| {
-                    matches!(scope.scheme(), "http" | "https")
-                        && scope.host_str().is_some()
-                        && scope.username().is_empty()
-                        && scope.password().is_none()
-                        && scope.path() == "/"
-                        && scope.query().is_none()
-                        && scope.fragment().is_none()
-                })
-        })
-    }
-
-    pub(crate) fn fetch_settings_require_native_git(
-        &self,
-        materializing: bool,
-        ssh_transport: bool,
-    ) -> bool {
-        self.config.iter().any(|(key, value)| match key.as_bytes() {
-            // Explicit variant selection keeps SSH on its native fetch path.
-            b"ssh.variant" => ssh_transport,
-            key => !streaming_fetch_config(key, value.as_deref(), materializing),
-        })
-    }
-
-    pub(crate) fn has_nonstandard_fetch_mapping(&self, source: &OsStr) -> Result<bool> {
-        if source.as_bytes().is_ascii() {
-            let source = source.as_bytes();
-            let mut mappings = self
-                .config
-                .iter()
-                .filter(|(key, _)| fetch_mapping_remote(key.as_bytes()) == Some(source))
-                .map(|(_, value)| value.as_deref());
-            if let Some(first) = mappings.next() {
-                let expected = [b"+refs/heads/*:refs/remotes/".as_slice(), source, b"/*"].concat();
-                return Ok(first.map(OsStr::as_bytes) != Some(expected.as_slice())
-                    || mappings.next().is_some());
-            }
-            return Ok(false);
-        }
-        let mut mappings = self
-            .config
-            .iter()
-            .filter_map(|(key, _)| fetch_mapping_remote(key.as_bytes()));
-        if !cfg!(target_os = "macos") {
-            return Ok(mappings.any(|name| name == source.as_bytes()));
-        }
-        if mappings.next().is_none() {
-            return Ok(false);
-        }
-        // Ask the same Git executable to look up the key with its configured
-        // Unicode precomposition. An unrelated mapping should not force a
-        // native fetch of a path or an alias.
-        let mut key = OsString::from("remote.");
-        key.push(source);
-        key.push(".fetch");
-        let mut command = self.command(None);
-        command
-            .env_remove("GIT_CONFIG")
-            .args(["config", "--includes", "--get-all", "--"])
-            .arg(key)
-            .stdin(Stdio::null());
-        let output = run_builtin(command)?;
-        Ok(output.status.code() != Some(1) || !output.stderr.is_empty())
     }
 
     pub(crate) fn has_multiple_group_members(&self, source: &OsStr) -> bool {
@@ -367,22 +290,24 @@ impl Git {
     }
 
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
-        let mut command = self.command(dir);
-        command.args(args).stdin(Stdio::null());
-        if args
+        let reads_objects = args
             .first()
             .is_some_and(|operation| *operation == "rev-parse")
-        {
-            // Older Git can fetch a missing promisor tree during REV:path
-            // resolution, even with GIT_NO_LAZY_FETCH set.
-            command.env("GIT_ALLOW_PROTOCOL", "");
+            && args.contains(&OsStr::new("--verify"));
+        let mut command = self.command(dir);
+        if reads_objects {
+            command.arg("--no-lazy-fetch");
         }
+        command.args(args).stdin(Stdio::null());
         let out = if local_query(args) {
             run_builtin(command).map_err(native_git_error)
         } else {
             run(command, true)
         }?;
         if !out.status.success() {
+            if reads_objects {
+                require_no_lazy_fetch(&out)?;
+            }
             bail!(
                 "Git {} failed: {}",
                 args[0].to_string_lossy(),
@@ -422,7 +347,7 @@ impl Git {
         command
             .current_dir(&self.cwd)
             .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_NO_LAZY_FETCH", "1");
+            .arg("--no-lazy-fetch");
         if self.original_dir.as_deref() == Some(dir) {
             return command;
         }
@@ -492,7 +417,7 @@ impl Git {
     }
 
     pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
-        self.verify_in_object_directory(dir, oid, kind, None)
+        self.run_verifier(dir, oid, signature_verifier(kind)?, None, None)
     }
 
     pub(crate) fn verify_streamed_object(
@@ -597,16 +522,6 @@ impl Git {
         )
     }
 
-    pub(crate) fn verify_in_object_directory(
-        &self,
-        dir: &Path,
-        oid: Oid,
-        kind: git2::ObjectType,
-        objects: Option<&Path>,
-    ) -> Result<()> {
-        self.run_verifier(dir, oid, signature_verifier(kind)?, objects, None)
-    }
-
     fn run_verifier(
         &self,
         dir: &Path,
@@ -655,7 +570,6 @@ impl Git {
             false,
             None,
             None,
-            false,
             CaptureMode::Foreground,
         )?;
         if !output.status.success() {
@@ -705,6 +619,12 @@ impl Git {
             .find(|(key, _)| key == "ssh.variant")
             .map(|(_, value)| value.clone().unwrap_or_default())
     }
+}
+
+fn selected_remote_option<'a>(key: &'a [u8], source: &OsStr) -> Option<&'a [u8]> {
+    key.strip_prefix(b"remote.")?
+        .strip_prefix(source.as_bytes())?
+        .strip_prefix(b".")
 }
 
 fn read_configuration(cwd: &Path, options: &[&str]) -> Result<Vec<u8>> {
@@ -787,8 +707,7 @@ fn prepare_verifier_config(cwd: &Path, source: &Path, git_dir: &Path) -> Result<
             .or(value);
         append_config_entry(&mut config, key, value)?;
     }
-    // Give verification its own local configuration scope without changing
-    // the fetch repository's settings or copying any fetched objects.
+    // Supply a private native config scope for the SHA-1 verification object.
     let directory = tempfile::Builder::new()
         .prefix("verify-config-")
         .tempdir_in(git_dir)
@@ -834,98 +753,7 @@ fn quote_config(out: &mut Vec<u8>, bytes: &[u8], escape_controls: bool) {
     out.push(b'"');
 }
 
-fn fetch_mapping_remote(key: &[u8]) -> Option<&[u8]> {
-    key.strip_prefix(b"remote.")?.strip_suffix(b".fetch")
-}
-
-fn credential_get_only(helper: &OsStr) -> OsString {
-    let helper = helper.as_bytes();
-    if helper.is_empty() {
-        // An empty helper resets the preceding helper list in Git.
-        return OsString::new();
-    }
-    let mut script =
-        b"!git_on_credential() { if test \"$1\" = get; then exec /bin/sh -c '".to_vec();
-    // Match Git's helper dispatch: snippets, absolute commands, and the
-    // git-credential-* family all get the operation appended to the command.
-    let command = if let Some(snippet) = helper.strip_prefix(b"!") {
-        snippet
-    } else {
-        if !helper.starts_with(b"/") {
-            script.extend_from_slice(b"git credential-");
-        }
-        helper
-    };
-    for byte in command {
-        if *byte == b'\'' {
-            script.extend_from_slice(b"'\\''");
-        } else {
-            script.push(*byte);
-        }
-    }
-    script.extend_from_slice(b" get'; fi; }; git_on_credential");
-    OsString::from_vec(script)
-}
-
-fn streaming_fetch_config(key: &[u8], value: Option<&OsStr>, materializing: bool) -> bool {
-    // Git fetch validates settings outside fetch.*, even with no worktree or
-    // destination ref. Delegate unfamiliar settings to that command so new
-    // config keys retain their native validation and behavior.
-    match key {
-        // Internal Git operations disable hooks and the filesystem monitor.
-        b"core.repositoryformatversion" | b"core.hookspath" | b"core.fsmonitor" => true,
-        // This setting controls integration by pull after fetching.
-        b"pull.rebase" => true,
-        // Signing and trust settings are evaluated by the verifier.
-        b"commit.gpgsign" | b"tag.gpgsign" | b"tag.forcesignannotated" => true,
-        key if key.starts_with(b"gpg.") => true,
-        b"core.askpass" | b"core.sshcommand" | b"user.name" | b"user.email"
-        | b"user.signingkey" => value.is_some(),
-        b"core.bare"
-        | b"core.filemode"
-        | b"core.ignorecase"
-        | b"core.logallrefupdates"
-        | b"core.precomposeunicode"
-        | b"core.quotepath"
-        | b"core.symlinks"
-        | b"push.autosetupremote" => {
-            value.is_none_or(|value| {
-                let bytes = value.as_bytes();
-                // Native Git and libgit2 agree on boolean words. Keep
-                // nonstandard integer forms on the native path.
-                matches!(bytes, b"0" | b"1")
-                    || (bytes.iter().all(u8::is_ascii_alphabetic)
-                        && git2::Config::parse_bool(value).is_ok())
-            })
-        }
-        b"init.defaultbranch" => value
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| git2::Reference::is_valid_name(&format!("refs/heads/{name}"))),
-        b"protocol.version" => value == Some(OsStr::new("2")),
-        b"color.ui" => value.is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"auto")),
-        // The default parallel fetch setting only affects remote groups and
-        // submodules, neither of which a streamed filtered selection fetches.
-        b"fetch.parallel" if !materializing => value == Some(OsStr::new("1")),
-        // Credential helpers and transport policy have their own gates.
-        key if key.starts_with(b"credential.") || key.starts_with(b"http.") => true,
-        // Git resolves remote names and rewrite settings. Matching fetch maps
-        // have already been checked when deciding whether to use native Git.
-        key if key.starts_with(b"remote.") => {
-            value.is_some()
-                && (key[b"remote.".len()..].ends_with(b".url")
-                    || fetch_mapping_remote(key).is_some())
-        }
-        key if key.starts_with(b"url.") => {
-            value.is_some() && (key.ends_with(b".insteadof") || key.ends_with(b".pushinsteadof"))
-        }
-        key if key.starts_with(b"branch.") => {
-            value.is_some() && (key.ends_with(b".remote") || key.ends_with(b".merge"))
-        }
-        _ => false,
-    }
-}
-
-fn signature_verifier(kind: ObjectType) -> Result<&'static str> {
+pub(crate) fn signature_verifier(kind: ObjectType) -> Result<&'static str> {
     match kind {
         ObjectType::Commit => Ok("verify-commit"),
         ObjectType::Tag => Ok("verify-tag"),
@@ -933,6 +761,15 @@ fn signature_verifier(kind: ObjectType) -> Result<&'static str> {
             "--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"
         ),
     }
+}
+
+fn require_no_lazy_fetch(output: &std::process::Output) -> Result<()> {
+    if output.status.code() == Some(129)
+        && memchr::memmem::find(&output.stderr, b"--no-lazy-fetch").is_some()
+    {
+        bail!("local revision resolution requires native Git with --no-lazy-fetch (Git 2.45 or newer); upgrade Git or select a supported Git on PATH");
+    }
+    Ok(())
 }
 
 fn native_git_error(error: anyhow::Error) -> anyhow::Error {
@@ -944,6 +781,24 @@ fn native_git_error(error: anyhow::Error) -> anyhow::Error {
         return error.context("native Git was not found on PATH; revision resolution requires native Git; install Git with your distribution tools or select an existing Git on PATH");
     }
     error
+}
+
+pub(crate) fn decode_url_bytes(mut encoded: &[u8]) -> Vec<u8> {
+    let digit = |byte: u8| char::from(byte).to_digit(16).map(|value| value as u8);
+    let mut path = Vec::new();
+    while let Some((&byte, tail)) = encoded.split_first() {
+        if let (b'%', [high, low, rest @ ..]) = (byte, tail) {
+            if let (Some(high), Some(low)) = (digit(*high), digit(*low)) {
+                let decoded = high * 16 + low;
+                path.push(decoded);
+                encoded = rest;
+                continue;
+            }
+        }
+        path.push(byte);
+        encoded = tail;
+    }
+    path
 }
 
 fn local_query(args: &[&OsStr]) -> bool {
@@ -1011,12 +866,11 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
         capture || managed,
         None,
         None,
-        false,
         CaptureMode::MayDetach,
     )?;
     if managed && !capture {
         use std::io::Write;
-        let _drawing = crate::terminal_ui::native_terminal_lease(true);
+        let _drawing = crate::terminal_ui::terminal_handoff(true)?;
         std::io::stdout().write_all(&output.stdout)?;
         std::io::stderr().write_all(&output.stderr)?;
         output.stdout.clear();
@@ -1027,19 +881,11 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
 
 /// Capture a Git builtin that does not invoke caller-configured helpers.
 pub(crate) fn run_builtin(command: Command) -> Result<std::process::Output> {
-    run_captured(command, true, true, None, None, false, CaptureMode::Channel)
+    run_captured(command, true, true, None, None, CaptureMode::Channel)
 }
 
 pub(crate) fn capture_inherited_group(command: Command) -> Result<std::process::Output> {
-    run_captured(
-        command,
-        true,
-        true,
-        None,
-        None,
-        false,
-        CaptureMode::InheritedGroup,
-    )
+    run_captured(command, true, true, None, None, CaptureMode::InheritedGroup)
 }
 
 fn trace_stream(value: &OsStr) -> Option<i32> {
@@ -1049,10 +895,6 @@ fn trace_stream(value: &OsStr) -> Option<i32> {
         bytes if bytes.eq_ignore_ascii_case(b"true") => Some(libc::STDERR_FILENO),
         _ => None,
     }
-}
-
-fn packet_trace_destination() -> Option<i32> {
-    trace_stream(&std::env::var_os("GIT_TRACE_PACKET")?)
 }
 
 pub(crate) fn native_git_command() -> Command {
@@ -1075,135 +917,26 @@ pub(crate) fn native_git_command() -> Command {
         }
     }
     command
+        .env_remove("GIT_TRACE_PACKET")
         .env_remove("SSLKEYLOGFILE")
         .env("GIT_OPTIONAL_LOCKS", "0");
     command
 }
 
-pub(crate) fn run_ref_advertisement(
-    mut command: Command,
-    run: &Path,
-) -> Result<(std::process::Output, bool)> {
-    use std::io::{Read, Seek};
-
-    let mut capture = tempfile::Builder::new()
-        .prefix("native-advertisement-")
-        .tempfile_in(run)
-        .context("open capability trace")?;
-    let sink = capture.path().with_extension("null");
-    std::os::unix::fs::symlink("/dev/null", &sink)?;
-    command.env("GIT_TRACE_PACKET", capture.path());
-    command.stdout(Stdio::null());
-    let output = run_captured(
-        command,
-        false,
-        true,
-        None,
-        None,
-        false,
-        CaptureMode::MayDetach,
-    );
-    // Keep the open capture readable and send subsequent opens to the null device.
-    let redirect = std::fs::rename(sink, capture.path());
-    if redirect.is_ok() {
-        capture.disable_cleanup(true);
-    }
-    let output = output?;
-    if output.status.success() {
-        redirect.context("redirect capability trace")?;
-    }
-    let trace = capture.as_file();
-    let length = trace.metadata()?.len();
-    let filtering = output.status.success()
-        && trace_advertises_filter(trace.take(length)).context("read capability trace")?;
-    if let Some(fd) = packet_trace_destination().filter(|_| length > 0) {
-        let mut trace = trace;
-        trace.rewind()?;
-        forward_packet_trace(&mut trace.take(length), fd)?;
-    }
-    Ok((output, filtering))
+#[doc(hidden)]
+pub fn write_run_error(message: std::fmt::Arguments<'_>) {
+    diagnostics::write(message, false);
 }
 
-fn forward_packet_trace(trace: &mut dyn std::io::Read, fd: i32) -> Result<()> {
-    use std::os::fd::FromRawFd;
-
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let destination = unsafe { std::fs::File::from_raw_fd(duplicate) };
-    let mut command = Command::new("/bin/cat");
-    command.stdout(Stdio::from(destination));
-    let output = run_captured(
-        command,
-        false,
-        true,
-        None,
-        Some(trace),
-        false,
-        CaptureMode::Channel,
-    )?;
-    crate::object::check_transfer()?;
-    if !output.status.success() {
-        eprintln!(
-            "warning: unable to write GIT_TRACE_PACKET: {}",
-            output.status
-        );
-    }
-    Ok(())
-}
-
-fn trace_advertises_filter(mut trace: impl std::io::Read) -> std::io::Result<bool> {
-    const WORD: &[u8] = b"filter\\0";
-    let mut matched = 0;
-    let mut buffer = [0; 8192];
-    loop {
-        let count = match trace.read(&mut buffer) {
-            Ok(0) => return Ok(matches!(matched, 6 | 8)),
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        for &byte in &buffer[..count] {
-            if byte.is_ascii_whitespace() {
-                if matches!(matched, 6 | 8) {
-                    return Ok(true);
-                }
-                matched = 0;
-            } else if WORD.get(matched) == Some(&byte) {
-                matched += 1;
-            } else {
-                matched = WORD.len() + 1;
-            }
-        }
+pub(crate) fn write_live_error(message: std::fmt::Arguments<'_>) {
+    // While the command owns the terminal, a background TOSTOP write would
+    // suspend the runner before it can return the filesystem error. The
+    // failure is retained for the final diagnostic after terminal handoff.
+    if crate::terminal_ui::preparing() || unsafe { libc::isatty(libc::STDERR_FILENO) } == 0 {
+        diagnostics::write(message, true);
     }
 }
 
-pub(crate) fn run_fetch(
-    mut command: Command,
-    input: Option<&mut dyn std::io::Read>,
-) -> Result<std::process::Output> {
-    let progress = crate::terminal_ui::progress_enabled();
-    command.stdout(Stdio::null());
-    let mut output = run_captured(
-        command,
-        false,
-        true,
-        None,
-        input,
-        true,
-        CaptureMode::MayDetach,
-    )?;
-    if progress {
-        output.stderr = crate::terminal_ui::progress_diagnostics(&output.stderr);
-    }
-    if output.status.success() && packet_trace_destination() == Some(libc::STDERR_FILENO) {
-        use std::io::Write;
-        let _drawing = crate::terminal_ui::native_terminal_lease(true);
-        std::io::stderr().write_all(&output.stderr)?;
-    }
-    Ok(output)
-}
 /// Stream native stdout to its consumer while the caller retains process,
 /// cancellation and terminal supervision. The consumer must read to EOF or fail;
 /// its errors stop and reap the owned operation before they are returned.
@@ -1241,7 +974,6 @@ pub(crate) fn run_with_output<T: Send>(
             true,
             Some(&failed),
             input,
-            false,
             CaptureMode::MayDetach,
         );
         finished.store(true, Ordering::Release);
@@ -1381,7 +1113,6 @@ fn run_captured(
     capture_stderr: bool,
     failed_output: Option<&std::sync::atomic::AtomicBool>,
     input: Option<&mut dyn std::io::Read>,
-    progress: bool,
     mode: CaptureMode,
 ) -> Result<std::process::Output> {
     use std::{
@@ -1415,8 +1146,6 @@ fn run_captured(
     } else {
         None
     };
-    let mut progress = (progress && crate::terminal_ui::progress_enabled())
-        .then(crate::terminal_ui::NativeProgress::new);
     let isolated = !matches!(mode, CaptureMode::InheritedGroup);
     let transport_terminal = isolated && !matches!(mode, CaptureMode::Foreground);
     let managed = transport_terminal && crate::terminal_ui::owns_terminal();
@@ -1430,7 +1159,7 @@ fn run_captured(
     let tty_fd = tty.as_ref().map(AsRawFd::as_raw_fd);
     let parent_group = unsafe { libc::getpgrp() };
     let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == parent_group });
-    let _progress_lease = crate::terminal_ui::native_terminal_lease(transfer);
+    let _progress_lease = crate::terminal_ui::terminal_handoff(transfer)?;
     if isolated {
         unsafe {
             command.pre_exec(move || {
@@ -1469,9 +1198,6 @@ fn run_captured(
                 break 'wait stop_request_operation(&mut child, signal_target)
                     .and(Err(error).context("read native Git output"));
             }
-        }
-        if let (Some(progress), Some(NativeCapture::File(stderr))) = (&mut progress, &stderr) {
-            progress.poll(&stderr.file);
         }
         match crate::terminal_ui::try_wait(&mut child) {
             Ok(Some(status)) => break Ok(status),
@@ -1522,7 +1248,6 @@ fn run_captured(
             ],
         );
     };
-    drop(progress);
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
         if unsafe { libc::tcgetpgrp(fd) } == child.id() as libc::pid_t {
@@ -1866,6 +1591,7 @@ impl SplitByte for [u8] {
 #[cfg(test)]
 mod transport_policy_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn local_verification_command_keeps_worktree_relative_alternates() -> Result<()> {
@@ -1892,15 +1618,6 @@ mod transport_policy_tests {
         );
         assert_eq!(result.stdout, b"blob\n");
         Ok(())
-    }
-
-    #[test]
-    fn capability_trace_recognizes_whole_tokens_across_reads() {
-        use std::io::Read;
-
-        let partial = &b"refilter filter-unsupported\nfilter\\"[..];
-        assert!(!trace_advertises_filter(partial).unwrap());
-        assert!(trace_advertises_filter(partial.chain(&b"0\n"[..])).unwrap());
     }
 
     #[test]
@@ -2059,7 +1776,6 @@ printf 'clock\000'
             true,
             None,
             Some(&mut RequestAfterInputCloses(Some(sync))),
-            false,
             CaptureMode::Channel,
         )
         .expect("preserve the outcome of a child that closes stdin");
@@ -2097,7 +1813,6 @@ printf 'clock\000'
             true,
             None,
             Some(&mut bytes.as_slice()),
-            false,
             CaptureMode::Channel,
         )
         .expect("capture Git output without regular files");
@@ -2107,7 +1822,7 @@ printf 'clock\000'
     }
 
     #[test]
-    fn explicit_transport_policy_keeps_http2_on_native_git() {
+    fn explicit_transport_policy_blocks_reusable_http2() {
         for key in ["protocol.allow", "protocol.https.allow"] {
             let git = Git {
                 cwd: PathBuf::new(),
@@ -2115,12 +1830,19 @@ printf 'clock\000'
                 original_dir: None,
                 original_worktree: None,
             };
-            assert!(!git.http2_compatible(), "{key}");
+            assert!(
+                !git.http2_compatible(
+                    OsStr::new("origin"),
+                    OsStr::new("https://example.invalid/repo.git")
+                )
+                .unwrap(),
+                "{key}"
+            );
         }
     }
 
     #[test]
-    fn ssh_variant_uses_the_last_value_and_applies_only_to_ssh() {
+    fn ssh_variant_uses_the_last_value() {
         let mut git = Git {
             cwd: PathBuf::new(),
             config: vec![
@@ -2131,94 +1853,11 @@ printf 'clock\000'
             original_worktree: None,
         };
         assert_eq!(git.configured_ssh_variant(), Some("ssh".into()));
-        for materializing in [false, true] {
-            assert!(git.fetch_settings_require_native_git(materializing, true));
-            assert!(!git.fetch_settings_require_native_git(materializing, false));
-        }
         git.config.push(("ssh.variant".into(), None));
         assert_eq!(git.configured_ssh_variant(), Some(OsString::new()));
     }
 
-    #[test]
-    fn streaming_defers_other_fetch_settings_to_native_git() {
-        for (key, value) in [
-            ("advice.fetchshowforcedupdates", "invalid"),
-            ("color.advice", "invalid"),
-            ("core.abbrev", "invalid"),
-            ("core.disambiguate", "invalid"),
-            ("core.quotepath", "invalid"),
-            ("feature.manyfiles", "invalid"),
-            ("fetch.parallel", "-1"),
-            ("fetch.prune", "invalid"),
-            ("index.version", "invalid"),
-            ("push.default", "invalid"),
-            ("submodule.fetchjobs", "invalid"),
-            ("submodule.recurse", "invalid"),
-            ("transfer.unpacklimit", "invalid"),
-        ] {
-            for materializing in [false, true] {
-                assert!(
-                    !streaming_fetch_config(key.as_bytes(), Some(OsStr::new(value)), materializing),
-                    "{key}"
-                );
-            }
-        }
-        for value in [
-            None,
-            Some("off"),
-            Some("YES"),
-            Some(""),
-            Some("0"),
-            Some("1"),
-        ] {
-            for materializing in [false, true] {
-                assert!(
-                    streaming_fetch_config(b"core.quotepath", value.map(OsStr::new), materializing),
-                    "{value:?}"
-                );
-            }
-        }
-        let default_parallel = Some(OsStr::new("1"));
-        assert!(streaming_fetch_config(
-            b"fetch.parallel",
-            default_parallel,
-            false
-        ));
-        assert!(!streaming_fetch_config(
-            b"fetch.parallel",
-            default_parallel,
-            true
-        ));
-    }
-}
-
-#[cfg(all(test, target_os = "macos"))]
-#[test]
-fn darwin_child_exit_notifies_the_wait_loop() {
-    use std::os::fd::AsRawFd;
-
-    let mut child = Command::new("/bin/cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let wakeup = ChildExitWakeup::new(child.id());
-    drop(child.stdin.take());
-    let mut event = libc::pollfd {
-        fd: wakeup.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let notified = event.fd >= 0 && unsafe { libc::poll(&mut event, 1, 5000) } == 1;
-    assert!(child.wait().unwrap().success());
-    assert!(notified && event.revents & libc::POLLIN != 0);
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
+    #[cfg(target_os = "linux")]
     #[test]
     fn detached_native_capture_is_memory_backed() -> Result<()> {
         use std::os::fd::AsRawFd;
@@ -2233,6 +1872,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn native_input_and_output_progress_with_pipe_backpressure() {
         let mut command = Command::new("/bin/sh");
@@ -2246,6 +1886,7 @@ mod tests {
         assert_eq!(&output[262144..], bytes);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn native_output_writer_error_stops_the_owned_operation() {
         struct Failed;

@@ -174,104 +174,11 @@ print('large file verified')
         compare_on_tmpfs(self,self.root,BINARY,self.repo,self.env['PATH'],self.large_local_fixture())
         self.clean()
 
-    def remote_materialization_fixture(self):
-        command=self.large_local_fixture(7*1024*1024)
-        self.git('config','uploadpack.allowFilter','true')
-        self.git('config','uploadpack.allowAnySHA1InWant','true')
-        return self.repo.as_uri(),command
 
-    def test_native_remote_copy_reuses_one_decoder_for_a_pack(self):
-        import hashlib
 
-        paths = ['payload-a', 'payload-b', 'payload-c']
-        expected = []
-        for name in paths:
-            data = shake_256(name.encode()).digest(80 * 1024)
-            (self.repo / name).write_bytes(data)
-            expected.append(hashlib.sha256(data).hexdigest())
-        with (self.repo / '.gitattributes').open('a') as attributes:
-            attributes.write('payload-* -text\n')
-        self.git('add', '.gitattributes', *paths)
-        self.git('commit', '-qm', 'native packed blobs')
-        self.git('config', 'fetch.prune', 'false')
-        self.before = self.git('status', '--porcelain')
-        environment, log = record_git_invocations(self.root, self.env)
-        result = subprocess.run(
-            [str(BINARY), *COPY_ARGS, self.repo.as_uri(), 'HEAD', '--write-policy=all', '--',
-             sys.executable, '-c',
-             'import hashlib, pathlib, sys\n'
-             'for path in sys.argv[1:]: print(hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest())',
-             *paths],
-            cwd=self.repo, env=environment, capture_output=True, timeout=20,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.decode().splitlines(), expected)
-        calls = git_invocations(log)
-        self.assertEqual(len([args for args in calls if 'fetch' in args]), 1, calls)
-        readers = [args for args in calls if 'cat-file' in args]
-        self.assertEqual(len(readers), 1, readers)
-        self.assertIn('--batch-command', readers[0])
-        self.clean()
 
-    def commit_with_large_message(self):
-        message = base64.b64encode(shake_256(b'commit metadata fixture').digest(512 * 1024))
-        self.git('commit', '--allow-empty', '-q', '-F', '-', data=message)
 
-    def test_file_snapshot_streams_with_default_fetch_policy(self):
-        self.git('config', 'pull.rebase', 'true')
-        source = self.repo.as_uri()
-        args = [
-            BINARY, source, 'HEAD', '--backend=copy', '--write-policy=all', '--',
-            sys.executable, '-I', '-S', '-c',
-            "from pathlib import Path; "
-            "print((Path.cwd().parent / 'remote-repository').exists()); "
-            "print(Path('tracked').read_bytes().hex())",
-        ]
-        child_env = {k: v for k, v in self.env.items() if not k.startswith('GIT_CONFIG_')}
-        child_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
-        child_env, calls = record_git_invocations(self.root, child_env)
-        for key, value, native in ((None, None, False), ('ssh.variant', 'ssh', False),
-                                   ('color.ui', 'auto', False),
-                                   ('fetch.parallel', '1', True)):
-            with self.subTest(configuration=key):
-                calls.write_text('')
-                config = ({} if key is None else
-                          {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': key,
-                           'GIT_CONFIG_VALUE_0': value})
-                result = subprocess.run(args, cwd=self.repo, env=child_env | config,
-                                        capture_output=True, timeout=20)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(),
-                                 [str(native).encode(), b'636f6d6d697474656400ff0d0a'])
-                self.assertEqual(any('fetch' in args for args in git_invocations(calls)), native)
-                self.clean()
 
-    @unittest.skipUnless(sys.platform == 'linux', 'private tmpfs quota requires Linux mount namespaces')
-    def test_native_fetch_with_packed_metadata_fits_two_checkouts(self):
-        from filesystem_quota import compare_on_tmpfs
-        self.commit_with_large_message()
-        # The clone keeps these similar tag messages as deltas. Importing
-        # them individually as loose objects exceeds its disk budget.
-        message = base64.b64encode(shake_256(b'tag metadata fixture').digest(192 * 1024))
-        revision = 'HEAD'
-        for index in range(6):
-            name = f'nested-{index}'
-            self.git('tag', '-a', '--cleanup=verbatim', '-F', '-', name, revision, data=message)
-            revision = f'refs/tags/{name}'
-        command = [sys.executable, '-I', '-S', '-c',
-                   "from pathlib import Path; assert Path('tool').is_file(); print('ready')"]
-        compare_on_tmpfs(self, self.root, BINARY, self.repo, self.env['PATH'], command,
-                         size_mib=1, source=self.repo.as_uri(), checkout_copies=2,
-                         git_config={'fetch.parallel': '1', 'fetch.unpackLimit': '1'},
-                         revision=revision, service_on_volume=True)
-        self.clean()
-
-    @unittest.skipUnless(sys.platform=='linux','private tmpfs quota requires Linux mount namespaces')
-    def test_large_remote_materialization_succeeds_on_nine_mib_tmpfs(self):
-        from filesystem_quota import compare_on_tmpfs
-        source,command=self.remote_materialization_fixture()
-        compare_on_tmpfs(self,self.root,BINARY,self.repo,self.env['PATH'],command,source=source)
-        self.clean()
 
     def test_command_status_and_signal_cleanup(self):
         code = f"""

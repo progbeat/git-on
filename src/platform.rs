@@ -1096,6 +1096,32 @@ pub fn siginfo_status(info: &libc::siginfo_t) -> i32 {
     }
 }
 
+pub(crate) fn parent_process(pid: libc::pid_t) -> Option<libc::pid_t> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+        // The executable name can contain spaces and closing parentheses.
+        let end = stat.iter().rposition(|&byte| byte == b')')?;
+        let parent = stat[end + 1..].split(|&byte| byte == b' ').nth(2)?;
+        std::str::from_utf8(parent).ok()?.parse().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut process = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                process.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        (read == size).then(|| unsafe { process.assume_init().pbi_ppid as libc::pid_t })
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn has_sys_admin() -> bool {
     fs::read_to_string("/proc/self/status")

@@ -1,13 +1,9 @@
-use super::ssh_jump;
 use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs, io,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        process::CommandExt,
-    },
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -17,17 +13,12 @@ const HOST_FILE_DEFAULT: &[u8] = b"~/.ssh/known_hosts ~/.ssh/known_hosts2";
 const MAX_HOST_FILES: usize = 32;
 const DISABLE_KEYCHAIN: &str = "UseKeychain=no";
 
-pub(super) struct Launch {
-    pub(super) args: Vec<OsString>,
-    pub(super) jump_client: OsString,
-}
-
 pub(super) fn launch(
     program: &OsStr,
     launcher_path: &Path,
     args: Vec<OsString>,
     before_host: usize,
-) -> Result<Launch> {
+) -> Result<Vec<OsString>> {
     let mut probe = Probe {
         program,
         disable_keychain: cfg!(target_os = "macos"),
@@ -35,13 +26,12 @@ pub(super) fn launch(
     let inspection_args = inspection_args(&args, before_host);
     let settings = probe.initial(&inspection_args)?;
     check_read_only_options(&settings)?;
-    let proxy = ssh_jump::from_probe(
-        setting(&settings, b"proxyjump"),
-        setting(&settings, b"proxycommand"),
-        &settings.stderr,
-        program,
-        &args[..before_host],
-    )?;
+    for key in [b"proxyjump".as_slice(), b"proxycommand"] {
+        anyhow::ensure!(
+            setting(&settings, key).is_none_or(|value| value == b"none"),
+            "direct SSH does not support ProxyJump or ProxyCommand"
+        );
+    }
     let (check_host_ip, host_files) = keep_host_files_read_only(
         &probe,
         &args[..before_host],
@@ -66,46 +56,13 @@ pub(super) fn launch(
     if let Some(host_files) = host_files {
         push_option(&mut options, host_files);
     }
-    let jump_client = if let Some(proxy) = proxy {
-        let mut forwarded = Vec::new();
-        // OpenSSH disables fd passing for an implicit ProxyJump.
-        if proxy.implicit {
-            push_option(&mut forwarded, "ProxyUseFdpass=no");
-        }
-        forwarded.extend(ssh_jump::without_proxy_arguments(&args[..before_host]));
-        let user_args = forwarded.len();
-        forwarded.extend_from_slice(&args[before_host..]);
-        let override_option =
-            OsString::from_vec([b"ProxyCommand=", proxy.command.as_slice()].concat());
-        let checked = probe.inspect(
-            &self::inspection_args(&forwarded, user_args),
-            Some(&override_option),
-        )?;
-        let fdpass = if proxy.implicit {
-            Some(b"no".as_slice())
-        } else {
-            setting(&settings, b"proxyusefdpass")
-        };
-        anyhow::ensure!(
-            setting(&checked, b"proxycommand") == Some(proxy.command.as_slice())
-                && setting(&checked, b"proxyusefdpass") == fdpass,
-            "SSH wrapper did not forward the owned proxy command",
-        );
-        anyhow::ensure!(
-            settings_without_proxy(&settings).eq(settings_without_proxy(&checked)),
-            "SSH wrapper changes its effective configuration with an owned proxy command",
-        );
-        push_option(&mut options, override_option);
-        options.extend(forwarded);
-        proxy.client
-    } else {
-        options.extend(args);
-        program.to_owned()
-    };
-    Ok(Launch {
-        args: options,
-        jump_client,
-    })
+    // Pin direct transport in the actual invocation, after explicit caller
+    // options (including -J none) and before OpenSSH reads config again.
+    let mut args = args.into_iter();
+    options.extend(args.by_ref().take(before_host));
+    push_option(&mut options, "ProxyCommand=none");
+    options.extend(args);
+    Ok(options)
 }
 
 fn check_read_only_options(settings: &Output) -> Result<()> {
@@ -125,15 +82,29 @@ fn check_read_only_options(settings: &Output) -> Result<()> {
     Ok(())
 }
 
-fn settings_without_proxy(output: &Output) -> impl Iterator<Item = &[u8]> {
-    output.stdout.split(|&byte| byte == b'\n').filter(|line| {
-        ![
-            b"proxyjump ".as_slice(),
-            b"proxycommand ",
-            b"proxyusefdpass ",
-        ]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
+// -o can follow another flag in the same option word.
+fn configuration_options(args: &[OsString]) -> impl Iterator<Item = &[u8]> {
+    let mut args = args.iter();
+    std::iter::from_fn(move || loop {
+        let argument = args.next()?;
+        let Some(flags) = argument.as_bytes().strip_prefix(b"-") else {
+            continue;
+        };
+        let Some(index) = flags
+            .iter()
+            .position(|flag| b"BbcDEeFIiJLlmOoPpQRSWw".contains(flag))
+        else {
+            continue;
+        };
+        let (flag, inline) = flags[index..].split_first().unwrap();
+        let value = if inline.is_empty() {
+            args.next()?.as_bytes()
+        } else {
+            inline
+        };
+        if *flag == b'o' {
+            return Some(value);
+        }
     })
 }
 
@@ -170,7 +141,7 @@ fn keep_host_files_read_only(
     // interpret whitespace in the dump as a path separator.
     let mut candidates = BTreeSet::from([HOST_FILE_DEFAULT.to_vec()]);
     candidates.extend(
-        ssh_jump::configuration_options(args)
+        configuration_options(args)
             .filter_map(host_file_values)
             .map(<[u8]>::to_vec),
     );
@@ -414,7 +385,7 @@ impl Probe<'_> {
 
     fn capture(&self, args: &[OsString], option: Option<&OsStr>) -> Result<Output> {
         let mut command = Command::new(self.program);
-        command.arg0(ssh_jump::LAUNCHER_COMMAND).arg("-G");
+        command.arg("-G");
         if self.disable_keychain {
             command.args(["-o", DISABLE_KEYCHAIN]);
         }

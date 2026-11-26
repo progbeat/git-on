@@ -64,7 +64,7 @@ def run(options):
     options.output.parent.mkdir(parents=True,exist_ok=True)
     with options.output.open('w') as output:
         def record(row):
-            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='file:// generated private server',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
+            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='direct HTTP/2 fixture',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
             output.write(json.dumps(row)+'\n');output.flush();print(json.dumps(row),flush=True)
         for count in options.sizes:
             f=Fixture()
@@ -79,7 +79,7 @@ def run(options):
                 child=f.root/'command.py';child.write_text(CHILD)
                 stat_bytes=stat_abi_bytes(build_stat_observer(f.root/'stat-abi'))
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.blob_bytes),str(stat_bytes)]
-                source='file://'+str(f.repo)
+                source=f.https()
                 env,log=native_command_audit(f.root,f.env,options.backend=='materialized')
                 backend_args = ['--backend=copy'] if options.backend=='materialized' else []
                 argv=[str(options.binary.resolve()),*backend_args,source,'HEAD','--write-policy=all','--',*command]

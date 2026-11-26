@@ -977,7 +977,7 @@ pub(super) struct PendingGroupCleanup {
 }
 
 impl PendingGroupCleanup {
-    fn retry(dir: &Path) -> Self {
+    pub(super) fn retry(dir: &Path) -> Self {
         Self {
             dir: dir.to_owned(),
             can_retry: true,

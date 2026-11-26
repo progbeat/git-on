@@ -8,7 +8,6 @@ test_binary=$(realpath "$4")
 root=$(mktemp -d /tmp/git-on-nfs.XXXXXXXX)
 mountd=
 nfs_started=false
-small_shm=false
 cleanup() {
     status=$?
     trap - EXIT
@@ -16,8 +15,6 @@ cleanup() {
         cat "$root/mountd.log" >&2
     fi
     if mountpoint -q "$root/client"; then umount "$root/client" || exit 1; fi
-    if "$small_shm"; then umount /dev/shm || exit 1; fi
-    if mountpoint -q "$root/memory"; then umount "$root/memory" || exit 1; fi
     if "$nfs_started"; then rpc.nfsd 0; fi
     if [ -n "$mountd" ]; then
         kill "$mountd" 2>/dev/null || :
@@ -51,8 +48,8 @@ nfs_started=true
 timeout 35 mount -i -n -t nfs4 -o vers=4.1,proto=tcp,addr=127.0.0.1,clientaddr=127.0.0.1,local_lock=none,timeo=20,retrans=2,soft \
     127.0.0.1:/ "$root/client"
 run_tests() {
-    setpriv --reuid "$test_uid" --regid "$test_gid" --clear-groups \
-        env -u LD_LIBRARY_PATH TMPDIR="$root/client" timeout 90 "$@"
+    setpriv --reset-env --reuid "$test_uid" --regid "$test_gid" --clear-groups \
+        env PATH="$PATH" TMPDIR="$root/client" timeout 90 "$@"
 }
 run_tests python3 tests/integration.py --binary "$binary" --require-nfs-tmpdir --require-fuse \
     CliTests.test_copy_status_when_nfs_defers_removing_run_contents \
@@ -69,9 +66,3 @@ run_tests "$test_binary" --include-ignored --exact --test-threads=1 \
     > "$root/rust-tests.log" || { cat "$root/rust-tests.log"; exit 1; }
 cat "$root/rust-tests.log"
 grep -Fq 'test result: ok. 7 passed;' "$root/rust-tests.log"
-mkdir "$root/memory"
-mount -t tmpfs -o "size=16m,mode=0700,uid=$test_uid,gid=$test_gid" tmpfs "$root/memory"
-mount -t tmpfs -o size=4m,mode=1777 tmpfs /dev/shm
-small_shm=true
-GIT_ON_TEST_SERVICE_TMPFS="$root/memory" run_tests python3 tests/integration.py --binary "$binary" \
-    CliTests.test_native_copy_uses_larger_service_tmpfs

@@ -1,156 +1,109 @@
 # Remote execution and native verification
 
 `git on REV [OPTIONS] -- COMMAND [ARGS...]` resolves one local revision through
-native Git. `git on REPOSITORY REFSPEC [OPTIONS] -- COMMAND [ARGS...]` uses the
-reusable protocol v2 path described below or passes both operands unchanged
-to native `git fetch` and selects the fetched object. Git-on parses its own
-options and command separator. Native Git supplies repository resolution and
-handles refspecs outside the reusable path.
-Runner options may appear anywhere before the first `--`, interspersed with
-the two operands; the command tail stays literal. URLs work
-outside a checkout. A configured remote name requires its local repository.
-Configured remote names, ordinary local paths, `file://`, HTTPS, OpenSSH and
-scp-style SSH URLs use native Git repository resolution and transport. Effective
-URL rewriting is applied once. Authentication and server capabilities still
-determine whether execution can proceed.
+Git. `git on REPOSITORY REVISION [OPTIONS] -- COMMAND [ARGS...]` loads one
+snapshot from the effective repository URL or local path. Options can appear
+anywhere before the first `--`. The command after it receives the remaining
+arguments verbatim. A configured remote name such as `origin` requires the
+caller's repository. Git resolves the name and applies `url.*.insteadOf` once.
 
-Native fetches apply inherited Git configuration within the
-[service-state contract](specification.md#service-state). Git-on disables
-hooks, including `reference-transaction` for updates in a private repository.
-Snapshot contents come directly from Git objects. Native Git never needs a
-worktree checkout to prepare them.
+## Network transport profile
 
-Fetch syntax such as `heads/main`, `tags/release`, `+main` and
-`main:refs/heads/demo` is interpreted by Git. A destination ref is written only
-in the private temporary repository, never the caller's repository. On a
-case-insensitive temporary filesystem that repository uses Git's reftable
-backend so distinct ref names retain their identity. In two-operand mode,
-`main:directory` is a fetch refspec, not a snapshot-subdirectory selector.
-Use the command's arguments or working-directory logic to choose a directory
-inside that fetched snapshot. One-operand local `HEAD:directory` remains native
-Git tree selection.
+GitHub.com is the reference for network compatibility. Hosts on other domains
+work when they offer the same Git behavior for these operations.
 
-Git decides which object-ID abbreviations and revision expressions are valid:
-local revision resolution and fetching do not necessarily accept the same forms.
-A full commit ID selects a fixed revision even if an upstream branch later
-moves. With native fetch, Git-on uses the single distinct object selected by
-`FETCH_HEAD`. Subsequent reads request exact OIDs. A fetch
-that selects multiple distinct objects cannot define one snapshot and fails
-before mounting.
-SHA-256 object storage, submodules and Git LFS remain unsupported.
+| Transport | Required protocol |
+| --- | --- |
+| `https://host/owner/repo.git` | Direct TLS with HTTP/2 and smart Git protocol v2 |
+| `ssh://git@host/owner/repo.git` and `git@host:owner/repo.git` | Direct OpenSSH with Git protocol v2 |
+
+Both transports use SHA-1 object IDs and shallow fetches by exact OID. Lazy
+mounts additionally require `filter tree:0`. The server must supply the objects
+reachable from the selected OID when later requests name them explicitly.
+Git-on selects a ref once and sends subsequent object requests by OID. Network
+execution requires Git 2.45.1 or newer for configuration, credential lookup and
+signature checks.
+
+Select `HEAD`, a full SHA-1 OID, a full ref such as `refs/heads/main`,
+`refs/tags/v1.0`, or `refs/pull/41/head`, or an unambiguous short branch or tag.
+The branch and tag shorthand forms `heads/main` and `tags/v1.0` are also
+supported. Network ref arguments use UTF-8. If names compete, use a full ref.
+The optional leading `+` and an explicit
+`:refs/...` suffix select the source. Network loads create no destination
+ref, and a configured remote's tracking map has no effect on this selection.
+Wildcard refspecs, remote groups and abbreviated OIDs are outside this profile.
+A colon in two-operand mode does not select a subdirectory of the tree.
+Use `HEAD:directory` with a local revision, or choose the working directory
+from the command.
+
+HTTP/1.x, Git protocol v0/v1, plain HTTP, `git://`, external Git remote helpers
+and proxies are unsupported. Use the canonical repository URL for HTTPS.
+Git-on treats redirects as errors. HTTPS ignores proxy environment variables and
+rejects explicit Git HTTP overrides. It uses normal TLS certificate validation,
+with `GIT_SSL_CAINFO` available for a custom CA bundle. SSH accepts direct ports
+and host aliases, including a direct connection to `ssh.github.com:443`, and
+rejects `ProxyCommand` and `ProxyJump`. Network loads reject explicit Git
+transport-policy overrides, custom upload-pack or server options, fetch fsck
+settings and custom `GIT_EXEC_PATH`. Unsupported network requests exit with
+a diagnostic.
+
+## Explicit local repositories
+
+`git on /path/to/repository REV -- COMMAND`, a `file://` URL, and a configured
+remote name that resolves to a local repository use the same revision and
+object reader as `git -C /path/to/repository on REV -- COMMAND`. Relative
+paths are resolved from the invocation directory. Git interprets `REV` as a
+local revision, including `HEAD:subdirectory`. The suffix after a colon is a
+tree path in a local revision. Writing a fetch-refspec destination is no
+longer part of the local-source form.
+
+Git-on reads the original repository directly. Local loading needs no
+upload-pack settings, temporary fetch repository, or copy of the source's
+objects. If maintenance removes a still-unread object, the operation asking
+for it reports a source read error.
+
+Git-on fixes the selected OID before execution. Later changes to a ref leave
+the selection unchanged. SHA-256 object storage, submodules and Git LFS
+remain unsupported.
 
 ## Object demand and cache lifetime
 
 Remote execution requires Git 2.45.1+. For lazy execution, fetch the selected
 object and root tree before mounting. Each subsequent missing tree or blob is
-explicitly fetched by OID with `tree:0`. libgit2 does not automatically fetch promisor objects; native
-Git also receives `GIT_NO_LAZY_FETCH=1`. Never request `blob:none`, perform a full
+explicitly fetched by OID with `tree:0`. Local object access through native
+Git uses `--no-lazy-fetch`. Missing objects in a local partial clone produce a
+source error. Never request `blob:none`, perform a full
 checkout or recursively walk unvisited trees for readonly operations. Subtree
 selection reads only ancestor trees. Writes in `all` prepare private copies of
 the affected files. Packs may contain necessary tag/commit ancestry or delta bases;
 tests inspect actual received objects, requests and bytes, since the filter's
 name alone proves nothing about demand.
 
-Where protocol v2 and the caller's policy permit, exact demands reuse
-invocation-owned channels. Native Git resolves the original repository and
-prepares the OpenSSH arguments. Local paths and `file://` URLs can stream a
-full OID, an unambiguous branch or tag, or `HEAD` from `upload-pack` from the first
-filtered fetch. Git's `fetch-pack --diag-url` resolves paths that need URL
-parsing. Its private Git directory is also available to the compatibility
-path. The stream does not write a pack or index there. Named selections
-on file sources advertising `ref-in-want` use native fetch, as do file sources
-with unknown formats. For every transport, native Git applies caller settings
-outside the streaming path when it selects the initial revision.
-A full SHA-1 object ID or unambiguous branch or tag can use the reusable HTTPS channel
-for the initial fetch after the server advertises filtering. Lazy HTTPS resolves
-a named ref with `ls-refs` and requests the resulting OID, including when the
-server advertises `ref-in-want`. With a full OID, the first fetch can handle
-the POST authentication challenge directly. A non-pack reply to the first
-fetch can require a ref query to finish authentication before retrying the
-same OID. If HTTPS falls back to native Git before decoding the first pack,
-native fetch keeps any OID already selected by the reusable channel. A named
-remote with Git's usual branch-to-tracking map uses the same streamed selection
-as its effective URL. With default fetch mappings, an unambiguous source-only
-force refspec such as `+main` uses the same stream as `main`. Explicit
-destinations, custom fetch mappings and remote groups use native Git.
-An SSH identity that
-authenticates without a prompt can select the ref or exact object ID and
-fetch the root tree over one owned channel. For a lazy mount, a named SSH
-selection channel advertising `ref-in-want` hands selection to native Git.
-Git-on continues with the selected OID. On older servers that send the shallow
-response sections out of order, Git-on forwards them in the order native Git
-expects on the same SSH channel. Other refspecs use native Git's selection with
-the caller's credentials, proxies and TLS policy.
-Interactive preparation uses native fetch with job-control supervision. Git-on
-owns the terminal and presents standard Git/OpenSSH askpass requests. Helpers
-request interaction through `GIT_ASKPASS` or `SSH_ASKPASS`. Configured askpass
-programs retain their selection policy and original environment. Once the
-command starts, HTTP(S) helpers run in their own sessions without a controlling
-terminal.
-SSH reuses only the existing identity-checked owned master. Explicit protocol v0/v1,
-custom server/vcs/server-option settings, explicit fsck policy, or a custom
-`GIT_EXEC_PATH` retain the native compatibility path. Git's standard inherited
-helper path supports reuse.
+SSH selects a ref and fetches the initial object on one owned channel.
+Later channels reuse the same OpenSSH master. When an authenticated channel
+waits for the Git advertisement, a spare can prepare on that master.
+A slow startup can also prepare spare channels while the first object arrives. The pool opens more channels
+when reads need them and continues using established channels if the server
+refuses an additional session. Before the first directory enumeration, a
+slow lookup can close the request side of one channel with its fetch while
+another channel stays ready. A tree lookup needs two ready spares so the file
+can still use this path after resolving its ancestors. The pack and SSH exit
+status must both confirm completion.
+
+HTTPS uses one HTTP/2 connection per session. On a Basic authentication
+challenge, Git-on uses `git credential fill` in the caller's context, then uses
+the returned username and password for requests to that repository. Libcurl
+can try `.netrc` before the helper lookup, as native Git does. A rejected
+helper result ends the exchange. Git-on sends no approval or rejection to
+credential helpers and keeps stored credentials and cookies intact. Libcurl and the server govern
+HTTP/2 concurrency and flow control.
 
 On FUSE and NFS, protected directory and file lookups can wait for an exact
 object independently of the filesystem worker. A cold pathname lookup can
 wait for its parent tree, then resolve the name and wait for its file size.
-Directory enumeration can wait for its tree as well. On eligible HTTPS mounts,
-an asynchronous loader multiplexes exact requests on one HTTP/2 connection.
-For a supported host-scoped HTTP Basic challenge, native Git reads existing
-credentials with `git credential fill` in the caller's context. Helpers can
-provide a username and password or continue an exchange with pre-encoded
-Authorization values as the server changes challenges. Both streaming and
-native HTTPS dispatch only credential lookups. Stored credentials and cookie
-files retain their contents after either outcome. Other initial challenges
-and credential policies use native Git's HTTP exchange. Libcurl and the peer
-govern the active streams. The loader can briefly wait for
-overlapping demands after confirming a scan or observing consistently slow
-replies.
-Each foreground fetch can group up to 64 already pending OIDs.
-Explicit Git HTTP configuration, authentication outside the supported exchange,
-and servers without HTTP/2 or filtered protocol v2 use the native helper.
-Transport selection completes before any object demand is sent.
+Directory enumeration can wait for its tree as well. Each foreground fetch
+can group up to 64 already pending OIDs.
 
-When the native ref advertisement supplies capabilities, Git-on captures
-the packet trace in a private temporary file and scans bounded chunks for
-filter support. Detached writers can finish using their open descriptors.
-Later opens of the trace path go to the null device during the run.
-The runner can emit the captured advertisement to the caller's stdout or
-stderr. Paths to external trace files and pipes remain untouched.
-
-Native helpers start with four available channels. If each of the first eight
-successful transfers takes at least 64 milliseconds, the pool can use up to
-16 channels. It can expand earlier if a scan confirms its forecasts while the
-connection is still being measured. SSH opens its channels through the same
-owned master and uses fewer when the server refuses an additional channel.
-On a slow SSH startup, up to two spare channels can begin negotiating protocol
-v2 as soon as the authenticated, owned socket exists. When the caller leaves
-the protocol version unconfigured, an unambiguous branch or tag can use a Git
-v0 ref advertisement while filtered protocol v2 channels negotiate on the
-same master. A ready channel
-can fetch the selected commit while another channel awaits an `ls-refs` reply.
-Object requests on this path use filtered protocol v2.
-If fetching the selected object also takes at least 64 milliseconds, up to two
-more SSH channels can start negotiating while the root tree is fetched.
-Ready startup channels can serve exact demands while other channels are still
-negotiating and the pool is measuring its first replies.
-An established SSH channel can serve exact demands when the opening limit
-shrinks. When ordinary slots are unavailable, a released slot can reconnect
-for an exact demand while another pack or startup negotiation is in progress.
-If the reopen attempt is refused during startup, the slot retries after a
-standby finishes negotiating. Recovery through a slot that has never opened
-waits for active packs and startup attempts to finish.
-When another channel opens during execution, pending requests stay eligible
-on the existing channels until one is available to send them.
-Beyond the initial SSH pool, actual demands open additional channels.
-Prefetch can use those channels after they connect.
-Before the first enumeration of a snapshot directory, a slow pathname lookup
-or file read can send SSH EOF with the final request on a channel while
-another negotiated channel stays ready for the next read. Enumeration keeps
-channels reusable for the reads it can trigger. Pack verification and the
-channel's exit status still determine whether each request completed
-successfully.
 An idle pool starts an ordinary request immediately. While a transfer is active,
 the queue can wait up to two milliseconds on a slow source or during a confirmed
 scan. For a confirmed scan, the wait can reach twelve milliseconds while the
@@ -204,41 +157,16 @@ objects retain those buffers for later access and become readable after the
 pack is verified. A demand for a known entry can wait for validation without
 another fetch. Eager materialization writes a verified extra directly into
 its destination.
-The native Git compatibility path can use temporary pack files.
-
-Explicit-all eager materialization needs the entire selected tree. Fetch the
-selected revision once with depth one and without an object filter. Reusable
-HTTPS, SSH, local paths and `file://` URLs can use a full OID, an unambiguous
-branch or tag, or the advertised `HEAD`. The file transport uses the
-installed Git's `upload-pack` under its default transport policy. HTTPS
-accepts HTTP/2, HTTP/1.1, and HTTP/1.0 responses for this one-time transfer.
-For SSH and `file://`, close the request stream after sending the fetch and
-verify the process exit status after receiving the complete pack. Decode the pack in RAM
-and write verified file contents to their
-destination paths. If automatic mount setup fails and copying is allowed, the
-same transfer can use the already selected OID. Native Git handles competing
-refs, named fetches on servers advertising `ref-in-want`, other refspecs,
-and custom fetch mappings. Signature and trust settings leave the transport
-choice to the same rules as a run without `--verify`. Explicit
-Git settings outside those handled by the streaming path go through native
-fetch, including settings that Git validates before accepting a pack.
-In that path, retain the compressed pack and decode
-directly into destination files. Large blobs in the same staged pack share a
-single native batch decoder. Both paths reuse already prepared objects.
-Both paths ask for a shallow snapshot and can operate without server-side
-filtering. Git receives the server's original challenge values during
-credential lookup. A rejected credential ends the exchange. Native Git handles
-repository- or user-scoped credentials and other authentication challenges.
+Explicit-all eager materialization needs the entire selected tree. It
+requests one shallow snapshot pack by OID without an object filter. Git-on
+decodes the pack in RAM and writes verified contents to their destination
+paths. Over SSH, Git-on closes the request stream after sending the fetch and
+checks the process's exit status after receiving the complete pack. If automatic mount setup fails and copying is allowed, the copy keeps
+the already selected OID. The network transfer works without server-side
+filtering in eager mode.
 
 ### Temporary Git contexts
 
-- Native fetch uses a private repository for destination refs and
-  `FETCH_HEAD`. Git writes incoming objects and indexes directly to a
-  separate temporary object directory. Selection and verification read the
-  original commit and tag objects from that directory. Git-on passes the
-  directory path to libgit2 as bytes.
-- Native ref negotiation or escaped file-URL diagnostics can use the same
-  private repository context.
 - For a streamed snapshot, Git-on exposes only the selected commit or tag
   as a loose object in its temporary service directory for native verification.
   Git uses the caller's repository context when available. Outside a repository,
@@ -247,51 +175,28 @@ repository- or user-scoped credentials and other authentication challenges.
   A private config directory carries a SHA-256 caller's repository-local
   verifier settings into the SHA-1 context. Local verification uses the caller's
   object database.
-- An object-location bridge adapts byte paths or nested alternates to libgit2
-  when needed. Linux can use an open directory descriptor for byte paths.
-  Git's quoted or relative alternate forms may use `git cat-file` for headers
-  and payload reads.
 - Index expressions such as `:path` use a private context for split-index
   timestamp updates. Git reads the index and its objects from the source.
   An alternate index may require a private copy of its referenced base to
   preserve Git's lookup order.
 
-Standard streamed HTTPS, SSH, and plain local paths use no temporary fetch
-repository. Compatibility operations can require one.
-This includes `origin` with the standard tracking refspec when its resolved URL
-streams. Credential lookup uses a directory only for any files it needs.
-See [temporary storage](usage.md#temporary-storage) for filesystem selection.
+Network loading and direct local reads take no temporary Git repository for
+object transfer. Local reads use libgit2 where it can open the selected
+store directly. Reftable repositories and object layouts such as nested or
+byte-valued alternate paths use one `git cat-file` process in the source
+repository context. Credential lookup can use a private directory for its
+temporary files. See [temporary storage](usage.md#temporary-storage) for
+filesystem selection.
 
-When materialization fetches missing objects by OID, at most 256 known object
-IDs from the current directory can share one native `fetch --stdin` and
-decoder operation. Each object is checked for existing run-local availability
-and deduplicated before requesting it. These requests use `tree:0`.
-All paths request only known objects. The batch
-size bounds request memory/argv work, not repository or file counts. Metrics
-separately report requested-object count (`remote_fetches`) and actual native
-fetch/decode operations; full-process tracing checks those operation counts.
-Session request/decode counts and transport process starts are separate from
-native fetch/cat-file counters. Server-side Git subprocesses remain real work,
-included in waited CPU for local source fixtures.
+Metrics count requested objects separately from streamed packs and
+transport starts. Count the work of fixture servers separately when
+comparing client operations.
 
 For filtered lazy execution, the server must advertise filtering before any
 object transfer. Git-on sends each tree in its own request and can batch blobs.
 This keeps a tree filter from omitting another explicitly requested object
 inside that tree. Rejection of a requested unadvertised OID names the OID and
 includes Git's server diagnostic.
-
-Two-operand local-path and `file://` sources use upload-pack and require the same
-capabilities. Ordinary local repositories do not enable them by default. When
-you control the source repository, configure it before fetching through git-on:
-
-```sh
-git -C ../another-repo config uploadpack.allowFilter true
-git -C ../another-repo config uploadpack.allowAnySHA1InWant true
-git on ../another-repo main -- ls
-```
-
-These settings belong to the source repository. One-operand local revision
-resolution reads its Git objects directly and needs no upload-pack configuration.
 
 There is no full-clone fallback. A demanded-object failure returns EIO for the
 affected filesystem operation, reports the transport error on stderr and makes
@@ -323,10 +228,8 @@ local and remote snapshots.
 
 Each remote invocation owns an invocation-local object store. The direct
 reusable HTTPS and SSH startup paths keep the selected commit or tag and its
-root tree in memory. Native fetch and native interactive preparation can use
-a private temporary bare repository.
-The streamed HTTPS credential lookup uses the caller's configuration and
-working directory. Reusable fetches keep verified Git objects in memory.
+root tree in memory. HTTPS credential lookup uses the caller's
+configuration and working directory. Reusable fetches keep verified Git objects in memory.
 Demanded objects remain available until cleanup,
 including after decoded memory-cache eviction.
 There is no global persistent object cache or cross-run reuse. A later invocation
@@ -355,7 +258,7 @@ errors propagate before launch or through the lazy operation and runner
 failure as applicable. No failure reruns a started child or silently changes
 write policy.
 
-Completion removes the run's temporary repository and owned SSH connection.
+Completion removes the run's private files and closes the owned SSH connection.
 After abrupt termination, the workspace retains private recovery data
 while the recorded SSH master or a busy run needs it. See
 [foreground lifecycle and cleanup](usage.md#foreground-lifecycle-and-cleanup)
@@ -363,8 +266,9 @@ and [resource limits](resources.md).
 
 ## Authentication
 
-Use the caller's effective system/global/repository configuration, expanded
-includes, inherited `git -c`, transport and credentials. Replay each value once
+Use the caller's effective Git configuration for URL resolution and credential
+lookup, and OpenSSH's effective configuration for direct SSH. Native signature
+verification honors expanded includes and inherited `git -c`. Replay each value once
 for the private repository in its effective order; expand include conditions in
 the original caller's context. Do not log or persist passphrases, modify an
 agent, or create/change real trust keys. Captured configuration stays in process
@@ -377,7 +281,7 @@ master, enable BatchMode and forbid replacement TCP connections. Connection loss
 fails clearly. OpenSSH uses the caller's existing trusted host keys.
 Unknown hosts require trust to be established before running Git-on.
 The runner disables host-key updates and forwarding.
-During native Git authentication, Ctrl-Z stops the invoking job and returns
+During interactive authentication, Ctrl-Z stops the invoking job and returns
 control to its shell. `fg` resumes preparation with the terminal; `bg` leaves the shell
 foregrounded, so another authentication read can stop the job until `fg`.
 
@@ -418,46 +322,32 @@ its socket identity is checked again. Older metadata-only client records lack a
 content fingerprint: close their live master with a trusted client before
 retrying cleanup. Legacy records without any selected-client entry can still
 close their identity-checked master through the same direct mux protocol.
-OpenSSH checks existing host keys at the destination and at each configured
-jump. Every hop uses the run's read-only host-key policy.
-With `CheckHostIP=yes`, OpenSSH checks existing address entries as usual.
-Git-on keeps the configured lookup order and directs additions to a private
-target. It uses `/dev/null` when the list has room and a private copy of
-the first file at OpenSSH's list limit. An ambiguous host-file setting stops
-SSH setup.
-OpenSSH discovers its default user and system configuration files in their
-original contexts. A launcher in service storage passes the read-only options
-to implicit jump clients and to `ProxyCommand ssh -W …` with literal
-OpenSSH options, including when an argv-forwarding wrapper changes the
-OpenSSH executable name. Literal `nc` network relays also work, including
-OpenSSH's documented `nc -X connect -x proxy %h %p` form. Proxy commands
-that require an arbitrary shell program are unsupported. An explicit
-`-F` profile keeps its user
-configuration context. The launcher and the private profile can use temporary
-paths containing spaces.
+OpenSSH checks existing host keys at the destination, including address
+entries with `CheckHostIP=yes`. Git-on preserves the configured lookup order
+and directs any additions to a private target. It uses `/dev/null` when
+there is room in the lookup list and a private copy of the first file at
+OpenSSH's list limit. An ambiguous host-file setting stops SSH setup.
+OpenSSH reads default and explicitly selected configuration files in their
+original contexts.
 
 OpenSSH evaluates `Match exec` while it reads configuration, including for
-`ssh -G`. Git-on can inspect the configuration multiple times when validating
-proxy or `CheckHostIP` settings. OpenSSH can also run these commands during
-connection setup. Effects of these explicitly configured local commands
-are covered by the [service-state exception](specification.md#service-state).
+`ssh -G`. It can run those commands again during connection setup. The effects
+of these explicitly configured commands are covered by the
+[service-state exception](specification.md#service-state).
 
-Apple's OpenSSH combines reading and storing passphrases in its
-`UseKeychain` option. Git-on keeps that option disabled for new connections
-to preserve the caller's Keychain. OpenSSH can use identities already
-available through the caller's agent or ask for a passphrase at startup.
-Multiple encrypted identities, separately authenticated jump hosts and
-interactive credential helpers can need extra initial interaction. The one-prompt guarantee covers a directly reachable
-host and one selected identity. Object loading during preparation can request
-credentials through Git-on. After command startup, lazy fetches disable
-Git/OpenSSH terminal/askpass prompts; a helper opening an independent graphical
-UI is outside that guarantee. Unix
-control-socket paths must fit Linux's length limit. Cancellation terminates owned
-transport subprocesses and follows the normal unmount/cleanup path.
+Apple's OpenSSH combines reading and storing passphrases in `UseKeychain`.
+Git-on disables it for new connections to preserve the caller's Keychain.
+OpenSSH can use an unlocked key from the caller's agent or prompt once for a
+selected encrypted key. During preparation, the terminal integration presents
+configured Git and OpenSSH askpass requests. After the command starts, Git
+and OpenSSH terminal and askpass prompts are disabled. A configured helper may
+open independent graphical UI. Unix control-socket paths must fit the host's
+length limit. Cancellation terminates owned transport subprocesses and follows
+the normal unmount and cleanup path.
 
 ## Native signature verification
 
-All runs use native Git to interpret positional operands. Local execution resolves
+Local execution uses native Git to resolve
 the unchanged revision in the caller's repository, then the object loader reads
 that pinned object through bundled libgit2. Remote execution resolves the selected
 object using the [transport rules above](#object-demand-and-cache-lifetime).

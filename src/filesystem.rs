@@ -1709,7 +1709,7 @@ pub(crate) enum SourceLookup {
 
 impl Overlay {
     pub(crate) fn parallel_remote_reads(&self) -> bool {
-        self.write_policy != WritePolicy::All && self._snapshot.reusable_remote_transport()
+        self.write_policy != WritePolicy::All && self._snapshot.has_remote_transport()
     }
 
     pub(crate) fn start_remote_demand(

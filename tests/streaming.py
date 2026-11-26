@@ -13,14 +13,14 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zlib
 
-from http2 import ARGS, OPTIONS, Fixture, Multiplexer
+from remote import ARGS, OPTIONS, Fixture
+from support.http2_server import Multiplexer
 
 
 def await_file(path, timeout, process=None):
@@ -79,34 +79,6 @@ def ssh_upload_pack(root):
             git.stdin.close()
 
 
-def ssh_branch_pack(root):
-    repository = root / 'server.git'
-    assert shlex.split(os.environ['SSH_ORIGINAL_COMMAND']) == ['git-upload-pack', str(repository)]
-    command = ['git', 'upload-pack', str(repository)]
-    requested = root / 'branch-query'
-    released = root / 'release-branch-query'
-    if os.environ.get('GIT_PROTOCOL') == 'version=0':
-        (root / 'legacy-advertised').touch()
-        assert await_file(requested, 12)
-        os.execvp('git', command)
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as git:
-        try:
-            for packet in packets(git.stdout):
-                sys.stdout.buffer.write(packet)
-            sys.stdout.buffer.flush()
-            while request := b''.join(packets(sys.stdin.buffer)):
-                if b'command=ls-refs\n' in request:
-                    requested.touch()
-                    assert await_file(released, 12)
-                git.stdin.write(request)
-                git.stdin.flush()
-                for packet in packets(git.stdout):
-                    sys.stdout.buffer.write(packet)
-                sys.stdout.buffer.flush()
-        finally:
-            git.stdin.close()
-
-
 def ssh_eof_pack(root, failed):
     repository = root / 'server.git'
     closing = set((root / 'closing').read_bytes().splitlines())
@@ -116,14 +88,11 @@ def ssh_eof_pack(root, failed):
     try:
         (root / 'initial-channel').mkdir()
     except FileExistsError:
-        initial = False
+        pass
     else:
-        initial = True
-        # Induce the normal slow-start path with negotiated spare channels.
-        if startup:
-            assert await_file(root / 'spare-advertised', 8)
-        else:
-            time.sleep(.35)
+        # A slow initial advertisement lets the runner warm a second
+        # channel while fetching the selected object.
+        time.sleep(.35)
     with subprocess.Popen(['git', 'upload-pack', repository], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE) as git:
         try:
@@ -132,8 +101,6 @@ def ssh_eof_pack(root, failed):
             sys.stdout.buffer.flush()
             if startup:
                 (root / f'advertised-{channel}').touch()
-                if not initial:
-                    (root / 'spare-advertised').touch()
             while True:
                 if startup:
                     while not select.select([0], [], [], .02)[0]:
@@ -162,11 +129,17 @@ def ssh_eof_pack(root, failed):
     return 0
 
 
-def read_after_ssh_expiry(root):
+def wait_for_ssh_channels(root, count):
     deadline = time.monotonic() + 8
-    while len(channels := list(root.glob('advertised-*'))) < 2:
-        assert time.monotonic() < deadline, 'both startup channels must advertise'
+    while len(channels := list(root.glob('advertised-*'))) < count:
+        assert time.monotonic() < deadline, f'{count} startup channels must advertise'
         time.sleep(.02)
+    return channels
+
+
+def read_after_ssh_expiry(root):
+    channels = wait_for_ssh_channels(root, 2)
+    deadline = time.monotonic() + 8
     (root / 'expire-spares').touch()
     # The local OpenSSH clients have consumed the server's normal exit. A
     # zombie is also eligible for git-on's non-reaping child check.
@@ -238,15 +211,14 @@ class StreamingTests(unittest.TestCase):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
         url = fixture.ssh(protocol_v2=True, max_sessions=2 if expire else 5,
-                          accept_env=('GIT_ON_FIXTURE_CHANNEL',) if expire else ())
-        if expire:
-            wrapper = fixture.root / 'ssh'
-            wrapper.write_text(
-                '#!/bin/sh\nexport GIT_ON_FIXTURE_CHANNEL=$$\n'
-                'exec /usr/bin/ssh -o SendEnv=GIT_ON_FIXTURE_CHANNEL "$@"\n'
-            )
-            wrapper.chmod(0o700)
-            fixture.env['GIT_SSH_COMMAND'] = str(wrapper) + fixture.env['GIT_SSH_COMMAND'][3:]
+                          accept_env=('GIT_ON_FIXTURE_CHANNEL',))
+        wrapper = fixture.root / 'ssh'
+        wrapper.write_text(
+            '#!/bin/sh\nexport GIT_ON_FIXTURE_CHANNEL=$$\n'
+            'exec /usr/bin/ssh -o SendEnv=GIT_ON_FIXTURE_CHANNEL "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        fixture.env['GIT_SSH_COMMAND'] = str(wrapper) + fixture.env['GIT_SSH_COMMAND'][3:]
         closing = [fixture.subtree, fixture.blob]
         (fixture.root / 'closing').write_text('\n'.join(closing))
         shim = [sys.executable, str(Path(__file__).resolve()), '--ssh-eof',
@@ -261,12 +233,18 @@ class StreamingTests(unittest.TestCase):
             cwd=fixture.cwd, env=fixture.env, capture_output=True, timeout=15,
         )
 
+    def run_with_ready_ssh_spares(self, fixture, url, command):
+        return self.run_sparse_ssh(fixture, url, [
+            sys.executable, str(Path(__file__).resolve()), '--ssh-with-spares',
+            str(fixture.root), *command,
+        ])
+
     def test_sparse_ssh_closes_used_channels_while_they_send_packs(self):
         for failed in (False, True):
             with self.subTest(failed=failed):
                 fixture, url, closing = self.sparse_ssh_fixture(failed)
                 command = ['cat', 'deep/file'] if failed else ['cat', 'deep/file', 'other']
-                result = self.run_sparse_ssh(fixture, url, command)
+                result = self.run_with_ready_ssh_spares(fixture, url, command)
                 self.assertEqual(result.stdout, b'expected\n' if failed else b'expected\nunrelated payload\n',
                                  result.stderr)
                 self.assertEqual(result.returncode, 125 if failed else 0, result.stderr)
@@ -279,7 +257,7 @@ class StreamingTests(unittest.TestCase):
 
     def test_first_cold_ssh_directory_enumeration_keeps_channels_reusable(self):
         fixture, url, _ = self.sparse_ssh_fixture()
-        result = self.run_sparse_ssh(fixture, url, ['ls', '-1', 'deep'])
+        result = self.run_with_ready_ssh_spares(fixture, url, ['ls', '-1', 'deep'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'file\n')
         self.assertFalse((fixture.root / fixture.subtree).exists(), 'SSH stdin closed during readdir')
@@ -296,37 +274,10 @@ class StreamingTests(unittest.TestCase):
         self.assertNotIn(request.name.rsplit('-', 1)[1], expired)
         self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
-    def ssh_branch_fixture(self):
+    def test_ssh_branch_respects_explicit_protocol_v2(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
-        url = fixture.ssh(protocol_v2=True)
-        authorized = fixture.root / 'authorized'
-        shim = shlex.join([sys.executable, str(Path(__file__).resolve()), '--ssh-branch', str(fixture.root)])
-        authorized.write_text(f'command="{shim}" ' + authorized.read_text())
-        return fixture, url
-
-    def test_ssh_branch_can_use_a_late_advertisement_while_ls_refs_is_held(self):
-        fixture, url = self.ssh_branch_fixture()
-        process = subprocess.Popen(
-            [OPTIONS.binary, url, 'main', mount_flag(), '--write-policy=none', '--', 'cat', 'deep/file'],
-            cwd=fixture.cwd, env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        fixture.children.append(process)
-        try:
-            self.assertTrue(await_file(fixture.root / 'branch-query', 8, process))
-            try:
-                output, errors = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.fail('the named revision waited for the held ls-refs reply')
-        finally:
-            (fixture.root / 'release-branch-query').touch()
-        self.assertEqual(process.returncode, 0, errors)
-        self.assertEqual(output, b'expected\n')
-        self.assertEqual((fixture.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
-
-    def test_ssh_branch_respects_explicit_protocol_v2(self):
-        fixture, url = self.ssh_branch_fixture()
-        (fixture.root / 'release-branch-query').touch()
+        url = fixture.ssh()
         fixture.git('init', '--quiet', at=fixture.cwd)
         remotes = fixture.cwd / '.git' / 'remotes'
         remotes.mkdir()
@@ -344,8 +295,6 @@ class StreamingTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'expected\n')
-        self.assertTrue((fixture.root / 'branch-query').is_file())
-        self.assertFalse((fixture.root / 'legacy-advertised').exists())
 
     def test_directory_dfs_prefetch_is_separate_and_publishes_early(self):
         self.assertTrue(OPTIONS.require_fuse or OPTIONS.require_nfs)
@@ -371,14 +320,12 @@ class StreamingTests(unittest.TestCase):
                 fixture.git('update-ref', 'refs/heads/main', commit)
                 split = SplitPack(fixture.root, oids[1:5], data[1:5], oids[-1], data[-1])
                 if transport == 'https':
-                    upstream = fixture.https()
+                    upstream = fixture.http1_upstream()
                     stack.callback(fixture.server.shutdown)
                     proxy = Multiplexer(fixture, upstream, None)
                     proxy.split_pack = split
-                    stack.callback(proxy.server_close)
-                    threading.Thread(target=proxy.serve_forever, daemon=True).start()
-                    stack.callback(proxy.shutdown)
-                    url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+                    proxy.start(stack.callback)
+                    url = proxy.url
                 else:
                     url = fixture.ssh(protocol_v2=True)
                     (fixture.root / 'wants').write_bytes(b'\n'.join(sorted(split.wants)))
@@ -453,20 +400,18 @@ assert Path('hidden/no').read_bytes() == {data[-1]!r}
     def test_a_base_read_joins_the_pack_that_supplied_an_early_delta(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
-        upstream = fixture.https()
+        upstream = fixture.http1_upstream()
         self.addCleanup(fixture.server.shutdown)
         basic = base64.b64encode(b'fixture:example-password').decode()
         proxy = Multiplexer(fixture, upstream, 'Basic ' + basic)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
+        proxy.start(self.addCleanup)
         split = SplitPack(fixture.root, [fixture.blob], [b'out/\n', b'expected\n'],
                           fixture.other, b'unrelated payload\n', hold_trailer=True)
         proxy.split_pack = split
         self.addCleanup(split.release.touch)
         fixture.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='credential.helper',
                            GIT_CONFIG_VALUE_0="!f() { echo username=fixture; echo password=example-password; }; f")
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        url = proxy.url
         starting = fixture.root / 'starting-base'
         done = fixture.root / 'base-read'
         script = f"""
@@ -493,16 +438,51 @@ Path({str(done)!r}).touch()
         self.assertEqual(process.returncode, 0, errors)
         self.assertNotIn(fixture.other.encode(), {oid for _, wants in proxy.records for oid in wants})
 
+    def test_materializing_a_lazy_snapshot_waits_for_the_pack_trailer(self):
+        fixture = fixture_in_short_tmp()
+        self.addCleanup(fixture.close)
+        tree = fixture.git('mktree', data=f'100644 blob {fixture.blob}\tfile\n'.encode())
+        commit = fixture.git('commit-tree', tree, data=b'lazy materialization\n')
+        fixture.git('update-ref', 'refs/heads/main', commit)
+        proxy = fixture.https_server()
+        pack = subprocess.check_output(
+            ['git', '-C', fixture.repo, 'pack-objects', '--stdout'],
+            input=(fixture.blob + '\n').encode(), env=fixture.env,
+        )
+        prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
+        split = SimpleNamespace(wants={fixture.blob.encode()}, prefix=b'000dpackfile\n' + prefix,
+                                tail=tail, started=fixture.root / 'pack-started',
+                                release=fixture.root / 'release-pack')
+        proxy.split_pack = split
+        self.addCleanup(split.release.touch)
+        probe = fixture.probe(proxy.url)
+        fixture.line(probe)
+        destination = fixture.root / 'copy'
+        destination.mkdir()
+        probe.stdin.write(f'materialize {destination}\n'.encode())
+        probe.stdin.flush()
+        try:
+            self.assertTrue(await_file(split.started, 8, probe), 'materialization never fetched the blob')
+            path = destination / 'file'
+            self.assertTrue(await_file(path, 5, probe), 'verified bytes did not reach the destination')
+            self.assertFalse(select.select([probe.stdout], [], [], .25)[0],
+                             'materialization reported success before validating the pack')
+        finally:
+            split.tail = None
+            split.release.touch()
+        stdout, errors = probe.communicate(input=b'exit\n', timeout=10)
+        self.assertNotEqual(probe.returncode, 0, errors)
+        self.assertNotIn(b'"materialized":true', stdout)
+        self.assertIn(b'execution incomplete', errors)
+
     def test_successful_child_exit_waits_for_the_pack_used_by_its_read(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
-        upstream = fixture.https()
+        upstream = fixture.http1_upstream()
         self.addCleanup(fixture.server.shutdown)
         proxy = Multiplexer(fixture, upstream, None)
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        proxy.start(self.addCleanup)
+        url = proxy.url
         pack = subprocess.check_output(['git', '-C', fixture.repo, 'pack-objects', '--stdout'],
                                        input=(fixture.blob + '\n').encode(), env=fixture.env)
         prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
@@ -605,15 +585,13 @@ pending.replace(pidfile)
         prefix, tail = split_pack_packets(pack[:-20], pack[-20:])
         split = SimpleNamespace(wants={blob.encode()}, prefix=b'000dpackfile\n' + prefix, tail=tail,
                                 started=fixture.root / 'pack-started', release=fixture.root / 'release-pack')
-        upstream = fixture.https()
+        upstream = fixture.http1_upstream()
         self.addCleanup(fixture.server.shutdown)
         proxy = Multiplexer(fixture, upstream, None)
         proxy.split_pack = split
-        self.addCleanup(proxy.server_close)
-        threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        self.addCleanup(proxy.shutdown)
+        proxy.start(self.addCleanup)
         self.addCleanup(split.release.touch)
-        url = f'https://127.0.0.1:{proxy.server_address[1]}/server.git'
+        url = proxy.url
 
         script = f"""
 import hashlib, os, time
@@ -692,11 +670,12 @@ with ThreadPoolExecutor(12) as pool:
 if __name__ == '__main__':
     if sys.argv[1:2] == ['--ssh-pack']:
         ssh_upload_pack(Path(sys.argv[2]))
-    elif sys.argv[1:2] == ['--ssh-branch']:
-        ssh_branch_pack(Path(sys.argv[2]))
     elif sys.argv[1:2] == ['--ssh-eof']:
         sys.exit(ssh_eof_pack(Path(sys.argv[2]), sys.argv[3].encode()))
     elif sys.argv[1:2] == ['--ssh-after-expiry']:
         read_after_ssh_expiry(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ['--ssh-with-spares']:
+        wait_for_ssh_channels(Path(sys.argv[2]), 3)
+        os.execvp(sys.argv[3], sys.argv[3:])
     else:
         unittest.main(argv=[sys.argv[0], *ARGS])

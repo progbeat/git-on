@@ -175,8 +175,10 @@ impl PreparedBlob {
 }
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
+    // Finish any pack already used by lazy reads so the copy can reuse its
+    // verified extra objects without admitting them to the hot blob cache.
+    snapshot.verify_materialization_packs()?;
     snapshot.set_spool_directory(root)?;
-    snapshot.begin_materialization()?;
     directory(
         snapshot,
         snapshot.tree_oid,

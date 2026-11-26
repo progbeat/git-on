@@ -1,7 +1,5 @@
 //! Transfer telemetry. Terminal drawing remains on the preparation UI thread.
 use std::{
-    fs::File,
-    os::unix::fs::FileExt,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -30,44 +28,9 @@ pub(super) fn display(value: &str) -> String {
     text
 }
 
-/// Read captured stderr by offset: seeking a dup would move the child's shared
-/// write offset and corrupt its diagnostics. Polling is bounded and best effort.
-pub(crate) struct NativeProgress {
-    previous: Option<Report>,
-    offset: u64,
-    lines: Lines,
-}
-impl NativeProgress {
-    pub(crate) fn new() -> Self {
-        Self {
-            previous: REPORT.lock().unwrap().take(),
-            offset: 0,
-            lines: Lines::default(),
-        }
-    }
-    pub(crate) fn poll(&mut self, file: &File) {
-        let mut bytes = [0; 4096];
-        for _ in 0..8 {
-            let Ok(count) = file.read_at(&mut bytes, self.offset) else {
-                break;
-            };
-            if count == 0 {
-                break;
-            }
-            self.offset += count as u64;
-            self.lines.feed(&bytes[..count]);
-        }
-    }
-}
-
-impl Drop for NativeProgress {
-    fn drop(&mut self) {
-        *REPORT.lock().unwrap() = self.previous.take();
-    }
-}
-
 pub(crate) struct PackProgress {
-    report: NativeProgress,
+    previous: Option<Report>,
+    lines: Lines,
     started: Instant,
     last_update: Option<Instant>,
 }
@@ -75,14 +38,15 @@ pub(crate) struct PackProgress {
 impl PackProgress {
     pub(crate) fn new() -> Self {
         Self {
-            report: NativeProgress::new(),
+            previous: REPORT.lock().unwrap().take(),
+            lines: Lines::default(),
             started: Instant::now(),
             last_update: None,
         }
     }
 
     pub(crate) fn remote(&mut self, bytes: &[u8]) {
-        self.report.lines.feed(bytes);
+        self.lines.feed(bytes);
     }
 
     pub(crate) fn received(&mut self, position: usize, total: usize, bytes: u64) {
@@ -102,6 +66,12 @@ impl PackProgress {
             detail: format!("{:.2} MiB | {:.2} KiB/s", kib / 1024.0, kib / seconds),
             counts: Some((position as u64, total as u64)),
         });
+    }
+}
+
+impl Drop for PackProgress {
+    fn drop(&mut self) {
+        *REPORT.lock().unwrap() = self.previous.take();
     }
 }
 
@@ -165,59 +135,18 @@ fn parse(bytes: &[u8]) -> Option<Report> {
     })
 }
 
-pub(crate) fn diagnostics(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .split_inclusive(|byte| *byte == b'\r' || *byte == b'\n')
-        .filter(|line| {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let summary = line
-                .strip_prefix(b"remote: Total ")
-                .is_some_and(|rest| rest.first().is_some_and(u8::is_ascii_digit));
-            parse(line).is_none() && !summary
-        })
-        .flatten()
-        .copied()
-        .collect()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Seek, Write};
-
-    #[test]
-    fn native_progress_preserves_capture_offsets_and_bounds_partial_lines() {
-        let file = tempfile::tempfile().unwrap();
-        let mut writer = file.try_clone().unwrap();
-        let first = b"remote: Compressing objects:  25% (1/4)\r";
-        writer.write_all(first).unwrap();
-        let mut progress = NativeProgress::new();
-        progress.poll(&file);
-        assert_eq!(current().unwrap().counts, Some((1, 4)));
-        assert_eq!(writer.stream_position().unwrap(), first.len() as u64);
-        let second = b"Receiving objects: 50% (2/4), 1.25 MiB | 640.00 KiB/s\r";
-        writer.write_all(second).unwrap();
-        progress.poll(&file);
-        let report = current().unwrap();
-        assert_eq!(report.label, "Receiving objects");
-        assert_eq!(report.counts, Some((2, 4)));
-        assert_eq!(report.detail, "1.25 MiB | 640.00 KiB/s");
-        let expected = [first.as_slice(), second.as_slice()].concat();
-        let mut actual = vec![0; expected.len()];
-        file.read_exact_at(&mut actual, 0).unwrap();
-        assert_eq!(actual, expected);
-        progress.lines.feed(&vec![b'x'; 65536]);
-        assert!(progress.lines.pending.len() <= 2048);
-        progress.lines.feed(b"Receiving objects: 90% (9/10)\r");
-        assert_eq!(current().unwrap().counts, Some((2, 4)));
-        progress.lines.feed(b"Receiving objects: 75% (3/4)\r");
-        assert_eq!(current().unwrap().counts, Some((3, 4)));
-        assert!(parse(b"warning: 50% (1/2)").is_none());
-        assert!(parse(b"Receiving objects: 200% (2/1)").is_none());
-        assert_eq!(
-            diagnostics(b"Receiving objects: 100% (4/4), done.\rfatal: broken pack\n"),
-            b"fatal: broken pack\n"
-        );
-    }
+#[test]
+fn sideband_progress_bounds_partial_lines_and_recovers_at_the_next_record() {
+    let mut progress = PackProgress::new();
+    progress.remote(b"remote: Compressing objects:  25% (1/");
+    progress.remote(b"4)\r");
+    assert_eq!(current().unwrap().counts, Some((1, 4)));
+    progress.remote(&vec![b'x'; 65536]);
+    progress.remote(b"Receiving objects: 90% (9/10)\r");
+    assert_eq!(current().unwrap().counts, Some((1, 4)));
+    progress.remote(b"Receiving objects: 50% (2/4), 1.25 MiB | 640.00 KiB/s\r");
+    let report = current().unwrap();
+    assert_eq!(report.counts, Some((2, 4)));
+    assert_eq!(report.detail, "1.25 MiB | 640.00 KiB/s");
 }

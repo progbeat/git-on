@@ -1142,15 +1142,9 @@ pub(crate) enum DemandLookup {
 }
 
 #[derive(Clone)]
-pub(crate) enum ReceivedObject {
-    Verified {
-        object: crate::pack_stream::VerifiedObject,
-        transfer: Option<Arc<Transfer>>,
-    },
-    Packed {
-        directory: Arc<tempfile::TempDir>,
-        size: usize,
-    },
+pub(crate) struct ReceivedObject {
+    pub(crate) object: crate::pack_stream::VerifiedObject,
+    pub(crate) transfer: Option<Arc<Transfer>>,
 }
 
 impl Drop for PackDecode {
@@ -1234,9 +1228,8 @@ impl RawBlobs {
             if *active < ACTIVE_DECODES - 1 {
                 break;
             }
-            // Leave a buffer for a real read while the command runs. After
-            // it exits, a used pack must also be able to finish validation
-            // while unrelated transfers hold the ordinary decode permits.
+            // Leave a buffer for a real read while the command runs. Pack
+            // verification can finish while other transfers hold ordinary slots.
             if *active <= ACTIVE_DECODES {
                 let limit = match priority() {
                     PackDecodePriority::Speculative => ACTIVE_DECODES - 1,
@@ -1342,21 +1335,13 @@ impl RawBlobs {
             } else {
                 use std::collections::hash_map::Entry;
                 match store.received.entry(oid) {
-                    Entry::Occupied(mut entry) => match entry.get_mut() {
-                        ReceivedObject::Verified { transfer, .. } => {
-                            if source.is_none() {
-                                *transfer = None;
-                            }
+                    Entry::Occupied(mut entry) => {
+                        if source.is_none() {
+                            entry.get_mut().transfer = None;
                         }
-                        packed @ ReceivedObject::Packed { .. } => {
-                            *packed = ReceivedObject::Verified {
-                                object: extra,
-                                transfer: source.cloned(),
-                            };
-                        }
-                    },
+                    }
                     Entry::Vacant(entry) => {
-                        entry.insert(ReceivedObject::Verified {
+                        entry.insert(ReceivedObject {
                             object: extra,
                             transfer: source.cloned(),
                         });
@@ -1421,24 +1406,6 @@ impl RawBlobs {
         required
     }
 
-    pub(crate) fn remember_packed(
-        &self,
-        oid: Oid,
-        directory: &Arc<tempfile::TempDir>,
-        size: usize,
-    ) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.objects.get(&oid).is_some_and(Descriptor::available) {
-            state
-                .received
-                .entry(oid)
-                .or_insert_with(|| ReceivedObject::Packed {
-                    directory: directory.clone(),
-                    size,
-                });
-        }
-    }
-
     pub(crate) fn forget_received(&self, oid: Oid) {
         self.state
             .lock()
@@ -1496,6 +1463,7 @@ impl RawBlobs {
             Ok(BlobBytes::Odb(Arc::new(OdbBlob::new(object))))
         })
     }
+    #[cfg(test)]
     pub(crate) fn insert_fetched(
         &mut self,
         oid: Oid,
@@ -2008,7 +1976,7 @@ impl Store {
     fn publish_blob(&mut self, oid: Oid, size: usize, used: bool, transfer: Option<Arc<Transfer>>) {
         let received = self.received.remove(&oid);
         let transfer = match &received {
-            Some(ReceivedObject::Verified {
+            Some(ReceivedObject {
                 transfer: proof, ..
             }) if transfer.as_ref().is_some_and(|source| !source.verified()) => proof.clone(),
             _ => transfer,

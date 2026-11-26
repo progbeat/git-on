@@ -4,12 +4,15 @@ use git_on::snapshot::Snapshot;
 use std::{
     env, fs,
     io::{self, BufRead, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
 };
 fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
-    let mut report =
-        serde_json::json!({"tree": snapshot.tree_oid.to_string(), "metrics": snapshot.metrics()});
+    let mut report = serde_json::json!({
+        "tree": snapshot.tree_oid.to_string(),
+        "metrics": snapshot.metrics(),
+        "source_git_dir": snapshot.source_git_dir().map(|path| path.as_os_str().as_bytes()),
+    });
     if include_objects {
         let objects: Vec<_> = snapshot
             .available_objects()?
@@ -22,13 +25,52 @@ fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
     io::stdout().flush()?;
     Ok(())
 }
-fn main() -> Result<()> {
+fn main() {
     if let Some(status) = git_on::service_storage::invoke() {
         std::process::exit(status);
     }
     if let Some(status) = git_on::remote::invoke_ssh_launcher() {
         std::process::exit(status);
     }
+    finish(run())
+}
+
+fn finish(result: Result<()>) {
+    let failed = result.is_err();
+    if let Err(error) = result {
+        git_on::git::write_run_error(format_args!("source-probe: {error:#}\n"));
+    }
+    if let Some(signal) = git_on::git::cancelled_signal() {
+        std::process::exit(128 + signal);
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cancelled_probe_reports_cleanup_failure() {
+    use std::process::Command;
+
+    const CHILD: &str = "GIT_ON_TEST_PROBE_CANCELLED_CLEANUP";
+    const ERROR: &str = "probe recovery retained at /fixture";
+    if env::var_os(CHILD).is_some() {
+        git_on::git::cancel_by_signal(libc::SIGTERM);
+        finish(Err(anyhow::anyhow!(ERROR)));
+        unreachable!();
+    }
+    let output = Command::new(env::current_exe().unwrap())
+        .args(["--exact", "cancelled_probe_reports_cleanup_failure"])
+        .env(CHILD, "1")
+        .env_remove("GIT_TRACE_PACKET")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(ERROR));
+}
+
+fn run() -> Result<()> {
     // Same process-start resource policy as the production CLI.
     unsafe { git_on::object::configure_pack_descriptors() }?;
     let args: Vec<_> = env::args_os().skip(1).collect();

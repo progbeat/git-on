@@ -63,10 +63,6 @@ impl Directory {
         self.directory.path()
     }
 
-    pub(crate) fn link(&self, run: &Path, name: &OsStr, entry: &Path) -> io::Result<()> {
-        symlink(self.path().join(entry), run.join(name))
-    }
-
     pub(crate) fn keep_for_owner(&mut self) {
         self.directory.remove_on_drop = false;
     }

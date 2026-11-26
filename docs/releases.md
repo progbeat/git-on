@@ -34,8 +34,11 @@ the declared runtime/build version to its locked edge. If the manifest and lock
 cannot identify one edge, validation fails explicitly instead of guessing its kind.
 
 Choose the version according to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
-Git-on's public API is the behavior promised in the [specification](specification.md)
-and user guides.
+Git-on's public API is the CLI contract for selecting a tree and running a
+command in its disposable view, as defined by the [specification](specification.md)
+and user guides. The older documentation described fetch destination refs in
+a temporary bare repository. Exposing that internal state was a bug. See the
+[author’s decision](interview.md).
 
 For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.

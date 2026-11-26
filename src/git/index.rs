@@ -1,4 +1,4 @@
-use super::{native_git_error, run_builtin, Git};
+use super::{native_git_error, require_no_lazy_fetch, run_builtin, Git};
 use crate::service_storage::Directory;
 use anyhow::{Context, Result};
 use git2::Oid;
@@ -68,11 +68,11 @@ pub(super) fn resolve(git: &Git, revision: &OsStr) -> Result<(PathBuf, Oid)> {
     let resolve = || {
         let mut command = git.command(None);
         command
+            .arg("--no-lazy-fetch")
             .arg("--git-dir")
             .arg(scratch.path())
             .env("GIT_COMMON_DIR", &common)
             .env("GIT_INDEX_FILE", effective_index)
-            .env("GIT_ALLOW_PROTOCOL", "")
             .env("TMPDIR", scratch.path());
         if let Some(worktree) = &worktree {
             command.arg("--work-tree").arg(worktree);
@@ -94,6 +94,7 @@ pub(super) fn resolve(git: &Git, revision: &OsStr) -> Result<(PathBuf, Oid)> {
             output = resolve()?;
         }
     }
+    require_no_lazy_fetch(&output)?;
     anyhow::ensure!(
         output.status.success(),
         "Git rev-parse failed: {}",
