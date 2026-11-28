@@ -102,12 +102,12 @@ original reference without loading its bytes. Unlink releases data after the
 last kernel lookup or open reference. Truncation followed by extension exposes
 zeros.
 
-For a spilled blob, copy-up checks the existing file and its length, then
-moves, clones or copies its bytes directly to writable backing. Git-on checks
-block digests only on immutable source reads and when installing spilled data
-into an eager checkout. Writes, truncation and reads on writable backing use
-ordinary file I/O. Linux can use kernel passthrough on later opens after cached
-handles are released and when it can preserve the file's attributes.
+For a spilled blob, copy-up verifies the original block digests before
+committing the writable backing. A direct copy verifies the same bytes it
+writes. A linked or cloned backing is verified in place. Writes, truncation
+and reads on the committed writable backing use ordinary file I/O. Linux can
+use kernel passthrough on later opens after cached handles are released and
+when it can preserve the file's attributes.
 
 There is at most one decoded backing per live source inode, with unchanged
 same-OID inodes sharing a single backing. No extra immutable full copy is retained

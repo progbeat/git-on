@@ -463,8 +463,11 @@ fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
 fn cleanup(dir: &Path) -> Result<()> {
     let dir = fs::canonicalize(dir)?;
     let _group = run_directory::Group::for_run(&dir);
+    let record = dir.join(".state");
+    // A cleaner that already consumed the record is removing the lock.
+    anyhow::ensure!(record.try_exists()?, "unrecognized temporary directory");
     let held_lock = lock(&dir, false)?;
-    let state: Recovery = serde_json::from_reader(File::open(dir.join(".state"))?)?;
+    let state: Recovery = serde_json::from_reader(File::open(&record)?)?;
     if state.format != "git-on-temp-v1" {
         bail!("unrecognized temporary directory");
     }
@@ -514,8 +517,21 @@ fn cleanup(dir: &Path) -> Result<()> {
             };
         }
     }
-    // Close the writable marker before unlinking it. NFS can retain an
-    // unlinked file while its descriptor is open and keep the directory busy.
+    // Keep both recovery files until all removable data is gone. Consume the
+    // recovery record under the lock so another cleaner cannot also succeed.
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if matches!(entry.file_name().as_encoded_bytes(), b".state" | b".lock") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::remove_file(record)?;
+    // An open writable lock can leave a busy unlinked file on NFS.
     drop(held_lock);
     fs::remove_dir_all(dir)?;
     Ok(())

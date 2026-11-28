@@ -166,7 +166,7 @@ struct Resident {
     block: usize,
     bytes: Arc<Vec<u8>>,
 }
-fn verify_installed(file: &File, path: &Path, size: u64, blocks: &[[u8; 32]]) -> Result<()> {
+fn check_installed(file: &File, path: &Path, size: u64) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let source = file.metadata()?;
     let installed = std::fs::symlink_metadata(path)?;
@@ -177,16 +177,32 @@ fn verify_installed(file: &File, path: &Path, size: u64, blocks: &[[u8; 32]]) ->
             && installed.len() == size,
         "installed blob changed during materialization"
     );
-    let mut bytes = vec![0; BLOCK];
-    for (block, expected) in blocks.iter().enumerate() {
+    Ok(())
+}
+
+fn read_verified_spill(
+    file: &File,
+    size: u64,
+    blocks: &[[u8; 32]],
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(
+        blocks.len() as u64 == size.div_ceil(BLOCK as u64),
+        "incomplete raw blob digests"
+    );
+    let mut bytes = vec![0; size.min((16 * BLOCK) as u64) as usize];
+    let mut offset = 0;
+    for expected in blocks.chunks(16) {
         crate::object::check_transfer()?;
-        let offset = block as u64 * BLOCK as u64;
-        let length = (size - offset).min(BLOCK as u64) as usize;
-        file.read_exact_at(&mut bytes[..length], offset)?;
-        anyhow::ensure!(
-            &digest(&bytes[..length]) == expected,
-            "verified raw blob bytes were modified"
-        );
+        let count = (size - offset).min(bytes.len() as u64) as usize;
+        file.read_exact_at(&mut bytes[..count], offset)?;
+        for (block, expected) in bytes[..count].chunks(BLOCK).zip(expected) {
+            if &digest(block) != expected {
+                return Err(invalid("verified raw blob bytes were modified"));
+            }
+        }
+        consume(&bytes[..count])?;
+        offset += count as u64;
     }
     Ok(())
 }
@@ -1279,23 +1295,10 @@ impl RawBlobs {
             created = true;
             if let Some(input) = input {
                 if !cloned {
-                    // Writable copies use ordinary I/O. Immutable readers
-                    // continue to check the shared source's block digests.
-                    let mut bytes = vec![0; (size.min(16 * BLOCK as u64)) as usize];
-                    let mut offset = 0;
-                    while offset < size {
-                        crate::object::check_transfer()?;
-                        let count = (size - offset).min(bytes.len() as u64) as usize;
-                        input.read_exact_at(&mut bytes[..count], offset)?;
-                        write_payload(&mut output, &bytes[..count], crate::object::check_transfer)
-                            .map_err(backing_error)?;
-                        offset += count as u64;
-                    }
-                } else {
-                    anyhow::ensure!(
-                        output.metadata()?.len() == size,
-                        "cloned source length changed"
-                    );
+                    read_verified_spill(&input, size, &object.blocks, |bytes| {
+                        write_payload(&mut output, bytes, crate::object::check_transfer)
+                            .map_err(backing_error)
+                    })?;
                 }
             } else if !object.file && size != 0 {
                 let resident = store
@@ -1315,8 +1318,13 @@ impl RawBlobs {
                         .map_err(backing_error)?;
                 }
             }
-            if verify_materialization {
-                verify_installed(&output, path, size, &object.blocks)?;
+            if object.file {
+                // A linked or cloned name is provisional. Check its contents
+                // before the write operation can publish writable backing.
+                check_installed(&output, path, size)?;
+                if cloned {
+                    read_verified_spill(&output, size, &object.blocks, |_| Ok(()))?;
+                }
             }
             let result = use_file(&output)?;
             if exclusive {
@@ -1805,17 +1813,31 @@ mod tests {
         assert!(store.get(oid).unwrap().is_none());
     }
     #[test]
-    fn materialization_rejects_a_corrupted_spill() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = RawBlobs::disk_only(directory.path()).unwrap();
-        let data = vec![b'x'; BLOCK + 3];
-        let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
-        let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
-        original.corrupt_for_test().unwrap();
-        let destination = directory.path().join("materialized");
-        assert!(store.install_spill(oid, &destination).is_err());
-        assert!(!destination.exists());
-        assert!(store.failure().is_some());
+    fn installing_or_promoting_a_spill_rejects_corruption() {
+        for exclusive in [None, Some(true), Some(false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = RawBlobs::disk_only(directory.path()).unwrap();
+            let data = vec![b'x'; BLOCK + 3];
+            let oid = Oid::hash_object(ObjectType::Blob, &data).unwrap();
+            let original = store.insert(oid, data.len(), data.as_slice()).unwrap();
+            original.corrupt_for_test().unwrap();
+            let destination = directory.path().join("destination");
+            let result = if let Some(exclusive) = exclusive {
+                store
+                    .promote::<()>(oid, &destination, exclusive, |_| {
+                        panic!("corrupted source accepted")
+                    })
+                    .map(|_| ())
+            } else {
+                store.install_spill(oid, &destination).map(|_| ())
+            };
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("bytes were modified"));
+            assert!(!destination.exists());
+            assert!(store.failure().is_some());
+        }
     }
     #[test]
     fn large_hot_cache_retains_two_objects_over_the_former_byte_limit() {
