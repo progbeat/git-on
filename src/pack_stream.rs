@@ -9,7 +9,10 @@ use std::{
     io::{BufRead, Read, Write},
     mem::MaybeUninit,
     ops::Range,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 mod delta;
@@ -153,6 +156,7 @@ pub(crate) struct Response {
     text: Vec<u8>,
     end: [u8; 4],
     end_len: usize,
+    input_progress: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +195,7 @@ impl Response {
             text: Vec::new(),
             end: [0; 4],
             end_len: 0,
+            input_progress: None,
         }
     }
 
@@ -203,6 +208,17 @@ impl Response {
     pub(crate) fn with_output(mut self, output: impl PackOutput + 'static) -> Self {
         self.pack.objects.output = Some(Box::new(output));
         self
+    }
+
+    pub(crate) fn with_input_progress(mut self, progress: Arc<AtomicBool>) -> Self {
+        self.input_progress = Some(progress);
+        self
+    }
+
+    fn mark_input_progress(&self) {
+        if let Some(progress) = &self.input_progress {
+            progress.store(true, Ordering::Relaxed);
+        }
     }
 
     fn done(&self) -> bool {
@@ -226,7 +242,10 @@ impl Response {
                 }
                 self.header_len = 0;
                 match crate::transport::packet_length(&self.header)? {
-                    0 if matches!(self.phase, Phase::Pack) => self.phase = Phase::Done,
+                    0 if matches!(self.phase, Phase::Pack) => {
+                        self.mark_input_progress();
+                        self.phase = Phase::Done;
+                    }
                     1 if matches!(self.phase, Phase::Shallow) => self.phase = Phase::Section,
                     length @ 5..=65520 => {
                         self.remaining = length - 4;
@@ -254,7 +273,11 @@ impl Response {
                     }
                 };
                 match channel {
-                    1 => self.pack.write(payload)?,
+                    1 if !payload.is_empty() => {
+                        self.mark_input_progress();
+                        self.pack.write(payload)?;
+                    }
+                    1 => (),
                     2 => (),
                     3 | b'E' => self.text.extend_from_slice(payload),
                     _ => bail!("invalid Git pack sideband"),

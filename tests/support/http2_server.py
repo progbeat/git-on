@@ -7,6 +7,7 @@ import socket
 import socketserver
 import ssl
 import threading
+import time
 from urllib.parse import urlsplit
 
 from h2.config import H2Configuration
@@ -115,11 +116,13 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                             self.server.records.append((self.client_address, wants))
                         split = self.server.split_pack
                         if split is not None and set(wants) == split.wants and authorized:
-                            h2.send_headers(stream, [
+                            headers = [
                                 (':status', '200'),
                                 ('content-type', 'application/x-git-upload-pack-result'),
-                                ('content-length', str(len(split.prefix) + len(split.tail))),
-                            ])
+                            ]
+                            if getattr(split, 'next_keepalive', None) is None and split.tail is not None:
+                                headers.append(('content-length', str(len(split.prefix) + len(split.tail))))
+                            h2.send_headers(stream, headers)
                             split_positions[stream] = 0
                             continue
                         forwarded = {key: value for key, value in headers.items() if not key.startswith(':')}
@@ -150,7 +153,9 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                         split_positions[stream] = position
                         if position == prefix_end:
                             split.started.touch()
-                    if position >= prefix_end and split.release.exists():
+                    if position < prefix_end:
+                        continue
+                    if split.release.exists():
                         if split.tail is None:
                             return
                         offset = self.send_body(h2, stream, split.tail, position - prefix_end, end=True)
@@ -158,6 +163,11 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                             split_positions.pop(stream)
                         else:
                             split_positions[stream] = prefix_end + offset
+                    elif (due := getattr(split, 'next_keepalive', None)) is not None and time.monotonic() >= due:
+                        if h2.local_flow_control_window(stream) >= 5:
+                            h2.send_data(stream, b'0005\1')
+                            split.keepalive_sent.touch()
+                            split.next_keepalive = time.monotonic() + 5
                 outgoing = h2.data_to_send()
                 if outgoing:
                     # The short receive timeout polls upstream futures. A

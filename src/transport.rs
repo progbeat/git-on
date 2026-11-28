@@ -1,4 +1,5 @@
 //! Invocation-owned native subprocesses and Git protocol v2 channels.
+use crate::demand::ResponseIdle;
 use anyhow::{bail, ensure, Context, Result};
 use git2::Oid;
 use std::{
@@ -40,22 +41,35 @@ fn check_transfer(stop: &Stop) -> io::Result<()> {
     crate::object::check_transfer().map_err(io::Error::other)
 }
 
-struct Input(UnixStream, Stop, crate::git::Capture);
+struct Input {
+    socket: UnixStream,
+    stop: Stop,
+    errors: crate::git::Capture,
+    idle: Option<ResponseIdle>,
+}
 impl Read for Input {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
+        if let Some(idle) = &mut self.idle {
+            // Also check when the previous read contained only keepalives.
+            idle.check()?;
+        }
         loop {
-            check_transfer(&self.1)?;
-            self.2.pump()?;
+            check_transfer(&self.stop)?;
+            self.errors.pump()?;
             let mut poll = libc::pollfd {
-                fd: self.0.as_raw_fd(),
+                fd: self.socket.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
             match unsafe { libc::poll(&mut poll, 1, 10) } {
                 -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
                 -1 => return Err(io::Error::last_os_error()),
-                0 => continue,
-                _ => return self.0.read(data),
+                0 => {
+                    if let Some(idle) = &mut self.idle {
+                        idle.check()?;
+                    }
+                }
+                _ => return self.socket.read(data),
             }
         }
     }
@@ -235,7 +249,15 @@ impl NativeProcess {
         Ok(Self {
             owner: Owner(Mutex::new(Some(child))),
             input: Output(input, stop.clone()),
-            output: BufReader::with_capacity(64 * 1024, Input(output, stop, errors)),
+            output: BufReader::with_capacity(
+                64 * 1024,
+                Input {
+                    socket: output,
+                    stop,
+                    errors,
+                    idle: None,
+                },
+            ),
             _native: native,
         })
     }
@@ -253,7 +275,7 @@ impl NativeProcess {
             self.output.read(&mut [0])? == 0,
             "unexpected data after the Git SSH pack"
         );
-        let Input(_, stop, errors) = self.output.get_mut();
+        let Input { stop, errors, .. } = self.output.get_mut();
         while !self.owner.exited()? {
             check_transfer(stop)?;
             errors.pump()?;
@@ -268,7 +290,7 @@ impl NativeProcess {
 
     pub(crate) fn error_text(&mut self) -> String {
         let _ = self.stop();
-        let errors = &mut self.output.get_mut().2;
+        let errors = &mut self.output.get_mut().errors;
         let _ = errors.pump();
         String::from_utf8_lossy(&errors.bytes).into_owned()
     }
@@ -297,12 +319,12 @@ impl StartingSession {
     pub(crate) fn wait_for_advertisement(sessions: &mut [Self]) -> io::Result<Option<usize>> {
         check_transfer(&None)?;
         for session in sessions.iter_mut() {
-            session.0.process.output.get_mut().2.pump()?;
+            session.0.process.output.get_mut().errors.pump()?;
         }
         let mut sockets: Vec<_> = sessions
             .iter()
             .map(|session| libc::pollfd {
-                fd: session.0.process.output.get_ref().0.as_raw_fd(),
+                fd: session.0.process.output.get_ref().socket.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             })
@@ -382,7 +404,11 @@ impl Session {
     }
     pub(crate) fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         self.process.input.1 = Some(stop.clone());
-        self.process.output.get_mut().1 = Some(stop);
+        self.process.output.get_mut().stop = Some(stop);
+    }
+
+    pub(crate) fn set_receive_idle(&mut self, idle: ResponseIdle) {
+        self.process.output.get_mut().idle = Some(idle);
     }
     fn request_branch(&mut self, query: &BranchQuery) -> Result<()> {
         self.process.input.write_all(&reference_request(query)?)?;
@@ -428,7 +454,7 @@ impl Session {
                     "unexpected pipelined Git request"
                 );
             } else {
-                let errors = &mut self.process.output.get_mut().2;
+                let errors = &mut self.process.output.get_mut().errors;
                 errors.pump()?;
                 errors.bytes.clear();
                 self.process.input.write_all(&fetch_request(oids, full)?)?;
@@ -711,11 +737,12 @@ mod tests {
             process: NativeProcess {
                 owner: Owner(Mutex::new(None)),
                 input: Output(input, None),
-                output: BufReader::new(Input(
-                    output,
-                    None,
-                    crate::git::Capture::new(None).unwrap().0,
-                )),
+                output: BufReader::new(Input {
+                    socket: output,
+                    stop: None,
+                    errors: crate::git::Capture::new(None).unwrap().0,
+                    idle: None,
+                }),
                 _native: None,
             },
             ref_requested: false,

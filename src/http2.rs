@@ -1,6 +1,7 @@
 //! Git protocol v2 exact-object requests multiplexed by an invocation-owned
 //! libcurl multi handle. Native Git still selects and verifies the revision.
 use crate::{
+    demand::ResponseIdle,
     object::{check_transfer, OperationCancelled},
     pack_stream, transport,
 };
@@ -125,6 +126,7 @@ struct Response {
     body: Body,
     error: Option<io::Error>,
     stop: Arc<AtomicBool>,
+    idle: Option<ResponseIdle>,
     h2: bool,
     ok: bool,
     git_pack: bool,
@@ -293,6 +295,7 @@ impl Client {
             body,
             error: None,
             stop: self.stop.clone(),
+            idle: None,
             h2: false,
             ok: false,
             git_pack: false,
@@ -390,9 +393,17 @@ impl Client {
         oids: &[Oid],
         response: pack_stream::Response,
         wake: &Arc<UnixStream>,
+        idle: ResponseIdle,
     ) -> Result<()> {
-        let body = Body::Streaming(Decoder::new(response, self.stop.clone(), wake.clone())?);
-        self.start_request(token, transport::exact_request(oids)?, body)
+        let decoder = Decoder::new(response, self.stop.clone(), wake.clone())?;
+        let body = Body::Streaming(decoder);
+        let mut easy = self.easy(
+            "git-upload-pack",
+            body,
+            Some(transport::exact_request(oids)?),
+        )?;
+        easy.get_mut().idle = Some(idle);
+        self.enqueue(token, easy)
     }
 
     pub(crate) fn fetch_eager(
@@ -407,7 +418,7 @@ impl Client {
         )?;
         loop {
             check_transfer()?;
-            if let Some((_, result)) = self.progress()?.into_iter().next() {
+            if let Some((_, result)) = self.progress(false)?.into_iter().next() {
                 return result;
             }
             self.multi.wait(&mut [], Duration::from_millis(100))?;
@@ -426,7 +437,10 @@ impl Client {
         Ok(())
     }
 
-    pub(crate) fn progress(&mut self) -> Result<Vec<(usize, Result<pack_stream::Received>)>> {
+    pub(crate) fn progress(
+        &mut self,
+        finishing: bool,
+    ) -> Result<Vec<(usize, Result<pack_stream::Received>)>> {
         let mut results = self.poll_active_decoders()?;
         self.multi.perform()?;
         let mut finished = Vec::new();
@@ -437,6 +451,9 @@ impl Client {
         });
         for (token, outcome) in finished {
             self.finish_request(token?, outcome, &mut results)?;
+        }
+        if finishing {
+            self.expire_receives(&mut results)?;
         }
         let complete: Vec<_> = self
             .decoding
@@ -452,6 +469,34 @@ impl Client {
             results.push((token, result));
         }
         Ok(results)
+    }
+
+    fn expire_receives(
+        &mut self,
+        results: &mut Vec<(usize, Result<pack_stream::Received>)>,
+    ) -> Result<()> {
+        // Drain curl's input and completion messages before testing for idle
+        // streams. A paused write callback is waiting for local processing.
+        let mut expired = Vec::new();
+        for (&token, handle) in &mut self.active {
+            let response = handle.get_mut();
+            let (Body::Streaming(decoder), Some(idle)) = (&response.body, &mut response.idle)
+            else {
+                continue;
+            };
+            if decoder.is_paused() {
+                idle.reset();
+            } else if decoder.has_pending_input() {
+                continue;
+            } else if let Err(error) = idle.check() {
+                response.error = Some(error);
+                expired.push(token);
+            }
+        }
+        for token in expired {
+            self.finish_request(token, Ok(()), results)?;
+        }
+        Ok(())
     }
 
     fn poll_active_decoders(&mut self) -> Result<Vec<(usize, Result<pack_stream::Received>)>> {
@@ -494,7 +539,10 @@ impl Client {
             .remove(&token)
             .context("unknown Git HTTP/2 request")?;
         let mut response = self.multi.remove2(handle)?;
-        if outcome.is_ok() && self.retry_with_credentials(&mut response)? {
+        if outcome.is_ok()
+            && response.get_ref().error.is_none()
+            && self.retry_with_credentials(&mut response)?
+        {
             return self.enqueue(token, response);
         }
         let outcome = self.check_response(&mut response, outcome);

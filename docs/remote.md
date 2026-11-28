@@ -80,8 +80,9 @@ base received as an extra becomes available to other requests after the
 pack and transport complete. The completed response can satisfy an exact
 request already in flight, independently of the duplicate transfer's outcome.
 After the user command exits normally, Git-on checks the outcome of
-responses that served it. Other in-flight requests can be cancelled
-during teardown.
+responses that served it. A response that waits for more pack data
+for 30 seconds during this check fails the run, even if keepalive packets
+arrive. Other in-flight requests can be cancelled during teardown.
 A temporary cache placement failure is reported for the affected object.
 It can be retried after capacity returns. The rest of its response still
 undergoes normal validation.

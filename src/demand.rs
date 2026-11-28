@@ -40,24 +40,19 @@ const HTTP2_READ_AHEAD: usize = 8;
 /// Tracks response tails still needed after the command has used their data.
 #[derive(Default)]
 pub(crate) struct ResponseCompletion {
-    state: Mutex<CompletionState>,
+    pending: Mutex<usize>,
     changed: Condvar,
-}
-
-#[derive(Default)]
-struct CompletionState {
-    observed: usize,
-    sealed: bool,
+    sealed: AtomicBool,
 }
 
 impl ResponseCompletion {
     pub(crate) fn wait(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.sealed = true;
-        while state.observed != 0 && crate::git::cancelled_signal().is_none() {
-            state = self
+        let mut pending = self.pending.lock().unwrap();
+        self.sealed.store(true, Ordering::Relaxed);
+        while *pending != 0 && crate::git::cancelled_signal().is_none() {
+            pending = self
                 .changed
-                .wait_timeout(state, Duration::from_millis(20))
+                .wait_timeout(pending, Duration::from_millis(20))
                 .unwrap()
                 .0;
         }
@@ -75,15 +70,16 @@ enum ReceiptState {
 #[derive(Default)]
 struct ResponseReceipt {
     state: Mutex<ReceiptState>,
+    pack_progress: Arc<AtomicBool>,
 }
 
 impl ResponseReceipt {
     fn observe(&self, completion: &Arc<ResponseCompletion>) {
         let mut receipt = self.state.lock().unwrap();
         if matches!(*receipt, ReceiptState::Pending) {
-            let mut state = completion.state.lock().unwrap();
-            if !state.sealed {
-                state.observed += 1;
+            let mut pending = completion.pending.lock().unwrap();
+            if !completion.sealed.load(Ordering::Relaxed) {
+                *pending += 1;
                 *receipt = ReceiptState::Observed(completion.clone());
             }
         }
@@ -99,9 +95,47 @@ impl Drop for ResponseGuard {
         if let ReceiptState::Observed(completion) =
             std::mem::replace(&mut *receipt, ReceiptState::Finished)
         {
-            completion.state.lock().unwrap().observed -= 1;
+            *completion.pending.lock().unwrap() -= 1;
             completion.changed.notify_all();
         }
+    }
+}
+
+/// An idle receive on a response whose bytes reached the command.
+pub(crate) struct ResponseIdle {
+    completion: Arc<ResponseCompletion>,
+    receipt: Arc<ResponseReceipt>,
+    waiting_since: Option<Instant>,
+}
+
+impl ResponseIdle {
+    pub(crate) fn reset(&mut self) {
+        self.waiting_since = None;
+    }
+
+    pub(crate) fn check(&mut self) -> io::Result<()> {
+        if !self.completion.sealed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if self.receipt.pack_progress.swap(false, Ordering::Relaxed) {
+            self.reset();
+        }
+        if self
+            .waiting_since
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            >= Duration::from_secs(30)
+            && matches!(
+                *self.receipt.state.lock().unwrap(),
+                ReceiptState::Observed(_)
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out receiving the rest of a Git pack used by the command",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -282,7 +316,7 @@ struct QueuedDemand {
 struct Work {
     items: Vec<QueuedDemand>,
     speculative: bool,
-    _response: ResponseGuard,
+    response: ResponseGuard,
 }
 
 impl Work {
@@ -310,12 +344,20 @@ impl Work {
         Some(Self {
             items,
             speculative,
-            _response: response,
+            response,
         })
     }
 
     fn wants(&self) -> Vec<Oid> {
         self.items.iter().map(|item| item.oid).collect()
+    }
+
+    fn receive_idle(&self, completion: &Arc<ResponseCompletion>) -> ResponseIdle {
+        ResponseIdle {
+            completion: completion.clone(),
+            receipt: self.response.0.clone(),
+            waiting_since: None,
+        }
     }
 }
 
@@ -930,6 +972,7 @@ impl Shared {
                 Ok(())
             }),
         )
+        .with_input_progress(work.response.0.pack_progress.clone())
         .with_output(scratch.pack_output())
     }
 
@@ -1154,6 +1197,7 @@ impl Shared {
                                 &oids,
                                 self.response(&work, &oids, scratch),
                                 decoder_signal,
+                                work.receive_idle(&self.completion),
                             )
                         }
                     };
@@ -1169,7 +1213,7 @@ impl Shared {
                 }
             }
             let mut foreground_finished = false;
-            for (token, pack) in client.progress()? {
+            for (token, pack) in client.progress(self.completion.sealed.load(Ordering::Relaxed))? {
                 let batch = active
                     .remove(&token)
                     .context("unknown completed Git demand")?;
@@ -1277,10 +1321,9 @@ impl Shared {
             } else {
                 let oids = work.wants();
                 connection.check().and_then(|_| {
-                    session
-                        .as_mut()
-                        .unwrap()
-                        .fetch_stream(&oids, self.response(&work, &oids, scratch))
+                    let session = session.as_mut().unwrap();
+                    session.set_receive_idle(work.receive_idle(&self.completion));
+                    session.fetch_stream(&oids, self.response(&work, &oids, scratch))
                 })
             };
             if result.is_err() {
@@ -1352,9 +1395,9 @@ mod tests {
         for oid in &batch.oids {
             queue.pending.remove(oid);
         }
-        assert_eq!(completion.state.lock().unwrap().observed, 1);
+        assert_eq!(*completion.pending.lock().unwrap(), 1);
         drop(work);
-        assert_eq!(completion.state.lock().unwrap().observed, 0);
+        assert_eq!(*completion.pending.lock().unwrap(), 0);
     }
 
     fn two_blob_response() -> (Oid, Oid, Vec<u8>, usize, Vec<u8>) {

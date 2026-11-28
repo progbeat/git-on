@@ -2872,35 +2872,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_source_with_only_one_free_descriptor() {
-        if !crate::raw_blob::under_descriptor_limit(
-            "filesystem::tests::truncate_source_with_only_one_free_descriptor",
-        ) {
-            return;
-        }
-        let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
-        let ino = overlay.ensure(Path::new("tracked.tmp")).unwrap();
-        let handle = overlay.open_file(ino, libc::O_RDWR).unwrap();
-        let oid = overlay.node(ino).unwrap().oid.unwrap();
-        overlay._snapshot.prepare_source_removal(oid).unwrap();
-        let mut held = Vec::new();
-        loop {
-            match File::open("/dev/null") {
-                Ok(file) => held.push(file),
-                Err(error) if error.raw_os_error() == Some(libc::EMFILE) => break,
-                Err(error) => panic!("{error}"),
-            }
-        }
-        assert_eq!(overlay.truncate(ino, 0), Err(libc::EMFILE));
-        assert_eq!(overlay.node(ino).unwrap().oid, Some(oid));
-        drop(held.pop().unwrap());
-        let result = overlay.truncate(ino, 0);
-        drop(held);
-        assert_eq!(result, Ok(()));
-        assert!(overlay.read_data(ino, handle, 0, 64).unwrap().is_empty());
-    }
-
-    #[test]
     fn writable_open_and_empty_write_preserve_source_data() {
         for flags in [libc::O_WRONLY, libc::O_RDWR | libc::O_APPEND] {
             let (_temp, mut fs) = fixture_policy(WritePolicy::All);

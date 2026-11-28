@@ -26,14 +26,19 @@ pub(crate) const COPY_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 const ENTRY_CHARGE: usize = 512;
 pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const LARGE_SLOTS: usize = 8;
+const SPILL_WRITE_CHUNK: usize = 1024 * 1024;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-fn write_payload(output: &mut impl Write, mut bytes: &[u8]) -> Result<()> {
+fn write_payload(
+    output: &mut impl Write,
+    mut bytes: &[u8],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
     while !bytes.is_empty() {
-        crate::object::check_transfer()?;
+        check()?;
         match output.write(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
             Ok(written) => bytes = &bytes[written..],
@@ -88,10 +93,17 @@ impl<W: Write, F: FnMut() -> Result<()>> Write for SealedWrite<W, F> {
         self.output.flush()
     }
 }
-fn write_sealed(output: &mut impl Write, bytes: &[u8]) -> Result<Vec<[u8; 32]>> {
-    let mut output = SealedWrite::new(output, crate::object::check_transfer);
-    output.write_all(bytes)?;
-    Ok(output.finish())
+fn write_sealed(
+    output: &mut impl Write,
+    bytes: &[u8],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Vec<[u8; 32]>> {
+    let mut blocks = Vec::with_capacity(bytes.len().div_ceil(BLOCK));
+    for chunk in bytes.chunks(SPILL_WRITE_CHUNK) {
+        blocks.extend(chunk.chunks(BLOCK).map(digest));
+        write_payload(output, chunk, &mut check)?;
+    }
+    Ok(blocks)
 }
 
 fn backing_error(error: anyhow::Error) -> anyhow::Error {
@@ -681,6 +693,7 @@ impl Pending {
                 totals: writes,
             },
             bytes,
+            crate::object::check_transfer,
         )?;
         self.committed = true;
         Ok(blocks.into_boxed_slice())
@@ -1274,7 +1287,8 @@ impl RawBlobs {
                         crate::object::check_transfer()?;
                         let count = (size - offset).min(bytes.len() as u64) as usize;
                         input.read_exact_at(&mut bytes[..count], offset)?;
-                        write_payload(&mut output, &bytes[..count]).map_err(backing_error)?;
+                        write_payload(&mut output, &bytes[..count], crate::object::check_transfer)
+                            .map_err(backing_error)?;
                         offset += count as u64;
                     }
                 } else {
@@ -1297,7 +1311,8 @@ impl RawBlobs {
                     .context("missing resident source")?;
                 anyhow::ensure!(resident.len() as u64 == size, "incomplete resident source");
                 for chunk in resident.chunks(16 * BLOCK) {
-                    write_payload(&mut output, chunk).map_err(backing_error)?;
+                    write_payload(&mut output, chunk, crate::object::check_transfer)
+                        .map_err(backing_error)?;
                 }
             }
             if verify_materialization {
@@ -1627,36 +1642,34 @@ impl Store {
     }
 }
 #[cfg(test)]
-pub(crate) fn under_descriptor_limit(name: &str) -> bool {
-    const CHILD: &str = "GIT_ON_TEST_RAW_NOFILE_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
-            0
-        );
-        let mut limit = unsafe { limit.assume_init() };
-        limit.rlim_cur = limit.rlim_cur.min(64);
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-        return true;
-    }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--test-threads=1"])
-        .env(CHILD, "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    false
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    fn under_descriptor_limit(name: &str) -> bool {
+        const CHILD: &str = "GIT_ON_TEST_RAW_NOFILE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            let mut limit = unsafe { limit.assume_init() };
+            limit.rlim_cur = limit.rlim_cur.min(64);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
     fn stored_bytes(path: &Path) -> u64 {
         std::fs::read_dir(path)
             .unwrap()
@@ -2385,7 +2398,7 @@ mod tests {
         struct Partial(Vec<u8>);
         impl Write for Partial {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                assert!(bytes.len() <= BLOCK);
+                assert!(bytes.len() <= SPILL_WRITE_CHUNK);
                 self.0.extend_from_slice(&bytes[..1]);
                 Ok(1)
             }
@@ -2395,15 +2408,15 @@ mod tests {
         }
         let mut checks = 0;
         let mut output = Partial(Vec::new());
-        let mut writer = SealedWrite::new(&mut output, || {
+        let error = write_sealed(&mut output, &vec![b'a'; SPILL_WRITE_CHUNK + 1], || {
             checks += 1;
             if checks == 2 {
                 return Err(crate::object::OperationCancelled.into());
             }
             Ok(())
-        });
-        let error = writer.write_all(&vec![b'a'; 2 * BLOCK]).unwrap_err();
-        assert!(crate::object::is_cancelled(&error.into()));
+        })
+        .unwrap_err();
+        assert!(crate::object::is_cancelled(&error));
         assert_eq!(output.0, b"a");
     }
 }

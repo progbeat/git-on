@@ -55,7 +55,13 @@ def ssh_upload_pack(root, exit_status=0):
                     sys.stdout.buffer.write((root / 'prefix').read_bytes())
                     sys.stdout.buffer.flush()
                     (root / 'pack-started').touch()
-                    assert await_file(root / 'release-pack', 15)
+                    if (root / 'send-keepalives').exists():
+                        while not await_file(root / 'release-pack', 5):
+                            sys.stdout.buffer.write(b'0005\1')
+                            sys.stdout.buffer.flush()
+                            (root / 'keepalive-sent').touch()
+                    else:
+                        assert await_file(root / 'release-pack', 15)
                     sys.stdout.buffer.write((root / 'tail').read_bytes())
                 else:
                     git.stdin.write(request)
@@ -94,10 +100,12 @@ def ssh_branch_pack(root):
 
 
 class SplitPack:
-    def __init__(self, root, wanted, contents, base_oid, base_data, bad_trailer=False):
+    def __init__(self, root, wanted, contents, base_oid, base_data, bad_trailer=False, keepalive=False):
         self.wants = {oid.encode() for oid in wanted}
         self.started = root / 'pack-started'
         self.release = root / 'release-pack'
+        self.next_keepalive = 0 if keepalive else None
+        self.keepalive_sent = root / 'keepalive-sent'
         # Encode the second blob as a REF_DELTA. Its base is a file in a
         # directory the command will only visit after consuming the forecast.
         entries = [bytes([0x30 | len(data)]) + zlib.compress(data)
@@ -117,6 +125,11 @@ class SplitPack:
         if bad_trailer:
             checksum[0] ^= 1
         self.tail = b''.join(entries[1:]) + bytes(checksum) + b'0000'
+        if keepalive:
+            # The server can send a keepalive only between complete pkt-lines.
+            payload = header + entries[0]
+            self.prefix = b'000dpackfile\n' + f'{len(payload) + 5:04x}'.encode() + b'\1' + payload
+            self.tail = f'{len(self.tail) + 1:04x}'.encode() + b'\1' + self.tail
 
 
 def fixture_in_short_tmp():
@@ -235,7 +248,7 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(OPTIONS.require_fuse or OPTIONS.require_nfs)
         for transport, tail in [
             ('https', 'valid'), ('ssh', 'valid'), ('https', 'bad'), ('https', 'bad after exit'),
-            ('https', 'unused after exit'),
+            ('https', 'unused after exit'), ('https', 'stalled after exit'), ('ssh', 'stalled after exit'),
         ]:
             bad_trailer = tail.startswith('bad')
             with self.subTest(transport=transport, tail=tail), ExitStack() as stack:
@@ -255,7 +268,9 @@ class StreamingTests(unittest.TestCase):
                 ).encode())
                 commit = fixture.git('commit-tree', root, data=b'separate prefetch\n')
                 fixture.git('update-ref', 'refs/heads/main', commit)
-                split = SplitPack(fixture.root, oids[1:5], data[1:5], oids[-1], data[-1], bad_trailer)
+                stalled = tail == 'stalled after exit'
+                split = SplitPack(fixture.root, oids[1:5], data[1:5], oids[-1], data[-1],
+                                  bad_trailer, keepalive=stalled)
                 if transport == 'https':
                     proxy = fixture.https_server()
                     proxy.split_pack = split
@@ -265,6 +280,8 @@ class StreamingTests(unittest.TestCase):
                     (fixture.root / 'wants').write_bytes(b'\n'.join(sorted(split.wants)))
                     (fixture.root / 'prefix').write_bytes(split.prefix)
                     (fixture.root / 'tail').write_bytes(split.tail)
+                    if stalled:
+                        (fixture.root / 'send-keepalives').touch()
                     authorized = fixture.root / 'authorized'
                     shim = shlex.join([sys.executable, str(Path(__file__).resolve()), '--ssh-pack', str(fixture.root)])
                     authorized.write_text(f'command="{shim}" ' + authorized.read_text())
@@ -287,7 +304,7 @@ if {tail == 'unused after exit'}:
 assert Path('b/first').read_bytes() == {data[1]!r}
 assert Path('b/first').read_bytes() == {data[1]!r}
 Path({str(ready)!r}).touch()
-if {tail == 'bad after exit'}:
+if {tail in ('bad after exit', 'stalled after exit')}:
     raise SystemExit(0)
 while not Path({str(split.release)!r}).exists():
     assert time.monotonic() < deadline, 'the test did not release the pack'
@@ -320,6 +337,9 @@ if not {bad_trailer}:
                     elif tail == 'unused after exit':
                         self.assertTrue(early)
                         self.assertEqual(process.wait(timeout=4), 0)
+                    elif tail == 'stalled after exit':
+                        self.assertTrue(early)
+                        self.assertEqual(process.wait(timeout=40), 125)
                     elif not bad_trailer:
                         refill = {oid.encode() for oid in oids[5:9]}
                         deadline = time.monotonic() + 5
@@ -335,6 +355,11 @@ if not {bad_trailer}:
                 self.assertTrue(started, f'separate four-object prefetch did not reach the server: {errors!r}')
                 self.assertTrue(early, f'the command waited for the rest of the pkt-line: {errors!r}')
                 if tail == 'unused after exit':
+                    continue
+                if tail == 'stalled after exit':
+                    self.assertTrue(split.keepalive_sent.is_file())
+                    self.assertIn(b'timed out receiving the rest of a Git pack used by the command', errors)
+                    self.assertEqual(run_directories(fixture.root), [])
                     continue
                 if bad_trailer:
                     self.assertEqual(process.returncode, 125, errors)

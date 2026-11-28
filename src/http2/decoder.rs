@@ -40,13 +40,15 @@ impl Decoder {
             .spawn(move || {
                 let result = (|| {
                     for chunk in chunks {
-                        if pending.fetch_sub(1, Ordering::AcqRel) >= QUEUE_CHUNKS {
-                            signal_http2(&wake);
-                        }
                         if cancelled.load(Ordering::Acquire) || stop.load(Ordering::Relaxed) {
                             return Err(OperationCancelled.into());
                         }
-                        pack.write_http(&chunk)?;
+                        let result = pack.write_http(&chunk);
+                        // Keep bytes being classified in the count as well.
+                        if pending.fetch_sub(1, Ordering::AcqRel) >= QUEUE_CHUNKS {
+                            signal_http2(&wake);
+                        }
+                        result?;
                     }
                     if cancelled.load(Ordering::Acquire) {
                         return Err(OperationCancelled.into());
@@ -86,6 +88,14 @@ impl Decoder {
                 }
             }
         }
+    }
+
+    pub(super) fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub(super) fn has_pending_input(&self) -> bool {
+        self.buffered.load(Ordering::Acquire) != 0
     }
 
     pub(super) fn resume(&mut self) -> bool {
