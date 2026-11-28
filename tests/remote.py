@@ -428,6 +428,18 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file')
                 self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_explicit_network_urls_take_precedence_over_matching_local_directories(self):
+        f = self.f
+        for url in (f.https(), f.ssh()):
+            with self.subTest(url=url):
+                (f.cwd / url).mkdir(parents=True)
+                result = subprocess.run(
+                    [OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
+                     '--', 'cat', 'deep/file'],
+                    cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'expected\n')
     def test_relative_local_remote_from_bare_subdirectory_follows_native_git(self):
         f = self.f
         caller = f.root / 'caller.git'

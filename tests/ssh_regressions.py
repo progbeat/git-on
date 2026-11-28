@@ -583,6 +583,23 @@ class SshRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'expected\n')
 
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux execute-only file semantics')
+    def test_direct_ssh_copy_accepts_an_execute_only_client(self):
+        f = self.f
+        client = f.root / 'ssh-exec-only'
+        shutil.copyfile(shutil.which('ssh'), client)
+        client.chmod(0o100)
+        if os.access(client, os.R_OK):
+            self.skipTest('requires an invoking user without read access to the executable')
+        url = f.ssh()
+        f.env['GIT_SSH_COMMAND'] = shlex.quote(str(client)) + f.env['GIT_SSH_COMMAND'][3:]
+        result = subprocess.run(
+            [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
+             '--', 'cat', 'deep/file'], cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+
     def test_short_proxy_jump_option_remains_usable_for_lazy_reads(self):
         f = self.f
         url = f.ssh(encrypted=True)

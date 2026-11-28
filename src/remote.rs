@@ -162,7 +162,6 @@ pub struct Remote {
     socket_owner: Option<SocketOwner>,
     ssh: Option<OsString>,
     ssh_directory: PathBuf,
-    control_client: Option<ControlClient>,
     failed: Option<String>,
     eager_loaded: bool,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
@@ -215,7 +214,10 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr) -> Result<Source> {
     } else {
         let path = Path::new(OsStr::from_bytes(url));
         let leading_segment = url.split(|&byte| byte == b'/').next().unwrap();
-        if leading_segment.contains(&b':') && !cwd.join(path).is_dir() {
+        if url.starts_with(b"https://")
+            || url.starts_with(b"ssh://")
+            || (leading_segment.contains(&b':') && !cwd.join(path).is_dir())
+        {
             return Ok(Source::Network {
                 git,
                 url: path.as_os_str().to_os_string(),
@@ -441,10 +443,6 @@ impl Remote {
         } else {
             cwd.clone()
         };
-        let control_client = ssh
-            .as_deref()
-            .map(|ssh| ControlClient::resolve(&ssh_directory, ssh))
-            .transpose()?;
         let mut remote = Self {
             git,
             run: run.to_path_buf(),
@@ -464,7 +462,6 @@ impl Remote {
             socket_owner: None,
             ssh,
             ssh_directory,
-            control_client,
             failed: None,
             eager_loaded: false,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
@@ -779,6 +776,11 @@ impl Remote {
             return Ok(None);
         }
         let command = self.ssh_command(SshMode::Master)?;
+        let ssh = self
+            .ssh
+            .as_deref()
+            .context("no OpenSSH command configured")?;
+        let client = ControlClient::resolve(&self.ssh_directory, ssh)?;
         let started = Instant::now();
         let mut additional = transport::copy_command(&command);
         additional
@@ -804,7 +806,7 @@ impl Remote {
                         Err(error) => failure = Some(error),
                     }
                 } else if connection.is_none() && started.elapsed() >= SSH_STANDBY_DELAY {
-                    self.record_socket_owner()?;
+                    self.record_socket_owner(&client)?;
                     if let Some(socket) = self.ssh_socket() {
                         let owned = transport::Connection::new(
                             transport::copy_command(&additional),
@@ -821,7 +823,7 @@ impl Remote {
             }
             failure.map_or(Ok(None), Err)
         })();
-        self.record_socket_owner()?;
+        self.record_socket_owner(&client)?;
         crate::object::check_transfer()?;
         let Some(mut session) = session? else {
             return Ok(None);
@@ -1030,7 +1032,7 @@ impl Remote {
         }
         Ok(())
     }
-    fn record_socket_owner(&mut self) -> Result<()> {
+    fn record_socket_owner(&mut self, client: &ControlClient) -> Result<()> {
         let Some(socket) = &self.socket else {
             return Ok(());
         };
@@ -1053,7 +1055,7 @@ impl Remote {
             format: "git-on-ssh-control-v1".into(),
             device: metadata.dev(),
             inode: metadata.ino(),
-            client: self.control_client.clone(),
+            client: Some(client.clone()),
         };
         self.socket_owner = Some(owner.clone());
         let mut file = OpenOptions::new()
