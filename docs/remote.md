@@ -85,11 +85,12 @@ The mount can read a verified wanted object before its pack ends. A delta
 base received as an extra becomes available to other requests after the
 pack and transport complete. The completed response can satisfy an exact
 request already in flight, independently of the duplicate transfer's outcome.
-After the user command exits normally, Git-on checks the outcome of
-responses that served it. Other in-flight requests can be cancelled
-during teardown. Git-on waits up to ten seconds for a closing SSH channel
-to report its exit status. Copy starts this wait after validating the pack.
-An expired wait is a transport failure.
+After the user command exits normally, Git-on continues validating the
+responses that supplied data. The run fails if any of them fails or waits
+30 seconds for more input. This timer runs only while the response waits
+for input. Other in-flight requests can be cancelled during teardown.
+Git-on waits up to ten seconds for a closing SSH channel to report its exit
+status. Copy starts that wait after validating the pack.
 A temporary cache placement failure is reported for the affected object.
 It can be retried after capacity returns. The rest of its response still
 undergoes normal validation.

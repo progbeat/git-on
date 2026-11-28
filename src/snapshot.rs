@@ -779,10 +779,11 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub fn finish_remote_reads(&self) {
+    pub fn finish_remote_reads(&self) -> Result<()> {
         if let Some(completion) = &self.response_completion {
-            completion.wait();
+            completion.wait()?;
         }
+        Ok(())
     }
     pub fn remote_failure(&self) -> Option<String> {
         self.state()

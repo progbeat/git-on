@@ -12,7 +12,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -46,27 +46,73 @@ pub(crate) struct ResponseCompletion {
 
 #[derive(Default)]
 struct CompletionState {
-    observed: usize,
+    observed: Vec<ObservedResponse>,
     sealed: bool,
+    failed: bool,
+}
+
+struct ObservedResponse {
+    receipt: Arc<ResponseReceipt>,
+    input_epoch: u64,
+    waiting_since: Instant,
+}
+
+impl CompletionState {
+    fn next_deadline(&mut self, now: Instant, grace: Duration) -> Option<Instant> {
+        self.observed
+            .iter_mut()
+            .filter_map(|response| {
+                let epoch = response.receipt.input_epoch.load(Ordering::Relaxed);
+                if epoch != response.input_epoch {
+                    response.input_epoch = epoch;
+                    response.waiting_since = now;
+                }
+                (epoch & 1 != 0).then_some(response.waiting_since + grace)
+            })
+            .min()
+    }
 }
 
 impl ResponseCompletion {
-    pub(crate) fn wait(&self) {
+    pub(crate) fn wait(&self) -> Result<()> {
+        self.wait_for(Duration::from_secs(30))
+    }
+
+    fn wait_for(&self, grace: Duration) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.sealed = true;
-        while state.observed != 0 && crate::git::cancelled_signal().is_none() {
+        if !state.sealed {
+            state.sealed = true;
+            let started = Instant::now();
+            for response in &mut state.observed {
+                response.waiting_since = started;
+            }
+        }
+        while !state.observed.is_empty()
+            && !state.failed
+            && crate::git::cancelled_signal().is_none()
+        {
+            let now = Instant::now();
+            let poll = Duration::from_millis(20);
+            let remaining = state
+                .next_deadline(now, grace)
+                .map_or(poll, |deadline| deadline.saturating_duration_since(now));
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "timed out waiting for Git packs that supplied data to finish"
+            );
             state = self
                 .changed
-                .wait_timeout(state, Duration::from_millis(20))
+                .wait_timeout(state, remaining.min(poll))
                 .unwrap()
                 .0;
         }
+        Ok(())
     }
 }
 
 #[derive(Default)]
 struct ReceiptState {
-    waiting: Option<Arc<ResponseCompletion>>,
+    waiting: Option<Weak<ResponseCompletion>>,
     finished: bool,
     failure: Option<String>,
 }
@@ -74,10 +120,26 @@ struct ReceiptState {
 #[derive(Default)]
 pub(crate) struct ResponseReceipt {
     state: Mutex<ReceiptState>,
+    // Odd during an input wait. A new wait advances the epoch even if the
+    // observer never saw the intervening processing state.
+    input_epoch: AtomicU64,
+}
+
+pub(crate) struct InputWait<'a>(&'a AtomicU64);
+
+impl Drop for InputWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl ResponseReceipt {
-    pub(crate) fn observe(&self, completion: &Arc<ResponseCompletion>) -> Result<bool> {
+    pub(crate) fn waiting_for_input(&self) -> InputWait<'_> {
+        self.input_epoch.fetch_add(1, Ordering::Relaxed);
+        InputWait(&self.input_epoch)
+    }
+
+    pub(crate) fn observe(self: &Arc<Self>, completion: &Arc<ResponseCompletion>) -> Result<bool> {
         let mut receipt = self.state.lock().unwrap();
         if let Some(error) = &receipt.failure {
             bail!("{error}");
@@ -85,8 +147,12 @@ impl ResponseReceipt {
         if !receipt.finished && receipt.waiting.is_none() {
             let mut state = completion.state.lock().unwrap();
             if !state.sealed {
-                state.observed += 1;
-                receipt.waiting = Some(completion.clone());
+                state.observed.push(ObservedResponse {
+                    receipt: self.clone(),
+                    input_epoch: self.input_epoch.load(Ordering::Relaxed),
+                    waiting_since: Instant::now(),
+                });
+                receipt.waiting = Some(Arc::downgrade(completion));
             }
         }
         Ok(!receipt.finished)
@@ -95,6 +161,11 @@ impl ResponseReceipt {
     pub(crate) fn fail(&self, error: &anyhow::Error) -> bool {
         let mut receipt = self.state.lock().unwrap();
         receipt.failure = Some(format!("{error:#}"));
+        if let Some(completion) = receipt.waiting.as_ref().and_then(Weak::upgrade) {
+            // The queue retains this failure for the final exit status.
+            completion.state.lock().unwrap().failed = true;
+            completion.changed.notify_all();
+        }
         receipt.waiting.is_some()
     }
 }
@@ -106,8 +177,13 @@ impl Drop for ResponseGuard {
     fn drop(&mut self) {
         let mut receipt = self.0.state.lock().unwrap();
         receipt.finished = true;
-        if let Some(completion) = receipt.waiting.take() {
-            completion.state.lock().unwrap().observed -= 1;
+        if let Some(completion) = receipt.waiting.take().and_then(|waiting| waiting.upgrade()) {
+            completion
+                .state
+                .lock()
+                .unwrap()
+                .observed
+                .retain(|response| !Arc::ptr_eq(&response.receipt, &self.0));
             completion.changed.notify_all();
         }
     }
@@ -1100,6 +1176,10 @@ impl Shared {
             let mut queue = self.queue.lock().unwrap();
             if let Some(error) = &failure {
                 queue.failure.get_or_insert_with(|| format!("{error:#}"));
+            } else {
+                // Close admission before draining. A request may already have
+                // passed the process-wide cancellation check.
+                self.stop.store(true, Ordering::Relaxed);
             }
             queue.waiting.clear();
             queue.ahead.clear();
@@ -1351,6 +1431,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completed_command_times_out_while_a_used_pack_is_still_open() {
+        let grace = Duration::from_millis(40);
+        let completion = Arc::new(ResponseCompletion::default());
+        let response = ResponseGuard::default();
+        let reading = response.0.waiting_for_input();
+        assert!(response.0.observe(&completion).unwrap());
+
+        let (send, receive) = mpsc::channel();
+        let waiting = completion.clone();
+        let waiter = thread::spawn(move || {
+            let start = Instant::now();
+            let result = waiting.wait_for(grace);
+            let _ = send.send((result, start.elapsed()));
+        });
+        let (outcome, elapsed) = receive
+            .recv_timeout(Duration::from_secs(3))
+            .expect("an open response stalled the wait");
+        waiter.join().unwrap();
+        assert!(elapsed >= grace);
+        assert!(outcome
+            .unwrap_err()
+            .to_string()
+            .contains("packs that supplied data"));
+        drop(reading);
+        drop(response);
+        assert!(completion.wait_for(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn input_deadlines_are_independent_and_pause_while_processing() {
+        let completion = Arc::default();
+        let active = ResponseGuard::default();
+        let stalled = ResponseGuard::default();
+        let reading = active.0.waiting_for_input();
+        let stalled_reading = stalled.0.waiting_for_input();
+        assert!(active.0.observe(&completion).unwrap());
+        assert!(stalled.0.observe(&completion).unwrap());
+        let grace = Duration::from_secs(30);
+        let start = Instant::now();
+        let received = start + Duration::from_secs(29);
+        for response in &mut completion.state.lock().unwrap().observed {
+            response.waiting_since = start;
+        }
+        drop(reading);
+        let reading = active.0.waiting_for_input();
+        let earliest = completion
+            .state
+            .lock()
+            .unwrap()
+            .next_deadline(received, grace);
+        assert_eq!(earliest, Some(start + grace));
+        drop(stalled_reading);
+        drop(stalled);
+        let deadline = completion
+            .state
+            .lock()
+            .unwrap()
+            .next_deadline(start + grace, grace);
+        assert_eq!(deadline, Some(received + grace));
+        drop(reading);
+        let while_processing = completion
+            .state
+            .lock()
+            .unwrap()
+            .next_deadline(start + grace * 3, grace);
+        assert_eq!(while_processing, None);
+    }
+
+    #[test]
+    fn http2_cancellation_drains_and_closes_the_demand_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool {
+            shared: Arc::default(),
+            scratch: RawBlobs::new(directory.path()).unwrap(),
+            workers: Mutex::default(),
+            wake: None,
+        };
+        let oid = Oid::zero();
+        let pending = pool.request(oid).unwrap();
+
+        // Model a caller that already passed the process-wide transfer check.
+        pool.shared.finish_http2(None);
+        assert!(pending.ready());
+        let error = pool.request(oid).err().expect("dispatcher is already gone");
+        assert!(object::is_cancelled(&error));
+    }
+
+    #[test]
     fn http2_dispatch_refills_a_freed_read_ahead_slot_without_foreground_work() {
         let mut queue = Queue::default();
         let queued = queue.insert(Oid::zero());
@@ -1413,9 +1581,9 @@ mod tests {
         for oid in &batch.oids {
             queue.pending.remove(oid);
         }
-        assert_eq!(completion.state.lock().unwrap().observed, 1);
+        assert_eq!(completion.state.lock().unwrap().observed.len(), 1);
         drop(work);
-        assert_eq!(completion.state.lock().unwrap().observed, 0);
+        assert!(completion.state.lock().unwrap().observed.is_empty());
     }
 
     fn two_blob_response() -> (Oid, Oid, Vec<u8>, usize, Vec<u8>) {
@@ -1553,7 +1721,7 @@ exit 23"#,
                     Ok(())
                 })
                 .unwrap();
-            assert_eq!(completion.state.lock().unwrap().observed, 1);
+            assert_eq!(completion.state.lock().unwrap().observed.len(), 1);
             cache.set_spill_error_for_test(Some(error));
             receiver.write_http(&prefix[split..]).unwrap();
             assert!(!second.ready());
@@ -1564,7 +1732,7 @@ exit 23"#,
             receiver.write_http(&checksum).unwrap();
             shared.finish(work, receiver.finish_http(), Instant::now(), None, &cache);
             assert_eq!(shared.queue.lock().unwrap().failure.is_none(), valid);
-            assert_eq!(completion.state.lock().unwrap().observed, 0);
+            assert!(completion.state.lock().unwrap().observed.is_empty());
             assert_eq!(cache.get(a).unwrap().unwrap().read_all().unwrap(), b"a");
 
             if valid {
@@ -1715,7 +1883,11 @@ exit 23"#,
 
         let mut partial = shared.response(&duplicate, &[b], &cache);
         partial.write_http(&prefix).unwrap();
-        assert!(cache.observe_cached(b, &Arc::default()).unwrap());
+        let completion = Arc::default();
+        assert!(cache.observe_cached(b, &completion).unwrap());
+        let stalled = ResponseGuard::default();
+        let _reading = stalled.0.waiting_for_input();
+        assert!(stalled.0.observe(&completion).unwrap());
         assert_eq!(cache.get(b).unwrap().unwrap().read_all().unwrap(), b"b");
         shared.finish(
             duplicate,
@@ -1726,6 +1898,7 @@ exit 23"#,
         );
         assert!(shared.queue.lock().unwrap().failure.is_some());
         assert!(cache.observe_cached(b, &Arc::default()).is_err());
+        assert!(completion.wait_for(Duration::ZERO).is_ok());
     }
 
     #[test]

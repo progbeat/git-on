@@ -196,6 +196,16 @@ impl Response {
         matches!(self.phase, Phase::Done)
     }
 
+    pub(crate) fn wait_for_input<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _wait = self
+            .pack
+            .objects
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.waiting_for_input());
+        read()
+    }
+
     /// Leave bytes after the response in the caller's buffer. Native helpers
     /// have a separate response-end marker. Direct SSH uses this same framer.
     fn feed(&mut self, mut input: &[u8]) -> Result<usize> {
@@ -289,7 +299,8 @@ impl Response {
 
     pub(crate) fn read(mut self, input: &mut impl BufRead) -> Result<Received> {
         while !self.done() {
-            let bytes = input.fill_buf()?;
+            let next = &mut *input;
+            let bytes = self.wait_for_input(move || next.fill_buf())?;
             if bytes.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

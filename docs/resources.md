@@ -6,8 +6,9 @@ Each invocation owns its prepared objects and temporary storage. Mounted runs
 share a 16 MiB LRU for complete blobs up to 64 KiB and authenticated blocks read
 from spills. Each entry is charged by allocation capacity plus 512 bytes.
 A separate LRU retains the eight most recently used complete large blobs.
-Readers of one OID share a resident buffer. Active read buffers and decoder
-allocations are accounted separately.
+This budget counts objects. Eight 32 MiB blobs can retain 256 MiB of payload,
+so the working set needs enough RAM for the large blobs it keeps resident.
+Active read buffers and decoder allocations are accounted separately.
 
 An additional 16 MiB LRU holds compressed copies of unrequested remote delta
 bases that might be needed later. Entries are charged by allocation capacity

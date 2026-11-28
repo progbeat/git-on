@@ -891,7 +891,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             .is_ok_and(|status| status.signal().is_none())
             && git_on::git::cancelled_signal().is_none()
         {
-            snapshot.finish_remote_reads();
+            if let Err(error) = snapshot.finish_remote_reads() {
+                outcome = Err(error);
+            }
             if let Some(signal) = git_on::git::cancelled_signal() {
                 outcome = Ok(ExitStatus::from_raw(signal));
             }
@@ -919,9 +921,11 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             transport_cleanup_failure = Some(error);
         }
         if let Some(failure) = snapshot.remote_failure() {
-            result = Err(anyhow::anyhow!(
-                "remote object loading failed; execution incomplete: {failure}"
-            ));
+            let message = format!("remote object loading failed; execution incomplete: {failure}");
+            result = Err(match result {
+                Ok(_) => anyhow::anyhow!("{message}"),
+                Err(error) => error.context(message),
+            });
         }
         #[cfg(feature = "test-metrics")]
         if let Err(e) = report_metrics(snapshot, measured_backend) {
