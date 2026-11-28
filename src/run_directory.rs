@@ -2,18 +2,20 @@ use std::{
     ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
     io,
+    mem::MaybeUninit,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
 
 const GROUP_NAME: &str = "git-on";
-const OWNERSHIP: &str = ".git-on-owner";
+const OWNERSHIP: &CStr = c".git-on-owner";
 
 pub(super) struct Group {
     path: PathBuf,
+    directory: File,
     metadata: fs::Metadata,
 }
 
@@ -58,7 +60,7 @@ impl Group {
                 };
                 let metadata = directory.metadata()?;
                 if !usable(&metadata, uid)
-                    || metadata.mode() & 0o1777 != 0o1777 && !has_marker(&path, uid)
+                    || metadata.mode() & 0o1777 != 0o1777 && !has_marker(&directory, uid)
                 {
                     break;
                 }
@@ -68,7 +70,12 @@ impl Group {
                 let error = match create(&directory, &entry) {
                     Ok(()) => {
                         let run = path.join(name);
-                        return Ok((Some(Self { path, metadata }), run, id));
+                        let group = Self {
+                            path,
+                            directory,
+                            metadata,
+                        };
+                        return Ok((Some(group), run, id));
                     }
                     Err(error) if error.kind() == io::ErrorKind::PermissionDenied => break,
                     Err(error) => error,
@@ -105,9 +112,13 @@ impl Group {
         if name != GROUP_NAME && name != private_name(uid).as_str() {
             return None;
         }
-        let metadata = path.symlink_metadata().ok()?;
-        (usable(&metadata, uid) && has_marker(path, uid)).then(|| Self {
+        let directory = open_group(path).ok()?;
+        let metadata = directory.metadata().ok()?;
+        // Recovery may start while a retiring run has the marker removed.
+        // Hold the directory through cleanup and check its marker on drop.
+        private_directory(&metadata, uid).then(|| Self {
             path: path.to_owned(),
+            directory,
             metadata,
         })
     }
@@ -130,7 +141,7 @@ fn publish_group(
         .prefix(".git-on-group-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(base)?;
-    write_marker(staged.path())?;
+    write_marker(&open_group(staged.path())?)?;
     let from = CString::new(staged.path().as_os_str().as_encoded_bytes())?;
     let to = CString::new(path.as_os_str().as_encoded_bytes())?;
     match rename(&from, &to) {
@@ -178,60 +189,100 @@ fn rename_group(from: &CStr, to: &CStr) -> io::Result<()> {
 
 impl Drop for Group {
     fn drop(&mut self) {
-        let uid = unsafe { libc::geteuid() };
-        if self.metadata.uid() == uid
-            && self.metadata.mode() & 0o1777 == 0o700
-            && self.same_private_directory(uid)
-            && fs::read_dir(&self.path).is_ok_and(|mut entries| {
-                entries.all(|entry| entry.is_ok_and(|entry| entry.file_name() == OWNERSHIP))
-            })
-        {
-            let removed = fs::remove_file(self.path.join(OWNERSHIP));
-            if (removed.is_ok()
-                || removed.is_err_and(|error| error.kind() == io::ErrorKind::NotFound))
-                && self.same_private_directory(uid)
-            {
-                // A launch can add a run after read_dir. Keep the ownership
-                // record in that case so the last finishing run can clean it.
-                if fs::remove_dir(&self.path).is_err_and(|error| {
-                    matches!(
-                        error.kind(),
-                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
-                    )
-                }) && self.same_private_directory(uid)
-                {
-                    let _ = write_marker(&self.path);
-                }
-            }
-        }
+        self.remove_if_empty(only_marker, |path| fs::remove_dir(path));
     }
 }
 
 impl Group {
+    fn remove_if_empty(
+        &self,
+        mut inspect: impl FnMut(&Path) -> bool,
+        mut remove: impl FnMut(&Path) -> io::Result<()>,
+    ) {
+        let uid = unsafe { libc::geteuid() };
+        if !private_directory(&self.metadata, uid) {
+            return;
+        }
+        while self.same_private_directory(uid)
+            && inspect(&self.path)
+            && has_marker(&self.directory, uid)
+        {
+            // Only the cleaner that removes this group's marker can retire
+            // it. A replacement at the same path has a different descriptor.
+            let removed =
+                unsafe { libc::unlinkat(self.directory.as_raw_fd(), OWNERSHIP.as_ptr(), 0) };
+            if removed != 0 || !self.same_private_directory(uid) {
+                return;
+            }
+            let Err(error) = remove(&self.path) else {
+                return;
+            };
+            if !self.same_private_directory(uid) || write_marker(&self.directory).is_err() {
+                return;
+            }
+            // A concurrent run can finish while the marker is absent.
+            // Check again after restoring it so that run can be the last.
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+            ) {
+                return;
+            }
+        }
+    }
+
     fn same_private_directory(&self, uid: u32) -> bool {
         self.path.symlink_metadata().is_ok_and(|current| {
-            current.is_dir()
-                && current.uid() == uid
-                && current.mode() & 0o1777 == 0o700
+            private_directory(&current, uid)
                 && current.ino() == self.metadata.ino()
                 && current.dev() == self.metadata.dev()
         })
     }
 }
 
-fn write_marker(path: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path.join(OWNERSHIP))
-        .map(drop)
+fn private_directory(metadata: &fs::Metadata, uid: u32) -> bool {
+    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o1777 == 0o700
 }
 
-fn has_marker(path: &Path, uid: u32) -> bool {
-    path.join(OWNERSHIP).symlink_metadata().is_ok_and(|marker| {
-        marker.is_file() && marker.uid() == uid && marker.mode() & 0o777 == 0o600
+fn only_marker(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| {
+        entries.all(|entry| {
+            entry.is_ok_and(|entry| entry.file_name().as_encoded_bytes() == OWNERSHIP.to_bytes())
+        })
     })
+}
+
+fn write_marker(directory: &File) -> io::Result<()> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            OWNERSHIP.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(unsafe { File::from_raw_fd(fd) });
+    Ok(())
+}
+
+fn has_marker(directory: &File, uid: u32) -> bool {
+    let mut marker = MaybeUninit::<libc::stat>::uninit();
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            OWNERSHIP.as_ptr(),
+            marker.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return false;
+    }
+    let marker = unsafe { marker.assume_init() };
+    marker.st_uid == uid && marker.st_mode & (libc::S_IFMT | 0o777) == libc::S_IFREG | 0o600
 }
 
 fn private_name(uid: u32) -> String {
@@ -258,6 +309,84 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
+    fn finishing_group_does_not_remove_the_replacement_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path();
+        let (first, first_run, _) = Group::create_in(base, rename_group, create_run).unwrap();
+        let (mut second, second_run, _) = Group::create_in(base, rename_group, create_run).unwrap();
+        let first = first.unwrap();
+        let path = first.path.clone();
+        fs::remove_dir(first_run).unwrap();
+        fs::remove_dir(second_run).unwrap();
+        let mut replacement = None;
+        first.remove_if_empty(
+            |group_path| {
+                assert!(only_marker(group_path));
+                drop(second.take());
+                assert!(!group_path.exists());
+                replacement = Some(Group::create_in(base, rename_group, create_run).unwrap());
+                true
+            },
+            |group_path| fs::remove_dir(group_path),
+        );
+        let (group, run, _) = replacement.unwrap();
+        assert_eq!(run.parent(), Some(path.as_path()));
+        assert!(
+            has_marker(&group.as_ref().unwrap().directory, unsafe {
+                libc::geteuid()
+            }),
+            "replacement lost its ownership marker"
+        );
+        fs::remove_dir(run).unwrap();
+        drop(group);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_cleanup_can_finish_on_either_side_of_marker_restoration() {
+        for finish_before_restore in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (group, run, _) =
+                Group::create_in(temporary.path(), rename_group, create_run).unwrap();
+            let group = group.unwrap();
+            fs::remove_dir(run).unwrap();
+            let concurrent_run = group.path.join("12345678");
+            let mut started = false;
+            let mut cleanup = None;
+            group.remove_if_empty(
+                |path| {
+                    let empty = only_marker(path);
+                    if !started {
+                        fs::create_dir(&concurrent_run).unwrap();
+                        started = true;
+                    }
+                    empty
+                },
+                |path| {
+                    let result = fs::remove_dir(path);
+                    if result.is_err() {
+                        assert!(!has_marker(&group.directory, unsafe { libc::geteuid() }));
+                        cleanup = Group::for_run(&concurrent_run);
+                        if finish_before_restore {
+                            fs::remove_dir(&concurrent_run).unwrap();
+                            drop(cleanup.take());
+                        }
+                    }
+                    result
+                },
+            );
+            if !finish_before_restore {
+                fs::remove_dir(&concurrent_run).unwrap();
+                drop(cleanup);
+            }
+            assert!(
+                !group.path.exists(),
+                "empty group left after recovery, finish_before_restore={finish_before_restore}"
+            );
+        }
+    }
+
+    #[test]
     fn occupied_group_and_unmarked_fallback_allow_a_private_run() {
         let temporary = tempfile::tempdir().unwrap();
         let base = temporary.path();
@@ -273,6 +402,11 @@ mod tests {
         assert_eq!(run.parent(), Some(base));
         assert!(run.is_dir());
         fs::remove_dir(run).unwrap();
+        let unmarked_run = fallback.join("12345678");
+        fs::create_dir(&unmarked_run).unwrap();
+        let recovery = Group::for_run(&unmarked_run);
+        fs::remove_dir(unmarked_run).unwrap();
+        drop(recovery);
         assert_eq!(fs::read_dir(&fallback).unwrap().count(), 0);
         assert_eq!(fs::read(&occupied).unwrap(), b"user data");
         assert_eq!(fs::read_dir(base).unwrap().count(), 2);
@@ -305,7 +439,7 @@ mod tests {
         let fallback = base.join(private_name(unsafe { libc::geteuid() }));
         for directory in [&primary, &fallback] {
             fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
-            write_marker(directory).unwrap();
+            write_marker(&open_group(directory).unwrap()).unwrap();
         }
         let primary_inode = fs::metadata(&primary).unwrap().ino();
         let (group, run, _) = Group::create_in(
