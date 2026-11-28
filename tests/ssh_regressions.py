@@ -2,8 +2,8 @@
 """Focused SSH review regressions using disposable real OpenSSH fixtures."""
 import argparse
 import importlib.util
+import hashlib
 import contextlib
-import errno
 import json
 import os
 from pathlib import Path
@@ -16,11 +16,10 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 import uuid
-from urllib.parse import urlsplit
+from support.run_storage import run_directories, run_lock, ssh_owner_marker
 
 SPEC = importlib.util.spec_from_file_location('git_on_remote_fixtures', Path(__file__).with_name('remote.py'))
 remote = importlib.util.module_from_spec(SPEC)
@@ -46,23 +45,6 @@ class SshRegressionTests(unittest.TestCase):
     def setUp(self):
         self.f = remote.Fixture()
         self.addCleanup(self.f.close)
-
-    def legacy_pin_recovery(self, fixture, directory):
-        repository = directory / 'remote-repository'
-        repository.mkdir(exist_ok=True)
-        fixture.git('init', '--bare', '--quiet', at=repository)
-        pin = 'refs/git-on/probe'
-        tree = remote.run(['git', '-C', fixture.repo, 'cat-file', 'tree', fixture.tree],
-                          env=fixture.env)
-        self.assertEqual(
-            fixture.git('hash-object', '-t', 'tree', '-w', '--stdin', data=tree, at=repository),
-            fixture.tree)
-        fixture.git('update-ref', pin, fixture.tree, at=repository)
-        (directory / '.lock').touch()
-        (directory / '.state').write_text(json.dumps(dict(
-            format='git-on-temp-v1', id='probe',
-            git_dir=str(repository), tree_oid=fixture.tree, pin_ref=pin)))
-        return ['git', '--git-dir=' + str(repository), 'show-ref', '--verify', pin]
 
     def loaded_read(self, url, fixture=None):
         f = self.f if fixture is None else fixture
@@ -116,8 +98,7 @@ class SshRegressionTests(unittest.TestCase):
                 # actual SIGKILL mount behavior belongs to --require-fuse CI.
                 (directory / '.lock').touch()
                 (directory / '.state').write_text(json.dumps(dict(
-                    format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
-                    git_dir=None, tree_oid=None, pin_ref=None)))
+                    format='git-on-temp-v1', id=str(uuid.uuid4()))))
                 cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
                                          env=f.env, capture_output=True, timeout=10)
                 self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
@@ -135,11 +116,13 @@ class SshRegressionTests(unittest.TestCase):
                     signal.pidfd_send_signal(descriptor, signal.SIGTERM)
             os.close(descriptor)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_selected_ssh_client_outside_path_closes_master_on_drop(self):
         for selection in ('GIT_SSH_COMMAND', 'GIT_SSH', 'core.sshCommand'):
             with self.subTest(selection=selection):
                 self.shutdown_selected_client_outside_path(selection, False)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_selected_ssh_client_outside_path_closes_master_on_stale_recovery(self):
         for selection in ('GIT_SSH_COMMAND', 'GIT_SSH', 'core.sshCommand'):
             with self.subTest(selection=selection):
@@ -175,31 +158,17 @@ class SshRegressionTests(unittest.TestCase):
         checked=subprocess.run(control,capture_output=True,check=True,timeout=5)
         descriptor=os.pidfd_open(int(re.search(rb'pid=(\d+)',checked.stderr).group(1)))
         try:
-            if mode=='recovery':
-                process.kill(); process.communicate(timeout=10)
-                self.assertEqual(process.returncode,-signal.SIGKILL)
             if mode=='spawn-race': armed.touch()
             else:
-                deadline = time.monotonic() + 5
-                while True:
-                    try:
-                        executable.write_bytes(replacement)
-                        break
-                    except OSError as error:
-                        if error.errno != errno.ETXTBSY or time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.01)
+                executable.write_bytes(replacement)
                 os.utime(executable,ns=(metadata.st_atime_ns,metadata.st_mtime_ns))
                 current=executable.stat()
                 self.assertEqual((current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns),
                                  (metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns))
-            pin=self.legacy_pin_recovery(f,directory)
-            if mode=='recovery':
-                result=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
-                status,errors=result.returncode,result.stderr
-            else:
-                process.stdin.write(b'exit\n'); process.stdin.flush()
-                _,errors=process.communicate(timeout=10); status=process.returncode
+            (directory/'.lock').touch()
+            (directory/'.state').write_text(json.dumps(dict(format='git-on-temp-v1',id='probe')))
+            process.stdin.write(b'exit\n'); process.stdin.flush()
+            _,errors=process.communicate(timeout=10); status=process.returncode
             if before:
                 self.assertTrue(marker.exists(),'authentic baseline did not execute the changed client')
                 if mode=='spawn-race': self.assertFalse(armed.exists(),'baseline did not reach the armed spawn race')
@@ -218,7 +187,6 @@ class SshRegressionTests(unittest.TestCase):
                 self.assertTrue(directory.exists())
                 self.assertFalse(select.select([descriptor],[],[],0)[0])
                 self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
-                self.assertEqual(subprocess.run(pin,capture_output=True,timeout=5).returncode,0)
                 executable.write_bytes(original); os.utime(executable,ns=(metadata.st_atime_ns,metadata.st_mtime_ns))
                 cleanup=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
@@ -230,16 +198,17 @@ class SshRegressionTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGTERM)
             os.close(descriptor)
 
-    def test_equal_length_restored_mtime_client_change_retains_live_master_pin_and_run(self):
-        for mode in ('drop','recovery'):
-            with self.subTest(mode=mode):
-                if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown(mode,before=True)
-                self.client_rewrite_shutdown(mode)
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
+    def test_equal_length_restored_mtime_client_change_retains_live_master_and_run(self):
+        if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown('drop',before=True)
+        self.client_rewrite_shutdown('drop')
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_shutdown_never_executes_selected_path_after_validation(self):
         if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown('spawn-race',before=True)
         self.client_rewrite_shutdown('spawn-race')
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_changed_client_and_invalid_recovery_record_preserve_owned_connection(self):
         f = self.f
         url = f.ssh()
@@ -252,11 +221,21 @@ class SshRegressionTests(unittest.TestCase):
         process = f.probe(url)
         f.line(process)
         directory = next(f.root.glob('*/ssh-control')).parent
+        marker = ssh_owner_marker(directory)
+        self.assertIsNotNone(marker)
         record_path = directory / 'ssh-control-owner'
-        record = json.loads(record_path.read_text())
-        workspace = (directory / '.git-on-memory').resolve(strict=True)
-        self.assertFalse(record_path.is_symlink())
-        self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
+        self.assertFalse(record_path.exists())
+        endpoint = (directory / 'ssh-control').stat()
+        client = executable.stat()
+        # Exercise old records explicitly. Current runs persist the socket
+        # identity in the name of the empty marker above.
+        record = dict(format='git-on-ssh-control-v1', device=endpoint.st_dev,
+                      inode=endpoint.st_ino, client=dict(
+                          path=list(os.fsencode(executable)),
+                          device=client.st_dev, inode=client.st_ino, size=client.st_size,
+                          modified_seconds=client.st_mtime_ns // 1_000_000_000,
+                          modified_nanoseconds=client.st_mtime_ns % 1_000_000_000,
+                          content_sha256=list(hashlib.sha256(executable.read_bytes()).digest())))
         control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
         checked = subprocess.run(control, capture_output=True, check=True, timeout=5)
         descriptor = os.pidfd_open(int(re.search(rb'pid=(\d+)', checked.stderr).group(1)))
@@ -271,8 +250,10 @@ class SshRegressionTests(unittest.TestCase):
             self.assertIn(b'probe recovery retained', errors)
             self.assertTrue(directory.exists())
             self.assertFalse(select.select([descriptor], [], [], 0)[0])
-            pin = self.legacy_pin_recovery(f, directory)
-            self.assertEqual(subprocess.run(pin, capture_output=True, timeout=5).returncode, 0)
+            marker.unlink()
+            (directory / '.lock').touch()
+            (directory / '.state').write_text(json.dumps(dict(
+                format='git-on-temp-v1', id='probe')))
             executable.unlink(); backup.rename(executable)
             for invalid in ('relative', 'unknown-field', 'invalid-type', 'missing-digest', 'bad-digest', 'directory', 'symlink', 'in-place'):
                 with self.subTest(record=invalid):
@@ -297,7 +278,6 @@ class SshRegressionTests(unittest.TestCase):
                     self.assertTrue(directory.exists())
                     self.assertFalse(select.select([descriptor], [], [], 0)[0])
                     self.assertEqual(subprocess.run(control, capture_output=True, timeout=5).returncode, 0)
-                    self.assertEqual(subprocess.run(pin, capture_output=True, timeout=5).returncode, 0)
                     if invalid in ('directory', 'symlink'):
                         if invalid == 'directory': executable.rmdir()
                         else: executable.unlink()
@@ -310,7 +290,6 @@ class SshRegressionTests(unittest.TestCase):
                                      env=f.env, capture_output=True, timeout=10)
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
             self.assertFalse(directory.exists())
-            self.assertFalse(workspace.exists(), 'checked cleanup retained the service directory')
             self.assertTrue(select.select([descriptor], [], [], 2)[0])
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=10)
@@ -318,6 +297,7 @@ class SshRegressionTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor, signal.SIGTERM)
             os.close(descriptor)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_sigkilled_master_stale_socket_does_not_block_recovery(self):
         f = self.f
         process = f.probe(f.ssh())
@@ -333,8 +313,7 @@ class SshRegressionTests(unittest.TestCase):
             process.kill(); process.communicate(timeout=10)
             (directory / '.lock').touch()
             (directory / '.state').write_text(json.dumps(dict(
-                format='git-on-temp-v1', id='probe',
-                git_dir=None, tree_oid=None, pin_ref=None)))
+                format='git-on-temp-v1', id='probe')))
             cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(directory)],
                                      env=f.env, capture_output=True, timeout=10)
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
@@ -345,6 +324,7 @@ class SshRegressionTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor, signal.SIGTERM)
             os.close(descriptor)
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_owned_socket_removed_during_unlink_does_not_block_recovery(self):
         f = self.f
         library = f.root / 'socket-unlink-race.so'
@@ -356,8 +336,7 @@ class SshRegressionTests(unittest.TestCase):
                 directory.mkdir(mode=0o700)
                 (directory / '.lock').touch()
                 (directory / '.state').write_text(json.dumps(dict(
-                    format='git-on-temp-v1', id='socket-unlink-race', keep=False,
-                    git_dir=None, tree_oid=None, pin_ref=None)))
+                    format='git-on-temp-v1', id='socket-unlink-race')))
                 control = directory / 'ssh-control'
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
                     endpoint.bind(str(control))
@@ -441,7 +420,8 @@ class SshRegressionTests(unittest.TestCase):
         process.stdin.write(b'read deep/file\n')
         process.stdin.flush()
         _, errors = process.communicate(timeout=10)
-        self.assertNotEqual(process.returncode, 0, errors)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertRegex(errors, rb'reconnection is forbidden|remote fetch of exact object')
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
@@ -520,7 +500,8 @@ class SshRegressionTests(unittest.TestCase):
                                      'lost owned master caused a replacement TCP connection:\n' + observed['log'])
                     self.assertEqual(observed['log'].count('Accepted publickey'), 1)
                     self.assertNotEqual(observed['status'], 0, observed['errors'])
-                    self.assertRegex(observed['errors'], b"SSH transport exited|SSH control connection is unavailable|remote fetch of exact object")
+                    self.assertRegex(observed['errors'], rb'reconnection is forbidden|remote fetch of exact object')
+                    self.assertNotIn(b'transport shutdown failed', observed['errors'])
                     self.assertEqual(observed['sockets'], [])
                     if encrypted:
                         self.assertEqual(observed['prompts'], ['prompt'])
@@ -560,12 +541,12 @@ class SshRegressionTests(unittest.TestCase):
         self.assertEqual(list(f.root.glob('*/ssh-control')), [])
 
     def test_ssh_tag_option_values_resembling_control_flags_remain_literal(self):
-        capability_config = self.f.root / 'tag-capability-config'
-        capability_config.write_text('Match tagged -M\n    BatchMode yes\n')
-        capability = subprocess.run(['ssh', '-F', capability_config, '-G', '-P', '-M', 'git-on-tag-check'],
+        probe = self.f.root / 'check-tag-support'
+        probe.write_text('Match tagged fixture\n    User git-on-tag-check\n')
+        capability = subprocess.run(['ssh', '-F', str(probe), '-G', '-P', 'fixture', 'git-on-tag-check'],
                                     capture_output=True, timeout=5)
-        if capability.returncode:
-            self.skipTest('installed OpenSSH does not support Match tagged')
+        if capability.returncode or b'user git-on-tag-check' not in capability.stdout.splitlines():
+            self.skipTest('installed OpenSSH does not support -P with Match tagged')
         for tag in ('-M', '-O'):
             with self.subTest(tag=tag):
                 f = remote.Fixture()
@@ -599,220 +580,8 @@ class SshRegressionTests(unittest.TestCase):
         # OpenSSH -J none is a native direct-host configuration. Inserting a
         # ProxyCommand=false fallback guard wrongly conflicts even with -J none.
         f.env['GIT_SSH_COMMAND'] += ' -J none'
-        runtime = f.root / 'runtime space'
-        runtime.mkdir()
-        f.env['TMPDIR'] = str(runtime)
         self.loaded_read(url)
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
-        self.assertEqual(list(runtime.iterdir()), [])
-
-    def test_default_ssh_configuration_is_opened_by_the_native_client(self):
-        f = self.f
-        url = f.ssh(protocol_v2=True)
-        native, *fixture_options = shlex.split(f.env.pop('GIT_SSH_COMMAND'))
-        client = shutil.which(native)
-        wrapper = f.root / 'default-client'
-        wrapper.write_text(f'''#!{sys.executable}
-import os, sys
-args = sys.argv[1:]
-if '-F' in args:
-    sys.exit('expected native SSH configuration discovery')
-if sys.platform == 'darwin' and 'UseKeychain=no' in args and 'IgnoreUnknown=UseKeychain' not in args:
-    sys.stderr.write('command-line: line 0: Bad configuration option: usekeychain\\n')
-    sys.exit(255)
-prefix = ['-o', 'StrictHostKeyChecking=accept-new'] if os.environ.get('FIXTURE_HOST_POLICY') else []
-os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
-''')
-        wrapper.chmod(0o700)
-        f.env['GIT_SSH'] = str(wrapper)
-        self.loaded_read(url)
-        host_file = f.root / 'known_hosts'
-        host_file.write_bytes(b'')
-        result = subprocess.run(
-            [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
-             '--', 'cat', 'deep/file'],
-            cwd=f.cwd, env=dict(f.env, FIXTURE_HOST_POLICY='1'),
-            capture_output=True, timeout=15,
-        )
-        self.assertEqual(host_file.read_bytes(), b'')
-        self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-        self.assertIn(b'stricthostkeychecking', result.stderr.lower())
-
-    def test_ssh_config_probe_does_not_wait_for_a_descendants_stderr(self):
-        f = self.f
-        url = f.ssh(protocol_v2=True)
-        gate = f.root / 'hold-stderr'
-        started = f.root / 'probe-descendant'
-        gate.touch()
-        native, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
-        wrapper = f.root / 'probe-client'
-        gate_path = shlex.quote(str(gate))
-        started_path = shlex.quote(str(started))
-        wrapper.write_text(
-            '#!/bin/sh\n'
-            'if [ "$1" = -G ]; then\n'
-            f'  ( : > {started_path}; while [ -e {gate_path} ]; do sleep 0.02; done ) </dev/null &\n'
-            f'  while [ ! -e {started_path} ]; do sleep 0.02; done\n'
-            'fi\n'
-            f'exec {shlex.quote(shutil.which(native))} "$@"\n'
-        )
-        wrapper.chmod(0o700)
-        f.env['GIT_SSH_COMMAND'] = shlex.join([str(wrapper), *options])
-        try:
-            result = subprocess.run(
-                [remote.OPTIONS.binary, url, 'main', '--backend=copy', '--write-policy=all',
-                 '--', 'cat', 'deep/file'],
-                cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
-            )
-            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-            self.assertTrue(started.exists())
-        finally:
-            gate.unlink()
-
-    def test_ssh_match_exec_runs_during_inspection_and_connection(self):
-        f = self.f
-        url = f.ssh(protocol_v2=True)
-        calls = f.root / 'match-exec-calls'
-        predicate = f.root / 'match-predicate'
-        predicate.write_text(
-            '#!/bin/sh\n'
-            f'printf "%s\\n" "$FIXTURE_SSH_PHASE" >> {shlex.quote(str(calls))}\n'
-        )
-        predicate.chmod(0o700)
-        config = f.root / 'match.conf'
-        config.write_text(f'Match exec "{shlex.quote(str(predicate))}"\n')
-        native, *options = shlex.split(f.env['GIT_SSH_COMMAND'])
-        options[options.index('-F') + 1] = str(config)
-        wrapper = f.root / 'probe-client'
-        wrapper.write_text(
-            '#!/bin/sh\n'
-            'if [ "$1" = -G ]; then FIXTURE_SSH_PHASE=probe; else FIXTURE_SSH_PHASE=connect; fi\n'
-            'export FIXTURE_SSH_PHASE\n'
-            f'exec {shlex.quote(shutil.which(native))} "$@"\n'
-        )
-        wrapper.chmod(0o700)
-        with tempfile.TemporaryDirectory(dir='/tmp', prefix='go-ssh-') as runtime:
-            env = dict(f.env, TMPDIR=runtime, SHELL='/bin/sh',
-                       GIT_SSH_COMMAND=shlex.join([str(wrapper), *options]))
-            result = subprocess.run(
-                [remote.OPTIONS.binary, url, 'main', '--backend=copy', '--write-policy=all',
-                 '--', 'cat', 'deep/file'],
-                cwd=f.cwd, env=env, capture_output=True, timeout=10,
-            )
-            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-            phases = calls.read_text().splitlines()
-            self.assertIn('probe', phases)
-            self.assertIn('connect', phases)
-            remote.assert_no_run_state(self, Path(runtime))
-
-    def test_check_host_ip_preserves_the_caller_host_files(self):
-        f = self.f
-        url = f.ssh()
-        port = urlsplit(url).port
-        alias = b'fixture-address-check'
-        address = f'[::ffff:127.0.0.1]:{port}'.encode()
-        host = (f.root / 'host.pub').read_bytes()
-        known = f.root / 'known hosts'
-        second = f.root / 'other-hosts'
-        second.touch()
-        escaped = str(known).replace(' ', r'\ ')
-        config = f.root / 'host.conf'
-        address_config = ('Host *\n HostName ::ffff:127.0.0.1\n'
-                          ' HostKeyAlias fixture-address-check\n CheckHostIP yes\n')
-        config.write_text(address_config)
-        command = [
-            'ssh', '-F', str(config), '-i', str(f.root / 'identity'),
-            '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
-        ]
-        f.env['GIT_SSH_COMMAND'] = shlex.join([
-            *command, '-vqo', f'UserKnownHostsFile="{known}" {second}',
-        ])
-        known.write_bytes(alias + b' ' + host)
-
-        # A native read demonstrates the actual OpenSSH update on this host.
-        native = subprocess.run(['git', 'ls-remote', url, 'HEAD'], cwd=f.cwd,
-                                env=f.env, capture_output=True, timeout=10)
-        self.assertEqual(native.returncode, 0, native.stderr)
-        self.assertIn(address + b' ', known.read_bytes())
-        original = alias + b' ' + host
-        known.write_bytes(original)
-
-        code = "from pathlib import Path; print(Path('deep/file').read_text(), end='')"
-        git_on = [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
-                  '--', sys.executable, '-I', '-S', '-c', code]
-        result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b'expected\n')
-        self.assertEqual(known.read_bytes(), original)
-        self.assertEqual(second.read_bytes(), b'')
-
-        probes = f.root / 'ssh-probes'
-        wrapper = f.root / 'counting-ssh'
-        wrapper.write_text(
-            '#!/bin/sh\n'
-            f'if test "$1" = -G; then echo probe >> {shlex.quote(str(probes))}; fi\n'
-            f'exec {shlex.quote(shutil.which("ssh"))} "$@"\n'
-        )
-        wrapper.chmod(0o700)
-        entries = [f.root / f'known-{index}' for index in range(30)]
-        unrelated = ''.join(f'Host unused-{i}\n UserKnownHostsFile ~/.ssh/other-{i}\n'
-                            for i in range(12))
-        f.env['GIT_SSH_COMMAND'] = shlex.join([str(wrapper), *command[1:]])
-        for stanzas, extra in ((('', unrelated), []), (('',), entries)):
-            with self.subTest(host_files=2+len(extra)):
-                files = ' '.join([f'"{known}"', str(second), *map(str, extra)])
-                counts = []
-                for inactive in stanzas:
-                    settings = address_config + f' UserKnownHostsFile {files}\n' + inactive
-                    config.write_text(settings)
-                    probes.unlink(missing_ok=True)
-                    result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
-                    self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-                    self.assertEqual(known.read_bytes(), original)
-                    self.assertEqual(second.read_bytes(), b'')
-                    self.assertFalse(any(path.exists() for path in extra))
-                    self.assertEqual(config.read_text(), settings)
-                    counts.append(len(probes.read_text().splitlines()))
-                self.assertEqual(len(set(counts)), 1, 'unrelated host stanzas launched extra ssh probes')
-
-        wrong = address + b' ' + (f.root / 'identity.pub').read_bytes()
-        second.write_bytes(wrong)
-        config.write_text(address_config + f' UserKnownHostsFile "{known}" {second}\n'
-                          f'Host unused\n UserKnownHostsFile {escaped} "{second}"\n')
-        f.env['GIT_SSH_COMMAND'] = shlex.join(command)
-        result = subprocess.run(git_on, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(b'host key', result.stderr.lower())
-        self.assertFalse(result.stdout)
-        self.assertEqual(known.read_bytes(), original)
-        self.assertEqual(second.read_bytes(), wrong)
-
-    def test_direct_ssh_rejects_proxy_configuration_before_connecting(self):
-        f = self.f
-        url = f.ssh()
-        direct = f.env['GIT_SSH_COMMAND']
-        for option in ('-J fixture-jump', '-o ProxyCommand=/bin/false'):
-            with self.subTest(option=option):
-                f.env['GIT_SSH_COMMAND'] = direct + ' ' + option
-                process = f.probe(url)
-                _, errors = process.communicate(timeout=10)
-                self.assertNotEqual(process.returncode, 0, errors)
-                self.assertIn(b'proxy', errors.lower())
-        self.assertNotIn('Accepted publickey', (f.root / 'sshd.log').read_text())
-
-        # The first inspection sees a direct connection. A later evaluation
-        # enables a command that would prevent it from reaching the fixture.
-        marker = f.root / 'inspected'
-        match = f.root / 'match'
-        match.write_text(f'#!/bin/sh\nif test -e {marker}; then exit 0; fi\n'
-                         f'touch {marker}\nexit 1\n')
-        match.chmod(0o700)
-        config = f.root / 'match-config'
-        config.write_text(f'Match exec "{match}"\n    ProxyCommand /usr/bin/false\n')
-        f.env['GIT_SSH_COMMAND'] = direct.replace('-F /dev/null', f'-F {config}')
-        self.loaded_read(url)
-        self.assertTrue(marker.is_file())
-        remote.assert_no_run_state(self, f.root)
 
     def test_user_master_flag_clusters_cannot_become_option_terminator(self):
         f = self.f
@@ -832,7 +601,8 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         f = self.f
         wrapper = f.root / 'hanging-ssh'
         pid_file = f.root / 'transport-pid'
-        wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid_file}"\nexec sleep 300\n')
+        wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid_file}.tmp"\n'
+                           f'/bin/mv "{pid_file}.tmp" "{pid_file}"\nexec sleep 300\n')
         wrapper.chmod(0o700)
         f.env['GIT_SSH_COMMAND'] = str(wrapper)
         pid, descriptor = pty.fork()
@@ -863,7 +633,7 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
                     break
             self.assertTrue(reaped, 'terminal interrupt did not stop runner: ' + repr(output))
             self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGINT, output)
-            self.assertEqual(remote.run_directories(f.root), [])
+            self.assertEqual(run_directories(f.root), [])
             transport = Path('/proc/' + pid_file.read_text().strip())
             self.assertTrue(not transport.exists() or (transport / 'stat').read_text().split()[2] == 'Z')
         finally:
@@ -914,8 +684,7 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         stale.mkdir(mode=0o700)
         (stale / '.lock').touch()
         (stale / '.state').write_text(json.dumps(dict(
-            format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
-            git_dir=None, tree_oid=None, pin_ref=None)))
+            format='git-on-temp-v1', id=str(uuid.uuid4()))))
         (stale / 'ssh-control').symlink_to(unrelated)
         cleanup = subprocess.run([str(remote.OPTIONS.binary.resolve()), '--cleanup', str(stale)],
                                  env=f.env, capture_output=True, timeout=5)
@@ -924,6 +693,7 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         self.assertEqual(subprocess.run(check, capture_output=True, timeout=5).returncode, 0,
                          'stale cleanup stopped a connection outside its run directory')
 
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_native_config_fifo_cancellation_stops_git_and_removes_state(self):
         f = self.f
         fifo = f.root / 'git-config-fifo'
@@ -937,9 +707,9 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
         native_children = []
         try:
             deadline = time.monotonic() + 5
-            while not remote.run_directories(f.root) and process.poll() is None and time.monotonic() < deadline:
+            while not any(run_lock(path) for path in run_directories(f.root)) and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
-            self.assertTrue(remote.run_directories(f.root), 'runner directory was never created')
+            self.assertTrue(any(run_lock(path) for path in run_directories(f.root)), 'runner lock was never created')
             deadline = time.monotonic() + 5
             while not native_children and process.poll() is None and time.monotonic() < deadline:
                 for entry in Path('/proc').iterdir():
@@ -960,7 +730,7 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
             except subprocess.TimeoutExpired:
                 self.fail('effective native Git config capture ignored SIGTERM while reading a FIFO')
             self.assertEqual(process.returncode, -signal.SIGTERM, errors)
-            self.assertEqual(remote.run_directories(f.root), [])
+            self.assertEqual(run_directories(f.root), [])
             for pid in native_children:
                 proc = Path('/proc') / str(pid)
                 self.assertTrue(not proc.exists() or (proc / 'stat').read_text().rpartition(')')[2].split()[0] == 'Z',
@@ -993,8 +763,7 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
                 stale.mkdir(mode=0o700)
                 (stale / '.lock').touch()
                 (stale / '.state').write_text(json.dumps(dict(
-                    format='git-on-temp-v1', id=str(uuid.uuid4()), keep=False,
-                    git_dir=None, tree_oid=None, pin_ref=None)))
+                    format='git-on-temp-v1', id=str(uuid.uuid4()))))
                 target = stale / 'ssh-control'
                 if owner_mode == 'replaced':
                     with socket.socket(socket.AF_UNIX) as original:
@@ -1013,6 +782,29 @@ os.execv({client!r}, [{client!r}, *prefix, *{fixture_options!r}, *args])
                 check = subprocess.run(['ssh', '-F', '/dev/null', '-S', str(unrelated), '-O', 'check', 'unused'],
                                        capture_output=True, timeout=5)
                 self.assertEqual(check.returncode, 0, 'cleanup stopped a replaced/unrecorded external socket')
+
+    def test_stale_cleanup_preserves_a_live_socket_before_the_ownership_record(self):
+        f = self.f
+        run_id = str(uuid.uuid4())
+        group = f.root / "git-on"
+        group.mkdir(mode=0o700)
+        (group / ".git-on-owner").touch(mode=0o600)
+        run = group / run_id[:8]
+        run.mkdir(mode=0o700)
+        (run / (".lock-" + run_id)).touch(mode=0o600)
+        control = run / "ssh-control"
+        cleanup = [str(remote.OPTIONS.binary.resolve()), "--cleanup", str(run)]
+        with socket.socket(socket.AF_UNIX) as master:
+            # The listener exists, but Git-on did not survive to record its inode.
+            master.bind(str(control))
+            master.listen()
+            result = subprocess.run(cleanup, env=f.env, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn(b"live SSH control socket", result.stderr)
+            self.assertTrue(control.is_socket())
+        result = subprocess.run(cleanup, env=f.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(run.exists())
 
 
 if __name__ == '__main__':

@@ -7,8 +7,6 @@ Native tests exercise the real filesystem through the same fixtures.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-import fcntl
 import json
 import os
 import pty
@@ -20,18 +18,15 @@ import stat
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 import unittest
-
-from support.git_invocations import git_invocations, record_git_invocations
+from support.run_storage import run_directories, run_lock
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser(description=__doc__)
 PARSER.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-on")
 PARSER.add_argument("--require-fuse", action="store_true")
 PARSER.add_argument("--require-nfs", action="store_true", help="Require a real Darwin NFSv4.1 mount in mount tests")
-PARSER.add_argument("--require-nfs-tmpdir", action="store_true", help="Require a Linux NFS-backed TMPDIR for cleanup tests")
 PARSER.add_argument("--uv", action="store_true", help="Also run network-backed uv examples")
 OPTIONS, UNITTEST_ARGS = PARSER.parse_known_args()
 BINARY = OPTIONS.binary.resolve()
@@ -45,45 +40,13 @@ def git(repo, *args, **kwargs):
     return subprocess.run(["git", "-C", str(repo), *args], check=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, **kwargs).stdout.decode().strip()
 
-def run_record(run):
-    return run.parent / f".git-on-run-{os.geteuid():x}-{run.name}"
 
-def linux_file_handle_available(path):
-    import ctypes
-
-    class FileHandle(ctypes.Structure):
-        _fields_ = [("size", ctypes.c_uint), ("kind", ctypes.c_int),
-                    ("bytes", ctypes.c_ubyte * 128)]
-
-    lookup = getattr(ctypes.CDLL(None), "name_to_handle_at", None)
-    if lookup is None:
-        return False
-    handle = FileHandle(size=128)
-    mount = ctypes.c_int()
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        return lookup(fd, b"", ctypes.byref(handle), ctypes.byref(mount), 0x1000) == 0  # AT_EMPTY_PATH
-    finally:
-        os.close(fd)
-
-@contextmanager
-def controlling_terminal():
-    master, slave = pty.openpty()
-    terminal = os.ttyname(slave)
-
-    def attach():
-        os.setsid()
-        descriptor = os.open(terminal, os.O_RDWR | os.O_NOCTTY)
-        try:
-            fcntl.ioctl(descriptor, termios.TIOCSCTTY, 0)
-        finally:
-            os.close(descriptor)
-
-    try:
-        yield attach
-    finally:
-        os.close(slave)
-        os.close(master)
+def file_size_limits(size=None, action=signal.SIG_DFL):
+    import resource
+    signal.signal(signal.SIGXFSZ, action)
+    if size is not None:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
 class RepositoryTest(unittest.TestCase):
@@ -138,15 +101,15 @@ class RepositoryTest(unittest.TestCase):
         return self.invoke_argv([tree, "--", *map(str, command)],
                                 input=input, timeout=timeout, extra_env=extra_env)
 
-    def invoke_argv(self, args, input=None, timeout=60, extra_env=None, preexec_fn=None):
-        before = set((self.system_tmp / "git-on").glob("??????"))
+    def invoke_argv(self, args, input=None, timeout=60, extra_env=None):
+        before = set(run_directories(self.system_tmp))
         argv = [str(BINARY), *args]
         env = dict(self.environment(), **(extra_env or {}))
         if OPTIONS.require_nfs:
             # Give an interrupted native test time to unmount its own share.
             # subprocess.run's timeout sends SIGKILL and can leave a hard mount.
             with subprocess.Popen(argv, cwd=self.repo, env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=preexec_fn) as process:
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
                 try:
                     stdout, stderr = process.communicate(input, timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -159,57 +122,18 @@ class RepositoryTest(unittest.TestCase):
             result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
         else:
             result = subprocess.run(argv, cwd=self.repo, env=env, input=input,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                                    preexec_fn=preexec_fn)
-        created = set((self.system_tmp / "git-on").glob("??????")) - before
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        created = set(run_directories(self.system_tmp)) - before
         self.assertLessEqual(len(created), 1, created)
         return result, next(iter(created), None)
 
     def python(self, code, **kwargs):
         return self.invoke(sys.executable, "-c", code, **kwargs)
 
-    def cleanup_run(self, run, timeout=15, *, umask=-1):
+    def cleanup_run(self, run, timeout=15):
         return subprocess.run([str(BINARY), "--cleanup", str(run)],
                               cwd=self.repo, env=self.environment(),
-                              capture_output=True, timeout=timeout, umask=umask)
-
-    def race_cleanup(self, run, count=4):
-        cleaners = [subprocess.Popen([str(BINARY), "--cleanup", str(run)], cwd=self.repo,
-                                     env=self.environment(), stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE) for _ in range(count)]
-        return [(cleaner, cleaner.communicate(timeout=20)) for cleaner in cleaners]
-
-    def require_linux_nfs_backing(self):
-        if sys.platform != "linux":
-            self.skipTest("Linux NFS client behavior")
-        storage = subprocess.check_output(["stat", "-f", "-c", "%T", self.system_tmp]).strip()
-        if storage not in (b"nfs", b"nfs4"):
-            if OPTIONS.require_nfs_tmpdir:
-                self.fail("requires NFS-backed TMPDIR")
-            self.skipTest("requires NFS-backed TMPDIR")
-
-    @contextmanager
-    def hold_cleanup_entry(self, path, symlink=False):
-        if symlink:
-            path.symlink_to("missing-target")
-            flags = os.O_PATH | os.O_NOFOLLOW
-        else:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        fd = os.open(path, flags, 0o600)
-        try:
-            yield
-        finally:
-            os.close(fd)
-
-    def require_linux_nfs_deferred_unlink(self, symlink=False):
-        self.require_linux_nfs_backing()
-        probe = self.root / f"unlink-probe-{symlink}"
-        with self.hold_cleanup_entry(probe, symlink):
-            probe.unlink()
-            if not any(path.is_symlink() == symlink for path in self.root.glob(".nfs*")):
-                if OPTIONS.require_nfs_tmpdir and not symlink:
-                    self.fail("the Linux NFS client must defer unlink of the open file")
-                self.skipTest("NFS preserves this unlinked entry without a placeholder")
+                              capture_output=True, timeout=timeout)
 
     def assert_no_runtime_files(self):
         self.assertEqual(list(self.system_tmp.iterdir()), [])
@@ -227,92 +151,129 @@ class MountedRepositoryTest(RepositoryTest):
 
 
 class CliTests(RepositoryTest):
-    @unittest.skipUnless(sys.platform == "darwin", "regression at the Darwin path limit")
-    def test_terminal_paths_fit_a_long_tmpdir(self):
-        temporary = self.system_tmp
-        while len(os.fsencode(temporary)) + 200 < 986:
-            temporary /= "x" * 99
-            temporary.mkdir()
-        temporary /= "x" * (985 - len(os.fsencode(temporary)))
-        temporary.mkdir()
-        with controlling_terminal() as attach:
-            result, _ = self.invoke_argv([
-                "HEAD:plain", "--backend=copy", "--write-policy=all", "--", sys.executable, "-c", "pass",
-            ], extra_env={"TMPDIR": str(temporary)}, preexec_fn=attach)
-        self.assert_success(result)
-        self.assertEqual(list(temporary.iterdir()), [])
-
-    @unittest.skipIf(os.geteuid() == 0, "requires ordinary directory permissions")
-    def test_reports_failure_removing_empty_temporary_group(self):
-        try:
-            result, _ = self.invoke_argv([
-                "HEAD", "--backend=copy", "--write-policy=all", "--", sys.executable, "-c",
-                "import os; os.chmod(os.environ['TMPDIR'], 0o500)",
-            ])
-        finally:
-            self.system_tmp.chmod(0o700)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(b"remove temporary git-on group", result.stderr)
-        self.assertEqual(list((self.system_tmp / "git-on").iterdir()), [])
-
-    def test_failed_group_setup_leaves_tmpdir_usable(self):
-        args = ["HEAD", "--backend=copy", "--write-policy=all", "--", sys.executable, "-c", "pass"]
-        failed, _ = self.invoke_argv(args, preexec_fn=lambda: os.umask(0o100))
-        self.assertEqual(failed.returncode, 125, failed.stderr)
-        self.assert_no_runtime_files()
-        result, _ = self.invoke_argv(args)
-        self.assert_success(result)
-        self.assert_no_runtime_files()
-
-    def test_group_lock_does_not_delay_run(self):
+    def test_cleanup_preserves_an_unregistered_empty_directory(self):
         group = self.system_tmp / "git-on"
         group.mkdir(mode=0o700)
-        descriptor = os.open(group, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            result, _ = self.invoke_argv([
-                "HEAD", "--backend=copy", "--write-policy=all", "--", sys.executable, "-c", "pass",
-            ], timeout=5)
-            self.assert_success(result)
-            self.assert_no_runtime_files()
-        finally:
-            os.close(descriptor)
+        (group / ".git-on-owner").touch(mode=0o600)
+        directory = group / "0123abcd"
+        directory.mkdir(mode=0o700)
+        result = self.cleanup_run(directory)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(directory.is_dir())
 
-    def test_empty_tmpdir_uses_current_directory(self):
-        if sys.platform == "linux":
-            self.repo.chmod(self.repo.stat().st_mode | stat.S_ISGID)
-        result, _ = self.invoke_argv([
-            "HEAD", "--backend=copy", "--write-policy=all", "--",
-            sys.executable, "-c", "from pathlib import Path; print(Path.cwd().parent.parent)",
-        ], extra_env={"TMPDIR": ""})
-        self.assert_success(result)
-        self.assertEqual(Path(os.fsdecode(result.stdout).strip()), self.repo / "git-on")
-        self.assertFalse((self.repo / "git-on").exists())
+        retired = group / "retired"
+        retired.mkdir()
+        identity = retired.stat()
+        marker = group / f".run-0123abcd-0000-4000-8000-000000000000.{identity.st_dev:x}.{identity.st_ino:x}"
+        marker.touch(mode=0o600)
+        result = self.cleanup_run(directory)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(directory.is_dir())
 
-    def test_uses_private_temporary_group_when_name_is_a_file(self):
+    def test_cleanup_recovers_owned_registrations(self):
+        import fcntl
+
+        for phase in ("reserved", "created", "ready", "removed"):
+            with self.subTest(phase=phase):
+                parent = self.system_tmp / phase
+                parent.mkdir()
+                group = parent / "git-on"
+                group.mkdir(mode=0o700)
+                (group / ".git-on-owner").touch(mode=0o600)
+                run = group / "0123abcd"
+                record = ".run-0123abcd-0000-4000-8000-000000000000"
+                if phase != "reserved":
+                    run.mkdir(mode=0o700)
+                if phase in ("ready", "removed"):
+                    identity = run.stat()
+                    record += f".{identity.st_dev:x}.{identity.st_ino:x}"
+                if phase == "removed":
+                    run.rmdir()
+                marker = group / record
+                marker.touch(mode=0o600)
+                if phase == "created":
+                    unrelated = run / "unrelated"
+                    unrelated.write_text("keep")
+                    self.assertNotEqual(self.cleanup_run(run).returncode, 0)
+                    self.assertEqual(unrelated.read_text(), "keep")
+                    unrelated.unlink()
+                if phase == "ready":
+                    with marker.open("r+b") as held:
+                        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        active = self.cleanup_run(run)
+                        self.assertNotEqual(active.returncode, 0)
+                        self.assertIn(b"run is active or locked", active.stderr)
+                self.assert_success(self.cleanup_run(run))
+                self.assertFalse(group.exists())
+
+    def test_copy_preserves_an_occupied_git_on_group_name(self):
         occupied = self.system_tmp / "git-on"
-        occupied.write_bytes(b"existing file")
-        result, _ = self.invoke_argv([
-            "HEAD", "--backend=copy", "--write-policy=all", "--", "/bin/cat", "tracked.txt",
-        ])
-        self.assert_success(result)
-        self.assertEqual(result.stdout, (self.repo / "tracked.txt").read_bytes())
-        self.assertEqual(occupied.read_bytes(), b"existing file")
-        self.assertEqual(list(self.system_tmp.iterdir()), [occupied])
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    occupied.write_text("user data")
+                elif kind == "directory":
+                    occupied.mkdir(mode=0o700)
+                else:
+                    occupied.symlink_to(self.repo, target_is_directory=True)
+                result, run = self.invoke_argv(
+                    ["HEAD", "--backend=copy", "--write-policy=all", "--", sys.executable,
+                     "-c", "from pathlib import Path; print(Path.cwd().parent.parent)"]
+                )
+                self.assert_success(result)
+                self.assertIsNone(run)
+                self.assertEqual(Path(os.fsdecode(result.stdout).strip()),
+                                 self.system_tmp / f".go{os.geteuid():x}")
+                self.assertEqual(list(self.system_tmp.iterdir()), [occupied])
+                if kind == "file":
+                    self.assertEqual(occupied.read_text(), "user data")
+                    occupied.unlink()
+                elif kind == "directory":
+                    occupied.rmdir()
+                else:
+                    self.assertEqual(occupied.readlink(), self.repo)
+                    occupied.unlink()
 
-    def test_refuses_symlinked_temporary_group(self):
-        target = self.root / "other-storage"
-        target.mkdir()
-        group = self.system_tmp / "git-on"
-        group.symlink_to(target, target_is_directory=True)
-        result, run = self.invoke_argv([
-            "HEAD", "--backend=copy", "--write-policy=all", "--", sys.executable, "-c", "pass",
-        ])
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(b"must be a real directory", result.stderr)
-        self.assertIsNone(run)
-        self.assertTrue(group.is_symlink())
-        self.assertEqual(list(target.iterdir()), [])
+    def test_cleanup_removes_interactive_terminal_files_after_runner_exit(self):
+        ready = self.root / "interactive-child"
+        code = (
+            "import os, signal, sys; from pathlib import Path; "
+            "p=Path(sys.argv[1]); tmp=p.with_suffix('.writing'); "
+            "tmp.write_text(str(os.getpid())); tmp.replace(p); signal.pause()"
+        )
+        env = self.environment()
+        pid, terminal = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            os.execve(BINARY, [str(BINARY), "HEAD", "--backend=copy", "--write-policy=all",
+                               "--", sys.executable, "-c", code, str(ready)], env)
+        child = None
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "interactive command did not start")
+            child = int(ready.read_text())
+            run, = run_directories(self.system_tmp)
+            terminal_dir, = run.glob(".git-on-terminal-*")
+            self.assertFalse((terminal_dir / "environment").exists())
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pid = None
+            try: os.kill(child, signal.SIGTERM)
+            except ProcessLookupError: pass
+            child = None
+            self.assert_success(self.cleanup_run(run))
+            self.assertEqual(list(self.system_tmp.iterdir()), [])
+        finally:
+            if child is not None:
+                try: os.kill(child, signal.SIGTERM)
+                except ProcessLookupError: pass
+            if pid is not None:
+                try: os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                os.waitpid(pid, 0)
+            os.close(terminal)
 
     def test_explicit_backend_selects_copy_and_unavailable_mount_does_not_fall_back(self):
         unavailable = "fuse" if sys.platform == "darwin" else "nfs"
@@ -350,6 +311,15 @@ class CliTests(RepositoryTest):
                         if runner.poll() is None:runner.kill()
                         runner.communicate(timeout=10)
 
+    def test_child_inherits_default_or_ignored_file_limit_signal(self):
+        for action, expected in ((signal.SIG_DFL, -signal.SIGXFSZ), (signal.SIG_IGN, 0)):
+            with self.subTest(action=action):
+                result = subprocess.run([str(BINARY), 'HEAD', '--write-policy=all', '--',
+                                         'sh', '-c', f'kill -{int(signal.SIGXFSZ)} $$; exit 0'],
+                                        cwd=self.repo, env=self.environment(), capture_output=True,
+                                        preexec_fn=lambda: file_size_limits(action=action), timeout=30)
+                self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
+                self.assert_no_runtime_files()
 
     def test_help_and_version(self):
         for arg in ("--help", "-h", "--version"):
@@ -429,15 +399,6 @@ class CliTests(RepositoryTest):
                 self.assertEqual(list(self.system_tmp.iterdir()), [])
                 self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
-        revision = "--internal-service-memory"
-        git(self.repo, "update-ref", "refs/tags/" + revision, "HEAD")
-        self.assertEqual(git(self.repo, "rev-parse", "--verify", "--end-of-options", revision),
-                         git(self.repo, "rev-parse", "HEAD"))
-        result, _ = self.invoke_argv([revision, "--backend=copy", "--write-policy=all", "--", *command])
-        self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
-        self.assertTrue(sentinel.exists())
-        self.assert_no_runtime_files()
-
     def test_empty_revision_is_rejected_by_git_before_command_execution(self):
         sentinel = self.root / "executed"
         result, run = self.invoke_argv([
@@ -451,15 +412,14 @@ class CliTests(RepositoryTest):
         self.assertFalse(sentinel.exists())
         self.assert_no_runtime_files()
 
-    def test_option_looking_local_repository_is_read_as_a_path(self):
+    def test_option_looking_repository_path_is_literal(self):
         (self.repo / "--source").symlink_to(self.repo, target_is_directory=True)
-        expected = git(self.repo, "-C", "--source", "show", "HEAD:tracked.txt")
         result, run = self.invoke_argv([
-            "--source", "HEAD", "--backend=copy", "--write-policy=all", "--",
-            sys.executable, "-c", "from pathlib import Path; print(Path('tracked.txt').read_text(), end='')",
+            "--source", "HEAD", "--backend=copy", "--write-policy=all",
+            "--", sys.executable, "-c", "print(open('tracked.txt').read().strip())",
         ])
-        self.assert_success(result)
-        self.assertEqual(result.stdout.decode().strip(), expected)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"committed\n")
         self.assertIsNone(run)
         self.assert_no_runtime_files()
 
@@ -515,17 +475,6 @@ class CliTests(RepositoryTest):
                 self.assertEqual(sentinel.read_text(), "preserve")
                 self.assertEqual(list(unrelated.iterdir()), [sentinel])
                 self.assertTrue(alias.is_symlink())
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        for name, mode in [("g12345", 0o700), ("g54321", 0o1700)]:
-            with self.subTest(mode=oct(mode)):
-                lookalike = group / name
-                lookalike.mkdir(mode=0o700)
-                lookalike.chmod(mode)
-                (lookalike / ".lock").touch()
-                (lookalike / "sentinel").write_text("preserve")
-                self.assertNotEqual(self.cleanup_run(lookalike).returncode, 0)
-                self.assertEqual((lookalike / "sentinel").read_text(), "preserve")
 
     def test_cleanup_rejects_malformed_state_without_deleting_contents(self):
         run = self.system_tmp / "git-on-unrecognized"
@@ -539,451 +488,36 @@ class CliTests(RepositoryTest):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_text(), "preserve")
 
-    def test_cleanup_recovers_an_interrupted_lock_publication(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        run.mkdir(mode=0o700)
-        marker = run / ".git-on-lock-new"
-        marker.touch(mode=0o600)
-        with marker.open("r+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            blocked = self.cleanup_run(run)
-            self.assertNotEqual(blocked.returncode, 0)
-            self.assertIn(b"active or locked", blocked.stderr)
-        sentinel = run / "valuable"
-        sentinel.write_bytes(b"keep")
-        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
-        self.assertEqual(sentinel.read_bytes(), b"keep")
-        self.assertTrue(marker.is_file())
-        sentinel.unlink()
-        recovered = self.cleanup_run(run)
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        self.assertFalse(run.exists())
-        self.assertFalse(group.exists())
-
-    @unittest.skipUnless(sys.platform == "darwin", "uses Darwin's immutable directory flag")
-    def test_cleanup_can_retry_after_the_parent_refuses_directory_removal(self):
-        for name in (".git-on-lock-new", ".git-on-lock-v2"):
-            with self.subTest(marker=name), tempfile.TemporaryDirectory(dir=self.system_tmp) as sub:
-                group = Path(sub) / "git-on"
-                group.mkdir(mode=0o700)
-                run = group / "g12345"
-                run.mkdir(mode=0o700)
-                marker = run / name
-                marker.touch(mode=0o600)
-                flags = group.stat().st_flags
-                os.chflags(group, flags | stat.UF_IMMUTABLE)
-                try:
-                    denied = self.cleanup_run(run)
-                    self.assertNotEqual(denied.returncode, 0, denied.stderr)
-                finally:
-                    os.chflags(group, flags)
-                self.assertTrue(marker.is_file())
-                self.assert_success(self.cleanup_run(run))
-                self.assertFalse(run.exists())
-                self.assertFalse(group.exists())
-
-    @unittest.skipUnless(sys.platform == "darwin", "uses Darwin's immutable file flag")
-    def test_cleanup_resumes_with_the_same_parked_marker(self):
-        for orphaned, mode in ((False, 0o700), (True, 0o700), (True, 0o1770)):
-            with self.subTest(orphaned=orphaned, mode=oct(mode)), tempfile.TemporaryDirectory(dir=self.system_tmp) as sub:
-                group = Path(sub) / "git-on"
-                group.mkdir(mode=0o700)
-                group.chmod(mode)
-                run = group / "g12345"
-                run.mkdir(mode=0o700)
-                marker = run / ".git-on-lock-v2"
-                marker.touch(mode=0o600)
-                inode = marker.stat().st_ino
-                child = run / "protected"
-                child.write_bytes(b"still here")
-                flags = child.stat().st_flags
-                os.chflags(child, flags | stat.UF_IMMUTABLE)
-                try:
-                    denied = self.cleanup_run(run)
-                    self.assertNotEqual(denied.returncode, 0, denied.stderr)
-                    self.assertEqual(child.read_bytes(), b"still here")
-                finally:
-                    os.chflags(child, flags)
-                [parked] = [path for path in group.iterdir() if path.is_file()]
-                self.assertEqual(parked.stat().st_ino, inode)
-                if orphaned:
-                    child.unlink()
-                    run.rmdir()
-                self.assert_success(self.cleanup_run(run))
-                self.assertFalse(run.exists())
-                self.assertFalse(parked.exists())
-                self.assertEqual(group.exists(), mode == 0o1770)
-
-    @unittest.skipUnless(sys.platform == "darwin", "uses Darwin's immutable file flag")
-    def test_flat_legacy_cleanup_can_retry_after_a_failed_unlink(self):
-        for blocked in ("payload", ".state", "parent"):
-            with self.subTest(blocked=blocked):
-                run = self.system_tmp / ("legacy-flat-" + blocked.lstrip("."))
-                run.mkdir(mode=0o700)
-                lock = run / ".lock"
-                lock.touch(mode=0o600)
-                inode = lock.stat().st_ino
-                state = run / ".state"
-                record = json.dumps({"format": "git-on-temp-v1", "id": "legacy-fixture"})
-                state.write_text(record)
-                (run / "payload").write_text("keep")
-                if blocked == "parent":
-                    mode = stat.S_IMODE(self.system_tmp.stat().st_mode)
-                    self.system_tmp.chmod(mode & ~0o200)
-                else:
-                    protected = run / blocked
-                    flags = protected.stat().st_flags
-                    os.chflags(protected, flags | stat.UF_IMMUTABLE)
-                try:
-                    failed = self.cleanup_run(run, umask=0o200 if blocked == "parent" else -1)
-                    self.assertNotEqual(failed.returncode, 0, failed.stderr)
-                    if blocked == "parent":
-                        self.assertEqual(lock.stat().st_ino, inode)
-                        self.assertEqual(state.read_text(), record)
-                    else:
-                        [parked] = list(self.system_tmp.glob(".git-on-flat-*"))
-                        self.assertFalse(lock.exists())
-                        self.assertEqual(parked.stat().st_ino, inode)
-                    if blocked == ".state":
-                        self.assertEqual(state.read_text(), record)
-                    if blocked == "payload":
-                        self.assertEqual(protected.read_text(), "keep")
-                finally:
-                    if blocked == "parent":
-                        self.system_tmp.chmod(mode)
-                    else:
-                        os.chflags(protected, flags)
-                self.assert_success(self.cleanup_run(run))
-                self.assertFalse(run.exists())
-                self.assertFalse(list(self.system_tmp.glob(".git-on-flat-*")))
-
-    @unittest.skipUnless(sys.platform == "darwin", "regression at the Darwin path limit")
-    def test_cleanup_accepts_long_run_path_with_private_lock(self):
-        parent = self.system_tmp.resolve()
-        while len(os.fsencode(parent)) < 1000:
-            remaining = 1000 - len(os.fsencode(parent))
-            step = min(81, remaining)
-            if remaining - step == 1:
-                step -= 1
-            parent /= "d" * (step - 1)
-            parent.mkdir()
-        group = parent / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        run.mkdir(mode=0o700)
-        directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            fd = os.open(".git-on-lock-v2", os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                         0o600, dir_fd=directory)
-            os.close(fd)
-        finally:
-            os.close(directory)
-        self.assertEqual(len(os.fsencode(run)), 1014)
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(run.exists())
-
-        group.mkdir(mode=0o700)
-        record = ".git-on-remove-g12345-ready-11111111-1111-1111-1111-111111111111-retry"
-        group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.mkdir(record, mode=0o700, dir_fd=group_fd)
-            record_fd = os.open(record, os.O_RDONLY | os.O_DIRECTORY, dir_fd=group_fd)
-            try:
-                fd = os.open(".nfs0123456789abcdef00000001", os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                             0o600, dir_fd=record_fd)
-                os.close(fd)
-            finally:
-                os.close(record_fd)
-        finally:
-            os.close(group_fd)
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(group.exists())
-
-    def test_cleanup_respects_an_older_starting_run(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        run.mkdir(mode=0o700)
-        marker = run / ".git-on-lock-new"
-        marker.touch(mode=0o600)
-        directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            denied = self.cleanup_run(run)
-            self.assertNotEqual(denied.returncode, 0, denied.stderr)
-            self.assertIn(b"active or locked", denied.stderr)
-            self.assertTrue(marker.exists())
-        finally:
-            os.close(directory)
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(group.exists())
-
-    def test_failed_startup_with_an_unusable_umask_removes_its_record(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        result = subprocess.run(
-            [str(BINARY), "HEAD", "--backend=copy", "--write-policy=all", "--", "/bin/true"],
-            cwd=self.repo, env=self.environment(), capture_output=True, timeout=10, umask=0o100,
-        )
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assert_no_runtime_files()
-
-    def test_cleanup_reports_an_unexpected_retirement_file(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        self.assertNotEqual(self.cleanup_run(run).returncode, 0)
-        self.assertTrue(group.is_dir())
-        retry_record = group / ".git-on-remove-g12345-ready-11111111-1111-1111-1111-111111111111-retry"
-        retry_record.mkdir(mode=0o700)
-        retry_record.chmod(0o2700)
-        placeholder = retry_record / ".nfs0123456789abcdef00000001"
-        placeholder.write_bytes(b"unrecognized contents")
-        placeholder.chmod(0o600)
-        short_name = retry_record / ".nfs1"
-        short_name.touch(mode=0o600)
-        unrelated = group / "unrelated"
-        unrelated.touch()
-        deferred = self.cleanup_run(run)
-        self.assertNotEqual(deferred.returncode, 0)
-        self.assertIn(b"Manual recovery is required", deferred.stderr)
-        self.assertIn(os.fsencode(retry_record.resolve()), deferred.stderr)
-        self.assertEqual(placeholder.read_bytes(), b"unrecognized contents")
-        self.assertTrue(short_name.is_file())
-        self.assertTrue(retry_record.is_dir())
-        self.assertTrue(unrelated.is_file())
-        placeholder.unlink()
-        short_name.unlink()
-        unrelated.unlink()
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(group.exists())
-
-    def test_cleanup_reclaims_an_empty_placeholder_after_a_client_crash(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        placeholders = (".nfs0123456789abcdef00000001", ".nfs.20051026.0001")
-        for last, placeholder in enumerate(placeholders, start=1):
-            name = f".git-on-remove-g12345-ready-11111111-1111-1111-1111-11111111111{last}-retry"
-            retry_record = group / name
-            retry_record.mkdir(mode=0o700)
-            (retry_record / placeholder).touch(mode=0o600)
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(group.exists())
-
-    def test_legacy_cleanup_can_retry_after_masked_retirement_directory(self):
-        self.require_linux_nfs_backing()
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "g12345"
-        marker = group / ".git-on-remove-g12345-ready-11111111-1111-1111-1111-111111111111"
-        marker.touch(mode=0o600)
-        failed = self.cleanup_run(run, umask=0o100)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertEqual(list(group.iterdir()), [marker])
-        self.assert_success(self.cleanup_run(run))
-        self.assertFalse(group.exists())
-
-    def test_concurrent_cleanup_removes_only_the_orphaned_record(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        run = group / "r12345"
-        run_record(run).mkdir(mode=0o700)
-        other = run_record(group / "r12346")
-        other.mkdir(mode=0o700)
-        results = self.race_cleanup(run, count=2)
-        # Concurrent rmdir calls can all succeed on the same empty directory.
-        self.assertTrue(any(cleaner.returncode == 0 for cleaner, _ in results), results)
-        self.assertEqual(list(group.iterdir()), [other])
-
-    def test_copy_status_when_nfs_defers_removing_run_contents(self):
-        self.require_linux_nfs_deferred_unlink()
-        for closed_stderr, symlink in ((False, False), (True, False), (False, True)):
-            with self.subTest(closed_stderr=closed_stderr, symlink=symlink):
-                if symlink:
-                    self.require_linux_nfs_deferred_unlink(symlink=True)
-                self.check_copy_status_with_held_nfs_file(closed_stderr, symlink)
-
-    def check_copy_status_with_held_nfs_file(self, closed_stderr, symlink):
-        gate = self.root / f"finish-{closed_stderr}-{symlink}"
-        command = """
-import os, sys, time
-print(os.getcwd(), flush=True)
-deadline = time.monotonic() + 10
-while not os.path.exists(sys.argv[1]):
-    if time.monotonic() >= deadline:
-        raise TimeoutError('parent did not release the command')
-    time.sleep(0.01)
-raise SystemExit(23)
-"""
-        runner = subprocess.Popen(
-            [str(BINARY), "HEAD", "--backend=copy", "--write-policy=all", "--",
-             sys.executable, "-c", command, str(gate)],
-            cwd=self.repo, env=self.environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        try:
-            self.assertTrue(select.select([runner.stdout], [], [], 10)[0], "copy did not start")
-            line = runner.stdout.readline().strip()
-            self.assertTrue(line, "copy exited before it could report its working directory")
-            run = Path(os.fsdecode(line)).parent
-            self.assertEqual(run.parent, self.system_tmp / "git-on")
-            [lock] = list(run_record(run).glob(".git-on-lock-v2-*"))
-            can_recover = not lock.name.startswith(".git-on-lock-v2-u")
-            if OPTIONS.require_nfs_tmpdir or linux_file_handle_available(run):
-                self.assertTrue(can_recover, "the writable marker must record the available identity")
-            inode = lock.stat().st_ino
-            directory = run
-            if closed_stderr:
-                directory = run / "nested"
-                directory.mkdir()
-            with self.hold_cleanup_entry(directory / "open-runtime-file", symlink):
-                saved_mode = stat.S_IMODE(self.system_tmp.stat().st_mode)
-                self.system_tmp.chmod(0o500)
-                try:
-                    if closed_stderr:
-                        runner.stderr.close()
-                        runner.stderr = None
-                    gate.touch()
-                    _, stderr = runner.communicate(timeout=10)
-                finally:
-                    self.system_tmp.chmod(saved_mode)
-                self.assertEqual(runner.returncode, 23, stderr)
-                if not closed_stderr:
-                    self.assertIn(b"cleanup is pending", stderr)
-                self.assertTrue(any(path.is_symlink() == symlink for path in directory.glob(".nfs*")))
-                self.assertEqual(lock.stat().st_ino, inode)
-                retry = self.cleanup_run(run)
-                self.assertNotEqual(retry.returncode, 0, retry)
-                if can_recover:
-                    self.assertIn(b"cleanup is pending", retry.stderr)
-                else:
-                    if not closed_stderr:
-                        self.assertIn(b"Manual recovery is required", stderr)
-                    self.assertRegex(
-                        retry.stderr, rb"persistent run directory identity|does not match its ownership record"
-                    )
-                    self.assertTrue(run.is_dir())
-                    self.assertEqual(lock.stat().st_ino, inode)
-            deadline = time.monotonic() + 3
-            if not can_recover:
-                # The fixture owns the directory and can remove it after the
-                # NFS client releases the held file.
-                while any(directory.glob(".nfs*")) and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertEqual(list(directory.glob(".nfs*")), [])
-                return
-            while True:
-                retry = self.cleanup_run(run)
-                if retry.returncode == 0 or time.monotonic() >= deadline:
-                    break
-                time.sleep(0.02)
-            self.assert_success(retry)
-            self.assert_no_runtime_files()
-        finally:
-            gate.touch()
-            if runner.poll() is None:
-                runner.kill()
-                runner.communicate(timeout=10)
-
-@unittest.skipUnless(sys.platform == "linux", "Linux mount namespaces")
-class MountNamespaceTests(RepositoryTest):
-    def test_cleanup_preserves_record_with_a_mounted_subdirectory(self):
-        from filesystem_quota import private_mount_namespace
-
-        prefix, uid, gid = private_mount_namespace(self)
-        driver = r"""
-import os, select, subprocess, sys
-from pathlib import Path
-
-binary, temporary, uid, gid = sys.argv[1:]
-uid, gid = int(uid), int(gid)
-os.environ.update(TMPDIR=temporary, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-command = [binary]
-if uid:
-    command = ["setpriv", "--reuid", str(uid), "--regid", str(gid), "--clear-groups", binary]
-group = Path(temporary) / "git-on"
-for run_present in (False, True):
-    if run_present:
-        child = "import os, sys; print(os.getcwd(), flush=True); sys.stdin.buffer.read(1)"
-        with subprocess.Popen([*command, "HEAD", "--backend=copy", "--write-policy=all", "--",
-                               sys.executable, "-c", child], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as runner:
-            try:
-                assert select.select([runner.stdout], [], [], 10)[0], "copy did not start"
-                cwd = runner.stdout.readline().strip()
-                assert cwd, runner.stderr.read().decode(errors="replace")
-                run = Path(os.fsdecode(cwd)).parent
-                assert run.parent == group, run
-                runner.kill()
-            finally:
-                try:
-                    runner.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    runner.kill()
-                    runner.communicate(timeout=5)
-                    raise
-        record = group / f".git-on-run-{uid:x}-{run.name}"
-        [marker] = record.glob(".git-on-lock-v2-*")
-        if marker.name.startswith(".git-on-lock-v2-u"):
-            # Recovery on this filesystem stops at the identity check.
-            # The orphan case above exercises the mount guard independently.
-            result = subprocess.run([*command, "--cleanup", run], capture_output=True, timeout=10)
-            assert result.returncode and b"persistent run directory identity" in result.stderr, result
-            assert marker.is_file() and run.is_dir(), result
-            continue
-    else:
-        group.mkdir(mode=0o700)
-        run = group / "r12345"
-        record = group / f".git-on-run-{uid:x}-{run.name}"
-        record.mkdir(mode=0o700)
-        marker = record / ".git-on-lock-v2"
-        marker.touch(mode=0o600)
-        if uid:
-            for path in (group, record, marker):
-                os.chown(path, uid, gid)
-    volume = record / "volume"
-    volume.mkdir()
-    subprocess.run(["mount", "--bind", volume, volume], check=True)
-    try:
-        result = subprocess.run([*command, "--cleanup", run], capture_output=True, timeout=10)
-        assert marker.is_file() and run.exists() == run_present, (run_present, result.stderr)
-        assert result.returncode and b"a mount remains below" in result.stderr, result
-    finally:
-        subprocess.run(["umount", volume], check=True)
-        volume.rmdir()
-    subprocess.run([*command, "--cleanup", run], check=True, timeout=10)
-"""
-        environment = self.environment()
-        # The namespace helper can invoke sudo, which drops TMPDIR.
-        environment.pop("TMPDIR")
-        result = subprocess.run(
-            [*prefix, sys.executable, "-c", driver, str(BINARY), str(self.system_tmp),
-             str(uid), str(gid)], cwd=self.repo, env=environment,
-            capture_output=True, timeout=45,
-        )
-        self.assert_success(result)
-
 
 @unittest.skipUnless(MOUNT_AVAILABLE, "real FUSE or NFS mount required")
 class MountTests(MountedRepositoryTest):
-    def serve_repository(self):
-        from remote import Fixture
+    def test_readonly_run_setup_needs_no_regular_file_payload(self):
+        try:
+            result = subprocess.run(
+                [str(BINARY), 'HEAD', *MOUNT_ARGS, '--write-policy=none', '--', 'true'],
+                cwd=self.repo, env=self.environment(), capture_output=True,
+                preexec_fn=lambda: file_size_limits(0), timeout=30,
+            )
+            self.assert_success(result)
+            self.assert_no_runtime_files()
+        finally:
+            for run in run_directories(self.system_tmp):
+                self.cleanup_run(run)
 
-        server = Fixture(self.repo / '.git')
-        self.addCleanup(server.close)
-        return server.https(), server.env['GIT_SSL_CAINFO']
-
-    def lazy_remote_stat_fixture(self):
+    def lazy_native_stat_fixture(self):
         size=7*1024*1024
         (self.repo/'large').write_bytes(b'x'*size)
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','lazy remote decode disk budget')
-        return self.serve_repository()
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','lazy native decode disk budget')
+        git(self.repo,'config','uploadpack.allowFilter','true')
+        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
+        # An explicit fsck policy retains native fetch/cat-file rather than the
+        # reusable protocol session. The oracle inherits the same Git setting.
+        config=dict(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='fetch.fsckObjects',GIT_CONFIG_VALUE_0='false')
+        return self.repo.as_uri(),['stat','-c','%s','large'],config,size
 
     @fuse_only
-    def test_lazy_remote_stat_keeps_decoded_payload_in_memory(self):
-        source, ca = self.lazy_remote_stat_fixture()
+    def test_lazy_native_stat_writes_one_decoded_payload(self):
+        source,_,config,_=self.lazy_native_stat_fixture()
         def write_bytes():
             return int(dict(line.split(': ',1) for line in Path('/proc/self/io').read_text().splitlines())['write_bytes'])
         before=write_bytes()
@@ -1003,12 +537,12 @@ before=written()
 size=Path('large').stat().st_size
 assert size==7*1024*1024,size
 count=written()-before
-assert count<1024*1024,('stat wrote decoded payloads',count,size)
+assert count<size+1024*1024,('stat wrote duplicate decoded payloads',count,size)
 print(size)
 ''']
-        env=dict(self.environment(), GIT_CONFIG_COUNT='0', GIT_SSL_CAINFO=ca)
+        env=dict(self.environment(),**config)
         clone=self.root/'clone'
-        result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
+        result=subprocess.run(['git','clone','--no-local','--quiet',source,str(clone)],
                               env=env,capture_output=True,timeout=20)
         self.assert_success(result)
         direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
@@ -1019,27 +553,18 @@ print(size)
         self.assert_no_runtime_files()
 
     @fuse_only
-    def test_lazy_remote_stat_succeeds_on_nine_mib_tmpfs(self):
+    def test_lazy_native_stat_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
-        source, ca = self.lazy_remote_stat_fixture()
-        command = ['stat', '-c', '%s', 'large']
+        source,command,_,_=self.lazy_native_stat_fixture()
         compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],command,
-                         source=source,write_policy='none',tls_ca=ca)
+                         source=source,write_policy='none',git_config={'fetch.fsckObjects':'false'})
         self.assert_no_runtime_files()
 
     source_mutations=('read','write','truncate','read-write','read-truncate','read-rewrite','read-truncate-extend','read-replace')
 
-    def add_spill_blobs(self, directory):
-        spill=directory/'spill'
-        spill.mkdir()
-        # Load one more than the hot-cache size so the spill has completed.
-        for index in range(9):
-            (spill/str(index)).write_bytes(bytes([index])*(64*1024+1))
-
-    def writable_open_fixture(self,mutation='read',source='local',spill=False):
+    def writable_open_fixture(self,mutation='read',source='local'):
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
-        if spill:self.add_spill_blobs(self.repo)
-        git(self.repo,'add','.');git(self.repo,'commit','-qm','writable open disk budget')
+        git(self.repo,'add','large');git(self.repo,'commit','-qm','writable open disk budget')
         from filesystem_quota import STORAGE_OBSERVATION
         return [sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
 import sys
@@ -1059,11 +584,6 @@ expected=b'x'*(6*1024*1024)
 if mutation!='read':
  fd=os.open(source,os.O_RDWR)
  if mutation.startswith('read-'):assert os.pread(fd,1,0)==b'x'
- if Path('spill').is_dir():
-  for index in range(9):
-   with open(Path('spill')/str(index),'rb') as other:assert other.read(1)==bytes([index])
-  if root!=Path.cwd():
-   assert any(raw.stat().st_size==len(expected) for raw in root.glob('raw-objects-*/*'))
  if mutation in ('write','read-write'):os.pwrite(fd,b'y',0);expected=b'y'+expected[1:]
  elif mutation=='read-rewrite':
   expected=b'y'*len(expected);assert os.pwrite(fd,expected,0)==len(expected)
@@ -1075,8 +595,7 @@ if mutation!='read':
  else:os.ftruncate(fd,1024);expected=expected[:1024]
  if fd is not None:os.close(fd)
 assert source.read_bytes()==expected
-budget=14 if Path('spill').is_dir() else 9
-assert allocated()<budget*1024*1024,('content mutation disk allocation',allocated())
+assert allocated()<9*1024*1024,('content mutation disk allocation',allocated())
 print('writable lifecycle verified')
 ''',source,mutation]
 
@@ -1096,40 +615,22 @@ print('writable lifecycle verified')
                 self.assert_no_runtime_files()
 
     @fuse_only
-    def test_spilled_copy_up_fits_two_checkouts(self):
+    def test_writable_open_succeeds_on_nine_mib_tmpfs(self):
         from filesystem_quota import compare_on_tmpfs
-        command=self.writable_open_fixture(spill=True)
-        compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],'read-write'],
-                         size_mib=14,checkout_copies=2)
+        command=self.writable_open_fixture()
+        # The allocation matrix covers every lifecycle; actual quota adds
+        # capacity failures for partial preservation and complete replacement.
+        for mutation in ('read-write','read-rewrite'):
+            with self.subTest(mutation=mutation):
+                compare_on_tmpfs(self,self.root,BINARY,self.repo,os.environ['PATH'],[*command[:-1],mutation])
         self.assert_no_runtime_files()
 
-    def test_remote_mutations_fit_checkout_disk_budget(self):
-        template=self.writable_open_fixture(source='remote')
-        source, ca = self.serve_repository()
-        config = {'GIT_CONFIG_COUNT': '0', 'GIT_SSL_CAINFO': ca}
-        env = dict(self.environment(), **config)
-        for mutation in ('read-write','read-rewrite','read-truncate-extend','read-replace'):
-            with self.subTest(mutation=mutation):
-                clone=self.root/f'clone-{mutation}'
-                command=[*template[:-1],mutation]
-                result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
-                                      env=env,capture_output=True,timeout=20)
-                self.assert_success(result)
-                direct=subprocess.run(command,cwd=clone,env=env,capture_output=True,timeout=20)
-                self.assert_success(direct)
-                result,_=self.invoke_argv([source,'HEAD','--write-policy=all','--',*command],extra_env=config)
-                self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
-                self.assert_no_runtime_files()
-
-    @fuse_only
-    def test_remote_rewrite_and_replacement_succeed_on_nine_mib_tmpfs(self):
-        from filesystem_quota import compare_on_tmpfs
-        template=self.writable_open_fixture(source='remote')
-        source, ca = self.serve_repository()
-        for mutation in ('read-rewrite', 'read-replace'):
-            with self.subTest(mutation=mutation):
-                compare_on_tmpfs(self, self.root, BINARY, self.repo, os.environ['PATH'],
-                                 [*template[:-1], mutation], source=source, tls_ca=ca)
+    def test_writable_lifecycle_through_explicit_file_url(self):
+        template = self.writable_open_fixture()
+        command = [*template[:-1], 'read-rewrite']
+        result, _ = self.invoke_argv([self.repo.as_uri(), 'HEAD', '--write-policy=all', '--', *command])
+        self.assert_success(result)
+        self.assertEqual(result.stdout, b'writable lifecycle verified\n')
         self.assert_no_runtime_files()
 
     def shared_source_fixture(self):
@@ -1166,108 +667,34 @@ print('independent aliases and unlinked reader verified')
 
     def test_unopened_aliases_and_unlinked_readers_share_only_needed_sources(self):
         command=self.shared_source_fixture()
-        git(self.repo,'config','uploadpack.allowFilter','true')
-        git(self.repo,'config','uploadpack.allowAnySHA1InWant','true')
         clone=self.root/'clone'
         result=subprocess.run(['git','clone','--no-local','--quiet',str(self.repo),str(clone)],
                               env=self.environment(),capture_output=True,timeout=20)
         self.assert_success(result)
         direct=subprocess.run(command,cwd=clone,env=self.environment(),capture_output=True,timeout=20)
         self.assert_success(direct)
-        for source in (None,self.repo.as_uri()):
-            with self.subTest(source=source):
-                operands=[source,'HEAD'] if source else ['HEAD']
-                result,_=self.invoke_argv([*operands,'--write-policy=all','--',*command])
-                self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
-                self.assert_no_runtime_files()
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
+        self.assert_success(result);self.assertEqual(result.stdout,direct.stdout)
+        self.assert_no_runtime_files()
 
-    def unlink_fault(self, variable='GIT_ON_TEST_UNLINK_FAULT'):
+    def transfer_fault(self):
         compiler=shutil.which('cc')
         self.assertIsNotNone(compiler,'C compiler is required for filesystem fault injection')
         library=self.root/'transfer-fault.so'
         if not library.is_file():
             subprocess.run([compiler,'-shared','-fPIC','-o',str(library),
                             str(ROOT/'tests/support/transfer_fault.c'),'-ldl'],check=True,capture_output=True)
-        return {'LD_PRELOAD':str(library),variable:'1'}
-
-    @fuse_only
-    def test_failed_copy_up_can_retry_after_cleanup_error(self):
-        (self.repo/'large').write_bytes(b'x'*(128*1024))
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','copy-up rollback')
-        env=self.unlink_fault('GIT_ON_TEST_COPY_ROLLBACK_FAULT')
-        command=[sys.executable,'-I','-S','-c',r'''
-import errno,os,resource
-fd=os.open('large',os.O_RDWR)
-assert os.pread(fd,2,0)==b'xx'
-runner=os.getppid()
-limits=resource.prlimit(runner,resource.RLIMIT_FSIZE)
-try:
- resource.prlimit(runner,resource.RLIMIT_FSIZE,(3,limits[1]))
- try:os.pwrite(fd,b'y',0)
- except OSError as error:assert error.errno==errno.EFBIG,error
- else:raise AssertionError('copy-up unexpectedly succeeded')
-finally:
- resource.prlimit(runner,resource.RLIMIT_FSIZE,limits)
-assert os.pread(fd,2,0)==b'xx'
-assert os.pwrite(fd,b'z',0)==1
-assert os.pread(fd,2,0)==b'zx'
-os.close(fd)
-''']
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env,
-                                  preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
-        self.assert_success(result)
-        self.assert_no_runtime_files()
-
-    def test_copy_up_and_reads_of_the_immutable_source(self):
-        data=b'x'*(3*65536+17)
-        for name in ('large','original'):
-            (self.repo/name).write_bytes(data)
-        self.add_spill_blobs(self.repo)
-        git(self.repo,'add','.');git(self.repo,'commit','-qm','copy-up integrity')
-        oid=git(self.repo,'rev-parse','HEAD:large')
-        url, ca = self.serve_repository()
-        command=[sys.executable,'-I','-S','-c',r'''
-import errno,os,sys
-from pathlib import Path
-fd=os.open('large',os.O_RDWR)
-assert os.pread(fd,1,0)==b'x'
-root=Path.cwd().parent
-raw=next(root.glob('raw-objects-*'))/sys.argv[1]
-assert not raw.exists()
-for index in range(9):
- with open(Path('spill')/str(index),'rb') as other:assert other.read(1)==bytes([index])
-with raw.open('r+b',buffering=0) as original:
- assert os.pwrite(original.fileno(),b'!',2*65536+7)==1
-assert os.pwrite(fd,b'y',0)==1
-os.fsync(fd)
-assert os.pread(fd,2,0)==b'yx'
-assert os.pread(fd,1,2*65536+7)==b'!'
-with raw.open('rb') as original:
- assert original.read(2)==b'xx'
-os.close(fd)
-fd=os.open('original',os.O_RDONLY)
-try:
- os.pread(fd,1,2*65536+7)
-except OSError as error:assert error.errno==errno.EIO,error
-else:raise AssertionError('immutable read accepted a changed block')
-os.close(fd)
-print('private write and immutable read verified')
-''',oid]
-        for source in ([], [url]):
-            with self.subTest(source=source):
-                result,_=self.invoke_argv([*source, 'HEAD', '--write-policy=all', '--', *command],
-                                          extra_env={'GIT_CONFIG_COUNT': '0', 'GIT_SSL_CAINFO': ca})
-                self.assertEqual(result.returncode,125 if source else 0,result.stderr)
-                self.assertEqual(result.stdout,b'private write and immutable read verified\n')
-                self.assert_no_runtime_files()
+        return {'LD_PRELOAD':str(library)}
 
     @fuse_only
     def test_unlinked_source_survives_backing_unlink_failure_without_redecode(self):
-        # Fail before installing the private backing. The verified cache still
-        # serves the open inode and allows a retry after removing the Git object.
-        env=self.unlink_fault()
+        # Fail to remove the temporary link before the first mutation. The
+        # raw inode must remain available even if the Git object is gone.
+        env=self.transfer_fault()
         (self.repo/'large').write_bytes(b'x'*(6*1024*1024))
-        git(self.repo,'add','large');git(self.repo,'commit','-qm','source transfer failure')
+        for index in range(8):
+            (self.repo/f'hot-{index}').write_bytes(bytes([index])*(2*65536))
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','source transfer failure')
         oid=git(self.repo,'rev-parse','HEAD:large')
         loose=self.repo/'.git/objects'/oid[:2]/oid[2:]
         from filesystem_quota import STORAGE_OBSERVATION
@@ -1276,6 +703,9 @@ import errno,sys
 from pathlib import Path
 fd=os.open('large',os.O_RDWR)
 assert os.pread(fd,1,0)==b'x'
+for index in range(8):
+    with open(f'hot-{index}', 'rb', buffering=0) as source:
+        assert source.read(1)==bytes([index])
 Path('large').unlink()
 try:os.pwrite(fd,b'y',0)
 except OSError as error:assert error.errno==errno.EACCES,error
@@ -1291,6 +721,55 @@ print('source retained after backing unlink failure')
 ''',str(loose)]
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
         self.assert_success(result);self.assert_no_runtime_files()
+
+    @fuse_only
+    def test_spilled_source_recovers_after_write_and_copy_up_rollback_fail(self):
+        (self.repo / 'large').write_bytes(b'x' * (1024 * 1024 + 1))
+        for index in range(8):
+            (self.repo / f'hot-{index}').write_bytes(bytes([index]) * (65536 + 1))
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-qm', 'copy-up rollback')
+        code = r'''
+import errno
+import os
+import sys
+from pathlib import Path
+retry = sys.argv[1]
+with open('large', 'r+b', buffering=0) as source:
+    assert source.read(1) == b'x'
+    for index in range(8):
+        assert Path(f'hot-{index}').read_bytes()[0] == index
+    try:
+        if retry == 'failed-truncate':
+            os.ftruncate(source.fileno(), 0)
+        else:
+            os.pwrite(source.fileno(), b'y', 1024 * 1024)
+    except OSError as error:
+        assert error.errno == errno.EIO, error
+    else:
+        raise AssertionError('first change was not faulted')
+    if retry != 'reopen':
+        assert os.fstat(source.fileno()).st_size == 1024 * 1024 + 1
+        os.ftruncate(source.fileno(), 0)
+        assert os.fstat(source.fileno()).st_size == 0
+        assert os.pread(source.fileno(), 1, 0) == b''
+if retry == 'reopen':
+    with open('large', 'r+b', buffering=0) as reopened:
+        fd = reopened.fileno()
+        assert os.pread(fd, 1, 1024 * 1024) == b'x', 'cold read lost the original spill'
+        assert os.pwrite(fd, b'z', 1024 * 1024) == 1
+        assert os.pread(fd, 1, 1024 * 1024) == b'z'
+'''
+        faults = self.transfer_fault()
+        for retry in ('reopen', 'truncate', 'failed-truncate'):
+            with self.subTest(retry=retry):
+                fault = 'truncate' if retry == 'failed-truncate' else 'write'
+                result, _ = self.invoke_argv(
+                    ['HEAD', '--write-policy=all', '--', sys.executable, '-I', '-S', '-c', code, retry],
+                    extra_env=dict(faults, GIT_ON_TEST_COPY_UP_ROLLBACK=fault),
+                )
+                self.assert_success(result)
+                self.assert_no_runtime_files()
 
     @fuse_only
     def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
@@ -1493,14 +972,13 @@ assert p.read_bytes()==b'new'
         self.assertIsNone(run)
         self.assert_no_runtime_files()
 
-    def test_two_operands_open_local_repository_without_creating_refs(self):
-        branch = git(self.repo, "symbolic-ref", "--short", "HEAD")
+    def test_two_operands_mount_the_exact_local_revision(self):
         before = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)")
         alias_name = b"repository space" if sys.platform == "darwin" else b"repository-\xff"
         raw_alias = self.root / os.fsdecode(alias_name)
         raw_alias.symlink_to(self.repo, target_is_directory=True)
         for source in (str(self.repo), ".", str(raw_alias)):
-            revision = branch
+            revision = "HEAD"
             with self.subTest(source=source, revision=revision):
                 result, run = self.invoke_argv([
                     source, revision, "--", sys.executable, "-c",
@@ -1916,7 +1394,7 @@ assert not Path('out/final-hard').exists()
             _,stderr=runner.communicate(timeout=3)
             self.assertEqual(runner.returncode,-signal.SIGTERM,stderr)
             self.assertFalse(Path(f'/proc/{helper}').exists(),'owned helper was not reaped')
-            run=next((self.system_tmp / "git-on").glob("??????"))
+            run=next(iter(run_directories(self.system_tmp)))
             self.assertIn(os.fsencode(run),stderr,'cleanup diagnostic must identify retained state')
             self.assert_success(self.cleanup_run(run))
             self.assert_no_runtime_files()
@@ -1928,59 +1406,57 @@ assert not Path('out/final-hard').exists()
             try: runner.communicate(timeout=5)
             except subprocess.TimeoutExpired:
                 runner.kill(); runner.communicate(timeout=5)
-            for run in (self.system_tmp / "git-on").glob("??????"):
+            for run in run_directories(self.system_tmp):
                 self.assert_success(self.cleanup_run(run))
 
-    def test_cleanup_after_reading_a_spilled_blob(self):
-        self.require_linux_nfs_deferred_unlink()
-        directory = self.repo / "cache-spill"
-        directory.mkdir()
-        large = directory / "large"
-        large.write_bytes(b"x" * (2 * 1024 * 1024))
-        self.add_spill_blobs(directory)
-        git(self.repo, "add", "cache-spill")
-        git(self.repo, "commit", "--quiet", "-m", "reread a spilled blob")
-        oid = git(self.repo, "hash-object", str(large))
+    def test_raw_file_limit_with_default_signal_cleans_mount(self):
+        for index in range(9):
+            (self.repo / f'large-{index}').write_bytes(bytes([index]) * (256 * 1024))
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '--quiet', '-m', 'raw file limit')
         code = """
-import os, sys
-from pathlib import Path
-with open('cache-spill/large', 'rb', buffering=0) as large:
-    assert large.read(1) == b'x'
+import errno, sys
+try:
     for index in range(9):
-        with open('cache-spill/spill/%d' % index, 'rb', buffering=0) as filler:
-            assert filler.read(1) == bytes([index])
-    [raw] = Path.cwd().parent.glob('raw-objects-*')
-    assert (raw / sys.argv[1]).is_file()
-    assert os.pread(large.fileno(), 1, 2 * 1024 * 1024 - 1) == b'x'
-print('reread from spill')
+        with open(f'large-{index}', 'rb', buffering=0) as source:
+            source.read(1)
+except OSError as error:
+    assert error.errno in (errno.EIO, errno.EFBIG), error
+    print('handled raw file limit')
+    sys.exit(23)
+raise AssertionError('eviction did not reach the file limit')
 """
-        result, _ = self.invoke_argv(
-            ["HEAD", "--write-policy=none", "--", sys.executable, "-c", code, oid]
-        )
-        self.assert_success(result)
-        self.assertEqual(result.stdout, b"reread from spill\n")
-        self.assert_no_runtime_files()
+        try:
+            result = subprocess.run([str(BINARY), 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
+                                    cwd=self.repo, env=self.environment(), capture_output=True, timeout=30,
+                                    preexec_fn=lambda: file_size_limits(128 * 1024))
+            self.assertEqual(result.returncode, 23, result.stderr.decode(errors='replace'))
+            self.assertEqual(result.stdout, b'handled raw file limit\n')
+            self.assert_no_runtime_files()
+        finally:
+            for run in run_directories(self.system_tmp):
+                self.cleanup_run(run)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux prlimit")
-    def test_checked_block_read_survives_cache_spill_limits_locally_and_remotely(self):
+    def test_block_read_survives_optional_cache_spill_failure(self):
         directory = self.repo / 'cache-spill'
         directory.mkdir()
         (directory / 'large').write_bytes(b'x' * (2 * 1024 * 1024))
-        self.add_spill_blobs(directory)
-        # 254 complete 64 KiB payloads plus entry charges fill the 16 MiB
-        # resident budget and displace the already-backed large-file block.
+        for index in range(8):
+            (directory / f'hot-{index}').write_bytes(bytes([index]) * (128 * 1024))
+        # Fill the 16 MiB block cache with entries that have no backing files.
         for index in range(254):
             (directory / f'f{index:04d}').write_bytes(index.to_bytes(4, 'little') + b's' * (65536 - 4))
         git(self.repo, 'add', 'cache-spill')
         git(self.repo, 'commit', '--quiet', '-m', 'cache-only spill limit')
-        source, ca = self.serve_repository()
         code = """
-import errno, os, resource
+import os, resource
 with open('cache-spill/large', 'rb', buffering=0) as large:
     assert large.read(1) == b'x'
-    for index in range(9):
-        with open('cache-spill/spill/%d' % index, 'rb', buffering=0) as filler:
-            assert filler.read(1) == bytes([index])
+    # Evict the whole large blob before filling the separate block cache.
+    for index in range(8):
+        with open(f'cache-spill/hot-{index}', 'rb', buffering=0) as hot:
+            assert hot.read(1) == bytes([index])
     for index in range(254):
         with open('cache-spill/f%04d' % index, 'rb', buffering=0) as small:
             assert small.read(4) == index.to_bytes(4, 'little')
@@ -1988,34 +1464,22 @@ with open('cache-spill/large', 'rb', buffering=0) as large:
     original = resource.prlimit(runner, resource.RLIMIT_FSIZE)
     try:
         resource.prlimit(runner, resource.RLIMIT_FSIZE, (3, original[1]))
-        # An untouched far block must be read and authenticated from raw disk.
-        try:
-            data = os.pread(large.fileno(), 1, 2 * 1024 * 1024 - 1)
-        except OSError as error:
-            assert error.errno in (errno.EIO, errno.EFBIG), error
-            print('handled cache-only read error', error.errno)
-        else:
-            assert data == b'x'
-            with open('cache-spill/f0000', 'rb', buffering=0) as resident:
-                assert resident.read(4) == b'\\0' * 4
-            print('checked bytes survived cache-only spill failure')
+        # Reading another block succeeds even when its admission cannot evict a resident blob.
+        assert os.pread(large.fileno(), 1, 2 * 1024 * 1024 - 1) == b'x'
+        with open('cache-spill/f0000', 'rb', buffering=0) as resident:
+            assert resident.read(4) == bytes(4)
     finally:
         resource.prlimit(runner, resource.RLIMIT_FSIZE, original)
 """
-        for operands in ([], [source]):
-            with self.subTest(source=operands):
-                try:
-                    # Turn the write limit into EFBIG to exercise failed optional
-                    # admission independently of the inherited signal policy.
-                    result = subprocess.run([str(BINARY), *operands, 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
-                                            cwd=self.repo, env=dict(self.environment(), GIT_CONFIG_COUNT='0', GIT_SSL_CAINFO=ca), capture_output=True, timeout=60,
-                                            preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
-                    self.assert_success(result)
-                    self.assertEqual(result.stdout, b'checked bytes survived cache-only spill failure\n')
-                    self.assert_no_runtime_files()
-                finally:
-                    for run in (self.system_tmp / "git-on").glob("??????"):
-                        self.cleanup_run(run)
+        try:
+            result = subprocess.run([str(BINARY), 'HEAD', '--write-policy=none', '--', sys.executable, '-c', code],
+                                    cwd=self.repo, env=self.environment(), capture_output=True, timeout=60,
+                                    preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
+            self.assert_success(result)
+            self.assert_no_runtime_files()
+        finally:
+            for run in run_directories(self.system_tmp):
+                self.cleanup_run(run)
 
     @fuse_only
     def test_partial_backing_write_and_sparse_blocks_remain_visible(self):
@@ -2069,8 +1533,10 @@ os.close(fd)
 import os,resource
 from pathlib import Path
 fd=os.open('large',os.O_RDWR)
-# Copy up before lowering the runner's write limit.
+# Prepare/adopt before lowering the runner's write limit.
 assert os.pwrite(fd,b'y',65536)==1
+with Path('large').open('rb',buffering=0) as second:
+ assert os.pread(second.fileno(),2,65535)==b'xy'
 runner=os.getppid()
 original=resource.prlimit(runner,resource.RLIMIT_FSIZE)
 try:
@@ -2085,14 +1551,8 @@ assert os.pwrite(fd,b'abcd',65534)==4
 os.ftruncate(fd,65537);os.ftruncate(fd,65570)
 assert os.pread(fd,40,65532)==b'xxabc'+b'\0'*33
 os.close(fd)
-# Subsequent I/O uses the private file, including bytes carried through copy-up.
-backing=Path.cwd().parent/'backing'/str(Path('large').stat().st_ino)
-with backing.open('r+b',buffering=0) as out:out.seek(10);out.write(b'!')
-with open('large','rb',buffering=0) as reopened:
- assert os.pread(reopened.fileno(),1,10)==b'!'
 ''']
-        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],
-                                  preexec_fn=lambda: signal.signal(signal.SIGXFSZ, signal.SIG_IGN))
+        result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command])
         self.assert_success(result);self.assert_no_runtime_files()
 
     @fuse_only
@@ -2969,12 +2429,10 @@ print(index)
             self.assertTrue(all(path.exists() for path in ready_files), "parallel children did not become ready")
             runs = [Path(path.read_text()) for path in ready_files]
             self.assertEqual(len(set(runs)), 3)
-            self.assertEqual(list(self.system_tmp.iterdir()), [self.system_tmp / "git-on"])
             for run in runs:
                 self.assertEqual(run.parent, self.system_tmp / "git-on")
-                self.assertEqual(run.stat().st_mode & 0o777, 0o700)
-                self.assertFalse((run / ".state").exists())
-                self.assertFalse((run / ".lock").exists())
+                self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
+                self.assertIsNotNone(run_lock(run))
                 self.assertFalse((run / "manifest.json").exists())
                 self.assertFalse((run / "stdout.log").exists())
                 self.assertFalse((run / "stderr.log").exists())
@@ -3365,7 +2823,6 @@ print('redirected-terminal-ok', flush=True)
 import subprocess, sys, time
 from pathlib import Path
 Path(sys.argv[3]).write_text(str(Path.cwd().parent))
-assert list(Path.cwd().parent.glob('t*/socket'))
 Path('out/recoverable').write_text('artifact')
 subprocess.Popen([sys.executable,'-c',sys.argv[1]], start_new_session=True,
                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3376,15 +2833,12 @@ assert p.exists()
 """
         run = None
         try:
-            with controlling_terminal() as attach:
-                result, run = self.invoke_argv([
-                    "HEAD", "--", sys.executable, "-c", code, descendant, str(pidfile), str(runfile),
-                ], timeout=20, preexec_fn=attach)
+            result, run = self.invoke(sys.executable, "-c", code, descendant,
+                                     str(pidfile), str(runfile), timeout=20)
             self.assertEqual(result.returncode, 125, result.stderr)
             self.assertIsNotNone(run)
             self.assertEqual(run, Path(runfile.read_text()))
             self.assertIn(os.fsencode(run), result.stderr)
-            self.assertNotIn(b"pin preserved", result.stderr)
             # A disconnected FUSE mount returns ENOTCONN to stat(), so
             # os.path.ismount misleadingly reports false. Inspect mountinfo.
             if sys.platform == "darwin":
@@ -3394,9 +2848,7 @@ assert p.exists()
                 mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
-            self.assertFalse((run / ".state").exists())
-            self.assertFalse(list(run.glob("t*")))
-            self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
+            self.assertIsNotNone(run_lock(run))
             cleanup = self.cleanup_run(run)
             if sys.platform == "darwin":
                 self.assert_success(cleanup)  # The checked recovery detaches a dead server.
@@ -3488,7 +2940,7 @@ time.sleep(300)
         process, run, _ = self.start_sleeping_run()
         active_cleanup = self.cleanup_run(run)
         self.assertNotEqual(active_cleanup.returncode, 0)
-        self.assertFalse((run / ".lock").exists())
+        self.assertIsNotNone(run_lock(run))
         self.assertTrue((run / "backing").is_dir())
         process.send_signal(signal.SIGTERM)
         _, stderr = process.communicate(timeout=15)
@@ -3496,56 +2948,14 @@ time.sleep(300)
         self.assert_no_runtime_files()
 
     def test_sigkill_recovery_explicitly_removes_stale_tempdir(self):
-        self.recover_stale_run()
-
-    @unittest.skipUnless(sys.platform == "darwin", "requires an NFS mount")
-    def test_sigkill_recovery_after_nfs_socket_directory_disappears(self):
-        self.recover_stale_run(remove_socket=True)
-
-    def recover_stale_run(self, remove_socket=False):
-        socket_dir = None
-        if sys.platform == "darwin":
-            group = self.system_tmp / "Git-On"
-            group.mkdir(mode=0o700)
-            if not (self.system_tmp / "git-on").exists():
-                group.rmdir()  # The volume is case-sensitive.
         process, run, child_pid = self.start_sleeping_run()
-        if sys.platform == "darwin":
-            mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
-            source, = [line.partition(" on ")[0] for line in mounts
-                       if line.partition(" on ")[2].rpartition(" (")[0] == str(run / "mount")]
-            self.assertTrue(source.startswith("<") and source.endswith(">:/"), source)
-            socket_dir = Path(source[1:-3]).parent
-            self.assertTrue(socket_dir.is_dir(), socket_dir)
         process.kill()
         try: os.killpg(child_pid, signal.SIGKILL)
         except ProcessLookupError: pass
         process.communicate(timeout=10)
-        self.assertFalse((run / ".state").exists())
+        self.assertIsNotNone(run_lock(run))
         self.assertTrue((run / "backing").is_dir())
-        if remove_socket:
-            def restore_endpoint_for_cleanup():
-                if run.exists() and socket_dir.parent.is_dir():
-                    socket_dir.mkdir(mode=0o700, exist_ok=True)
-            self.addCleanup(restore_endpoint_for_cleanup)
-            (socket_dir / "s").unlink(missing_ok=True)
-            socket_dir.rmdir()
-            mounts = subprocess.check_output(["/sbin/mount"], text=True).splitlines()
-            self.assertTrue(any(line.startswith(source + " on " + str(run / "mount") + " (")
-                                for line in mounts))
-        if sys.platform == "linux":
-            moved = self.system_tmp.with_name(self.system_tmp.name + "-moved")
-            self.system_tmp.rename(moved)
-            try:
-                recovered = moved / run.relative_to(self.system_tmp)
-                self.assert_success(self.cleanup_run(recovered))
-                self.assertFalse(recovered.exists())
-            finally:
-                moved.rename(self.system_tmp)
-        else:
-            self.assert_success(self.cleanup_run(run))
-        if socket_dir is not None:
-            self.assertFalse(socket_dir.exists(), socket_dir)
+        self.assert_success(self.cleanup_run(run))
         self.assertFalse(run.exists())
         self.assert_no_runtime_files()
 
@@ -3581,7 +2991,7 @@ time.sleep(300)
             cleaner.communicate(timeout=5)
             if run.exists(): self.assert_success(self.cleanup_run(run))
 
-    def test_concurrent_cleanup_removes_only_stale_run(self):
+    def test_concurrent_cleanup_has_one_winner_and_removes_only_stale_run(self):
         process, run, child_pid = self.start_sleeping_run()
         process.kill()
         try: os.killpg(child_pid, signal.SIGKILL)
@@ -3590,70 +3000,35 @@ time.sleep(300)
         sibling = self.system_tmp / "unrelated-directory"
         sibling.mkdir()
         (sibling / "sentinel").write_text("preserve")
-        results = self.race_cleanup(run)
-        self.assertTrue(any(cleaner.returncode == 0 for cleaner, _ in results), results)
+        cleaners = [subprocess.Popen([str(BINARY), "--cleanup", str(run)], cwd=self.repo,
+                                     env=self.environment(), stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE) for _ in range(4)]
+        results = [(cleaner, cleaner.communicate(timeout=20)) for cleaner in cleaners]
+        self.assertEqual(sum(cleaner.returncode == 0 for cleaner, _ in results), 1, results)
         self.assertFalse(run.exists())
         self.assertEqual((sibling / "sentinel").read_text(), "preserve")
         self.assertEqual(list(self.system_tmp.iterdir()), [sibling])
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/git-on/"))
 
-    @unittest.skipUnless(sys.platform == "darwin", "requires a Darwin NFS mount")
-    def test_cleanup_recovers_a_legacy_run_on_nfs(self):
-        code = """
-import subprocess, sys
-from pathlib import Path
 
-group = Path.cwd() / 'git-on'
-group.mkdir(mode=0o700)
-run = group / 'g12345'
-run.mkdir(mode=0o700)
-(run / '.git-on-lock-v2').touch(mode=0o600)
-result = subprocess.run([sys.argv[1], '--cleanup', str(run)], capture_output=True, timeout=10)
-assert result.returncode == 0, result.stderr
-assert not group.exists(), list(group.iterdir())
-"""
-        result, _ = self.invoke_argv([
-            "HEAD", "--write-policy=all", "--", sys.executable, "-I", "-S", "-c", code, str(BINARY),
-        ])
-        self.assert_success(result)
-        self.assert_no_runtime_files()
+
+
+
 
     def test_only_tree_oid_is_injected_and_tmpdir_is_private_then_removed(self):
-        group = self.system_tmp / "git-on"
-        if sys.platform == "darwin":
-            mixed_case = self.system_tmp / "Git-On"
-            mixed_case.mkdir(mode=0o700)
-            if group.exists():
-                group = mixed_case
-            else:
-                mixed_case.rmdir()
         code = r"""
-import os, subprocess, sys
+import json, os, stat
 from pathlib import Path
 injected = {key: value for key, value in os.environ.items() if key.startswith('GIT_ON_')}
 assert injected == {'GIT_ON_TREE_OID': os.environ['EXPECTED_TREE']}, injected
 run = Path.cwd().parent
 assert Path.cwd().name == 'mount'
-assert run.parent == Path(os.environ['EXPECTED_TEMP_GROUP'])
-assert run.stat().st_mode & 0o777 == 0o700
+assert run.parent == Path(os.environ['TMPDIR']) / 'git-on'
+assert stat.S_IMODE(run.stat().st_mode) == 0o700
+identity = run.stat()
+marker, = run.parent.glob(f'.run-{run.name}-*.{identity.st_dev:x}.{identity.st_ino:x}')
+assert marker.is_file() and marker.stat().st_size == 0
 assert not (run / '.state').exists()
-assert not (run / '.lock').exists()
-record = run.parent / f'.git-on-run-{os.geteuid():x}-{run.name}'
-assert record.stat().st_mode & 0o777 == 0o700
-[marker] = list(record.glob('.git-on-lock-v2-*'))
-assert marker.stat().st_size == 0
-if sys.platform == 'darwin':
-    mounts = subprocess.check_output(['/sbin/mount'], text=True).splitlines()
-    source, = [line.partition(' on ')[0] for line in mounts
-               if line.partition(' on ')[2].rpartition(' (')[0] == str(Path.cwd())]
-    assert source.startswith('<') and source.endswith('>:/'), source
-    socket = Path(source[1:-3])
-    group = socket.parent.parent
-    assert group.parent == Path('/private/tmp')
-    assert group.name in ('git-on', f'.go{os.geteuid():x}')
-    assert socket.parent.name.startswith('nfs-')
-    assert socket.is_socket()
-    print(socket.parent)
 assert (run / 'backing').is_dir()
 assert not (run / 'manifest.json').exists()
 assert not (run / 'stdout.log').exists()
@@ -3662,14 +3037,10 @@ assert not (run / 'output').exists()
 assert os.environ['UNRELATED_VARIABLE'] == 'inherited'
 print(run)
 """
-        result, run = self.python(code, extra_env={
-            "EXPECTED_TREE": self.tree, "EXPECTED_TEMP_GROUP": str(group),
-            "UNRELATED_VARIABLE": "inherited",
-        })
+        result, run = self.python(code, extra_env={"EXPECTED_TREE": self.tree, "UNRELATED_VARIABLE": "inherited"})
         self.assert_success(result)
         self.assertIsNone(run)
-        for directory in os.fsdecode(result.stdout).splitlines():
-            self.assertFalse(Path(directory).exists(), directory)
+        self.assertFalse(Path(os.fsdecode(result.stdout).strip()).exists())
         self.assertEqual(result.stderr, b"")
         self.assert_no_runtime_files()
 
@@ -3682,7 +3053,7 @@ print(run)
                                   extra_env={"GIT_ON_RUN_DIR": str(old_run)})
         self.assert_success(result)
         self.assertIsNone(run)
-        self.assertEqual(Path(os.fsdecode(result.stdout).strip()).parent, self.system_tmp / 'git-on')
+        self.assertEqual(Path(os.fsdecode(result.stdout).strip()).parent, self.system_tmp / "git-on")
         self.assertEqual(list(old_run.iterdir()), [sentinel])
         self.assertEqual(sentinel.read_text(), "untouched")
         self.assert_no_runtime_files()
@@ -3717,6 +3088,4 @@ if __name__ == "__main__":
         PARSER.error("select the Darwin NFS client on macOS or the Linux FUSE client")
     if OPTIONS.require_fuse and not FUSE_AVAILABLE:
         PARSER.error("real FUSE required: /dev/fuse and fusermount3/fusermount must be available")
-    if OPTIONS.require_nfs_tmpdir and sys.platform != "linux":
-        PARSER.error("NFS-backed TMPDIR checks require the Linux NFS client")
     unittest.main(argv=[sys.argv[0], *UNITTEST_ARGS], verbosity=2)

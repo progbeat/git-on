@@ -39,7 +39,7 @@ fn command(mode: Mode) -> Command {
         .disable_version_flag(true)
         .args_override_self(true)
         .override_usage(RUN_USAGE)
-        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nOne Git operand selects a local revision. Two operands select a local repository, configured remote, or direct HTTPS or SSH source, followed by the revision.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nBackend auto uses FUSE on Linux and NFSv4.1 on macOS 26 and later. Explicit fuse and nfs require a mount. Backend copy creates a regular temporary directory and requires explicit --write-policy=all. Auto can use copy when a mount is unavailable and all was selected explicitly. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
+        .after_help("Runner options may appear anywhere before the first --. The first -- is required before every command; all following argv is literal.\nNative Git resolves local revisions, including when you supply a local repository. Network sources use direct HTTPS with HTTP/2 or OpenSSH, both with Git protocol v2.\nWrite policy: ignored (default), none (read-only), untracked (new paths), all (temporary copy-on-write changes). Source Git objects stay immutable.\nBackend auto uses FUSE on Linux and NFSv4.1 on macOS 26 and later. Explicit fuse and nfs require a mount. Backend copy creates a regular temporary directory and requires explicit --write-policy=all. Auto can use copy when a mount is unavailable and all was selected explicitly. Temporary backing uses the system temporary directory (TMPDIR).\nGIT_ON_TREE_OID identifies the pinned source tree. Cleanup: git on --cleanup DIRECTORY\nUse git on -h for help through Git. Exit: child status; runner failure 125; usage 2.");
     if mode != Mode::Cleanup {
         command = command
             .arg(
@@ -73,7 +73,7 @@ fn command(mode: Mode) -> Command {
                     .action(ArgAction::Append)
                     .required(true)
                     .value_parser(OsStringValueParser::new())
-                    .help("Local REV, or REPOSITORY REV to select an explicit source"),
+                    .help("Local REV, or REPOSITORY REV passed unchanged to native Git"),
             );
     }
     if mode != Mode::Run {

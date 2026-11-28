@@ -84,12 +84,8 @@ def validate_resources(plan,root):
         if r.get('head')!=plan['head'] or r.get('working_tree_dirty') is not False:
             raise ValueError('stale, dirty or unidentified pack-scaling evidence')
         n=r['distinct_blobs']
-        metrics=r['metrics']
-        if r.get('passes')!=2 or r.get('requested_objects')!=n+2 or metrics.get('remote_fetches')!=n+2:
-            raise ValueError('wrong pack demand control')
-        if any(value!=0 for value in (r.get('pack_metadata_syscalls'), metrics.get('remote_fetch_operations'),
-                                      metrics.get('remote_repositories_created'))):
-            raise ValueError('unexpected native fetch or private pack storage')
+        if r['baseline'] or r['passes']!=2 or r['metrics']['remote_fetches']!=n+2:raise ValueError('wrong pack demand control')
+        if r['pack_directory_bytes_enumerated']!=0 or r['pack_metadata_syscalls']!=0:raise ValueError('streamed demand used on-disk pack metadata')
     return dict(distinct_demand_sizes=[32,128,512])
 
 

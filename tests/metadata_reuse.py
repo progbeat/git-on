@@ -8,7 +8,8 @@ import subprocess
 import sys
 from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
 from process_capture import capture
-from remote import Fixture, run_directories
+from remote import Fixture
+from support.run_storage import run_directories
 
 CHILD=r'''
 import json,os,sys
@@ -56,7 +57,7 @@ def run(options):
                 stat_bytes=stat_abi_bytes(build_stat_observer(f.root/'stat-abi'))
                 child=f.root/'command.py';child.write_text(CHILD)
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.operations),str(stat_bytes)]
-                source=f.https() if options.source=='remote' else None
+                source=f.https() if options.source=='remote' else str(f.repo)
                 env=dict(f.env)
                 backend_args = ['--backend=copy'] if options.backend=='materialized' else []
                 argv=[str(options.binary.resolve()),*backend_args]

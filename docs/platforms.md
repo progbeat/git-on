@@ -7,10 +7,8 @@ optional passthrough does not change that requirement.
 HTTPS uses the system libcurl and its TLS and HTTP/2 libraries. The Linux
 binary loads the distribution's `libcurl.so.4` at startup. On Ubuntu the
 `curl` package installs this dependency. macOS supplies libcurl as part of
-the operating system. HTTPS requires both TLS and HTTP/2 support in libcurl.
-
-Local object access uses Git's `--no-lazy-fetch` option from Git 2.45.
-Network execution requires Git 2.45.1 or newer.
+the operating system. HTTPS requires TLS and HTTP/2 support in libcurl and
+Git protocol v2 support on the server.
 
 ## Apple Silicon
 
@@ -35,10 +33,9 @@ binary. Both jobs test the revision under review.
 Passthrough requires Linux6.9+/FUSE7.40 and CAP_SYS_ADMIN for registration. It is
 optional: ordinary users or unsupported kernels retain FUSE userspace I/O, never
 materialization solely because this optimization is unavailable. Physically
-backed command-generated files and private copies of tracked files can qualify.
-The regular file must already have writable backing when opened. Ordinary
-handles and mappings must be released before starting passthrough on that inode.
-The child receives no new privileges.
+backed writable regular files qualify. A tracked file qualifies after copy-up
+once its ordinary FUSE opens have closed and its attributes can be preserved.
+The child receives no new privileges; never recommend sudo git on for this.
 
 ```sh
 cargo build --locked --features test-metrics

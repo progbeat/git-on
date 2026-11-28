@@ -1,4 +1,4 @@
-//! Validated access to private backing files.
+//! Open run-local files relative to their owned directories.
 use std::{
     ffi::CStr,
     fs::{File, Metadata},
@@ -10,19 +10,15 @@ use std::{
 };
 
 #[cfg(test)]
-std::thread_local! {
-    pub(crate) static METADATA_ERROR: std::cell::Cell<Option<(usize, i32)>> = const {
-        std::cell::Cell::new(None)
-    };
+thread_local! {
+    pub(crate) static FAIL_NEXT_FILE_METADATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_NEXT_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn private_file_metadata(file: &File) -> io::Result<Metadata> {
     #[cfg(test)]
-    if let Some((checks_before_error, error)) = METADATA_ERROR.take() {
-        if checks_before_error == 0 {
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        METADATA_ERROR.set(Some((checks_before_error - 1, error)));
+    if FAIL_NEXT_FILE_METADATA.replace(false) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
     }
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
@@ -33,12 +29,19 @@ pub(crate) fn private_file_metadata(file: &File) -> io::Result<Metadata> {
 }
 
 /// Open relative to the owned directory without following links or blocking on
-/// special files. The caller must check the descriptor before using it.
-pub(crate) fn open_private_descriptor(
+/// special files. Return the checked metadata so callers can also check length
+/// without another fstat.
+pub(crate) fn open_private_file(
     directory: &File,
     name: &CStr,
     flags: libc::c_int,
-) -> io::Result<File> {
+) -> io::Result<(File, Metadata)> {
+    let file = open_file_at(directory, name, flags)?;
+    let metadata = private_file_metadata(&file)?;
+    Ok((file, metadata))
+}
+
+pub(crate) fn open_file_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -53,13 +56,20 @@ pub(crate) fn open_private_descriptor(
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Return the checked metadata so callers can check length without another fstat.
-pub(crate) fn open_private_file(
-    directory: &File,
-    name: &CStr,
-    flags: libc::c_int,
-) -> io::Result<(File, Metadata)> {
-    let file = open_private_descriptor(directory, name, flags)?;
-    let metadata = private_file_metadata(&file)?;
-    Ok((file, metadata))
+pub(crate) fn remove_file_at(directory: &File, name: &CStr) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_UNLINK.replace(false) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    loop {
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::NotFound => return Ok(()),
+            io::ErrorKind::Interrupted => (),
+            _ => return Err(error),
+        }
+    }
 }

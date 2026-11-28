@@ -1,7 +1,6 @@
 """TLS HTTP/2 Git fixture fronting the local git-http-backend."""
 
 from concurrent.futures import ThreadPoolExecutor
-import gzip
 import http.client
 import re
 import socket
@@ -25,12 +24,10 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         self.authorization = authorization
         self.upstream_tls = ssl.create_default_context(cafile=fixture.env['GIT_SSL_CAINFO'])
         self.records = []
-        self.authorized_fetch_packets = []
+        self.authorization_counts = []
+        self.redirect_discovery = False
         self.split_pack = None
         self.unauthenticated_wants = set()
-        self.unexpected_credential = False
-        self.authenticate_wants_only = False
-        self.gzip_pack = False
         super().__init__(('127.0.0.1', 0), MultiplexedRequests)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(fixture.root / 'tls.crt', fixture.root / 'tls.key')
@@ -47,14 +44,12 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         cleanup(self.shutdown)
 
     def forward(self, method, path, headers, body):
+        if self.redirect_discovery and path == '/old.git/info/refs?service=git-upload-pack':
+            return 301, [('location', '/server.git/info/refs?service=git-upload-pack')], b''
         authorization = next((value for key, value in headers.items()
                               if key.lower() == 'authorization'), None)
-        if (method == 'POST' and self.authorization is not None
-                and authorization != self.authorization
-                and (not self.authenticate_wants_only or b'want ' in body)):
+        if method == 'POST' and self.authorization is not None and authorization != self.authorization:
             self.unauthenticated_wants.update(re.findall(rb'want ([0-9a-f]{40})', body))
-            if authorization is not None:
-                self.unexpected_credential = True
             challenge = REJECTION_CHALLENGE if authorization is not None else 'Basic realm="git-on-fixture"'
             return 401, [('www-authenticate', challenge), ('content-length', '0')], b''
         upstream = http.client.HTTPSConnection(
@@ -65,11 +60,6 @@ class Multiplexer(socketserver.ThreadingTCPServer):
             response = upstream.getresponse()
             fields = response.getheaders()
             payload = response.read()
-            if (self.gzip_pack and response.status == 200
-                    and (b'want ' in body or b'want-ref ' in body)):
-                payload = gzip.compress(payload)
-                fields = [(key, value) for key, value in fields if key.lower() != 'content-length']
-                fields.extend([('Content-Encoding', 'gzip'), ('Content-Length', str(len(payload)))])
             return response.status, fields, payload
         finally:
             upstream.close()
@@ -103,6 +93,9 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                 for event in h2.receive_data(data) if data else ():
                     stream = getattr(event, 'stream_id', None)
                     if isinstance(event, RequestReceived):
+                        self.server.authorization_counts.append(
+                            sum(key == 'authorization' for key, _ in event.headers)
+                        )
                         pending[stream] = (dict(event.headers), bytearray())
                     elif isinstance(event, DataReceived):
                         pending[stream][1].extend(event.data)
@@ -120,7 +113,6 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                         authorized = headers.get('authorization') == self.server.authorization
                         if wants and authorized:
                             self.server.records.append((self.client_address, wants))
-                            self.server.authorized_fetch_packets.append(bytes(body))
                         split = self.server.split_pack
                         if split is not None and set(wants) == split.wants and authorized:
                             h2.send_headers(stream, [

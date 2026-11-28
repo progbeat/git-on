@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Protect existing recording artifacts without running VHS or mounting FUSE."""
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout
 import errno
 import hashlib
 import importlib.util
@@ -72,11 +72,14 @@ class RecordingDestinationTests(unittest.TestCase):
                 error = caught
         return error, dependencies, opened, recorder
 
-    def successful_recording(self, replace_stage=None):
-        make = self.root / "fixture-make"
-        make.write_text('#!/bin/sh\nprintf "%s\\n" "$1"\n')
-        make.chmod(0o700)
-        real_popen = MOD.subprocess.Popen
+    def successful_recording(self, replace_stage=None, build_in_mount=True):
+        shim = self.root / "make-handler"
+        shim.write_text('#!/bin/sh\n[ "${0##*/}" = make ]\n')
+        shim.chmod(0o700)
+        tool_dir = self.root / "tools with 'quoting'"
+        tool_dir.mkdir()
+        alias = tool_dir / "make"
+        alias.symlink_to(shim)
 
         def successful_vhs(*args, **kwargs):
             stage = Path(os.readlink(kwargs["cwd"]))
@@ -84,16 +87,19 @@ class RecordingDestinationTests(unittest.TestCase):
             kwargs["stdout"].write("owned VHS diagnostics\n")
             kwargs["stdout"].flush()
             runtime = Path(kwargs["env"]["TMPDIR"])
-            wrapper = Path(kwargs["env"]["PATH"].split(os.pathsep)[0]) / "make"
-            with patch.object(MOD.subprocess, "Popen", real_popen):
-                output = MOD.subprocess.check_output(
-                    [wrapper, "compiled"], env=dict(kwargs["env"], GIT_ON_TREE_OID=MOD.TREE), timeout=5)
-            self.assertEqual(output, b"compiled\n")
-            run = runtime / "git-on" / "rUn001"
+            run = runtime / "git-on" / "ab1234ef"
             (run / "mount").mkdir(parents=True)
             executable = run / "mount/sl"
             executable.write_bytes(b"generated SL fixture")
             executable.chmod(0o755)
+            (run / ".state").write_text(json.dumps({"format": "git-on-temp-v1", "id": "fixture"}))
+            build_env = dict(kwargs["env"], GIT_ON_TREE_OID=MOD.TREE)
+            make = Path(build_env["PATH"].split(os.pathsep, 1)[0]) / "make"
+            with chdir(run / "mount" if build_in_mount else runtime):
+                pid = os.posix_spawn(make, [str(make)], build_env)
+            _, status = os.waitpid(pid, 0)
+            if os.waitstatus_to_exitcode(status) != 0:
+                raise RuntimeError("The selected make shim did not run")
 
             class SuccessfulVhs:
                 returncode = None
@@ -116,9 +122,8 @@ class RecordingDestinationTests(unittest.TestCase):
 
         with redirect_stdout(io.StringIO()):
             return self.attempt_recording(
-                dependency_probe=lambda name: str(make) if name == "make" else "fixture-tool",
-                recorder_failure=successful_vhs,
-            )
+                dependency_probe=lambda tool: str(alias) if tool == "make" else "fixture-tool",
+                recorder_failure=successful_vhs)
 
     def assert_rejected_before_probes(self, attempt):
         error, dependencies, opened, recorder = attempt
@@ -530,6 +535,12 @@ class RecordingDestinationTests(unittest.TestCase):
         self.assertEqual(metadata["gif_sha256"], hashlib.sha256(b"owned animation fixture").hexdigest())
         self.assertTrue(metadata["generated_sl_removed_with_snapshot"])
         self.assertEqual(metadata["upstream_tree"], MOD.TREE)
+
+    def test_recording_rejects_build_outside_the_observed_mount(self):
+        error, _, _, _ = self.successful_recording(build_in_mount=False)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("Running source differs", str(error))
+        self.assertFalse((self.destination / "capture").exists())
 
     def test_failed_recording_preserves_replacement_staging_directory_and_owned_log(self):
         owned = self.root / "held-owned-stage"

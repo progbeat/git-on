@@ -116,12 +116,8 @@ impl Session {
 }
 
 #[cfg(target_os = "macos")]
-pub fn start_nfs(
-    overlay: crate::filesystem::Overlay,
-    id: &str,
-    socket: std::path::PathBuf,
-) -> std::io::Result<Session> {
-    nfs::Session::start(overlay, id, socket).map(Session::Macos)
+pub fn start_nfs(overlay: crate::filesystem::Overlay, id: &str) -> std::io::Result<Session> {
+    nfs::Session::start(overlay, id).map(Session::Macos)
 }
 
 #[cfg(target_os = "linux")]

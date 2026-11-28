@@ -51,9 +51,8 @@ from an ordinary local copy of the repository?
 running a script from a large monorepo can happen almost instantly without
 materializing the whole repository before execution.
 
-Assume individual Git objects fit in RAM. A lazy read can decode and verify a
-whole blob, even for a partial read. Keeping a few large blobs in RAM lets the
-command read them before they have to be written to temporary storage.
+Large files also need to be taken into account. Preferably, they should be read
+and written to the cache as streams rather than loaded entirely into RAM.
 
 If the backend supports passthrough with the required permissions and it speeds
 up file operations, that mode should be used.
@@ -90,59 +89,11 @@ deprecation practices so that users know what to expect.
 
 **Question:** What integrity guarantees must Git-on provide?
 
-**Answer:** Verify each Git object against its OID before exposing its
-contents. Reads of an unchanged Git object must preserve this guarantee
-despite tampering with temporary storage by unprivileged processes. On a
-mount, the first successful content change switches the file to private
-writable storage. Copy-up and subsequent reads of that file use ordinary
-filesystem I/O, including for bytes retained from the source. Root and access
-to Git-on's process memory are outside the threat model.
+**Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
 
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 
-**Answer**: If the command can finish with two checked-out copies of the
-selected revision on disk, Git-on must be able to run it too. This concerns
-available space on the filesystem. A finite process `RLIMIT_FSIZE` is outside
-the intended workload.
-
-**Question:** If a valid pack sends more extra objects than fit in RAM, what
-should give way: retaining every OID received or the RAM and disk limits?
-With arbitrarily much data, both conditions and the two-checkout promise
-cannot be met at the same time.
-
-**Answer:** Exceeding available RAM is outside the practical workloads Git-on
-should support. Git-on should leave process limits to the host.
-
-**Question:** Which contract should remain for `git gc` and crash recovery with
-`--cleanup`? In a test, `git gc --prune=now` removed an object the snapshot
-needed when no Git ref had been written. A separate `--cleanup` after `SIGKILL`
-uses the saved record to find the ref and check its target.
-
-**Answer:** I do not understand what this has to do with git on. Git on is for
-temporary materialization and must have no permanent effect on repositories or
-on the system as a whole.
-
-**Question:** The earlier task permitted service writes to disk only for LRU
-eviction. The new task permits temporary repositories and asks to remove packs
-and indexes where compatibility allows. Can PR #41 retain disk-backed private
-packs and indexes for nonstandard refspecs and settings that still require
-native Git?
-
-**Answer:** No. Apply the “disk only on LRU eviction” rule in this PR.
-
-The current [storage requirements](specification.md#storage-and-buffer-requirements)
-supersede this answer for regular files required by native Git. They permit
-temporary disk storage when an existing writable tmpfs is unavailable.
-The [service-state contract](specification.md#service-state) permits the
-ordinary effects of Git's configured verifier during `--verify`.
-
-**Question:** Do you approve a narrow exception to the write rule for an
-explicit OpenSSH `Match exec` directive? OpenSSH can run the command during
-`ssh -G`, before connecting, and run it again during connection setup. A local
-review noted that the specification previously had an agreed exception only
-for the verifier.
-
-**Answer:** Document an exception for `Match exec`.
+**Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.
 
 **Question:** Which version should PR #41 use? Cold reviews consider this a
 SemVer 2.0 blocker. The 1.5.2 documentation promised support for
@@ -162,3 +113,11 @@ profile those invocations now fail.
 
 **Answer:** Use 1.5.3. I never asked for that support. It was a mistake for
 the AI agent to add and document it without asking me.
+
+**Question.** Do you allow a narrow exception to the write rule for an
+explicitly configured OpenSSH `Match exec`? OpenSSH can run that command
+during `ssh -G`, before connecting, and run it again while configuring a
+connection. The local review noted that the specification previously agreed
+on an exception only for the verifier.
+
+**Answer.** Document an exception for `Match exec`.

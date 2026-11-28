@@ -43,11 +43,10 @@ snapshot before invoking uv:
 git on origin main -- sh -c 'cd examples/uv-project && uv run --locked main.py'
 ```
 
-With two positional operands, Git interprets the second as a fetch refspec;
-`main:examples/uv-project` would name a destination ref, not a subtree.
-Add `--verify` after the revision/refspec when native Git should verify the selected
-commit or annotated tag under your existing configuration. Verification does not
-assert passed tests.
+For a network source, select an advertised ref or a full SHA-1 OID. For a local
+source, `HEAD:examples/uv-project` selects that subtree directly. Add `--verify`
+when native Git should verify the selected commit or annotated tag under your
+existing configuration.
 
 The first example uses PEP 723 inline metadata and `main.py.lock`. The second
 uses `pyproject.toml` and `uv.lock`. Both pin NumPy 2.2.6 and Numba 0.61.2; the

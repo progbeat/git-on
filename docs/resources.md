@@ -2,157 +2,152 @@
 
 ## Payload cache
 
-Each invocation owns its prepared objects and temporary storage. A 16 MiB
-block LRU charges allocation capacity plus 512 bytes per retained entry. It
-holds whole blobs up to 64 KiB and at most one recently read block per spilled
-blob. Newly verified larger blobs enter a separate whole-blob LRU with room
-for eight entries. Reads update recency while an entry stays in that cache.
-The first read can use the decoded buffer without writing and rereading a
-raw file. After a spill, reads use the backing file and the block LRU.
-Even a partial read can require a whole blob in RAM.
+Each invocation owns its prepared objects and temporary storage. Mounted runs
+share a 16 MiB LRU for complete blobs up to 64 KiB and authenticated blocks read
+from spills. Each entry is charged by allocation capacity plus 512 bytes.
+A separate LRU retains the eight most recently used complete large blobs.
+Readers of one OID share a resident buffer. Active read buffers and decoder
+allocations are accounted separately.
 
-The count limit targets source repositories where a few whole blobs fit
-comfortably in RAM. The payload bytes in the hot LRU are bounded by the
-combined uncompressed size of the eight largest distinct blobs in the tree.
-At the revisions below, this is about 14.35 MiB for CPython, 16.91 MiB for Go,
-and 120.97 MiB for Linux. [CPython `de54cf5`](https://github.com/python/cpython/tree/de54cf5be371a6f5e2e9f208c38def5f81d3ef02) ·
-[Go 1.24.0](https://github.com/golang/go/tree/3901409b5d0fb7c85a3e6730a59943cc93b2835c) ·
-[Linux v6.12](https://github.com/torvalds/linux/tree/adc218676eef25575469234709c2d87185ca223a)
+An additional 16 MiB LRU holds compressed copies of unrequested remote delta
+bases that might be needed later. Entries are charged by allocation capacity
+plus 512 bytes. The decoder keeps any base needed by its active pack until
+the pack completes. One decoded base of up to 16 MiB can be reused within
+each active pack. A later demand uses the compressed copy when retained.
+On eviction the unused compressed copy is released. A later first demand
+can fetch it directly.
 
-On trees with blob sizes like these, keeping a few verified buffers whole
-avoids temporary writes and disk reads when a command revisits them. A
-pending spill and active decoding buffers are additional memory costs.
+Evicted payloads can spill to private storage. Prepared objects remain reusable
+after close/reopen and eviction
+without further fetch or decode. If admitting a checked disk block would
+require an unrelated spill that fails, the read returns the checked bytes and
+keeps the previous resident.
+If storage capacity prevents an eviction write, its resident bytes remain
+readable and the failed remote read can be retried once space is available.
 
-Eviction spills verified data to private backing when needed. One large spill
-can run in the background while readers use verified buffers. If that write
-fails, the blob stays readable in RAM and the next large-blob admission
-retries it before starting another eviction. Incremental HTTPS and SSH pack
-decoders reserve a decode slot before inflating a large blob. One of the
-eight ordinary slots stays available for required reads. After the command
-exits, a ninth slot lets used packs finish verification while unrelated
-transfers hold the ordinary slots. Native Git decoding can allocate
-whole-blob buffers outside those slots.
-A read can use its verified buffer while placement waits, including after
-joining an in-progress prefetch. If a placement write fails, an exposed
-buffer stays in decoded memory while the receiver finishes verifying the
-pack. The cache can retain up to nine early publications awaiting placement,
-including active decoders and buffers left after an I/O error. Admission of
-another large blob retries placement with those buffers. A later read of the
-same object can also trigger the retry. When all nine slots are occupied,
-newly decoded buffers are published once placement succeeds. Network requests
-can run concurrently.
-Prepared objects remain reusable across close/reopen and RAM eviction without
-another fetch or decode. If an optional disk-block admission needs a spill that
-fails, return the checked bytes and keep the unbacked resident.
+Reads from a whole resident blob hold the cached buffer until the reply has
+consumed the requested range. The FUSE reply sends that range directly.
+On first access to a packed local blob, libgit2 normally returns a full
+decoded buffer. With the audited libgit2 build, the cache owns that buffer
+and reads borrow ranges from it. Embeddings without the audited startup
+policy verify and import the bytes into their own buffer. Objects unavailable
+through libgit2 use native `git cat-file` in the source repository.
+
+Mounted HTTPS reads decode responses outside the network dispatcher. A large
+victim stays readable in memory while its spill is written. Independent
+requests can complete during that write. Each response has a bounded input
+queue and pauses its own HTTP/2 stream when the queue fills. Foreground
+reads and read-ahead have separate limits on concurrent decoders.
 
 ## Metadata and source decoding
 
-Trusted RAM retains object IDs, exact lengths and a 32-byte BLAKE3 digest per
-64 KiB block of each spilled object. Full-block digests cost 1/2048 of the
-payload size. Touched trees are parsed once into shared immutable structures.
-The materializer borrows names from those structures and recurses by the
-verified child tree OID.
-The whole-blob cache, active reads, full-object decoding buffers, verification
-metadata and namespace state are accounted for outside the 16 MiB block budget.
+Original OIDs, exact lengths and ordered BLAKE3 block hashes remain in trusted
+process memory. Touched unique directories are parsed once into shared immutable
+structures; raw tree bytes are released. Parsed directories, object descriptors,
+header sizes and filesystem namespace state grow with demand outside the
+payload LRU.
 
 Libgit2 uses 8 MiB source-pack mapping windows and a 16 MiB soft mapped-byte
-budget. The pack descriptor cache retains up to 32 descriptors.
+budget. Retained pack descriptors are limited to
+`clamp(floor(RLIMIT_NOFILE / 4), 1, 32)`. Git-on does not raise OS limits.
 Active windows and necessary packed-object/delta decoding can exceed retained
 cache budgets. Libgit2 can retain decoded delta bases up to 1 MiB each and
-16 MiB per pack. When a local packed blob needs whole-object decoding, the cache
-retains the immutable libgit2 allocation. The same allocation serves ranges
-and can supply a spill or copy-up. Packed trees are parsed directly from the
-verified ODB buffer. These budgets are independent of the sizes
-of the objects being decoded and read.
+16 MiB per pack. Packed/delta decoding can require a complete decoded object;
+these budgets are not object-size or total-memory ceilings.
 
 The wholly readonly `none` policy permits kernel directory-page caching on FUSE
 ABI 7.28 and later. Mutable policies keep directory contents live. Cached pages
 cover enumerated directories and do not preload leaf contents or subtrees.
 
+An NFS READ response can send a slice directly from a verified blob. NFS keeps
+the last response for each session slot so it can answer duplicates. If retaining
+the shared backing allocation would exceed the slot's replay budget, Git-on
+copies the response bytes into compact replay storage.
+
 ## Files and temporary disk space
 
-Each spilled object has one raw file. The store retains one last-read file
-descriptor shared by its readers. Reusable HTTPS and SSH sessions decode full
-objects and deltas in RAM from the first pack.
-Readers can receive a verified object while the rest of the pack is still in
-flight. Native local object reader
-requests, Git's configuration and discovery output,
-and `mount_nfs` diagnostics pass through streams. Capture for
-operations that can invoke detached helpers or SSH proxies uses a seekable handle
-so inherited output remains writable after the native Git process exits.
-On Linux the handle uses an anonymous memory file when available. Lazy
-decoding fills the object buffer in RAM and verifies the full Git OID before
-serving or spilling it. Reads borrow ranges from the resident blob or from the
-authenticated cache blocks they touch. Reusable pack decoders complete split
-headers before passing the compressed body to zlib by reference.
-NFS sends these ranges and symlink targets with their XDR fields using vectored
-I/O. A replay slot retains a compact encoding when the backing allocations
-would exceed its budget. The FUSE library accepts a single payload slice.
-Full blocks read for a contiguous reply can be authenticated in that buffer.
-An already resident block or an unaligned range is gathered as needed.
+Raw backing uses one file per spilled original object. The store shares one
+recent read descriptor. Git-on decodes incoming Git packs from HTTPS and OpenSSH
+streams, keeping active decoder state in memory. Temporary disk usage is
+bounded by the selected objects that spill and the work the command requires.
+Private Git scratch may be used for index revision resolution and native
+signature verification.
 
+Temporary files obey inherited file-size and descriptor limits. Git-on catches
+`SIGXFSZ` from its own writes so `EFBIG` follows normal cleanup. Executed commands
+retain the caller's signal disposition. Stale runs follow the documented
+recovery contract.
 
-Explicit-all materialization verifies object bytes directly into the
-private execution tree, without a second complete raw copy. Loose objects
-stream; packed/delta objects retain libgit2's required decoding. A repeated OID
-reuses a prepared file or symlink target across directories, authenticating the
-copied bytes against that original OID. File copies remain independent. The
-command starts only after every destination has passed verification and policy
-checks. Direct HTTPS and SSH materialization keep the decoded pack in RAM
-and release file buffers as they reach their destinations. Local
-materialization reads the original object database. Repeated OIDs reuse
-verified files or symlink targets in the execution tree. Lazy reads retain
-the invocation-owned verified raw store.
+The copy backend writes verified local data into the private execution tree.
+For a network source it requests a shallow pack for the selected revision.
+Copy uses the same small-blob and large-blob caches as mounting.
+An evicted file's backing can be transferred into the visible tree within the
+same private run. Git-on checks the installed file and its block digests before
+launching the command.
+Repeated OIDs can reuse a prepared file or symlink target across directories.
+Copies remain independent. The command starts after the tree passes verification
+and policy checks.
 
+In FUSE, metadata and namespace changes preserve the source OID without loading
+or copying its payload. Read handles, hard links and unlinked inodes retain
+access to that source. Writable opens, empty writes and unchanged-size truncation
+leave source data intact. The first successful write or content-changing
+truncation commits private backing. A failed operation that changes no bytes
+leaves the source backing available for verified reads and retry. All handles
+observe committed changes through the same inode.
+Before the first destructive source operation, an ownership index counts original
+file and symlink inodes in the selected tree, including unopened paths. Shared
+trees are counted by multiplicity. This reads tree metadata, never blob contents;
+remote tree demands are batched by depth. It is not startup or readonly work.
 
-On native mounts, metadata and namespace changes preserve the source OID.
-Writable opens, empty writes and unchanged-size truncation leave the source
-payload untouched. The first content change installs a private file after
-the change succeeds. Copy-up uses a filesystem clone when available and copies
-the retained bytes directly otherwise. Truncating to zero starts empty. An
-allowed writer can change any part of the private file, so all its bytes use
-ordinary I/O, including bytes retained from the source. All handles of the
-inode then see the private data. Eligible Linux FUSE opens can use passthrough.
-Writable `all` FUSE mounts use one request worker. When the filesystem
-cannot clone a spilled blob, copying its retained bytes delays later FUSE
-requests until the write completes.
+If another original inode or an active decoder still needs the raw source,
+copy-up gives the mutated inode its own backing. It uses a filesystem clone
+where supported, or copies the bytes directly. For the last original inode,
+Git-on can transfer the raw file into the writable layer with its existing
+descriptor. Its raw name is retained until the first successful change.
+Resident bytes are written once. Truncation to zero releases the
+original reference without loading its bytes. Unlink releases data after the
+last kernel lookup or open reference. Truncation followed by extension exposes
+zeros.
 
-Unlink preserves open or looked-up inodes until their last reference is
-released. The immutable source remains reusable from the cache for the
-invocation. The disk-space acceptance case allows two checked-out copies of the
-selected revision and enough space for the same command to finish.
+For a spilled blob, copy-up checks the existing file and its length, then
+moves, clones or copies its bytes directly to writable backing. Git-on checks
+block digests only on immutable source reads and when installing spilled data
+into an eager checkout. Writes, truncation and reads on writable backing use
+ordinary file I/O. Linux can use kernel passthrough on later opens after cached
+handles are released and when it can preserve the file's attributes.
+
+There is at most one decoded backing per live source inode, with unchanged
+same-OID inodes sharing a single backing. No extra immutable full copy is retained
+for an inode that has become writable. Prepared bytes still needed by any
+original inode survive eviction and close/reopen without refetch or repeat
+decoding. Necessary delta bases that are not requested source files remain in
+compressed Git storage rather than becoming additional decoded raw files.
 
 `spool_writes` counts raw payload `File::write` calls, including failed attempts.
 `spool_bytes` counts bytes accepted by those writes, including partial data that
 is later discarded. Transport/metadata staging and durability work are excluded.
 The separate retained-raw counters describe current storage, not cumulative I/O.
-`hot_blob_spill_bytes` measures the whole buffer held by an unfinished eviction.
-`verified_decode_buffer_bytes` measures published pack buffers awaiting cache placement.
-`remote_eager_verified_pack_capacity` measures the peak capacity of distinct
-verified buffers held by an eager pack, counting references to the same buffer
-once. In-progress inflation, unresolved delta instructions and metadata are
-separate allocations.
 
 ## Integrity
 
 Every source object must match its canonical Git OID before publication.
 The pinned git2/libgit2 build uses collision-detecting SHA1DC; the CLI enables
-strict native verification before Git work or threads. Owned ODB objects
-with matching identity and type can reuse that proof. Streams and builds
+strict native verification before Git work or threads. Only a typed owned ODB
+blob with matching identity/type can reuse that proof. Streams and builds
 without that policy use independent verification.
 
-Trusted block hashes are formed from the same verified bytes. When reading a
-spilled immutable Git object from disk, Git-on checks its length and the
-complete intersecting 64 KiB blocks and returns bytes from those checked
-buffers. Length changes, reordering, substitution and same-UID disk tampering
-fail before changed bytes are served. Resident verified bytes are reused
-directly. Root access and interference with process memory are outside the
-threat model.
+Trusted block hashes are formed from the same verified bytes. A reload of an
+immutable object from its disk cache checks complete intersecting 64 KiB blocks and returns
+bytes from those checked buffers. Length changes, reordering, substitution and
+same-UID disk tampering fail before changed bytes are served. Resident verified
+bytes are not hashed again on every read. Root access and interference with
+process memory are outside the threat model.
 
 ## Verification requirements
 
 - Raw-store tests cover identity, length and block corruption, failed publication,
-  eviction, active readers and retry after a partial background write.
+  eviction, active readers, large-object streaming and inherited file-size limits.
 - Remote, SSH and lifecycle tests check transport reuse, cancellation, cleanup
   and reduced descriptor limits.
 - Object and metadata reuse tests check exact results, source demands, bounded

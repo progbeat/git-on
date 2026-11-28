@@ -14,7 +14,7 @@ fn out_of_range_tree_modes_stay_rejected() {
         repo.find_tree(tree).is_err(),
         "libgit2 should reject this mode"
     );
-    let result = Snapshot::load(temp.path(), OsStr::new(&tree.to_string()), "mode-review")
+    let result = Snapshot::load(temp.path(), OsStr::new(&tree.to_string()))
         .and_then(|snapshot| snapshot.entry(Path::new("file")));
     assert!(
         result.is_err(),
@@ -47,7 +47,7 @@ fn leading_zero_modes_preserve_native_tree_semantics() {
         .unwrap();
     assert!(native.status.success(), "{:?}", native.stderr);
     assert!(native.stdout.starts_with(b"100644 blob "));
-    let snapshot = Snapshot::load(temp.path(), OsStr::new(&tree.to_string()), "zero-mode").unwrap();
+    let snapshot = Snapshot::load(temp.path(), OsStr::new(&tree.to_string())).unwrap();
     let entry = snapshot.entry(Path::new("file")).unwrap().unwrap();
     assert_eq!(entry.mode, 0o100644);
     assert_eq!(snapshot.read(entry.oid, 0, 100).unwrap(), b"payload");
@@ -63,7 +63,7 @@ fn tree_parser_does_not_apply_a_host_filename_limit() {
     bytes.extend(blob.as_bytes());
     let tree = repo.odb().unwrap().write(ObjectType::Tree, &bytes).unwrap();
     assert!(repo.find_tree(tree).unwrap().get_name(&name).is_some());
-    let snapshot = Snapshot::load(temp.path(), OsStr::new(&tree.to_string()), "long-name").unwrap();
+    let snapshot = Snapshot::load(temp.path(), OsStr::new(&tree.to_string())).unwrap();
     let entry = snapshot.entry(Path::new(&name)).unwrap().unwrap();
     assert_eq!(snapshot.read(entry.oid, 0, 100).unwrap(), b"payload");
 }

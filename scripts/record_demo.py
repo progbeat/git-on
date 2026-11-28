@@ -170,27 +170,27 @@ def _record(binary, target):
         tools = private / "bin"
         tools.mkdir()
         (tools / "git-on").symlink_to(binary)
+        # Capture the tree seen by the real build without changing the tape.
+        make = tools / "make"
+        real_make = shlex.quote(str(Path(shutil.which("make")).absolute()))
+        make.write_bytes(os.fsencode(
+            '#!/bin/sh\n'
+            'cwd=$(pwd -P) || exit\n'
+            'printf "%s\\000%s\\000" "$cwd" "$GIT_ON_TREE_OID" >> "$GIT_ON_DEMO_TREES" || exit\n'
+            f'exec {real_make} "$@"\n'))
+        make.chmod(0o700)
+        trees = private / "observed-trees"
         runtime = private / "runtime"
         runtime.mkdir()
         status = private / "shell-status"
-        recorded_tree = private / "tree-oid"
-        # Use the tree ID passed to the actual build. A streamed run may have
-        # no temporary Git repository or pin in its recovery record.
-        make = tools / "make"
-        make.write_text(
-            '#!/bin/sh\nprintf "%s\\n" "$GIT_ON_TREE_OID" > "$GIT_ON_DEMO_TREE"\n'
-            f'exec {shlex.quote(os.path.abspath(shutil.which("make")))} "$@"\n'
-        )
-        make.chmod(0o700)
         # The clean VHS Bash records its actual command status after each prompt.
         # This does not change the hero command or any of its terminal output.
         env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                    TMPDIR=str(runtime), GIT_ON_DEMO_STATUS=str(status),
-                   GIT_ON_DEMO_TREE=str(recorded_tree),
+                   GIT_ON_DEMO_TREES=str(trees),
                    PROMPT_COMMAND='printf "%s\\n" "$?" >> "$GIT_ON_DEMO_STATUS"',
                    LC_ALL="C.UTF-8")
         observed = set()
-        generated = False
         log_fd = os.open("vhs.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=staging_fd)
         with os.fdopen(log_fd, "w") as stream:
             # The pinned staging cwd stays private even if the requested output
@@ -203,20 +203,19 @@ def _record(binary, target):
                 while process.poll() is None:
                     if time.monotonic() > deadline:
                         raise RuntimeError("VHS recording exceeded four minutes")
-                    for run in (*runtime.glob("git-on/??????"), *runtime.glob("git-on-*")):
-                        if (run / "mount/sl").is_file():
-                            if run not in observed:
-                                tree = recorded_tree.read_text().strip()
-                                if tree != TREE:
-                                    raise RuntimeError("Running source differs from the reviewed upstream commit")
-                                info["upstream_tree"] = tree
-                                observed.add(run)
-                            generated |= os.access(run / "mount/sl", os.X_OK)
+                    for run in (runtime / "git-on").glob("*"):
+                        executable = run / "mount/sl"
+                        if executable.is_file() and os.access(executable, os.X_OK):
+                            observed.add(run)
                     time.sleep(0.02)
                 if process.returncode:
                     raise RuntimeError(f"VHS failed with status {process.returncode}; recording artifacts were not published")
-                if not generated or len(observed) != 1:
+                if len(observed) != 1:
                     raise RuntimeError("No single real mounted SL build/execution was observed")
+                mount = os.fsencode((next(iter(observed)) / "mount").resolve())
+                if not trees.exists() or trees.read_bytes().split(b"\0") != [mount, TREE.encode(), b""]:
+                    raise RuntimeError("Running source differs from the reviewed upstream commit")
+                info["upstream_tree"] = TREE
                 statuses = status.read_text().splitlines() if status.exists() else []
                 if statuses != ["0", "0"]:
                     raise RuntimeError(f"The recorded shell did not return successfully: {statuses}")

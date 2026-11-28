@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from process_capture import capture
+from support.run_storage import run_directories
 
 
 def child_code(count,shape):
@@ -93,8 +94,6 @@ for phase in ('first','repeat'):
 
 
 def directory_cache_case(f,binary,record):
-    from remote import run_directories
-
     # Missing leaf data and an unvisited missing subtree make accidental
     # preloading observable without timing assertions or a large fixture.
     count=640
@@ -127,7 +126,7 @@ def directory_cache_case(f,binary,record):
 
 
 def run(options):
-    from remote import Fixture, run_directories
+    from remote import Fixture
     from scalability import fixture
     assert sys.platform=='linux','Linux required'
     assert Path('/dev/fuse').is_char_device() and shutil.which('fusermount3'),'real FUSE required'

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from support.run_storage import run_directories
 
 PARSER=argparse.ArgumentParser()
 PARSER.add_argument('--binary',type=Path,required=True)
@@ -263,7 +264,7 @@ def main():
     if OPTIONS.profile=='namespace':assert OPTIONS.backend=='fuse','namespace-only profile measures lazy FUSE'
     cases=scenario_plan(OPTIONS.backend,OPTIONS.source,OPTIONS.profile,policies,OPTIONS.verification,
         [int(n) for n in OPTIONS.sizes.split(',')] if OPTIONS.sizes else None)
-    from remote import Fixture, run_directories
+    from remote import Fixture
     OPTIONS.output.parent.mkdir(parents=True,exist_ok=True)
     f=Fixture()
     try:

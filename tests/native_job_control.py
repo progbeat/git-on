@@ -13,11 +13,10 @@ import select
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
-import termios
 import time
 import unittest
+from support.run_storage import run_directories
 
 SPEC = importlib.util.spec_from_file_location(
     'git_on_ssh_regressions', Path(__file__).with_name('ssh_regressions.py'))
@@ -52,14 +51,12 @@ def state(pid):
 class Shell:
     prompt = b'git-on-job-shell> '
 
-    def __init__(self, fixture, *, size=None):
+    def __init__(self, fixture):
         self.groups = set()
         self.pending = bytearray()
         self.transcript = bytearray()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            if size is not None:
-                termios.tcsetwinsize(0, size)
             env = dict(fixture.env, PS1=self.prompt.decode(), PS2='continuation> ', TERM='dumb')
             remote.exec_fixture_child(
                 [shutil.which('bash'), '--noprofile', '--norc', '-i'], fixture.cwd, env)
@@ -108,9 +105,6 @@ class Shell:
                     os.killpg(group, sig)
         with contextlib.suppress(OSError):
             self.send(b'exit\n')
-        # Hang up before reaping. On macOS the exiting controlling shell can
-        # otherwise wait for the master side of the terminal to close.
-        os.close(self.fd)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             child, _ = os.waitpid(self.pid, os.WNOHANG)
@@ -124,6 +118,7 @@ class Shell:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(self.pid, signal.SIGKILL)
             os.waitpid(self.pid, 0)
+        os.close(self.fd)
 
 
 class NativeJobControlTests(unittest.TestCase):
@@ -144,28 +139,17 @@ class NativeJobControlTests(unittest.TestCase):
         shell.send((shlex.join(argv) + '\n').encode())
         shell.expect(b"identity': ")
         runner, = children(shell.pid)
-        shell.groups.add(runner)
-        native = []
-        for child in children(runner):
-            transports = [child, *children(child)]
-            ssh = [pid for pid in transports if Path(f'/proc/{pid}/exe').resolve().name == 'ssh']
-            if ssh:
-                native.append((child, ssh))
-        self.assertEqual(len(native), 1, 'expected one owned SSH transport group')
-        (leader, self.transport_pids), = native
-        self.runner, self.native_group = runner, os.getpgid(leader)
-        shell.groups.add(self.native_group)
-        if not native_terminal:
-            run, = remote.run_directories(self.f.root)
-            self.assertEqual(run.parent, self.f.root / 'git-on')
-            socket, = run.glob('t???/socket')
-            self.assertTrue(socket.is_socket())
-            self.assertFalse(list(self.f.root.glob('.git-on-terminal-*')))
+        helper, = children(runner)
+        self.runner, self.native_group = runner, os.getpgid(helper)
+        shell.groups.update((runner, self.native_group))
         self.assertEqual(os.getpgid(runner), runner)
-        self.assertEqual(self.native_group, leader)
+        self.assertEqual(self.native_group, helper)
         self.assertNotEqual(self.native_group, runner)
-        self.assertEqual(os.getsid(leader), shell.pid if native_terminal else leader)
+        self.assertEqual(os.getsid(helper), shell.pid if native_terminal else helper)
         self.assertEqual(os.tcgetpgrp(shell.fd), self.native_group if native_terminal else runner)
+        self.transport_pids = [helper, *children(helper)]
+        self.assertTrue(any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh'
+                            for pid in self.transport_pids), 'the job did not own an SSH process')
 
     def stop_authentication(self):
         self.begin_authentication()
@@ -180,7 +164,7 @@ class NativeJobControlTests(unittest.TestCase):
         self.assertIn(b'Stopped', output)
         self.assertEqual(state(self.runner), 'T')
         shell.wait_for(lambda: state(self.native_group)=='T',
-                       'OpenSSH did not stop with the invoking job')
+                       'native Git did not stop with the invoking job')
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
 
     def foreground(self):
@@ -204,7 +188,7 @@ class NativeJobControlTests(unittest.TestCase):
         shell.expect(f'native-job-status={expected}\r\n'.encode())
         shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
-        self.assertEqual(remote.run_directories(self.f.root), [], 'runner leaked recovery state')
+        self.assertEqual(run_directories(self.f.root), [], 'runner leaked recovery state')
         self.assertEqual(list(self.f.root.glob('*/ssh-control')), [], 'runner leaked SSH socket')
         if expected == 125:
             self.assertIn(b'native Git verify-commit failed', output)
@@ -241,57 +225,41 @@ class NativeJobControlTests(unittest.TestCase):
         self.shell.send(b'\x03')
         self.assert_finished(130)
 
-    def assert_forced_askpass_fails(self, helper, *, materialized=False, compare_native=True):
-        f, shell = self.f, self.shell
-        argv = [shutil.which('env'), '-u', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE=force']
-        if helper is not None:
-            argv.append(f'SSH_ASKPASS={helper}')
-        if compare_native:
-            native = subprocess.run([*argv, 'git', 'ls-remote', self.url, 'HEAD'],
-                                    cwd=f.cwd, env=f.env, capture_output=True, timeout=15)
-            self.assertNotEqual(native.returncode, 0, native.stdout)
-            self.assertIn(b'Permission denied (publickey)', native.stderr)
-        options = ['--verify']
-        if materialized:
-            tools = f.root / 'eager-auth-tools'
-            tools.mkdir()
-            for name in ('git', 'ssh'):
-                (tools / name).symlink_to(shutil.which(name))
-            argv.append(f'PATH={tools}')
-            options.append('--write-policy=all')
-        runner_file = f.root / 'forced-askpass-runner'
-        argv.extend(['/bin/sh', '-c', 'printf "%s" "$$" > "$1"; shift; exec "$@"',
-                     'fixture', str(runner_file), str(remote.OPTIONS.binary), self.url,
-                     'HEAD', *options, '--', '/bin/true'])
-        shell.send((shlex.join(argv) + '; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
-        shell.wait_for(lambda: runner_file.exists() and runner_file.stat().st_size > 0,
-                       'runner did not start')
-        runner = int(runner_file.read_text())
-        shell.groups.add(runner)
-        try:
-            output = shell.expect(shell.prompt, timeout=8)
-        except AssertionError:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(runner, signal.SIGTERM)
-            shell.expect(shell.prompt)
-            shell.groups.remove(runner)
-            raise
-        shell.groups.remove(runner)
-        self.assertIn(b'\r\nASKPASS-STATUS:125\r\n', output)
-        self.assertIn(b'Permission denied (publickey)', output)
-        self.assertNotIn(b"identity': ", output)
-        self.assertEqual(remote.run_directories(f.root), [])
-
-    # Each test gets its own listener so failures from another case cannot
-    # make OpenSSH reject a new connection before authentication.
     def test_forced_askpass_failure_does_not_fall_back_to_terminal(self):
-        self.assert_forced_askpass_fails(None)
-
-    def test_empty_forced_askpass_does_not_fall_back_in_lazy_execution(self):
-        self.assert_forced_askpass_fails('', compare_native=False)
-
-    def test_empty_forced_askpass_does_not_fall_back_in_materialized_execution(self):
-        self.assert_forced_askpass_fails('', materialized=True)
+        import subprocess
+        f=self.f;shell=self.shell
+        tools=f.root/'eager-auth-tools';tools.mkdir()
+        for name in ('git','ssh'):(tools/name).symlink_to(shutil.which(name))
+        for helper in ('empty','default'):
+            with self.subTest(helper=helper):
+                env=dict(f.env,SSH_ASKPASS_REQUIRE='force')
+                env.pop('SSH_ASKPASS',None)
+                if helper=='empty':env['SSH_ASKPASS']=''
+                native=subprocess.run(['git','ls-remote',self.url,'HEAD'],env=env,
+                                      capture_output=True,timeout=15)
+                self.assertNotEqual(native.returncode,0,native.stdout)
+                for backend in (('lazy','materialized') if helper=='empty' else ('lazy',)):
+                    runner_file=f.root/f'forced-askpass-{helper}-{backend}'
+                    argv=[shutil.which('env'),'-u','SSH_ASKPASS','SSH_ASKPASS_REQUIRE=force']
+                    if helper=='empty':argv.append('SSH_ASKPASS=')
+                    if backend=='materialized':argv.append('PATH='+str(tools))
+                    argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1.tmp"; /bin/mv "$1.tmp" "$1"; shift; exec "$@"',
+                                 'fixture',str(runner_file),str(remote.OPTIONS.binary),self.url,
+                                 'HEAD','--verify',*(['--write-policy=all'] if backend=='materialized' else []),'--','/bin/true'])
+                    shell.send((shlex.join(argv)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
+                    shell.wait_for(runner_file.exists,'runner did not start')
+                    shell.groups.add(int(runner_file.read_text()))
+                    try:output=shell.expect(shell.prompt,timeout=8)
+                    except AssertionError:
+                        with contextlib.suppress(ProcessLookupError):os.killpg(int(runner_file.read_text()),signal.SIGTERM)
+                        shell.expect(shell.prompt)
+                        shell.groups.clear()
+                        raise
+                    shell.groups.clear()
+                    self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
+                    self.assertNotIn(b"identity': ",output)
+                    self.assertEqual(run_directories(f.root),[])
+                    if backend=='materialized':self.assertIn(b'Permission denied',output)
 
 
 class HttpsCredentialTerminalTests(unittest.TestCase):
@@ -318,9 +286,9 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         shell.send((shlex.join(command)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
         output=shell.expect(shell.prompt,timeout=20)
         self.assertIn(b'\r\nASKPASS-STATUS:0\r\n',output)
-        self.assertEqual(remote.run_directories(f.root),[])
+        self.assertEqual(run_directories(f.root),[])
 
-    def test_managed_https_credential_lookup_keeps_runner_in_foreground(self):
+    def test_managed_credentials_keep_foreground_and_finish_materialization(self):
         import base64
         f=remote.Fixture(); self.addCleanup(f.close)
         # Fork the shell before starting the fixture's HTTPS server thread.
@@ -343,17 +311,18 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                           ' token=subprocess.check_output([os.environ["GIT_ASKPASS"],"https-helper-token: "])\n'
                           ' sys.stdout.write("username=fixture\\npassword="+token.decode().strip()+"\\n")\n')
         helper.chmod(0o700)
-        # The direct HTTPS session authenticates during discovery.
-        # Hide the FUSE helper so the test can stop before mounting.
+        # Hide the FUSE helper, retaining actual HTTPS and an actual terminal.
         programs=f.root/'programs'; programs.mkdir()
         (programs/'git').symlink_to(shutil.which('git'))
         environment=dict(PATH=str(programs),GIT_CONFIG_COUNT='1',GIT_SSL_CAINFO=f.env['GIT_SSL_CAINFO'],
                          GIT_CONFIG_KEY_0='credential.helper',GIT_CONFIG_VALUE_0=str(helper))
         command=[shutil.which('env'),*[key+'='+value for key,value in environment.items()],
-                 str(remote.OPTIONS.binary),url,'HEAD','--backend=fuse','--','/bin/false']
-        shell.send((shlex.join(command)+'; printf "https-helper-status=%d\\n" "$?"\n').encode())
-        native_groups=set(); deadline=time.monotonic()+20
-        while shell.prompt not in shell.pending:
+                 str(remote.OPTIONS.binary),url,'HEAD','--write-policy=all','--',
+                 sys.executable,'-I','-S','-c',
+                 "from pathlib import Path; assert Path('deep/file').read_bytes()==b'expected\\n'; print('https-helper-command-ok')"]
+        shell.send((shlex.join(command)+'\n').encode())
+        prompts=0; deadline=time.monotonic()+20
+        while b'\r\nhttps-helper-command-ok\r\n' not in shell.pending:
             self.assertLess(time.monotonic(),deadline,'HTTPS credential flow did not finish: '+repr(bytes(shell.transcript)))
             if b'https-helper-token: ' in shell.pending:
                 shell.expect(b'https-helper-token: ')
@@ -363,16 +332,15 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                 shell.groups={runner,group}
                 self.assertEqual(os.tcgetpgrp(shell.fd),runner,
                                  'credential helper took the terminal from git-on')
-                native_groups.add(group)
-                shell.send(b'fixture-token\n')
+                shell.send(b'fixture-token\n'); prompts+=1
             else: shell.read()
-        output=shell.expect(shell.prompt)
+        self.assertEqual(prompts,1,'expected one credential lookup for the stream')
+        shell.expect(shell.prompt)
         shell.groups.clear()
-        self.assertIn(b'FUSE unavailable',output)
-        self.assertIn(b'\r\nhttps-helper-status=125\r\n',output)
-        self.assertEqual(len(native_groups),1,'expected one credential lookup per session')
+        shell.send(b'printf "https-helper-status=%s\\n" "$?"\n')
+        shell.expect(b'https-helper-status=0\r\n'); shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-        self.assertEqual(remote.run_directories(f.root),[],'HTTPS run leaked temporary storage')
+        self.assertEqual(run_directories(f.root),[],'HTTPS run leaked temporary storage')
 
 
 def replay_baseline():

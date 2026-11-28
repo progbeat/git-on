@@ -7,7 +7,7 @@ use super::{
         Job, REMOTE_READ_WINDOW,
     },
     protocol::{self, Credentials, Rpc, SessionId, MAX_OPS},
-    Context, Server, Writer, MIN_CHANNEL_SIZE,
+    Context, DemandFailure, Server, Writer, MIN_CHANNEL_SIZE,
 };
 use crate::{backend::FileType, filesystem::SourceLookup, snapshot::PendingObject};
 use git2::Oid;
@@ -26,8 +26,7 @@ use tokio::{
 type SlotKey = (SessionId, u32);
 
 enum ObjectDemand {
-    Blob(Oid, Option<u64>),
-    Directory(Oid),
+    Final(Oid, Option<u64>),
     ParentTree(Oid),
 }
 
@@ -58,8 +57,12 @@ impl Server {
             while index < parked.len() {
                 if parked[index].object.ready() {
                     let call = parked.swap_remove(index);
-                    call.object.finish();
-                    if call.recheck_lookup {
+                    let failure = call.object.finish().err().map(|_| DemandFailure {
+                        // A parent tree is needed by LOOKUP, before GETFH and
+                        // GETATTR. All other demands serve the last operation.
+                        operations_left: if call.recheck_lookup { 3 } else { 1 },
+                    });
+                    if call.recheck_lookup && failure.is_none() {
                         let next = match &call.job {
                             Job::Call(data, _) => {
                                 self.read_request(data, parked.iter().map(|call| call.slot))
@@ -79,7 +82,7 @@ impl Server {
                             }
                         }
                     }
-                    call.job.run(self);
+                    call.job.run(self, failure);
                 } else {
                     index += 1;
                 }
@@ -138,7 +141,7 @@ impl Server {
                     _ => (),
                 },
             }
-            job.run(self);
+            job.run(self, None);
         }
     }
 
@@ -147,12 +150,11 @@ impl Server {
         demand: ObjectDemand,
         wake: &Arc<Notify>,
     ) -> Option<(PendingObject, bool)> {
-        let (object, recheck_lookup) = match demand {
-            ObjectDemand::Blob(oid, inode) => (self.core.start_remote_demand(oid, inode), false),
-            ObjectDemand::Directory(oid) => (self.core.start_remote_tree_demand(oid), false),
-            ObjectDemand::ParentTree(oid) => (self.core.start_remote_tree_demand(oid), true),
+        let (oid, inode, recheck_lookup) = match demand {
+            ObjectDemand::Final(oid, inode) => (oid, inode, false),
+            ObjectDemand::ParentTree(oid) => (oid, None, true),
         };
-        let object = object?;
+        let object = self.core.start_remote_demand(oid, inode)?;
         object.notify_when_ready(wake);
         Some((object, recheck_lookup))
     }
@@ -217,7 +219,7 @@ impl Server {
             [PutFh(handle), GetAttr(mask)] => {
                 let ino = self.inode_from_handle(handle).ok()?;
                 self.attribute_size_demand(ino, *mask)
-                    .map(|oid| ObjectDemand::Blob(oid, Some(ino)))
+                    .map(|oid| ObjectDemand::Final(oid, Some(ino)))
             }
             [PutFh(handle), GetAttr(parent_mask), Lookup(name), GetFh, GetAttr(mask)] => {
                 self.lookup_size_demand(credentials, handle, Some(*parent_mask), name, *mask)
@@ -251,7 +253,7 @@ impl Server {
         // Reserve only the exact object during admission under a different
         // UID. The regular RPC path applies permissions and read-ahead.
         let demand = match demand {
-            Some(ObjectDemand::Blob(oid, _)) if !same_uid => Some(ObjectDemand::Blob(oid, None)),
+            Some(ObjectDemand::Final(oid, _)) if !same_uid => Some(ObjectDemand::Final(oid, None)),
             demand => demand,
         };
         Some((id, demand))
@@ -271,8 +273,7 @@ impl Server {
         }
         self.require_access(&Context::new(credentials), ino, libc::R_OK | libc::X_OK)
             .ok()?;
-        self.core.begin_directory_enumeration();
-        Some(ObjectDemand::Directory(oid))
+        Some(ObjectDemand::Final(oid, None))
     }
 
     fn attribute_size_demand(&self, ino: u64, mask: Bitmap) -> Option<Oid> {
@@ -305,7 +306,7 @@ impl Server {
         {
             SourceLookup::Inode(ino) => self
                 .attribute_size_demand(ino, mask)
-                .map(|oid| ObjectDemand::Blob(oid, Some(ino))),
+                .map(|oid| ObjectDemand::Final(oid, Some(ino))),
             SourceLookup::Tree(oid) => Some(ObjectDemand::ParentTree(oid)),
         }
     }
@@ -316,11 +317,44 @@ mod tests {
     use super::*;
     use crate::{
         backend::nfs::{
-            status::{ACCESS, OK, SEQ_FALSE_RETRY},
+            status::{ACCESS, IO, OK, SEQ_FALSE_RETRY},
             tests::{call_as, fixture, results, sequence, session_with, xdr},
         },
         policy::WritePolicy,
     };
+
+    #[test]
+    fn failed_demand_returns_and_replays_the_compound_error() {
+        let (_dir, mut server) = fixture(WritePolicy::None);
+        let call = |xid, count, ops: &[u8]| call_as(xid, count, ops, 10, 11, &[]);
+        let session = session_with(&mut server, call);
+        let request = |xid, seq| {
+            let ops = xdr(|w| {
+                sequence(w, &session, seq, 0, 3);
+                w.u32(24); // PUTROOTFH
+                w.u32(15); // LOOKUP
+                w.opaque(b"tracked");
+                w.u32(10); // GETFH
+                w.u32(9); // GETATTR size
+                w.u32(1);
+                w.u32(1 << 4);
+            });
+            call(xid, 5, &ops)
+        };
+        let first = request(3, 1);
+        let reply = server
+            .rpc_after_demand(&first, Some(DemandFailure { operations_left: 3 }))
+            .unwrap();
+        let replay = server.rpc_after_demand(&first, None).unwrap();
+        assert!(Arc::ptr_eq(
+            reply.body.as_ref().unwrap(),
+            replay.body.as_ref().unwrap(),
+        ));
+        let reply = reply.into_bytes();
+        results(&reply, IO, 3);
+        assert_eq!(replay.into_bytes(), reply);
+        results(&server.rpc(&request(4, 2)).unwrap(), OK, 5);
+    }
 
     #[test]
     fn mixed_uid_attribute_calls_preserve_permissions_and_slot_order() {
@@ -342,7 +376,7 @@ mod tests {
         let parked = || [(session, 0)].into_iter();
         assert!(matches!(
             server.read_request(&request, parked()),
-            Some(((id, 1), Some(ObjectDemand::Blob(_, None)))) if id == session
+            Some(((id, 1), Some(ObjectDemand::Final(_, None)))) if id == session
         ));
         assert!(server
             .read_request(&request, [(session, 1)].into_iter())

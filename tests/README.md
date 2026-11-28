@@ -28,12 +28,8 @@ ratio or complete #20 acceptance. See [CI coverage](../docs/ci-performance.md).
 
 ```console
 cargo build --locked
-fixture_env=$(mktemp -d)
-trap 'rm -rf -- "$fixture_env"' EXIT
-python3 -m venv "$fixture_env"
-"$fixture_env/bin/python" -m pip install -r tests/requirements-http2.txt
-"$fixture_env/bin/python" tests/integration.py --binary target/debug/git-on --require-fuse --uv
-"$fixture_env/bin/python" tests/write_policy.py --binary target/debug/git-on --require-fuse
+python3 tests/integration.py --binary target/debug/git-on --require-fuse --uv
+python3 tests/write_policy.py --binary target/debug/git-on --require-fuse
 ```
 
 Requirements: Linux, Git, Python 3.11+, `uv` (CI pins 0.8.22), a usable `/dev/fuse`,
@@ -57,42 +53,22 @@ tests as skipped; this is not evidence that the filesystem works. `--uv` enables
 the dependency integration tests and must not be omitted when claiming complete
 coverage.
 
-To exercise shutdown after rereading a spilled blob on an NFS-backed temporary
-directory, run the real FUSE test with `TMPDIR` set to a writable NFS mount:
-
-```sh
-TMPDIR=/path/to/nfs python3 tests/integration.py --require-fuse \
-  MountTests.test_cleanup_after_reading_a_spilled_blob
-```
-
-This places the raw cache on NFS, where an open file can defer unlink. The FUSE
-mount still serves the snapshot to the child command.
-The real-FUSE CI job provisions loopback NFS from `nfs-kernel-server` in
-private namespaces. It checks command status, spill, legacy recovery, and
-focused Rust recovery checks on that backing filesystem. Build the bin test
-harness with `cargo test --locked --bin git-on --no-run` and pass its printed
-executable path as `test_binary`.
-
-```sh
-sudo unshare --mount --net --uts --propagation private \
-  /bin/sh tests/nfs_cleanup.sh target/debug/git-on "$(id -u)" "$(id -g)" "$test_binary"
-```
-
 ## Remote transport and native verification
 
 `tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
 fixture certificates, identities, agents and signing keys. Native Git is the
-verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG;
-no user key or trust store is read or changed by these tests. Use the Python
-environment with `tests/requirements-http2.txt` installed as shown above.
+verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG.
+Install the Python HTTP/2 fixture dependencies in the test environment with
+`python3 -m pip install h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0`.
+The fixtures use disposable keys and trust stores.
 
 ```console
 cargo build --locked --features test-metrics --example source-probe --bin git-on
-"$fixture_env/bin/python" tests/remote.py
-"$fixture_env/bin/python" tests/ssh_regressions.py
-"$fixture_env/bin/python" tests/native_job_control.py
-"$fixture_env/bin/python" tests/remote.py --require-fuse
-"$fixture_env/bin/python" tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
+python3 tests/remote.py
+python3 tests/ssh_regressions.py
+python3 tests/native_job_control.py
+python3 tests/remote.py --require-fuse
+python3 tests/remote.py --require-fuse --million RemoteTests.test_million_distinct_file_remote_fresh_runs_bounded_fetch
 ```
 
 The source probe exercises the production loader without a mount and records
@@ -116,7 +92,7 @@ authentic historical executables without rebuilding known failing binaries on
 every push.
 SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
-retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
+retain the live master and run for recovery. A Linux/glibc spawn interposer
 changes the pathname only after file validation, demonstrating the old race;
 fixed shutdown must not reach that spawn at all. Existing outside-PATH ELF and
 transparent-wrapper checks continue to require actual OpenSSH master closure.
@@ -125,26 +101,12 @@ total deadline; these socket-pair checks are distinct from actual SSH and FUSE.
 The million fixture has exactly one million distinct seven-byte blobs at six
 digit paths; preparation verifies every leaf before measuring remote demand.
 
-The `rust` CI job runs loader regressions. `real-fuse` runs the OpenSSH
-regressions and requires real mounts for remote writes, keep, cancellation,
-busy/stale recovery, external
+The `rust` CI job runs loader and SSH regressions. `real-fuse` requires real
+mounts for remote writes, keep, cancellation, busy/stale recovery, external
 `git -c --verify`, and caught transport EIO. `lazy-performance` requires actual
 FUSE for the remote million no-op/read and repeated fresh-run read. A loader success or
 an explicitly skipped local mount test is never a real-FUSE pass. Public GitHub
 availability is not required by these deterministic gates.
-
-For the live GitHub.com transport check, run the same read on both URLs with
-native Git and an SSH identity accepted by GitHub.
-
-```sh
-revision=7241600d3594980a32d70d6b749a1e7c70238842
-for source in https://github.com/progbeat/git-on.git git@github.com:progbeat/git-on.git; do
-    git on "$source" "$revision" --backend=copy --write-policy=all -- cat Cargo.toml | shasum -a 256
-done
-```
-
-Each run prints hash
-`366a84336f449c132dcf19ce8d1dba22324b9c7cda389b979f6b12841aa4f3fe`.
 
 ## Complete FUSE callback inventory
 
@@ -177,10 +139,12 @@ protection, file/directory renames and deletion, symlinks/hardlinks, metadata,
 open-handle coherence, disposable overlay cleanup, command errors and SIGINT cleanup.
 Its dirty-index/working-copy fixture verifies that `untracked` means absent from
 the selected commit. Source checks include ignored host files to catch leaks.
-
-The shared mount suite checks first-write isolation and detects altered spilled
-blocks on reads of the immutable file. The Linux fault shim injects one backing
-unlink failure to verify that an open unlinked inode stays usable.
+Source-transfer regressions inject same-UID changes at rename, partial-write and
+truncate boundaries through `support/transfer_fault.c`; every case must return
+checked bytes or EIO. Actual inherited file-size and descriptor limits exercise
+short writes, recovery and retained source proofs separately. The tmpfs subset
+checks capacity for partial preservation and full replacement; the ordinary
+allocation matrix covers all writable-open lifecycles.
 
 | Path / operation | `none` | `ignored` | `untracked` | `all` |
 | --- | --- | --- | --- | --- |
@@ -250,14 +214,14 @@ after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
 active state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
-runs verify isolation and normal mount cleanup. Example artifact tests
+runs verify isolation and normal mount and runtime cleanup. Example artifact tests
 inspect caches inside the command or explicitly copy them to an external path.
 
 Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
 during startup transport and after the mounted child starts. SIGKILL observations
 kill only the runner first: assert the exact mount remains in `mountinfo`, fresh
 directory access returns `ENOTCONN`, the child group and SSH master survive,
-and private files remain. Stale cleanup can acquire the private run lock.
+private files remain, and run/cache flocks are available.
 External fixture cleanup stops the owned child before checked stale recovery;
 recovery must remove the mount and private state and close the recorded master.
 A native fusermount wrapper holds helper completion after the actual mount to
@@ -306,11 +270,11 @@ See [resource acceptance](../docs/resources.md), the
 [CI cost/coverage map](../docs/ci-performance.md), and the
 [dependency audit](../docs/crate-audit.md). Resource regressions remain in
 `remote.py`; optional `--before-resource-probe` replays exact-master failures.
-`pack_scaling.py --probe ...` uses Linux strace to check for zero private pack
-filesystem activity. It checks network requests for 32, 128 and 512 distinct
-blobs and verifies the available OID set once after both read passes. The probe's `--metrics-only` mode omits
-full-OID enumeration from repeated measurements. Report preparation and command
-time separately.
+`pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
+32/128/512 distinct-object pack metadata work, and verifies the full available
+OID set once after both read passes. The current HTTPS run reports wall time
+under strace. The optional historical file-transport replay reports structural
+counters and uses the original probe's per-read enumeration.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
 defaults to `--profile matrix`: every interaction once at 1k paths. The pinned

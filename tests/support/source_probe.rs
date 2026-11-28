@@ -2,17 +2,13 @@
 use anyhow::{Context, Result};
 use git_on::snapshot::Snapshot;
 use std::{
-    env, fs,
+    env,
     io::{self, BufRead, Write},
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
 };
 fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
-    let mut report = serde_json::json!({
-        "tree": snapshot.tree_oid.to_string(),
-        "metrics": snapshot.metrics(),
-        "source_git_dir": snapshot.source_git_dir().map(|path| path.as_os_str().as_bytes()),
-    });
+    let mut report =
+        serde_json::json!({"tree": snapshot.tree_oid.to_string(), "metrics": snapshot.metrics()});
     if include_objects {
         let objects: Vec<_> = snapshot
             .available_objects()?
@@ -25,74 +21,25 @@ fn report(snapshot: &Snapshot, include_objects: bool) -> Result<()> {
     io::stdout().flush()?;
     Ok(())
 }
-fn main() {
-    if let Some(status) = git_on::service_storage::invoke() {
-        std::process::exit(status);
-    }
-    if let Some(status) = git_on::remote::invoke_ssh_launcher() {
-        std::process::exit(status);
-    }
-    finish(run())
-}
-
-fn finish(result: Result<()>) {
-    let failed = result.is_err();
-    if let Err(error) = result {
-        git_on::git::write_run_error(format_args!("source-probe: {error:#}\n"));
-    }
-    if let Some(signal) = git_on::git::cancelled_signal() {
-        std::process::exit(128 + signal);
-    }
-    if failed {
-        std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn cancelled_probe_reports_cleanup_failure() {
-    use std::process::Command;
-
-    const CHILD: &str = "GIT_ON_TEST_PROBE_CANCELLED_CLEANUP";
-    const ERROR: &str = "probe recovery retained at /fixture";
-    if env::var_os(CHILD).is_some() {
-        git_on::git::cancel_by_signal(libc::SIGTERM);
-        finish(Err(anyhow::anyhow!(ERROR)));
-        unreachable!();
-    }
-    let output = Command::new(env::current_exe().unwrap())
-        .args(["--exact", "cancelled_probe_reports_cleanup_failure"])
-        .env(CHILD, "1")
-        .env_remove("GIT_TRACE_PACKET")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
-    assert!(String::from_utf8_lossy(&output.stderr).contains(ERROR));
-}
-
-fn run() -> Result<()> {
+fn main() -> Result<()> {
     // Same process-start resource policy as the production CLI.
     unsafe { git_on::object::configure_pack_descriptors() }?;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let source = args.first().context("source required")?;
     let revision = args.get(1).context("revision required")?;
-    let run = tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()?;
+    let run = tempfile::tempdir()?;
     let loaded = Snapshot::load_source(
         &env::current_dir()?,
         (source != "local").then_some(source.as_os_str()),
         revision,
         args.iter().any(|x| x == "--verify"),
-        false,
+        args.iter().any(|x| x == "--eager"),
         run.path(),
     );
     let snapshot = match loaded {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(cleanup) =
-                git_on::remote::stop_connection(&git_on::platform::ssh_control_path(run.path()))
-            {
+            if let Err(cleanup) = git_on::remote::stop_run_connection(run.path()) {
                 let retained = run.keep();
                 return Err(anyhow::anyhow!(
                     "{error:#}; shutdown: {cleanup:#}; probe recovery retained at {}",
@@ -146,9 +93,6 @@ fn run() -> Result<()> {
                 "{}",
                 serde_json::json!({"names": entries.iter().map(|x| x.0.to_string_lossy()).collect::<Vec<_>>()})
             );
-        } else if let Some(path) = operation.strip_prefix("materialize ") {
-            git_on::materialize::materialize(&snapshot, Path::new(path))?;
-            println!("{}", serde_json::json!({"materialized": true}));
         } else if operation != "report" {
             anyhow::bail!("unknown probe operation");
         }

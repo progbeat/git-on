@@ -1,37 +1,41 @@
 use super::{
     protocol::{StateId, MAX_OPS},
     read_record,
-    server::{RpcReply, Server},
+    server::Server,
     status::*,
-    write_response,
     xdr::{fragment, Reader, Writer, MAX_RECORD},
     FilesystemFailures,
 };
-use crate::{
-    filesystem::Overlay,
-    policy::WritePolicy,
-    raw_blob::{RawBlobs, BLOCK},
-    snapshot::Snapshot,
-};
+use crate::{filesystem::Overlay, policy::WritePolicy, snapshot::Snapshot};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::io::AsyncWriteExt;
 
-pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
-    fixture_with_content(policy, b"tracked bytes")
+#[test]
+fn mount_helper_captures_diagnostics_without_a_file() {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "test ! -f /dev/fd/2 || exit 9; head -c 131072 /dev/zero >&2; printf 'mount failure\n' >&2; exit 3",
+    ]);
+    let message = super::run_mount_helper(command, || false)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("exit status: 3"));
+    assert!(message.ends_with("mount failure"));
 }
 
-fn fixture_with_content(policy: WritePolicy, content: &[u8]) -> (tempfile::TempDir, Server) {
+pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
     let directory = tempfile::tempdir().unwrap();
     let repo = git2::Repository::init(directory.path()).unwrap();
-    let blob = repo.blob(content).unwrap();
+    let blob = repo.blob(b"tracked bytes").unwrap();
     let mut tree = repo.treebuilder(None).unwrap();
     tree.insert("tracked", blob, 0o100644).unwrap();
     let tree = tree.write().unwrap().to_string();
     let id = uuid::Uuid::new_v4();
-    let snapshot = Snapshot::load(directory.path(), tree.as_ref(), &id.to_string()).unwrap();
+    let snapshot = Snapshot::load(directory.path(), tree.as_ref()).unwrap();
     let core =
         Overlay::with_write_policy(snapshot, directory.path().join("backing"), policy).unwrap();
     (
@@ -103,22 +107,91 @@ fn session(server: &mut Server) -> [u8; 16] {
     session_with(server, call)
 }
 
+#[test]
+fn readlink_keeps_the_target_in_a_separate_reply_segment() {
+    let (_directory, mut server) = fixture(WritePolicy::All);
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let target = b"tracked";
+    server
+        .core
+        .create_node(
+            1,
+            "link".as_ref(),
+            crate::backend::FileType::Symlink,
+            0o777,
+            uid,
+            gid,
+            target.to_vec(),
+        )
+        .unwrap();
+    let session = session(&mut server);
+    let ops = xdr(|w| {
+        sequence(w, &session, 1, 0, 3);
+        w.u32(24); // PUTROOTFH
+        w.u32(15); // LOOKUP
+        w.opaque(b"link");
+        w.u32(27); // READLINK
+    });
+    let reply = server.rpc_after_demand(&call(3, 4, &ops), None).unwrap();
+    assert_eq!(
+        reply.body.as_ref().unwrap().segments().nth(1),
+        Some(target.as_slice())
+    );
+    let reply = reply.into_bytes();
+    let mut r = results(&reply, OK, 4);
+    stat(&mut r, 53, OK);
+    r.take(36).unwrap();
+    stat(&mut r, 24, OK);
+    stat(&mut r, 15, OK);
+    stat(&mut r, 27, OK);
+    assert_eq!(r.opaque(255).unwrap(), target);
+    r.finish().unwrap();
+}
+
+#[test]
+fn compound_read_keeps_both_cached_ranges_in_the_reply() {
+    let (_directory, mut server) = fixture(WritePolicy::None);
+    let ino = server.core.lookup_inode(1, "tracked".as_ref()).unwrap();
+    let cached = server.core.read_without_handle(ino, 0, 13).unwrap();
+    let session = session(&mut server);
+    let ops = xdr(|w| {
+        sequence(w, &session, 1, 0, 3);
+        lookup_tracked(w);
+        for (offset, size) in [(0, 3), (8, 5)] {
+            w.u32(25); // READ
+            StateId::READ_BYPASS.encode(w);
+            w.u64(offset);
+            w.u32(size);
+        }
+    });
+    let reply = server.rpc_after_demand(&call(3, 5, &ops), None).unwrap();
+    let segments: Vec<_> = reply.body.as_ref().unwrap().segments().collect();
+    assert_eq!(segments[1].as_ptr(), cached.as_ptr());
+    assert_eq!(
+        segments.get(3).map(|data| data.as_ptr()),
+        Some(cached[8..].as_ptr())
+    );
+    assert_eq!(segments[1], &cached[..3]);
+    assert_eq!(segments[3], &cached[8..]);
+    let reply = reply.into_bytes();
+    let mut r = results(&reply, OK, 5);
+    stat(&mut r, 53, OK);
+    r.take(36).unwrap();
+    stat(&mut r, 24, OK);
+    stat(&mut r, 15, OK);
+    for (data, eof) in [(&cached[..3], false), (&cached[8..], true)] {
+        stat(&mut r, 25, OK);
+        assert_eq!(r.boolean().unwrap(), eof);
+        assert_eq!(r.opaque(13).unwrap(), data);
+    }
+    r.finish().unwrap();
+}
+
 pub(super) fn session_with(
     server: &mut Server,
     call: impl Fn(u32, u32, &[u8]) -> Vec<u8>,
 ) -> [u8; 16] {
-    let create = create_session_request(server, &call, MAX_RECORD as u32);
-    let reply = server.rpc(&call(2, 1, &create)).unwrap();
-    let mut r = results(&reply, OK, 1);
-    assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (43, OK));
-    r.fixed().unwrap()
-}
-
-fn create_session_request(
-    server: &mut Server,
-    call: impl Fn(u32, u32, &[u8]) -> Vec<u8>,
-    reply_limit: u32,
-) -> Vec<u8> {
     let exchange = xdr(|w| {
         w.u32(42);
         w.fixed(&[7; 8]);
@@ -132,7 +205,7 @@ fn create_session_request(
     assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (42, OK));
     let client = r.u64().unwrap();
     let sequence = r.u32().unwrap();
-    xdr(|w| {
+    let create = xdr(|w| {
         w.u32(43);
         w.u64(client);
         w.u32(sequence);
@@ -141,8 +214,8 @@ fn create_session_request(
             for n in [
                 0,
                 MAX_RECORD as u32,
-                reply_limit,
-                reply_limit,
+                MAX_RECORD as u32,
+                MAX_RECORD as u32,
                 MAX_OPS as u32,
                 4,
                 0,
@@ -152,67 +225,11 @@ fn create_session_request(
         }
         w.u32(0);
         w.u32(0);
-    })
-}
-
-#[test]
-fn create_session_replay_keeps_only_the_operation_payload() {
-    let (_dir, mut server) = fixture(WritePolicy::None);
-    let request = create_session_request(&mut server, call, MAX_RECORD as u32);
-    let original = server.rpc(&call(2, 1, &request)).unwrap();
-    let replay = server.rpc(&call(3, 1, &request)).unwrap();
-    assert_eq!(original[4..], replay[4..]);
-}
-
-#[test]
-fn cached_read_reply_fits_the_negotiated_slot_budget() {
-    const COUNT: usize = 600 * 1024 + 1;
-    const SECOND: usize = 128 * 1024 + 3;
-    const LIMIT: usize = 1024 * 1024;
-    for size in [COUNT, LIMIT + 1] {
-        let contents = vec![b'x'; size];
-        let (_dir, mut server) = fixture_with_content(WritePolicy::None, &contents);
-        let create = create_session_request(&mut server, call, LIMIT as u32);
-        let reply = server.rpc(&call(2, 1, &create)).unwrap();
-        let mut response = results(&reply, OK, 1);
-        stat(&mut response, 43, OK);
-        let session = response.fixed().unwrap();
-        let ops = xdr(|w| {
-            sequence(w, &session, 1, 0, 0);
-            lookup_tracked(w);
-            w.u32(25); // READ
-            StateId::ANONYMOUS.encode(w);
-            w.u64(0);
-            w.u32(COUNT as u32);
-            w.u32(25); // A second range shares the same verified allocation.
-            StateId::ANONYMOUS.encode(w);
-            w.u64(3);
-            w.u32(SECOND as u32);
-            w.u32(10); // GETFH
-        });
-        let reply = server.rpc_reply(&call(3, 6, &ops)).unwrap();
-        let body = reply.body.unwrap();
-        assert!(body.len() > COUNT + SECOND);
-        assert!(body.capacity() + reply.header.len() <= LIMIT);
-        assert_eq!(body.data_slice_count(), 2 * usize::from(size == COUNT));
-        let replay = server.rpc_reply(&call(4, 6, &ops)).unwrap().body.unwrap();
-        assert!(Arc::ptr_eq(&body, &replay));
-        let encoded = server.rpc(&call(5, 6, &ops)).unwrap();
-        let mut response = results(&encoded, OK, 6);
-        stat(&mut response, 53, OK);
-        response.take(36).unwrap();
-        stat(&mut response, 24, OK); // PUTROOTFH
-        stat(&mut response, 15, OK); // LOOKUP
-        stat(&mut response, 25, OK);
-        assert_eq!(response.boolean().unwrap(), size == COUNT);
-        assert_eq!(response.opaque(COUNT).unwrap(), &contents[..COUNT]);
-        stat(&mut response, 25, OK);
-        assert!(!response.boolean().unwrap());
-        assert_eq!(response.opaque(SECOND).unwrap(), &contents[3..3 + SECOND]);
-        stat(&mut response, 10, OK);
-        assert!(!response.opaque(64).unwrap().is_empty());
-        response.finish().unwrap();
-    }
+    });
+    let reply = server.rpc(&call(2, 1, &create)).unwrap();
+    let mut r = results(&reply, OK, 1);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (43, OK));
+    r.fixed().unwrap()
 }
 
 pub(super) fn sequence(w: &mut Writer, session: &[u8; 16], sequence: u32, slot: u32, highest: u32) {
@@ -666,74 +683,6 @@ fn request_counts_and_lengths_are_bounded() {
     let ops = xdr(|w| sequence(w, &session, 1, 0, 3));
     let reply = server.rpc(&call(1, (MAX_OPS + 1) as u32, &ops)).unwrap();
     stat(&mut results(&reply, TOO_MANY_OPS, 1), 53, TOO_MANY_OPS);
-}
-
-#[tokio::test]
-async fn checked_blocks_and_padding_reach_the_socket_in_order() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut store = RawBlobs::disk_only(directory.path()).unwrap();
-    let bytes: Vec<_> = (0..3 * BLOCK).map(|n| (n % 251) as u8).collect();
-    let oid = git2::Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap();
-    let blob = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
-    let offset = BLOCK - 1;
-    let count = BLOCK + 3;
-    let mut writer = Writer::default();
-    writer.opaque_data(
-        blob.read_shared(offset as u64, count as u32).unwrap(),
-        4 * BLOCK,
-    );
-    writer.u32(123);
-    let body = writer.into_reply(Some(4 * BLOCK));
-    assert_eq!(body.data_slice_count(), 3);
-    let response = RpcReply {
-        header: vec![0; 4],
-        body: Some(Arc::new(body)),
-    };
-
-    let (mut peer, stream) = tokio::net::UnixStream::pair().unwrap();
-    let (_, mut output) = stream.into_split();
-    let deadline = Duration::from_secs(5);
-    let (_, received) = tokio::time::timeout(deadline, async {
-        tokio::try_join!(
-            write_response(&mut output, Some(response), deadline),
-            read_record(&mut peer)
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    let mut reply = Reader::new(&received);
-    assert_eq!(reply.u32().unwrap(), 0);
-    assert_eq!(reply.opaque(count).unwrap(), &bytes[offset..offset + count]);
-    assert_eq!(reply.u32().unwrap(), 123);
-    reply.finish().unwrap();
-    for operation_budget in [4 * BLOCK, 2 * BLOCK] {
-        let mut writer = Writer::default();
-        writer.opaque_data(
-            blob.read_shared(offset as u64, count as u32).unwrap(),
-            operation_budget,
-        );
-        writer.u32(123);
-        let replay = writer.into_reply(Some(2 * BLOCK));
-        assert_eq!(replay.data_slice_count(), 0);
-        assert!(replay.capacity() <= 2 * BLOCK);
-        assert!(replay.slices().flatten().eq(&received[4..]));
-    }
-
-    use crate::raw_blob::{BlobBytes, ReadData};
-    const BUDGET: usize = 88;
-    let mut writer = Writer::default();
-    let shared = BlobBytes::from(vec![b'a'; 24]);
-    for data in [
-        ReadData::Shared(shared.clone(), 0..20),
-        ReadData::Shared(shared, 4..24),
-        ReadData::Shared(BlobBytes::from(vec![b'b'; 44]), 5..8),
-    ] {
-        writer.opaque_data(data, BUDGET - writer.wire_len() - 4);
-    }
-    let replay = writer.into_reply(Some(BUDGET));
-    assert_eq!(replay.data_slice_count(), 3);
-    assert!(replay.capacity() <= BUDGET);
 }
 
 #[tokio::test]

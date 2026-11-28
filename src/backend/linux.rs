@@ -2,7 +2,6 @@
 //! this module only converts typed callbacks and holds Linux backing handles.
 use super::{FileAttr, FileType, SetAttributes, TimeOrNow};
 use crate::filesystem::{FsResult, Overlay, SourceLookup};
-use crate::raw_blob::ReadData;
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -26,24 +25,6 @@ const TTL: Duration = Duration::ZERO;
 // generated children or mutable directory streams. A fully readonly namespace
 // may also cache directory pages. All-policy metadata stays uncached.
 const PINNED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-// FUSE lookup replies with a zero node ID cache a missing name.
-const MISSING_ENTRY: fuser::FileAttr = fuser::FileAttr {
-    ino: INodeNo(0),
-    size: 0,
-    blocks: 0,
-    atime: SystemTime::UNIX_EPOCH,
-    mtime: SystemTime::UNIX_EPOCH,
-    ctime: SystemTime::UNIX_EPOCH,
-    crtime: SystemTime::UNIX_EPOCH,
-    kind: fuser::FileType::RegularFile,
-    perm: 0,
-    nlink: 0,
-    uid: 0,
-    gid: 0,
-    rdev: 0,
-    blksize: 0,
-    flags: 0,
-};
 pub(super) const REMOTE_WORKERS: usize = 8;
 // TODO: use native FUSE_INTERRUPT when fuser exposes it and requests can be
 // interrupted without a blocked dispatcher. Do not emulate it by polling
@@ -119,20 +100,19 @@ impl State {
     fn backing(
         &mut self,
         ino: u64,
+        handle: u64,
         register: impl FnOnce(&File) -> std::io::Result<fuser::BackingId>,
     ) -> Option<Arc<fuser::BackingId>> {
         if !self.enabled {
             return None;
         }
-        let id = if let Some(id) = self.backings.get(&ino).and_then(Weak::upgrade) {
+        let existing = self.backings.get(&ino).and_then(Weak::upgrade);
+        let file = self
+            .core
+            .eligible_backing(ino, handle, existing.is_some())?;
+        let id = if let Some(id) = existing {
             id
         } else {
-            // An older ordinary handle or mmap can still use the FUSE page
-            // cache. Start passthrough only after those handles are released.
-            if self.core.has_multiple_open_handles(ino) {
-                return None;
-            }
-            let file = self.core.eligible_backing(ino)?;
             let id = Arc::new(register(file).ok()?);
             self.backings.insert(ino, Arc::downgrade(&id));
             id
@@ -204,10 +184,9 @@ fn empty(reply: ReplyEmpty, result: FsResult<()>) {
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
-fn data(reply: ReplyData, result: FsResult<ReadData>) {
+fn data(reply: ReplyData, result: FsResult<impl AsRef<[u8]>>) {
     match result {
-        // Linux reads prepare a single slice for fuser's read reply.
-        Ok(data) => reply.data(&data.contiguous()),
+        Ok(data) => reply.data(data.as_ref()),
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
@@ -264,21 +243,19 @@ impl Filesystem for Fuse {
             else {
                 break None;
             };
-            let (inode, pending) = match lookup {
-                SourceLookup::Inode(ino) => (
-                    Some(ino),
-                    state
-                        .core
-                        .pending_source_size(ino)
-                        .and_then(|oid| state.core.start_remote_demand(oid, Some(ino))),
-                ),
-                SourceLookup::Tree(oid) => (None, state.core.start_remote_tree_demand(oid)),
+            let (inode, oid) = match lookup {
+                SourceLookup::Inode(ino) => (Some(ino), state.core.pending_source_size(ino)),
+                SourceLookup::Tree(oid) => (None, Some(oid)),
             };
-            let Some(pending) = pending else {
+            let Some(pending) = oid.and_then(|oid| state.core.start_remote_demand(oid, inode))
+            else {
                 break inode;
             };
             drop(state);
-            pending.finish();
+            if pending.finish().is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
             state = self.state();
             // Directory release or FORGET can reclaim the inode while the
             // lookup is suspended. Resolve it again from the verified source.
@@ -291,13 +268,6 @@ impl Filesystem for Fuse {
             Ok(a) => {
                 let (attr_ttl, entry_ttl) = state.cache_ttls(&a);
                 reply.entry_with_ttls(&attr_ttl, &entry_ttl, &attr(a), Generation(0));
-            }
-            Err(libc::ENOENT)
-                if prepared.is_none()
-                    && state.core.read_only()
-                    && state.source_cacheable(parent.0) =>
-            {
-                reply.entry_with_ttls(&TTL, &PINNED_TTL, &MISSING_ENTRY, Generation(0));
             }
             Err(error) => reply.error(Errno::from_i32(error)),
         }
@@ -494,7 +464,7 @@ impl Filesystem for Fuse {
                     FopenFlags::empty()
                 };
                 #[cfg(target_os = "linux")]
-                if let Some(id) = state.backing(ino.0, |file| reply.open_backing(file)) {
+                if let Some(id) = state.backing(ino.0, fh, |file| reply.open_backing(file)) {
                     state.handles.insert(fh, (ino.0, id.clone()));
                     #[cfg(feature = "test-metrics")]
                     state.core.record_passthrough();
@@ -539,7 +509,7 @@ impl Filesystem for Fuse {
         match result {
             Ok((a, fh)) => {
                 #[cfg(target_os = "linux")]
-                if let Some(id) = state.backing(a.ino, |file| reply.open_backing(file)) {
+                if let Some(id) = state.backing(a.ino, fh, |file| reply.open_backing(file)) {
                     state.handles.insert(fh, (a.ino, id.clone()));
                     #[cfg(feature = "test-metrics")]
                     state.core.record_passthrough();
@@ -578,21 +548,20 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("read");
-        data(
-            reply,
-            i64::try_from(offset)
-                .map_err(|_| libc::EINVAL)
-                .and_then(|offset| {
-                    if state.no_open && fh.0 == 0 {
-                        if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
-                            return Err(libc::EBADF);
-                        }
-                        state.core.read_without_handle(ino.0, offset, size)
-                    } else {
-                        state.core.read_data(ino.0, fh.0, offset, size)
+        let result = i64::try_from(offset)
+            .map_err(|_| libc::EINVAL)
+            .and_then(|offset| {
+                if state.no_open && fh.0 == 0 {
+                    if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
+                        return Err(libc::EBADF);
                     }
-                }),
-        );
+                    state.core.read_without_handle(ino.0, offset, size)
+                } else {
+                    state.core.read_data(ino.0, fh.0, offset, size)
+                }
+            });
+        drop(state);
+        data(reply, result);
     }
     fn write(
         &self,
@@ -609,10 +578,7 @@ impl Filesystem for Fuse {
         let result = i64::try_from(offset)
             .map_err(|_| libc::EINVAL)
             .and_then(|offset| {
-                let mut state = self.state();
-                #[cfg(feature = "test-metrics")]
-                state.core.record_fuse_request("write");
-                state
+                self.state()
                     .core
                     .write_data(ino.0, fh.0, offset, data, write_flags.bits(), flags.0)
             });
@@ -679,13 +645,13 @@ impl Filesystem for Fuse {
             .parallel_reads
             .then(|| state.core.pending_source_tree(ino.0))
             .flatten()
-            .and_then(|oid| {
-                state.core.begin_directory_enumeration();
-                state.core.start_remote_tree_demand(oid)
-            })
+            .and_then(|oid| state.core.start_remote_demand(oid, None))
         {
             drop(state);
-            pending.finish();
+            if pending.finish().is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
             state = self.state();
         }
         match state.core.open_directory(ino.0, flags.0) {

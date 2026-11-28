@@ -43,93 +43,57 @@ separate from that contract; a requirement is not a claim of a passing test.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
-## Service state
+## Source selection and observable state
 
-Git-on may read caller files and repositories and obtain data from remote
-sources. During preparation, execution, teardown, failure, cancellation, and
-stale-run cleanup, Git-on and its service operations keep their writes inside
-run-owned storage. The runner may write ordinary output to stdout and stderr.
+With one operand, native Git resolves the revision through
+`git rev-parse --verify --end-of-options`. Git interprets abbreviations,
+ancestry, reflogs and `HEAD:path`. With an explicit local source, including
+`file://` or a remote name that resolves to a local path, resolve the revision
+and read its objects as in `git -C PATH on REV`. Object directories and
+alternates follow native Git's repository setup, including bare repositories,
+linked worktrees and byte-valued paths. Do not interpret a local revision as
+a fetch destination.
 
-Signature verification with `--verify` is an exception to the service write
-boundary. Git-on calls `git verify-commit` or `git verify-tag` on the selected
-object ID. Git and its configured verifier use the caller's effective
-configuration and the verifier's ordinary environment. Direct verification
-may write to its normal profile or to other paths selected by its configuration.
-Git and its verifier own those effects, including on failure or cancellation.
+For a network source, apply native Git remote-name and URL rewriting once.
+The supported profile is direct HTTPS with HTTP/2 or direct OpenSSH, both
+using Git protocol v2. Select `HEAD`, an exact ref, an unambiguous short branch
+or a full SHA-1 OID, then use the fixed OID throughout the invocation. The
+selected object must yield a tree. See [the remote guide](remote.md) for the
+supported configuration and authentication.
 
-An explicit `Match exec` directive in the effective OpenSSH configuration is
-also an exception. OpenSSH can run the configured local command during an
-`ssh -G` inspection before any connection and again during connection setup.
-The command uses its ordinary permissions and can write outside run-owned
-storage, including on runs that fail or are cancelled. OpenSSH's own host-key
-and credential storage follows the read-only rules below.
+Git-on may read repositories and receive remote objects. It may write its
+private runtime files, invocation caches and visible materialization or
+writable backing. Outside this service space, its own operations must leave
+repository refs, indexes, objects, configuration, worktree files, other user
+files and configuration, persistent credential state, and remote state
+unchanged. This applies to helper processes and to setup, cancellation,
+failure, completion and stale-run cleanup. Git-on creates no permanent clones,
+launches no system `git fetch` and executes no reference-update or fsmonitor
+hooks for source selection. The command after `--` follows the snapshot's
+write policy independently.
 
-Git-on cleans up the files it creates for the run. The write policy governs
-the command after `--`.
+With `--verify`, use `git verify-commit` for a commit OID or `git verify-tag`
+for an annotated tag OID, with the effective Git configuration and the
+configured verifier's normal profile. The ordinary effects of native
+`git verify-commit`, `git verify-tag`, and the configured verifier are
+outside Git-on's state guarantee. The target of a verified tag
+comes from that exact tag object. A moved ref cannot change the selected
+snapshot. A rejected signature or unavailable selected object prevents the
+child from starting. OpenSSH may run explicitly configured `Match exec`
+commands as it evaluates connection settings. Effects of those commands are
+outside Git-on's guarantee as well.
 
-- Resolution, fetch, snapshot preparation, and cleanup preserve source refs,
-  indexes, object databases, Git configuration, and worktrees. These operations
-  leave no persistent clone and make no requests to write remote repository data.
-- Local loading reads repository objects in place. Network loading decodes
-  packs in memory. Git-on never invokes system `git fetch`, creates a
-  temporary fetch repository, stages a pack or index, or writes a
-  fetch-refspec destination.
-- Signature verification of a streamed remote snapshot exposes the selected
-  commit or tag as a temporary loose object. The transfer keeps its pack,
-  trees, and file contents out of the verifier's object directory. Staging can
-  retry in the run directory if the automatically selected `tmpfs` fills.
-- Native operations disable hooks and local filesystem monitors. Credential
-  lookup reads existing credentials. An authentication result does not save,
-  erase, or replace stored credentials, host keys, or cookies.
-- Cleanup can remove owned runtime data. Recovery metadata from an older
-  invocation does not authorize Git-on to write to a source repository.
-- The writable snapshot and actions of the command after `--` follow the
-  [filesystem policy](#filesystem-policy). This policy does not grant extra
-  write access to preparation or cleanup processes.
-
-## Native Git argument compatibility
-
-Native Git supplies local revision resolution, effective repository URLs and
-configuration. The [network transport profile](remote.md#network-transport-profile)
-defines the selection and fetch rules for HTTPS and SSH.
-
-- With one operand, pass the exact `OsStr` to native `git --no-lazy-fetch
-  rev-parse --verify --end-of-options`. Git interprets revisions including
-  abbreviations, ancestry, reflogs and `HEAD:path`. Git with
-  `--no-lazy-fetch` support must be on `PATH`.
-- With two operands, use native Git to resolve a configured remote or
-  repository URL once. A local path or `file://` URL selects the repository
-  for the same revision resolution and object reads as `git -C PATH on REV`.
-  For an existing directory, the explicitly selected path uses Git discovery
-  before any `.git` suffix fallback, including inside a worktree. Preserve
-  ordinary Git revision syntax, including `HEAD:subdir`. The local mode has
-  no fetch-refspec destinations.
-- Network sources use direct smart Git protocol v2 over HTTPS with HTTP/2 or
-  OpenSSH. GitHub.com is the acceptance reference. Resolve a named revision
-  once via `ls-refs` and fetch by the selected full SHA-1 OID. Network fetches
-  create no private pack, index, or Git repository for object transfer.
-  Verification may need its own private Git context.
-- A fetch must identify one distinct selected object that yields a tree.
-  Signature verification uses the full OID of the selected commit or
-  annotated tag. For a tag, the recorded target in that object determines the
-  snapshot. Moving a tag or branch leaves the selection unchanged. A failed
-  verification or an unavailable selected object prevents execution.
-- Git-on accesses the caller's local object database read-only and retains the
-  selected tree OID in memory for the invocation. If external repository
-  maintenance removes an unread object, the operation that needs it reports the
-  source error.
-- Native operations use the caller's Git configuration and object-location
-  environment. Resolve local revisions and read the objects from the same
-  Git-selected object database, including object directories and alternates.
-  Relative object locations follow native Git's repository setup context,
-  including worktree subdirectories, bare repositories and explicit `GIT_DIR`.
-  Native operations apply the [service-state invariant](#service-state) while
-  resolving and fetching objects. Git-on reads the snapshot directly from Git
-  objects and uses its own materializer for a disposable execution tree.
-- Regression tests must compare acceptance, selected objects and diagnostics
-  against native Git in isolated local fixtures. Include implicit and explicit
-  local sources, subtree syntax, non-UTF-8 paths, and invalid revisions.
-  Exercise the network profile against GitHub.com over both transports.
+Store decoded objects in memory. Only cache eviction writes raw payloads to
+private storage. Native Git may require private files for local index-revision
+resolution and signature verification. Use an existing writable tmpfs
+for that scratch state when available, otherwise use the private run under
+the system temporary directory. Delete it on exit and error. `--backend=copy`
+writes the visible selected tree and writable mounts may write private backing.
+Runtime recovery uses empty markers. Their names identify the invocation and
+any owned SSH control socket. A new run binds its marker to the directory
+identity before creating snapshot data. The initial reservation allows
+recovery to remove an empty directory at the reserved path. Recovery
+preserves directories without a matching marker or a valid legacy record.
 
 ## Filesystem policy
 
@@ -162,47 +126,25 @@ The native mount and write-policy contracts apply to local and remote runs.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
-- The writable layer is fresh for each run. It uses private filesystem-backed
-  storage in a per-run directory under `TMPDIR/git-on` (or the system temporary
-  location's `git-on` directory). If another unprivileged user owns that group
-  or an ordinary file occupies its name, git-on uses a private group for the current
-  user. The writable layer uses the underlying temporary filesystem's capacity
-  and operating-system limits. Native service files can use a separate location.
-- Completion unmounts the snapshot and removes the run's temporary files.
-  The last run removes its empty group.
-  When an NFS client defers removal because a file is still open, git-on
-  reports the run path and preserves the command's exit status. The diagnostic
-  gives a later `--cleanup` command when automatic recovery can verify the
-  record, and identifies manual recovery when the surviving directory lacks
-  a persistent identity.
+- The writable layer is fresh for each run. Each run has a private directory
+  under `TMPDIR/git-on` or the system temporary location's `git-on` group.
+  If a user-owned path occupies the group name, Git-on uses a separate group
+  for the current user. The temporary filesystem's capacity and operating-system
+  limits apply.
+- Completion unmounts the snapshot when mounted and deletes the private run.
+  The last run removes its empty group when Git-on owns it.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
 - Handle recoverable resource errors through ordinary operation or runner
   failures and orderly cleanup whenever possible. Manual stale-run recovery
   does not justify abrupt termination for an error that can be handled.
-- Abrupt termination and busy mounts may require stale-run cleanup.
-  An empty, writable ownership marker locks the run from reservation to
-  teardown, including on NFS. Startup rollback and ordinary cleanup can
-  retire the marker without allocating another inode.
-  `git on --cleanup <temporary-directory>` accepts legacy records and unused
-  reservations. It refuses active runs and preserves directories, mounts, or
-  endpoints whose identity it cannot verify. It can reclaim verified service
-  directories after their helper exits. If removal must be retried, it keeps
-  the run record. Older Git pins remain in the source repository.
-  Cleanup never terminates processes based on stale PIDs.
+- Abrupt process or machine termination and busy mounts may require stale-run
+  cleanup. Minimal temporary recovery metadata records mount identity and
+  identifies the owned SSH socket. Recovery refuses active directories, avoids
+  unrelated mounts, and leaves the source repository unchanged, including
+  references named in records written by earlier versions.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
-
-### Resource assumptions
-
-Supported workloads fit in available RAM, including the aggregate data
-needed to decode and retain a pack. Git-on leaves inherited process
-limits, including `RLIMIT_FSIZE`, to the host. It follows its own cache
-policy independently of those limits. The two-checkout budget concerns
-available filesystem space for Git-on and the command.
-Regular files required by native Git use the capacity and limits of the
-selected temporary filesystem. `GIT_ON_SERVICE_TMPDIR` can select an existing
-writable `tmpfs`. The verifier uses its own environment and storage limits.
 
 ## Backend selection and materialization
 
@@ -236,11 +178,11 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset.
 The lazy startup and performance requirements below apply to both native mounts.
 
-Remote materialization obtains the selected revision in one shallow transfer.
-A mount fallback reuses the original selection and fetches the full snapshot
-in one additional shallow transfer.
-Verified contents are written to their final paths, and already prepared
-contents are reused for repeated OIDs.
+Remote materialization obtains the selected revision in one streamed shallow
+transfer. A mount fallback reuses the original selection and fetches the full
+snapshot in one additional shallow transfer. Materialization reuses verified
+contents for repeated OIDs. The inherited per-file limit applies to the files
+that are written, including visible files and evicted blobs.
 
 ## FUSE operation coverage requirement
 
@@ -280,12 +222,14 @@ affected behavior is claimed verified.
 
 The objective is minimal launch overhead and demand-driven work, including for
 repositories with millions of paths. Native mounts must avoid full checkouts
-and eager in-memory materialization of the revision's file contents.
+and complete in-memory copies of the selected tree.
 
 1. Before launching the child, git-on must not recursively enumerate the entire
-   selected tree, load every blob, or materialize all source files. Resolving and
-   pinning the selected tree and establishing the mount are permitted startup
-   work. Unvisited subtrees must not be traversed merely to start the command.
+   selected tree, load every blob, or materialize all source files. Selecting
+   the root tree OID and establishing the mount are permitted startup work.
+   Report a read error if an unfetched local object becomes unavailable, for
+   example after Git garbage collection. Unvisited subtrees must not be
+   traversed merely to start the command.
 2. Lookup, attributes, directory listing, and reads load metadata or contents
    needed for those operations. Listing a directory may decode that directory's
    tree object, but must not recursively enumerate its children. Resolving a
@@ -299,25 +243,27 @@ and eager in-memory materialization of the revision's file contents.
    A lookup in an
    unopened directory may load only the necessary blob headers, applicable
    ignore files, and required Git object decoding.
-4. Assume individual Git objects fit in RAM. A lazy read may decode and verify
-   a whole object even for a partial read. Git storage encoding may also require
-   decoding delta bases. Remote read-ahead uses the already parsed directory
+4. Git storage encoding may require decoding a whole object or its delta bases,
+   even for a partial read. Remote read-ahead uses the already parsed directory
    view and does not open additional trees. Measurements distinguish requested
    objects, speculative transfers, and necessary storage-level decoding.
 5. Write-policy checks must load applicable pinned ignore rules on demand and
    check relevant tracked paths without a whole-tree scan. Protecting a tracked
    ancestor does not require enumerating all its descendants.
 6. Repeated operations should reuse useful decoded data instead of repeatedly
-   decoding the same objects. Bound the block LRU by bytes and the hot whole-blob
-   LRU by object count. Account for active reads, decoding, and metadata
-   separately from those caches.
-7. Keep prepared Git objects immutable and verify the bytes served from them.
-   The first successful content change switches the file to private writable
-   backing. Copy-up uses an ordinary filesystem copy or clone. The entire
-   private file uses ordinary filesystem I/O, including bytes retained from
-   the source. Block authentication is confined to immutable source reads.
-   If the same command can finish with two checked-out copies of the selected
-   revision on disk, Git-on must be able to run it too.
+   decoding the same objects. Decoded memory caching must have an explicit bounded retention
+   policy; walking many files must not retain every payload indefinitely.
+   Active reads and unavoidable object decoding are accounted for separately.
+7. Do not keep duplicate full source payloads merely to transfer data between
+   snapshot and filesystem layers. Memory use should reflect demanded objects,
+   active operations, and bounded caches, not the whole repository's contents.
+   A writable source inode must not retain an additional complete immutable
+   decoded backing merely for reuse. The last original inode transfers its
+   backing; other original same-OID inodes, including unopened paths and
+   open-unlinked references, retain their prepared bytes without repeated
+   decoding. Ownership accounting may inspect selected-tree metadata when the
+   first destructive source operation requires it; it must not preload blobs
+   or become a launch, read or policy-check prerequisite.
 8. Failures discovered in objects reached on demand must be reported through
    the corresponding operation or documented runner failure. Whole-repository
    validation must not be introduced as an implicit startup prerequisite.
@@ -347,10 +293,11 @@ execution cost or inventing internal bytes; N=0 cases still use the complete
 materialize-plus-command comparison.
 
 One-time required fetch, decode and verification may happen lazily within the
-materialization budget. Immutable data already obtained/prepared must not be
-fetched or unpacked again in the same invocation, including close/reopen and
-decoded-memory-cache eviction. Invocation-local temporary storage must support
-that reuse; no global cache or cross-run reuse is introduced. Count all work,
+materialization budget. Prepared immutable source files remain reusable
+within the same invocation, including close/reopen and decoded-cache eviction.
+Extra delta bases received for Git pack decoding use a bounded compressed
+cache before their first demand. Invocation-local temporary storage supports
+reuse of prepared files. Count all work,
 including native Git children, rather than proving this contract from loader-only
 counters. Amortized/expected Big-O does not justify a large constant: minimizing
 measured real overhead also remains required.
@@ -358,29 +305,6 @@ measured real overhead also remains required.
 No numerical latency, throughput, or memory SLA has been agreed. “Fast” does
 not establish a particular number of milliseconds. Measurements must report
 hardware, software, storage, cache state, fixture shape, and the tested revision.
-
-## Storage and buffer requirements
-
-1. Internally managed object buffers use disk only when the LRU evicts them.
-   Git-on may read existing repositories from disk. The visible execution
-   tree from `copy` and user writes, including copy-up and native-mount
-   backing files, may use disk. Native verification or local index resolution
-   may require separate private files.
-2. Immutable data already in RAM is used without copying on every execution
-   path. Components borrow existing buffers or transfer ownership of them
-   without copying their contents.
-3. Keep the revision's loaded directory metadata and other internal metadata
-   in RAM. Native mounts follow the lazy access requirements when loading
-   metadata.
-4. Remove redundant passes over data when the performance gain justifies the
-   complexity. Where practical, compute and cache needed results as the data
-   is processed, taking into account the capabilities of the libraries in use.
-
-Git-on creates private verifier and local index files, and regular
-diagnostic or transport files on demand. It uses existing filesystems for
-these files and removes them with the invocation. Internal synchronization
-and recovery may use directory entries, empty locks, and sockets alongside
-the writable layer. The external verifier's files follow its native configuration.
 
 ## Acceptance evidence
 
@@ -450,12 +374,14 @@ not replace them or establish proof for all possible sequences.
 ## Implementation and verification
 
 The implementation uses a shared pinned object store, demand-only metadata/blob
-access and deferred inode creation. A byte-budgeted LRU retains complete small
-objects and individual blocks of spilled files. A separate LRU holds whole hot
-blobs. Trusted descriptors, block hashes and parsed directories remain in RAM
-outside the block budget. Extra objects from reusable packs retain their
-verified bytes in RAM until use. Parsing a demanded tree releases its raw
-bytes. The FUSE layer retains no duplicate snapshot payloads. Source
+access, content caches and deferred inode creation. A byte-budgeted LRU holds
+small blobs and reused disk blocks. A separate LRU retains the eight most
+recently used complete large blobs. Copy uses these same caches before
+materialization. Readers of the same OID share verified buffers. Trusted
+descriptors, digests of spilled blocks and parsed directories
+remain in RAM for touched unique objects outside that payload budget. Raw tree
+bytes and disk object/name indexes are not retained. The FUSE layer retains no
+duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail
 metadata access, LFS pointers fail content reads, and unrelated entries remain
 usable. Listing a directory may report a submodule name without following it.

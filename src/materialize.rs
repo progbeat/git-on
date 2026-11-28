@@ -1,16 +1,13 @@
 //! Eager, byte-preserving non-FUSE execution view for explicit write-policy=all.
-use crate::{
-    platform::{open_child_directory, DirectoryEntries},
-    snapshot::{EntryKind, Snapshot},
-};
+use crate::snapshot::{EntryKind, Snapshot};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     fs::{self, OpenOptions},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::{
         ffi::OsStrExt,
-        fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{symlink, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -18,8 +15,9 @@ use std::{
 /// After checking that no mount remains, restore only owned physical directory
 /// permissions. A child may have removed all owner access from its disposable
 /// view. Walk pinned directory descriptors; never traverse a snapshot symlink.
-pub fn prepare_cleanup(run: &fs::File) -> Result<()> {
-    restore_at(run.as_raw_fd(), c"mount")
+pub fn prepare_cleanup(root: &Path) -> Result<()> {
+    let root = CString::new(root.as_os_str().as_bytes())?;
+    restore_at(libc::AT_FDCWD, &root)
 }
 
 fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
@@ -48,73 +46,83 @@ fn restore_at(parent: libc::c_int, name: &CStr) -> Result<()> {
         stat.st_uid == unsafe { libc::geteuid() },
         "refusing to chmod a foreign directory"
     );
-    let open = || open_child_directory(parent, name, libc::O_RDONLY);
-    let directory = match open() {
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            restore_locked_directory(parent, name, &stat)?;
-            open()
+    let mode = (stat.st_mode & 0o7777) | 0o700;
+    let open = || unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let mut fd = open();
+    if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied {
+        // Opening a mode-000 directory first requires a no-follow chmod. This
+        // operation also refuses a symlink substituted between stat and chmod.
+        if unsafe { libc::fchmodat(parent, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("restore locked disposable directory");
         }
-        result => result,
+        fd = open();
     }
-    .context("open disposable directory for cleanup")?;
-    let metadata = checked_directory_metadata(&directory, &stat)?;
-    if metadata.mode() & 0o700 != 0o700 {
-        directory.set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("open disposable directory without following links");
     }
-    let mut entries =
-        DirectoryEntries::from_file(directory).context("read disposable directory")?;
-    let directory = entries.as_raw_fd();
-    while let Some((name, kind)) = entries
-        .next_entry()
-        .context("enumerate disposable directory")?
-    {
-        if matches!(kind, libc::DT_DIR | libc::DT_UNKNOWN) {
-            restore_at(directory, name)?;
-        }
-    }
-    Ok(())
-}
-
-fn checked_directory_metadata(file: &fs::File, expected: &libc::stat) -> Result<fs::Metadata> {
-    let metadata = file.metadata()?;
+    let directory = unsafe { fs::File::from_raw_fd(fd) };
+    use std::os::unix::fs::MetadataExt;
+    let metadata = directory.metadata()?;
     #[cfg(target_os = "linux")]
-    let device = expected.st_dev;
+    let device = stat.st_dev;
     #[cfg(target_os = "macos")]
-    let device = expected.st_dev as u64;
+    let device = stat.st_dev as u64;
     ensure!(
-        metadata.ino() == expected.st_ino
-            && metadata.dev() == device
-            && metadata.uid() == expected.st_uid,
+        metadata.ino() == stat.st_ino && metadata.dev() == device && metadata.uid() == stat.st_uid,
         "disposable directory changed during cleanup"
     );
-    Ok(metadata)
-}
-
-#[cfg(target_os = "linux")]
-fn restore_locked_directory(parent: libc::c_int, name: &CStr, expected: &libc::stat) -> Result<()> {
-    // O_PATH pins and checks the actual mount without requiring read access.
-    let directory = open_child_directory(parent, name, libc::O_PATH)?;
-    let metadata = checked_directory_metadata(&directory, expected)?;
-    fs::set_permissions(
-        format!("/proc/self/fd/{}", directory.as_raw_fd()),
-        fs::Permissions::from_mode(metadata.mode() | 0o700),
-    )
-    .context("restore locked disposable directory")
-}
-
-#[cfg(target_os = "macos")]
-fn restore_locked_directory(parent: libc::c_int, name: &CStr, expected: &libc::stat) -> Result<()> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(parent, stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("inspect cleanup parent");
+    directory.set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate cleanup directory descriptor");
     }
-    ensure!(
-        unsafe { stat.assume_init() }.st_dev == expected.st_dev,
-        "a mount remains below the disposable directory"
-    );
-    let mode = (expected.st_mode & 0o7777) | 0o700;
-    if unsafe { libc::fchmodat(parent, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("restore locked disposable directory");
+    struct Entries(*mut libc::DIR);
+    impl Drop for Entries {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let entries = unsafe { libc::fdopendir(duplicate) };
+    if entries.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(error).context("read disposable directory");
+    }
+    let entries = Entries(entries);
+    loop {
+        // readdir returns null for either EOF or error; clear/check errno.
+        #[cfg(target_os = "linux")]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { libc::__error() };
+        unsafe {
+            *errno = 0;
+        }
+        let entry = unsafe { libc::readdir(entries.0) };
+        if entry.is_null() {
+            if unsafe { *errno } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("enumerate disposable directory");
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            restore_at(directory.as_raw_fd(), name)?;
+        }
     }
     Ok(())
 }
@@ -126,194 +134,184 @@ struct PreparedBlob {
 }
 impl PreparedBlob {
     fn copy_to(&self, root: &Path, oid: git2::Oid, output: &mut dyn std::io::Write) -> Result<()> {
+        let copy = |input: &mut dyn std::io::Read| {
+            crate::object::copy_verified(
+                input,
+                output,
+                git2::ObjectType::Blob,
+                usize::try_from(self.size)?,
+                oid,
+            )
+        };
         match self.kind {
-            EntryKind::Symlink => self.with_symlink_target(root, oid, |bytes| {
-                crate::object::write_verified_buffer(bytes, output)
-            }),
+            EntryKind::Symlink => {
+                let target = fs::read_link(root.join(&self.path))?;
+                copy(&mut target.as_os_str().as_bytes())
+            }
             EntryKind::File => {
                 let mut input = OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(root.join(&self.path))?;
                 crate::spool::private_file_metadata(&input)?;
-                crate::object::copy_verified(
-                    &mut input,
-                    output,
-                    git2::ObjectType::Blob,
-                    usize::try_from(self.size)?,
-                    oid,
-                )
+                copy(&mut input)
             }
             EntryKind::Directory => unreachable!("only prepared blobs are retained"),
-        }
-    }
-
-    fn with_symlink_target<T>(
-        &self,
-        root: &Path,
-        oid: git2::Oid,
-        consume: impl FnOnce(&[u8]) -> Result<T>,
-    ) -> Result<T> {
-        if self.kind == EntryKind::Symlink {
-            let target = fs::read_link(root.join(&self.path))?;
-            let bytes = target.as_os_str().as_bytes();
-            let mut verifier = crate::object::VerifiedWriter::new(
-                std::io::sink(),
-                git2::ObjectType::Blob,
-                usize::try_from(self.size)?,
-                oid,
-            );
-            crate::object::write_verified_buffer(bytes, &mut verifier)?;
-            verifier.finish()?;
-            consume(bytes)
-        } else {
-            let mut target = Vec::new();
-            self.copy_to(root, oid, &mut target)?;
-            consume(&target)
         }
     }
 }
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
-    // Finish any pack already used by lazy reads so the copy can reuse its
-    // verified extra objects without admitting them to the hot blob cache.
-    snapshot.verify_materialization_packs()?;
     snapshot.set_spool_directory(root)?;
     directory(
         snapshot,
-        snapshot.tree_oid,
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
-    )?;
-    snapshot.finish_materialization()
+        snapshot.has_copy_spills()?,
+    )
 }
 fn directory(
     snapshot: &Snapshot,
-    oid: git2::Oid,
     relative: &Path,
     root: &Path,
     prepared: &mut std::collections::HashMap<git2::Oid, PreparedBlob>,
+    adopt_spills: bool,
 ) -> Result<()> {
-    let source = snapshot.directory_by_oid(oid)?;
-    let children = Snapshot::directory_children(&source, relative).collect::<Result<Vec<_>>>()?;
-    for batch in children.chunks(256) {
-        snapshot.prepare_materialization(batch, |oid| prepared.contains_key(&oid))?;
-        for (name, entry) in batch {
-            if let Some(signal) = crate::git::cancelled_signal() {
-                bail!("materialization cancelled by signal {signal}");
-            }
-            let bytes = name.as_bytes();
-            ensure!(
-                !bytes.is_empty()
-                    && bytes != b"."
-                    && bytes != b".."
-                    && !bytes.contains(&b'/')
-                    && !bytes.contains(&0),
-                "unsupported snapshot name {:?}",
-                name
-            );
-            let relative = relative.join(name);
-            let path = root.join(&relative);
-            ensure!(
-                entry.mode != 0o160000,
-                "submodules are unsupported: {}",
-                relative.display()
-            );
-            let result = (|| -> Result<()> {
-                match entry.kind {
-                    EntryKind::Directory => {
-                        fs::create_dir(&path)?;
-                        directory(snapshot, entry.oid, &relative, root, prepared)?;
-                        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    let mut expected = std::collections::HashSet::new();
+    for (name, entry) in snapshot.children(relative)? {
+        if let Some(signal) = crate::git::cancelled_signal() {
+            bail!("materialization cancelled by signal {signal}");
+        }
+        let bytes = name.as_bytes();
+        ensure!(
+            !bytes.is_empty()
+                && bytes != b"."
+                && bytes != b".."
+                && !bytes.contains(&b'/')
+                && !bytes.contains(&0),
+            "unsupported snapshot name {:?}",
+            name
+        );
+        let relative = relative.join(&name);
+        let path = root.join(&relative);
+        ensure!(
+            entry.mode != 0o160000,
+            "submodules are unsupported: {}",
+            relative.display()
+        );
+        let result = (|| -> Result<()> {
+            match entry.kind {
+                EntryKind::Directory => {
+                    fs::create_dir(&path)?;
+                    directory(snapshot, &relative, root, prepared, adopt_spills)?;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+                    ensure!(
+                        fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
+                        "host cannot preserve directory permissions"
+                    );
+                }
+                EntryKind::Symlink => {
+                    let install = |target: &[u8]| -> Result<u64> {
+                        symlink(std::ffi::OsStr::from_bytes(target), &path)?;
                         ensure!(
-                            fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
-                            "host cannot preserve directory permissions"
+                            fs::read_link(&path)?.as_os_str().as_bytes() == target,
+                            "host cannot preserve symlink target"
                         );
-                    }
-                    EntryKind::Symlink => {
-                        let create = |target: &[u8]| -> Result<u64> {
-                            ensure!(
-                                !target.is_empty() && !target.contains(&0),
-                                "unusable symlink target"
-                            );
-                            symlink(std::ffi::OsStr::from_bytes(target), &path)?;
-                            ensure!(
-                                fs::read_link(&path)?.as_os_str().as_bytes() == target,
-                                "host cannot preserve symlink target"
-                            );
-                            Ok(target.len() as u64)
-                        };
-                        let size = match prepared.get(&entry.oid) {
-                            Some(source) => source.with_symlink_target(root, entry.oid, create)?,
-                            None => snapshot.with_materialized_symlink_target(entry.oid, create)?,
-                        };
-                        prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
-                            path: relative.clone(),
-                            size,
-                            kind: entry.kind,
-                        });
-                    }
-                    EntryKind::File => {
-                        let mode = entry.mode & 0o777;
+                        Ok(target.len() as u64)
+                    };
+                    let size = if let Some(source) = prepared.get(&entry.oid) {
+                        let mut target = Vec::new();
+                        source.copy_to(root, entry.oid, &mut target)?;
+                        ensure!(
+                            !target.is_empty() && !target.contains(&0),
+                            "unusable symlink target"
+                        );
+                        install(&target)?
+                    } else {
+                        let target = snapshot.read_link_data(entry.oid)?;
+                        let size = install(&target)?;
+                        snapshot.release_copy_blob(entry.oid)?;
+                        size
+                    };
+                    prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
+                        path: relative.clone(),
+                        size,
+                        kind: entry.kind,
+                    });
+                }
+                EntryKind::File => {
+                    let previous = prepared.get(&entry.oid);
+                    let installed = if adopt_spills && previous.is_none() {
+                        snapshot.install_spilled_blob(entry.oid, &path)?
+                    } else {
+                        None
+                    };
+                    let (output, new_size) = if let Some((output, size)) = installed {
+                        (output, Some(size))
+                    } else {
                         let mut output = OpenOptions::new()
                             .write(true)
                             .create_new(true)
-                            .mode(mode)
+                            .mode(0o600)
                             .custom_flags(libc::O_NOFOLLOW)
                             .open(&path)?;
-                        if let Some(source) = prepared.get(&entry.oid) {
-                            // Reuse decoded bytes across directories, while checking
-                            // the copied buffers against the original OID. Prepared
-                            // files are mutable disk and cannot be trusted on reopen.
+                        let size = if let Some(source) = previous {
+                            // Reopened files must still match the original OID.
                             source.copy_to(root, entry.oid, &mut output)?;
+                            None
                         } else {
-                            let size = snapshot.copy_verified_blob(entry.oid, &mut output)?;
-                            prepared.insert(
-                                entry.oid,
-                                PreparedBlob {
-                                    path: relative.clone(),
-                                    size,
-                                    kind: entry.kind,
-                                },
-                            );
-                        }
-                        // Normally creation already applied the final mode.
-                        // Repair and verify bits removed by the caller's umask.
-                        if output.metadata()?.permissions().mode() & 0o777 != mode {
-                            output.set_permissions(fs::Permissions::from_mode(mode))?;
-                            ensure!(
-                                output.metadata()?.permissions().mode() & 0o777 == mode,
-                                "host cannot preserve executable/permission bits"
-                            );
-                        }
+                            Some(snapshot.copy_verified_blob(entry.oid, &mut output)?)
+                        };
+                        (output, size)
+                    };
+                    if let Some(size) = new_size {
+                        prepared.insert(
+                            entry.oid,
+                            PreparedBlob {
+                                path: relative.clone(),
+                                size,
+                                kind: entry.kind,
+                            },
+                        );
                     }
+                    let mode = entry.mode & 0o777;
+                    output.set_permissions(fs::Permissions::from_mode(mode))?;
+                    ensure!(
+                        output.metadata()?.permissions().mode() & 0o777 == mode,
+                        "host cannot preserve executable/permission bits"
+                    );
                 }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-                {
-                    let existing =
-                        fs::read_dir(path.parent().context("missing materialized parent")?)?
-                            .map(|entry| entry.map(|entry| entry.file_name()))
-                            .collect::<std::io::Result<Vec<_>>>()?;
-                    bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
-                }
-                return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::raw_blob::BackingError>()
+                        .map(|e| &e.0)
+                })
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                let existing = fs::read_dir(path.parent().context("missing materialized parent")?)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
+            }
+            return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
         }
+        expected.insert(name);
     }
     let actual = fs::read_dir(root.join(relative))?
         .map(|e| e.map(|e| e.file_name()))
         .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
     ensure!(
-        actual.len() == source.len() && actual.iter().all(|name| source.index(name).is_some()),
+        actual == expected,
         "host changed snapshot names in {}: expected {:?}, found {:?}",
         relative.display(),
-        source.children().map(|(name, ..)| name).collect::<Vec<_>>(),
+        expected,
         actual
     );
     Ok(())
@@ -339,12 +337,8 @@ mod tests {
         root.insert("b-link", link_first, 0o120000).unwrap();
         root.insert("directory", child, 0o040000).unwrap();
         let tree = root.write().unwrap();
-        let snapshot = Snapshot::load(
-            source.path(),
-            std::ffi::OsStr::new(&tree.to_string()),
-            "eager-reuse",
-        )
-        .unwrap();
+        let snapshot =
+            Snapshot::load(source.path(), std::ffi::OsStr::new(&tree.to_string())).unwrap();
         let storage = tempfile::tempdir().unwrap();
         let destination = storage.path().join("view");
         fs::create_dir(&destination).unwrap();

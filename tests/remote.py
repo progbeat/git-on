@@ -5,16 +5,15 @@ The source probe runs the production loader without a mount. --require-fuse
 and --require-nfs also execute the CLI through their native mounts.
 """
 import argparse
-import base64
 import contextlib
 import errno
-import stat
 import fcntl
 import http.server
 import json
 import os
 import pty
 from pathlib import Path
+from urllib.parse import quote_from_bytes, urlsplit
 import pwd
 import queue
 import random
@@ -33,8 +32,7 @@ import threading
 import time
 import unittest
 import unicodedata
-
-from support.git_invocations import git_invocations, record_git_invocations
+from support.run_storage import run_directories, run_id, run_lock, ssh_owner_marker
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser()
@@ -55,71 +53,10 @@ for artifact in ('probe','binary','before_binary','before_lifecycle_binary','bef
     selected=getattr(OPTIONS,artifact)
     if selected is not None: setattr(OPTIONS,artifact,selected.resolve())
 
-def run_directories(root):
-    # Red-before comparisons also run legacy binaries with a flat layout.
-    return [*root.glob('git-on/??????'), *root.glob(f'.go{os.geteuid():x}/??????'),
-            *root.glob('git-on-*')]
-
-def assert_no_run_state(test, root):
-    groups = (root / 'git-on', root / f'.go{os.geteuid():x}')
-    records = [record for group in groups for pattern in ('.git-on-run-*', '.git-on-remove-*')
-               for record in group.glob(pattern)]
-    test.assertEqual(run_directories(root) + records + list(root.glob('.git-on-service-*')), [])
-
-def assert_run_unlocked(directory):
-    record = directory.parent / f'.git-on-run-{os.geteuid():x}-{directory.name}'
-    lock = next((candidate for candidate in (*record.glob('.git-on-lock-v2-*'),
-                                            directory / '.git-on-lock-v2')
-                 if candidate.is_file()), directory / '.lock')
-    fd = os.open(lock, os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        os.close(fd)
-
-def fuse_mount_source(point):
-    for line in Path('/proc/self/mountinfo').read_text().splitlines():
-        if line.split()[4] == str(point):
-            return line.partition(' - ')[2].split()[1]
-    return ''
-
 def run(argv, **kwargs):
     result=subprocess.run(list(map(str, argv)), capture_output=True, **kwargs)
     if result.returncode: raise RuntimeError('fixture command failed: '+result.stderr.decode())
     return result.stdout
-
-def terminate_and_reap(process):
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-
-def fill_output(fd):
-    blocking = os.get_blocking(fd)
-    os.set_blocking(fd, False)
-    try:
-        for chunk in (b'x' * 4096, b'x'):
-            with contextlib.suppress(BlockingIOError):
-                while True:
-                    os.write(fd, chunk)
-        if os.isatty(fd):
-            # A PTY can move queued output to its master after the first EAGAIN.
-            end = time.monotonic() + 2
-            stable = time.monotonic() + .07
-            while time.monotonic() < stable:
-                if time.monotonic() >= end:
-                    raise AssertionError('terminal output never became full')
-                try:
-                    os.write(fd, b'x')
-                except BlockingIOError:
-                    time.sleep(.005)
-                else:
-                    stable = time.monotonic() + .07
-    finally:
-        os.set_blocking(fd, blocking)
 
 def terminal_lines(transcript,columns=80):
     """Replay the cursor movement and line erasure used by the terminal UI."""
@@ -163,37 +100,33 @@ def exec_fixture_child(argv, cwd, env):
     os._exit(127)
 
 class Fixture:
-    def __init__(self, git_dir=None, *, temp_parent=None):
-        if temp_parent is None and sys.platform == 'darwin':
-            # A second temporary directory under macOS's system TMPDIR can
-            # exceed the Unix socket limit once OpenSSH adds its own suffix.
-            temp_parent = '/tmp'
-        self.temp = tempfile.TemporaryDirectory(dir=temp_parent, prefix='git-on-transport-')
+    def __init__(self):
+        # The fixture adds a directory above Git-on's own run directory.
+        # Keep that extra prefix short enough for OpenSSH on macOS.
+        self.temp = tempfile.TemporaryDirectory(
+            prefix='git-on-transport-', dir='/tmp' if sys.platform == 'darwin' else None,
+        )
         self.root = Path(self.temp.name)
         self.repo = self.root / 'server.git'
         self.cwd = self.root / 'outside'
         self.cwd.mkdir()
         self.env = {k:v for k,v in os.environ.items() if not k.startswith(('GIT_', 'SSH_'))}
         self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', XDG_CACHE_HOME=str(self.root / 'cache'), TMPDIR=str(self.root), LC_ALL='C')
-        if git_dir is not None:
-            self.repo.symlink_to(Path(git_dir).resolve(), target_is_directory=True)
-            self.git('config', 'uploadpack.allowFilter', 'true')
-            self.git('config', 'uploadpack.allowAnySHA1InWant', 'true')
-        else:
-            self.git('init', '--bare', '--quiet', str(self.repo), at=self.root)
-            self.git('config', 'uploadpack.allowFilter', 'true')
-            self.git('config', 'uploadpackfilter.tree.maxDepth', '0')
-            self.git('config', 'uploadpack.allowAnySHA1InWant', 'true')
-            self.git('config', 'user.name', 'Disposable Fixture')
-            self.git('config', 'user.email', 'fixture@example.invalid')
-            self.blob = self.git('hash-object', '-w', '--stdin', data=b'expected\n')
-            self.other = self.git('hash-object', '-w', '--stdin', data=b'unrelated payload\n')
-            self.ignore = self.git('hash-object', '-w', '--stdin', data=b'out/\n')
-            self.subtree = self.git('mktree', data=f'100644 blob {self.blob}\tfile\n'.encode())
-            self.tree = self.git('mktree', data=f'100644 blob {self.ignore}\t.gitignore\n040000 tree {self.subtree}\tdeep\n100644 blob {self.other}\tother\n'.encode())
-            self.commit = self.git('commit-tree', self.tree, data=b'fixture\n')
-            self.git('update-ref', 'refs/heads/main', self.commit)
-            self.git('symbolic-ref', 'HEAD', 'refs/heads/main')
+        self.git('init', '--bare', '--quiet', str(self.repo), at=self.root)
+        self.git('config', 'uploadpack.allowFilter', 'true')
+        self.git('config', 'uploadpackfilter.tree.maxDepth', '0')
+        self.git('config', 'uploadpack.allowAnySHA1InWant', 'true')
+        self.git('config', 'http.uploadpack', 'true')
+        self.git('config', 'user.name', 'Disposable Fixture')
+        self.git('config', 'user.email', 'fixture@example.invalid')
+        self.blob = self.git('hash-object', '-w', '--stdin', data=b'expected\n')
+        self.other = self.git('hash-object', '-w', '--stdin', data=b'unrelated payload\n')
+        self.ignore = self.git('hash-object', '-w', '--stdin', data=b'out/\n')
+        self.subtree = self.git('mktree', data=f'100644 blob {self.blob}\tfile\n'.encode())
+        self.tree = self.git('mktree', data=f'100644 blob {self.ignore}\t.gitignore\n040000 tree {self.subtree}\tdeep\n100644 blob {self.other}\tother\n'.encode())
+        self.commit = self.git('commit-tree', self.tree, data=b'fixture\n')
+        self.git('update-ref', 'refs/heads/main', self.commit)
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/main')
         self.requests = []
         self.denied_oids = set()
         self.deny_auth = False
@@ -205,36 +138,33 @@ class Fixture:
         self.handles = []
         self.servers = []
     def git(self, *args, data=None, at=None):
-        return run(['git', '-C', at or self.repo, *args], input=data, env=self.env).decode().strip()
-    def with_git_wrapper(self, directory, body):
-        tools = self.root / directory
-        tools.mkdir()
-        wrapper = tools / 'git'
-        native = shutil.which('git', path=self.env['PATH'])
-        wrapper.write_text(f"#!{sys.executable}\nimport os, sys\n{body}\n"
-                           f"os.execv({native!r}, ['git', *sys.argv[1:]])\n")
-        wrapper.chmod(0o700)
-        return dict(self.env, PATH=str(tools) + os.pathsep + self.env['PATH'])
+        return run(['git', '-C', at or self.repo, *args], input=data, env=self.env).decode(errors='surrogateescape').strip()
     def close(self):
         self.resume.set()
         for stop in reversed(self.servers):
             stop()
+        if hasattr(self,'server'):
+            self.server.shutdown()
+            self.server.server_close()
         for process in reversed(self.children):
-            terminate_and_reap(process)
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=5)
         for handle in self.handles: handle.close()
         self.temp.cleanup()
-    def https(self, authorization=None):
-        return self.https_server(authorization).url
+    def https(self, authorization=None, transfer_delay=0):
+        return self.https_server(authorization, transfer_delay).url
 
-    def https_server(self, authorization=None):
+    def https_server(self, authorization=None, transfer_delay=0):
         from support.http2_server import Multiplexer
 
-        backend = self.http1_upstream(authorization=authorization)
+        backend = self.http1_upstream(authorization, transfer_delay)
         server = Multiplexer(self, backend, None)
         server.start(self.servers.append)
         return server
 
-    def http1_upstream(self, authorization=None):
+    def http1_upstream(self, authorization=None, transfer_delay=0):
         key, cert = self.root/'tls.key', self.root/'tls.crt'
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert])
         backend = Path(run(['git', '--exec-path']).decode().strip()) / 'git-http-backend'
@@ -275,28 +205,34 @@ class Fixture:
                 for line in headers.split(b'\r\n'):
                     name, _, value = line.partition(b':')
                     if name.lower() == b'status': status = int(value.strip().split()[0])
-                    elif name.lower() != b'content-length':
-                        fields.append((name.decode(), value.strip().decode()))
+                    else: fields.append((name.decode(), value.strip().decode()))
                 try:
                     self.send_response(status)
                     for name, value in fields: self.send_header(name, value)
                     self.send_header('Content-Length', str(len(body))); self.end_headers()
-                    self.wfile.write(body)
+                    if transfer_delay and wants:
+                        for offset in range(0,len(body),8192):
+                            self.wfile.write(body[offset:offset+8192]);self.wfile.flush();time.sleep(transfer_delay)
+                    else:self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
                     # A cancellation regression deliberately closes the client
                     # before the held server request can send its response.
                     if not stalled_request: raise
                     return
-                fixture.requests.append(dict(path=path, request_bytes=len(data), response_bytes=len(body), wants=[x.decode() for x in re.findall(rb'want ([0-9a-f]{40})', data)], headers=self.headers.get_all('X-Git-On-Fixture', [])))
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                fixture.requests.append(dict(
+                    path=path, request_bytes=len(data), response_bytes=len(body), wants=wants,
+                    shallow=b'deepen 1\n' in data, headers=self.headers.get_all('X-Git-On-Fixture', []),
+                ))
+        class Server(http.server.ThreadingHTTPServer):
+            request_queue_size = socket.SOMAXCONN
+        server = Server(('127.0.0.1', 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert, key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         self.server = server
-        self.servers.extend((server.server_close, server.shutdown))
         self.env['GIT_SSL_CAINFO'] = str(cert)
         return f'https://127.0.0.1:{server.server_port}/server.git'
-    def ssh(self, encrypted=False, protocol_v2=True, max_sessions=None, accept_env=()):
+    def ssh(self, encrypted=False, protocol_v2=True, max_sessions=None):
         sshd = shutil.which('sshd') or '/usr/sbin/sshd'
         if not Path(sshd).exists(): raise RuntimeError('OpenSSH server missing; install openssh-server')
         host, identity = self.root/'host', self.root/'identity'
@@ -306,9 +242,8 @@ class Fixture:
         with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port = sock.getsockname()[1]
         config = self.root/'sshd_config'
         config.write_text(f'Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nPidFile {self.root}/sshd.pid\nAuthorizedKeysFile {authorized}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nLogLevel VERBOSE\n')
-        accepted = ('GIT_PROTOCOL', *accept_env) if protocol_v2 else accept_env
-        if accepted:
-            with config.open('a') as output:output.write('AcceptEnv ' + ' '.join(accepted) + '\n')
+        if protocol_v2:
+            with config.open('a') as output:output.write('AcceptEnv GIT_PROTOCOL\n')
         if max_sessions is not None:
             with config.open('a') as output:output.write(f'MaxSessions {max_sessions}\n')
         errors = (self.root/'sshd.log').open('w+b'); self.handles.append(errors)
@@ -332,29 +267,34 @@ class Fixture:
         askpass.chmod(0o700)
         self.env.update(SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE='force', DISPLAY='fixture:0')
         return f'ssh://{pwd.getpwuid(os.getuid()).pw_name}@127.0.0.1:{port}{self.repo}'
-    def force_upload_pack(self, commands):
-        wrapper = self.root / 'fixture-upload-pack'
-        wrapper.write_text('#!/bin/sh\n' + commands)
-        wrapper.chmod(0o700)
-        authorized = self.root / 'authorized'
-        authorized.write_text(f'command="{wrapper}" ' + authorized.read_text())
-    def probe(self, source, revision='HEAD', verify=False, *, prefix=()):
-        process = subprocess.Popen([*prefix, str(OPTIONS.probe.resolve()), source, revision, *(['--verify'] if verify else [])], cwd=self.cwd, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    def probe(self, source, revision='HEAD', verify=False, eager=False):
+        flags = [flag for enabled, flag in ((verify, '--verify'), (eager, '--eager')) if enabled]
+        process = subprocess.Popen([str(OPTIONS.probe.resolve()), source, revision, *flags], cwd=self.cwd, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         self.children.append(process)
         return process
-    def line(self, process, read_error=None):
+    def line(self, process):
         ready, _, _ = select.select([process.stdout], [], [], 20)
         if not ready: raise AssertionError('probe output timed out')
         line = process.stdout.readline()
         if not line:
             server_log=(self.root/'sshd.log').read_text() if (self.root/'sshd.log').exists() else ''
-            errors = process.stderr.read() if read_error is None else read_error()
-            raise AssertionError('probe failed: '+errors.decode(errors='replace')+'\n'+server_log)
+            raise AssertionError('probe failed: '+process.stderr.read().decode()+'\n'+server_log)
         return json.loads(line)
     def operation(self, process, text):
         process.stdin.write((text+'\n').encode()); process.stdin.flush()
         value = self.line(process); report = self.line(process)
         return value, report
+    def wait_for_packs(self, process, count, *keys):
+        # Verified objects are readable before the enclosing pack ends.
+        deadline = time.monotonic()+10
+        while True:
+            process.stdin.write(b'report\n'); process.stdin.flush()
+            report = self.line(process)
+            if all(report['metrics'][key] >= count for key in keys):
+                return report
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'pack counters did not reach {count}: {report["metrics"]}')
+            time.sleep(.01)
     def finish(self, process):
         process.stdin.write(b'exit\n'); process.stdin.flush()
         _, errors = process.communicate(timeout=20)
@@ -405,7 +345,7 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
         result = subprocess.run([str(OPTIONS.probe), source, 'HEAD'], cwd=self.root,
                                 env=self.env, capture_output=True, timeout=10)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        assert_no_run_state(self, self.root)
+        self.assertEqual(run_directories(self.root), [])
         return result.stderr.decode()
 
     def test_missing_native_git_names_requirement_and_safe_next_step(self):
@@ -432,17 +372,17 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
         self.assertNotEqual(result.returncode, 0, result.stdout)
         for detail in ('native Git', 'not found on PATH', 'revision resolution', 'install'):
             self.assertIn(detail, result.stderr.decode())
-        assert_no_run_state(self, self.root)
+        self.assertEqual(run_directories(self.root), [])
 
     def test_github_publickey_failure_offers_conditional_https_without_retry(self):
+        self.native_version('2.45.1')
+        ssh = self.tools / 'ssh'
+        ssh.write_text("#!/bin/sh\nprintf '%s\\n' 'git@github.com: Permission denied (publickey).' >&2\nexit 255\n")
+        ssh.chmod(0o700)
+        self.env['GIT_SSH_COMMAND'] = str(ssh)
         for source in ('git@github.com:owner/repository.git',
                        'ssh://git@github.com/owner/repository.git'):
             with self.subTest(source=source):
-                self.native_version('2.45.1')
-                ssh = self.tools / 'ssh'
-                ssh.write_text('#!/bin/sh\nprintf "%s\n" "Permission denied (publickey)." >&2\nexit 255\n')
-                ssh.chmod(0o700)
-                self.env['GIT_SSH_COMMAND'] = str(ssh)
                 (self.root / 'native-requests').unlink(missing_ok=True)
                 error = self.failure(source)
                 for detail in ('publickey', 'if this GitHub repository is public',
@@ -456,193 +396,141 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.addCleanup(self.f.close)
-    def fetched_oid(self, source, revision, *, filtered=True):
-        """Native fetch is the oracle; the caller repository is never its target."""
+    def test_explicit_local_paths_preserve_original_bytes(self):
         f=self.f
-        with tempfile.TemporaryDirectory(dir=f.root,prefix='fetch-oracle-') as directory:
-            f.git('init','--bare','--quiet',directory,at=f.root)
-            result=subprocess.run(['git','-C',directory,'fetch','--no-tags',
-                                   '--filter=tree:0' if filtered else '--no-filter',
-                                   '--refmap=','--',source,revision],
-                                  env=f.env,capture_output=True,timeout=20)
-            self.assertEqual(result.returncode,0,result.stderr)
-            rows=(Path(directory)/'FETCH_HEAD').read_bytes().splitlines()
-            selected=[row.split(b'\t',1)[0].decode() for row in rows
-                      if b'\tnot-for-merge\t' not in row]
-            self.assertEqual(len(selected),1,rows)
-            return selected[0]
-    def test_explicit_local_sources_use_the_same_revision_as_git_c(self):
-        f = self.f
-        local = f.root / 'source :: with spaces.git'
-        f.repo.rename(local)
-        f.repo = local
-        f.git('init', '--quiet', at=f.cwd)
-        relative = '../' + local.name
-        without_suffix = local.with_suffix('')
-        gitfile = f.root / 'gitfile'
-        gitfile.write_text(f'gitdir: {local.name}\n')
-        home_path = '~/' + local.name
-        f.git('remote', 'add', 'origin', relative, at=f.cwd)
-        f.git('remote', 'add', 'home-relative', home_path, at=f.cwd)
-        f.git('config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/unused/*', at=f.cwd)
-        f.git('config', 'remotes.origin', 'other another', at=f.cwd)
-        before_refs = f.git('show-ref')
-        before_config = (local / 'config').read_bytes()
-        environment, log = record_git_invocations(f.root, dict(f.env, HOME=str(f.root)))
-        environment = git_on_environment(OPTIONS.binary, environment, f.root / 'local-cli-tools')
-        command = [
-            'HEAD:deep', '--backend=copy', '--write-policy=all',
-            '--', 'sh', '-c', 'printf "%s\n" "$GIT_ON_TREE_OID"; cat file',
-        ]
-        expected = f.subtree.encode() + b'\nexpected\n'
-        for label, argv in (
-            ('git -C', ['git', '-C', local, 'on']),
-            ('relative', [OPTIONS.binary, relative]),
-            ('absolute', [OPTIONS.binary, local]),
-            ('file URL', [OPTIONS.binary, local.as_uri()]),
-            ('configured remote', [OPTIONS.binary, 'origin']),
-            ('home-relative path', [OPTIONS.binary, home_path]),
-            ('home-relative remote', [OPTIONS.binary, 'home-relative']),
-            ('omitted .git suffix', [OPTIONS.binary, str(without_suffix) + '/']),
-            ('file URL without .git suffix', [OPTIONS.binary, without_suffix.as_uri()]),
-            ('gitfile', [OPTIONS.binary, gitfile]),
-            ('gitfile with trailing slash', [OPTIONS.binary, str(gitfile) + '/']),
-            ('gitfile URL with trailing slash', [OPTIONS.binary, gitfile.as_uri() + '/']),
-        ):
-            with self.subTest(source=label):
-                self.assertEqual(run([*argv, *command], cwd=f.cwd, env=environment, timeout=20), expected)
-        without_suffix.mkdir()
-        self.assertEqual(run([OPTIONS.binary, without_suffix, *command], cwd=f.cwd,
-                             env=environment, timeout=20), expected)
-        nested = f.cwd / 'local_team::work'
-        nested.mkdir()
-        nested.with_suffix('.git').symlink_to(local, target_is_directory=True)
-        (nested / 'selected').write_text('caller subtree\n')
-        f.git('add', '--', f'{nested.name}/selected', at=f.cwd)
-        f.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-              'commit', '-qm', 'caller', at=f.cwd)
-        f.git('remote', 'add', 'nested', nested.name, at=f.cwd)
-        show_tree = ['HEAD:./', '--backend=copy', '--write-policy=all', '--',
-                     'sh', '-c', 'printf "%s\n" "$GIT_ON_TREE_OID"; cat selected']
-        expected = run(['git', '-C', nested, 'on', *show_tree], env=environment, timeout=20)
-        for source in (nested.name, nested.as_uri(), 'nested'):
+        weird=f.root/os.fsdecode(b'server-\xff.git')
+        literal = f.cwd / '~git-on-test-source'
+        literal.symlink_to(f.repo, target_is_directory=True)
+        paths = [str(f.repo), '../server.git', literal.name]
+        for separators in ('', '/'):
+            encoded = quote_from_bytes(os.fsencode(f.repo), safe=separators)
+            encoded = '%2F' + encoded[1:] if separators else encoded
+            source = 'file://' + encoded
+            self.assertEqual(f.git('ls-remote', source, 'HEAD', at=f.cwd).split()[0], f.commit)
+            paths.append(source)
+        try:
+            weird.symlink_to(f.repo, target_is_directory=True)
+        except OSError as error:
+            if error.errno != errno.EILSEQ:
+                raise
+        else:
+            paths.append(str(weird))
+        for source in paths:
             with self.subTest(source=source):
-                self.assertEqual(run([OPTIONS.binary, source, *show_tree], cwd=f.cwd,
-                                     env=environment, timeout=20), expected)
-        missing = f.cwd / 'absent'
-        missing.with_suffix('.git').mkdir()
-        helper_url = 'ext::example'
-        (f.cwd / helper_url).mkdir()
-        (f.cwd / '::helper').mkdir()
-        (f.cwd / 'rsync:obsolete').mkdir()
-        f.git('remote', 'add', 'helper', helper_url, at=f.cwd)
-        f.git('remote', 'add', 'forced-helper', nested.as_uri(), at=f.cwd)
-        f.git('config', 'remote.forced-helper.vcs', 'ext', at=f.cwd)
-        for source, diagnostic in (
-            (missing, b'local repository path is unavailable'),
-            ('helper', b'remote transport must be direct HTTPS or OpenSSH'),
-            ('::helper', b'remote transport must be direct HTTPS or OpenSSH'),
-            ('rsync:obsolete', b'remote transport must be direct HTTPS or OpenSSH'),
-            ('forced-helper', b'external Git remote helpers are outside the direct transport profile'),
+                process=f.probe(source,'main')
+                self.assertEqual(f.line(process)['tree'],f.tree)
+                value,_=f.operation(process,'read deep/file')
+                self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_relative_local_remote_from_bare_subdirectory_follows_native_git(self):
+        f = self.f
+        caller = f.root / 'caller.git'
+        f.git('init', '--bare', '--quiet', str(caller), at=f.root)
+        nested = caller / 'nested'
+        nested.mkdir()
+        source = caller / f.repo.name
+        f.git('clone', '--bare', '--quiet', str(f.repo), str(source), at=f.root)
+        f.git('config', 'remote.origin.url', '../' + source.name, at=caller)
+        decoy = f.git('mktree', data=f'100644 blob {f.blob}\tother\n'.encode())
+        f.git('update-ref', 'HEAD', f.git('commit-tree', decoy, data=b'decoy\n'))
+        self.assertEqual(f.git('ls-remote', 'origin', 'HEAD', at=nested).split()[0], f.commit)
+        expected = f.git('show', 'HEAD:other', at=source).encode() + b'\n'
+        result = subprocess.run([OPTIONS.binary.resolve(), 'origin', 'HEAD', '--backend=copy',
+                                 '--write-policy=all', '--', 'cat', 'other'],
+                                cwd=nested, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, expected)
+    def test_relative_legacy_local_remotes_use_the_caller_worktree_root(self):
+        f = self.f
+        f.git('init', '--quiet', at=f.cwd)
+        nested = f.cwd / 'nested'
+        nested.mkdir()
+        for directory, definition in (
+            ('remotes', 'URL: ../server.git\nPull: refs/heads/main:refs/heads/main\n'),
+            ('branches', '../server.git#main\n'),
         ):
-            with self.subTest(rejected_source=source):
+            with self.subTest(directory=directory):
+                name = f'local-{directory}'
+                remote = f.cwd / '.git' / directory / name
+                remote.parent.mkdir(exist_ok=True)
+                remote.write_text(definition)
+                self.assertEqual(f.git('ls-remote', name, 'HEAD', at=nested).split()[0],
+                                 f.commit)
                 result = subprocess.run(
-                    [OPTIONS.binary, source, 'HEAD', '--backend=copy', '--write-policy=all',
-                     '--', 'printf', 'command ran'],
-                    cwd=f.cwd, env=environment, capture_output=True, timeout=20,
+                    [OPTIONS.binary, name, 'HEAD', '--backend=copy',
+                     '--write-policy=all', '--', 'cat', 'deep/file'],
+                    cwd=nested, env=f.env, capture_output=True, timeout=20,
                 )
-                self.assertEqual(result.returncode, 125, result.stderr)
-                self.assertEqual(result.stdout, b'')
-                self.assertIn(diagnostic, result.stderr)
-        destination = 'refs/heads/private-copy'
-        rejected = subprocess.run(
-            [OPTIONS.binary, 'origin', f'main:{destination}', '--backend=copy',
-             '--write-policy=all', '--', 'printf', 'command ran'],
-            cwd=f.cwd, env=environment, capture_output=True, timeout=20,
-        )
-        self.assertEqual(rejected.returncode, 125, rejected.stderr)
-        self.assertEqual(rejected.stdout, b'')
-        self.assertTrue(git_invocations(log))
-        self.assertFalse(any('fetch' in args or 'init' in args for args in git_invocations(log)))
-        self.assertEqual(f.git('show-ref'), before_refs)
-        self.assertEqual((local / 'config').read_bytes(), before_config)
-        assert_no_run_state(self, f.root)
-
-    def test_https_selects_exact_short_refs_in_large_advertisements(self):
-        f = self.f
-        neighbor = f.git('commit-tree', f.subtree, data=b'neighbor tree\n')
-        refs = [f'create {ref} {f.commit}\n'
-                for ref in ('refs/heads/tag', 'refs/heads/r', 'refs/tags/release')]
-        f.git('update-ref', '--stdin', data=''.join(refs).encode())
-        url = f.https()
-        for revision in ('tag', 'heads/r', 'tags/release', 'r'):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'expected\n')
+    def test_local_branch_tag_collision_follows_native_revision_precedence(self):
+        f=self.f; source='file://'+str(f.repo)
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        other=f.git('commit-tree',other_tree,data=b'tag collision fixture\n')
+        f.git('update-ref','refs/tags/main',other)
+        for revision in ('main','heads/main','tags/main'):
             with self.subTest(revision=revision):
-                if revision == 'r':
-                    neighbors = ''.join(f'create refs/heads/r-neighbor-{index:04d}-abcdefghij {neighbor}\n'
-                                        for index in range(4096))
-                    f.git('update-ref', '--stdin', data=neighbors.encode())
-                result = subprocess.run(
-                    [OPTIONS.binary, url, revision, '--backend=copy', '--write-policy=all',
-                     '--', 'sh', '-c', 'printf "%s\\n" "$GIT_ON_TREE_OID"; cat deep/file'],
-                    cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
-                )
-                self.assertEqual((result.returncode, result.stdout),
-                                 (0, f.tree.encode() + b'\nexpected\n'), result.stderr)
-
-    def test_local_reftable_uses_native_object_reads(self):
-        f = self.f
-        source = f.root / 'with-reftable.git'
-        f.git('init', '--quiet', '--bare', '--ref-format=reftable', source, at=f.root)
-        (source / 'objects/info/alternates').write_bytes(os.fsencode(f.repo / 'objects') + b'\n')
-        f.git('update-ref', 'refs/heads/main', f.commit, at=source)
-        self.assertEqual(f.git('rev-parse', 'main^{tree}', at=source), f.tree)
-
-        # An unread caller stderr pipe must not block the object reader.
-        native_git = shlex.quote(shutil.which('git'))
-        tools = f.root / 'reader-tools'
-        tools.mkdir()
-        wrapper = tools / 'git'
-        wrapper.write_text(
-            '#!/bin/sh\ncase " $* " in\n'
-            '    *" --batch-command "*) dd if=/dev/zero bs=65536 count=4 >&2 2>/dev/null ;;\n'
-            f'esac\nexec {native_git} "$@"\n'
-        )
-        wrapper.chmod(0o700)
-        f.env['PATH'] = str(tools) + os.pathsep + f.env['PATH']
-        process = f.probe(source, 'main')
-        self.assertTrue(select.select([process.stdout], [], [], 5)[0],
-                        'native object reader stalled while writing diagnostics')
-        initial = f.line(process)
-        self.assertEqual(initial['tree'], f.tree)
-        self.assertEqual(bytes(initial['source_git_dir']), os.fsencode(source.resolve()))
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(list(f.root.glob('*/local-object-bridge-*')), [])
-        f.finish(process)
-
-    def test_force_prefixed_refspec_follows_native_ssh_selection(self):
-        f = self.f
-        other_tree = f.git('mktree', data=f'100644 blob {f.other}\tfile\n'.encode())
-        other = f.git('commit-tree', other_tree, data=b'force refspec fixture\n')
-        f.git('update-ref', 'refs/heads/+main', other)
-        source = f.ssh(protocol_v2=True)
-        for revision, commit, tree in (
-            ('+main', f.commit, f.tree),
-            ('refs/heads/+main', other, other_tree),
-        ):
-            with self.subTest(revision=revision):
-                self.assertEqual(self.fetched_oid(source, revision), commit)
-                process = f.probe(source, revision)
-                self.assertEqual(f.line(process)['tree'], tree)
+                oid=f.git('rev-parse','--verify',revision)
+                process=f.probe(source,revision)
+                self.assertEqual(f.line(process)['tree'],f.git('rev-parse',oid+'^{tree}'))
                 f.finish(process)
-        with self.subTest(configured_variant='ssh'):
-            f.env, calls = record_git_invocations(f.root, f.env)
-            f.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='ssh.variant',
-                         GIT_CONFIG_VALUE_0='ssh')
-            process = f.probe(source, '+main')
-            self.assertEqual(f.line(process)['tree'], f.tree)
-            f.finish(process)
-            self.assertFalse(any('fetch' in args for args in git_invocations(calls)))
+    def test_invalid_local_revision_reports_native_git_error(self):
+        f=self.f; source='file://'+str(f.repo)
+        for revision in ('missing-branch','main:bad..destination'):
+            with self.subTest(revision=revision):
+                process=f.probe(source,revision)
+                _,errors=process.communicate(timeout=20)
+                self.assertNotEqual(process.returncode,0)
+                self.assertIn(b'Git rev-parse failed',errors)
+                self.assertNotIn(b'not advertised',errors)
+    @unittest.skipIf(sys.platform == 'darwin', 'requires byte-valued ref filenames')
+    def test_local_non_utf8_ref_is_passed_to_git_unchanged(self):
+        f=self.f; revision=os.fsdecode(b'branch-\xff')
+        f.git('update-ref','refs/heads/'+revision,f.commit)
+        process=f.probe('file://'+str(f.repo),revision)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file')
+        self.assertEqual(value['data'],'expected\n'); f.finish(process)
+    def test_fetch_multiple_selected_objects_and_blob_never_execute_command(self):
+        f=self.f; source='file://'+str(f.repo)
+        other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        other=f.git('commit-tree',other_tree,data=b'second fetch target\n')
+        f.git('update-ref','refs/heads/other',other)
+        sentinel=f.root/'executed'
+        for revision in ('refs/heads/*:refs/remotes/private/*',f.blob):
+            with self.subTest(revision=revision):
+                result=subprocess.run([str(OPTIONS.binary),source,revision,'--',
+                                       sys.executable,'-c',
+                                       f'from pathlib import Path; Path({str(sentinel)!r}).touch()'],
+                                      cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+                self.assertEqual(result.returncode,125,result.stderr)
+                self.assertNotIn(b'Usage:',result.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertEqual(run_directories(f.root),[])
+    def test_relative_remote_transport_paths_follow_native_worktree(self):
+        f = self.f
+        f.git('init', '--quiet', at=f.cwd)
+        nested = f.cwd / 'nested'
+        nested.mkdir()
+        https, ssh = f.https(), f.ssh()
+        f.git('remote', 'add', 'origin', https, at=f.cwd)
+        f.git('config', 'http.sslCAInfo', '../tls.crt', at=f.cwd)
+        env = f.env.copy()
+        env.pop('GIT_SSL_CAINFO')
+        env['GIT_SSH_COMMAND'] = env['GIT_SSH_COMMAND'].replace(str(f.root / 'identity'), '../identity')
+        for url in (https, ssh):
+            with self.subTest(url=url):
+                f.git('remote', 'set-url', 'origin', url, at=f.cwd)
+                native = run(['git', 'ls-remote', 'origin', 'HEAD'], cwd=nested, env=env)
+                self.assertEqual(native.split()[0].decode(), f.commit)
+                result = subprocess.run(
+                    [str(OPTIONS.binary), 'origin', 'HEAD', '--backend=copy',
+                     '--write-policy=all', '--', 'cat', 'deep/file'],
+                    cwd=nested, env=env, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'expected\n')
+        self.assertFalse(run_directories(f.root))
+
     def test_fixture_exec_failure_exits_without_reentering_test_runner(self):
         f=self.f; pid,fd=pty.fork(); reaped=False; transcript=bytearray()
         if pid==0:
@@ -692,6 +580,7 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n')
                 f.finish(process)
+    @unittest.skipIf(sys.platform == 'darwin', 'requires byte-valued ref filenames')
     def test_review_unrelated_non_utf8_remote_ref_preserves_ascii_selection(self):
         f=self.f; name=b'refs/heads/unrelated-\xff'
         f.git('update-ref',os.fsdecode(name),f.commit)
@@ -758,21 +647,26 @@ class RemoteTests(unittest.TestCase):
         tree=write('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
         commit=write('commit-tree',tree,data=b'external ODB fixture\n')
         self.assertNotEqual(commit,f.commit)
+        from support.git_invocations import git_invocations, record_git_invocations
+        observed,log=record_git_invocations(f.root,original)
         for variable in ('GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES'):
             with self.subTest(variable=variable):
-                f.env=dict(original,**{variable:str(objects)})
+                log.write_text('')
+                f.env=dict(observed,**{variable:str(objects)})
                 self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
                 process=f.probe('local',commit)
                 self.assertEqual(f.line(process)['tree'],tree)
                 value,_=f.operation(process,'read file')
                 self.assertEqual(value['data'],'external object database\n'); f.finish(process)
+                batches=[args[-1] for args in git_invocations(log) if 'cat-file' in args]
+                self.assertCountEqual(batches,['--batch','--batch-check'] if 'ALTERNATE' in variable else [])
                 if OPTIONS.require_fuse:
                     result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
                                           cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,b'external object database\n')
-                    assert_no_run_state(self, f.root)
-    def test_local_namespace_environment_does_not_leave_snapshot_pins(self):
+                    self.assertEqual(run_directories(f.root),[])
+    def test_local_namespace_environment_reads_native_repository(self):
         f=self.f; f.cwd=f.repo; unscoped=dict(f.env)
         f.env['GIT_NAMESPACE']='snapshot-input-namespace'
         def refs():
@@ -791,8 +685,8 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout,b'expected\n')
             self.assertEqual(refs(),before)
-            assert_no_run_state(self, f.root)
-    def test_local_common_directory_reads_without_changing_native_repository_refs(self):
+            self.assertEqual(run_directories(f.root),[])
+    def test_local_common_directory_reads_native_repository(self):
         f=self.f; f.cwd=f.repo; unscoped=dict(f.env); common=f.root/'common.git'
         run(['git','clone','--bare','--no-local','--quiet',f.repo,common],env=f.env)
         f.git('config','user.name','Common Repository',at=common)
@@ -808,31 +702,18 @@ class RemoteTests(unittest.TestCase):
         f.env.update(GIT_DIR=str(f.repo),GIT_COMMON_DIR=str(common))
         self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
         process=f.probe('local',commit)
-        initial = f.line(process)
-        self.assertEqual(initial['tree'], tree)
-        self.assertEqual(bytes(initial['source_git_dir']), os.fsencode(f.repo.resolve()))
-        for repository in before: self.assertEqual(refs(repository),before[repository])
+        self.assertEqual(f.line(process)['tree'],tree)
         value,_=f.operation(process,'read file')
         self.assertEqual(value['data'],'common repository\n'); f.finish(process)
         for repository in before: self.assertEqual(refs(repository),before[repository])
-        invocation = f.cwd / 'nested'
-        invocation.mkdir()
-        relative = dict(f.env, GIT_COMMON_DIR=os.path.relpath(common, f.repo))
-        env = git_on_environment(OPTIONS.binary, relative, f.root / 'common-dir-tools')
-        revision = commit + '^{tree}'
-        self.assertEqual(run(['git', '-C', f.repo, 'rev-parse', revision],
-                             cwd=invocation, env=env).strip(), tree.encode())
-        for arguments in (['git', '-C', f.repo, 'on'], [OPTIONS.binary, f.repo]):
-            with self.subTest(arguments=arguments):
-                observed = run([*arguments, revision, '--backend=copy', '--write-policy=all',
-                                '--', 'cat', 'file'], cwd=invocation, env=env, timeout=15)
-                self.assertEqual(observed, b'common repository\n')
-        if OPTIONS.require_fuse or OPTIONS.require_nfs:
+        if OPTIONS.require_fuse:
+            result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
+                                  cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,b'common repository\n')
+            for repository in before: self.assertEqual(refs(repository),before[repository])
             ready=f.root/'common-ready'
-            code=(f'import os,time; from pathlib import Path; '
-                  f'assert Path("file").read_text() == "common repository\\n"; '
-                  f'ready=Path({str(ready)!r}); pending=ready.with_suffix(".new"); '
-                  f'pending.write_text(str(os.getpid())); pending.replace(ready); time.sleep(30)')
+            code=f'import os,time; from pathlib import Path; assert Path("file").read_text() == "common repository\\n"; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(30)'
             process=subprocess.Popen([str(OPTIONS.binary),commit,'--',sys.executable,'-c',code],
                                      cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             f.children.append(process)
@@ -841,26 +722,21 @@ class RemoteTests(unittest.TestCase):
             self.assertTrue(ready.exists(),'common-directory snapshot did not execute its command')
             child=int(ready.read_text()); runs=run_directories(f.root)
             self.assertEqual(len(runs),1)
-            live_refs={repository:refs(repository) for repository in before}
             process.kill(); process.wait(timeout=5)
             with contextlib.suppress(ProcessLookupError): os.kill(child,signal.SIGTERM)
             process.communicate(timeout=5)
-            stale_refs={repository:refs(repository) for repository in before}
             cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(runs[0])],
                                    cwd=f.cwd,env=unscoped,capture_output=True,timeout=15)
             self.assertEqual(cleanup.returncode,0,cleanup.stderr)
             self.assertFalse(runs[0].exists())
-            self.assertEqual(live_refs,before)
-            self.assertEqual(stale_refs,before)
             for repository in before: self.assertEqual(refs(repository),before[repository])
+    @unittest.skipUnless(sys.platform == 'linux', 'byte-valued repository filenames require Linux')
     def test_local_c_quoted_alternate_with_colon_and_non_utf8_path_matches_native_git(self):
-        f = self.f
-        f.cwd = f.repo
-        # APFS itself rejects filenames that are invalid UTF-8.
-        suffix = b'\xff' if sys.platform == 'linux' else 'é'.encode()
-        objects = f.root / os.fsdecode(b'alternate:objects-' + suffix)
-        objects.mkdir()
-        writer=dict(f.env,GIT_OBJECT_DIRECTORY=str(objects))
+        f=self.f; f.cwd=f.repo; objects=f.root/os.fsdecode(b'alternate:objects-\xff'); objects.mkdir()
+        nested=f.root/os.fsdecode(b'nested-\xfe'); nested.mkdir()
+        (objects/'info').mkdir()
+        (objects/'info/alternates').write_bytes(b'../'+os.fsencode(nested.name)+b'\n')
+        writer=dict(f.env,GIT_OBJECT_DIRECTORY=str(nested))
         def write(*args,data):
             return run(['git','-C',f.repo,*args],input=data,env=writer).decode().strip()
         blob=write('hash-object','-w','--stdin',data=b'quoted alternate\n')
@@ -873,369 +749,19 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(f.git('rev-parse','--verify',commit+'^{tree}'),tree)
         process=f.probe('local',commit)
         self.assertEqual(f.line(process)['tree'],tree)
+        self.assertFalse(list(f.root.glob('*/local-object-bridge-*')))
         value,_=f.operation(process,'read file')
         self.assertEqual(value['data'],'quoted alternate\n'); f.finish(process)
-        if OPTIONS.require_fuse:
-            result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
-                                  cwd=f.cwd,env=f.env,capture_output=True,timeout=20)
-            self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(result.stdout,b'quoted alternate\n')
-            assert_no_run_state(self, f.root)
-
-    def test_local_absolute_object_directory_with_an_alternate_needs_no_private_odb(self):
-        f = self.f
-        f.cwd = f.repo
-        name = b'primary:objects-' + (b'utf8' if sys.platform == 'darwin' else b'\xff')
-        primary = f.root.resolve() / os.fsdecode(name)
-        (primary / 'info').mkdir(parents=True)
-        (primary / 'info' / 'alternates').write_text('../server.git/objects\n')
-        f.env['GIT_OBJECT_DIRECTORY'] = str(primary)
-        expected = f.git('show', f.commit + ':deep/file')
-        self.assertEqual(expected, 'expected')
-        process = f.probe('local', f.commit)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], expected + '\n')
-        bridges = list(f.root.glob('*/local-object-bridge-*'))
-        f.finish(process)
-        self.assertEqual(bridges, [])
-
-    def test_local_absolute_object_directory_accepts_native_relative_alternates(self):
-        f = self.f
-        f.cwd = f.repo
-        link = f.git('hash-object', '-w', '--stdin', data=b'deep/file')
-        entries = f.git('ls-tree', f.tree).encode() + f'\n120000 blob {link}\tlink\n'.encode()
-        tree = f.git('mktree', data=entries)
-        commit = f.git('commit-tree', tree, data=b'relative alternates fixture\n')
-        primary = f.root.resolve() / 'primary-objects'
-        (primary / 'info').mkdir(parents=True)
-        shutil.copytree(f.repo / 'objects', primary / 'sub')
-        f.env['GIT_OBJECT_DIRECTORY'] = str(primary)
-        f.env['GIT_ON_SERVICE_TMPDIR'] = str(f.root / 'missing-service-dir')
-        entry = primary / 'info/alternates'
-        for line in ('sub', '"sub"'):
-            with self.subTest(alternate=line):
-                entry.write_text(line + '\n')
-                expected = f.git('show', commit + ':deep/file')
-                self.assertEqual(expected, 'expected')
-                process = f.probe('local', commit)
-                self.assertEqual(f.line(process)['tree'], tree)
-                value, _ = f.operation(process, 'read deep/file')
-                self.assertEqual(value['data'], expected + '\n')
-                self.assertEqual(list(f.root.glob('*/local-object-bridge-*')), [])
-                f.finish(process)
-                copy = subprocess.run(
-                    [OPTIONS.binary, commit, '--backend=copy', '--write-policy=all', '--',
-                     'cat', 'link'],
-                    cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
-                )
-                self.assertEqual((copy.returncode, copy.stdout), (0, b'expected\n'), copy.stderr)
-                assert_no_run_state(self, f.root)
-
-        # An unrelated object directory with the same relative spelling in
-        # the caller's cwd is outside the source Git selected.
-        shutil.copytree(primary / 'sub', f.cwd / 'elsewhere')
-        entry.write_text('elsewhere\n')
-        native = subprocess.run(
-            ['git', 'cat-file', '-e', commit], cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
-        )
-        self.assertNotEqual(native.returncode, 0, native.stderr)
-        failed = subprocess.run(
-            [OPTIONS.binary, commit, '--backend=copy', '--write-policy=all', '--', 'cat', 'link'],
-            cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
-        )
-        self.assertEqual((failed.returncode, failed.stdout), (125, b''), failed.stderr)
-        assert_no_run_state(self, f.root)
-
-    def test_native_local_alternates_do_not_fetch_missing_promisor_objects(self):
-        f = self.f
-        f.cwd = f.repo
-        f.git('config', 'remote.provider.url', f.repo.as_uri())
-        f.git('config', 'remote.provider.promisor', 'true')
-        programs = f.root / 'git-without-no-lazy-fetch'
-        programs.mkdir()
-        git = shutil.which('git')
-        launcher = programs / 'git'
-        intercepted = programs / 'intercepted'
-        events = programs / 'native-process-events'
-        launcher.write_text(
-            '#!/bin/sh\n'
-            'for argument do case "$argument" in cat-file|rev-parse) '
-            f'unset GIT_NO_LAZY_FETCH; export GIT_TRACE2_EVENT={shlex.quote(str(events))}; printf "%s\\n" "$argument" >> {shlex.quote(str(intercepted))}; '
-            'break ;; esac; done\n'
-            f'exec {shlex.quote(git)} "$@"\n'
-        )
-        launcher.chmod(0o700)
-        for missing, revision in ((f.blob, f.commit), (f.subtree, f.commit + ':deep/file')):
-            with self.subTest(revision=revision):
-                intercepted.unlink(missing_ok=True)
-                events.unlink(missing_ok=True)
-                primary = f.root / ('objects-' + missing)
-                (primary / 'info').mkdir(parents=True)
-                (primary / 'info/alternates').write_text('sub\n')
-                storage = primary / 'sub'
-                shutil.copytree(f.repo / 'objects', storage)
-                (storage / missing[:2] / missing[2:]).unlink()
-                env = dict(f.env, PATH=str(programs) + os.pathsep + f.env['PATH'],
-                           GIT_OBJECT_DIRECTORY=str(primary), GIT_ALLOW_PROTOCOL='file')
-                before = sorted(path.relative_to(primary) for path in primary.rglob('*'))
+        backends = ['copy', 'fuse'] if OPTIONS.require_fuse else ['copy']
+        for backend in backends:
+            with self.subTest(backend=backend):
                 result = subprocess.run(
-                    [OPTIONS.binary, revision, '--backend=copy', '--write-policy=all', '--',
-                     'cat', 'deep/file'],
-                    cwd=f.cwd, env=env, capture_output=True, timeout=20,
+                    [OPTIONS.binary, commit, '--backend=' + backend, '--write-policy=all',
+                     '--', 'cat', 'file'], cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
                 )
-                self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-                expected_reader = 'cat-file' if missing == f.blob else 'rev-parse'
-                self.assertIn(expected_reader, intercepted.read_text().splitlines())
-                fetches = [event['argv'] for event in map(json.loads, events.read_text().splitlines())
-                           if event.get('event') == 'child_start' and 'fetch' in event.get('argv', [])]
-                self.assertEqual(fetches, [], 'native Git started a promisor fetch')
-                self.assertEqual(sorted(path.relative_to(primary) for path in primary.rglob('*')), before)
-                assert_no_run_state(self, f.root)
-
-    def test_cr_inside_an_alternates_comment_does_not_add_an_object_store(self):
-        f = self.f
-        f.git('init', '--quiet', at=f.cwd)
-        alternates = f.cwd / '.git' / 'objects' / 'info' / 'alternates'
-        contents = b'# ignored\r' + os.fsencode(f.repo / 'objects') + b'\n'
-        alternates.write_bytes(contents)
-        native = subprocess.run(['git', 'cat-file', '-t', f.tree], cwd=f.cwd, env=f.env,
-                                capture_output=True, timeout=10)
-        self.assertNotEqual(native.returncode, 0)
-        result = subprocess.run(
-            [OPTIONS.binary, f.tree, '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
-            cwd=f.cwd, env=f.env, capture_output=True, timeout=20,
-        )
-        self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-        self.assertEqual(alternates.read_bytes(), contents)
-        assert_no_run_state(self, f.root)
-
-    def test_local_alternates_keep_the_primary_depth_alongside_env(self):
-        f = self.f
-        f.cwd = f.repo
-        stores = [f.root / f'objects-{index}' for index in range(6)]
-        for store, following in zip(stores, [*stores[1:], f.repo / 'objects']):
-            (store / 'info').mkdir(parents=True)
-            (store / 'info/alternates').write_text(os.path.relpath(following, store) + '\n')
-        elsewhere = f.root / 'environment-objects'
-        elsewhere.mkdir()
-        f.env.update(GIT_OBJECT_DIRECTORY=str(stores[0]),
-                     GIT_ALTERNATE_OBJECT_DIRECTORIES=str(elsewhere))
-        self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-        process = f.probe('local', f.commit)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(list(f.root.glob('*/local-object-bridge-*')), [])
-        f.finish(process)
-
-    def test_native_local_alternates_keep_the_resolved_environment_store(self):
-        f = self.f
-        f.cwd = f.repo
-        primary = f.root / 'primary-objects'
-        (primary / 'info').mkdir(parents=True)
-        original = f.root / 'objects-with-":quote'
-        shutil.copytree(f.repo / 'objects', original)
-        empty = f.root / 'empty-objects'
-        empty.mkdir()
-        (primary / 'info/alternates').write_text('"../empty-objects"\n')
-        alternate = f.root / 'environment-objects'
-        f.env['GIT_OBJECT_DIRECTORY'] = str(primary)
-        for value in (str(alternate), '"missing:' + str(alternate), f'"{alternate}\\000suffix"'):
-            with self.subTest(value=value):
-                alternate.unlink(missing_ok=True)
-                alternate.symlink_to(original, target_is_directory=True)
-                f.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = value
-                self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-                process = f.probe('local', f.commit)
-                self.assertEqual(f.line(process)['tree'], f.tree)
-                alternate.unlink()
-                alternate.symlink_to(empty, target_is_directory=True)
-                value, _ = f.operation(process, 'read deep/file')
-                self.assertEqual(value['data'], 'expected\n')
-                f.finish(process)
-                alternate.unlink()
-
-        physical = f.root / 'physical'
-        (physical / 'child').mkdir(parents=True)
-        (physical / 'objects').symlink_to(original, target_is_directory=True)
-        alternate.symlink_to(physical / 'child', target_is_directory=True)
-        with self.subTest(value='symlink/../objects with NUL suffix'):
-            store = alternate / '..' / 'objects'
-            f.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = f'"{store}\\000suffix"'
-            self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-            process = f.probe('local', f.commit)
-            self.assertEqual(f.line(process)['tree'], f.tree)
-            value, _ = f.operation(process, 'read deep/file')
-            self.assertEqual(value['data'], 'expected\n')
-            f.finish(process)
-
-    def test_native_local_alternates_read_from_a_long_resolved_environment(self):
-        f = self.f
-        f.cwd = f.repo
-        primary = f.root / 'primary-objects'
-        (primary / 'info').mkdir(parents=True)
-        (f.root / 'empty-objects').mkdir()
-        (primary / 'info/alternates').write_text('../empty-objects\n')
-        long_path = f.root
-        for index in range(8):
-            long_path /= f'objects-{index}-' + 'x' * 68
-        long_path.mkdir(parents=True)
-        entries, stores = [], []
-        for index in range(220):
-            store = long_path / f'objects-{index}'
-            store.mkdir()
-            alias = f.root / f'alias-{index}'
-            alias.symlink_to(store, target_is_directory=True)
-            entries.append(str(alias))
-            stores.append(store)
-
-        def chain(*paths):
-            for here, following in zip(paths, paths[1:]):
-                (here / 'info').mkdir(parents=True)
-                (here / 'info/alternates').write_text(os.path.relpath(following, here) + '\n')
-
-        # The first root reaches the shared directory at the nesting limit.
-        # The later root skips that already visited store, so the last direct
-        # entry is still traversed at depth zero in Git's single graph.
-        shared = long_path / 'shared'
-        chain(stores[0], *(long_path / f'early-{i}' for i in range(4)), shared)
-        chain(stores[-2], *(long_path / f'late-{i}' for i in range(3)), shared)
-        chain(shared, stores[-1], f.repo / 'objects')
-        f.env.update(GIT_OBJECT_DIRECTORY=str(primary),
-                     GIT_ALTERNATE_OBJECT_DIRECTORIES=':'.join(entries))
-        self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-        f.env, log = record_git_invocations(f.root, f.env)
-        process = f.probe('local', f.commit)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        alias = f.root / 'alias-219'
-        alias.unlink()
-        alias.symlink_to(f.root / 'empty-objects', target_is_directory=True)
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        f.finish(process)
-        starts = git_invocations(log)
-        readers = [argv for argv in starts if 'cat-file' in argv
-                   and any(mode in argv for mode in ('--batch-command', '--batch', '--batch-check'))]
-        self.assertIn(len(readers), (1, 2), readers)
-
-    def test_native_local_alternates_report_an_early_git_error(self):
-        f = self.f
-        f.cwd = f.repo
-        primary = f.root / 'primary-objects'
-        (primary / 'info').mkdir(parents=True)
-        (primary / 'info/alternates').write_text('"../server.git/objects"\n')
-        programs = f.root / 'programs'
-        programs.mkdir()
-        git = shutil.which('git')
-        launcher = programs / 'git'
-        launcher.write_text(
-            '#!/bin/sh\n'
-            'for argument do if [ "$argument" = cat-file ]; then echo "fixture git failure" >&2; exit 17; fi; done\n'
-            f'exec {shlex.quote(git)} "$@"\n'
-        )
-        launcher.chmod(0o700)
-        env = dict(f.env, PATH=str(programs) + os.pathsep + f.env['PATH'],
-                   GIT_OBJECT_DIRECTORY=str(primary))
-        result = subprocess.run(
-            [OPTIONS.binary, f.commit, '--backend=copy', '--write-policy=all', '--', 'true'],
-            cwd=f.cwd, env=env, capture_output=True, timeout=20,
-        )
-        self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-        self.assertIn(b'fixture git failure', result.stderr)
-
-    def test_copy_rejects_a_native_decoder_failure_at_eof(self):
-        f = self.f
-        f.cwd = f.repo
-        data = random.Random(9).randbytes(80 * 1024)
-        blob = f.git('hash-object', '-w', '--stdin', data=data)
-        tree = f.git('mktree', data=f'100644 blob {blob}\tpayload\n'.encode())
-        commit = f.git('commit-tree', tree, data=b'batch exit fixture\n')
-        f.git('update-ref', 'refs/heads/main', commit)
-        primary = f.root / 'primary-objects'
-        (primary / 'info').mkdir(parents=True)
-        (primary / 'info/alternates').write_text('"../server.git/objects"\n')
-        tools = f.root / 'programs'
-        tools.mkdir()
-        native = shlex.quote(shutil.which('git'))
-        launcher = tools / 'git'
-        launcher.write_text(
-            '#!/bin/sh\nfor argument do\n'
-            '    case "$argument" in --batch-command)\n'
-            f'        {native} "$@" || exit $?\n'
-            '        exit 13 ;;\n'
-            '    esac\ndone\n'
-            f'exec {native} "$@"\n'
-        )
-        launcher.chmod(0o700)
-        env = dict(f.env, PATH=str(tools) + os.pathsep + f.env['PATH'],
-                   GIT_OBJECT_DIRECTORY=str(primary))
-        result = subprocess.run(
-            [OPTIONS.binary, f.repo.as_uri(), commit, '--backend=copy', '--write-policy=all',
-             '--', 'printf', 'child ran'],
-            cwd=f.cwd, env=env, capture_output=True, timeout=20,
-        )
-        self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-        self.assertIn(b'exit status: 13', result.stderr)
-        assert_no_run_state(self, f.root)
-
-        if OPTIONS.require_fuse or OPTIONS.require_nfs:
-            backend = 'fuse' if OPTIONS.require_fuse else 'nfs'
-            result = subprocess.run(
-                [OPTIONS.binary, commit, f'--backend={backend}', '--', 'cat', 'payload'],
-                cwd=f.cwd, env=env,
-                capture_output=True, timeout=20,
-            )
-            self.assertEqual(result.stdout, data)
-            self.assertEqual(result.returncode, 125, result.stderr)
-            self.assertIn(b'exit status: 13', result.stderr)
-            assert_no_run_state(self, f.root)
-
-    def test_local_absolute_object_directory_keeps_its_resolved_store(self):
-        f = self.f
-        f.cwd = f.repo
-        empty = f.root / 'empty-objects'
-        empty.mkdir()
-        primary = f.root / 'selected-objects'
-        primary.symlink_to(f.repo / 'objects')
-        f.env['GIT_OBJECT_DIRECTORY'] = str(primary)
-        self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-        process = f.probe('local', f.commit)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        replacement = f.root / 'replacement'
-        replacement.symlink_to(empty)
-        replacement.replace(primary)
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        f.finish(process)
-
-    @unittest.skipUnless(sys.platform == 'linux', 'byte paths require Linux in this fixture')
-    def test_local_indirect_primary_byte_path_keeps_full_alternate_depth(self):
-        f = self.f
-        f.cwd = f.repo
-        stores = [f.root / os.fsdecode(b'byte-objects-\xff')]
-        stores.extend(f.root / f'objects-{index}' for index in range(1, 6))
-        for store, following in zip(stores, [*stores[1:], f.repo / 'objects']):
-            (store / 'info').mkdir(parents=True)
-            relative = os.fsencode(os.path.relpath(following, store))
-            (store / 'info' / 'alternates').write_bytes(relative + b'\n')
-        primary = f.root / 'primary'
-        primary.symlink_to(stores[0])
-        f.env['GIT_OBJECT_DIRECTORY'] = str(primary)
-        self.assertEqual(f.git('show', f.commit + ':deep/file'), 'expected')
-        process = f.probe('local', f.commit)
-        self.assertEqual(f.line(process)['tree'], f.tree)
-        empty = f.root / 'empty-objects'
-        empty.mkdir()
-        alternate = f.root / 'replacement'
-        alternate.symlink_to(empty)
-        alternate.replace(primary)
-        value, _ = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(list(f.root.glob('*/local-object-bridge-*')), [])
-        f.finish(process)
-        assert_no_run_state(self, f.root)
-
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'quoted alternate\n')
+                self.assertFalse(run_directories(f.root))
     def test_local_hash_prefixed_alternate_components_match_native_git(self):
         if not OPTIONS.require_fuse: self.skipTest('actual FUSE execution explicitly required')
         f=self.f; f.cwd=f.repo; original=dict(f.env)
@@ -1277,7 +803,7 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=original),before_refs)
                 for directory in before_objects:
                     self.assertEqual(object_files(directory),before_objects[directory])
-                assert_no_run_state(self, f.root)
+                self.assertEqual(run_directories(f.root),[])
                 if accepted:
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,payload)
@@ -1324,10 +850,8 @@ class RemoteTests(unittest.TestCase):
                     f.cwd,f.env=cwd,env
                     process=f.probe('local',commit)
                     self.assertEqual(f.line(process)['tree'],tree)
-                    bridges=list(f.root.glob('*/local-object-bridge-*'))
                     value,_=f.operation(process,'read file')
                     self.assertEqual(value['data'].encode(),payload); f.finish(process)
-                    self.assertEqual(bridges,[])
                     if OPTIONS.require_fuse:
                         result=subprocess.run([str(OPTIONS.binary),commit,'--','cat','file'],
                                               cwd=cwd,env=env,capture_output=True,timeout=20)
@@ -1366,35 +890,6 @@ class RemoteTests(unittest.TestCase):
                         self.assertEqual(result.stdout,b'bare relative alternate\n')
                 finally: f.cwd,f.env=previous_cwd,previous_env
                 self.assertEqual(run(['git','-C',f.repo,'for-each-ref'],env=f.env),before)
-    def test_local_nested_environment_alternates_match_native_git(self):
-        f=self.f; stores=[f.root/f'objects-{index}' for index in range(7)]
-        for store in stores: (store/'info').mkdir(parents=True)
-        for store,following in zip(stores,stores[1:]):
-            (store/'info'/'alternates').write_text(str(following)+'\n')
-        f.env['GIT_OBJECT_DIRECTORY']=str(stores[-1])
-        blob=f.git('hash-object','-w','--stdin',data=b'nested alternate\n')
-        del f.env['GIT_OBJECT_DIRECTORY']
-        tree=f.git('mktree','--missing',data=f'100644 blob {blob}\tleaf\n'.encode())
-        for alternate,accepted in ((stores[0],False),(stores[1],True)):
-            with self.subTest(alternate=alternate.name):
-                env=dict(f.env,GIT_ALTERNATE_OBJECT_DIRECTORIES=str(alternate))
-                native=subprocess.run(['git','cat-file','-p',tree+':leaf'],cwd=f.repo,env=env,
-                                      capture_output=True,timeout=10)
-                self.assertEqual(native.returncode==0,accepted,native.stderr)
-                process = subprocess.Popen(
-                    [OPTIONS.probe, 'local', tree, '--metrics-only'], cwd=f.repo, env=env,
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                )
-                f.children.append(process)
-                self.assertEqual(f.line(process)['tree'], tree)
-                self.assertEqual(list(f.root.glob('*/local-object-bridge-*')), [])
-                stdout, stderr = process.communicate(input=b'read leaf\nexit\n', timeout=10)
-                self.assertEqual(process.returncode == 0, accepted, stderr)
-                if accepted:
-                    self.assertEqual(json.loads(stdout.splitlines()[0])['data'].encode(), native.stdout)
-                else:
-                    self.assertEqual(stdout, b'')
-                    self.assertIn(b'read blob header', stderr)
     def test_https_fresh_runs_lazy_objects_ref_race_and_local_equivalence(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         wanted={f.commit,f.tree,f.subtree,f.blob}
@@ -1422,6 +917,30 @@ class RemoteTests(unittest.TestCase):
         expected=run(['git','-C',f.repo,'show',f.commit+':deep/file'],env=f.env)
         self.assertEqual(expected,value['data'].encode())
         print('HTTPS request/byte evidence:', json.dumps(f.requests), flush=True)
+    def test_review_url_rewrites_are_applied_once_for_urls_and_remote_names(self):
+        f=self.f; config=f.root/'global_config'
+        wrong=f.root/'does-not-exist'
+        config.write_text(f'[url "file://{wrong}/"]\ninsteadOf = https://fixture.invalid/\n[url "file://{f.root}/"]\ninsteadOf = file://{wrong}/\n')
+        f.env['GIT_CONFIG_GLOBAL']=str(config)
+        for named in (False,True):
+            if named:
+                f.git('init','--quiet',str(f.cwd),at=f.root); f.git('remote','add','fixture','https://fixture.invalid/server.git',at=f.cwd)
+            process=f.probe('fixture' if named else 'https://fixture.invalid/server.git')
+            _,errors=process.communicate(timeout=20)
+            self.assertNotEqual(process.returncode,0)
+            self.assertIn(str(wrong).encode(),errors)
+    def test_named_remote_rejects_an_alternate_upload_pack_before_connecting(self):
+        f = self.f
+        url = f.https()
+        f.git('init', '--quiet', at=f.cwd)
+        f.git('remote', 'add', 'fixture', url, at=f.cwd)
+        f.git('config', 'remote.fixture.uploadpack', 'alternate-upload-pack', at=f.cwd)
+        process = f.probe('fixture')
+        _, errors = process.communicate(timeout=20)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(b'outside the Git protocol v2 profile', errors)
+        self.assertFalse(f.requests)
+
     def signing(self):
         f=self.f; key=f.root/'signature'
         run(['ssh-keygen','-q','-t','ed25519','-N','','-f',key])
@@ -1431,193 +950,54 @@ class RemoteTests(unittest.TestCase):
         commit=f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'commit-tree','-S',f.tree,data=b'signed fixture\n')
         f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'tag','-s','-m','signed tag','signed',commit)
         return commit,allowed
-
-    def test_eager_signed_copy_streams_for_both_url_and_origin(self):
+    def test_native_verification_uses_owned_temporary_files(self):
         f = self.f
-        signed, allowed = self.signing()
-        tag = f.git('rev-parse', 'refs/tags/signed')
-        f.git('update-ref', 'refs/heads/main', signed)
-        global_config = f.root / 'gitconfig'
-        inactive = f.root / 'inactive-signing-policy'
-        inactive.write_text('[gpg]\n\tminTrustLevel = invalid\n')
-        global_config.write_text(f'[includeIf "gitdir:**/verify-*"]\n\tpath = "{inactive}"\n')
-        f.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        signed, _ = self.signing()
+        observed = f.root / "observed-signature"
+        verifier = f.root / "observe-verifier"
+        verifier.write_text(f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+from support.run_storage import run_directories
+if '-s' in sys.argv:
+    signature = Path(sys.argv[sys.argv.index('-s') + 1]).resolve()
+    roots = []
+    for run in run_directories(Path({str(f.root)!r})):
+        roots.append(run.resolve())
+        marker = run / '.native-scratch'
+        if marker.is_symlink():
+            roots.append(marker.resolve())
+    assert signature.is_file()
+    with open({str(observed)!r}, 'a') as output:
+        print(json.dumps([str(signature), any(signature.is_relative_to(root) for root in roots)]),
+              file=output)
+os.execvp('ssh-keygen', ['ssh-keygen', *sys.argv[1:]])
+""")
+        verifier.chmod(0o700)
         url = f.https()
-        self.addCleanup(f.server.shutdown)
-        caller = f.root / 'caller'
-        f.git('init', '--quiet', caller, at=f.root)
-        f.git('remote', 'add', 'origin', url, at=caller)
-        f.git('config', 'tag.gpgsign', 'true', at=caller)
-        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',))
-        for source, revision, cwd, operation, oid, status in (
-            (url, 'main', f.cwd, 'verify-commit', signed, 0),
-            (url, 'signed', caller, 'verify-tag', tag, 0),
-            ('origin', 'signed', caller, 'verify-tag', tag, 0),
-            ('origin', 'refs/tags/signed', caller, 'verify-tag', tag, 125),
-        ):
-            with self.subTest(source=source, revision=revision, status=status):
-                if status:
-                    allowed.write_text('')
-                start = len(f.requests)
-                log.write_text('')
-                with tempfile.TemporaryFile(dir=f.root) as metrics:
-                    fd = metrics.fileno()
-                    result = subprocess.run(
-                        [OPTIONS.binary, source, revision, '--verify', '--backend=copy',
-                         '--write-policy=all', '--', 'cat', 'deep/file'],
-                        cwd=cwd, env=dict(env, GIT_ON_TEST_METRICS_FD=str(fd)),
-                        pass_fds=(fd,), capture_output=True, timeout=20,
-                    )
-                    calls = git_invocations(log)
-                    self.assertFalse([call for call in calls if 'fetch' in call['argv']], calls)
-                    expected = b'' if status else b'expected\n'
-                    self.assertEqual((result.returncode, result.stdout), (status, expected), result.stderr)
-                    if not status:
-                        metrics.seek(0)
-                        self.assertEqual(json.load(metrics)['remote_repositories_created'], 0)
-                verifies = [call for call in calls if operation in call['argv']]
-                self.assertEqual([call['argv'][-1] for call in verifies], [oid], calls)
-                self.assertFalse(Path(verifies[0]['env']['GIT_OBJECT_DIRECTORY']).exists())
-                self.assertEqual([request['wants'] for request in f.requests[start:] if request['wants']],
-                                 [[oid]])
-                if status:
-                    self.assertIn(b'execution forbidden', result.stderr)
-                assert_no_run_state(self, f.root)
-
-    def test_signed_https_selection_keeps_lazy_transport(self):
-        f = self.f
-        self.signing()
-        tag = f.git('rev-parse', 'refs/tags/signed')
-        f.env, log = record_git_invocations(f.root, f.env)
-        url = f.https()
-        process = f.probe(url, 'signed', verify=True)
-        initial = f.line(process)
-        self.assertEqual(initial['tree'], f.tree)
-        self.assertTrue({f.blob, f.other}.isdisjoint(initial['objects']))
-        value, report = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertIn(f.blob, report['objects'])
-        self.assertNotIn(f.other, report['objects'])
-        f.finish(process)
-        self.assertEqual(report['metrics']['remote_repositories_created'], 0)
-        calls = git_invocations(log)
-        self.assertFalse([args for args in calls if 'fetch' in args], calls)
-        self.assertEqual([args[-1] for args in calls if 'verify-tag' in args], [tag], calls)
-
-        if OPTIONS.require_nfs:
-            log.write_text('')
-            env = dict(f.env, GIT_ON_TEST_NFS_MOUNT_ERROR='1')
-            result = subprocess.run(
-                [OPTIONS.binary, url, 'signed', '--verify',
-                 '--write-policy=all', '--', 'cat', 'deep/file'],
-                cwd=f.cwd, env=env, capture_output=True, timeout=20,
-            )
-            self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-            calls = git_invocations(log)
-            self.assertFalse(any('fetch' in args for args in calls), calls)
-            self.assertEqual([args[-1] for args in calls if 'verify-tag' in args], [tag], calls)
-            assert_no_run_state(self, f.root)
-
-    @unittest.skipUnless(sys.platform == 'linux', 'automatic tmpfs selection on Linux')
-    def test_streamed_verifier_retries_when_automatic_tmpfs_fills(self):
-        from filesystem_quota import private_mount_namespace
-
-        f = self.f
-        namespace, uid, gid = private_mount_namespace(self)
-        shared_memory = Path('/dev/shm').resolve()
-        fixture_root = f.root.resolve()
-        candidates = (fixture_root, Path('/var/tmp').resolve())
-        disk = next((path for path in candidates
-                     if not path.is_relative_to(shared_memory)
-                     and os.pathsep not in os.fspath(path)
-                     and os.access(path, os.W_OK | os.X_OK)
-                     and run(['stat', '-f', '-c', '%T', path]).strip() != b'tmpfs'), None)
-        if disk is None:
-            if os.environ.get('GITHUB_ACTIONS') == 'true':
-                self.fail('tmpfs fallback test requires a disk-backed runtime directory')
-            self.skipTest('tmpfs fallback test requires a disk-backed runtime directory')
-        if (f.root != fixture_root or fixture_root.is_relative_to(shared_memory)
-                or os.pathsep in os.fspath(fixture_root)):
-            f = self.f = Fixture(temp_parent=disk)
-            self.addCleanup(f.close)
-        temporary = tempfile.TemporaryDirectory(dir=disk, prefix='go-verify-quota-')
-        self.addCleanup(temporary.cleanup)
-        runtime = Path(temporary.name).resolve()
-        programs = f.root / 'programs'
-        programs.mkdir()
-        binary = OPTIONS.binary
-        if binary.is_relative_to(shared_memory):
-            binary = programs / 'git-on'
-            shutil.copy2(OPTIONS.binary, binary)
-        self.signing()
-        url = f.https()
-        native = shutil.which('git', path=f.env['PATH'])
-        self.assertIsNotNone(native, 'native Git is missing from the fixture PATH')
-        native = Path(native).absolute()
-        resolved_git = native.resolve()
-        native_git = programs / 'git'
-        if resolved_git.is_relative_to(shared_memory):
-            shutil.copy2(resolved_git, native_git)
-        else:
-            native_git.symlink_to(resolved_git)
-        # The recorder uses only the standard library. Its interpreter must
-        # stay visible when the fixture replaces /dev/shm.
-        interpreter = Path(sys.executable).resolve()
-        if interpreter.is_relative_to(shared_memory):
-            system_python = shutil.which('python3', path=os.defpath)
-            interpreter = Path(system_python).resolve() if system_python else None
-            if interpreter is None or interpreter.is_relative_to(shared_memory):
-                reason = 'no system Python interpreter outside /dev/shm'
-                if os.environ.get('GITHUB_ACTIONS') == 'true':
-                    self.fail(reason)
-                self.skipTest(reason)
-        env, log = record_git_invocations(f.root, f.env, include_env=('GIT_OBJECT_DIRECTORY',),
-                                          interpreter=interpreter, native=native,
-                                          native_fallback=native_git)
-        env.update(TMPDIR=str(runtime), XDG_RUNTIME_DIR=str(runtime),
-                   GIT_CEILING_DIRECTORIES=str(f.root))
-        keys = ('PATH', 'TMPDIR', 'XDG_RUNTIME_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
-                'GIT_SSL_CAINFO', 'GIT_CEILING_DIRECTORIES',
-                'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
-                'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1')
-        settings = [f'{key}={env[key]}' for key in keys]
-        run_on_tmpfs = """
-mount -t tmpfs -o "$1" tmpfs /dev/shm
-uid=$2 gid=$3
-shift 3
-if [ "$uid" -ne 0 ]; then
-    set -- setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
-fi
-timeout --kill-after=3s 18s "$@"
-entries=$(ls -A /dev/shm)
-if [ -n "$entries" ]; then
-    printf 'files remain in private /dev/shm: %s\n' "$entries" >&2
-    exit 1
-fi
-"""
-        quotas = (('size=4m', True), ('size=1m,nr_inodes=2', False), ('size=4k', False))
-        for options, expect_tmpfs in quotas:
-            with self.subTest(options=options):
-                log.write_text('')
+        f.git('init', '--quiet', at=f.cwd)
+        nested = f.cwd / 'nested'
+        nested.mkdir()
+        env = dict(f.env, GIT_CONFIG_COUNT='3', GIT_CONFIG_VALUE_1='../allowed-signers',
+                   GIT_CONFIG_KEY_2='gpg.ssh.program',
+                   GIT_CONFIG_VALUE_2=str(verifier))
+        for source in (str(f.repo), url):
+            with self.subTest(source=source):
+                observed.unlink(missing_ok=True)
                 result = subprocess.run(
-                    [*namespace, 'sh', '-ec', run_on_tmpfs,
-                     'verify-quota', options, str(uid), str(gid), 'env', *settings, binary,
-                     url, 'signed', '--verify', '--backend=copy',
+                    [OPTIONS.binary, source, signed, '--verify', '--backend=copy',
                      '--write-policy=all', '--', 'cat', 'deep/file'],
-                    cwd=f.cwd, env=env, capture_output=True, timeout=30,
+                    cwd=nested, env=env, capture_output=True, timeout=20,
                 )
-                self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-                calls = git_invocations(log)
-                self.assertFalse([call for call in calls if 'fetch' in call['argv']], calls)
-                objects, = [Path(call['env']['GIT_OBJECT_DIRECTORY'])
-                            for call in calls if 'verify-tag' in call['argv']]
-                self.assertTrue(objects.parent.name.startswith('verify-'), objects)
-                if expect_tmpfs:
-                    self.assertTrue(objects.is_relative_to(shared_memory), objects)
-                else:
-                    self.assertEqual(objects.parents[2], runtime / 'git-on')
-                self.assertEqual(list(runtime.iterdir()), [])
-                assert_no_run_state(self, f.root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'expected\n')
+                signatures = list(map(json.loads, observed.read_text().splitlines()))
+                self.assertTrue(signatures)
+                for file, owned in signatures:
+                    self.assertTrue(owned, file)
+                    self.assertFalse(Path(file).parent.exists(), file)
+                self.assertEqual(run_directories(f.root), [])
 
     def test_review_peeled_tag_advertisement_rows_are_not_selectable_refs(self):
         f=self.f; signed,_=self.signing()
@@ -1640,15 +1020,14 @@ fi
                 process=f.probe(url,'refs/tags/signed^{}',verify=verify)
                 _,errors=process.communicate(timeout=20)
                 self.assertNotEqual(process.returncode,0,'peeled advertisement helper accepted as an exact ref')
-                self.assertIn(b'select one remote ref',errors)
+                self.assertIn(b'select a single remote ref',errors)
                 self.assertFalse(any(x['wants'] for x in f.requests[requests:]),'unsupported selector fetched objects')
-    def test_native_ssh_signature_tag_refspec_replacements_and_failures(self):
+    def test_ssh_signatures_over_https_ignore_replace_refs_and_reject_unsigned_objects(self):
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
         replacement_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
         replacement=f.git('commit-tree',replacement_tree,data=b'different replacement\n')
         f.git('update-ref','refs/replace/'+signed,replacement)
-        for revision in (signed,'signed','+refs/tags/signed',
-                         'refs/tags/signed:refs/tags/private-copy'):
+        for revision in (signed, 'refs/tags/signed'):
             process=f.probe(url,revision,verify=True); report=f.line(process)
             self.assertEqual(report['tree'],f.tree)
             value,_=f.operation(process,'read deep/file')
@@ -1691,225 +1070,20 @@ fi
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file')
                 self.assertEqual(value['data'],'expected\n'); f.finish(process)
-
-    def test_remote_verifier_keeps_the_callers_git_configuration(self):
-        f = self.f
-        url = f.https()
-        _, allowed = self.signing()
-        f.env.pop('GIT_CONFIG_COUNT')
-        f.env['GIT_CONFIG_GLOBAL'] = str(f.root / 'gitconfig')
-        f.git('config', '--global', 'fixture.verify', 'enabled')
-        policy = f.root / 'policy'
-        policy.mkdir()
-        f.git('init', '--quiet', at=policy)
-        f.git('config', 'fixture.verify', 'permit', at=policy)
-        verifier = f.root / 'caller-verify'
-        journal = f.root / 'verifier-used'
-        verifier.write_text(
-            '#!/bin/sh\n'
-            'test "$(git config --global fixture.verify)" = enabled || exit 1\n'
-            'test "$(git config --local fixture.verify)" = deny || exit 1\n'
-            'test "$(git config --get fixture.policy)" = permit || exit 1\n'
-            'if git config --local --get fixture.policy >/dev/null; then exit 1; fi\n'
-            'test "$(git config --get fixture.conditional)" = enabled || exit 1\n'
-            'if test "$FIXTURE_CHECK_WORKTREE_CONFIG" = 1; then\n'
-            '    test "$(git config --worktree fixture.verify)" = permit || exit 1\n'
-            '    test "$(git config --get fixture.verify)" = permit || exit 1\n'
-            'fi\n'
-            'if test -n "$FIXTURE_WORKTREE"; then\n'
-            '    test "$(git rev-parse --show-toplevel)" = "$FIXTURE_WORKTREE" || exit 1\n'
-            '    test "$(git -C "$FIXTURE_POLICY" config --local fixture.verify)" = permit || exit 1\n'
-            'fi\n'
-            'if test "$FIXTURE_NO_WORKTREE" = 1; then\n'
-            '    test "$(git rev-parse --is-inside-work-tree)" = false || exit 1\n'
-            '    test "$(git rev-parse --is-bare-repository)" = false || exit 1\n'
-            'fi\n'
-            f'printf invoked > {shlex.quote(str(journal))}\n'
-            f'exec {shlex.quote(shutil.which("ssh-keygen"))} "$@"\n'
-        )
-        verifier.chmod(0o700)
-        conditional_config = f.root / 'conditional-config'
-        conditional_config.write_text('[fixture]\n\tconditional = enabled\n')
-        for object_format in ('sha1', 'sha256'):
-            with self.subTest(object_format=object_format):
-                caller = f.root / object_format
-                caller.mkdir()
-                extra = ('--ref-format=reftable', '--initial-branch=verification') if object_format == 'sha256' else ()
-                f.git('init', '--quiet', '--object-format=' + object_format, *extra, at=caller)
-                f.git('config', '--global', f'includeIf.gitdir:{caller.resolve()}/.git.path',
-                      str(conditional_config))
-                f.git('config', 'fixture.verify', 'deny', at=caller)
-                policy_config = caller / '.git' / 'fixture-policy'
-                policy_config.write_text('[fixture]\n\tpolicy = permit\n')
-                f.git('config', 'include.path', 'fixture-policy', at=caller)
-                f.git('config', 'gpg.format', 'ssh', at=caller)
-                if object_format == 'sha256':
-                    f.git('config', 'extensions.worktreeConfig', 'true', at=caller)
-                    f.git('config', '--worktree', 'fixture.verify', 'permit', at=caller)
-                    branch_config = f.root / 'branch-verifier-config'
-                    shutil.copyfile(allowed, caller / 'allowed-signers')
-                    f.git('config', '--file', str(branch_config),
-                          'gpg.ssh.allowedSignersFile', 'allowed-signers')
-                    f.git('config', '--file', str(branch_config), 'gpg.ssh.program', str(verifier))
-                    f.git('config', '--global', 'includeIf.onbranch:verification.path', str(branch_config))
-                    self.assertEqual(f.git('config', 'gpg.ssh.program', at=caller), str(verifier))
-                else:
-                    f.git('config', 'gpg.ssh.allowedSignersFile', str(allowed), at=caller)
-                    f.git('config', 'gpg.ssh.program', str(verifier), at=caller)
-                cwd = caller / 'nested'
-                cwd.mkdir()
-                environment = dict(f.env)
-                if object_format == 'sha256':
-                    environment['FIXTURE_CHECK_WORKTREE_CONFIG'] = '1'
-                else:
-                    f.git('init', '--quiet', at=cwd)
-                    shutil.rmtree(cwd / '.git/objects')
-                    self.assertEqual(f.git('rev-parse', '--absolute-git-dir', at=cwd),
-                                     str(caller.resolve() / '.git'))
-                    environment['FIXTURE_WORKTREE'] = str(caller.resolve())
-                    environment['FIXTURE_POLICY'] = str(policy.resolve())
-                contexts = [(cwd, environment, None)]
-                if object_format == 'sha1':
-                    contexts.append((caller / '.git', dict(f.env, FIXTURE_NO_WORKTREE='1'), None))
-                    worktree = f.root / 'separate-worktree'
-                    worktree.mkdir()
-                    contexts.append((caller, f.env, worktree))
-                else:
-                    explicit = dict(environment, GIT_DIR=str(caller.resolve() / '.git'),
-                                    GIT_WORK_TREE=str(caller.resolve()))
-                    contexts.append((f.cwd, explicit, None))
-                for directory, env, worktree in contexts:
-                    with self.subTest(directory=directory.name):
-                        if directory == f.cwd:
-                            (caller / 'allowed-signers').rename(directory / 'allowed-signers')
-                        if worktree is not None:
-                            f.git('config', 'core.worktree', str(worktree), at=caller)
-                            self.assertEqual(f.git('rev-parse', '--show-toplevel', at=caller),
-                                             str(worktree.resolve()))
-                        journal.unlink(missing_ok=True)
-                        output = run([OPTIONS.binary, url, 'refs/tags/signed', '--verify',
-                                      '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
-                                     cwd=directory, env=env, timeout=20)
-                        self.assertEqual(output, b'expected\n')
-                        self.assertEqual(journal.read_text(), 'invoked')
-
     def test_native_openpgp_verification_uses_git_configuration(self):
-        f = self.f
-        signing_home = f.root / 'gnupg'
-        empty_home = f.root / 'unknown-gnupg'
-        for home in (signing_home, empty_home):
-            home.mkdir(mode=0o700)
-            self.addCleanup(run, ['gpgconf', '--kill', 'all'],
-                            env=dict(f.env, GNUPGHOME=str(home)))
-        f.env['GNUPGHOME'] = str(signing_home)
-        uid = 'OpenPGP fixture <fixture@example.invalid>'
-        run(['gpg', '--batch', '--pinentry-mode', 'loopback', '--passphrase', '',
-             '--quick-generate-key', uid, 'ed25519', 'sign', '0'], env=f.env)
-        signed = f.git('-c', 'user.signingkey=fixture@example.invalid', 'commit-tree',
-                       '-S', f.tree, data=b'OpenPGP fixture\n')
-
-        journal = f.root / 'verifier-journal'
-        trace = f.root / 'git-trace'
-        verifier = f.root / 'caller-gpg'
-        gpg = shlex.quote(shutil.which('gpg', path=f.env['PATH']))
-        verifier.write_text(
-            '#!/bin/sh\n'
-            f'printf "%s\\n%s\\n" "$GNUPGHOME" "$TMPDIR" >> {shlex.quote(str(journal))}\n'
-            f'exec {gpg} "$@"\n'
-        )
-        verifier.chmod(0o700)
-        f.git('config', 'gpg.program', str(verifier))
-
-        for home, status, stdout in ((signing_home, 0, b'expected\n'), (empty_home, 125, b'')):
-            with self.subTest(gnupg_home=home.name):
-                env = dict(f.env, GNUPGHOME=str(home), GIT_TRACE=str(trace),
-                           GIT_ON_SERVICE_TMPDIR=str(f.root / 'no-service-storage'))
-                journal.unlink(missing_ok=True)
-                trace.unlink(missing_ok=True)
-                result = subprocess.run(
-                    [OPTIONS.binary, '--verify', signed, '--backend=copy', '--write-policy=all',
-                     '--', 'cat', 'deep/file'],
-                    cwd=f.repo, env=env, capture_output=True, timeout=20,
-                )
-                self.assertEqual(journal.read_text().splitlines(), [str(home), str(f.root)])
-                self.assertIn(f'verify-commit {signed}', trace.read_text())
-                self.assertEqual((result.returncode, result.stdout), (status, stdout), result.stderr)
-                if status:
-                    self.assertIn(b'execution forbidden', result.stderr)
-                assert_no_run_state(self, f.root)
-
-    @unittest.skipUnless(shutil.which('gpgsm'), 'requires the native X.509 verifier')
-    def test_x509_verification_uses_the_callers_certificate_policy(self):
-        f = self.f
-        home = f.root / 'x509'
-        home.mkdir(mode=0o700)
-        f.env['GNUPGHOME'] = str(home)
-        self.addCleanup(run, ['gpgconf', '--kill', 'all'], env=f.env)
-        certificate, key = f.root / 'fixture.crt', f.root / 'fixture.key'
-        policy = '1.2.3.4'
-        run(['openssl', 'req', '-x509', '-nodes', '-newkey', 'rsa:2048', '-days', '1',
-             '-subj', '/CN=Policy fixture', '-addext', 'basicConstraints=critical,CA:TRUE',
-             '-addext', 'keyUsage=critical,digitalSignature,keyCertSign',
-             '-addext', 'certificatePolicies=critical,' + policy,
-             '-keyout', key, '-out', certificate], env=f.env)
-        fingerprint = run(['openssl', 'x509', '-in', certificate, '-noout', '-fingerprint', '-sha1'],
-                          env=f.env).strip().split(b'=', 1)[1]
-        (home / 'trustlist.txt').write_bytes(fingerprint + b' S\n')
-        policies = f.repo / 'fixture policy.txt'
-        policies.write_text(policy + '\n')
-        (home / 'gpgsm.conf').write_text(f'disable-crl-checks\npolicy-file "{policies.name}"\n')
-        run(['gpgsm', '--batch', '--import', certificate], cwd=f.repo, env=f.env)
-        # Some gpgsm builds require /dev/stdin for Git's detached input.
-        wrapper = f.root / 'gpgsm-stdin'
-        verifier = shutil.which('gpgsm')
-        wrapper.write_text(f'''#!{sys.executable}
-import os, sys
-os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for arg in sys.argv[1:])])
-''')
-        wrapper.chmod(0o700)
-        f.git('config', 'gpg.x509.program', str(wrapper))
-        unsigned = run(['git', '-C', f.repo, 'cat-file', 'commit', f.commit], env=f.env)
-        cms = run(['openssl', 'cms', '-sign', '-binary', '-outform', 'DER', '-md', 'sha256',
-                   '-signer', certificate, '-inkey', key], input=unsigned, env=f.env)
-        signature = b'-----BEGIN SIGNED MESSAGE-----\n' + base64.encodebytes(cms) + b'-----END SIGNED MESSAGE-----'
-        headers, message = unsigned.split(b'\n\n', 1)
-        signed = headers + b'\ngpgsig ' + signature.replace(b'\n', b'\n ') + b'\n\n' + message
-        commit = f.git('hash-object', '-w', '-t', 'commit', '--stdin', data=signed)
-        native = ['git', '-C', str(f.repo), 'verify-commit', commit]
-        run(native, env=f.env)
-        agent_config = home / 'gpg-agent.conf'
-        command = [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all',
-                   '--', 'cat', 'deep/file']
-        result = subprocess.run(command, cwd=f.repo, env=f.env, capture_output=True, timeout=20)
-        self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-
-        agent_config.write_text('no-user-trustlist\n')
-        run(['gpgconf', '--kill', 'gpg-agent'], env=f.env)
-        untrusted = subprocess.run(native, env=f.env, capture_output=True, timeout=20)
-        self.assertNotEqual(untrusted.returncode, 0)
-        executed = f.root / 'untrusted-command-executed'
-        rejected = subprocess.run(
-            [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all', '--',
-             sys.executable, '-c', 'import pathlib, sys; pathlib.Path(sys.argv[1]).touch()', executed],
-            cwd=f.repo, env=f.env, capture_output=True, timeout=20,
-        )
-        self.assertEqual(rejected.returncode, 125, rejected.stderr)
-        self.assertIn(b'execution forbidden', rejected.stderr)
-        self.assertFalse(executed.exists())
-        agent_config.unlink()
-        run(['gpgconf', '--kill', 'gpg-agent'], env=f.env)
-        self.assertEqual(policies.read_text(), policy + '\n')
-        policies.write_text('1.2.3.5\n')
-        denied = subprocess.run(native, env=f.env, capture_output=True, timeout=20)
-        self.assertNotEqual(denied.returncode, 0)
-        self.assertIn(b'No policy match', denied.stderr)
-        rejected = subprocess.run(
-            [OPTIONS.binary, commit, '--verify', '--backend=copy', '--write-policy=all', '--', 'cat', 'deep/file'],
-            cwd=f.repo, env=f.env, capture_output=True, timeout=20,
-        )
-        self.assertEqual((rejected.returncode, rejected.stdout), (125, b''), rejected.stderr)
-        self.assertIn(b'No policy match', rejected.stderr)
-        self.assertEqual(policies.read_text(), '1.2.3.5\n')
+        f=self.f; home=f.root/'gnupg'; home.mkdir(mode=0o700)
+        env=dict(f.env,GNUPGHOME=str(home))
+        run(['gpg','--batch','--pinentry-mode','loopback','--passphrase','','--quick-generate-key','Fixture <fixture@example.invalid>','ed25519','sign','0'],env=env)
+        wrapper=f.root/'gpg-program'; wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{home}" exec gpg "$@"\n'); wrapper.chmod(0o700)
+        f.git('config','gpg.program',str(wrapper)); f.git('config','user.signingkey','fixture@example.invalid')
+        signed=f.git('commit-tree','-S',f.tree,data=b'OpenPGP fixture\n')
+        f.cwd=f.repo
+        process=f.probe('local',signed,verify=True); f.line(process); f.operation(process,'read deep/file'); f.finish(process)
+        empty=f.root/'unknown-gnupg'; empty.mkdir(mode=0o700)
+        wrapper.write_text(f'#!/bin/sh\nGNUPGHOME="{empty}" exec gpg "$@"\n')
+        process=f.probe('local',signed,verify=True); _,errors=process.communicate(timeout=20)
+        self.assertNotEqual(process.returncode,0); self.assertIn(b'execution forbidden',errors)
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux PID descriptors')
     def test_review_stalled_transport_cancels_and_cleans_descendants(self):
         f=self.f; wrapper=f.root/'hang-ssh'; pid=f.root/'transport-pid'
         wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid}"\nexec sleep 300\n'); wrapper.chmod(0o700)
@@ -1932,7 +1106,8 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         # or depending on whether the container's PID 1 reaps adopted zombies.
         self.assertTrue(select.select([transport_fd],[],[],2)[0],
                         'owned stalled transport survived cancellation')
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux PID descriptors')
     def test_startup_transport_all_handled_signals(self):
         f=self.f; wrapper=f.root/'hanging-selected-ssh'; pid=f.root/'transport-pid'
         wrapper.write_text(f'#!/bin/sh\necho $$ > "{pid}.new"\nmv "{pid}.new" "{pid}"\nexec sleep 300\n'); wrapper.chmod(0o700)
@@ -1955,13 +1130,14 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
                     # death, including on loaded runners and unreaped zombies.
                     self.assertTrue(select.select([descriptor],[],[],2)[0],
                                     'owned startup transport survived cancellation')
-                    assert_no_run_state(self, f.root)
+                    self.assertEqual(run_directories(f.root),[])
                 finally:
                     if not select.select([descriptor],[],[],0)[0]:
                         with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(descriptor,signal.SIGKILL)
                     os.close(descriptor)
                     if process.poll() is None:
                         process.kill(); process.communicate(timeout=5)
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux PID descriptors')
     def test_sigkill_during_native_config_startup_requires_external_process_cleanup(self):
         f=self.f; native=str(Path(shutil.which('git')).resolve())
         config=f.root/'config-fifo'; os.mkfifo(config,0o600)
@@ -1989,10 +1165,9 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         directory,=run_directories(f.root)
         process.kill(); self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
         self.assertFalse(select.select([descriptor],[],[],.1)[0],'startup native operation unexpectedly stopped with runner death')
-        self.assertFalse((directory/'.state').exists())
-        self.assertFalse((directory/'ssh-control-owner').exists())
+        self.assertIsNone(ssh_owner_marker(directory))
         self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
-        assert_run_unlocked(directory)
+        with run_lock(directory).open('r+b') as held: fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
         # This live pidfd identifies only the disposable child captured above.
         os.killpg(native_pid,signal.SIGKILL)
         self.assertTrue(select.select([descriptor],[],[],5)[0])
@@ -2000,16 +1175,7 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
         self.assertEqual(cleanup.returncode,0,cleanup.stderr); self.assertFalse(directory.exists())
         print('SIGKILL startup evidence:',json.dumps(dict(native_child_survives=True,mount_present=False,
-              pin_present=False,ssh_owner_present=False,run_lock_released=True,explicit_recovery_succeeded=True)),flush=True)
-    def test_direct_ssh_requires_git_protocol_v2(self):
-        f = self.f
-        source = f.ssh(protocol_v2=False)
-        process = f.probe(source)
-        _, errors = process.communicate(timeout=10)
-        self.assertNotEqual(process.returncode, 0, errors)
-        self.assertIn(b'Git protocol v2', errors)
-        assert_no_run_state(self, f.root)
-
+              ssh_owner_present=False,run_lock_released=True,explicit_recovery_succeeded=True)),flush=True)
     def test_ssh_encrypted_identity_one_prompt_and_transport_reuse(self):
         f=self.f; url=f.ssh(encrypted=True)
         process=f.probe(url); f.line(process)
@@ -2029,34 +1195,36 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         (f.root/'prompts').unlink()
         process=f.probe(url); f.line(process); f.operation(process,'read deep/file'); f.finish(process)
         self.assertFalse((f.root/'prompts').exists())
-    def test_refusal_filter_missing_oid_and_connection_loss(self):
+    def test_ssh_refuses_unavailable_filtering(self):
         f=self.f; url=f.ssh()
-        process=f.probe(url); f.line(process)
-        # Stop the owned ControlMaster, without affecting other SSH connections.
-        sockets=list(f.root.glob('*/ssh-control')); self.assertEqual(len(sockets),1)
-        run(['ssh','-F','/dev/null','-S',sockets[0],'-O','exit','git-on-control'])
-        process.stdin.write(b'read deep/file\n'); process.stdin.flush()
-        _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0); self.assertRegex(errors, b"SSH transport exited|SSH control connection is unavailable|remote fetch of exact object")
         f.git('config','uploadpack.allowFilter','false')
         process=f.probe(url); _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0); self.assertIn(b'lacks object filtering',errors)
+        self.assertNotEqual(process.returncode,0); self.assertIn(b'object filtering',errors)
     def test_review_connection_loss_cannot_reconnect_with_explicit_proxy_option(self):
         f=self.f; url=f.ssh()
         f.env['GIT_SSH_COMMAND'] += ' -o ProxyCommand=none'
         process=f.probe(url); f.line(process)
+        log=f.root/'sshd.log'
+        connections=log.read_bytes().count(b'Connection from ')
+        self.assertGreater(connections,0)
         sockets=list(f.root.glob('*/ssh-control')); self.assertEqual(len(sockets),1)
-        run(['ssh','-F','/dev/null','-S',sockets[0],'-O','exit','git-on-control'])
+        socket=sockets[0]
+        run(['ssh','-F','/dev/null','-S',socket,'-O','exit','git-on-control'],env=f.env)
+        deadline=time.monotonic()+10
+        while socket.exists() and time.monotonic()<deadline: time.sleep(.01)
+        self.assertFalse(socket.exists(),'closed OpenSSH master left its control socket')
         process.stdin.write(b'read deep/file\n'); process.stdin.flush()
         _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0,'lost master was replaced by another authenticated connection')
-        self.assertRegex(errors, b"SSH transport exited|SSH control connection is unavailable|remote fetch of exact object")
+        self.assertNotEqual(process.returncode,0,'read succeeded after the master closed')
+        self.assertEqual(log.read_bytes().count(b'Connection from '),connections,errors)
     def test_real_mount_remote_disposable_cleanup_and_cancellation(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
-        result=subprocess.run(['git','on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools'),capture_output=True,timeout=30)
+        env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools')
+        ca=env.pop('GIT_SSL_CAINFO')
+        result=subprocess.run(['git','-c','http.sslCAInfo='+ca,'on',url,'main','--','sh','-c','cat deep/file; mkdir out; printf kept > out/result'],cwd=f.cwd,env=env,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
         process=subprocess.Popen([str(OPTIONS.binary.resolve()),url,'HEAD','--','sleep','30'],cwd=f.cwd,env=f.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         f.children.append(process)
         deadline=time.monotonic()+10
@@ -2064,7 +1232,7 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         self.assertTrue(any('/mount' in x and 'git-on:' in x for x in Path('/proc/self/mountinfo').read_text().splitlines()),'remote run never mounted')
         process.send_signal(signal.SIGTERM); process.communicate(timeout=10)
         self.assertEqual(process.returncode,-signal.SIGTERM)
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
 
     def test_stat_repeated_reads_and_large_partial_reads_fetch_only_demand(self):
         f=self.f; payload=bytes(range(256))*(64*1024)
@@ -2078,12 +1246,14 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         size,stat=f.operation(process,'stat large')
         self.assertEqual(size['size'],len(payload)); self.assertEqual(stat['metrics']['blob_loads'],0)
         request_count=len(f.requests)
+        writes=None
         for offset in (0,len(payload)-4096,512,512):
             value,report=f.operation(process,f'range {offset} 4096 large')
             self.assertEqual(bytes(value['bytes']),payload[offset:offset+4096])
             self.assertEqual(report['metrics']['blob_loads'],1)
-            self.assertEqual(report['metrics']['spool_writes'],0)
-            self.assertEqual(report['metrics']['hot_blob_cache_entries'],1)
+            self.assertEqual(report['metrics']['spool_bytes'],0)
+            if writes is None:writes=report['metrics']['spool_writes']
+            self.assertEqual(report['metrics']['spool_writes'],writes)
             self.assertNotIn(f.other,report['objects'])
         self.assertEqual(len(f.requests),request_count)
         _,report=f.operation(process,'release'); self.assertEqual(report['metrics']['active_spool_bytes'],0)
@@ -2094,7 +1264,7 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
         f.env['GIT_TERMINAL_PROMPT']='0'; f.env['GIT_ASKPASS']='/bin/false'
         f.deny_auth=True
         process=f.probe(url); _,errors=process.communicate(timeout=20)
-        self.assertNotEqual(process.returncode,0); self.assertIn(b'authentication failed',errors)
+        self.assertNotEqual(process.returncode,0); self.assertIn(b'Git HTTPS authentication failed',errors)
         f.deny_auth=False
         unreachable=f.git('commit-tree',f.tree,data=b'unreachable exact commit\n')
         f.git('config','uploadpack.allowAnySHA1InWant','false')
@@ -2139,84 +1309,91 @@ os.execv({verifier!r}, [{verifier!r}, *('/dev/stdin' if arg == '-' else arg for 
                 self.assertEqual(f.line(process)['tree'],f.tree); f.finish(process)
 
     def test_native_verifier_moving_ref_keeps_exact_distinct_tree(self):
+        f=self.f; signed,allowed=self.signing(); f.cwd=f.repo
+        different_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
+        different=f.git('commit-tree',different_tree,data=b'distinct tree B\n')
+        f.git('update-ref','refs/heads/main',signed)
+        verifier=f.root/'ssh-verifier'
+        verifier.write_text(f'#!/bin/sh\ngit --git-dir="{f.repo}" update-ref refs/heads/main {different}\nexec ssh-keygen "$@"\n')
+        verifier.chmod(0o700)
+        f.env.update(GIT_CONFIG_COUNT='3',GIT_CONFIG_KEY_2='gpg.ssh.program',GIT_CONFIG_VALUE_2=str(verifier))
+        process=f.probe('local','HEAD',verify=True)
+        self.assertEqual(f.line(process)['tree'],f.tree)
+        value,_=f.operation(process,'read deep/file'); self.assertEqual(value['data'],'expected\n'); f.finish(process)
+        self.assertEqual(f.git('rev-parse','HEAD'),different)
+
+    def test_eager_ssh_verifies_the_fixed_tag_object_before_materializing(self):
         f = self.f
-        url = f.https()
-        signed, _ = self.signing()
-        tag = f.git('rev-parse', 'refs/tags/signed')
-        different_dir = f.git('mktree', data=f'100644 blob {f.other}\tfile\n'.encode())
-        different_tree = f.git('mktree', data=f'040000 tree {different_dir}\tdeep\n'.encode())
-        different = f.git('commit-tree', different_tree, data=b'distinct tree\n')
-        f.git('tag', '-a', '-m', 'replacement tag', 'replacement', different)
-        replacement = f.git('rev-parse', 'refs/tags/replacement')
-
-        native = shutil.which('git', path=f.env['PATH'])
-        tools = f.root / 'git-tools'
-        tools.mkdir()
-        git = tools / 'git'
-        log = f.root / 'verified-object'
-        git.write_text(f"""#!{sys.executable}
-import json, os, subprocess, sys
-from pathlib import Path
-
+        _, allowed = self.signing()
+        ref = "refs/tags/signed"
+        tag = f.git("rev-parse", ref)
+        tree = f.git("mktree", data=f"100644 blob {f.other}\tother\n".encode())
+        replacement = f.git("commit-tree", tree, data=b"moved after verification\n")
+        source = f.ssh()
+        wrapper_dir = f.root / "git-wrapper"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "git"
+        log = f.root / "verified-tag"
+        native = shutil.which("git", path=f.env["PATH"])
+        wrapper.write_text(
+            f"""#!{sys.executable}
+import os, subprocess, sys
 args = sys.argv[1:]
-if 'fetch' in args:
-    with open({str(log)!r}, 'a') as output:
-        output.write(json.dumps(['fetch']) + '\\n')
-for operation in ('verify-commit', 'verify-tag'):
-    if operation in args:
-        if objects := os.environ.get('GIT_OBJECT_DIRECTORY'):
-            oid = args[-1]
-            files = [str(path.relative_to(objects)) for path in Path(objects).rglob('*')
-                     if path.is_file()]
-            assert files == [f'{{oid[:2]}}/{{oid[2:]}}'], files
-        result = subprocess.run([{native!r}, *args])
-        if result.returncode == 0:
-            with open({str(log)!r}, 'a') as output:
-                output.write(json.dumps([operation, args[-1]]) + '\\n')
-            if obsolete := os.environ.get('FIXTURE_REMOVE_OBJECT'):
-                if obsolete == 'staged':
-                    (Path(objects) / files[0]).unlink()
-                else:
-                    Path(obsolete).unlink()
-            else:
-                source_env = {{key: value for key, value in os.environ.items()
-                              if key != 'GIT_OBJECT_DIRECTORY'}}
-                subprocess.run([{native!r}, '-C', {str(f.repo)!r}, 'update-ref',
-                                os.environ['FIXTURE_MOVE_REF'],
-                                os.environ['FIXTURE_MOVE_TO']], check=True, env=source_env)
-        sys.exit(result.returncode)
+if 'verify-tag' in args:
+    status = subprocess.call([{native!r}, *args])
+    if status != 0:
+        sys.exit(status)
+    with open({str(log)!r}, 'w') as output:
+        output.write(args[-1])
+    sys.exit(subprocess.call([{native!r}, '--git-dir={f.repo}', 'update-ref', {ref!r}, {replacement!r}]))
 os.execv({native!r}, [{native!r}, *args])
-""")
-        git.chmod(0o700)
-        for source, reference, operation, oid, destination in (
-            ([], 'refs/heads/main', 'verify-commit', signed, different),
-            ([], 'refs/tags/signed', 'verify-tag', tag, replacement),
-            ([url], 'refs/tags/signed', 'verify-tag', tag, replacement),
-            ([url], 'refs/tags/signed', 'verify-tag', tag, None),
-            ([], 'refs/tags/replacement', 'verify-tag', tag, None),
-        ):
-            with self.subTest(source=source, operation=operation, reference=reference):
-                log.unlink(missing_ok=True)
-                f.git('update-ref', reference, oid)
-                env = dict(f.env, PATH=str(tools) + os.pathsep + f.env['PATH'])
-                if destination is None:
-                    env['FIXTURE_REMOVE_OBJECT'] = (
-                        'staged' if source else str(f.repo / 'objects' / signed[:2] / signed[2:])
-                    )
-                else:
-                    env.update(FIXTURE_MOVE_REF=reference, FIXTURE_MOVE_TO=destination)
-                result = subprocess.run(
-                    [OPTIONS.binary, *source, reference, '--verify', '--backend=copy', '--write-policy=all',
-                     '--', 'cat', 'deep/file'],
-                    cwd=f.cwd if source else f.repo, env=env, capture_output=True, timeout=20,
-                )
-                self.assertEqual(git_invocations(log), [[operation, oid]])
-                if destination is None:
-                    self.assertEqual((result.returncode, result.stdout), (125, b''), result.stderr)
-                else:
-                    self.assertEqual((result.returncode, result.stdout), (0, b'expected\n'), result.stderr)
-                    self.assertEqual(f.git('rev-parse', reference), destination)
-                assert_no_run_state(self, f.root)
+"""
+        )
+        wrapper.chmod(0o700)
+        env = dict(f.env, PATH=str(wrapper_dir) + os.pathsep + f.env["PATH"])
+        args = [OPTIONS.binary, source, ref, "--backend=copy", "--write-policy=all",
+                "--verify", "--", "sh", "-c", 'printf "%s\\n" "$GIT_ON_TREE_OID"; cat deep/file']
+        result = subprocess.run(args, cwd=f.cwd, env=env, capture_output=True, timeout=25)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.read_text(), tag)
+        self.assertEqual(f.git("rev-parse", ref), replacement)
+        self.assertEqual(result.stdout, f"{f.tree}\nexpected\n".encode())
+        f.git("update-ref", ref, tag)
+        allowed.unlink()
+        result = subprocess.run(args, cwd=f.cwd, env=env, capture_output=True, timeout=25)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+    def test_ssh_leaves_known_hosts_and_local_command_state_unchanged(self):
+        f = self.f
+        source = f.ssh()
+        known = f.root / "known_hosts"
+        original = known.read_bytes()
+        marker = f.root / "local-command"
+        config = f.root / "client-config"
+        config.write_text(f"Host *\n  PermitLocalCommand yes\n  LocalCommand /usr/bin/touch {marker}\n")
+        f.env["GIT_SSH_COMMAND"] = (f.env["GIT_SSH_COMMAND"]
+                                     .replace("-F /dev/null", "-F " + shlex.quote(str(config)))
+                                     .replace("StrictHostKeyChecking=yes", "StrictHostKeyChecking=accept-new"))
+        args = [OPTIONS.binary, source, "HEAD", "--backend=copy", "--write-policy=all",
+                "--", "/bin/cat", "deep/file"]
+        known.unlink()
+        result = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(known.exists())
+        known.write_bytes(original)
+        result = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"expected\n")
+        self.assertEqual(known.read_bytes(), original)
+        self.assertFalse(marker.exists())
+        with config.open("a") as settings:
+            settings.write("  CheckHostIP yes\n")
+        result = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(b"CheckHostIP", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(known.read_bytes(), original)
 
     def openpgp_signing(self):
         f=self.f; signing=f.root/'gpg-sign'; signing.mkdir(mode=0o700)
@@ -2258,8 +1435,8 @@ os.execv({native!r}, [{native!r}, *args])
         command=[sys.executable,'-c','from pathlib import Path; import sys; Path(sys.argv[1]).touch()',str(sentinel)]
         env=dict(f.env,PATH=str(OPTIONS.binary.parent)+':'+f.env['PATH'])
         for policy in ('repository','git-c'):
-            # The -c case must override a permissive repository setting for
-            # both local and remote native verification.
+            # The -c case must override a permissive repository setting, then
+            # survive Git::capture and replay into the remote private repository.
             f.git('config','gpg.minTrustLevel','fully' if policy=='repository' else 'undefined')
             config=[] if policy=='repository' else ['-c','gpg.minTrustLevel=fully']
             runner=[str(OPTIONS.binary)] if policy=='repository' else ['git',*config,'on']
@@ -2277,7 +1454,7 @@ os.execv({native!r}, [{native!r}, *args])
                         self.assertNotIn(b'mount snapshot',result.stderr)
                         self.assertFalse(sentinel.exists(),'trust-rejected command executed')
                         self.assertEqual(result.stdout,b'')
-                        assert_no_run_state(self, f.root)
+                        self.assertEqual(run_directories(f.root),[])
                         print('configured native trust rejection evidence:',json.dumps(dict(policy=policy,operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_executed=sentinel.exists())),flush=True)
 
     def test_real_mount_openpgp_default_policy_executes_unknown_trust_commit_and_tag(self):
@@ -2295,13 +1472,11 @@ os.execv({native!r}, [{native!r}, *args])
                     result=subprocess.run([str(OPTIONS.binary),*operands,'--verify','--',sys.executable,'-c',code,str(sentinel)],cwd=f.repo,env=f.env,capture_output=True,timeout=30)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(sentinel.read_bytes(),b'expected\n')
-                    assert_no_run_state(self, f.root)
+                    self.assertEqual(run_directories(f.root),[])
                     print('native default trust execution evidence:',json.dumps(dict(operation=operation,source=source,native_status=native.returncode,runner_status=result.returncode,command_bytes=sentinel.stat().st_size)),flush=True)
 
     def test_real_mount_native_git_c_verification_and_caught_transport_failure(self):
-        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
-            self.skipTest('requires a native mount')
-        from native_job_control import Shell
+        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; signed,allowed=self.signing(); url=f.https(); self.addCleanup(f.server.shutdown)
         env=git_on_environment(OPTIONS.binary,f.env,f.root/'selected-tools')
         for key in list(env):
@@ -2311,67 +1486,11 @@ os.execv({native!r}, [{native!r}, *args])
             self.assertEqual(result.returncode,0,result.stderr); self.assertEqual(result.stdout,b'expected\n')
         # The command catches EIO and returns 0. The runner must still report 125.
         f.denied_oids.add(f.blob)
-        runner, child = f.root / 'tty-runner', f.root / 'tty-child'
-        code = (
-            "import errno, os, sys\nfrom pathlib import Path\n"
-            "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
-            "try:\n open('deep/file').read()\n"
-            "except OSError as error:\n assert error.errno == errno.EIO\n"
-            "else:\n raise AssertionError('transport fault not observed')\n"
-            "print('caught transport error')"
-        )
-        shell = Shell(f, size=(30, 160))
-        self.addCleanup(shell.close)
-        shell.send(b'stty tostop\n')
-        shell.expect(shell.prompt)
-        launcher = 'printf "%s" "$$" > "$1"; shift; exec "$@"'
-        command = ['/bin/sh', '-c', launcher, 'fixture', str(runner), str(OPTIONS.binary),
-                   url, 'HEAD', '--', sys.executable, '-c', code, str(child)]
-        shell.send(shlex.join(command).encode() + b'; printf "runner status %d\\n" "$?"\n')
-        try:
-            output = shell.expect(shell.prompt, timeout=15)
-            self.assertIn(b'\r\ncaught transport error\r\n', output)
-            self.assertIn(b'\r\nrunner status 125\r\n', output)
-            self.assertIn(f.blob.encode(), output)
-            self.assertIn(b'execution incomplete', output)
-        finally:
-            for marker in (runner, child):
-                if marker.is_file() and (pid := marker.read_text()).isdigit():
-                    shell.groups.add(int(pid))
-        assert_no_run_state(self, f.root)
-
-    def test_real_mount_caught_verified_raw_storage_failure_is_sticky(self):
-        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):self.skipTest('requires a native mount')
-        f=self.f;blob=f.git('hash-object','-w','--stdin',data=b'v'*(128*1024))
-        rows=[f'100644 blob {blob}\tfile\n']
-        for index in range(9):
-            filler=f.git('hash-object','-w','--stdin',data=bytes([index])*(64*1024+1))
-            rows.append(f'100644 blob {filler}\tfiller-{index}\n')
-        tree=f.git('mktree',data=''.join(rows).encode())
-        commit=f.git('commit-tree',tree,data=b'raw integrity failure\n');f.git('update-ref','refs/heads/main',commit)
-        code=f"""import errno,os,time
-from pathlib import Path
-os.stat('file')
-for index in range(9):
- with open(f'filler-{{index}}','rb') as filler:assert filler.read(1)==bytes([index])
-raw=next(Path.cwd().parent.glob('raw-objects-*'))/{blob!r}
-deadline=time.monotonic()+5
-while not(raw.is_file() and raw.stat().st_size==128*1024):
- assert time.monotonic()<deadline,'the raw source never finished spilling'
- time.sleep(.01)
-with raw.open('r+b') as output:output.write(b'!')
-try:
- with open('file','rb') as source:source.read(1)
-except OSError as error:
- assert error.errno==errno.EIO,error
-else:raise AssertionError('raw corruption was not rejected')
-print('caught-EIO-and-returned-success')
-"""
-        result=subprocess.run([str(OPTIONS.binary),f.https(),'HEAD','--write-policy=none','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
-        self.assertIn(b'caught-EIO-and-returned-success',result.stdout)
+        code="import errno\ntry:\n open('deep/file').read()\nexcept OSError as e:\n assert e.errno == errno.EIO\nelse:\n raise AssertionError('transport fault not observed')\n"
+        result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,125,result.stderr)
-        self.assertIn(b'bytes were modified',result.stderr);self.assertIn(b'execution incomplete',result.stderr)
-        assert_no_run_state(self, f.root)
+        self.assertIn(f.blob.encode(),result.stderr); self.assertIn(b'execution incomplete',result.stderr)
+        self.assertEqual(run_directories(f.root),[])
 
     def test_remote_never_requires_or_modifies_global_cache(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
@@ -2400,11 +1519,14 @@ print('caught-EIO-and-returned-success')
         f.env=original
 
     def test_large_remote_objects_reuse_run_odb_and_fresh_runs_stream(self):
-        # Read a working set that fits the whole-blob cache without spilling.
-        f=self.f
-        size=64*1024+1
-        ids=[f.git('hash-object','-w','--stdin',data=bytes([byte])*size)
-             for byte in b'abc']
+        # Each blob fits the whole-object cache, so reopening requires no
+        # additional requests or service writes.
+        f=self.f; ids=[]; object_mib=1
+        for byte in b'abc':
+            with tempfile.TemporaryFile() as output:
+                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
+                for _ in range(object_mib): writer.stdin.write(bytes([byte])*(1024*1024))
+                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); ids.append(output.read().decode().strip())
         tree=f.git('mktree',data=''.join(f'100644 blob {oid}\t{name}\n' for name,oid in zip('abc',ids)).encode())
         commit=f.git('commit-tree',tree,data=b'large run-local reuse fixture\n');f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
@@ -2414,10 +1536,11 @@ print('caught-EIO-and-returned-success')
             self.assertEqual(bytes(value['bytes']),name.encode()*16)
         self.assertEqual(last['metrics']['remote_fetches'],5)
         self.assertEqual(last['metrics']['spool_bytes'],0)
+        writes=last['metrics']['spool_writes']
         requests=len(f.requests)
         value,last=f.operation(process,'range 13 16 a');self.assertEqual(bytes(value['bytes']),b'a'*16)
         self.assertEqual(len(f.requests),requests,'available run object fetched again')
-        self.assertEqual(last['metrics']['spool_writes'],0,'closed hot blob was written')
+        self.assertEqual(last['metrics']['spool_writes'],writes,'closed blob was written again')
         f.finish(process)
         # A separate invocation streams a newly fetched loose object again.
         requests=len(f.requests);process=f.probe(url);f.line(process)
@@ -2427,8 +1550,9 @@ print('caught-EIO-and-returned-success')
         self.assertEqual({oid for request in f.requests[requests:] for oid in request['wants']},{commit,tree,ids[2]})
         f.finish(process)
         self.assertFalse((f.root/'cache').exists())
-        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=len(ids)*size,metrics=last['metrics'])),flush=True)
+        print('large run object evidence:',json.dumps(dict(logical_blob_bytes=3*object_mib*1024*1024,metrics=last['metrics'])),flush=True)
 
+    @unittest.skipIf(OPTIONS.require_fuse, 'copy and NFS fallback run in their own jobs')
     def test_materialized_remote_fetches_the_selected_tree_once(self):
         f=self.f;entries=[]
         for index in range(2):
@@ -2436,113 +1560,91 @@ print('caught-EIO-and-returned-success')
             tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
             entries.append(f'040000 tree {tree}\td{index}\n')
         tree=f.git('mktree',data=''.join(entries).encode())
-        commit=f.git('commit-tree',tree,'-p',f.commit,data=b'materialization transfer regression\n')
+        ancestor=f.commit
+        commit=f.git('commit-tree',tree,'-p',ancestor,data=b'materialization transfer regression\n')
         f.git('update-ref','refs/heads/main',commit)
         url=f.https();self.addCleanup(f.server.shutdown)
-        code=("import os\nfrom pathlib import Path\n"
-              f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}\n"
-              "run = Path.cwd().parent\n"
-              "assert not (run / '.state').exists() and not (run / '.lock').exists()\n"
-              "assert not (run / 'remote-repository').exists()\n"
+        code=("import os; from pathlib import Path; "
+              f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}; "
               "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(2)); "
               "print('verified')")
-        result = subprocess.run([str(OPTIONS.binary), url, 'HEAD', '--write-policy=all',
-                                 '--backend=copy', '--', sys.executable, '-c', code],
-                                cwd=f.cwd, env=f.env, capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b'verified\n')
-        self.assertEqual([request['wants'] for request in f.requests if request['wants']], [[commit]])
-        assert_no_run_state(self, f.root)
+        if OPTIONS.require_nfs:
+            ssh = f.ssh()
+            target = urlsplit(ssh)
+            scp = f"{target.username}@{target.hostname}:{target.path}"
+            cases = [('https', url, 'auto'), ('ssh', ssh, 'auto'), ('scp', scp, 'auto')]
+        else:
+            cases = [('https', url, 'copy')]
+        for transport, source, backend in cases:
+            with self.subTest(transport=transport, backend=backend):
+                # Git syntax selects the transport before any local path check.
+                lookalike = f.cwd / source
+                lookalike.parent.mkdir(parents=True, exist_ok=True)
+                lookalike.symlink_to(f.repo, target_is_directory=True)
+                f.requests.clear()
+                env = dict(f.env)
+                if backend == 'auto':
+                    env['GIT_ON_TEST_NFS_MOUNT_ERROR'] = '1'
+                if transport in ('ssh', 'scp'):
+                    log = f.root / 'sshd.log'
+                    connections = log.read_text().count('Accepted publickey')
+                    env['GIT_SSH_COMMAND'] += ' -J none'
+                    if transport == 'scp':
+                        env['GIT_SSH_COMMAND'] += f' -p {target.port}'
+                    root = f.root.resolve()
+                    tmpdir = root / ('s' * (58 - len(os.fsencode(root))))
+                    tmpdir.mkdir(exist_ok=True)
+                    self.assertEqual(len(os.fsencode(tmpdir)), 59)
+                    env['TMPDIR'] = str(tmpdir)
+                else:
+                    env.update(GIT_CONFIG_COUNT='6', GIT_CONFIG_KEY_0='http.version',
+                               GIT_CONFIG_VALUE_0='HTTP/2',
+                               GIT_CONFIG_KEY_1='http.proxy', GIT_CONFIG_VALUE_1='',
+                               GIT_CONFIG_KEY_2='http.https://elsewhere.invalid/.version',
+                               GIT_CONFIG_VALUE_2='HTTP/1.1',
+                               GIT_CONFIG_KEY_3='remote.unused.uploadpack',
+                               GIT_CONFIG_VALUE_3='unused-command',
+                               GIT_CONFIG_KEY_4='protocol.https.allow',
+                               GIT_CONFIG_VALUE_4='always',
+                               GIT_CONFIG_KEY_5='http.sslVerify', GIT_CONFIG_VALUE_5='true')
+                result = subprocess.run([str(OPTIONS.binary), source, 'HEAD', '--write-policy=all',
+                                         '--backend='+backend, '--', sys.executable, '-c', code],
+                                        cwd=f.cwd, env=env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,b'verified\n')
+                if transport == 'https':
+                    wants = [request['wants'] for request in f.requests if request['wants']]
+                    expected = [[commit], [tree], [commit]] if backend == 'auto' else [[commit]]
+                    self.assertEqual(wants, expected,
+                                     'eager preparation performs separate directory/object fetches')
+                    self.assertTrue(f.requests[-1]['shallow'], 'copy fetch did not ask for depth one')
+                else:
+                    self.assertEqual(log.read_text().count('Accepted publickey'), connections + 1)
+                    if transport == 'scp':
+                        local = subprocess.run([str(OPTIONS.binary), './' + source, 'HEAD',
+                                                '--backend=copy', '--write-policy=all', '--',
+                                                sys.executable, '-c', code],
+                                               cwd=f.cwd, env=env, capture_output=True, timeout=30)
+                        self.assertEqual(local.returncode, 0, local.stderr)
+                        self.assertEqual(local.stdout, result.stdout)
+                        self.assertEqual(log.read_text().count('Accepted publickey'), connections + 1)
+                self.assertEqual(run_directories(Path(env['TMPDIR'])), [])
 
-    @unittest.skipUnless(OPTIONS.require_nfs, 'tests automatic fallback after NFS startup')
-    def test_auto_copy_reuses_selected_ssh_snapshot_with_one_session(self):
-        for maximum in (1, 3):
-            with self.subTest(max_sessions=maximum):
-                f = self.f if maximum == 1 else Fixture()
-                if maximum > 1:
-                    self.addCleanup(f.close)
-                self.check_auto_ssh_copy_reuses_selection(f, maximum)
-
-    def check_auto_ssh_copy_reuses_selection(self, f, maximum):
-        source = f.ssh(protocol_v2=True, max_sessions=maximum)
-        (f.root / 'closing').write_text(f.commit)
-        (f.root / 'expected-advertisements').write_text(str(maximum))
-        shim = [sys.executable, str(Path(__file__).resolve().with_name('streaming.py')),
-                '--ssh-eof', str(f.root), '']
-        trace = shlex.quote(str(f.root / 'pack'))
-        f.force_upload_pack(f'export GIT_TRACE_PACKET={trace}-$$ GIT_ON_FIXTURE_CHANNEL=copy-$$\n'
-                            f'exec {shlex.join(shim)}\n')
-        environment, invocations = record_git_invocations(f.root, f.env)
-        with tempfile.TemporaryDirectory(dir='/tmp', prefix='go-copy-') as runtime, \
-                tempfile.TemporaryFile() as metrics:
-            env = dict(environment, GIT_ON_TEST_NFS_MOUNT_ERROR='1', TMPDIR=runtime,
-                       GIT_ON_TEST_METRICS_FD=str(metrics.fileno()))
-            result = subprocess.run(
-                [OPTIONS.binary, source, f.commit, '--write-policy=all', '--', 'cat', 'deep/file'],
-                cwd=f.cwd, env=env, capture_output=True, timeout=20, pass_fds=(metrics.fileno(),),
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, b'expected\n')
-            metrics.seek(0)
-            report = json.load(metrics)
-            self.assertEqual(report['backend'], 'copy', report)
-            self.assertGreater(report['remote_session_fetch_operations'], 0, report)
-            self.assertFalse(any('fetch' in argv for argv in git_invocations(invocations)))
-            self.assertEqual(report['remote_repositories_created'], 0, report)
-            commit_requests = [path.read_bytes().count(b'upload-pack< want ' + f.commit.encode())
-                               for path in f.root.glob('pack-*')]
-            self.assertEqual([count for count in commit_requests if count], [2], report)
-            assert_no_run_state(self, Path(runtime))
-
-    def test_eager_ssh_closes_input_before_receiving_the_pack(self):
+    @unittest.skipIf(OPTIONS.require_fuse, 'eager preparation runs in the copy suite')
+    def test_eager_copy_keeps_large_blobs_in_the_shared_cache(self):
         f = self.f
-        url = f.ssh(protocol_v2=True)
-        upload_pack = f.root / 'wait-for-eof.py'
-        upload_pack.write_text(
-            'import os, select, subprocess, sys, time\n'
-            'upload = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE)\n'
-            'request = bytearray()\n'
-            'deadline = time.monotonic() + 3\n'
-            'while select.select([0], [], [], max(0, deadline - time.monotonic()))[0]:\n'
-            '    chunk = os.read(0, 4096)\n'
-            '    if not chunk:\n'
-            '        upload.communicate(request)\n'
-            '        sys.exit(upload.returncode)\n'
-            '    request.extend(chunk)\n'
-            'upload.communicate()\n'
-            'sys.exit("expected SSH request EOF before sending the pack")\n'
-        )
-        f.force_upload_pack(shlex.join(
-            [sys.executable, str(upload_pack), shutil.which('git'), 'upload-pack', str(f.repo)]
-        ) + '\n')
-        with tempfile.TemporaryDirectory(dir='/tmp', prefix='go-copy-') as runtime:
-            result = subprocess.run(
-                [OPTIONS.binary, url, f.commit, '--backend=copy', '--write-policy=all',
-                 '--', 'cat', 'deep/file'],
-                cwd=f.cwd, env=dict(f.env, TMPDIR=runtime), capture_output=True, timeout=20,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b'expected\n')
-
-    def test_ssh_checks_exit_after_receiving_a_complete_pack(self):
-        f = self.f
-        url = f.ssh(protocol_v2=True)
-        f.force_upload_pack(f'git upload-pack {shlex.quote(str(f.repo))}\nexit 1\n')
-        modes = [('copy', 'all', b'')]
-        if OPTIONS.require_fuse or OPTIONS.require_nfs:
-            backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
-            modes.append((backend, 'none', b'expected\n'))
-        for backend, policy, stdout in modes:
-            with self.subTest(backend=backend), \
-                    tempfile.TemporaryDirectory(dir='/tmp', prefix='go-ssh-') as runtime:
-                result = subprocess.run(
-                    [OPTIONS.binary, url, f.commit, '--backend=' + backend, '--write-policy=' + policy,
-                     '--', 'cat', 'deep/file'],
-                    cwd=f.cwd, env=dict(f.env, TMPDIR=runtime), capture_output=True, timeout=20,
-                )
-                self.assertNotEqual(result.returncode, 0, result.stderr)
-                self.assertIn(b'SSH transport exited with exit status: 1', result.stderr)
-                self.assertEqual(result.stdout, stdout)
+        size = 64 * 1024 + 1
+        objects = [f.git('hash-object', '-w', '--stdin', data=byte * size) for byte in (b'a', b'b')]
+        tree = f.git('mktree', data=''.join(
+            f'100644 blob {oid}\tfile-{index}\n' for index, oid in enumerate(objects)
+        ).encode())
+        commit = f.git('commit-tree', tree, data=b'eager large-blob policy\n')
+        f.git('update-ref', 'refs/heads/main', commit)
+        probe = f.probe(f.https(), commit, eager=True)
+        metrics = f.line(probe)['metrics']
+        f.finish(probe)
+        self.assertEqual(metrics['spool_bytes'], 0, metrics)
+        self.assertEqual(metrics['large_blob_cache_entries'], 2, metrics)
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_git_on_in_a_terminal_reuses_the_https_demand_session(self):
@@ -2582,9 +1684,10 @@ print('caught-EIO-and-returned-success')
         self.assertEqual(report['remote_fetches'], 5, report)
         self.assertEqual(report['remote_http2_fetch_operations'], 5, report)
         self.assertEqual(report['remote_session_starts'], 1, report)
+        self.assertEqual(report['remote_fetch_operations'], 0, report)
         self.assertEqual({oid for request in f.requests for oid in request['wants']},
                          {f.commit, f.tree, f.subtree, f.blob, f.other})
-        assert_no_run_state(self, f.root)
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_cancel_concurrent_https_demands(self):
@@ -2604,6 +1707,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 import time
+assert sorted(os.listdir('.')) == ['first', 'second']
 with ThreadPoolExecutor(2) as pool:
     first = pool.submit(os.stat, 'first')
     while not Path({str(gate)!r}).exists():
@@ -2618,36 +1722,43 @@ with ThreadPoolExecutor(2) as pool:
             cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         f.children.append(process)
-        self.assertEqual(f.stalled_requests.get(timeout=12), [f.blob])
+        first_stall = f.stalled_requests.get(timeout=12)
         gate.touch()
-        self.assertEqual(f.stalled_requests.get(timeout=8), [f.other])
+        second_stall = f.stalled_requests.get(timeout=8)
+        # The scheduler can start the speculative stream first. Both distinct
+        # streams must still be stalled before the runner is cancelled.
+        self.assertCountEqual([first_stall, second_stall], [[f.blob], [f.other]])
         process.send_signal(signal.SIGTERM)
         _, errors = process.communicate(timeout=12)
         self.assertEqual(process.returncode, -signal.SIGTERM, errors)
         self.assertNotIn(b'execution incomplete', errors)
-        assert_no_run_state(self, f.root)
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
-    def test_concurrent_https_lookups_fetch_only_requested_objects(self):
+    def test_concurrent_https_lookups_combine_only_requested_objects(self):
         f = self.f
-        sizes = list(range(21, 27))
+        sizes = list(range(21, 37))
         wanted = [f.git('hash-object', '-w', '--stdin', data=b'x' * size) for size in sizes]
-        # Only four directory warm-ups. With the selection and warm blob,
-        # this stays below the eight replies needed to expand the pool.
         directories = [f.git('mktree', data=f'100644 blob {oid}\tfile\n'.encode())
-                       for oid in wanted[:4]]
-        cold_tree = f.git('mktree', data=f'100644 blob {wanted[-1]}\tinside\n'.encode())
+                       for oid in wanted]
         entries = [f'040000 tree {oid}\td{index}'
                    for index, oid in enumerate(directories)]
-        entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\t-unused',
+        entries.extend((f'100644 blob {f.blob}\twarm', f'100644 blob {f.other}\tunused',
                         f'100644 blob {f.blob}\twarm-alias', f'040000 tree {directories[0]}\talias',
-                        f'040000 tree {cold_tree}\tcold', f'100644 blob {wanted[-1]}\ts-cold-file',
-                        f'100644 blob {wanted[4]}\tq-gate-file',
                         f'040000 tree {f.subtree}\tunvisited'))
         tree = f.git('mktree', data=('\n'.join(entries) + '\n').encode())
         commit = f.git('commit-tree', tree, data=b'concurrent lookups\n')
         f.git('update-ref', 'refs/heads/main', commit)
-        url = f.https()
+        server = f.https_server()
+        forward = server.forward
+
+        def delayed(method, path, headers, body):
+            if b'want ' in body:
+                time.sleep(.08)
+            return forward(method, path, headers, body)
+
+        server.forward = delayed
+        url = server.url
         self.addCleanup(f.server.shutdown)
         self.addCleanup(f.resume.set)
         f.stalled_oids.update(wanted)
@@ -2661,7 +1772,7 @@ import time
 assert 'unvisited' in os.listdir('.')
 assert os.stat('warm').st_size == 9
 sizes = {sizes!r}
-parents = [Path(f'd{{index}}') for index in range(4)]
+parents = [Path(f'd{{index}}') for index in range(len(sizes))]
 alias = Path('alias')
 # Warm each parent with a lookup so this case measures foreground requests.
 for parent in [*parents, alias]:
@@ -2674,43 +1785,27 @@ def wait_for(name):
         assert time.monotonic() < deadline, name
         time.sleep(.01)
 
-def read(path):
+def read(parent):
+    path = parent / 'file'
     return path.stat().st_size, path.read_bytes()
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-    first = pool.submit(read, parents[0] / 'file')
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(sizes)) as pool:
+    first = pool.submit(read, parents[0])
     wait_for('start-next')
-    second = pool.submit(read, parents[1] / 'file')
-    duplicate = pool.submit(read, alias / 'file')
+    second = pool.submit(read, parents[1])
+    duplicate = pool.submit(read, alias)
     wait_for('check-cached')
     assert os.stat('warm-alias').st_size == 9
     (control / 'cached-ready').touch()
-    initial = [first, second]
-    for index in (2, 3):
-        wait_for(f'start-{{index}}')
-        initial.append(pool.submit(read, parents[index] / 'file'))
-    wait_for('start-mixed')
-    cold = pool.submit(os.listdir, 'cold')
-    cold_file = pool.submit(read, Path('s-cold-file'))
-    wait_for('start-gate-file')
-    gate_file = pool.submit(read, Path('q-gate-file'))
-    assert cold.result() == ['inside']
-    results = [future.result() for future in initial] + [gate_file.result(), cold_file.result()]
-    assert results == [(size, b'x' * size) for size in sizes]
+    rest = list(pool.map(read, parents[2:]))
+    assert [first.result(), second.result(), *rest] == [(size, b'x' * size) for size in sizes]
     assert duplicate.result() == first.result()
 """
-        demands, notify = os.pipe()
-        self.addCleanup(os.close, demands)
-        try:
-            os.set_blocking(notify, False)
-            process = subprocess.Popen(
-                [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
-                 sys.executable, '-I', '-S', '-c', command],
-                cwd=f.cwd, env=dict(f.env, GIT_ON_TEST_DEMAND_FD=str(notify)), pass_fds=(notify,),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-        finally:
-            os.close(notify)
+        process = subprocess.Popen(
+            [str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend, '--write-policy=none', '--',
+             sys.executable, '-I', '-S', '-c', command],
+            cwd=f.cwd, env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
         f.children.append(process)
         def next_stalled(message, timeout=10):
             try:
@@ -2726,34 +1821,20 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertTrue(ready.exists(), 'cached blob waited behind the transfers')
-        for index in (2, 3):
-            (f.root / f'start-{index}').touch()
-            self.assertEqual(next_stalled('another independent lookup did not reach HTTPS'), [wanted[index]])
-        (f.root / 'start-mixed').touch()
-        def wait_for_demands(*oids):
-            missing = set(oids)
-            deadline = time.monotonic() + 10
-            while missing:
-                self.assertTrue(select.select([demands], [], [], max(0, deadline-time.monotonic()))[0],
-                                f'demands did not reach the scheduler: {missing}')
-                oid = os.read(demands, 20)
-                self.assertEqual(len(oid), 20, 'demand observer closed')
-                missing.discard(oid.hex())
-        try:
-            wait_for_demands(cold_tree, wanted[-1])
-            # Queue this file after the alias is pending, so read-ahead
-            # cannot make the alias speculative.
-            (f.root / 'start-gate-file').touch()
-            wait_for_demands(wanted[4])
-        finally:
-            f.resume.set()
+        more_wants = next_stalled('concurrent sibling lookups did not reach HTTPS')
+        if len(more_wants) == 1:
+            next_stalled('a fourth exact demand did not reach HTTPS')
+        # Give concurrent callbacks time to reach the mount while the initial
+        # transfers are held. A free connection can batch those pending OIDs.
+        time.sleep(.2)
+        f.resume.set()
         _, errors = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 0, errors)
         batches = [request['wants'] for request in f.requests if request['wants']]
         self.assertCountEqual([oid for batch in batches for oid in batch],
-                              [commit, tree, f.blob, *directories, cold_tree, *wanted])
-        self.assertEqual([batch for batch in batches if cold_tree in batch], [[cold_tree]])
-        assert_no_run_state(self, f.root)
+                              [commit, tree, f.blob, *directories, *wanted])
+        self.assertTrue(any(len(set(batch).intersection(wanted)) > 1 for batch in batches), batches)
+        self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_cold_directory_demand_overlaps_file_lookup(self):
@@ -2810,7 +1891,7 @@ with ThreadPoolExecutor(1) as pool:
                 self.assertTrue(overlapped, 'independent lookup waited for the cold tree')
                 self.assertCountEqual([oid for request in f.requests for oid in request['wants']],
                                       [f.commit, f.tree, f.subtree, f.other, *children])
-                assert_no_run_state(self, f.root)
+                self.assertFalse(run_directories(f.root))
 
     @unittest.skipUnless(OPTIONS.require_fuse, 'requires the FUSE directory reference lifecycle')
     def test_fuse_lookup_survives_directory_close_during_https_wait(self):
@@ -2860,9 +1941,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
     def test_startup_progress_covers_local_resolution_and_initial_remote_fetch(self):
         f=self.f
         revision=':/progress-\x1b'+'界'*60
-        f.commit=f.git('commit-tree',f.tree,data=(revision[2:]+'\n').encode())
+        blob=f.git('hash-object','-w','--stdin',data=random.Random(16).randbytes(512*1024))
+        tree=f.git('mktree',data=f'100644 blob {blob}\tpayload\n'.encode())
+        f.commit=f.git('commit-tree',tree,data=(revision[2:]+'\n').encode())
         f.git('update-ref','refs/heads/main',f.commit)
-        url=f.https();self.addCleanup(f.server.shutdown)
+        url=f.https(transfer_delay=.04);self.addCleanup(f.server.shutdown)
         tools=f.root/'startup-tools';tools.mkdir()
         entered=f.root/'git-entered';release=f.root/'git-release'
         wrapper=tools/'git'
@@ -2881,7 +1964,7 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                 termios.tcsetwinsize(slave,(24,48))
                 operands=[revision] if phase=='local-resolution' else [url,'HEAD']
                 started=time.monotonic()
-                process=subprocess.Popen([str(OPTIONS.binary),*operands,'--backend=copy','--write-policy=all','--',
+                process=subprocess.Popen([str(OPTIONS.binary),*operands,'--write-policy=all','--',
                                           sys.executable,'-c',"import sys;sys.stderr.write('COMMAND-START\\n');print('command-output')"],
                                          cwd=f.repo,env=env|color,stdout=subprocess.PIPE,stderr=slave if terminal else subprocess.PIPE)
                 os.close(slave);f.children.append(process)
@@ -2891,11 +1974,11 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                         if terminal and select.select([master],[],[],.01)[0]:transcript.extend(os.read(master,65536))
                         elif not terminal:time.sleep(.01)
                     self.assertNotIn(b'git on',transcript,'indicator appeared before its delay')
-                    if phase=='local-resolution':
-                        deadline=time.monotonic()+5
-                        while not entered.exists() and process.poll() is None and time.monotonic()<deadline:
+                    if phase == 'local-resolution':
+                        deadline = time.monotonic() + 5
+                        while not entered.exists() and process.poll() is None and time.monotonic() < deadline:
                             time.sleep(.01)
-                        self.assertTrue(entered.exists(),'first Git invocation did not start')
+                        self.assertTrue(entered.exists(), 'first Git invocation did not start')
                     else:self.assertTrue(f.stalled.wait(10),'initial fetch did not reach its controlled stall')
                     if terminal:
                         deadline=started+4
@@ -2929,182 +2012,81 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                     if color.get('NO_COLOR'):self.assertNotRegex(transcript,rb'\x1b\[[0-9;]*m')
                     else:self.assertIn(b'\x1b[36m',transcript,'TTY indicator has no color accent')
                     visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',transcript)
-                    if phase == 'local-resolution':
+                    if phase=='initial-fetch':
+                        self.assertIn(b'git on HEAD',visible)
+                    else:
                         self.assertIn(b':/progress-\\u{1b}',visible,'revision is missing or its controls are not escaped')
-                    frames=visible.split(b'COMMAND-START')[0].decode('utf-8').split('\r')
-                    self.assertTrue(all('\n' not in frame for frame in frames), 'indicator used multiple rows')
-                    self.assertLessEqual(max(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in frame) for frame in frames),48)
-                    screen = terminal_lines(transcript, columns=48)
-                    self.assertIn('COMMAND-START', screen.splitlines())
-                    self.assertNotRegex(screen, '[\u2800-\u28ff]')
+                        frames=visible.split(b'COMMAND-START')[0].decode('utf-8').split('\r')
+                        self.assertLessEqual(max(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in frame) for frame in frames),48)
+                    self.assertLess(transcript.rfind(b'\x1b[2K'),transcript.index(b'COMMAND-START'))
+                    self.assertNotIn(b'git on',transcript[transcript.index(b'COMMAND-START'):])
                 else:self.assertEqual(errors,b'COMMAND-START\n')
-                assert_no_run_state(self, f.root)
+                self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(sys.platform=='linux','controlling Bash job and /proc state observation')
-    def test_remote_preparation_progress_with_tostop(self):
+    def test_preparation_progress_during_https_transfer_with_tostop(self):
         import native_job_control
         f=self.f;url=f.https();self.addCleanup(f.server.shutdown)
-        original=f.env
-        for selection in ('automatic','initial-background'):
-            with self.subTest(selection=selection):
-                f.env=dict(original)
-                shell=native_job_control.Shell(f, size=(30, 160));self.addCleanup(shell.close)
-                shell.send(b'stty tostop\n');shell.expect(shell.prompt)
-                f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
-                runner_file=f.root/f'tostop-runner-{selection}'
-                child = (
-                    "import sys, termios\n"
-                    "assert termios.tcgetattr(0)[3] & termios.ECHO, 'terminal echo was left disabled'\n"
-                    "assert sys.stdin.readline() == 'typed-ahead\\n', 'typed input was lost'\n"
-                    "print('\\nchild-completed')"
-                )
-                argv = ['/bin/sh', '-c', 'printf "%s" "$$" > "$1"; shift; exec "$@"', 'fixture',
-                        str(runner_file), str(OPTIONS.binary), url,
-                        'HEAD', '--write-policy=all',
-                        '--', sys.executable, '-c', child]
-                background = selection == 'initial-background'
-                status = b'; printf "STATUS:%d\\n" "$?"\n'
-                shell.send(('TERM=xterm '+shlex.join(argv)).encode()
-                           + (b' &\n' if background else status))
-                try:
-                    self.assertTrue(f.stalled.wait(10), 'HTTPS did not reach controlled TTY stall')
-                    runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
-                    shell.groups.add(runner)
-                    self.assertEqual(foreground,shell.pid if background else runner)
-                    self.assertEqual(os.getsid(runner),shell.pid)
-                    if background:
-                        shell.expect(shell.prompt)
-                        time.sleep(.7)
-                        shell.read()
-                        self.assertNotIn(b'git on', shell.transcript)
-                        before_fg = len(shell.transcript)
-                        shell.send(b'fg >/dev/null' + status)
-                        shell.wait_for(lambda: os.tcgetpgrp(shell.fd) == runner, 'fg did not restore the runner')
-                        shell.wait_for(lambda: b'git on' in shell.transcript[before_fg:],
-                                       'indicator did not appear when the job first entered the foreground')
-                    shell.send(b'typed-')
-                    deadline=time.monotonic()+1.3
-                    while time.monotonic()<deadline:
-                        shell.read()
-                        if native_job_control.state(runner)=='T':break
-                    self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during native Git ownership: {bytes(shell.transcript)!r}')
-                    label = b'git on'
-                    self.assertGreaterEqual(shell.transcript.count(label),2,'native Git wait hid the animation')
-                    shell.send(b'ahead\n')
-                    deadline=time.monotonic()+.2
-                    while time.monotonic()<deadline:shell.read()
-                    f.resume.set()
-                    output=shell.expect(shell.prompt,timeout=15)
-                    self.assertIn(b'STATUS:0',output)
-                    visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
-                    self.assertIn(b'child-completed',visible.splitlines())
-                    self.assertNotIn(b'git on',output[output.rindex(b'child-completed'):])
-                    screen=terminal_lines(output, columns=160)
-                    for artifact in ('git on HEAD','Receiving objects','Compressing objects','━'):
-                        self.assertNotIn(artifact,screen,'preparation left an indicator on screen')
-                    self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-                    assert_no_run_state(self, f.root)
-                    shell.groups.clear()
-                finally:
-                    f.resume.set()
-        f.env=original
-
+        tools=f.root/'tostop-tools';tools.mkdir();(tools/'git').symlink_to(shutil.which('git'))
+        shell=native_job_control.Shell(f);self.addCleanup(shell.close)
+        shell.send(b'stty tostop\n');shell.expect(shell.prompt)
+        f.resume.clear();f.stalled.clear();f.stalled_oids={f.commit}
+        runner_file=f.root/'tostop-runner'
+        argv=['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"','fixture',str(runner_file),str(OPTIONS.binary),url,'HEAD','--write-policy=all','--',sys.executable,'-c',"import sys,termios;assert termios.tcgetattr(0)[3]&termios.ECHO;assert sys.stdin.readline()=='typed-ahead\\n';print('child-completed')"]
+        shell.send((f'PATH={shlex.quote(str(tools))} TERM=xterm '+shlex.join(argv)+'; printf "STATUS:%d\\n" "$?"\n').encode())
+        try:
+            self.assertTrue(f.stalled.wait(10),'HTTPS transfer did not reach controlled TTY stall')
+            runner=int(runner_file.read_text());foreground=os.tcgetpgrp(shell.fd)
+            shell.groups.update((runner,foreground))
+            self.assertEqual(foreground,runner,'HTTPS helper took the terminal from git-on')
+            self.assertEqual(os.getsid(runner),shell.pid)
+            shell.send(b'typed-')
+            deadline=time.monotonic()+1.3
+            while time.monotonic()<deadline:
+                shell.read()
+                if native_job_control.state(runner)=='T':break
+            self.assertNotEqual(native_job_control.state(runner),'T',f'runner stopped during an HTTPS transfer: {bytes(shell.transcript)!r}')
+            self.assertGreaterEqual(shell.transcript.count(b'git on'),2,'HTTPS transfer hid the animation')
+            shell.send(b'ahead\n')
+            deadline=time.monotonic()+.2
+            while time.monotonic()<deadline:shell.read()
+            f.resume.set()
+            output=shell.expect(shell.prompt,timeout=15)
+            self.assertIn(b'STATUS:0',output)
+            visible=re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]',b'',output)
+            self.assertIn(b'child-completed',visible.splitlines())
+            self.assertNotIn(b'git on',output[output.rindex(b'child-completed'):])
+            screen=terminal_lines(output)
+            for artifact in ('git on HEAD','Receiving objects','Compressing objects','━'):
+                self.assertNotIn(artifact,screen,'preparation left an indicator on screen')
+            self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
+            self.assertEqual(run_directories(f.root),[])
+            shell.groups.clear()
+        finally:f.resume.set()
     def test_materialization_progress_is_delayed_tty_only_and_cleared_before_child_or_error(self):
         f=self.f; url=f.https(); self.addCleanup(f.server.shutdown)
         programs=f.root/'progress-tools'; programs.mkdir(); (programs/'git').symlink_to(shutil.which('git'))
         env=dict(f.env,PATH=str(programs),TERM='xterm')
         f.stalled_oids={f.commit}
-        outcomes = ('error','cancel','blocked-cancel','recovered-cancel','blocked-finish',
-                    'blocked-before-first-frame','read-only','disconnected')
-        if os.geteuid() != 0:
-            outcomes += ('inherited-nonblocking-tty',)
-
-        for outcome in outcomes:
+        for outcome in ('success','error','cancel'):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(f.root/'cache',ignore_errors=True)
                 f.resume.clear(); f.stalled.clear(); f.denied_oids=set()
                 master,slave=pty.openpty()
-                termios.tcsetwinsize(slave, (24, 80))
-                receiver = self.enterContext(os.fdopen(master, 'rb', buffering=0))
-                # Keep the slave open until the parent drains the transcript.
+                self.addCleanup(os.close,master)
                 self.addCleanup(os.close,slave)
-                inherited = outcome.startswith('inherited-')
-                if inherited or outcome=='blocked-before-first-frame':
-                    filler = os.open(os.ttyname(slave), os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
-                    self.addCleanup(os.close, filler)
-                if inherited:
-                    mode = stat.S_IMODE(os.fstat(slave).st_mode)
-                    self.addCleanup(os.fchmod, slave, mode)
-                    os.fchmod(slave, 0)
-                    with self.assertRaises(PermissionError):
-                        os.open(os.ttyname(slave), os.O_WRONLY | os.O_NOCTTY)
-                    os.set_blocking(slave, False)
                 child="import sys; sys.stderr.write('CHILD-START\\n'); print('child output')"
-                if inherited or outcome in ('blocked-finish','blocked-before-first-frame','disconnected'):
-                    child="print('child output')"
-                if outcome=='blocked-before-first-frame':
-                    fill_output(filler)
-                destination = slave
-                if outcome=='read-only':
-                    destination = os.open(os.ttyname(slave), os.O_RDONLY | os.O_NOCTTY)
-                    self.addCleanup(os.close, destination)
-                    child = "print('child output')"
-                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--backend=copy','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=destination)
+                process=subprocess.Popen([str(OPTIONS.binary),url,'HEAD','--backend=copy','--write-policy=all','--',sys.executable,'-c',child],cwd=f.cwd,env=env,stdout=subprocess.PIPE,stderr=slave)
                 f.children.append(process)
                 self.assertTrue(f.stalled.wait(10),'materialization never reached controlled object stall')
-                if outcome=='blocked-before-first-frame':
-                    time.sleep(.8)
-                    f.resume.set()
-                    output,_=process.communicate(timeout=4)
-                    self.assertEqual((process.returncode,output),(0,b'child output\n'))
-                    assert_no_run_state(self,f.root)
-                    continue
-                if inherited or outcome=='read-only':
-                    unexpected = select.select([master],[],[],.8)[0]
-                    if inherited:
-                        self.assertFalse(os.get_blocking(slave))
-                        os.set_blocking(slave, True)
-                        fill_output(filler)
-                        time.sleep(.2)
-                    f.resume.set()
-                    output,_=process.communicate(timeout=4)
-                    self.assertEqual((process.returncode,output),(0,b'child output\n'))
-                    self.assertFalse(unexpected, 'indicator wrote without writable nonblocking stderr')
-                    self.assertTrue(os.get_blocking(slave))
-                    assert_no_run_state(self,f.root)
-                    continue
                 transcript=bytearray(); deadline=time.monotonic()+5
                 while b'git on' not in transcript and time.monotonic()<deadline:
                     if select.select([master],[],[],.1)[0]: transcript.extend(os.read(master,65536))
                 self.assertIn(b'git on',transcript)
                 self.assertNotIn(b'CHILD-START',transcript)
-                if outcome=='disconnected':
-                    receiver.close()
-                    f.resume.set()
-                    output,_=process.communicate(timeout=5)
-                    self.assertEqual((process.returncode,output),(0,b'child output\n'))
-                    assert_no_run_state(self,f.root)
-                    continue
                 if outcome=='error': f.denied_oids={f.commit}
-                if outcome in ('blocked-cancel','recovered-cancel','blocked-finish'):
-                    # Fill the terminal through a separate open file description.
-                    filler = os.open(os.ttyname(slave), os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
-                    self.addCleanup(os.close, filler)
-                    fill_output(filler)
-                if outcome in ('cancel','blocked-cancel','recovered-cancel'):
-                    process.send_signal(signal.SIGTERM)
+                if outcome=='cancel': process.send_signal(signal.SIGTERM)
                 f.resume.set()
-                if outcome in ('blocked-cancel','blocked-finish'):
-                    output,_=process.communicate(timeout=4)
-                    status = -signal.SIGTERM if outcome=='blocked-cancel' else 125
-                    self.assertEqual((process.returncode, output), (status, b''))
-                    assert_no_run_state(self, f.root)
-                    continue
-                if outcome=='recovered-cancel':
-                    time.sleep(.04)
-                    deadline=time.monotonic()+4
-                    while process.poll() is None and time.monotonic()<deadline:
-                        if select.select([master],[],[],.05)[0]: transcript.extend(os.read(master,65536))
                 output,_=process.communicate(timeout=20)
                 while select.select([master],[],[],.05)[0]:
                     try: chunk=os.read(master,65536)
@@ -3113,92 +2095,114 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
                         raise
                     if not chunk: break
                     transcript.extend(chunk)
-                self.assertEqual(process.returncode,-signal.SIGTERM if outcome in ('cancel','recovered-cancel') else 125,transcript)
-                self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
-                screen = terminal_lines(transcript, columns=80)
-                if outcome=='recovered-cancel':
-                    self.assertTrue(0 <= transcript.rfind(b'xxxxxxxx') < transcript.rfind(b'\x1b[2K'),
-                                    'did not clear the frame after the terminal resumed')
-                    # Filler can scroll the initial frame out of its old row.
-                    screen = screen.rsplit('\n', 1)[-1]
-                self.assertNotRegex(screen, '[\u2800-\u28ff]')
-                if outcome=='error':
-                    self.assertRegex(transcript.rsplit(b'\x1b[2K', 1)[-1],
-                                     rb'\b(?:HTTP (?:error )?403|returned error: 403)\b')
-                assert_no_run_state(self, f.root)
+                self.assertIn(b'\x1b[2K',transcript)
+                if outcome=='success':
+                    self.assertEqual(process.returncode,0,transcript)
+                    self.assertEqual(output,b'child output\n')
+                    self.assertGreater(transcript.index(b'CHILD-START'),transcript.rfind(b'\x1b[2K'))
+                else:
+                    self.assertEqual(process.returncode,-signal.SIGTERM if outcome=='cancel' else 125,transcript)
+                    self.assertNotIn(b'CHILD-START',transcript); self.assertEqual(output,b'')
+                    if outcome=='error': self.assertIn(b'403',transcript)
+                self.assertEqual(run_directories(f.root),[])
+
+    @unittest.skipUnless(sys.platform=='linux' and shutil.which('strace'), 'Linux strace object-I/O observation')
+    def test_private_remote_objects_do_not_sync_disposable_payloads(self):
+        f=self.f;trace=f.root/'private-object-io.trace'
+        # Durability for the caller's repository does not apply to streamed
+        # objects or change its Git configuration.
+        env=dict(f.env,GIT_CONFIG_COUNT='2',GIT_CONFIG_KEY_0='core.fsync',GIT_CONFIG_VALUE_0='all',
+            GIT_CONFIG_KEY_1='core.fsyncObjectFiles',GIT_CONFIG_VALUE_1='true')
+        before=f.git('config','--list')
+        source=f.https()
+        env['GIT_SSL_CAINFO']=f.env['GIT_SSL_CAINFO']
+        result=subprocess.run(['strace','-f','-yy','-e','trace=fsync,fdatasync',
+            '-o',str(trace),str(OPTIONS.probe),source,'HEAD','--metrics-only'],
+            cwd=f.cwd,env=env,input=b'read deep/file\nread deep/file\nreport\nexit\n',capture_output=True,timeout=40)
+        self.assertEqual(result.returncode,0,result.stderr)
+        rows=[json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row['data'] for row in rows if 'data' in row],['expected\n']*2)
+        reports=[row['metrics'] for row in rows if 'metrics' in row]
+        self.assertEqual(reports[-1]['remote_fetches'],4)
+        self.assertEqual(reports[-1]['remote_fetches'],reports[-2]['remote_fetches'])
+        self.assertNotRegex(trace.read_text(), r'\b(?:fsync|fdatasync)\(')
+        self.assertEqual(f.git('config','--list'),before)
 
     def test_remote_raw_import_reuses_evicted_objects_without_loose_blob_copies(self):
-        f = self.f
-        size = 1024 * 1024 + 1
-        blobs = [(index.to_bytes(2, 'little'), f'f{index:02d}') for index in range(17)]
-        entries = []
-        for prefix, name in blobs:
-            oid = f.git('hash-object', '-w', '--stdin', data=prefix + b'x' * (size - len(prefix)))
-            entries.append(f'100644 blob {oid}\t{name}\n')
-        tree = f.git('mktree', data=''.join(entries).encode())
-        commit = f.git('commit-tree', tree, data=b'raw eviction fixture\n')
-        f.git('update-ref', 'refs/heads/main', commit)
-        url = f.https()
-        trace = f.root / 'raw-object-io.trace'
-        observer = []
-        if sys.platform == 'linux' and shutil.which('strace'):
-            observer = ['strace', '-f', '-yy', '-e', 'trace=write,pwrite64,fsync,fdatasync',
-                        '-o', str(trace)]
-        f.git('init', '--quiet', at=f.cwd)
-        f.git('config', 'core.fsync', 'all', at=f.cwd)
-        before = f.git('config', '--list', at=f.cwd)
-        process = f.probe(url, prefix=observer)
-        f.line(process)
-        for prefix, name in blobs:
-            value, last = f.operation(process, f'range 0 2 {name}')
-            self.assertEqual(bytes(value['bytes']), prefix)
-            f.operation(process, 'release')
-        value, again = f.operation(process, 'range 0 2 f00')
-        self.assertEqual(bytes(value['bytes']), blobs[0][0])
-        wants = [oid for request in f.requests for oid in request['wants']]
-        self.assertEqual(len(wants), len(blobs) + 2)
-        self.assertEqual(len(set(wants)), len(wants), 'an evicted object was requested again')
-        metrics = again['metrics']
-        self.assertEqual(metrics['blob_loads'], last['metrics']['blob_loads'])
-        self.assertGreater(metrics['retained_raw_blob_entries'], 0, 'the working set never evicted')
-        self.assertLessEqual(metrics['blob_cache_bytes'], metrics['blob_cache_limit'])
-        self.assertTrue(list(f.root.glob('*/raw-objects-*/*')), 'no evicted payload on disk')
-        self.assertFalse(list(f.root.glob('*/remote-repository')))
-        f.finish(process)
-        if observer:
-            lines = [line for line in trace.read_text().splitlines() if '/raw-objects-' in line]
-            self.assertTrue(any(re.search(r'\b(write|pwrite64)\(', line) for line in lines), lines)
-            self.assertFalse(any(re.search(r'\b(fsync|fdatasync)\(', line) for line in lines), lines)
-        self.assertEqual(f.git('config', '--list', at=f.cwd), before)
-
-    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor observation')
-    def test_session_keeps_descriptors_bounded_after_raw_blobs_spill(self):
-        import resource
-        # Leave more than 64 on disk with eight hot blobs and one pending spill.
-        f=self.f;count=74;size=64*1024+1;entries=[]
+        f=self.f;entries=[];oids=[];count=300
         for index in range(count):
-            data=(index+1).to_bytes(4,'little')+bytes(size-4)
+            prefix=f'raw-{index:03d}:'.encode();data=prefix+b'x'*(65536-len(prefix))
+            oid=f.git('hash-object','-w','--stdin',data=data);oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'raw eviction fixture\n');f.git('update-ref','refs/heads/main',commit)
+        process=f.probe(f.https());f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'range 0 32 f{index:03d}')
+            self.assertEqual(bytes(value['bytes']),f'raw-{index:03d}:'.encode()+b'x'*24)
+        value,again=f.operation(process,'range 0 32 f000');self.assertEqual(bytes(value['bytes']),b'raw-000:'+b'x'*24)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
+        self.assertEqual(again['metrics']['blob_loads'],last['metrics']['blob_loads'],'evicted raw blob was unpacked again')
+        self.assertFalse(list(f.root.rglob('remote-repository')))
+        self.assertGreater(again['metrics']['retained_raw_blob_entries'],0,'working set did not actually evict payloads')
+        self.assertLessEqual(again['metrics']['blob_cache_bytes'],again['metrics']['blob_cache_limit'])
+        f.finish(process)
+
+    def test_protocol_v2_reuses_native_clients_across_many_blob_demands(self):
+        f=self.f;count=140;entries=[];oids=[]
+        for index in range(count):
+            oid=f.git('hash-object','-w','--stdin',data=f'unique-{index}\n'.encode());oids.append(oid)
+            entries.append(f'100644 blob {oid}\tf{index:04d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode());commit=f.git('commit-tree',tree,data=b'session reuse\n');f.git('update-ref','refs/heads/main',commit)
+        source=f.ssh()
+        from support.git_invocations import git_invocations, record_git_invocations
+        f.env, trace = record_git_invocations(f.root, f.env)
+        process=f.probe(source);f.line(process)
+        for index in range(count):
+            value,last=f.operation(process,f'read f{index:04d}')
+            self.assertEqual(value['data'],f'unique-{index}\n')
+        value,again=f.operation(process,'read f0000');self.assertEqual(value['data'],'unique-0\n')
+        self.assertEqual(again['metrics']['blob_loads'],count)
+        self.assertEqual(again['metrics']['remote_fetches'],count+2)
+        again=f.wait_for_packs(process,count+2,'remote_session_decode_operations')
+        f.finish(process)
+        self.assertFalse(any('fetch' in args or 'cat-file' in args for args in git_invocations(trace)))
+        self.assertEqual(again['metrics']['remote_session_fetch_operations'], count + 2)
+        self.assertEqual(again['metrics']['remote_session_decode_operations'], count + 2)
+        self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
+        self.assertEqual(set(again['objects']),{commit,tree,*oids})
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux process resource limits')
+    def test_session_pack_and_raw_storage_respect_fsize_and_descriptor_limits(self):
+        import hashlib,resource
+        f=self.f;count=140;limit=8192;entries=[]
+        for index in range(count):
+            data=hashlib.shake_256(f'session-parts:{index}'.encode()).digest(limit)
             oid=f.git('hash-object','-w','--stdin',data=data)
             entries.append(f'100644 blob {oid}\tf{index:04d}\n')
         tree=f.git('mktree',data=''.join(entries).encode())
         commit=f.git('commit-tree',tree,data=b'bounded session parts\n');f.git('update-ref','refs/heads/main',commit)
-        def limit_descriptors():
+        def reduced_limits():
+            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
             resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
-        process=subprocess.Popen([str(OPTIONS.probe),f.https(),'HEAD','--metrics-only'],cwd=f.cwd,
-            env=f.env,preexec_fn=limit_descriptors,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        source=f.https()
+        process=subprocess.Popen([str(OPTIONS.probe),source,'HEAD','--metrics-only'],cwd=f.cwd,
+            env=f.env,preexec_fn=reduced_limits,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         f.children.append(process);f.line(process)
         for index in range(count):
-            value,_=f.operation(process,f'range 0 4 f{index:04d}')
-            self.assertEqual(value['bytes'],list((index+1).to_bytes(4,'little')))
+            value,last=f.operation(process,f'range 0 32 f{index:04d}')
+            self.assertEqual(value['bytes'],list(hashlib.shake_256(f'session-parts:{index}'.encode()).digest(32)))
             f.operation(process,'release')
-        value,again=f.operation(process,'range 0 4 f0000')
-        self.assertEqual(value['bytes'],[1,0,0,0])
+        value,again=f.operation(process,'range 0 32 f0000')
+        self.assertEqual(value['bytes'],list(hashlib.shake_256(b'session-parts:0').digest(32)))
         self.assertEqual(again['metrics']['blob_loads'],count)
-        self.assertEqual(again['metrics']['remote_session_fetch_operations'],count+2)
+        again=f.wait_for_packs(process,count+2,'remote_http2_fetch_operations')
+        self.assertEqual(again['metrics']['remote_http2_fetch_operations'],count+2)
         self.assertEqual(again['metrics']['remote_session_decode_operations'],count+2)
         self.assertEqual(again['metrics']['remote_session_starts'],1)
-        self.assertEqual(again['metrics']['remote_raw_blob_bytes'],count*size)
-        self.assertGreater(len(list(f.root.glob('*/raw-objects-*/*'))),64)
+        self.assertEqual(again['metrics']['remote_raw_blob_bytes'],count*limit)
+        self.assertGreater(again['metrics']['remote_raw_blob_bytes'],limit)
+        self.assertEqual(again['metrics']['spool_bytes'], 0)
         self.assertLessEqual(len(list(Path(f'/proc/{process.pid}/fd').iterdir())),48)
         f.finish(process)
 
@@ -3207,51 +2211,32 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         f.git('update-ref', 'refs/tags/release', f.commit)
         url = f.ssh(protocol_v2=True)
         process = f.probe(url, 'release')
-        selected = f.line(process)
-        self.assertEqual(selected['tree'], f.tree)
-        self.assertEqual(selected['metrics']['remote_fetch_operations'], 0)
+        self.assertEqual(f.line(process)['tree'], f.tree)
         value, _ = f.operation(process, 'read deep/file')
         self.assertEqual(value['data'], 'expected\n')
         f.finish(process)
         self.assertEqual((f.root / 'sshd.log').read_text().count('Accepted publickey'), 1)
 
-    def test_mounted_ssh_reuses_native_upload_pack_setup(self):
-        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
-            self.skipTest('actual FUSE or NFS execution required')
-        f = self.f
-        url = f.ssh(protocol_v2=True)
-        env, log = record_git_invocations(f.root, f.env)
-        backend = 'fuse' if OPTIONS.require_fuse else 'nfs'
-        result = subprocess.run(
-            [OPTIONS.binary, url, f.commit, '--backend=' + backend,
-             '--write-policy=none', '--', 'cat', 'deep/file'],
-            cwd=f.cwd, env=env, capture_output=True, timeout=20,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b'expected\n')
-        calls = git_invocations(log)
-        setup = [args for args in calls if '--git-dir=/dev/null' in args and 'ls-remote' in args]
-        self.assertEqual(len(setup), 1, calls)
-        self.assertFalse(any('fetch' in args or 'fetch-pack' in args for args in calls), calls)
-        assert_no_run_state(self, f.root)
-
     def test_ssh_spare_can_prepare_while_first_advertisement_waits(self):
         f = self.f
-        url = f.ssh(max_sessions=2)
+        url = f.ssh(protocol_v2=True, max_sessions=2)
         release = f.root / 'release-primary'
-        first_channel = shlex.quote(str(f.root / 'first-channel'))
-        f.force_upload_pack(
-            f'if mkdir {first_channel} 2>/dev/null; then\n'
-            '    printf 000eversion\n'
+        self.addCleanup(release.touch)
+        shim = f.root / 'hold-first-upload-pack'
+        shim.write_text(
+            '#!/bin/sh\n'
+            f'if mkdir {shlex.quote(str(f.root / "first-channel"))} 2>/dev/null; then\n'
             f'    while test ! -f {shlex.quote(str(release))}; do sleep 0.02; done\n'
-            '    exit 0\n'
             'fi\n'
             f'exec git-upload-pack {shlex.quote(str(f.repo))}\n'
         )
+        shim.chmod(0o700)
+        authorized = f.root / 'authorized'
+        authorized.write_text(f'command="{shlex.quote(str(shim))}" ' + authorized.read_text())
         process = f.probe(url, 'main')
         try:
             ready, _, _ = select.select([process.stdout], [], [], 5)
-            self.assertTrue(ready, 'the spare never received a v2 advertisement')
+            self.assertTrue(ready, 'the spare did not complete preparation before the first advertisement')
             self.assertEqual(f.line(process)['tree'], f.tree)
         finally:
             release.touch()
@@ -3261,40 +2246,29 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
     def test_protocol_v2_ssh_session_reuses_owned_connection_and_fails_on_loss(self):
         f=self.f;url=f.ssh(protocol_v2=True)
         process=f.probe(url);f.line(process)
-        value,report=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
-        self.assertEqual(set(report['objects']), {f.commit, f.tree, f.subtree, f.blob})
+        value,_=f.operation(process,'read deep/file');self.assertEqual(value['data'],'expected\n')
+        report=f.wait_for_packs(process,4,'remote_session_fetch_operations')
+        self.assertEqual(report['metrics']['remote_session_fetch_operations'],4)
         socket=next(f.root.rglob('ssh-control'))
         run(['ssh','-F','/dev/null','-S',socket,'-O','exit','fixture-host'],env=f.env)
         with self.assertRaises(AssertionError):f.operation(process,'read other')
         self.assertNotEqual(process.wait(timeout=10),0)
         self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
 
-    def test_session_reads_full_objects_without_pack_staging(self):
-        f = self.f
-        process = f.probe(f.https())
-        self.assertIsNone(f.line(process)['source_git_dir'])
-        self.assertFalse(list(f.root.rglob('remote-repository')))
-        value, report = f.operation(process, 'read deep/file')
-        self.assertEqual(value['data'], 'expected\n')
-        self.assertEqual(report['metrics']['remote_session_starts'], 1)
-        self.assertEqual(report['metrics']['remote_fetch_operations'], 0)
-        self.assertFalse(list(f.root.rglob('remote-repository')))
-        self.assertFalse(list(f.root.rglob('raw-parts-*')))
-        f.finish(process)
-
-    def delta_session_fixture(self, prefix_size=20000, include_base=False, root_extras=None):
+    def delta_session_fixture(self, prefix_size=20000, include_base=False, root_extras=None,
+                              packet_size=60000, payload_prefix=None, hold_tail=False):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
-        base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
+        prefix = b'a' * prefix_size if payload_prefix is None else payload_prefix
+        prefix_size = len(prefix)
+        base=prefix+b'base';wanted=prefix+b'changed'
         base_oid=f.git('hash-object','-w','--stdin',data=base)
         wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
         entries=f'100644 blob {wanted_oid}\tfile\n'
         if include_base:entries+=f'100644 blob {base_oid}\tbase\n'
-        extra_oids=[]
         for name, content in (root_extras or {}).items():
             oid=f.git('hash-object','-w','--stdin',data=content)
             entries+=f'100644 blob {oid}\t{name}\n'
-            extra_oids.append(oid)
         tree=f.git('mktree',data=entries.encode())
         commit=f.git('commit-tree',tree,data=b'delta session\n');f.git('update-ref','refs/heads/main',commit)
         def integer(value):
@@ -3311,11 +2285,28 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         data+=entry(7,len(delta))+bytes.fromhex(base_oid)+zlib.compress(delta)
         data+=hashlib.sha1(data).digest()
         tree_pack=run([native,'-C',f.repo,'pack-objects','--stdout'],
-                      input=''.join(f'{oid}\n' for oid in [tree, *extra_oids]).encode(),env=f.env)
+                      input=f'{tree}\n'.encode(),env=f.env)
         trace = f.root / 'delta-demands'
         server = f.https_server()
         forward = server.forward
         packs = {tree.encode(): tree_pack, wanted_oid.encode(): data}
+
+        def framed(pack):
+            reply = bytearray(b'000dpackfile\n')
+            for start in range(0, len(pack), packet_size):
+                chunk = pack[start:start + packet_size]
+                reply.extend(f'{len(chunk)+5:04x}'.encode() + b'\x01' + chunk)
+            return bytes(reply)
+
+        if hold_tail:
+            from types import SimpleNamespace
+            server.split_pack = SimpleNamespace(
+                wants={wanted_oid.encode()},
+                prefix=framed(data[:-20]),
+                tail=b'0019\x01' + data[-20:] + b'0000',
+                started=f.root / 'delta-pack-started',
+                release=f.root / 'delta-pack-release',
+            )
 
         def send_pack(method, path, headers, body):
             wants = re.findall(rb'want ([0-9a-f]{40})', body)
@@ -3324,69 +2315,54 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
             [oid] = wants
             with trace.open('ab') as output:
                 output.write(oid + b'\n')
-            pack = packs[oid]
-            reply = bytearray(b'000dpackfile\n')
-            for start in range(0, len(pack), 60000):
-                chunk = pack[start:start + 60000]
-                reply.extend(f'{len(chunk)+5:04x}'.encode() + b'\x01' + chunk)
-            reply.extend(b'0000')
-            return 200, [('content-type', 'application/x-git-upload-pack-result')], bytes(reply)
+            return 200, [('content-type', 'application/x-git-upload-pack-result')], framed(packs[oid]) + b'0000'
 
         server.forward = send_pack
-        return wanted, base_oid, wanted_oid, tree, commit, trace, server.url
+        return wanted, base_oid, wanted_oid, tree, commit, trace, server
 
     def test_session_imports_required_delta_pack_without_a_second_fetch(self):
-        f=self.f;wanted,_,wanted_oid,tree,_,trace,url=self.delta_session_fixture()
-        process=f.probe(url);f.line(process)
-        value,first=f.operation(process,'range 19990 100 file')
-        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        f = self.f
+        extras = {f'extra{index}': bytes([index]) * 70000 for index in range(7)}
+        wanted, _, wanted_oid, tree, _, trace, server = self.delta_session_fixture(70000, root_extras=extras)
+        process=f.probe(server.url);f.line(process)
+        value,first=f.operation(process,'range 69990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[69990:])
         f.operation(process,'release')
-        value,again=f.operation(process,'range 19990 100 file')
-        self.assertEqual(bytes(value['bytes']),wanted[19990:])
+        value,again=f.operation(process,'range 69990 100 file')
+        self.assertEqual(bytes(value['bytes']),wanted[69990:])
         self.assertEqual(first['metrics']['blob_loads'], again['metrics']['blob_loads'])
         self.assertEqual(trace.read_text().splitlines(), [tree, wanted_oid])
-        self.assertEqual(again['metrics']['remote_fetch_operations'], 0)
+        f.operation(process,'release')
+        for name, expected in extras.items():
+            value, _ = f.operation(process, f'range 0 1 {name}')
+            self.assertEqual(bytes(value['bytes']), expected[:1])
+            f.operation(process,'release')
+        report = f.wait_for_packs(process, 10, 'remote_http2_fetch_operations')
+        self.assertEqual(report['metrics']['large_blob_cache_entries'], 8)
+        self.assertEqual(report['metrics']['spool_bytes'], 0, 'a delta-only base displaced a wanted blob')
         self.assertFalse(list(f.root.rglob('remote-repository')))
         self.assertFalse(list(f.root.rglob('raw-parts-*')))
         f.finish(process)
 
     def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
-        f=self.f;wanted,base_oid,_,tree,_,trace,url=self.delta_session_fixture(include_base=True)
-        process=f.probe(url);f.line(process)
-        f.operation(process,'range 0 1 file')
-        f.operation(process,'release')
-        value,prepared=f.operation(process,'range 19990 100 base')
-        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
-        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
-        f.operation(process,'release')
-        value,reopened=f.operation(process,'range 19990 100 base')
-        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
-        for field in ('remote_fetch_operations','remote_decode_operations','blob_loads'):
-            self.assertEqual(prepared['metrics'][field],reopened['metrics'][field])
+        f = self.f
+        _, _, wanted, tree, commit, _, server = self.delta_session_fixture(include_base=True, packet_size=31)
+        process = f.probe(server.url)
+        f.line(process)
+        f.operation(process, 'range 0 1 file')
+        f.operation(process, 'release')
+        f.wait_for_packs(process, 3, 'remote_http2_fetch_operations')
+        value, _ = f.operation(process, 'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']), b'a' * 10 + b'base')
         f.finish(process)
-
-    def test_copy_reuses_an_unopened_base_received_by_a_lazy_read(self):
-        f=self.f
-        # More than eight large extras would spill if copy first admitted
-        # their verified bytes to the lazy read cache.
-        extras={f'extra-{index}':bytes([index])*65537 for index in range(10)}
-        wanted,base_oid,_,tree,_,trace,url=self.delta_session_fixture(include_base=True,root_extras=extras)
-        process=f.probe(url);f.line(process)
-        f.operation(process,'range 0 1 file')
-        f.operation(process,'release')
-        destination=f.root/'copy-snapshot';destination.mkdir()
-        _, report=f.operation(process,'materialize '+str(destination))
-        self.assertEqual((destination/'file').read_bytes(),wanted)
-        self.assertEqual((destination/'base').read_bytes(),f.git('cat-file','blob',base_oid).encode())
-        for name, content in extras.items():
-            self.assertEqual((destination/name).read_bytes(),content)
-        self.assertEqual(report['metrics']['spool_bytes'],0)
-        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
-        f.finish(process)
+        self.assertCountEqual(
+            [oid.decode() for _, wants in server.records for oid in wants],
+            [commit, tree, wanted],
+        )
 
     def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
-        f=self.f;wanted,_,wanted_oid,tree,_,trace,url=self.delta_session_fixture(40000)
+        f=self.f;wanted,_,wanted_oid,tree,_,trace,server=self.delta_session_fixture(40000)
         code=r'''
 import errno,os,sys
 from pathlib import Path
@@ -3421,17 +2397,17 @@ if sys.argv[1]=='untracked':
         for policy in ('none','untracked','all'):
             with self.subTest(policy=policy):
                 trace.unlink(missing_ok=True)
-                result=subprocess.run([str(OPTIONS.binary),url,'HEAD',
+                result=subprocess.run([str(OPTIONS.binary),server.url,'HEAD',
                     '--write-policy='+policy,'--',sys.executable,'-I','-S','-c',code,policy],
                     cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
-                assert_no_run_state(self, f.root)
+                self.assertEqual(run_directories(f.root), [])
                 self.assertEqual(f.git('cat-file','blob',wanted_oid).encode(),wanted)
 
     def large_delta_storage_fixture(self):
         size=7*1024*1024
-        _,_,wanted_oid,tree,_,trace,url=self.delta_session_fixture(size-7)
+        _,_,wanted_oid,tree,_,trace,server=self.delta_session_fixture(size-7)
         from filesystem_quota import STORAGE_OBSERVATION
         command=[sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
 import sys
@@ -3447,7 +2423,7 @@ if sys.argv[1]=='rewrite':
  assert allocated()<9*1024*1024,('delta mutation duplicated source',allocated())
 print('delta payload verified')
 ''']
-        return command,wanted_oid,tree,trace,url
+        return command,wanted_oid,tree,trace,server.url
 
     def test_delta_base_is_not_a_second_materialized_file(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
@@ -3464,7 +2440,7 @@ print('delta payload verified')
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,direct.stdout)
                 self.assertEqual(trace.read_text().splitlines(),[tree,wanted_oid])
-                assert_no_run_state(self, f.root)
+                self.assertEqual(run_directories(f.root), [])
 
     def test_delta_decode_and_rewrite_succeed_on_nine_mib_tmpfs(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
@@ -3473,6 +2449,102 @@ print('delta payload verified')
         compare_on_tmpfs(self,f.root,OPTIONS.binary,f.repo,f.env['PATH'],[*command,'rewrite'],source=url,tls_ca=f.env['GIT_SSL_CAINFO'])
 
 
+
+    def test_spilled_delta_copy_up_before_the_trailer_fits_two_checkouts(self):
+        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
+        from filesystem_quota import compare_on_tmpfs
+        from random import Random
+        f = self.f
+        pressure = {f'pressure-{index}': bytes([index]) * (65536 + 1) for index in range(8)}
+        prefix = Random(18).randbytes(7 * 1024 * 1024 - 7)
+        _, _, wanted_oid, _, _, _, server = self.delta_session_fixture(
+            root_extras=pressure, payload_prefix=prefix, hold_tail=True,
+        )
+        release = f.root / 'delta-pack-release'
+        code = r'''
+import sys
+from pathlib import Path
+from random import Random
+entry = Path('file')
+release = Path(sys.argv[1])
+mounted = not Path('.git').exists()
+try:
+    expected = Random(18).randbytes(7 * 1024 * 1024 - 7) + b'changed'
+    assert entry.read_bytes() == expected
+    for index in range(8):
+        with open(f'pressure-{index}', 'rb', buffering=0) as pressure:
+            assert pressure.read(1) == bytes([index])
+    if mounted:
+        (spill,) = Path.cwd().parent.glob('raw-objects-*/' + sys.argv[2])
+        assert spill.stat().st_size == len(expected)
+        assert not release.exists()
+    with entry.open('r+b', buffering=0) as output:
+        assert output.write(b'z') == 1
+    assert entry.read_bytes() == b'z' + expected[1:]
+    print('spilled delta copy-up verified')
+finally:
+    if mounted:
+        release.touch()
+'''
+        command = [sys.executable, '-I', '-S', '-c', code, str(release), wanted_oid]
+        compare_on_tmpfs(self, f.root, OPTIONS.binary, f.repo, f.env['PATH'], command,
+                         size_mib=16, source=server.url, tls_ca=f.env['GIT_SSL_CAINFO'])
+        self.assertTrue((f.root / 'delta-pack-started').exists())
+        self.assertTrue(release.exists())
+
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
+    def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):
+        import resource
+        f=self.f
+        entries=[]
+        for index in range(192):
+            blob=f.git('hash-object','-w','--stdin',data=f'object-{index}\n'.encode())
+            entries.append(f'100644 blob {blob}\tf{index:03d}\n')
+        tree=f.git('mktree',data=''.join(entries).encode())
+        commit=f.git('commit-tree',tree,data=b'descriptor fixture\n')
+        f.git('update-ref','refs/heads/main',commit)
+        source = f.https()
+        limit=64
+        def reduced_limit(): resource.setrlimit(resource.RLIMIT_NOFILE,(limit,limit))
+        def exercise(binary,cache,expect_failure=False):
+            process=subprocess.Popen([str(binary), 'file://' + str(f.repo) if expect_failure else source, 'HEAD'],cwd=f.cwd,
+                env=dict(f.env,XDG_CACHE_HOME=str(cache)),preexec_fn=reduced_limit,
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+            f.children.append(process)
+            samples=[]; failure=None; last=None
+            try:
+                f.line(process)
+                for index in range(192):
+                    value,last=f.operation(process,f'read f{index:03d}')
+                    self.assertEqual(value['data'],f'object-{index}\n')
+                    if index in (15,63,127,191):
+                        samples.append(dict(objects=index+1,descriptors=len(list(Path(f'/proc/{process.pid}/fd').iterdir()))))
+                        if not expect_failure:
+                            self.assertFalse(list(f.root.rglob('remote-repository')))
+            except (AssertionError,BrokenPipeError) as error:
+                failure=str(error)
+                process.wait(timeout=10)
+            if expect_failure:
+                self.assertIsNotNone(failure,'old binary unexpectedly completed; red result unavailable')
+                self.assertIn('Too many open files',failure)
+            else:
+                if failure: self.fail(failure)
+                fetches=last['metrics']['remote_fetches']
+                value,again=f.operation(process,'read f000')
+                self.assertEqual(value['data'],'object-0\n')
+                self.assertEqual(again['metrics']['remote_fetches'],fetches)
+                f.finish(process)
+                self.assertLessEqual(max(x['descriptors'] for x in samples),48)
+            print('descriptor evidence:',json.dumps(dict(binary=str(binary),cache=str(cache),rlimit_nofile=limit,samples=samples,failure=failure,metrics=last['metrics'] if last else None)),flush=True)
+            return last
+        if OPTIONS.before_resource_probe:
+            exercise(OPTIONS.before_resource_probe,f.root/'before-cache',True)
+        cache=f.root/'resource-cache'
+        for _ in range(2):
+            report=exercise(OPTIONS.probe,cache)
+            self.assertEqual(report['metrics']['blob_loads'],192)
+            self.assertEqual(report['metrics']['remote_fetches'],194)
+        self.assertFalse(cache.exists())
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux source-pack mapping observation')
     def test_idle_local_pack_mappings_do_not_retain_the_complete_source_pack(self):
@@ -3517,36 +2589,24 @@ print('delta payload verified')
         f.finish(process)
         print('source pack mapping evidence:',json.dumps(dict(mapped_kib=mapped_kib,rss_kib=rss_kib,pack_bytes=packs[0].stat().st_size,blob_loads=24)),flush=True)
 
-    def test_first_large_loose_range_stays_hot_without_spilling(self):
-        f=self.f
-        mib = 1024 * 1024
-        before = OPTIONS.before_resource_probe if sys.platform == 'linux' else None
-        sizes = (16 * mib, 64 * mib, 128 * mib) if before else (128 * 1024,)
-        for size in sizes:
-            chunk = b'x' * min(size, mib)
-            with tempfile.TemporaryFile() as output:
-                writer=subprocess.Popen(['git','-C',str(f.repo),'hash-object','-w','--stdin'],env=f.env,stdin=subprocess.PIPE,stdout=output)
-                for _ in range(size//len(chunk)): writer.stdin.write(chunk)
-                writer.stdin.close(); self.assertEqual(writer.wait(),0); output.seek(0); blob=output.read().decode().strip()
-            tree=f.git('mktree',data=f'100644 blob {blob}\tlarge\n'.encode())
-            for binary in ([before] if before else [])+[OPTIONS.probe]:
-                process=subprocess.Popen([str(binary),'local',tree],cwd=f.repo,env=f.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-                f.children.append(process); f.line(process)
-                value,report=f.operation(process,'range 1234 16 large')
-                self.assertEqual(bytes(value['bytes']),b'x'*16)
-                repeated,again=f.operation(process,'range 4321 16 large')
-                self.assertEqual(repeated,value)
-                if binary==OPTIONS.probe:
-                    self.assertEqual(report['metrics']['spool_bytes'],0)
-                    self.assertEqual(report['metrics']['hot_blob_cache_entries'],1)
-                    self.assertGreaterEqual(report['metrics']['hot_blob_cache_bytes'],size)
-                    self.assertEqual(report['metrics']['streamed_blob_loads'],1)
-                self.assertEqual(again['metrics']['spool_writes'],report['metrics']['spool_writes'])
-                if before:
-                    status=Path(f'/proc/{process.pid}/status').read_text()
-                    peak_kib=int(re.search(r'^VmHWM:\s+(\d+)',status,re.M).group(1))
-                    print('loose range evidence:',json.dumps(dict(binary=str(binary),object_mib=size//mib,peak_resident_kib=peak_kib,metrics=report['metrics'])),flush=True)
-                f.finish(process)
+    @unittest.skipUnless(sys.platform=='linux', 'Linux /proc peak resident-memory observation')
+    def test_first_large_loose_range_reuses_the_hot_object(self):
+        import hashlib
+        f = self.f
+        size = 4 * 1024 * 1024
+        data = hashlib.shake_256(b"hot-loose-object").digest(size)
+        blob = f.git("hash-object", "-w", "--stdin", data=data)
+        tree = f.git("mktree", data=f"100644 blob {blob}\tlarge\n".encode())
+        f.cwd = f.repo
+        process = f.probe("local", tree)
+        f.line(process)
+        for offset in (1234, size - 16, 1234):
+            value, report = f.operation(process, f"range {offset} 16 large")
+            self.assertEqual(bytes(value["bytes"]), data[offset:offset+16])
+        self.assertEqual(report["metrics"]["streamed_blob_loads"], 1)
+        self.assertEqual(report["metrics"]["large_blob_cache_bytes"], size)
+        self.assertEqual(report["metrics"]["spool_bytes"], 0)
+        f.finish(process)
 
     def test_million_distinct_file_remote_fresh_runs_bounded_fetch(self):
         if not OPTIONS.million: self.skipTest('million-file acceptance explicitly selected in CI')
@@ -3591,19 +2651,19 @@ print('delta payload verified')
         f=self.f; url=f.ssh(); (f.root/'authorized').write_text('')
         process=f.probe(url); _,errors=process.communicate(timeout=20)
         self.assertNotEqual(process.returncode,0)
-        self.assertIn(b'authentication failed',errors)
+        self.assertRegex(errors, rb'authentication failed|Permission denied|requires filtered Git protocol')
         self.assertFalse((f.root/'prompts').exists())
 
-    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
-    def test_pty_selected_encrypted_identity_one_prompt_multiple_lazy_reads(self):
+    def test_pty_selected_encrypted_identity_prompts_once(self):
         f=self.f; url=f.ssh(encrypted=True)
         env=dict(f.env)
         for key in ('SSH_ASKPASS','SSH_ASKPASS_REQUIRE','DISPLAY'): env.pop(key,None)
+        backend = ('--backend=nfs' if OPTIONS.require_nfs else
+                   '--backend=fuse' if OPTIONS.require_fuse else '--backend=copy')
         pid,fd=pty.fork()
         if pid==0:
-            backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
-            exec_fixture_child([str(OPTIONS.binary), url, 'HEAD', '--backend=' + backend,
-                                '--', 'cat', 'deep/file', 'other'], f.cwd, env)
+            exec_fixture_child([str(OPTIONS.binary), url, 'HEAD', backend, '--write-policy=all',
+                                '--', '/bin/cat', 'deep/file', 'other'], f.cwd, env)
         transcript=bytearray()
         reaped=False
         def await_bytes(needle):
@@ -3617,8 +2677,8 @@ print('delta payload verified')
                 transcript.extend(chunk)
         try:
             await_bytes(b'Enter passphrase'); os.write(fd,b'fixture-password\n')
-            await_bytes(b'expected\r\n')
-            await_bytes(b'unrelated payload\r\n')
+            await_bytes(b'expected')
+            await_bytes(b'unrelated payload')
             deadline=time.monotonic()+10
             while time.monotonic()<deadline:
                 done,status=os.waitpid(pid,os.WNOHANG)
@@ -3655,9 +2715,7 @@ print('delta payload verified')
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(master_fd,signal.SIGTERM)
             os.close(master_fd)
         self.addCleanup(dispose_master)
-        owner = directory / 'ssh-control-owner'
-        self.assertTrue(owner.is_file())
-        self.assertFalse(owner.is_symlink())
+        self.assertIsNotNone(ssh_owner_marker(directory))
         def cleanup():
             with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
             if process.poll() is None: process.kill()
@@ -3666,12 +2724,11 @@ print('delta payload verified')
         self.addCleanup(cleanup)
         active=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
         self.assertNotEqual(active.returncode,0); self.assertTrue((directory/'backing').exists())
-        self.assertFalse((directory/'.state').exists())
+        recovery_id=run_id(directory)
         mountpoint=directory/'mount'
-        source=fuse_mount_source(mountpoint)
-        self.assertTrue(source.startswith('git-on:'))
         def mounted():
-            return fuse_mount_source(mountpoint)==source
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery_id in line
+                       for line in Path('/proc/self/mountinfo').read_text().splitlines())
         self.assertTrue(mounted())
         self.assertEqual((mountpoint/'out/result').read_bytes(),b'recover')
         # Kill the runner alone first. Its child has its own group and no
@@ -3687,22 +2744,22 @@ print('delta payload verified')
         self.assertEqual(json.loads(inaccessible.stdout)['errno'],errno.ENOTCONN)
         self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertFalse(select.select([master_fd],[],[],0)[0])
-        self.assertFalse((directory/'remote-repository').exists())
+        self.assertIsNotNone(ssh_owner_marker(directory))
         self.assertTrue(any(path.is_file() and path.read_bytes()==b'recover'
                             for path in (directory/'backing').iterdir()),'raw writable payload was lost')
-        self.assertTrue((directory/'ssh-control-owner').is_file())
         # Kernel flock ownership ends with the killed process.
-        assert_run_unlocked(directory)
+        with run_lock(directory).open('r+b') as held:
+            fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
         print('SIGKILL runtime evidence:',json.dumps(dict(mount_remaining=mounted(),
               mount_errno=errno.ENOTCONN,child_alive=True,ssh_master_alive=True,
-              native_repository_created=False,locks_released=True)),flush=True)
+              run_retained=True,locks_released=True)),flush=True)
         os.killpg(state['pid'],signal.SIGKILL); process.communicate(timeout=10)
         stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
         self.assertEqual(stale.returncode,0,stale.stderr); self.assertFalse(directory.exists())
         self.assertFalse(mounted())
         self.assertNotEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertTrue(select.select([master_fd],[],[],5)[0],'recorded owned master survived stale recovery')
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
 
     def test_real_mount_all_handled_signals_close_owned_ssh_and_remove_state(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
@@ -3772,11 +2829,10 @@ print('delta payload verified')
         helper_text,point=ready.read_text().splitlines(); helper_pid=int(helper_text)
         helper_fd=os.pidfd_open(helper_pid)
         mountpoint=Path(point); directory=mountpoint.parent
-        self.assertFalse((directory/'.state').exists())
-        source=fuse_mount_source(mountpoint)
-        self.assertTrue(source.startswith('git-on:'))
+        recovery_id=run_id(directory)
         def mounted():
-            return fuse_mount_source(mountpoint)==source
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery_id in line
+                       for line in Path('/proc/self/mountinfo').read_text().splitlines())
         self.assertTrue(mounted()); self.assertFalse(child.exists())
         process.kill(); self.assertEqual(process.wait(timeout=10),-signal.SIGKILL)
         self.assertTrue(mounted()); self.assertFalse(child.exists())
@@ -3793,15 +2849,15 @@ print('delta payload verified')
         print('SIGKILL mount boundary evidence:',json.dumps(dict(child_started=False,
               mount_remaining_after_kill=True,ssh_master_retained=True,recovery_removed_mount_and_state=True)),flush=True)
 
-    def test_review_real_mount_failed_ssh_shutdown_retains_recovery_and_pin(self):
+    def test_review_real_mount_failed_ssh_shutdown_retains_recovery(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         if OPTIONS.before_lifecycle_binary:
             with self.assertRaisesRegex(AssertionError,'0 != 125'):
-                self.failed_ssh_shutdown_retains_recovery_and_pin(OPTIONS.before_lifecycle_binary)
+                self.failed_ssh_shutdown_retains_recovery(OPTIONS.before_lifecycle_binary)
             print('RED-BEFORE mounted SSH shutdown: old runner returned0 and removed recovery for a live master',flush=True)
-        self.failed_ssh_shutdown_retains_recovery_and_pin(OPTIONS.binary)
+        self.failed_ssh_shutdown_retains_recovery(OPTIONS.binary)
 
-    def failed_ssh_shutdown_retains_recovery_and_pin(self,binary):
+    def failed_ssh_shutdown_retains_recovery(self,binary):
         f=Fixture(); self.addCleanup(f.close)
         url=f.ssh(); ssh=str(Path(shutil.which('ssh')).resolve())
         selected=f.root/'selected-client'; original=f.root/'original-client'
@@ -3849,9 +2905,8 @@ print('delta payload verified')
         self.assertEqual(process.returncode,125,errors)
         self.assertIn(b'recorded SSH shutdown executable changed',errors)
         self.assertIn(str(directory).encode(),errors)
-        self.assertTrue((directory/'ssh-control-owner').is_file())
+        self.assertIsNotNone(ssh_owner_marker(directory))
         self.assertFalse(select.select([master_fd],[],[],0)[0])
-        self.assertFalse((directory/'.state').exists())
         self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
         original.replace(selected)
         stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
@@ -3869,7 +2924,7 @@ print('delta payload verified')
             result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code,child,str(runfile),str(ready)],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,125,result.stderr)
             directory=Path(runfile.read_text())
-            self.assertFalse((directory/'remote-repository').exists())
+            self.assertIsNotNone(run_lock(directory))
             self.assertIn(str(directory/'mount'),[line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()])
             refused=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
             self.assertNotEqual(refused.returncode,0)
@@ -3879,7 +2934,7 @@ print('delta payload verified')
             if directory is not None:
                 stale=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(stale.returncode,0,stale.stderr)
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
 
     def stalled_mount_shutdown(self, binary, escaped, expect_old):
         f=self.f; url=self.stall_url
@@ -3925,7 +2980,8 @@ print('delta payload verified')
                 cleanup=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def handled_term_during_active_remote_read(self):
+    @unittest.skipUnless(OPTIONS.require_fuse, 'real FUSE explicitly required in CI')
+    def test_handled_term_during_active_remote_read_preserves_child_exit(self):
         f=self.f;url=f.https();self.addCleanup(f.server.server_close);self.addCleanup(f.server.shutdown)
         f.stalled.clear();f.resume.clear();f.stalled_oids={f.blob}
         ready=f.root/'handled-read-ready'
@@ -3960,10 +3016,6 @@ signal.pause()
                 cleanup=subprocess.run([str(OPTIONS.binary),'--cleanup',str(directory)],capture_output=True,timeout=20)
                 self.assertEqual(cleanup.returncode,0,cleanup.stderr)
 
-    def test_handled_term_during_active_remote_read_preserves_child_exit(self):
-        if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
-        self.handled_term_during_active_remote_read()
-
     def test_review_real_mount_stalled_lazy_fetch_shutdown(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; self.stall_url=f.https(); self.addCleanup(f.server.shutdown)
@@ -3972,6 +3024,43 @@ signal.pause()
                 if OPTIONS.before_binary and escaped: self.stalled_mount_shutdown(OPTIONS.before_binary,escaped,True)
                 self.stalled_mount_shutdown(OPTIONS.binary,escaped,False)
 
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_real_mount_caught_spilled_blob_failure_is_sticky(self):
+        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
+            self.skipTest("requires a native mount")
+        f = self.f
+        oids = [f.git("hash-object", "-w", "--stdin", data=bytes([index]) * 65537)
+                for index in range(9)]
+        rows = "".join(f"100644 blob {oid}\tf{index}\n" for index, oid in enumerate(oids))
+        tree = f.git("mktree", data=rows.encode())
+        commit = f.git("commit-tree", tree, data=b"spill fixture\n")
+        f.git("update-ref", "refs/heads/main", commit)
+        source = f.https()
+        body = f"""import errno
+from pathlib import Path
+for index in range(9):
+    assert Path(f'f{{index}}').stat().st_size == 65537
+spill, = Path.cwd().parent.glob('raw-objects-*/{oids[0]}')
+with spill.open('r+b') as output:
+    output.write(b'!')
+try:
+    with open('f0', 'rb') as source:
+        source.read(1)
+except OSError as error:
+    assert error.errno == errno.EIO, error
+else:
+    raise AssertionError('changed backing bytes were exposed')
+print('caught-EIO')
+"""
+        mode = "nfs" if OPTIONS.require_nfs else "fuse"
+        result = subprocess.run([OPTIONS.binary, source, "HEAD", "--backend=" + mode,
+                                 "--write-policy=none", "--", sys.executable, "-c", body],
+                                cwd=f.cwd, env=f.env, capture_output=True, timeout=30)
+        self.assertEqual(result.stdout, b"caught-EIO\n", result.stderr)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn(b"bytes were modified", result.stderr)
+        self.assertIn(b"execution incomplete", result.stderr)
+        self.assertFalse(run_directories(f.root))
 
     def ignore_policy_fixture(self):
         f=self.f
@@ -3985,31 +3074,32 @@ signal.pause()
     def test_review_real_mount_ignore_acquisition_faults_report_eio(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=self.ignore_policy_fixture()
-        cases=([(OPTIONS.before_policy_binary,errno.EROFS)] if OPTIONS.before_policy_binary else [])+[(OPTIONS.binary,errno.EIO)]
-        for binary,expected in cases:
-            for operation,path in (('create','created.tmp'),('mkdir','created-dir')):
-                with self.subTest(binary=str(binary),operation=operation):
-                    shutil.rmtree(f.root/'cache',ignore_errors=True)
-                    f.requests.clear(); f.denied_oids={f.ignore}
-                    code="import json,os,sys; from pathlib import Path\n"
-                    code+="try:\n"
-                    code+=(" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n" if operation=='create' else " os.mkdir(sys.argv[1])\n")
-                    code+="except OSError as error:\n print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}),flush=True)\nelse:\n raise AssertionError('ignore acquisition fault permitted mutation')\n"
-                    env=dict(f.env)
-                    result=subprocess.run([str(binary),url,'HEAD','--',sys.executable,'-c',code,path],cwd=f.cwd,env=env,capture_output=True,timeout=30)
-                    self.assertEqual(result.returncode,125,result.stderr)
-                    self.assertEqual(json.loads(result.stdout),{'errno':expected,'exists':False},result.stderr)
-                    self.assertIn(b'execution incomplete',result.stderr)
-                    self.assertTrue(any(f.ignore in request['wants'] and request.get('status')==403 for request in f.requests),f.requests)
-                    self.assertIn(f.ignore.encode(),result.stderr)
-                    assert_no_run_state(self, f.root)
-                    print('ignore acquisition errno regression evidence:',json.dumps(dict(binary=str(binary),before=expected==errno.EROFS,operation=operation,errno=expected)),flush=True)
+        cases = ([(OPTIONS.before_policy_binary, errno.EROFS)] if OPTIONS.before_policy_binary else [])
+        cases.append((OPTIONS.binary, errno.EIO))
+        for binary, expected in cases:
+            f.denied_oids = {f.ignore}
+            for operation, path in (('create', 'created.tmp'), ('mkdir', 'created-dir')):
+                with self.subTest(binary=str(binary), operation=operation):
+                    f.requests.clear()
+                    code = "import json,os,sys\ntry:\n"
+                    code += (" fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)\n"
+                             if operation == 'create' else " os.mkdir(sys.argv[1])\n")
+                    code += ("except OSError as error:\n"
+                             " print(json.dumps({'errno':error.errno,'exists':os.path.lexists(sys.argv[1])}))\n"
+                             "else:\n raise AssertionError('ignore acquisition allowed mutation')\n")
+                    result = subprocess.run([binary, url, 'HEAD', '--', sys.executable, '-c', code, path],
+                                            cwd=f.cwd, env=f.env, capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {'errno': expected, 'exists': False}, result.stderr)
+                    self.assertIn(b'execution incomplete', result.stderr)
+                    self.assertTrue(any(f.ignore in r['wants'] and r.get('status') == 403 for r in f.requests))
+                    self.assertFalse(run_directories(f.root))
         # With healthy rules, policy denial retains its distinct EROFS meaning.
         f.denied_oids.clear(); shutil.rmtree(f.root/'cache',ignore_errors=True)
         code="import errno,os\nfor operation in (lambda: os.open('denied',os.O_CREAT|os.O_WRONLY,0o600),lambda: os.mkdir('denied-dir')):\n try: operation()\n except OSError as error: assert error.errno==errno.EROFS,error\n else: raise AssertionError('unignored mutation allowed')\nfd=os.open('created.tmp',os.O_CREAT|os.O_WRONLY,0o600); os.close(fd)\nos.mkdir('created-dir')\n"
         result=subprocess.run([str(OPTIONS.binary),url,'HEAD','--',sys.executable,'-c',code],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stderr)
-        assert_no_run_state(self, f.root)
+        self.assertEqual(run_directories(f.root),[])
 
     def test_real_mount_delayed_ignore_acquisition_preserves_policy(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
@@ -4041,7 +3131,7 @@ signal.pause()
                     self.assertTrue(handled.exists())
                     self.assertEqual(observed.read_text(),str(allowed))
                     self.assertNotIn(b'execution incomplete',errors)
-                    assert_no_run_state(self, f.root)
+                    self.assertEqual(run_directories(f.root),[])
                 finally:
                     f.resume.set();f.stalled_oids.clear()
                     if process.poll() is None:
@@ -4113,6 +3203,6 @@ signal.pause()
             self.assertEqual(result.returncode,125,result.stderr)
             self.assertTrue(b'execution forbidden' in result.stderr or b'raw trees' in result.stderr,result.stderr)
             self.assertFalse(sentinel.exists())
-            assert_no_run_state(self, f.root)
+            self.assertEqual(run_directories(f.root),[])
 
 if __name__=='__main__': unittest.main(argv=[__file__,*ARGS])

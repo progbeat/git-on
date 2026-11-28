@@ -11,7 +11,8 @@ from collections import Counter
 import os
 from process_capture import capture
 from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
-from remote import Fixture, run_directories
+from remote import Fixture
+from support.run_storage import run_directories
 
 
 CHILD=r'''
@@ -64,7 +65,7 @@ def run(options):
     options.output.parent.mkdir(parents=True,exist_ok=True)
     with options.output.open('w') as output:
         def record(row):
-            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='direct HTTP/2 fixture',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
+            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='HTTPS HTTP/2 fixture',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
             output.write(json.dumps(row)+'\n');output.flush();print(json.dumps(row),flush=True)
         for count in options.sizes:
             f=Fixture()
@@ -96,35 +97,18 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
     assert [p['completed'] for p in phases]==['first','repeat'],result
     assert all(p['files']==count and p['payload_bytes']==count*size and p['metadata_result_bytes']==count*stat_bytes for p in phases),result
     assert metrics['remote_fetches']==(1 if backend=='materialized' else count+2),metrics
-    raw_count=0 if backend=='materialized' else count
-    assert metrics['remote_raw_blob_imports']==raw_count and metrics['remote_raw_blob_bytes']==raw_count*size,metrics
+    assert metrics['remote_raw_blob_imports']==count and metrics['remote_raw_blob_bytes']==count*size,metrics
     assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen'
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
     if backend:
-        operations=1 if backend=='materialized' else count+2
-        session_fetches=metrics.get('remote_session_fetch_operations',0)
-        session_decodes=metrics.get('remote_session_decode_operations',0)
-        assert metrics['remote_fetch_operations']+session_fetches==operations,metrics
-        streamed=metrics.get('streamed_blob_loads',0)
-        assert 0<=streamed<=count,metrics
-        if backend=='materialized':
-            # Eager streaming decodes its one shallow pack. Native Git shares
-            # one cat-file process for the streamed blobs in its packed fetch.
-            assert session_decodes==session_fetches,metrics
-            assert metrics['remote_decode_operations']==int(streamed>0),metrics
-            if session_fetches:assert streamed==0,metrics
+        operations = metrics['remote_http2_fetch_operations']
+        if backend == 'materialized':
+            assert operations == 1, metrics
         else:
-            # The direct session also decodes the selected commit and root tree.
-            decodes=count
-            if session_fetches:
-                decodes+=1 if metrics['remote_fetch_operations'] else 2
-            assert metrics['remote_decode_operations']+session_decodes==decodes,metrics
-        if session_fetches:assert metrics['remote_session_starts']==1,metrics
-    if backend:
-        native=result['native_commands']
-        assert not native.get('unpack-objects',0),'raw import re-encodes loose objects'
-        assert native.get('cat-file',0)==metrics['remote_decode_operations'],result
-        assert native.get('fetch',0)==metrics['remote_fetch_operations'],result
+            assert 2 < operations <= count + 2, metrics
+        assert metrics['remote_session_fetch_operations'] == metrics['remote_session_decode_operations'] == operations, metrics
+        assert metrics['remote_session_starts'] == 1, metrics
+        assert not result['native_commands'], result
     if backend=='fuse':assert result['fuse_requests'].get('read',0)>0,'real FUSE dispatch missing'
     if backend=='materialized':assert not result['fuse_requests'],'materialization did not bypass FUSE'
 

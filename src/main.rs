@@ -3,10 +3,11 @@ use git_on::{
     backend::Backend,
     filesystem::Overlay,
     git::set_foreground as foreground,
-    platform::{child_exited, mount_is_ours, remove_empty_temporary_group, ssh_control_path},
+    platform::{ensure_unmounted, mount_is_ours},
     policy::WritePolicy,
-    snapshot::{Preparation, Snapshot},
+    snapshot::Snapshot,
 };
+use serde::Deserialize;
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
     iterator::Signals,
@@ -15,7 +16,9 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
+    io::{ErrorKind, Write},
     os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -24,14 +27,64 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "test-metrics")]
-use std::{io::Write, os::fd::FromRawFd};
-
 mod cli;
-mod run_directory;
+use git_on::run_directory;
 
-use run_directory::{private_dir, LockedRun, PendingGroupCleanup};
-
+// Ephemeral recovery information only: no invocation history, arguments or logs.
+#[derive(Deserialize)]
+#[cfg_attr(all(test, target_os = "linux"), derive(serde::Serialize))]
+struct Recovery {
+    format: String,
+    id: String,
+    // Preserve these fields when reading recovery records from 1.5.2.
+    #[serde(skip_serializing)]
+    git_dir: Option<PathBuf>,
+    #[serde(skip_serializing)]
+    pin_ref: Option<String>,
+    #[serde(skip_serializing)]
+    tree_oid: Option<String>,
+    #[cfg(target_os = "macos")]
+    nfs_socket: Option<PathBuf>,
+}
+fn private_dir(path: &Path) -> Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(())
+}
+#[cfg(all(test, target_os = "linux"))]
+fn save(dir: &Path, state: &Recovery) -> Result<()> {
+    let path = dir.join(".state-new");
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    serde_json::to_writer(&mut f, state)?;
+    f.flush()?;
+    fs::rename(path, dir.join(".state"))?;
+    Ok(())
+}
+fn lock(path: &Path, create: bool) -> Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = f.metadata()?;
+    anyhow::ensure!(opened.is_file(), "invalid temporary run lock");
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("run is active or locked");
+    }
+    if !create {
+        let current = path.symlink_metadata()?;
+        anyhow::ensure!(
+            opened.dev() == current.dev() && opened.ino() == current.ino(),
+            "temporary run lock changed"
+        );
+    }
+    Ok(f)
+}
 fn kill_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
@@ -156,7 +209,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
                 git_on::git::cancel_by_signal(signal);
                 kill_group(child.id(), libc::SIGKILL);
                 child.wait().context("reap cancelled unmount helper")?;
-                bail!("clean unmount cancelled by signal {signal}");
+                bail!("clean unmount cancelled by signal {signal}; recovery state preserved for --cleanup");
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -172,10 +225,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            bail!(
-                "mount is busy or unmount failed at {}",
-                mountpoint.display()
-            );
+            bail!("mount is busy or unmount failed; transient data preserved for --cleanup");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -195,13 +245,11 @@ impl Mounted {
 
     fn finish(&mut self) -> Result<()> {
         if let Some(session) = self.session.take() {
-            #[cfg(target_os = "macos")]
-            let git_on::backend::Session::Macos(nfs) = &session;
             let result = mount_is_ours(
                 self.mountpoint.parent().unwrap(),
                 &self.id,
                 #[cfg(target_os = "macos")]
-                Some(nfs.socket_path()),
+                None,
             )
             .and_then(|mounted| {
                 if mounted {
@@ -217,8 +265,8 @@ impl Mounted {
             #[cfg(target_os = "linux")]
             if let Err(error) = result {
                 // Do not invoke fuser's lazy-unmount fallback on a busy mount.
-                // Process exit closes the FUSE connection; the persistent pin
-                // and run artifacts allow explicit, checked stale cleanup.
+                // Process exit closes the FUSE connection. The run directory
+                // remains available for checked stale cleanup.
                 std::mem::forget(session);
                 return Err(error);
             }
@@ -243,128 +291,14 @@ impl Drop for Mounted {
     }
 }
 #[cfg(target_os = "macos")]
-fn attach_nfs(
-    mounted: &Mounted,
-    policy: WritePolicy,
-    signals: &mut Signals,
-    _socket: &Path,
-) -> Result<()> {
-    use std::{
-        io::{ErrorKind, Read},
-        os::{fd::OwnedFd, unix::net::UnixStream},
-    };
-    #[cfg(feature = "test-metrics")]
-    if let Some(path) = env::var_os("GIT_ON_TEST_NFS_MOUNT_ERROR").filter(|path| !path.is_empty()) {
-        if path != "1" {
-            fs::write(path, _socket.as_os_str().as_encoded_bytes())?;
-        }
-        bail!("test NFS mount failure");
-    }
-    let (mut diagnostic, writer) = UnixStream::pair()?;
-    diagnostic.set_nonblocking(true)?;
-    let mut message = Vec::new();
-    let fd = diagnostic.as_raw_fd();
-    let mut drain = || -> std::io::Result<bool> {
-        let mut buffer = [0; 4096];
-        for _ in 0..16 {
-            match diagnostic.read(&mut buffer) {
-                Ok(0) => return Ok(false),
-                Ok(count) => message.extend_from_slice(&buffer[..count.min(4096 - message.len())]),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(true),
-                Err(error) if error.kind() == ErrorKind::Interrupted => (),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(true)
-    };
-    let Some(git_on::backend::Session::Macos(session)) = mounted.session.as_ref() else {
-        bail!("NFS server is unavailable");
-    };
-    let mut helper = session
-        .mount_command(&mounted.mountpoint, policy)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(OwnedFd::from(writer)))
-        .spawn()
-        .context("start mount_nfs")?;
-    let wakeup = git_on::git::ChildExitWakeup::new(helper.id());
-    let mut diagnostic_open = true;
-    let status = loop {
-        if git_on::git::cancelled_signal().is_some() || mounted.failed() {
-            kill_group(helper.id(), libc::SIGKILL);
-            helper.wait().context("reap mount_nfs")?;
-            bail!("NFS mount interrupted or server stopped");
-        }
-        match helper.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if diagnostic_open {
-                    match drain() {
-                        Ok(open) => diagnostic_open = open,
-                        Err(error) => {
-                            kill_group(helper.id(), libc::SIGKILL);
-                            let _ = helper.wait();
-                            return Err(error).context("read mount_nfs diagnostics");
-                        }
-                    }
-                }
-                signals.pending().for_each(drop);
-                wakeup.wait(
-                    Duration::from_millis(25),
-                    None,
-                    [diagnostic_open.then_some(fd), None],
-                );
-            }
-            Err(error) => {
-                kill_group(helper.id(), libc::SIGKILL);
-                let _ = helper.wait();
-                return Err(error).context("wait for mount_nfs");
-            }
-        }
-    };
-    if !status.success() {
-        drain().context("read mount_nfs diagnostics")?;
-        bail!(
-            "mount_nfs returned {status}: {}",
-            String::from_utf8_lossy(&message).trim()
-        );
-    }
-    if !mount_is_ours(
-        mounted.mountpoint.parent().unwrap(),
-        &mounted.id,
-        Some(session.socket_path()),
-    )? {
-        bail!("NFS mount did not become ready");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn remove_partial_nfs(id: &str, socket: &mut Option<PathBuf>) -> Result<()> {
-    if let Some(path) = socket.as_deref() {
-        git_on::platform::cleanup_nfs_socket(id, Some(path))?;
-        *socket = None;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 fn mount_overlay(
     overlay: Overlay,
     dir: &Path,
     id: &str,
     policy: WritePolicy,
     allow_fallback: bool,
-    signals: &mut Signals,
-    nfs_socket: &mut Option<PathBuf>,
 ) -> Result<Option<Mounted>> {
-    let start = (|| -> std::io::Result<_> {
-        let socket = git_on::platform::reserve_nfs_socket(id)?;
-        *nfs_socket = Some(socket.clone());
-        git_on::backend::start_nfs(overlay, id, socket)
-    })();
-    let session = match start {
+    let session = match git_on::backend::start_nfs(overlay, id) {
         Ok(session) => session,
         Err(error)
             if allow_fallback
@@ -373,17 +307,19 @@ fn mount_overlay(
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
                 ) =>
         {
-            remove_partial_nfs(id, nfs_socket)?;
             return Ok(None);
         }
         Err(error) => return Err(error).context("start private NFS server"),
     };
+    let mountpoint = dir.join("mount");
+    let git_on::backend::Session::Macos(nfs) = &session;
+    let attached = nfs.attach(&mountpoint, id, policy);
     let mut mounted = Mounted {
         session: Some(session),
-        mountpoint: dir.join("mount"),
+        mountpoint,
         id: id.into(),
     };
-    match attach_nfs(&mounted, policy, signals, nfs_socket.as_deref().unwrap()) {
+    match attached {
         Ok(()) => Ok(Some(mounted)),
         Err(attach) => {
             let filesystem_failed = match mounted.session.as_ref() {
@@ -393,8 +329,8 @@ fn mount_overlay(
             if let Err(cleanup) = mounted.finish() {
                 return Err(anyhow::anyhow!("{attach:#}; cleanup: {cleanup:#}"));
             }
-            git_on::platform::ensure_unmounted(dir, None)?;
-            remove_partial_nfs(id, nfs_socket)?;
+            ensure_unmounted(dir)?;
+            git_on::platform::cleanup_nfs_socket(id, None)?;
             if allow_fallback && !filesystem_failed && git_on::git::cancelled_signal().is_none() {
                 Ok(None)
             } else {
@@ -411,7 +347,6 @@ fn mount_overlay(
     id: &str,
     policy: WritePolicy,
     _allow_fallback: bool,
-    _signals: &mut Signals,
 ) -> Result<Option<Mounted>> {
     let mountpoint = dir.join("mount");
     let session = git_on::backend::mount(overlay, &mountpoint, id, policy)
@@ -430,6 +365,25 @@ fn mount_overlay(
     Ok(Some(mounted))
 }
 
+fn child_exited(pid: u32) -> Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(e.into());
+    }
+    Ok(git_on::platform::siginfo_pid(&info) != 0)
+}
 fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
     let (Some(parent_pgid), Some(fd)) = (terminal.parent, terminal.descriptor()) else {
         return Ok(());
@@ -473,6 +427,238 @@ fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
         }
         kill_group(pid, libc::SIGCONT);
     }
+    Ok(())
+}
+fn remove_run(
+    dir: &Path,
+    marker: &Path,
+    held_lock: File,
+    remove_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<bool> {
+    if marker.parent() != Some(dir) {
+        // A sibling marker stays locked and recognizable through removal.
+        remove_directory(dir)?;
+        fs::remove_file(marker)?;
+        drop(held_lock);
+        return Ok(true);
+    }
+    let state = dir.join(".state");
+    let recovery = if marker.ends_with(".lock") {
+        Some(fs::read(&state)?)
+    } else {
+        None
+    };
+    for child in dir.read_dir()? {
+        let child = child?;
+        let path = child.path();
+        if path == marker || path == state {
+            continue;
+        }
+        if child.file_type()?.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    // Only the process holding the lock can remove the marker. Close its
+    // descriptor before removing the directory so NFS can finish the unlink.
+    fs::remove_file(marker)?;
+    drop(held_lock);
+    if let Err(error) = remove_directory(dir) {
+        // Another cleanup can remove the empty run after its marker is gone.
+        if error.kind() == ErrorKind::NotFound
+            && fs::symlink_metadata(dir).is_err_and(|error| error.kind() == ErrorKind::NotFound)
+        {
+            return Ok(false);
+        }
+        (|| -> Result<()> {
+            if let Some(recovery) = recovery {
+                match OpenOptions::new()
+                    .write(true)
+                    .mode(0o600)
+                    .create_new(true)
+                    .open(state)
+                {
+                    Ok(mut file) => file.write_all(&recovery)?,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            lock(marker, true)?;
+            Ok(())
+        })()
+        .with_context(|| {
+            format!("restore recovery state after directory removal failed: {error}")
+        })?;
+        return Err(error.into());
+    }
+    Ok(true)
+}
+
+#[test]
+fn final_removal_succeeds_if_another_cleanup_removed_the_run() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("temp");
+    private_dir(&dir).unwrap();
+    let marker = dir.join(".lock-00000000-0000-0000-0000-000000000000");
+    let held = lock(&marker, true).unwrap();
+    let removed = remove_run(&dir, &marker, held, |path| {
+        fs::remove_dir(path)?;
+        fs::remove_dir_all(path)
+    })
+    .unwrap();
+    assert!(!removed);
+    assert!(!dir.exists());
+}
+
+fn cleanup_incomplete_registration(dir: &Path) -> Result<()> {
+    let name = dir.file_name().context("missing git-on run name")?;
+    let parent = dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = parent.canonicalize()?.join(name);
+    let _group =
+        run_directory::Group::for_run_parent(&dir).context("unrecognized git-on run group")?;
+    let (marker, _) = run_directory::run_registration(&dir)?.context("no git-on registration")?;
+    let held = lock(&marker, false)?;
+    anyhow::ensure!(
+        held.metadata()?.len() == 0
+            && dir
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
+        "temporary run directory changed"
+    );
+    Ok(fs::remove_file(marker)?)
+}
+
+fn cleanup_pending_run(dir: &Path, marker: PathBuf, id: uuid::Uuid) -> Result<()> {
+    let held = lock(&marker, false)?;
+    anyhow::ensure!(
+        held.metadata()?.len() == 0
+            && git_on::git::run_marker(dir)?.is_none()
+            && run_directory::pending_registration(dir)? == Some((marker.clone(), id)),
+        "temporary run registration changed"
+    );
+    ensure_unmounted(dir)?;
+    // A reservation precedes publication of any snapshot files.
+    fs::remove_dir(dir).context("remove empty reserved git-on run")?;
+    Ok(fs::remove_file(marker)?)
+}
+
+fn cleanup(dir: &Path) -> Result<()> {
+    let dir = match fs::canonicalize(dir) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return cleanup_incomplete_registration(dir);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let _group = run_directory::Group::for_run(&dir);
+    let (marker, held_lock, state) = match git_on::git::run_marker(&dir)? {
+        Some((path, id)) => {
+            anyhow::ensure!(_group.is_some(), "unrecognized private git-on run");
+            let held = lock(&path, false)?;
+            anyhow::ensure!(held.metadata()?.len() == 0, "invalid git-on run marker");
+            if path.parent() != Some(&dir) {
+                anyhow::ensure!(
+                    run_directory::run_registration(&dir)? == Some((path.clone(), id)),
+                    "git-on run registration changed"
+                );
+            }
+            (
+                path,
+                held,
+                Recovery {
+                    format: "git-on-temp-v1".into(),
+                    id: id.to_string(),
+                    git_dir: None,
+                    pin_ref: None,
+                    tree_oid: None,
+                    #[cfg(target_os = "macos")]
+                    nfs_socket: None,
+                },
+            )
+        }
+        None => {
+            let path = dir.join(".lock");
+            let held = match lock(&path, false) {
+                Ok(held) => held,
+                Err(error) => {
+                    if _group.is_some()
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == ErrorKind::NotFound)
+                    {
+                        if let Some((marker, id)) = run_directory::pending_registration(&dir)? {
+                            return cleanup_pending_run(&dir, marker, id);
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            let state = serde_json::from_reader(File::open(dir.join(".state"))?)?;
+            (path, held, state)
+        }
+    };
+    if state.format != "git-on-temp-v1" {
+        bail!("unrecognized temporary directory");
+    }
+    if mount_is_ours(
+        &dir,
+        &state.id,
+        #[cfg(target_os = "macos")]
+        state.nfs_socket.as_deref(),
+    )? {
+        #[cfg(target_os = "linux")]
+        clean_unmount(&dir.join("mount"))?;
+        #[cfg(target_os = "macos")]
+        unmount_dead_server(&dir.join("mount"))?;
+    }
+    ensure_unmounted(&dir)?;
+    git_on::remote::stop_run_connection(&dir)?;
+    #[cfg(target_os = "linux")]
+    git_on::git::cleanup_native_scratch(&dir, &state.id)?;
+    #[cfg(target_os = "macos")]
+    git_on::platform::cleanup_nfs_socket(&state.id, state.nfs_socket.as_deref())?;
+    git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
+    // Finish checked mount and socket teardown even when the old record
+    // must remain available to release its source ref with the prior version.
+    if let (Some(pin), Some(repository)) = (&state.pin_ref, &state.git_dir) {
+        if !repository.starts_with(&dir) {
+            anyhow::ensure!(
+                pin == &format!("refs/git-on/{}", state.id),
+                "invalid legacy source reference in recovery record"
+            );
+            let repo = git2::Repository::open(repository).with_context(|| {
+                format!(
+                    "legacy source repository unavailable: {}",
+                    repository.display()
+                )
+            })?;
+            match repo.find_reference(pin) {
+                Ok(reference) => {
+                    let recorded = state
+                        .tree_oid
+                        .as_deref()
+                        .and_then(|oid| git2::Oid::from_str(oid).ok());
+                    if recorded.is_none() || reference.target() != recorded {
+                        bail!("legacy source ref {pin} has a different target; recovery record retained");
+                    }
+                    bail!(
+                    "legacy run records source ref {pin} in {}; use git-on 1.5.2 to clean up this run",
+                    repository.display()
+                    );
+                }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                Err(error) => return Err(error).context("inspect legacy recovery reference"),
+            };
+        }
+    }
+    anyhow::ensure!(
+        remove_run(&dir, &marker, held_lock, |path| fs::remove_dir_all(path))?,
+        "another cleanup already removed this git-on run"
+    );
     Ok(())
 }
 fn supervise(
@@ -519,6 +705,7 @@ fn supervise(
 }
 #[cfg(feature = "test-metrics")]
 fn report_metrics(snapshot: &Snapshot, backend: Option<&str>) -> Result<()> {
+    use std::os::fd::FromRawFd;
     if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
         let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
         if fd < 3 {
@@ -536,129 +723,7 @@ fn report_metrics(snapshot: &Snapshot, backend: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-fn finish_before_spawn(finish: impl FnOnce() -> Result<()>) -> Result<Option<ExitStatus>> {
-    let finish = finish();
-    if let Some(signal) = git_on::git::cancelled_signal() {
-        return Ok(Some(ExitStatus::from_raw(signal)));
-    }
-    finish?;
-    Ok(None)
-}
-
-fn stop_and_unmount(
-    outcome: Result<ExitStatus>,
-    unmount: impl FnOnce() -> Result<()>,
-) -> Result<ExitStatus> {
-    // A filesystem request can still be waiting on a remote Git operation.
-    git_on::git::stop_operations();
-    match (outcome, unmount()) {
-        (Ok(status), Ok(())) => Ok(status),
-        (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
-        (Err(e), _) | (_, Err(e)) => Err(e),
-    }
-}
-
-fn finish_preparation(result: Result<ExitStatus>, terminal: Result<()>) -> Result<ExitStatus> {
-    use git_on::terminal_ui::TerminalClearFailed;
-    match (result, terminal) {
-        (Err(error), Err(clearing)) if !error.is::<TerminalClearFailed>() => {
-            Err(error.context(clearing))
-        }
-        (Ok(_), Err(clearing)) => Err(clearing),
-        (result, _) => result,
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn preparation_reports_why_terminal_handoff_failed() {
-    use git_on::terminal_ui::TerminalClearFailed;
-    let load = Err(anyhow::anyhow!("native helper could not read a credential"));
-    let terminal = Err(TerminalClearFailed.into());
-    let error = finish_preparation(load, terminal).unwrap_err();
-    assert_eq!(
-        format!("{error:#}"),
-        "cannot clear the startup indicator on stderr: native helper could not read a credential"
-    );
-    let handoff = Err(anyhow::Error::from(TerminalClearFailed).context("launch native Git"));
-    let error = finish_preparation(handoff, Err(TerminalClearFailed.into())).unwrap_err();
-    assert_eq!(
-        format!("{error:#}"),
-        "launch native Git: cannot clear the startup indicator on stderr"
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn startup_abort_stops_operations_before_unmount() {
-    const CHILD: &str = "GIT_ON_TEST_CANCEL_DURING_FINISH";
-    if let Some(mode) = env::var_os(CHILD) {
-        let _signals = subscribe_signals().unwrap();
-        let outcome = finish_before_spawn(|| {
-            if mode == "clear-failure" {
-                bail!("fixture terminal clear failure");
-            }
-            assert_eq!(unsafe { libc::raise(SIGTERM) }, 0);
-            Ok(())
-        })
-        .and_then(|status| status.context("startup attempted to spawn a command"));
-        let result = stop_and_unmount(outcome, || {
-            assert!(
-                git_on::git::operations_stopped(),
-                "unmount started while Git operations were active"
-            );
-            Ok(())
-        });
-        if mode == "clear-failure" {
-            assert_eq!(
-                result.unwrap_err().to_string(),
-                "fixture terminal clear failure"
-            );
-        } else {
-            assert_eq!(result.unwrap().signal(), Some(SIGTERM));
-        }
-        return;
-    }
-    #[cfg(target_os = "linux")]
-    let _process = tests::PROCESS_TEST_LOCK.lock().unwrap();
-    for mode in ["clear-failure", "signal"] {
-        let status = Command::new(env::current_exe().unwrap())
-            .args(["--exact", "startup_abort_stops_operations_before_unmount"])
-            .env(CHILD, mode)
-            .status()
-            .unwrap();
-        assert!(status.success(), "{mode}");
-    }
-}
-
 fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
-    let mut signals = subscribe_signals()?;
-    #[cfg(target_os = "macos")]
-    let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
-    if let Some(signal) = git_on::git::cancelled_signal() {
-        return Ok(ExitStatus::from_raw(signal));
-    }
-
-    let temporary = git_on::platform::temporary_base();
-    let explain_temp_error = || {
-        format!(
-            "cannot create a private snapshot in {}. Check the directory's write/search permissions and available space, or choose another TMPDIR",
-            temporary.display()
-        )
-    };
-    let parent = fs::canonicalize(&temporary).with_context(explain_temp_error)?;
-    let (dir, locked) = run_directory::create(&parent).with_context(explain_temp_error)?;
-    execute_in_group(invoked, run, dir, locked, &mut signals)
-}
-
-fn execute_in_group(
-    invoked: Instant,
-    run: cli::RunArgs<'_>,
-    dir: PathBuf,
-    locked: LockedRun,
-    signals: &mut Signals,
-) -> Result<ExitStatus> {
-    let id = locked.id();
     let cli::RunArgs {
         tree,
         repository: source,
@@ -667,21 +732,25 @@ fn execute_in_group(
         write_policy,
         backend,
     } = run;
+    let mut signals = subscribe_signals()?;
     #[cfg(target_os = "macos")]
-    let mut nfs_socket = None;
+    let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
+    if let Some(signal) = git_on::git::cancelled_signal() {
+        return Ok(ExitStatus::from_raw(signal));
+    }
+    let (_group, dir, id, (marker, held_lock)) = run_directory::Group::create().with_context(|| {
+        format!("cannot create a private snapshot in {}; check the directory's write/search permissions and available space, or choose another TMPDIR", env::temp_dir().display())
+    })?;
     let mut observed = None;
     let mut progress = None;
-    let mut session = None;
     #[cfg(feature = "test-metrics")]
     let mut measured_backend = None;
-    let outcome = (|| -> Result<ExitStatus> {
+    let mut result = (|| -> Result<ExitStatus> {
         #[cfg(feature = "test-metrics")]
-        for key in ["GIT_ON_TEST_METRICS_FD", "GIT_ON_TEST_DEMAND_FD"] {
-            if let Some(fd) = env::var_os(key) {
-                let fd: i32 = fd.to_str().context("invalid test descriptor")?.parse()?;
-                if fd < 3 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                    bail!("invalid {key} descriptor");
-                }
+        if let Some(fd) = env::var_os("GIT_ON_TEST_METRICS_FD") {
+            let fd: i32 = fd.to_str().context("invalid metrics fd")?.parse()?;
+            if fd < 3 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                bail!("invalid test metrics descriptor");
             }
         }
         let progress = progress.insert(git_on::terminal_ui::StartupProgress::start(
@@ -702,19 +771,12 @@ fn execute_in_group(
         };
         let materialized = selected == Backend::Copy
             || (allow_fallback && unavailable.as_ref().is_ok_and(Option::is_some));
-        let preparation = if materialized {
-            Preparation::Copy
-        } else if cfg!(target_os = "macos") && allow_fallback {
-            Preparation::MountOrCopy
-        } else {
-            Preparation::Mount
-        };
-        let snapshot = Snapshot::load_source_for_execution(
+        let snapshot = Snapshot::load_source(
             &env::current_dir()?,
             source.as_deref(),
             &tree,
             verify,
-            preparation,
+            materialized,
             &dir,
         )?;
         observed = Some(snapshot.clone());
@@ -723,7 +785,7 @@ fn execute_in_group(
         private_dir(&dir.join("backing"))?;
 
         let unavailable = unavailable?;
-        session = if materialized {
+        let mut session = if materialized {
             None
         } else {
             if let Some(reason) = unavailable {
@@ -735,23 +797,14 @@ fn execute_in_group(
             if let Some(signal) = git_on::git::cancelled_signal() {
                 return Ok(ExitStatus::from_raw(signal));
             }
-            mount_overlay(
-                overlay,
-                &dir,
-                id,
-                write_policy,
-                allow_fallback,
-                signals,
-                #[cfg(target_os = "macos")]
-                &mut nfs_socket,
-            )?
+            mount_overlay(overlay, &dir, &id, write_policy, allow_fallback)?
         };
         if session.is_none() {
             if let Some(signal) = git_on::git::cancelled_signal() {
                 return Ok(ExitStatus::from_raw(signal));
             }
             if !materialized {
-                snapshot.fetch_copy_objects()?;
+                snapshot.prepare_copy_after_mount_failure()?;
             }
             git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
         }
@@ -760,9 +813,6 @@ fn execute_in_group(
             .find(|signal| matches!(*signal, SIGINT | SIGTERM | SIGHUP | SIGQUIT))
         {
             return Ok(ExitStatus::from_raw(signal));
-        }
-        if session.is_some() {
-            snapshot.begin_mounted_reads();
         }
         let mut command = Command::new(&args[0]);
         command
@@ -799,9 +849,7 @@ fn execute_in_group(
                 },
             );
         }
-        if let Some(status) = finish_before_spawn(|| progress.finish())? {
-            return Ok(status);
-        }
+        progress.finish();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -824,7 +872,7 @@ fn execute_in_group(
 
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
-        let outcome = supervise(&mut child, signals, &terminal, session.as_ref());
+        let mut outcome = supervise(&mut child, &mut signals, &terminal, session.as_ref());
 
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
@@ -832,25 +880,38 @@ fn execute_in_group(
             }
         }
         if outcome.is_err() {
-            git_on::git::stop_operations();
             kill_group(pid, libc::SIGKILL);
             let _ = child.wait();
         }
         drop(terminal);
-        outcome.and_then(|status| {
-            if status.success() && git_on::git::cancelled_signal().is_none() {
-                snapshot.verify_used_packs()?;
-                if session.is_some() {
-                    snapshot.finish_idle_native_reader()?;
-                }
+        // Normal exit still needs the verdict of packs that supplied bytes.
+        // Cancel other work before unmount so unused reads cannot block it.
+        if outcome
+            .as_ref()
+            .is_ok_and(|status| status.signal().is_none())
+            && git_on::git::cancelled_signal().is_none()
+        {
+            snapshot.finish_remote_reads();
+            if let Some(signal) = git_on::git::cancelled_signal() {
+                outcome = Ok(ExitStatus::from_raw(signal));
             }
-            Ok(status)
-        })
+        }
+        git_on::git::stop_operations();
+
+        let unmount = session.as_mut().map_or(Ok(()), Mounted::finish);
+
+        match (outcome, unmount) {
+            (Ok(status), Ok(())) => Ok(status),
+            (Err(a), Err(b)) => bail!("{a:#}; cleanup: {b:#}"),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
     })();
-    let mut result = stop_and_unmount(outcome, || session.as_mut().map_or(Ok(()), Mounted::finish));
-    let terminal = progress
-        .as_mut()
-        .map_or(Ok(()), |progress| progress.finish());
+    if let Some(mut progress) = progress {
+        progress.finish();
+    }
+    // Also cover errors before the child could start. State inspection below
+    // must never wait behind an owned operation that the run no longer needs.
+    git_on::git::stop_operations();
 
     let mut transport_cleanup_failure = None;
     if let Some(snapshot) = &observed {
@@ -877,85 +938,44 @@ fn execute_in_group(
                 )
             });
         }
-        locked.check_directory(&dir)?;
         if mount_is_ours(
             &dir,
-            id,
+            &id,
             #[cfg(target_os = "macos")]
-            nfs_socket.as_deref(),
+            None,
         )? {
-            return Err(locked.remaining_mount_error(&dir));
+            bail!(
+                "temporary mount remains at {}; use --cleanup after stopping its users",
+                dir.display()
+            );
         }
-        locked.check_unmounted(&dir)?;
+        ensure_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
-        git_on::remote::stop_connection(&ssh_control_path(&dir))?;
+        git_on::remote::stop_run_connection(&dir)?;
+        #[cfg(target_os = "linux")]
+        git_on::git::cleanup_native_scratch(&dir, &id)?;
         #[cfg(target_os = "macos")]
-        if let Some(socket) = nfs_socket.as_deref() {
-            git_on::platform::cleanup_nfs_socket(id, Some(socket))?;
-        }
-        locked.prepare_cleanup()?;
-        // Workers and mounts are gone. Release cached object descriptors
-        // before deleting their backing files, including on NFS clients.
-        locked.check_directory(&dir)?;
+        git_on::platform::cleanup_nfs_socket(&id, None)?;
+        git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
         drop(observed.take());
-        locked.cleanup_service_workspace(&dir)?;
+        remove_run(&dir, &marker, held_lock, |path| fs::remove_dir_all(path))?;
         Ok(())
-    })()
-    .and_then(|()| locked.remove(&dir))
-    .map(|_| ());
+    })();
 
-    finish_execution(
-        &dir,
-        finish_preparation(result, terminal),
-        cleanup_result,
-        observed,
-    )
-}
-
-#[derive(Debug)]
-struct CleanupIncomplete;
-
-impl std::fmt::Display for CleanupIncomplete {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("cleanup incomplete")
-    }
-}
-
-fn finish_execution(
-    dir: &Path,
-    mut result: Result<ExitStatus>,
-    cleanup_result: Result<()>,
-    observed: Option<Snapshot>,
-) -> Result<ExitStatus> {
     if let Err(e) = cleanup_result {
-        if e.is::<PendingGroupCleanup>() {
-            // A command that completed still owns its exit status. A later
-            // --cleanup reports a pending result until the open file closes.
-            git_on::git::write_run_error(format_args!("git-on: {e:#}\n"));
-            return result;
-        }
-        // Keep the private object files available to a later checked cleanup.
-        if let Some(snapshot) = observed {
-            if let Err(error) = git_on::service_storage::retain_for_cleanup(dir) {
-                git_on::git::write_run_error(format_args!(
-                    "git-on: retain service files for cleanup: {error:#}\n"
-                ));
-            }
+        // Leave the retained run for explicit cleanup without retrying transport shutdown.
+        if let Some(snapshot) = observed.take() {
             std::mem::forget(snapshot);
         }
-        let error = match result {
+        if git_on::git::cancelled_signal().is_some() {
+            eprintln!("git-on: {e:#}");
+        }
+        result = Err(match result {
             Ok(_) => e,
             Err(a) => anyhow::anyhow!("{a:#}; cleanup: {e:#}"),
-        };
-        result = Err(error.context(CleanupIncomplete));
+        });
     }
-    let group = dir.parent().unwrap();
-    let cleanup = remove_empty_temporary_group(group)
-        .with_context(|| format!("remove temporary git-on group {}", group.display()))
-        .context(CleanupIncomplete);
-    let status = result?;
-    cleanup?;
-    Ok(status)
+    result
 }
 fn subscribe_signals() -> std::io::Result<Signals> {
     git_on::git::initialize_cancellation()?;
@@ -968,14 +988,21 @@ fn subscribe_signals() -> std::io::Result<Signals> {
         libc::SIGCONT,
     ])
 }
+fn handle_file_size_errors() -> std::io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { action.assume_init() }.sa_sigaction == libc::SIG_DFL {
+        // Catch daemon write-limit signals so EFBIG reaches normal cleanup.
+        // Exec resets caught handlers to default; an inherited SIG_IGN remains
+        // unchanged, preserving the caller's choice in Git and the command.
+        unsafe { signal_hook::low_level::register(libc::SIGXFSZ, || {}) }?;
+    }
+    Ok(())
+}
 fn main() {
     let invoked = Instant::now();
-    if let Some(status) = git_on::service_storage::invoke() {
-        std::process::exit(status);
-    }
-    if let Some(status) = git_on::remote::invoke_ssh_launcher() {
-        std::process::exit(status);
-    }
     if let Some(status) = git_on::terminal_ui::invoke_askpass() {
         std::process::exit(status);
     }
@@ -983,9 +1010,10 @@ fn main() {
     let result = (|| -> Result<ExitStatus> {
         // main has not created signal handlers, worker threads or Git handles.
         unsafe { git_on::object::configure_pack_descriptors() }?;
+        handle_file_size_errors()?;
         match cli::parse(&args) {
             Ok(cli::Invocation::Cleanup(directory)) => {
-                run_directory::cleanup(Path::new(&directory))?;
+                cleanup(Path::new(&directory))?;
                 Ok(ExitStatus::from_raw(0))
             }
             Ok(cli::Invocation::Run(run)) => execute(invoked, run),
@@ -995,7 +1023,6 @@ fn main() {
             }
         }
     })();
-    report_run_result(&result);
     match result {
         Ok(status) => {
             if let Some(signal) = status.signal() {
@@ -1007,7 +1034,7 @@ fn main() {
             }
             std::process::exit(status.code().unwrap_or(125));
         }
-        Err(_) => {
+        Err(e) => {
             if let Some(signal) = git_on::git::cancelled_signal() {
                 unsafe {
                     libc::signal(signal, libc::SIG_DFL);
@@ -1015,16 +1042,8 @@ fn main() {
                 }
                 std::process::exit(128 + signal);
             }
+            eprintln!("git-on: {e:#}");
             std::process::exit(125);
-        }
-    }
-}
-
-fn report_run_result(result: &Result<ExitStatus>) {
-    if let Err(error) = result {
-        // Keep recovery details even if cancellation arrives after teardown.
-        if error.is::<CleanupIncomplete>() || git_on::git::cancelled_signal().is_none() {
-            git_on::git::write_run_error(format_args!("git-on: {error:#}\n"));
         }
     }
 }
@@ -1032,167 +1051,11 @@ fn report_run_result(result: &Result<ExitStatus>) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
-    pub(super) static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn cancelled_cleanup_can_exit_with_blocked_stderr() {
-        use std::{
-            io::{ErrorKind, Write},
-            os::fd::OwnedFd,
-            os::unix::net::UnixStream,
-        };
-
-        const CHILD: &str = "GIT_ON_TEST_BLOCKED_CLEANUP_DIAGNOSTIC";
-        const MODE: &str = "GIT_ON_TEST_CLEANUP_DIAGNOSTIC_MODE";
-        if let Some(run) = env::var_os(CHILD) {
-            let mode = env::var_os(MODE).unwrap();
-            let mut run = PathBuf::from(run);
-            if mode == "late-cleanup-failure" {
-                let result = finish_execution(
-                    &run,
-                    Ok(ExitStatus::from_raw(42 << 8)),
-                    Err(anyhow::anyhow!("use --cleanup {}", run.display())),
-                    None,
-                );
-                git_on::git::cancel_by_signal(SIGTERM);
-                report_run_result(&result);
-                return;
-            }
-            if mode == "late" {
-                git_on::git::initialize_cancellation().unwrap();
-                // Only displayed. Fill the pipe before the parent signals us.
-                run.push("x".repeat(1024 * 1024));
-            } else {
-                git_on::git::cancel_by_signal(SIGTERM);
-            }
-            if mode != "error" {
-                let status = finish_execution(
-                    &run,
-                    Ok(ExitStatus::from_raw(42 << 8)),
-                    Err(PendingGroupCleanup::retry(&run).into()),
-                    None,
-                )
-                .unwrap();
-                assert_eq!(status.code(), Some(42));
-                return;
-            }
-            let result = finish_execution(
-                &run,
-                Ok(ExitStatus::from_raw(SIGTERM)),
-                Err(anyhow::anyhow!("fixture cleanup failed")),
-                None,
-            );
-            report_run_result(&result);
-            let error = result.unwrap_err();
-            assert!(format!("{error:#}").contains("fixture cleanup failed"));
-            return;
-        }
-
-        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
-        let temporary = tempfile::tempdir().unwrap();
-        let run = temporary.path().join("run");
-        let mut command = Command::new(env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "tests::cancelled_cleanup_can_exit_with_blocked_stderr",
-            ])
-            .env(CHILD, &run)
-            .env("GIT_TRACE_PACKET", "2");
-        let output = command.env(MODE, "pending").output().unwrap();
-        assert!(output.status.success());
-        let warning = String::from_utf8(output.stderr).unwrap();
-        assert!(warning.contains("--cleanup") && warning.contains(&*run.to_string_lossy()));
-        let output = command.env(MODE, "late-cleanup-failure").output().unwrap();
-        assert!(output.status.success());
-        let warning = String::from_utf8(output.stderr).unwrap();
-        assert_eq!(warning.matches("--cleanup").count(), 1, "{warning}");
-        assert!(warning.contains(&*run.to_string_lossy()));
-
-        for mode in ["pending", "error", "late"] {
-            if mode != "pending" {
-                command.env_remove("GIT_TRACE_PACKET");
-            }
-            let (reader, mut writer) = UnixStream::pair().unwrap();
-            let watch = if mode == "late" {
-                // The diagnostic is bounded before it reaches stderr. A
-                // default socket buffer can hold the entire warning.
-                let capacity: libc::c_int = 4096;
-                assert_eq!(
-                    unsafe {
-                        libc::setsockopt(
-                            writer.as_raw_fd(),
-                            libc::SOL_SOCKET,
-                            libc::SO_SNDBUF,
-                            std::ptr::from_ref(&capacity).cast(),
-                            std::mem::size_of_val(&capacity) as libc::socklen_t,
-                        )
-                    },
-                    0
-                );
-                Some(writer.try_clone().unwrap())
-            } else {
-                writer.set_nonblocking(true).unwrap();
-                let full = loop {
-                    if let Err(error) = writer.write(&[0]) {
-                        break error;
-                    }
-                };
-                assert_eq!(full.kind(), ErrorKind::WouldBlock);
-                writer.set_nonblocking(false).unwrap();
-                None
-            };
-            let mut child = command
-                .env(MODE, mode)
-                .stderr(Stdio::from(OwnedFd::from(writer)))
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(4);
-            if let Some(watch) = watch {
-                let mut ready = [
-                    libc::pollfd {
-                        fd: reader.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: watch.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    },
-                ];
-                loop {
-                    unsafe { libc::poll(ready.as_mut_ptr(), 2, 10) };
-                    if ready[0].revents & libc::POLLIN != 0 && ready[1].revents & libc::POLLOUT == 0
-                    {
-                        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, SIGTERM) }, 0);
-                        break;
-                    }
-                    if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("cleanup warning did not reach the full pipe");
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success(), "{mode}: {status}");
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    let _ = child.wait();
-                    panic!("{mode}: cancelled cleanup blocked on stderr");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
+    static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn clean_unmount_waits_for_active_helper_but_bounds_completed_failures() {
@@ -1210,7 +1073,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("mount is busy or unmount failed"));
-        assert!(!error.to_string().contains("--cleanup"));
         assert!(start.elapsed() < Duration::from_secs(6));
     }
 
@@ -1360,6 +1222,52 @@ mod tests {
                 }
             }
         }
+    }
+    fn recovery() -> Recovery {
+        Recovery {
+            format: "git-on-temp-v1".into(),
+            id: "unit-test".into(),
+            git_dir: None,
+            pin_ref: None,
+            tree_oid: None,
+        }
+    }
+    #[test]
+    fn recovery_refuses_active_runs_and_removes_disposable_state() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("temp");
+        private_dir(&dir).unwrap();
+        let held = lock(&dir.join(".lock"), true).unwrap();
+        save(&dir, &recovery()).unwrap();
+        assert!(cleanup(&dir).unwrap_err().to_string().contains("active"));
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(held);
+        cleanup(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+    #[test]
+    fn recovery_can_retry_after_final_directory_removal_fails() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("temp");
+        private_dir(&dir).unwrap();
+        let held = lock(&dir.join(".lock"), true).unwrap();
+        save(&dir, &recovery()).unwrap();
+        let error = remove_run(&dir, &dir.join(".lock"), held, |path| {
+            fs::remove_file(path.join(".state"))?;
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        cleanup(&dir).unwrap();
+        assert!(!dir.exists());
     }
     #[test]
     fn event_supervisor_preserves_exit_and_signal() {

@@ -3,20 +3,20 @@
 | Responsibility | Implementation | Constraints |
 | --- | --- | --- |
 | Linux FUSE | Registry `fuser` 0.18 | The adapter converts typed callbacks and owns backing handles. Kernel capability negotiation controls passthrough and caching; supported operations retain their fallback behavior. |
-| Git storage and native configuration | `git2` with vendored libgit2, and native Git children | Git interprets revisions, sources and refspecs. Credentials, proxy/TLS and signature policy use native configuration. Packed/delta decoding can require complete decoded objects. |
+| Git storage and native configuration | `git2` with vendored libgit2, and native Git children | Native Git resolves local revisions and reads its configuration. libgit2 reads local objects, with native `cat-file` for object storage it cannot read. Git handles credential lookup and signature verification. |
 | Canonical object verification | `sha1-checked`, plus the audited native SHA1DC ODB path | Verify Git type, length and payload before publication; reject detected collisions. Only typed verified ODB objects may reuse the native proof. SHA-1 identifies the supported Git object format. |
-| Temporary-storage authentication | `blake3` | Ordered BLAKE3 block expectations and exact lengths stay in protected RAM. Authenticate the actual reloaded buffer before returning bytes. |
-| Payload and ignore-rule retention | `lru` | A byte-accounted 16 MiB payload LRU with one entry per original OID; an eight-entry hot blob LRU and a separate 4 MiB / 128-entry compiled-rule LRU. Metadata and active decoder/read allocations are accounted separately. |
+| Immutable spill verification | `blake3` | Ordered BLAKE3 block digests and exact lengths stay in memory. Each disk block is checked before its bytes are returned. |
+| Payload and ignore-rule retention | `lru` | Mount and copy use 16 MiB for small payloads and spill blocks, plus eight whole large blobs. Compiled ignore rules have a 4 MiB / 128-entry cache. |
 | Directory metadata | Standard maps, shared immutable structures and scoped merged views | Parse demanded trees once, support direct name lookup and stable active enumeration versions, and retain only issued inode references. |
-| Pack inflation | `flate2` with zlib | Reusable HTTPS and SSH sessions reconstruct deltas from verified bases in RAM. Each published object passes canonical OID verification. The receiver verifies zlib completion, pack framing and the trailer. |
-| Temporary files | `tempfile` and anchored no-follow file operations | Invocation ownership, descriptor limits, and cleanup apply to temporary files. Block authentication protects immutable source reads. Private backing uses ordinary filesystem I/O. |
+| Pack inflation | `flate2` with zlib | The shared Git v2 decoder inflates entries and applies deltas in memory. It checks object identity before publication and checks the complete pack on transfer completion. |
+| Temporary files | `tempfile` and anchored no-follow file operations | Invocation ownership, inherited file/descriptor limits, failure cleanup and same-UID tamper protection apply to every storage path. |
 | Cancellation and children | `signal-hook` and scoped native process ownership | Signals and shutdown preserve owned-child cleanup and documented recovery behavior. |
-| Remote sessions | Native Git upload-pack, HTTP helper and SSH transport with bounded protocol framing | Reuse invocation-owned sessions and prepared objects. Unsupported protocols or native policy settings use the compatibility path. |
+| Remote sessions | libcurl HTTP/2 and OpenSSH | Remote object requests use direct Git v2. The transports reuse invocation-owned connections and verified objects. |
 
 The exact dependency versions and sources are recorded in `Cargo.lock`.
 Native verification assumptions are tied to that locked build. Changes to the
 Git/hash dependency closure require checking those assumptions again.
 
-[Resource use and integrity invariants](resources.md) apply across these
+[Resource limits and integrity invariants](resources.md) apply across these
 boundaries. Rust 1.89 checks, platform builds, license notices and observable
 behavior are validated by the repository's required test and packaging jobs.

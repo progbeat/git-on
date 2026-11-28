@@ -67,7 +67,7 @@ jobs:
         run: |
           git --version
           sudo apt-get update
-          sudo apt-get install --yes libcurl4-openssl-dev openssl gnupg strace
+          sudo apt-get install --yes libcurl4-openssl-dev openssh-server openssl gnupg strace
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -90,22 +90,22 @@ jobs:
         run: python3 tests/materialized.py target/debug/git-on
       - name: Installer smoke test
         run: python3 tests/installer_smoke.py --binary target/debug/git-on
-      - name: Build the source probe for pack scaling
-        if: needs.changes.outputs.resources == 'true'
-        run: cargo build --locked --features test-metrics --example source-probe
-      - name: Install HTTP/2 fixture dependencies
-        if: needs.changes.outputs.resources == 'true'
+      - name: Native Git oracle, real HTTPS/OpenSSH, run-storage and transport regressions
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
+          cargo build --locked --features test-metrics --example source-probe --bin git-on
+          python3 tests/remote.py
+          python3 tests/http2.py
+          python3 tests/ssh_regressions.py
       - name: Measure distinct-object pack work
         id: pack_scaling
         if: needs.changes.outputs.resources == 'true'
         # Current regressions run on every PR. Authentic red-before replays are
         # retained as opt-in commands, not rebuilt on every unchanged push.
-        run: >-
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/pack_scaling.py
-          --probe target/debug/examples/source-probe --output pack-scaling.jsonl
+        run: python3 tests/pack_scaling.py --probe target/debug/examples/source-probe --output pack-scaling.jsonl
       - name: Retain pack metadata measurements
         if: always() && needs.changes.outputs.resources == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -134,7 +134,7 @@ jobs:
         run: |
           git --version
           sudo apt-get update
-          sudo apt-get install --yes fuse3 libcurl4-openssl-dev nfs-kernel-server openssh-server openssl gnupg netcat-openbsd strace
+          sudo apt-get install --yes fuse3 libcurl4-openssl-dev openssh-server openssl gnupg strace
           python3 -m pip install --user 'uv==0.8.22'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Require a usable FUSE device
@@ -153,25 +153,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - run: cargo build --release --locked
-      - name: Install HTTP/2 fixture dependencies
-        run: |
-          python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
       - name: Real mount, adversarial operations, process lifecycle, and uv
-        run: >-
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/integration.py
-          --binary target/release/git-on --require-fuse --uv
-      - name: Recover deferred cleanup on NFS-backed temporary storage
-        run: |
-          set -o pipefail
-          test_binary=$(cargo test --release --locked --bin git-on --no-run --message-format=json \
-            | python3 -c 'import json, sys
-          (binary,) = (item["executable"] for item in map(json.loads, sys.stdin)
-                       if item["reason"] == "compiler-artifact" and item.get("executable")
-                       and item["target"]["name"] == "git-on" and item["profile"]["test"])
-          print(binary)')
-          sudo unshare --mount --net --uts --propagation private \
-            /bin/sh tests/nfs_cleanup.sh target/release/git-on "$(id -u)" "$(id -g)" "$test_binary"
+        run: python3 tests/integration.py --binary target/release/git-on --require-fuse --uv
       - name: All four write policies on real FUSE
         run: python3 tests/write_policy.py --binary target/release/git-on --require-fuse
       - name: Build private resource instrumentation
@@ -179,10 +162,15 @@ jobs:
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
       - name: Multiplex exact Git demands through real FUSE
         run: |
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on \
-            --probe target/release/examples/source-probe --require-fuse
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/release/git-on \
-            --probe target/release/examples/source-probe --require-fuse
+          python3 -m venv "$RUNNER_TEMP/http2-tests"
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on --require-fuse \
+            Http2Tests.test_post_authentication_and_multiplexed_fetches \
+            Http2Tests.test_reports_actual_pack_progress_while_the_stream_is_open \
+            Http2Tests.test_explicit_https_credentials_are_used_after_a_basic_challenge \
+            Http2Tests.test_url_matched_authorization_header_is_sent_once
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/release/git-on --require-fuse
       - name: Share the exact-head instrumented runner with WebKit
         if: needs.changes.outputs.scale == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -192,9 +180,10 @@ jobs:
           if-no-files-found: error
       - name: Remote mounts, native git -c verification, writes and transport faults
         run: |
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on
+          export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
+          python3 tests/remote.py --require-fuse --probe target/release/examples/source-probe --binary target/release/git-on
           python3 tests/ssh_regressions.py --probe target/release/examples/source-probe --binary target/release/git-on
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/native_job_control.py --binary target/release/git-on
+          python3 tests/native_job_control.py --binary target/release/git-on
 
       - name: Protected-source kernel-cache regression
         if: needs.changes.outputs.resources == 'true'
@@ -202,13 +191,15 @@ jobs:
       - name: Distinct-object CLI preparation and closed-reader reuse
         if: needs.changes.outputs.resources == 'true'
         run: |
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/object_reuse.py --binary target/release/git-on --backend fuse --sizes 160 --output object-reuse-fuse.jsonl
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/object_reuse.py --binary target/release/git-on --backend materialized --sizes 32 --output object-reuse-materialized.jsonl
+          export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
+          python3 tests/object_reuse.py --binary target/release/git-on --backend fuse --sizes 160 --output object-reuse-fuse.jsonl
+          python3 tests/object_reuse.py --binary target/release/git-on --backend materialized --sizes 32 --output object-reuse-materialized.jsonl
       - name: Wide-tree preparation and repeated metadata reuse
         if: needs.changes.outputs.resources == 'true'
         run: |
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-reuse-local.jsonl
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-reuse-remote.jsonl
+          export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
+          python3 tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source local --sizes 1000,100000 --output metadata-reuse-local.jsonl
+          python3 tests/metadata_reuse.py --binary target/release/git-on --backend fuse --source remote --sizes 100000 --output metadata-reuse-remote.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.changes.outputs.resources == 'true'
         with:
@@ -261,7 +252,7 @@ jobs:
           case "$SCALE_REQUIRED" in
             true)
               for SOURCE in local remote; do
-                "$RUNNER_TEMP/http2-tests/bin/python" tests/scalability.py --binary "$TEST_BINARY" --backend passthrough --source "$SOURCE" --policies ignored --profile "$SCALE_PROFILE" --output "stress-artifacts/scale-passthrough-$SOURCE.jsonl"
+                python3 tests/scalability.py --binary "$TEST_BINARY" --backend passthrough --source "$SOURCE" --policies ignored --profile "$SCALE_PROFILE" --output "stress-artifacts/scale-passthrough-$SOURCE.jsonl"
               done
               echo 'scale_coverage=passed' >> "$GITHUB_OUTPUT"
               ;;
@@ -307,10 +298,10 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           cargo build --release --locked --features test-metrics --example source-probe --bin git-on
-      - name: Install HTTP/2 fixture dependencies
+      - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
       - name: Remote million distinct-file fresh-run fetch gates through real FUSE
         run: >-
           "$RUNNER_TEMP/http2-tests/bin/python" tests/remote.py --require-fuse --million
@@ -376,11 +367,11 @@ jobs:
       - run: |
           rustup toolchain install stable --profile minimal
           cargo build --release --locked --features test-metrics --bin git-on
-      - name: Install HTTP/2 fixture dependencies
-        if: contains(matrix.sources, 'remote')
+      - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
       - name: Source, policy and signature behavior matrix
         env:
           SOURCES: ${{ matrix.sources }}
@@ -389,9 +380,7 @@ jobs:
           PROFILE: ${{ matrix.profile }}
         run: |
           for SOURCE in ${SOURCES//,/ }; do
-            python=python3
-            if [ "$SOURCE" = remote ]; then python="$RUNNER_TEMP/http2-tests/bin/python"; fi
-            "$python" tests/scalability.py --binary target/release/git-on --backend "$BACKEND" --source "$SOURCE" --policies "$POLICIES" --profile "$PROFILE" --output "scale-results-$SOURCE.jsonl"
+            python3 tests/scalability.py --binary target/release/git-on --backend "$BACKEND" --source "$SOURCE" --policies "$POLICIES" --profile "$PROFILE" --output "scale-results-$SOURCE.jsonl"
           done
       - name: Retain scenario plans and phase measurements
         if: always()
@@ -498,45 +487,34 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --features test-metrics -- -D warnings
       - run: cargo test --locked --all-targets --features test-metrics
-      - run: cargo build --locked --features test-metrics --bin git-on --example source-probe
+      - run: cargo build --locked --features test-metrics
       - run: python3 tests/integration.py --binary target/debug/git-on --require-nfs CliTests
       - run: python3 tests/materialized.py target/debug/git-on
-      - name: Install HTTP/2 fixture dependencies
+      - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
       - name: Require real user-owned NFSv4.1 mounts
         run: |
+          export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
           python3 tests/write_policy.py --binary target/debug/git-on --require-nfs
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/integration.py --binary target/debug/git-on --require-nfs MountTests
+          python3 tests/integration.py --binary target/debug/git-on --require-nfs MountTests
           python3 tests/fsync_contract.py --binary target/debug/git-on --require-nfs
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/remote.py --binary target/debug/git-on --require-nfs \
-            RemoteTests.test_local_common_directory_reads_without_changing_native_repository_refs \
-            RemoteTests.test_native_openpgp_verification_uses_git_configuration \
-            RemoteTests.test_eager_signed_copy_streams_for_both_url_and_origin \
-            RemoteTests.test_signed_https_selection_keeps_lazy_transport \
-            RemoteTests.test_native_verifier_moving_ref_keeps_exact_distinct_tree \
-            RemoteTests.test_remote_verifier_keeps_the_callers_git_configuration \
-            RemoteTests.test_explicit_local_sources_use_the_same_revision_as_git_c \
-            RemoteTests.test_startup_progress_covers_local_resolution_and_initial_remote_fetch \
-            RemoteTests.test_materialization_progress_is_delayed_tty_only_and_cleared_before_child_or_error \
-            RemoteTests.test_native_local_alternates_do_not_fetch_missing_promisor_objects \
-            RemoteTests.test_local_alternates_keep_the_primary_depth_alongside_env \
-            RemoteTests.test_native_local_alternates_keep_the_resolved_environment_store \
-            RemoteTests.test_native_local_alternates_read_from_a_long_resolved_environment \
+          python3 tests/remote.py --binary target/debug/git-on --require-nfs \
             RemoteTests.test_materialized_remote_fetches_the_selected_tree_once \
-            RemoteTests.test_auto_copy_reuses_selected_ssh_snapshot_with_one_session \
             RemoteTests.test_git_on_in_a_terminal_reuses_the_https_demand_session \
             RemoteTests.test_cancel_concurrent_https_demands \
             RemoteTests.test_cold_directory_demand_overlaps_file_lookup \
-            RemoteTests.test_concurrent_https_lookups_fetch_only_requested_objects
-          python3 tests/ssh_regressions.py --binary target/debug/git-on \
-            SshRegressionTests.test_ssh_match_exec_runs_during_inspection_and_connection \
-            SshRegressionTests.test_direct_ssh_rejects_proxy_configuration_before_connecting
+            RemoteTests.test_concurrent_https_lookups_combine_only_requested_objects \
+            RemoteTests.test_real_mount_caught_spilled_blob_failure_is_sticky
           GIT_ON_TEST_FSYNC_ERROR=1 cargo test --locked --lib --features test-metrics backend::nfs::tests::sync_errors_are_returned_in_rpc_replies -- --exact --ignored
       - name: Multiplex exact Git demands through real NFS
         run: |
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/debug/git-on --require-nfs
+          "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/debug/git-on --require-nfs \
+            Http2Tests.test_post_authentication_and_multiplexed_fetches \
+            Http2Tests.test_reports_actual_pack_progress_while_the_stream_is_open \
+            Http2Tests.test_explicit_https_credentials_are_used_after_a_basic_challenge \
+            Http2Tests.test_url_matched_authorization_header_is_sent_once
           "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/debug/git-on --require-nfs
       - name: Run upstream pynfs over the production socket
         run: |
@@ -588,9 +566,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: |
           readelf -d unpacked/git-on-${{ matrix.target }}/git-on | grep -F 'Shared library: [libcurl.so.4]'
-          python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
-          "$RUNNER_TEMP/http2-tests/bin/python" tests/integration.py --binary unpacked/git-on-${{ matrix.target }}/git-on --require-fuse
+          python3 tests/integration.py --binary unpacked/git-on-${{ matrix.target }}/git-on --require-fuse
       - if: runner.os == 'macOS'
         run: |
           otool -L unpacked/git-on-${{ matrix.target }}/git-on | grep -F '/usr/lib/libcurl.4.dylib'

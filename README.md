@@ -88,9 +88,7 @@ git on main --verify --write-policy=all -- python script.py
 ```
 
 `--verify` checks the selected commit's signature. With an annotated tag, it
-checks the exact tag object and runs the tree selected by its recorded target.
-Verification failure stops execution. Git's configured verifier uses its usual
-profile and may make its ordinary changes there.
+checks the tag's signature instead. Verification failure stops execution.
 
 Use a commit hash in place of `main` to pin the source and require verification
 together.
@@ -126,10 +124,8 @@ Supply a repository URL and a revision. Replace the URL with your repository:
 git on https://github.com/OWNER/REPO.git main --write-policy=all -- cargo test
 ```
 
-A configured remote name, such as `origin`, also works. Network loads use
-direct Git protocol v2 over HTTPS with HTTP/2 or OpenSSH. GitHub.com is the
-reference. See the [remote guide](docs/remote.md#network-transport-profile)
-for ref selection, compatibility limits, and signature verification.
+A configured remote name, such as `origin`, also works. See the
+[remote guide](docs/remote.md) for fetching and signature verification.
 
 For all command-line options, run:
 

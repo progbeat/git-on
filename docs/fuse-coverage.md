@@ -63,7 +63,6 @@ The short IDs below keep the matrix readable. References are machine-checked.
 | P-cache-cow | tests/fuse_protocol.rs | protocol_all_source_data_cache_stops_after_copy_up_without_extending_ttls |
 | P-dir-cache | tests/fuse_protocol.rs | protocol_directory_kernel_cache_only_for_readonly_supported_abi |
 | P-dir-attrs | tests/fuse_protocol.rs | protocol_cached_source_directory_attrs_do_not_cache_generated_membership |
-| P-missing-cache | tests/fuse_protocol.rs | protocol_missing_entry_cache_requires_readonly_directory |
 | P-create | tests/fuse_protocol.rs | protocol_creation_links_removal_and_rename_flags |
 | P-dir | tests/fuse_protocol.rs | protocol_directory_pagination_sync_statfs_and_bad_handles |
 | P-dir-partial | tests/fuse_protocol.rs | protocol_partial_directory_pages_reopen_cookies_and_source_inode_identity |
@@ -123,7 +122,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | --- | --- | --- | --- | --- |
 | init | implemented | P-life, P-no-open | I-snapshot | ABI negotiation succeeds; Linux kernel passthrough is negotiated only with CAP_SYS_ADMIN and kernel support; otherwise ordinary FUSE. Readonly `none` negotiates NO_OPEN_SUPPORT only when advertised by the peer; mutable policies and older peers retain ordinary handles. Optional remote-lock, readdirplus and writeback-cache capabilities stay disabled. Every protocol fixture initializes a real session. |
 | destroy | inherited | P-life | I-snapshot | DESTROY is acknowledged and the session thread joins successfully; no requests follow termination. Default hook has no application-side work; backing registrations are owned by open handles; cleanup uses separate lifecycle tests. |
-| lookup | implemented | P-life, P-namespace, P-dir-attrs, P-missing-cache | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_only_retains_protected_source` checks positive caching only for policy-protected source names and attributes, including directories; generated names and `all` stay uncached. Mutable directory membership and streams remain uncached. Wholly readonly `none` directory pages and missing names may be cached. The negative lookup test checks the entry TTL and permits creation after misses on mutable policies. |
+| lookup | implemented | P-life, P-namespace, P-dir-attrs | I-snapshot, I-lazy | Existing/missing paths, bad parent, invalid components and overlong names; cold/missing-object behavior is also checked on mounts. `protocol_kernel_cache_only_retains_protected_source` checks positive caching only for policy-protected source names and attributes, including directories; generated names and `all` stay uncached. Mutable directory membership/streams remain uncached; wholly readonly `none` directory pages may be cached. |
 | forget | implemented | P-life, P-namespace, P-metadata | - | Forgotten inode becomes unavailable; excessive/unknown forget counts do not corrupt root; removed directory is reclaimed after its handles close. Kernel timing is not deterministic; unit tests also cover open-handle retention. |
 | batch_forget | inherited | P-life | - | Default dispatch delegates to forget for multiple inodes; subsequent getattr returns ENOENT for each. Kernel batching is not assumed by mounted tests. |
 | getattr | implemented | P-life, P-io, P-namespace, P-metadata, P-partial, P-sparse, P-no-open | I-file, I-links, I-partial | Attribute replies and inode existence; initial mode/ownership, stale file handle rejected; partial-write size and sparse allocation blocks match actual backing metadata; mounted size, mode and link-count assertions. `passthrough_unlinked_inode_keeps_backing_until_last_lookup_is_forgotten` and the real enabled/fallback suite cover metadata through O_PATH after unlink or replacement. |
@@ -136,7 +135,7 @@ if dispatched; it does **not** mean the corresponding Linux syscall must fail.
 | symlink | implemented | P-create | I-links | Real callback creates a symlink; mounted exact target, write-through, dangling link and namespace/policy denial assertions. Embedded NUL is not representable in a well-formed wire pathname. |
 | rename | implemented | P-create, P-namespace | I-directory, I-rename | RENAME and RENAME2 dispatch; NOREPLACE success/collision, rejected exchange/whiteout/unknown flags, self/same-inode and type mismatch; unchanged source/destination on mounted rejection. |
 | link | implemented | P-create, P-namespace | I-links | Regular hardlink, directory/zero-link rejection; shared inode, link counts, alias writes and protected source/destination behavior. `passthrough_link_reply_refreshes_backing_metadata_without_stat` checks size/blocks/mtime in the LINK reply after bypass writes, before GETATTR or close. |
-| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Opened private regular files can use passthrough after copy-up. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
+| open | implemented | P-io, P-cache-cow, P-no-open | I-file, I-exec, I-cache-cow, I-readonly | Readonly tracked success and write rejection; directory/symlink type errors; mounted flags, append, truncation and execution. KEEP_CACHE applies to unchanged regular source opened readonly, including all-policy source until copy-up; NOFLUSH remains restricted to policy-protected source. Mutable handles use ordinary behavior. Negotiated readonly no-open replies ENOSYS; Linux then skips per-file open/release RPCs and retains immutable cached pages. All-policy entry/attribute TTLs stay zero. Protocol copy-up flags are checked locally; I-cache-cow requires a real mount for mmap and namespace coherence. |
 | read | implemented | P-io, P-bounds, P-partial, P-sparse, P-no-open | I-file, I-large, I-partial, I-readonly | Exact bytes, holes, EOF, negative offset, stale/mismatched/write-only handle; written prefix remains readable after a real short backing write; sparse hole boundary, sequential/range reads and large-object behavior on mounts. |
 | write | implemented | P-io, P-bounds, P-partial, P-sparse | I-file, I-mmap, I-partial | Offset/hole writes, stale/readonly handle, negative/overflow offset, zero length and sync flags; RLIMIT_FSIZE forces partial progress followed by EFBIG, with prefix/size/block visibility verified; append and mmap/current-description behavior on mounts. |
 | flush | implemented | P-io, P-bounds, P-no-open | I-sync | Repeated flush keeps handle usable; stale handle rejected. Mounted dup-close preserves remaining open description. The kernel may skip close-flush for readonly protected source with NOFLUSH; mutable handles and explicit fsync retain their callbacks. Negotiated readonly no-open uses fh=0 and returns ENOSYS once, allowing the kernel to omit further flush requests. Flush is not a persistence/fsync guarantee. |
@@ -208,15 +207,18 @@ macOS uses the [separate NFSv4.1 protocol adapter](nfs.md). Linux FUSE
 acceptance runs on a host with a real FUSE device.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
-FOPEN_PASSTHROUGH for physically backed regular files, after policy and access
-checks. This includes private copies of tracked files after the ordinary handles
-are released. Create/open handles share one BackingId per inode, retained
-through release. getattr refreshes
+FOPEN_PASSTHROUGH for physically backed writable regular files after policy
+and access checks. Create/open handles share one BackingId per inode, retained
+through release. A tracked file can qualify on reopen after copy-up and the
+release of its ordinary FUSE handles, provided its attributes can be preserved.
+getattr refreshes
 size, blocks and data timestamps from the backing descriptor without replacing
 logical overlay mode, uid, gid or link count. Lack of the kernel capability,
 CAP_SYS_ADMIN or a successful registration retains userspace I/O on this same
 FUSE mount. No new privileged child, detached process or early teardown exists.
 
 `tests/passthrough.py` must establish real negotiation and bypass, metadata,
-reopen/truncate, executable and mmap behavior on a capable kernel. Protocol
+reopen/truncate, executable and mmap behavior on a capable kernel. Its tracked
+file control checks a simultaneous cached reopen, a later passthrough reopen,
+preserved bytes and timestamps, and read callback counts. Protocol
 responses and ordinary mount tests alone do not demonstrate kernel bypass.

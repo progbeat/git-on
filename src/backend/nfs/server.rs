@@ -3,7 +3,7 @@ use super::{
     locks::LockState,
     protocol::{self, Channel, Credentials, Operation, Rpc, SessionId, StateId, MAX_OPS},
     status::*,
-    xdr::{ReplyBody, Writer, MAX_RECORD},
+    xdr::{Writer, MAX_RECORD},
 };
 use crate::filesystem::Overlay;
 use sha2::{Digest, Sha256};
@@ -14,6 +14,10 @@ use std::{
 };
 
 mod demand;
+
+pub(super) struct DemandFailure {
+    operations_left: u32,
+}
 
 pub(super) const LEASE_SECONDS: u32 = 90;
 const MAX_CLIENTS: usize = 8;
@@ -54,12 +58,25 @@ struct Slot {
 struct Replay {
     digest: [u8; 32],
     credentials: Credentials,
-    reply: Arc<ReplyBody>,
+    reply: Arc<Writer>,
 }
 
 pub(super) struct RpcReply {
     pub(super) header: Vec<u8>,
-    pub(super) body: Option<Arc<ReplyBody>>,
+    pub(super) body: Option<Arc<Writer>>,
+}
+
+#[cfg(test)]
+impl RpcReply {
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        let Self { mut header, body } = self;
+        if let Some(body) = body {
+            for part in body.segments() {
+                header.extend_from_slice(part);
+            }
+        }
+        header
+    }
 }
 
 struct Session {
@@ -232,16 +249,14 @@ impl Server {
 
     #[cfg(test)]
     pub fn rpc(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let RpcReply { mut header, body } = self.rpc_reply(data)?;
-        if let Some(body) = body {
-            for slice in body.slices() {
-                header.extend_from_slice(slice);
-            }
-        }
-        Some(header)
+        self.rpc_after_demand(data, None).map(RpcReply::into_bytes)
     }
 
-    pub(super) fn rpc_reply(&mut self, data: &[u8]) -> Option<RpcReply> {
+    pub(super) fn rpc_after_demand(
+        &mut self,
+        data: &[u8],
+        failure: Option<DemandFailure>,
+    ) -> Option<RpcReply> {
         let mut w = Writer::default();
         let mut body = None;
         let call = match protocol::rpc(data) {
@@ -282,7 +297,13 @@ impl Server {
                     Some(Rpc::Compound(credentials, request)) => {
                         if let Ok(compound) = protocol::compound(request) {
                             w.u32(0);
-                            body = Some(self.compound(compound, credentials, request, data.len()));
+                            body = Some(self.compound(
+                                compound,
+                                credentials,
+                                request,
+                                data.len(),
+                                failure,
+                            ));
                         } else {
                             w.u32(4); // GARBAGE_ARGS
                         }
@@ -304,7 +325,8 @@ impl Server {
         credentials: Credentials,
         raw_request: &[u8],
         request_size: usize,
-    ) -> Arc<ReplyBody> {
+        failure: Option<DemandFailure>,
+    ) -> Arc<Writer> {
         let mut reply = Writer::default();
         reply.u32(OK);
         reply.opaque(request.tag);
@@ -313,10 +335,10 @@ impl Server {
 
         if request.minor != 1 {
             reply.patch_u32(0, MINOR_MISMATCH);
-            return Arc::new(reply.into_reply(None));
+            return Arc::new(reply);
         }
         if request.count == 0 {
-            return Arc::new(reply.into_reply(None));
+            return Arc::new(reply);
         }
         let mut context = Context::new(credentials);
         let mut budget = MAX_RECORD - RPC_REPLY_HEADER;
@@ -370,10 +392,16 @@ impl Server {
                                 }
                             }
                             Operation::Sequence(_) => Err(SEQUENCE_POS),
+                            _ if failure
+                                .as_ref()
+                                .is_some_and(|f| request.count - i == f.operations_left) =>
+                            {
+                                Err(IO)
+                            }
                             op => {
                                 // Always leave room to report a subsequent operation's error.
                                 let tail = if i + 1 < request.count { 12 } else { 0 };
-                                let limit = budget.saturating_sub(reply.wire_len() + tail);
+                                let limit = budget.saturating_sub(reply.len() + tail);
                                 self.perform(op, &mut context, request.count, i, limit, &mut reply)
                             }
                         }
@@ -400,16 +428,23 @@ impl Server {
             self.core.forget_inode(ino, 1);
         }
         reply.patch_u32(count_at, count);
-        // The socket and the replay slot share the exact same response body.
-        let reply = Arc::new(reply.into_reply(replay_slot.is_some().then_some(budget)));
+        if replay_slot.is_some() {
+            reply.shrink_inline(budget);
+        }
+        let reply = Arc::new(reply);
         if let Some((sequence, digest)) = replay_slot {
             if let Some(session) = self.sessions.get_mut(&sequence.session) {
+                // A short range can own a much larger blob. Compact only the
+                // replay copy when retaining that allocation exceeds its budget.
+                let cached = reply
+                    .compact_for_replay(budget)
+                    .map_or_else(|| reply.clone(), Arc::new);
                 session.slots[sequence.slot as usize] = Slot {
                     sequence: sequence.id,
                     last: Some(Replay {
                         digest,
                         credentials,
-                        reply: reply.clone(),
+                        reply: cached,
                     }),
                 };
                 if let Some(client) = self.clients.get_mut(&session.client) {
@@ -702,7 +737,7 @@ impl Server {
 
 enum Sequenced {
     New(u64, usize),
-    Replay(Arc<ReplyBody>),
+    Replay(Arc<Writer>),
 }
 
 #[cfg(test)]

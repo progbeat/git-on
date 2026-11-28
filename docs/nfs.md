@@ -3,10 +3,9 @@
 On macOS 26 and later, git-on exports one pinned Git tree and an invocation-local
 writable layer to the built-in Darwin client. The Rust server uses the shared
 Overlay for Git object verification, inode identity, copy-on-write and all four
-write policies. The server opens a Unix stream socket in a short, per-run 0700
-directory inside a user-owned group under `/private/tmp`. The writable backing
-stays under `TMPDIR/git-on`.
-Only the mounting user and the kernel can access the local endpoint. The process uses
+write policies. The server opens a Unix stream socket in a short 0700 directory
+under `/private/tmp`. The writable backing stays in the private run under `TMPDIR/git-on`. Only the
+mounting user and the kernel can access the local endpoint. The process uses
 `mount_nfs` with NFSv4.1 and `AUTH_SYS`; it needs neither a TCP listener nor
 rpcbind. Symlink targets and component names are handled as bytes.
 
@@ -36,9 +35,6 @@ including a successful prefix followed by an error. Mounts with parallel remote
 object reads can negotiate up to 32 slots. The negotiated maximum reply size
 keeps each session's replay storage within 16 MiB. Git data requests can remain
 outstanding until they complete or the invocation is cancelled.
-READ replies send the file range and its XDR fields as separate slices. Replay
-shares the same reply. If retaining a range would hold an allocation larger than
-the negotiated slot budget, the server retains a compact encoding of that reply.
 Short GETATTR and LOOKUP compounds can use an independent slot while another
 slot waits for a Git object. A single client session can send these calls under
 different AUTH_SYS credentials. Permission checks use each call's credentials.
@@ -55,17 +51,12 @@ consumes an error while flushing buffered writes.
 ## Cleanup
 
 Git-on normally unmounts while the listener and worker still serve the client.
-It then stops the listener, connections and worker and deletes the temporary
-data. If cleanup fails, it reports the retained run directory. Stop processes
-using the mount, then run
+It then stops the listener, connections and worker before deleting the temporary data. If cleanup fails, it reports the retained run
+directory. Stop processes using the mount, then run
 `git on --cleanup <temporary-directory>`. Cleanup checks recovered run identity
 against the system's NFS mount entries and refuses to delete a directory that
-still contains a mount. The short socket path is determined by the run
-directory identity, including when the runner stopped before binding the
-socket. Cleanup keeps the run directory for a retry if it cannot inspect
-the endpoint. Older recovery records select the saved or historical flat path.
-If the embedded server has exited, recovery detaches the identified
-stale mount without waiting for the dead endpoint to flush.
+still contains a mount. If the embedded server has exited, recovery detaches the
+identified stale mount without waiting for the dead endpoint to flush.
 
 ## Verification
 
