@@ -26,7 +26,7 @@ pub(crate) const COPY_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 const ENTRY_CHARGE: usize = 512;
 pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const LARGE_SLOTS: usize = 8;
-const SPILL_WRITE_CHUNK: usize = 1024 * 1024;
+const SPILL_WRITE_CHUNK: usize = 64 * BLOCK;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()

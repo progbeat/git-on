@@ -45,6 +45,7 @@ replies up to 256 KiB. Select by full SHA-1 OID when a reference reply is larger
 ## Authentication and state
 
 HTTPS sends the single effective URL-matched `http.extraHeader` when configured.
+For URLs without user information, libcurl can read matching `.netrc` entries.
 If discovery, ref listing, or an object request receives a Basic challenge,
 Git-on passes the effective repository URL and any supplied credentials to
 `git credential fill` through its standard input for read-only lookup.

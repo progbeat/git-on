@@ -239,6 +239,31 @@ class Http2Tests(unittest.TestCase):
                 self.assertEqual(result.returncode, 125 if policy == "false" else 0, result.stderr)
                 self.assertEqual(result.stdout, b"" if policy == "false" else b"expected\n")
 
+    def test_plain_https_url_reads_netrc_after_relative_redirect(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        token = base64.b64encode(b"fixture:example-password").decode()
+        server = fixture.https_server(authorization="Basic " + token)
+        server.redirect_discovery = True
+        url = server.url.replace("/server.git", "/old.git")
+        home = fixture.root / "home"
+        home.mkdir()
+        netrc = home / ".netrc"
+        contents = "machine 127.0.0.1 login fixture password example-password\n"
+        netrc.write_text(contents)
+        netrc.chmod(0o600)
+        env = dict(fixture.env, HOME=str(home), GIT_TERMINAL_PROMPT="0")
+        env.pop("NETRC", None)
+        env.pop("CURL_HOME", None)
+        result = subprocess.run(
+            [OPTIONS.binary, url, fixture.commit, "--backend=copy", "--write-policy=all",
+             "--", "cat", "deep/file"],
+            cwd=fixture.cwd, env=env, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"expected\n")
+        self.assertEqual(netrc.read_text(), contents)
+
     def test_url_credentials_reach_the_credential_lookup(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)

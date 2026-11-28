@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use curl::{
-    easy::{Auth, Easy2, Handler, HttpVersion, List, WriteError},
+    easy::{Auth, Easy2, Handler, HttpVersion, List, NetRc, WriteError},
     multi::{Easy2Handle, Multi, WaitFd},
 };
 use git2::Oid;
@@ -127,6 +127,7 @@ struct Response {
     error: Option<io::Error>,
     stop: Arc<AtomicBool>,
     idle: Option<ResponseIdle>,
+    location: Option<Vec<u8>>,
     h2: bool,
     ok: bool,
     git_pack: bool,
@@ -165,12 +166,18 @@ impl Handler for Response {
             self.ok = data.split(u8::is_ascii_whitespace).nth(1) == Some(b"200");
             self.git_pack = false;
             self.basic = false;
+            self.location = None;
             if let Body::Discovery(bytes) = &mut self.body {
                 bytes.clear();
             }
         } else if let Some(colon) = data.iter().position(|&byte| byte == b':') {
             if data[..colon].eq_ignore_ascii_case(b"content-type") {
                 self.git_pack = data[colon + 1..].trim_ascii() == PACK_RESULT;
+            }
+            if matches!(self.body, Body::Discovery(_))
+                && data[..colon].eq_ignore_ascii_case(b"location")
+            {
+                self.location = Some(data[colon + 1..].trim_ascii().to_vec());
             }
             if data[..colon].eq_ignore_ascii_case(b"www-authenticate") {
                 self.basic |= data[colon + 1..]
@@ -226,10 +233,19 @@ impl Client {
         let mut response = client.discovery(DISCOVERY, None)?;
         if config.options.follow_initial_redirects {
             for _ in 0..5 {
-                let Some(next) = response.redirect_url()? else {
+                if !(300..400).contains(&response.response_code()?) {
+                    break;
+                }
+                let Some(location) = response.get_ref().location.as_deref() else {
                     break;
                 };
-                let next = url::Url::parse(next).context("invalid Git HTTPS redirect")?;
+                // Resolve against our request URL before libcurl adds authentication.
+                let current = url::Url::parse(&client.service_url(DISCOVERY))?;
+                let location =
+                    std::str::from_utf8(location).context("invalid Git HTTPS redirect")?;
+                let next = current
+                    .join(location)
+                    .context("invalid Git HTTPS redirect")?;
                 ensure!(
                     next.origin() == client.base.origin()
                         && next.username().is_empty()
@@ -290,26 +306,35 @@ impl Client {
         Ok(selected.map(|oid| (client, Some(oid))))
     }
 
+    fn service_url(&self, service: &str) -> String {
+        format!("{}/{service}", self.base.as_str().trim_end_matches('/'))
+    }
+
     fn easy(&self, service: &str, body: Body, request: Option<Vec<u8>>) -> Result<Easy2<Response>> {
         let mut easy = Easy2::new(Response {
             body,
             error: None,
             stop: self.stop.clone(),
             idle: None,
+            location: None,
             h2: false,
             ok: false,
             git_pack: false,
             basic: false,
             sent_credentials: false,
         });
-        easy.url(&format!(
-            "{}/{service}",
-            self.base.as_str().trim_end_matches('/')
-        ))?;
+        easy.url(&self.service_url(service))?;
         easy.proxy("")?;
         easy.http_version(HttpVersion::V2TLS)?;
         easy.pipewait(true)?;
         easy.progress(true)?;
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(|(_, url)| url.username().is_empty() && url.password().is_none())
+        {
+            easy.netrc(NetRc::Optional)?;
+        }
         if let Some(ca) = &self.ca {
             easy.cainfo(ca)?;
         }
