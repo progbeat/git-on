@@ -93,7 +93,7 @@ jobs:
       - name: Native Git oracle, real HTTPS/OpenSSH, run-storage and transport regressions
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
           echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"
           cargo build --locked --features test-metrics --example source-probe --bin git-on
@@ -163,7 +163,7 @@ jobs:
       - name: Multiplex exact Git demands through real FUSE
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
           echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on --require-fuse \
             Http2Tests.test_post_authentication_and_multiplexed_fetches \
@@ -300,7 +300,7 @@ jobs:
       - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
       - name: Remote million distinct-file fresh-run fetch gates through real FUSE
         run: >-
           "$RUNNER_TEMP/http2-tests/bin/python" tests/remote.py --require-fuse --million
@@ -369,7 +369,7 @@ jobs:
       - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
           echo "$RUNNER_TEMP/http2-tests/bin" >> "$GITHUB_PATH"
       - name: Source, policy and signature behavior matrix
         env:
@@ -492,7 +492,7 @@ jobs:
       - name: Set up the Git HTTPS fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/http2-tests"
-          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0
+          "$RUNNER_TEMP/http2-tests/bin/python" -m pip install --disable-pip-version-check -r tests/requirements-http2.txt
       - name: Require real user-owned NFSv4.1 mounts
         run: |
           export PATH="$RUNNER_TEMP/http2-tests/bin:$PATH"

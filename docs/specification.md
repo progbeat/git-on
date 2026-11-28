@@ -47,17 +47,19 @@ separate from that contract; a requirement is not a claim of a passing test.
 
 With one operand, native Git resolves the revision through
 `git rev-parse --verify --end-of-options`. Git interprets abbreviations,
-ancestry, reflogs and `HEAD:path`. With an explicit local source, including
-`file://` or a remote name that resolves to a local path, resolve the revision
+ancestry, reflogs and `HEAD:path`. With two operands, use native Git to resolve
+remote names and apply URL rewrites once, then classify the source by syntax.
+HTTPS URLs, SSH URLs and SCP-style addresses select network sources even if
+the same spelling names a local directory. With an explicit local source,
+including `file://` or a remote name that resolves to a local path, resolve the revision
 and read its objects as in `git -C PATH on REV`. A named remote uses the
 effective `remote.<name>.url` setting. Object directories and
 alternates follow native Git's repository setup, including bare repositories,
 linked worktrees and byte-valued paths. Do not interpret a local revision as
 a fetch destination.
 
-For a network source, apply native Git remote-name and URL rewriting once.
-The supported profile is direct HTTPS with HTTP/2 or direct OpenSSH, both
-using Git protocol v2. Select `HEAD`, an exact ref, an unambiguous short branch
+The supported network profile is direct HTTPS with HTTP/2 or direct OpenSSH,
+both using Git protocol v2. Select `HEAD`, an exact ref, an unambiguous short branch
 or a full SHA-1 OID, then use the fixed OID throughout the invocation. The
 selected object must yield a tree. See [the remote guide](remote.md) for the
 supported configuration and authentication.

@@ -26,6 +26,7 @@ class Multiplexer(socketserver.ThreadingTCPServer):
         self.upstream_tls = ssl.create_default_context(cafile=fixture.env['GIT_SSL_CAINFO'])
         self.records = []
         self.authorization_counts = []
+        self.user_agents = set()
         self.redirect_discovery = False
         self.split_pack = None
         self.unauthenticated_wants = set()
@@ -97,7 +98,9 @@ class MultiplexedRequests(socketserver.BaseRequestHandler):
                         self.server.authorization_counts.append(
                             sum(key == 'authorization' for key, _ in event.headers)
                         )
-                        pending[stream] = (dict(event.headers), bytearray())
+                        headers = dict(event.headers)
+                        self.server.user_agents.add(headers.get('user-agent'))
+                        pending[stream] = (headers, bytearray())
                     elif isinstance(event, DataReceived):
                         pending[stream][1].extend(event.data)
                         h2.acknowledge_received_data(event.flow_controlled_length, stream)

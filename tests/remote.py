@@ -31,6 +31,8 @@ import threading
 import time
 import unittest
 import unicodedata
+from urllib.parse import urlsplit
+
 from support.run_storage import run_directories
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -414,7 +416,9 @@ class RemoteTests(unittest.TestCase):
         weird=f.root/os.fsdecode(b'server-\xff.git')
         literal = f.cwd / '~git-on-test-source'
         literal.symlink_to(f.repo, target_is_directory=True)
-        paths = [str(f.repo), '../server.git', literal.name]
+        colon = f.cwd / 'fixture:repo.git'
+        colon.symlink_to(f.repo, target_is_directory=True)
+        paths = [str(f.repo), '../server.git', literal.name, './' + colon.name, str(colon)]
         try:
             weird.symlink_to(f.repo, target_is_directory=True)
         except OSError as error:
@@ -428,15 +432,19 @@ class RemoteTests(unittest.TestCase):
                 self.assertEqual(f.line(process)['tree'],f.tree)
                 value,_=f.operation(process,'read deep/file')
                 self.assertEqual(value['data'],'expected\n'); f.finish(process)
-    def test_explicit_network_urls_take_precedence_over_matching_local_directories(self):
+    def test_network_sources_take_precedence_over_matching_local_directories(self):
         f = self.f
-        for url in (f.https(), f.ssh()):
+        https = f.https()
+        ssh = urlsplit(f.ssh())
+        scp = f'{ssh.username}@{ssh.hostname}:{ssh.path}'
+        scp_env = dict(f.env, GIT_SSH_COMMAND=f'{f.env["GIT_SSH_COMMAND"]} -p {ssh.port}')
+        for url, env in ((https, f.env), (ssh.geturl(), f.env), (scp, scp_env)):
             with self.subTest(url=url):
                 (f.cwd / url).mkdir(parents=True)
                 result = subprocess.run(
                     [OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
                      '--', 'cat', 'deep/file'],
-                    cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
+                    cwd=f.cwd, env=env, capture_output=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, b'expected\n')

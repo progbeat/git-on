@@ -4,6 +4,8 @@
 path or `file://` URL, or a network URL. Effective Git URL rewrites apply once.
 A named remote uses the effective `remote.<name>.url` setting.
 Repository-local settings apply when Git discovers that repository.
+SCP-style addresses such as `git@github.com:OWNER/REPO.git` select SSH.
+To select a local path such as `name:repo`, use `./name:repo` or an absolute path.
 A local source always uses native Git revision syntax, including `HEAD:path`,
 and honors the same index and object environment as `git -C PATH on REV`.
 A local partial clone requires a Git version that supports `--no-lazy-fetch`

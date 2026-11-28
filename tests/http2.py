@@ -187,31 +187,38 @@ class Http2Tests(unittest.TestCase):
     def test_uses_effective_transport_settings(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
-        url = fixture.https()
-        for key, values, allowed in (
-            ("protocol.version", ["1", "2"], True),
-            ("protocol.version", ["1"], False),
-            ("fetch.fsckObjects", ["false"], True),
-            ("transfer.fsckObjects", ["true", "false"], True),
-            ("fetch.fsckObjects", ["true"], False),
-            ("http.sslCAInfo", [fixture.env["GIT_SSL_CAINFO"]], True),
-            ("http.userAgent", ["git-on-fixture"], True),
-            ("http.postBuffer", ["1048576"], True),
+        server = fixture.https_server()
+        http_settings = [
+            ("http.sslCAInfo", fixture.env["GIT_SSL_CAINFO"]),
+            ("http.userAgent", "git-on-fixture"),
+            ("http.postBuffer", "1048576"),
+        ]
+        for settings, allowed in (
+            ([("protocol.version", "1"), ("protocol.version", "2")], True),
+            ([("protocol.version", "1")], False),
+            ([("fetch.fsckObjects", "false")], True),
+            ([("transfer.fsckObjects", "true"), ("transfer.fsckObjects", "false")], True),
+            ([("fetch.fsckObjects", "true")], False),
+            (http_settings, True),
         ):
-            with self.subTest(key=key, values=values):
-                env = dict(fixture.env, GIT_CONFIG_COUNT=str(len(values)), GIT_TRACE_PACKET="0")
-                if key == "http.sslCAInfo":
+            with self.subTest(settings=settings):
+                env = dict(fixture.env, GIT_CONFIG_COUNT=str(len(settings)), GIT_TRACE_PACKET="0")
+                check_http = settings == http_settings
+                if check_http:
                     env.pop("GIT_SSL_CAINFO")
-                for index, value in enumerate(values):
+                    server.user_agents.clear()
+                for index, (key, value) in enumerate(settings):
                     env[f"GIT_CONFIG_KEY_{index}"] = key
                     env[f"GIT_CONFIG_VALUE_{index}"] = value
                 result = subprocess.run(
-                    [OPTIONS.binary, url, fixture.commit, "--backend=copy", "--write-policy=all",
+                    [OPTIONS.binary, server.url, fixture.commit, "--backend=copy", "--write-policy=all",
                      "--", "cat", "deep/file"],
                     cwd=fixture.cwd, env=env, capture_output=True, timeout=20,
                 )
                 self.assertEqual(result.returncode, 0 if allowed else 125, result.stderr)
                 self.assertEqual(result.stdout, b"expected\n" if allowed else b"")
+                if check_http:
+                    self.assertEqual(server.user_agents, {"git-on-fixture"})
 
     def test_initial_discovery_redirect_uses_the_new_repository_path(self):
         fixture = Fixture()

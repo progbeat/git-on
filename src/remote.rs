@@ -211,18 +211,12 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr) -> Result<Source> {
             .position(|&byte| byte == b'/')
             .context("file URL requires an absolute repository path")?;
         decode_url_path(&file[start..])?
+    } else if remote_separator(url).is_some() {
+        return Ok(Source::Network {
+            git,
+            url: OsStr::from_bytes(url).to_os_string(),
+        });
     } else {
-        let path = Path::new(OsStr::from_bytes(url));
-        let leading_segment = url.split(|&byte| byte == b'/').next().unwrap();
-        if url.starts_with(b"https://")
-            || url.starts_with(b"ssh://")
-            || (leading_segment.contains(&b':') && !cwd.join(path).is_dir())
-        {
-            return Ok(Source::Network {
-                git,
-                url: path.as_os_str().to_os_string(),
-            });
-        }
         anyhow::ensure!(!url.is_empty(), "missing local repository path");
         url.to_vec()
     };
@@ -309,7 +303,8 @@ fn decode_url_path(mut bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-fn scp_separator(bytes: &[u8]) -> Option<usize> {
+// A slash before the separator makes the source an explicit local path.
+fn remote_separator(bytes: &[u8]) -> Option<usize> {
     let mut bracketed = false;
     let boundary = bytes.iter().position(|&byte| {
         match byte {
@@ -319,9 +314,13 @@ fn scp_separator(bytes: &[u8]) -> Option<usize> {
         }
         byte == b'/' || byte == b':' && !bracketed
     })?;
+    (bytes[boundary] == b':').then_some(boundary)
+}
+
+fn scp_separator(bytes: &[u8]) -> Option<usize> {
+    let boundary = remote_separator(bytes)?;
     let path = &bytes[boundary + 1..];
-    (bytes[boundary] == b':' && !path.starts_with(b"//") && !path.starts_with(b":"))
-        .then_some(boundary)
+    (!path.starts_with(b"//") && !path.starts_with(b":")).then_some(boundary)
 }
 
 fn ssh_target(url: &OsStr) -> Result<(OsString, Option<u16>, Vec<u8>)> {
