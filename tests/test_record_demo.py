@@ -72,7 +72,8 @@ class RecordingDestinationTests(unittest.TestCase):
                 error = caught
         return error, dependencies, opened, recorder
 
-    def successful_recording(self, replace_stage=None, build_in_mount=True):
+    def successful_recording(self, replace_stage=None, build_in_mount=True,
+                             run_path="git-on/ab1234ef"):
         shim = self.root / "make-handler"
         shim.write_text('#!/bin/sh\n[ "${0##*/}" = make ]\n')
         shim.chmod(0o700)
@@ -87,7 +88,7 @@ class RecordingDestinationTests(unittest.TestCase):
             kwargs["stdout"].write("owned VHS diagnostics\n")
             kwargs["stdout"].flush()
             runtime = Path(kwargs["env"]["TMPDIR"])
-            run = runtime / "git-on" / "ab1234ef"
+            run = runtime / run_path
             (run / "mount").mkdir(parents=True)
             executable = run / "mount/sl"
             executable.write_bytes(b"generated SL fixture")
@@ -111,7 +112,8 @@ class RecordingDestinationTests(unittest.TestCase):
                         return None
                     if self.returncode is None:
                         shutil.rmtree(run)
-                        run.parent.rmdir()
+                        if run.parent != runtime:
+                            run.parent.rmdir()
                         Path(kwargs["env"]["GIT_ON_DEMO_STATUS"]).write_text("0\n0\n")
                         if replace_stage is not None:
                             replace_stage(stage)
@@ -535,6 +537,11 @@ class RecordingDestinationTests(unittest.TestCase):
         self.assertEqual(metadata["gif_sha256"], hashlib.sha256(b"owned animation fixture").hexdigest())
         self.assertTrue(metadata["generated_sl_removed_with_snapshot"])
         self.assertEqual(metadata["upstream_tree"], MOD.TREE)
+
+    def test_successful_recording_from_a_standalone_run(self):
+        error, _, _, _ = self.successful_recording(run_path="git-on-ab1234ef")
+        self.assertIsNone(error)
+        self.assertTrue((self.destination / "capture" / "demo.json").is_file())
 
     def test_recording_rejects_build_outside_the_observed_mount(self):
         error, _, _, _ = self.successful_recording(build_in_mount=False)

@@ -1172,12 +1172,17 @@ impl Capture {
         Ok(())
     }
 
-    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+    pub(crate) fn drain_available(&mut self) -> std::io::Result<()> {
         // Drain queued socket data without waiting for inherited writers in
         // a verifier's subprocesses.
         for _ in 0..8 {
             self.pump()?;
         }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        self.drain_available()?;
         Ok(self.bytes)
     }
 }

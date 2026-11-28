@@ -291,7 +291,7 @@ impl NativeProcess {
     pub(crate) fn error_text(&mut self) -> String {
         let _ = self.stop();
         let errors = &mut self.output.get_mut().errors;
-        let _ = errors.pump();
+        let _ = errors.drain_available();
         String::from_utf8_lossy(&errors.bytes).into_owned()
     }
 }

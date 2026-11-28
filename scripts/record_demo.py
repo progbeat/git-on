@@ -180,7 +180,7 @@ def _record(binary, target):
             f'exec {real_make} "$@"\n'))
         make.chmod(0o700)
         trees = private / "observed-trees"
-        runtime = private / "runtime"
+        runtime = (private / "runtime").resolve()
         runtime.mkdir()
         status = private / "shell-status"
         # The clean VHS Bash records its actual command status after each prompt.
@@ -190,7 +190,7 @@ def _record(binary, target):
                    GIT_ON_DEMO_TREES=str(trees),
                    PROMPT_COMMAND='printf "%s\\n" "$?" >> "$GIT_ON_DEMO_STATUS"',
                    LC_ALL="C.UTF-8")
-        observed = set()
+        observed_mount = None
         log_fd = os.open("vhs.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=staging_fd)
         with os.fdopen(log_fd, "w") as stream:
             # The pinned staging cwd stays private even if the requested output
@@ -203,23 +203,27 @@ def _record(binary, target):
                 while process.poll() is None:
                     if time.monotonic() > deadline:
                         raise RuntimeError("VHS recording exceeded four minutes")
-                    for run in (runtime / "git-on").glob("*"):
-                        executable = run / "mount/sl"
-                        if executable.is_file() and os.access(executable, os.X_OK):
-                            observed.add(run)
+                    if observed_mount is None and trees.exists():
+                        fields = trees.read_bytes().split(b"\0")
+                        if len(fields) == 3 and not fields[2]:
+                            mount = Path(os.fsdecode(fields[0]))
+                            if mount.name != "mount" or not mount.is_relative_to(runtime):
+                                raise RuntimeError("Running source differs from the reviewed upstream commit")
+                            executable = mount / "sl"
+                            if executable.is_file() and os.access(executable, os.X_OK):
+                                observed_mount = mount
                     time.sleep(0.02)
                 if process.returncode:
                     raise RuntimeError(f"VHS failed with status {process.returncode}; recording artifacts were not published")
-                if len(observed) != 1:
+                if observed_mount is None:
                     raise RuntimeError("No single real mounted SL build/execution was observed")
-                mount = os.fsencode((next(iter(observed)) / "mount").resolve())
-                if not trees.exists() or trees.read_bytes().split(b"\0") != [mount, TREE.encode(), b""]:
+                if trees.read_bytes().split(b"\0") != [os.fsencode(observed_mount), TREE.encode(), b""]:
                     raise RuntimeError("Running source differs from the reviewed upstream commit")
                 info["upstream_tree"] = TREE
                 statuses = status.read_text().splitlines() if status.exists() else []
                 if statuses != ["0", "0"]:
                     raise RuntimeError(f"The recorded shell did not return successfully: {statuses}")
-                if list(runtime.iterdir()) or any(run.exists() for run in observed):
+                if any(runtime.iterdir()):
                     raise RuntimeError("SL completion left its mounted snapshot or generated executable behind")
                 info["generated_sl_removed_with_snapshot"] = True
                 info["recorded_command_exit_status"] = 0
