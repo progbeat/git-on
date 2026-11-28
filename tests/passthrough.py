@@ -25,6 +25,8 @@ with tempfile.TemporaryDirectory() as scratch:
     git('init','-q')
     (repo/'.gitignore').write_text('out/\n')
     (repo/'program.c').write_text('#include <stdio.h>\nint main(void) { puts("compiled"); return 0; }\n')
+    (repo/'tracked').write_bytes(b'x' * (256 * 1024))
+    (repo/'truncate-first').write_bytes(b'original')
     git('add','.'); git('commit','-qm','fixture')
     code=r'''
 import mmap,os,subprocess,time
@@ -115,12 +117,23 @@ subprocess.run(['cc','program.c','-o','out/program'],check=True)
 assert subprocess.check_output(['./out/program'])==b'compiled\n'
 print('ordinary child UID/zero capabilities, metadata, reopen, truncate, modes, rename/unlink, mmap and compiled executable verified')
 '''
-    read_fd,write_fd=os.pipe()
-    try:
-        result=subprocess.run([str(args.binary.resolve()),'HEAD','--',os.sys.executable,'-c',code],cwd=repo,env=dict(env,GIT_ON_TEST_METRICS_FD=str(write_fd)),pass_fds=[write_fd],capture_output=True,timeout=90)
-    finally: os.close(write_fd)
-    with os.fdopen(read_fd) as f: metrics=json.load(f)
-    assert result.returncode==0,(result.stdout,result.stderr)
+    def run_case(program, *options):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd) as reports:
+            try:
+                result = subprocess.run(
+                    [str(args.binary.resolve()), 'HEAD', *options, '--', os.sys.executable, '-c', program],
+                    cwd=repo, env=dict(env, GIT_ON_TEST_METRICS_FD=str(write_fd)),
+                    pass_fds=[write_fd], capture_output=True, timeout=90,
+                )
+            finally:
+                os.close(write_fd)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            report = json.load(reports)
+        assert list(tmp.iterdir()) == [], list(tmp.iterdir())
+        return result.stdout.decode(), report
+
+    output, metrics = run_case(code)
     if args.expect=='enabled':
         assert metrics['passthrough_handles']>0,metrics
         assert metrics['generated_read_callbacks']==0,metrics
@@ -128,6 +141,39 @@ print('ordinary child UID/zero capabilities, metadata, reopen, truncate, modes, 
     else:
         assert metrics['passthrough_handles']==0,metrics
         assert metrics['generated_write_callbacks']>0,metrics
-    assert list(tmp.iterdir())==[],list(tmp.iterdir())
+    tracked_code = r'''
+import os
+from pathlib import Path
+
+tracked = Path('tracked')
+stamp = 946684800000000000
+os.utime(tracked, ns=(stamp, stamp))
+with tracked.open('r+b', buffering=0) as writer:
+    assert os.pwrite(writer.fileno(), b'changed' * 512 + b'y' * 512, 0) == 4096
+    with tracked.open('rb', buffering=0) as cached:
+        attrs = os.fstat(cached.fileno())
+        assert attrs.st_size == 256 * 1024 and attrs.st_mtime_ns > stamp
+os.utime(tracked, ns=(stamp, stamp))
+with tracked.open('rb', buffering=0) as reopened:
+    attrs = os.fstat(reopened.fileno())
+    assert (attrs.st_atime_ns, attrs.st_mtime_ns) == (stamp, stamp)
+    assert os.pread(reopened.fileno(), 7, 0) == b'changed'
+    assert os.pread(reopened.fileno(), 1, attrs.st_size - 1) == b'x'
+
+os.truncate('truncate-first', 0)
+truncated = os.open('truncate-first', os.O_RDWR)
+try:
+    assert os.fstat(truncated).st_size == 0
+    assert os.write(truncated, b'new') == 3
+    assert os.pread(truncated, 3, 0) == b'new'
+finally:
+    os.close(truncated)
+'''
+    _, tracked = run_case(tracked_code, '--write-policy=all')
+    callbacks = tracked['fuse_requests'].get('read', 0)
+    if args.expect == 'enabled':
+        assert tracked['passthrough_handles'] == 2 and callbacks == 0, tracked
+    else:
+        assert tracked['passthrough_handles'] == 0 and callbacks > 0, tracked
     assert subprocess.check_output(['git','status','--porcelain'],cwd=repo)==b''
-    print(result.stdout.decode(),json.dumps(metrics,sort_keys=True))
+    print(output, json.dumps(dict(generated=metrics, tracked=tracked), sort_keys=True))

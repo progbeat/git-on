@@ -85,7 +85,7 @@ def validate_resources(plan,root):
             raise ValueError('stale, dirty or unidentified pack-scaling evidence')
         n=r['distinct_blobs']
         if r['baseline'] or r['passes']!=2 or r['metrics']['remote_fetches']!=n+2:raise ValueError('wrong pack demand control')
-        if not 0<r['pack_directory_bytes_enumerated']<=2048*(n+2) or not 0<r['pack_metadata_syscalls']<=64*(n+2):raise ValueError('pack metadata work exceeds linear gate')
+        if r['pack_directory_bytes_enumerated']!=0 or r['pack_metadata_syscalls']!=0:raise ValueError('streamed demand used on-disk pack metadata')
     return dict(distinct_demand_sizes=[32,128,512])
 
 

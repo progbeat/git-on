@@ -100,13 +100,17 @@ impl State {
     fn backing(
         &mut self,
         ino: u64,
+        handle: u64,
         register: impl FnOnce(&File) -> std::io::Result<fuser::BackingId>,
     ) -> Option<Arc<fuser::BackingId>> {
         if !self.enabled {
             return None;
         }
-        let file = self.core.eligible_backing(ino)?;
-        let id = if let Some(id) = self.backings.get(&ino).and_then(Weak::upgrade) {
+        let existing = self.backings.get(&ino).and_then(Weak::upgrade);
+        let file = self
+            .core
+            .eligible_backing(ino, handle, existing.is_some())?;
+        let id = if let Some(id) = existing {
             id
         } else {
             let id = Arc::new(register(file).ok()?);
@@ -180,9 +184,9 @@ fn empty(reply: ReplyEmpty, result: FsResult<()>) {
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
-fn data(reply: ReplyData, result: FsResult<Vec<u8>>) {
+fn data(reply: ReplyData, result: FsResult<impl AsRef<[u8]>>) {
     match result {
-        Ok(data) => reply.data(&data),
+        Ok(data) => reply.data(data.as_ref()),
         Err(e) => reply.error(Errno::from_i32(e)),
     }
 }
@@ -248,7 +252,10 @@ impl Filesystem for Fuse {
                 break inode;
             };
             drop(state);
-            pending.finish();
+            if pending.finish().is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
             state = self.state();
             // Directory release or FORGET can reclaim the inode while the
             // lookup is suspended. Resolve it again from the verified source.
@@ -457,7 +464,7 @@ impl Filesystem for Fuse {
                     FopenFlags::empty()
                 };
                 #[cfg(target_os = "linux")]
-                if let Some(id) = state.backing(ino.0, |file| reply.open_backing(file)) {
+                if let Some(id) = state.backing(ino.0, fh, |file| reply.open_backing(file)) {
                     state.handles.insert(fh, (ino.0, id.clone()));
                     #[cfg(feature = "test-metrics")]
                     state.core.record_passthrough();
@@ -502,7 +509,7 @@ impl Filesystem for Fuse {
         match result {
             Ok((a, fh)) => {
                 #[cfg(target_os = "linux")]
-                if let Some(id) = state.backing(a.ino, |file| reply.open_backing(file)) {
+                if let Some(id) = state.backing(a.ino, fh, |file| reply.open_backing(file)) {
                     state.handles.insert(fh, (a.ino, id.clone()));
                     #[cfg(feature = "test-metrics")]
                     state.core.record_passthrough();
@@ -541,21 +548,20 @@ impl Filesystem for Fuse {
         let mut state = self.state();
         #[cfg(feature = "test-metrics")]
         state.core.record_fuse_request("read");
-        data(
-            reply,
-            i64::try_from(offset)
-                .map_err(|_| libc::EINVAL)
-                .and_then(|offset| {
-                    if state.no_open && fh.0 == 0 {
-                        if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
-                            return Err(libc::EBADF);
-                        }
-                        state.core.read_without_handle(ino.0, offset, size)
-                    } else {
-                        state.core.read_data(ino.0, fh.0, offset, size)
+        let result = i64::try_from(offset)
+            .map_err(|_| libc::EINVAL)
+            .and_then(|offset| {
+                if state.no_open && fh.0 == 0 {
+                    if flags.0 & libc::O_ACCMODE == libc::O_WRONLY {
+                        return Err(libc::EBADF);
                     }
-                }),
-        );
+                    state.core.read_without_handle(ino.0, offset, size)
+                } else {
+                    state.core.read_data(ino.0, fh.0, offset, size)
+                }
+            });
+        drop(state);
+        data(reply, result);
     }
     fn write(
         &self,
@@ -642,7 +648,10 @@ impl Filesystem for Fuse {
             .and_then(|oid| state.core.start_remote_demand(oid, None))
         {
             drop(state);
-            pending.finish();
+            if pending.finish().is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
             state = self.state();
         }
         match state.core.open_directory(ino.0, flags.0) {

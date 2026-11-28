@@ -262,7 +262,7 @@ mod tests {
         tree.insert(".gitignore", root_ignore, 0o100644).unwrap();
         tree.insert("nested", child_oid, 0o040000).unwrap();
         let oid = tree.write().unwrap();
-        let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "policy").unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string())).unwrap();
         let policy = Policy::new(&snap).unwrap();
         (tmp, snap, policy)
     }
@@ -322,16 +322,12 @@ mod tests {
         assert_eq!(snapshot.metrics().tree_reads, 2);
     }
     #[test]
-    fn policy_owns_pin_and_errors_fail_closed() {
-        let (tmp, snapshot, policy) = fixture("*\n", "");
-        let repo = Repository::open(tmp.path()).unwrap();
+    fn policy_reads_after_snapshot_drop_and_errors_fail_closed() {
+        let (_tmp, snapshot, policy) = fixture("*\n", "");
         drop(snapshot);
-        assert!(repo.find_reference("refs/git-on/policy").is_ok());
         assert!(!policy.allows(Path::new("nested/existing.log/child"), false));
         assert!(!policy.allows(Path::new("nested/existing.log"), false));
         assert!(policy.allows(Path::new("untracked"), false));
-        drop(policy);
-        assert!(repo.find_reference("refs/git-on/policy").is_err());
         for content in [
             b"*\n".as_slice(),
             b"version https://git-lfs.github.com/spec/v1\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsize 123\n",
@@ -348,7 +344,7 @@ mod tests {
                     .unwrap();
             }
             let snapshot =
-                Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "failure").unwrap();
+                Snapshot::load(tmp.path(), OsStr::new(&oid.to_string())).unwrap();
             let policy = Policy::new(&snapshot).unwrap();
             assert!(!policy.allows(Path::new("new-file"), false));
         }
@@ -566,8 +562,7 @@ mod tests {
         let mut tree = repo.treebuilder(None).unwrap();
         tree.insert(".gitignore", pattern, 0o120000).unwrap();
         let oid = tree.write().unwrap();
-        let snap =
-            Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "symlink-ignore").unwrap();
+        let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string())).unwrap();
         let policy = Policy::new(&snap).unwrap();
         assert!(!policy.allows(Path::new("new-file"), false));
     }
@@ -789,8 +784,7 @@ mod tests {
             let mut tree = repo.treebuilder(None).unwrap();
             tree.insert(".gitignore", blob, 0o100644).unwrap();
             let oid = tree.write().unwrap();
-            let snap =
-                Snapshot::load(tmp.path(), OsStr::new(&oid.to_string()), "raw-bytes").unwrap();
+            let snap = Snapshot::load(tmp.path(), OsStr::new(&oid.to_string())).unwrap();
             let policy = Policy::new(&snap).unwrap();
             std::fs::write(tmp.path().join(".gitignore"), bytes).unwrap();
             let candidates = [

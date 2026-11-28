@@ -213,7 +213,7 @@ class CiPlanTests(unittest.TestCase):
             data.pop();write()
             with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
-            data[0]['pack_metadata_syscalls']=0;data.append(dict(data[0],distinct_blobs=512));write()
+            data[0]['pack_metadata_syscalls']=1;data.append(dict(data[0],distinct_blobs=512));write()
             with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
     def test_resource_gate_requires_complete_current_cache_reports(self):

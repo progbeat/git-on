@@ -57,8 +57,10 @@ coverage.
 
 `tests/remote.py` starts disposable HTTPS smart-Git and OpenSSH servers with
 fixture certificates, identities, agents and signing keys. Native Git is the
-verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG;
-no user key or trust store is read or changed by these tests.
+verification oracle. Install Git 2.45.1+, openssh-server, OpenSSL and GnuPG.
+Install the Python HTTP/2 fixture dependencies in the test environment with
+`python3 -m pip install h2==4.2.0 hpack==4.1.0 hyperframe==6.1.0`.
+The fixtures use disposable keys and trust stores.
 
 ```console
 cargo build --locked --features test-metrics --example source-probe --bin git-on
@@ -90,7 +92,7 @@ authentic historical executables without rebuilding known failing binaries on
 every push.
 SSH shutdown regressions can additionally replay `87a11d5`: equal-length client
 rewrites with restored mtime must never execute a sentinel script and must
-retain the live master, pin and run for recovery. A Linux/glibc spawn interposer
+retain the live master and run for recovery. A Linux/glibc spawn interposer
 changes the pathname only after file validation, demonstrating the old race;
 fixed shutdown must not reach that spawn at all. Existing outside-PATH ELF and
 transparent-wrapper checks continue to require actual OpenSSH master closure.
@@ -212,14 +214,14 @@ after unmount; absence of built-in logs, manifests,
 and output directories; normal and SIGKILL recovery cleanup; refused cleanup of
 active state; retained busy mounts and explicit
 recovery; and locked PEP 723/uv project imports with Numba cache reuse. Concurrent
-runs verify isolation and normal mount/Git-pin cleanup. Example artifact tests
+runs verify isolation and normal mount and runtime cleanup. Example artifact tests
 inspect caches inside the command or explicitly copy them to an external path.
 
 Remote real-FUSE lifecycle tests deliver SIGINT, SIGTERM, SIGHUP and SIGQUIT
 during startup transport and after the mounted child starts. SIGKILL observations
 kill only the runner first: assert the exact mount remains in `mountinfo`, fresh
 directory access returns `ENOTCONN`, the child group and SSH master survive,
-private files and the exact pin remain, and run/cache flocks are available.
+private files remain, and run/cache flocks are available.
 External fixture cleanup stops the owned child before checked stale recovery;
 recovery must remove the mount and private state and close the recorded master.
 A native fusermount wrapper holds helper completion after the actual mount to
@@ -270,9 +272,9 @@ See [resource acceptance](../docs/resources.md), the
 `remote.py`; optional `--before-resource-probe` replays exact-master failures.
 `pack_scaling.py --probe ... [--before-probe ...]` requires Linux strace, checks
 32/128/512 distinct-object pack metadata work, and verifies the full available
-OID set once after both read passes. The probe's `--metrics-only` mode omits
-full-OID enumeration from repeated measurements. Report preparation and command
-time separately.
+OID set once after both read passes. The current HTTPS run reports wall time
+under strace. The optional historical file-transport replay reports structural
+counters and uses the original probe's per-read enumeration.
 
 `scalability.py --binary ... --backend fuse|materialized|passthrough --source local|remote`
 defaults to `--profile matrix`: every interaction once at 1k paths. The pinned

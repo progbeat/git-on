@@ -23,10 +23,10 @@ Every executed command requires `--`. Before the first separator, supply exactly
 one local revision, or a repository followed by a revision. Recognized
 `--verify`, `--backend=auto|fuse|nfs|copy` and `--write-policy=none|ignored|untracked|all` options may
 appear anywhere before that separator, interspersed with the operands.
-`--keep` and `-k` before the separator return usage 2 with migration guidance. With one
-operand, native Git resolves the unchanged revision, including `HEAD:path/to/subtree`. With two,
-native `git fetch` receives the unchanged repository and revision/refspec;
-`main:destination` is a fetch refspec, not a remote directory selector.
+`--keep` and `-k` before the separator return usage 2 with migration guidance. Native Git resolves local revisions
+including `HEAD:path/to/subtree`, whether the local repository is implicit or
+supplied. A network source selects a ref or full SHA-1 OID. The supported
+transports are direct HTTPS/HTTP/2 and OpenSSH with Git protocol v2.
 Everything after that first separator is literal command
 argv: git-on does not parse the command's options or any subsequent `--`.
 
@@ -42,8 +42,8 @@ git on HEAD:examples/uv-project -- uv run --locked main.py
 | `git on HEAD -- cmd -k -- arg` | Default cleanup; pass `-k -- arg` to `cmd` |
 | `git on HEAD cmd` | Usage error: missing command separator |
 | `git on origin HEAD -- cmd` | Run the advertised HEAD from configured remote origin |
-| `git on /path/to/repo.git heads/main -- cmd` | Native Git fetch selects the branch from a local repository |
-| `git on origin +main:refs/heads/private-copy -- cmd` | Fetch refspec; destination exists only in the temporary repository |
+| `git on /path/to/repo.git HEAD:examples -- cmd` | Run the local tree at `examples` |
+| `git on origin refs/tags/v1.2.3 -- cmd` | Run the revision selected by the exact remote tag |
 
 Missing `--`, missing revision operands, extra positional operands, malformed
 git-on options and missing/empty command names return 2 before Git resolution.
@@ -73,7 +73,7 @@ second `--` belongs to that executable.
 | `nfs` | Requires a macOS NFSv4.1 mount. |
 | `copy` | Eagerly creates a regular temporary directory. Requires explicit `--write-policy=all`. |
 
-For repository operands, native fetch semantics, cache bounds and signature verification,
+For repository operands, supported transports, cache bounds and signature verification,
 see [the remote guide](remote.md).
 
 The selected tree is resolved once to a full tree object ID. Commits, annotated tags
@@ -138,12 +138,11 @@ Submodules fail when their metadata is accessed; Git LFS pointer blobs fail when
 contents are read. Unused unsupported entries do not prevent starting a command or
 reading unrelated files. Directory listings can show submodule names. They are never
 silently treated as usable checked-out content. Snapshot reads use committed bytes
-without checkout filters or a synthetic `.git` working copy. Native Git fetch
-uses inherited Git configuration and may invoke its configured hooks while
-updating refs in the private repository. Like configured credential/transport
-helpers and the executed command, those programs run with the caller's identity
-and can access host paths outside the mount. Git SHA-256
-repositories are not currently supported by the bundled libgit2.
+without checkout filters or a synthetic `.git` working copy. Git-on leaves
+the source repository and user files unchanged. Native verification and
+explicitly configured OpenSSH `Match exec` commands retain the effects
+described in the [source contract](specification.md#source-selection-and-observable-state).
+Repositories using SHA-256 object IDs are outside the supported profile.
 
 ## Standard streams and temporary writes
 
@@ -158,12 +157,12 @@ selected tree ID. The rest of the caller's environment is inherited. No `GIT_ON_
 `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed. If callers already
 set those names, they remain ordinary inherited variables.
 
-Generated and copied-up modified files use a private directory in the system temporary location, respecting
-`TMPDIR`. Storage uses ordinary filesystem-backed files, not a private memory
-filesystem, and there is no git-on disk quota. If the system's temporary location is
-itself a memory filesystem, choose a disk-backed location with `TMPDIR`. Filesystem
-capacity and operating-system resource limits still apply. Temporary directories are
-private to the current user.
+Generated and copied-up modified files use a private run directory, normally
+under `TMPDIR/git-on` or the system temporary location's `git-on` group.
+If neither that group nor the per-user group is available, the run uses a
+private directory directly under the same temporary location. Storage capacity
+follows the filesystem and operating-system resource limits. The last run
+removes a group that Git-on owns when it is empty.
 
 git-on unmounts and removes temporary writes after the command finishes.
 `--keep` and `-k` were removed in 1.3.0. Use explicit external paths for required
@@ -185,25 +184,25 @@ git-on does not drain or wait for captured-output pipes because it creates none.
 detached process outside the managed group can still retain inherited descriptors;
 git-on is a foreground runner, not a service daemonizer or host process sandbox.
 
-Git trees are pinned under `refs/git-on/<id>` while in use. Normal completion unmounts,
-releases the pin, and removes temporary state. A busy mount or abrupt termination can leave a temporary
-directory, mount, and pin; minimal private recovery metadata allows checked cleanup
-without keeping execution logs or a run manifest:
+Git-on selects the tree by its object ID. Normal completion unmounts and removes
+temporary state. A busy mount or abrupt termination can leave a temporary
+directory and mount. Recover the private runtime files with:
 
 ```sh
 git on --cleanup /path/to/stale-temporary-directory
 ```
 
-Cleanup refuses an active locked run, will only
-unmount a matching git-on filesystem, and checks the pin's exact target before deleting
-it. A busy stale mount requires stopping processes using it first. Cleanup does not kill
-processes by stale PID. A surviving pin intentionally prevents garbage collection until
-cleanup releases it.
+Cleanup refuses active locked runs and unmounts only matching git-on
+filesystems. Stop any processes using a busy mount before trying again.
+Cleanup leaves source repositories unchanged. If a ref recorded by 1.5.2
+still exists in the source repository, cleanup retains the recovery record and
+directs you to the 1.5.2 cleanup command. Clean up those runs with 1.5.2 before upgrading. If the source repository loses an unread object during a
+run, for example to Git garbage collection, reading that object fails.
 
 SIGKILL is uncatchable and does not forward a signal to the command. The command
 may keep running in its own process group. git-on does not enable FUSE
 `auto_unmount`; killing the runner after mounting leaves a disconnected mount
-whose fresh directory accesses fail with `ENOTCONN`. Temporary files, pins and a
+whose fresh directory accesses fail with `ENOTCONN`. Temporary files and a
 recorded remote SSH master may remain. Stop the command and any other mount users
 first, then use the cleanup command above. The same recovery can be necessary if
 the runner dies during mount setup before launching the command. Cleanup does
@@ -212,24 +211,18 @@ not stop surviving commands or infer process ownership from old PIDs.
 ## Lazy access and performance
 
 The [behavioral and performance specification](specification.md) defines the contract.
-Startup resolves and pins the selected tree and mounts its root; it does not recursively
+Startup resolves the selected tree and mounts its root; it does not recursively
 enumerate the source. Lookup loads ancestor directory metadata and the requested blob
 header, directory listing loads only that directory, and read loads the requested
 content. Write checks load only applicable pinned ignore files.
 
-Decoded content retention is bounded: 8 MiB / 128 blob entries, 4 MiB / 256 tree
-entries, 4,096 blob headers, and 4 MiB / 128 compiled ignore-rule entries. Idle open
-file descriptors do not pin evicted small payloads. Kernel inode references and active
-directory listings retain their necessary metadata until released. libgit2 also has its
-own internal object cache with a default 256 MiB soft target; its default blob caching
-is disabled.
-
-Git encoding can require decoding an entire requested blob or its delta bases. Large
-blobs use an immediately unlinked spool in the private backing directory, shared by
-simultaneous readers and removed after their final close; subsequent ranges in that open
-file do not repeatedly decode the object. A first read still needs the memory to decode
-that object. These limits are retained-cache budgets, not a bound on total RSS, kernel
-cache, active metadata, or temporary large-object decoding.
+Mounted runs retain up to 16 MiB of small blobs and authenticated disk blocks,
+plus the eight most recently used complete large blobs. The network copy backend
+uses a 128 MiB payload cache before materialization. Evicted blobs remain
+reusable in private backing for the invocation. Active object and delta
+decoding, kernel caches and loaded metadata also use memory. The
+[resource guide](resources.md) describes retention and cleanup. The ignore-rule
+cache budget is 4 MiB / 128 compiled ignore-rule entries.
 
 The [benchmark](../tests/benchmark.md) checks exact output and demand counts on a
 million distinct files using a separate, opt-in instrumented test build. Its counters

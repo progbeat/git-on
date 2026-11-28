@@ -12,6 +12,7 @@ import os
 from process_capture import capture
 from benchmark_support import build_stat_observer, source_identity, stat_abi_bytes
 from remote import Fixture
+from support.run_storage import run_directories
 
 
 CHILD=r'''
@@ -64,7 +65,7 @@ def run(options):
     options.output.parent.mkdir(parents=True,exist_ok=True)
     with options.output.open('w') as output:
         def record(row):
-            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='file:// generated private server',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
+            row.update(head=head,working_tree_dirty=dirty,backend=options.backend,source='HTTPS HTTP/2 fixture',source_cache='new invocation; source OS cache uncontrolled/warm from fixture creation')
             output.write(json.dumps(row)+'\n');output.flush();print(json.dumps(row),flush=True)
         for count in options.sizes:
             f=Fixture()
@@ -79,7 +80,7 @@ def run(options):
                 child=f.root/'command.py';child.write_text(CHILD)
                 stat_bytes=stat_abi_bytes(build_stat_observer(f.root/'stat-abi'))
                 command=[sys.executable,'-I','-S',str(child),str(count),str(options.blob_bytes),str(stat_bytes)]
-                source='file://'+str(f.repo)
+                source=f.https()
                 env,log=native_command_audit(f.root,f.env,options.backend=='materialized')
                 backend_args = ['--backend=copy'] if options.backend=='materialized' else []
                 argv=[str(options.binary.resolve()),*backend_args,source,'HEAD','--write-policy=all','--',*command]
@@ -87,7 +88,7 @@ def run(options):
                 result['native_commands']=native_commands(log)
                 validate_runner(result,count,options.blob_bytes,stat_bytes,options.backend)
                 record(dict(type='runner',files=count,blob_bytes=options.blob_bytes,stat_abi_bytes=stat_bytes,**result))
-                assert not list(f.root.glob('git-on-*')),'private invocation leaked'
+                assert not run_directories(f.root),'private invocation leaked'
             finally:f.close()
 
 
@@ -96,25 +97,18 @@ def validate_runner(result,count,size,stat_bytes,backend=None):
     assert [p['completed'] for p in phases]==['first','repeat'],result
     assert all(p['files']==count and p['payload_bytes']==count*size and p['metadata_result_bytes']==count*stat_bytes for p in phases),result
     assert metrics['remote_fetches']==(1 if backend=='materialized' else count+2),metrics
-    raw_count=0 if backend=='materialized' else count
-    assert metrics['remote_raw_blob_imports']==raw_count and metrics['remote_raw_blob_bytes']==raw_count*size,metrics
+    assert metrics['remote_raw_blob_imports']==count and metrics['remote_raw_blob_bytes']==count*size,metrics
     assert metrics['blob_loads']==count,'source blob was decoded again after close/reopen'
     assert metrics['blob_cache_bytes']<=metrics['blob_cache_limit'],metrics
     if backend:
-        operations=1 if backend=='materialized' else count+2
-        session_fetches=metrics.get('remote_session_fetch_operations',0)
-        session_decodes=metrics.get('remote_session_decode_operations',0)
-        assert metrics['remote_fetch_operations']+session_fetches==operations,metrics
-        streamed=metrics.get('streamed_blob_loads',0)
-        assert 0<=streamed<=count,metrics
-        decodes=streamed if backend=='materialized' else operations
-        assert metrics['remote_decode_operations']+session_decodes==decodes,metrics
-        if session_fetches:assert metrics['remote_session_starts']==1,metrics
-    if backend:
-        native=result['native_commands']
-        assert not native.get('unpack-objects',0),'raw import re-encodes loose objects'
-        assert native.get('cat-file',0)==metrics['remote_decode_operations'],result
-        assert native.get('fetch',0)==metrics['remote_fetch_operations'],result
+        operations = metrics['remote_http2_fetch_operations']
+        if backend == 'materialized':
+            assert operations == 1, metrics
+        else:
+            assert 2 < operations <= count + 2, metrics
+        assert metrics['remote_session_fetch_operations'] == metrics['remote_session_decode_operations'] == operations, metrics
+        assert metrics['remote_session_starts'] == 1, metrics
+        assert not result['native_commands'], result
     if backend=='fuse':assert result['fuse_requests'].get('read',0)>0,'real FUSE dispatch missing'
     if backend=='materialized':assert not result['fuse_requests'],'materialization did not bypass FUSE'
 

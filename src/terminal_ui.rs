@@ -1,8 +1,6 @@
 //! Preparation owns terminal rendering and standard Git/SSH prompt requests.
 use anyhow::Result;
-mod progress;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-pub(crate) use progress::{diagnostics as progress_diagnostics, NativeProgress};
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
@@ -36,10 +34,61 @@ const ENVIRONMENT: [&str; 5] = [
 ];
 static DIRECTORY_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PREPARING: AtomicBool = AtomicBool::new(false);
-static VISIBLE: AtomicBool = AtomicBool::new(false);
+static SHOW_TRANSFER: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DRAW: Mutex<Option<ProgressBar>> = Mutex::new(None);
 static NATIVE: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
+static TRANSFER: Mutex<Option<Transfer>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Transfer {
+    started: Instant,
+    bytes: u64,
+    complete: usize,
+    total: usize,
+}
+
+pub(crate) fn transfer_progress(
+    started: &mut Option<Instant>,
+    bytes: u64,
+    complete: usize,
+    total: usize,
+) {
+    if preparing() && SHOW_TRANSFER.load(Ordering::Relaxed) {
+        let mut transfer = TRANSFER.lock().unwrap();
+        *transfer = Some(Transfer {
+            started: *started.get_or_insert_with(Instant::now),
+            bytes,
+            complete,
+            total,
+        });
+    }
+}
+
+pub(crate) fn transfer_finished(started: Option<Instant>) {
+    if let Some(started) = started {
+        let mut transfer = TRANSFER.lock().unwrap();
+        if transfer.is_some_and(|active| active.started == started) {
+            *transfer = None;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn completed_pack_clears_only_its_own_progress() {
+    let active = Instant::now();
+    *TRANSFER.lock().unwrap() = Some(Transfer {
+        started: active,
+        bytes: 20,
+        complete: 1,
+        total: 1,
+    });
+    transfer_finished(active.checked_sub(Duration::from_secs(1)));
+    assert!(TRANSFER.lock().unwrap().is_some());
+    transfer_finished(Some(active));
+    assert!(TRANSFER.lock().unwrap().is_none());
+}
 
 pub(crate) struct NativeOperation(u32);
 impl NativeOperation {
@@ -65,6 +114,14 @@ pub(crate) fn try_wait(
     if !owns_terminal() {
         return child.try_wait();
     }
+    if has_exited(child)? {
+        reap(child).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn has_exited(child: &std::process::Child) -> std::io::Result<bool> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     if unsafe {
         libc::waitid(
@@ -77,25 +134,13 @@ pub(crate) fn try_wait(
     {
         return Err(std::io::Error::last_os_error());
     }
-    if crate::platform::siginfo_pid(&info) == 0 {
-        Ok(None)
-    } else {
-        reap(child).map(Some)
-    }
+    Ok(crate::platform::siginfo_pid(&info) != 0)
 }
 
 type Environment = Vec<Option<Vec<u8>>>;
 
 pub(crate) fn preparing() -> bool {
     PREPARING.load(Ordering::Acquire)
-}
-pub(crate) fn progress_enabled() -> bool {
-    preparing() && VISIBLE.load(Ordering::Relaxed)
-}
-pub(crate) fn configure_fetch(command: &mut Command) {
-    if progress_enabled() {
-        command.arg("--progress");
-    }
 }
 pub(crate) fn owns_terminal() -> bool {
     DIRECTORY_PATH.get().is_some()
@@ -110,6 +155,9 @@ fn clear(drawing: &mut Option<ProgressBar>) {
             bar.set_draw_target(ProgressDrawTarget::hidden());
         }
         bar.finish_and_clear();
+        if foreground(std::io::stderr().as_raw_fd()) {
+            let _ = std::io::stderr().write_all(b"\r\x1b[2K");
+        }
     }
 }
 pub(crate) fn native_terminal_lease(
@@ -128,8 +176,22 @@ pub struct StartupProgress {
     original_stop: Option<libc::sigaction>,
     _directory: Option<tempfile::TempDir>,
 }
+fn display_revision(value: &str) -> String {
+    let mut text = String::new();
+    for character in value.chars().take(256) {
+        if character.is_control() {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    text
+}
+
+/// Read captured stderr by offset: seeking a dup would move the child's shared
+/// write offset and corrupt its diagnostics. Polling is bounded and best effort.
 impl StartupProgress {
-    pub fn start(invoked: Instant, revision: &OsStr) -> Result<Self> {
+    pub fn start(invoked: Instant, revision: &OsStr, run: &Path) -> Result<Self> {
         PREPARING.store(true, Ordering::Release);
         let tty = OpenOptions::new()
             .read(true)
@@ -143,7 +205,7 @@ impl StartupProgress {
         if tty.is_some() {
             let private = tempfile::Builder::new()
                 .prefix(".git-on-terminal-")
-                .tempdir()?;
+                .tempdir_in(run)?;
             let environment: Environment = ENVIRONMENT
                 .iter()
                 .map(|key| std::env::var_os(key).map(|value| value.as_bytes().to_vec()))
@@ -171,8 +233,8 @@ impl StartupProgress {
         let stopping = stop.clone();
         let visible = std::io::stderr().is_terminal()
             && std::env::var_os("TERM").is_none_or(|term| term != "dumb");
-        VISIBLE.store(visible, Ordering::Relaxed);
-        let revision = progress::display(&revision.to_string_lossy());
+        SHOW_TRANSFER.store(visible, Ordering::Relaxed);
+        let revision = display_revision(&revision.to_string_lossy());
         if !visible && listener.is_none() {
             return Ok(Self {
                 stop,
@@ -211,41 +273,42 @@ impl StartupProgress {
                             if let Some(echo) = &mut echo {
                                 let _ = echo.disable();
                             }
+                            let transfer = *TRANSFER.lock().unwrap();
+                            if transfer.is_none()
+                                && drawing.as_ref().is_some_and(|bar| bar.length().is_some())
+                            {
+                                clear(&mut drawing);
+                            }
                             let bar = drawing.get_or_insert_with(|| {
                                 let _ = std::io::stderr().write_all(b"\r");
                                 let bar = ProgressBar::new_spinner();
                                 bar.set_style(
-                                    ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}")
-                                        .expect("static progress template")
-                                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+                                    ProgressStyle::with_template(
+                                        "{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}",
+                                    )
+                                    .expect("static progress template")
+                                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
                                 );
                                 bar
                             });
-                            let report = progress::current();
-                            let counts = report.as_ref().and_then(|report| report.counts);
-                            if bar.length().is_some() != counts.is_some() {
-                                let template = if counts.is_some() {
-                                    "{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}\n  {wide_bar:.green/dim} {percent}% {pos}/{len}"
-                                } else {
-                                    "{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}"
-                                };
-                                bar.set_style(ProgressStyle::with_template(template).expect("static progress template").tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ").progress_chars("━╸─"));
+                            if bar.prefix().is_empty() {
+                                bar.set_prefix("git on");
+                                bar.set_message(revision.clone());
                             }
-                            if let Some((position, total)) = counts {
-                                bar.set_length(total);
-                                bar.set_position(position);
-                            } else {
-                                bar.unset_length();
-                            }
-                            let (label, detail) = report.map_or_else(
-                                || ("git on".into(), revision.clone()),
-                                |report| (report.label, report.detail),
-                            );
-                            if bar.prefix() != label {
-                                bar.set_prefix(label);
-                            }
-                            if bar.message() != detail {
-                                bar.set_message(detail);
+                            if let Some(transfer) = transfer {
+                                if bar.length().is_none() && transfer.total != 0 {
+                                    bar.set_style(
+                                        ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold.cyan} {wide_msg:.dim}\n  {wide_bar:.green/dim} {pos}/{len}")
+                                            .expect("static pack progress template"),
+                                    );
+                                }
+                                if bar.length() != Some(transfer.total as u64) {
+                                    bar.set_length(transfer.total as u64);
+                                }
+                                bar.set_position(transfer.complete as u64);
+                                let mib = transfer.bytes as f64 / 1048576.0;
+                                let speed = mib / transfer.started.elapsed().as_secs_f64().max(0.001);
+                                bar.set_message(format!("receiving pack {mib:.1} MiB ({speed:.1} MiB/s)"));
                             }
                             bar.tick();
                         } else {

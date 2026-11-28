@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Increasing distinct-object demand: observe retained packs and pack-index work.
 
-strace observes only the loader, excluding native Git subprocesses. Source-probe
+strace observes the loader and its children. Source-probe
 reports only counters between reads, then enumerates available OIDs once.
-Historical helpers still enumerate per read; their wall times include that cost.
+The optional historical replay uses local transport and enumerates per read.
 """
 import argparse
 import json
@@ -17,6 +17,10 @@ from benchmark_support import source_identity
 from remote import Fixture
 
 
+PACK_PATH = re.compile(r'/objects/pack(?:[/"> ]|$)|\.(?:pack|idx)(?:["> ]|$)')
+PACK_METADATA = re.compile(r'\b(?:getdents64|newfstatat|statx|openat|open|creat|rename(?:at2?)?)\(')
+
+
 def exercise(binary,count,before=False):
     f=Fixture()
     try:
@@ -27,11 +31,14 @@ def exercise(binary,count,before=False):
         tree=f.git('mktree',data=''.join(entries).encode())
         commit=f.git('commit-tree',tree,data=b'distinct demand fixture\n');f.git('update-ref','refs/heads/main',commit)
         trace=f.root/'trace'
-        argv=['strace','-ttt','-T','-yy','-e','trace=getdents64,newfstatat,statx','-o',str(trace),str(binary.resolve()),'file://'+str(f.repo),'HEAD']
+        source = 'file://' + str(f.repo) if before else f.https()
+        argv=['strace','-f','-yy','-e','trace=execve,getdents64,newfstatat,statx,openat,open,creat,rename,renameat,renameat2',
+              '-o',str(trace),str(binary.resolve()),source,'HEAD']
         if not before: argv.append('--metrics-only')
         commands=(''.join(f'read f{index:04d}\n' for index in range(count))*2+'report\nexit\n').encode()
         begin=time.monotonic_ns()
         result=subprocess.run(argv,cwd=f.cwd,env=f.env,input=commands,capture_output=True,check=True)
+        elapsed=time.monotonic_ns()-begin
         rows=[json.loads(row) for row in result.stdout.splitlines()]
         values=[row['data'] for row in rows if 'data' in row]
         assert values==[f'object-{i}\n' for i in range(count)]*2
@@ -47,19 +54,23 @@ def exercise(binary,count,before=False):
             assert second['remote_fetches']==first['remote_fetches'],'available run objects fetched again'
         pack_bytes=pack_metadata=0
         for line in trace.read_text().splitlines():
-            if '/remote-repository/objects/pack' not in line: continue
-            if re.search(r'\b(getdents64|newfstatat|statx)\(',line): pack_metadata+=1
+            if not before and 'execve(' in line:
+                assert not re.search(r'"/[^"]*/git-fetch",|"/[^"]*/git", \[[^]]*"fetch"', line), line
+            if not PACK_PATH.search(line): continue
+            if PACK_METADATA.search(line): pack_metadata+=1
             if 'getdents64(' in line:
                 returned=re.search(r'= (\d+) ',line)
                 if returned: pack_bytes+=int(returned.group(1))
         # source-probe owns and cleans its private run. Explicitly sampled live
         # retained pack counts are covered by the interactive permanent test.
         observation=dict(binary=str(binary),distinct_blobs=count,passes=2,pack_directory_bytes_enumerated=pack_bytes,
-            pack_metadata_syscalls=pack_metadata,elapsed_ns=time.monotonic_ns()-begin,metrics=second,
-            baseline=before,object_storage='private run ODB; second pass same run' if not before else 'historical global cache',measurement='loader-only strace; final OID enumeration once' if not before else 'historical helper enumerates OIDs per read')
+            pack_metadata_syscalls=pack_metadata,metrics=second,baseline=before,
+            transport='file' if before else 'https',
+            object_storage='streamed objects; second pass same run' if not before else 'historical global cache',
+            measurement='strace including children; final OID enumeration once' if not before else 'historical helper enumerates OIDs per read')
         if not before:
-            assert 0<pack_bytes<=2048*(count+2),observation
-            assert 0<pack_metadata<=64*(count+2),observation
+            observation['elapsed_ns']=elapsed
+            assert pack_bytes == pack_metadata == 0, observation
         return observation
     finally:f.close()
 

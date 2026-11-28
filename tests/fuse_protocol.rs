@@ -117,8 +117,7 @@ impl Peer {
             }
         }
         let oid = tree.write().unwrap();
-        let snapshot =
-            Snapshot::load(repo.path(), OsStr::new(&oid.to_string()), "protocol").unwrap();
+        let snapshot = Snapshot::load(repo.path(), OsStr::new(&oid.to_string())).unwrap();
         let overlay =
             Overlay::with_write_policy(snapshot, temp.path().join("upper"), policy).unwrap();
         let mut fds = [-1; 2];

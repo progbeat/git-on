@@ -43,55 +43,56 @@ separate from that contract; a requirement is not a claim of a passing test.
 - git-on has no built-in execution logs, durable run manifests, artifact export,
   or experiment-recording layer. Callers may record output externally.
 
-## Native Git argument compatibility
+## Source selection and observable state
 
-This compatibility is part of the original command contract. Corrections that
-restore native Git argument semantics are bug fixes, not a new git-on grammar.
-Native Git is the resolution authority for both local and remote operands.
-Consequently, direct local `git-on` execution also requires Git on `PATH`, even
-where the former Git-free resolver accepted a revision. Retiring that resolver
-is part of this bug fix; it does not require a major version increment.
+With one operand, native Git resolves the revision through
+`git rev-parse --verify --end-of-options`. Git interprets abbreviations,
+ancestry, reflogs and `HEAD:path`. With two operands, use native Git to resolve
+remote names and apply URL rewrites once, then classify the source by syntax.
+HTTPS URLs, SSH URLs and SCP-style addresses select network sources even if
+the same spelling names a local directory. With an explicit local source,
+including `file://` or a remote name that resolves to a local path, resolve the revision
+and read its objects as in `git -C PATH on REV`. A named remote uses the
+effective `remote.<name>.url` setting. Object directories and
+alternates follow native Git's repository setup, including bare repositories,
+linked worktrees and byte-valued paths. Do not interpret a local revision as
+a fetch destination.
 
-- With one operand, pass that exact `OsStr` as the revision argument to native
-  `git rev-parse --verify --end-of-options`. Git interprets its revision syntax,
-  including abbreviations, ancestry, reflogs and `HEAD:path`. Native Git is
-  required for local resolution as well as remote operations.
-- With two operands, pass the exact repository and revision/refspec arguments
-  to native `git fetch` in a private temporary Git repository. Git resolves
-  configured remotes, URLs, local paths, ref names, refspecs and their precedence.
-  A colon in this second operand is fetch syntax; git-on must not reinterpret
-  it as a remote subtree selector or strip a `+` prefix.
-- Do not implement an additional repository/revision grammar, reject operands
-  by character set or encoding, trim them, expand names, duplicate Git's
-  ambiguity checks or introduce host-specific resolution. Delegate acceptance
-  and diagnostics to the native Git operation, with argument boundaries that
-  prevent an operand from becoming an internal Git option. git-on's own option
-  and command-boundary checks remain its responsibility.
-- Resolve once before executing the command. The native fetch result must
-  identify one distinct selected object; a result with no object or multiple
-  different objects cannot identify the single snapshot. The selected object
-  must yield a Git tree. These are checks of Git's result, not operand syntax.
-  Signature verification examines the exact selected commit or annotated tag;
-  a tree returned by `HEAD:path` has no signature to verify.
-- Caller refs, index and working files must stay untouched. Fetch destinations
-  are confined to the private repository. Existing object-demand, filter,
-  cancellation, SSH ownership, cache and filesystem contracts still apply;
-  materialization cannot bypass any Git resolution, verification or object error.
-- Native operations use the caller's Git configuration and object-location
-  environment. Resolve local revisions and read the objects from the same
-  Git-selected object database, including object directories and alternates.
-  Relative object locations follow native Git's repository setup context,
-  including worktree subdirectories, bare repositories and explicit `GIT_DIR`.
-  Native fetch can invoke configured Git hooks for its private ref updates;
-  git-on does not introduce a checkout or run checkout filters on snapshot
-  content. Hooks and other configured helpers are caller programs with host
-  access, like the explicitly executed command; their side effects are not
-  confined by the snapshot's write policy.
-- Regression tests must compare acceptance, selected objects and diagnostics
-  against native Git in isolated fixture repositories. Include native ref
-  spellings and prefixes, colliding branch/tag names, literal fetch refspecs,
-  local paths, non-UTF-8 operands and invalid inputs. A short hash accepted by
-  local revision resolution must not be assumed accepted by remote fetch.
+The supported network profile is direct HTTPS with HTTP/2 or direct OpenSSH,
+both using Git protocol v2. Select `HEAD`, an exact ref, an unambiguous short branch
+or a full SHA-1 OID, then use the fixed OID throughout the invocation. The
+selected object must yield a tree. See [the remote guide](remote.md) for the
+supported configuration and authentication.
+
+Git-on may read repositories and receive remote objects. It may write its
+private runtime files, invocation caches and visible materialization or
+writable backing. Outside this service space, its own operations must leave
+repository refs, indexes, objects, configuration, worktree files, other user
+files and configuration, persistent credential state, and remote state
+unchanged. This applies to helper processes and to setup, cancellation,
+failure, completion and stale-run cleanup. Git-on creates no permanent clones,
+launches no system `git fetch` and executes no reference-update or fsmonitor
+hooks for source selection. The command after `--` follows the snapshot's
+write policy independently.
+
+With `--verify`, use `git verify-commit` for a commit OID or `git verify-tag`
+for an annotated tag OID, with the effective Git configuration and the
+configured verifier's normal profile. The ordinary effects of native
+`git verify-commit`, `git verify-tag`, and the configured verifier are
+outside Git-on's state guarantee. The target of a verified tag
+comes from that exact tag object. A moved ref cannot change the selected
+snapshot. A rejected signature or unavailable selected object prevents the
+child from starting. OpenSSH may run explicitly configured `Match exec`
+commands as it evaluates connection settings. Effects of those commands are
+outside Git-on's guarantee as well.
+
+Store decoded objects in memory. Only cache eviction writes raw payloads to
+private storage. Native Git may require private files for local index-revision
+resolution and remote signature verification. Use an existing writable tmpfs
+for that scratch state when available, otherwise use the private run under
+the system temporary directory. Delete it on exit and error. `--backend=copy`
+writes the visible selected tree and writable
+mounts may write private backing.
 
 ## Filesystem policy
 
@@ -119,27 +120,32 @@ The native mount and write-policy contracts apply to local and remote runs.
   directory renames keep demand-loaded source origins. Git objects, the index,
   and the working copy stay unchanged. Unsupported filesystem operations retain
   their existing error contracts.
+  Reads remain verified while a file is backed by its pinned Git object. Once
+  a write or truncation commits private writable backing, the whole file uses
+  ordinary I/O and normal passthrough eligibility, including inherited ranges.
 - The same rule governs all programs and languages. No Python, uv, Numba, cache,
   or environment-directory exception exists.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
-- The writable layer is fresh for each run. It uses private filesystem-backed
-  storage under the system temporary location and respects `TMPDIR`; git-on
-  creates no private memory filesystem and imposes no disk quota. The underlying
-  temporary filesystem's capacity and operating-system limits still apply.
-- Completion unmounts (when mounted) and deletes the private execution tree.
+- The writable layer is fresh for each run. Git-on creates a private directory,
+  normally in the system temporary location's `git-on` group or in a group
+  for the current user. Git-on publishes a new group with its ownership record
+  in place. If neither group is available, the run uses a private directory
+  directly under the system temporary location. The temporary filesystem's
+  capacity and operating-system limits apply.
+- Completion unmounts the snapshot when mounted and deletes the private run.
+  The last run removes its empty group when Git-on owns it.
   `--keep` and `-k` are removed before the separator; child argv remains literal.
   Host paths explicitly written by the command are outside this cleanup scope.
 - Handle recoverable resource errors through ordinary operation or runner
   failures and orderly cleanup whenever possible. Manual stale-run recovery
   does not justify abrupt termination for an error that can be handled.
 - Abrupt process or machine termination and busy mounts may require stale-run
-  cleanup. Minimal temporary recovery metadata is permitted for mount identity,
-  locking, releasing the exact Git pin and identifying the owned SSH socket;
-  it is not a run manifest or log.
-  `git on --cleanup <temporary-directory>` must refuse active directories, avoid unrelated mounts and changed pin targets, and
-  never terminate processes based on stale PIDs.
+  cleanup. Minimal temporary recovery metadata records mount identity and
+  identifies the owned SSH socket. Recovery refuses active directories, avoids
+  unrelated mounts, and leaves the source repository unchanged, including
+  references named in records written by earlier versions.
 - The filesystem is not a host security sandbox. This contract does not promise
   isolation from external files, processes, networks, or inherited credentials.
 
@@ -223,9 +229,11 @@ repositories with millions of paths. Native mounts must avoid full checkouts
 and complete in-memory copies of the selected tree.
 
 1. Before launching the child, git-on must not recursively enumerate the entire
-   selected tree, load every blob, or materialize all source files. Resolving and
-   pinning the selected tree and establishing the mount are permitted startup
-   work. Unvisited subtrees must not be traversed merely to start the command.
+   selected tree, load every blob, or materialize all source files. Selecting
+   the root tree OID and establishing the mount are permitted startup work.
+   Report a read error if an unfetched local object becomes unavailable, for
+   example after Git garbage collection. Unvisited subtrees must not be
+   traversed merely to start the command.
 2. Lookup, attributes, directory listing, and reads load metadata or contents
    needed for those operations. Listing a directory may decode that directory's
    tree object, but must not recursively enumerate its children. Resolving a
@@ -289,10 +297,11 @@ execution cost or inventing internal bytes; N=0 cases still use the complete
 materialize-plus-command comparison.
 
 One-time required fetch, decode and verification may happen lazily within the
-materialization budget. Immutable data already obtained/prepared must not be
-fetched or unpacked again in the same invocation, including close/reopen and
-decoded-memory-cache eviction. Invocation-local temporary storage must support
-that reuse; no global cache or cross-run reuse is introduced. Count all work,
+materialization budget. Prepared immutable source files remain reusable
+within the same invocation, including close/reopen and decoded-cache eviction.
+Extra delta bases received for Git pack decoding use a bounded compressed
+cache before their first demand. Invocation-local temporary storage supports
+reuse of prepared files. Count all work,
 including native Git children, rather than proving this contract from loader-only
 counters. Amortized/expected Big-O does not justify a large constant: minimizing
 measured real overhead also remains required.
@@ -369,10 +378,15 @@ not replace them or establish proof for all possible sequences.
 ## Implementation and verification
 
 The implementation uses a shared pinned object store, demand-only metadata/blob
-access, a byte-budgeted content LRU and deferred inode creation. The LRU retains
-at most one entry per original OID across all readers: a complete small object
-or one large-file block. Trusted descriptors/block hashes and parsed directories
-remain in RAM for touched unique objects outside that payload budget. Raw tree
+access, content caches and deferred inode creation. A byte-budgeted LRU holds
+small blobs and reused disk blocks. A separate LRU retains the eight most
+recently used complete large blobs, with capacity measured in objects. A
+first read from a local or remote repository can load a whole large blob for
+a range. After eviction, disk reads verify just the blocks they touch.
+Network copy uses a 128 MiB payload LRU for complete blobs before
+materialization. Readers of the same OID share verified buffers. Trusted
+descriptors, digests of spilled blocks and parsed directories remain in RAM for
+touched unique objects outside that payload budget. Raw tree
 bytes and disk object/name indexes are not retained. The FUSE layer retains no
 duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail

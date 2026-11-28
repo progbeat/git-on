@@ -32,7 +32,19 @@ pub(crate) struct Directory {
 impl Directory {
     pub(crate) fn verified(oid: Oid, size: usize, input: impl Read) -> Result<Self> {
         let mut input = Checked::new(input, size);
-        let mut parser = Parser::new(&mut input);
+        let directory = Self::parse(&mut input)?;
+        input.finish(oid)?;
+        Ok(directory)
+    }
+    pub(crate) fn from_verified_pack(object: &crate::pack_stream::VerifiedObject) -> Result<Self> {
+        anyhow::ensure!(
+            object.kind() == git2::ObjectType::Tree,
+            "pack object is not a tree"
+        );
+        Self::parse(object.data())
+    }
+    fn parse(input: impl Read) -> Result<Self> {
+        let mut parser = Parser::new(input);
         let mut entries = Vec::new();
         let mut names = HashMap::new();
         while let Some(item) = parser.next()? {
@@ -49,10 +61,6 @@ impl Directory {
                 oid: item.oid,
             });
         }
-        drop(parser);
-        // Parsing and hashing consume exactly the same stream. Neither entries
-        // nor negative lookup results become observable before full OID trust.
-        input.finish(oid)?;
         let weight = std::mem::size_of::<Self>()
             + entries.capacity() * std::mem::size_of::<Node>()
             + entries

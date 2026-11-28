@@ -163,18 +163,12 @@ impl PreparedBlob {
 
 pub fn materialize(snapshot: &Snapshot, root: &Path) -> Result<()> {
     snapshot.set_spool_directory(root)?;
-    snapshot.begin_materialization()?;
-    let batch_size = if crate::spool::Files::size_limit()?.is_some() {
-        1
-    } else {
-        256
-    };
     directory(
         snapshot,
         Path::new(""),
         root,
         &mut std::collections::HashMap::new(),
-        batch_size,
+        snapshot.has_copy_spills()?,
     )
 }
 fn directory(
@@ -182,125 +176,126 @@ fn directory(
     relative: &Path,
     root: &Path,
     prepared: &mut std::collections::HashMap<git2::Oid, PreparedBlob>,
-    batch_size: usize,
+    adopt_spills: bool,
 ) -> Result<()> {
-    let mut children = snapshot.children(relative)?.into_iter();
     let mut expected = std::collections::HashSet::new();
-    loop {
-        let batch: Vec<_> = children.by_ref().take(batch_size).collect();
-        if batch.is_empty() {
-            break;
+    for (name, entry) in snapshot.children(relative)? {
+        if let Some(signal) = crate::git::cancelled_signal() {
+            bail!("materialization cancelled by signal {signal}");
         }
-        snapshot.prepare_materialization(&batch, |oid| prepared.contains_key(&oid))?;
-        for (name, entry) in batch {
-            if let Some(signal) = crate::git::cancelled_signal() {
-                bail!("materialization cancelled by signal {signal}");
-            }
-            let bytes = name.as_bytes();
-            ensure!(
-                !bytes.is_empty()
-                    && bytes != b"."
-                    && bytes != b".."
-                    && !bytes.contains(&b'/')
-                    && !bytes.contains(&0),
-                "unsupported snapshot name {:?}",
-                name
-            );
-            let relative = relative.join(&name);
-            let path = root.join(&relative);
-            ensure!(
-                entry.mode != 0o160000,
-                "submodules are unsupported: {}",
-                relative.display()
-            );
-            let result = (|| -> Result<()> {
-                match entry.kind {
-                    EntryKind::Directory => {
-                        fs::create_dir(&path)?;
-                        directory(snapshot, &relative, root, prepared, batch_size)?;
-                        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-                        ensure!(
-                            fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
-                            "host cannot preserve directory permissions"
-                        );
+        let bytes = name.as_bytes();
+        ensure!(
+            !bytes.is_empty()
+                && bytes != b"."
+                && bytes != b".."
+                && !bytes.contains(&b'/')
+                && !bytes.contains(&0),
+            "unsupported snapshot name {:?}",
+            name
+        );
+        let relative = relative.join(&name);
+        let path = root.join(&relative);
+        ensure!(
+            entry.mode != 0o160000,
+            "submodules are unsupported: {}",
+            relative.display()
+        );
+        let result = (|| -> Result<()> {
+            match entry.kind {
+                EntryKind::Directory => {
+                    fs::create_dir(&path)?;
+                    directory(snapshot, &relative, root, prepared, adopt_spills)?;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+                    ensure!(
+                        fs::metadata(&path)?.permissions().mode() & 0o777 == 0o755,
+                        "host cannot preserve directory permissions"
+                    );
+                }
+                EntryKind::Symlink => {
+                    let mut target = Vec::new();
+                    if let Some(source) = prepared.get(&entry.oid) {
+                        source.copy_to(root, entry.oid, &mut target)?;
+                    } else {
+                        snapshot.copy_verified_blob(entry.oid, &mut target)?;
                     }
-                    EntryKind::Symlink => {
-                        let target = if let Some(source) = prepared.get(&entry.oid) {
-                            let mut target = Vec::new();
-                            source.copy_to(root, entry.oid, &mut target)?;
-                            ensure!(
-                                !target.is_empty() && !target.contains(&0),
-                                "unusable symlink target"
-                            );
-                            target
-                        } else {
-                            let mut target = Vec::new();
-                            snapshot.copy_verified_blob(entry.oid, &mut target)?;
-                            ensure!(
-                                !target.is_empty() && !target.contains(&0),
-                                "unusable symlink target"
-                            );
-                            target
-                        };
-                        symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
-                        ensure!(
-                            fs::read_link(&path)?.as_os_str().as_bytes() == target,
-                            "host cannot preserve symlink target"
-                        );
-                        prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
-                            path: relative.clone(),
-                            size: target.len() as u64,
-                            kind: entry.kind,
-                        });
-                    }
-                    EntryKind::File => {
+                    ensure!(
+                        !target.is_empty() && !target.contains(&0),
+                        "unusable symlink target"
+                    );
+                    symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
+                    ensure!(
+                        fs::read_link(&path)?.as_os_str().as_bytes() == target,
+                        "host cannot preserve symlink target"
+                    );
+                    prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
+                        path: relative.clone(),
+                        size: target.len() as u64,
+                        kind: entry.kind,
+                    });
+                }
+                EntryKind::File => {
+                    let previous = prepared.get(&entry.oid);
+                    let installed = if adopt_spills && previous.is_none() {
+                        snapshot.install_spilled_blob(entry.oid, &path)?
+                    } else {
+                        None
+                    };
+                    let (output, new_size) = if let Some((output, size)) = installed {
+                        (output, Some(size))
+                    } else {
                         let mut output = OpenOptions::new()
                             .write(true)
                             .create_new(true)
                             .mode(0o600)
                             .custom_flags(libc::O_NOFOLLOW)
                             .open(&path)?;
-                        if let Some(source) = prepared.get(&entry.oid) {
-                            // Reuse decoded bytes across directories, while checking
-                            // the copied buffers against the original OID. Prepared
-                            // files are mutable disk and cannot be trusted on reopen.
+                        let size = if let Some(source) = previous {
+                            // Reopened files must still match the original OID.
                             source.copy_to(root, entry.oid, &mut output)?;
+                            None
                         } else {
-                            let size = snapshot.copy_verified_blob(entry.oid, &mut output)?;
-                            prepared.insert(
-                                entry.oid,
-                                PreparedBlob {
-                                    path: relative.clone(),
-                                    size,
-                                    kind: entry.kind,
-                                },
-                            );
-                        }
-                        let mode = entry.mode & 0o777;
-                        output.set_permissions(fs::Permissions::from_mode(mode))?;
-                        ensure!(
-                            output.metadata()?.permissions().mode() & 0o777 == mode,
-                            "host cannot preserve executable/permission bits"
+                            Some(snapshot.copy_verified_blob(entry.oid, &mut output)?)
+                        };
+                        (output, size)
+                    };
+                    if let Some(size) = new_size {
+                        prepared.insert(
+                            entry.oid,
+                            PreparedBlob {
+                                path: relative.clone(),
+                                size,
+                                kind: entry.kind,
+                            },
                         );
                     }
+                    let mode = entry.mode & 0o777;
+                    output.set_permissions(fs::Permissions::from_mode(mode))?;
+                    ensure!(
+                        output.metadata()?.permissions().mode() & 0o777 == mode,
+                        "host cannot preserve executable/permission bits"
+                    );
                 }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-                {
-                    let existing =
-                        fs::read_dir(path.parent().context("missing materialized parent")?)?
-                            .map(|entry| entry.map(|entry| entry.file_name()))
-                            .collect::<std::io::Result<Vec<_>>>()?;
-                    bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
-                }
-                return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
             }
-            expected.insert(name);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::raw_blob::BackingError>()
+                        .map(|e| &e.0)
+                })
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                let existing = fs::read_dir(path.parent().context("missing materialized parent")?)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                bail!("snapshot path {} collides with existing host entries {:?}; this filesystem cannot represent the snapshot faithfully", relative.display(), existing);
+            }
+            return Err(error).with_context(|| format!("cannot faithfully materialize {} (unsupported name, symlink/permission limitation, or object error)", relative.display()));
         }
+        expected.insert(name);
     }
     let actual = fs::read_dir(root.join(relative))?
         .map(|e| e.map(|e| e.file_name()))
@@ -335,12 +330,8 @@ mod tests {
         root.insert("b-link", link_first, 0o120000).unwrap();
         root.insert("directory", child, 0o040000).unwrap();
         let tree = root.write().unwrap();
-        let snapshot = Snapshot::load(
-            source.path(),
-            std::ffi::OsStr::new(&tree.to_string()),
-            "eager-reuse",
-        )
-        .unwrap();
+        let snapshot =
+            Snapshot::load(source.path(), std::ffi::OsStr::new(&tree.to_string())).unwrap();
         let storage = tempfile::tempdir().unwrap();
         let destination = storage.path().join("view");
         fs::create_dir(&destination).unwrap();

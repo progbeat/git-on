@@ -15,6 +15,10 @@ use std::{
 
 mod demand;
 
+pub(super) struct DemandFailure {
+    operations_left: u32,
+}
+
 pub(super) const LEASE_SECONDS: u32 = 90;
 const MAX_CLIENTS: usize = 8;
 const MAX_SESSIONS: usize = 4;
@@ -54,7 +58,23 @@ struct Slot {
 struct Replay {
     digest: [u8; 32],
     credentials: Credentials,
-    reply: Vec<u8>,
+    reply: Arc<Vec<u8>>,
+}
+
+pub(super) struct RpcReply {
+    pub(super) header: Vec<u8>,
+    pub(super) body: Option<Arc<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl RpcReply {
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        let Self { mut header, body } = self;
+        if let Some(body) = body {
+            header.extend_from_slice(&body);
+        }
+        header
+    }
 }
 
 struct Session {
@@ -225,8 +245,18 @@ impl Server {
         self.drop_expired_directories(now, lease);
     }
 
+    #[cfg(test)]
     pub fn rpc(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        self.rpc_after_demand(data, None).map(RpcReply::into_bytes)
+    }
+
+    pub(super) fn rpc_after_demand(
+        &mut self,
+        data: &[u8],
+        failure: Option<DemandFailure>,
+    ) -> Option<RpcReply> {
         let mut w = Writer::default();
+        let mut body = None;
         let call = match protocol::rpc(data) {
             Ok((xid, call)) => {
                 w.u32(xid);
@@ -265,8 +295,13 @@ impl Server {
                     Some(Rpc::Compound(credentials, request)) => {
                         if let Ok(compound) = protocol::compound(request) {
                             w.u32(0);
-                            let reply = self.compound(compound, credentials, request, data.len());
-                            w.fixed(&reply);
+                            body = Some(self.compound(
+                                compound,
+                                credentials,
+                                request,
+                                data.len(),
+                                failure,
+                            ));
                         } else {
                             w.u32(4); // GARBAGE_ARGS
                         }
@@ -276,7 +311,10 @@ impl Server {
                 }
             }
         }
-        Some(w.into_bytes())
+        Some(RpcReply {
+            header: w.into_bytes(),
+            body,
+        })
     }
 
     fn compound(
@@ -285,7 +323,8 @@ impl Server {
         credentials: Credentials,
         raw_request: &[u8],
         request_size: usize,
-    ) -> Vec<u8> {
+        failure: Option<DemandFailure>,
+    ) -> Arc<Vec<u8>> {
         let mut reply = Writer::default();
         reply.u32(OK);
         reply.opaque(request.tag);
@@ -294,10 +333,10 @@ impl Server {
 
         if request.minor != 1 {
             reply.patch_u32(0, MINOR_MISMATCH);
-            return reply.into_bytes();
+            return Arc::new(reply.into_bytes());
         }
         if request.count == 0 {
-            return reply.into_bytes();
+            return Arc::new(reply.into_bytes());
         }
         let mut context = Context::new(credentials);
         let mut budget = MAX_RECORD - RPC_REPLY_HEADER;
@@ -309,7 +348,9 @@ impl Server {
                 break;
             };
             let operation = protocol::operation(opcode, &mut request.ops);
-            let mut payload = Writer::default();
+            let result_at = reply.len();
+            reply.u32(opcode);
+            reply.u32(OK);
             let mut result_opcode = opcode;
 
             let status = match operation {
@@ -336,7 +377,7 @@ impl Server {
                                     digest,
                                     request_size,
                                     request.count,
-                                    &mut payload,
+                                    &mut reply,
                                 ) {
                                     Ok(Sequenced::Replay(replay)) => return replay,
                                     Ok(Sequenced::New(client, max_reply)) => {
@@ -349,18 +390,17 @@ impl Server {
                                 }
                             }
                             Operation::Sequence(_) => Err(SEQUENCE_POS),
+                            _ if failure
+                                .as_ref()
+                                .is_some_and(|f| request.count - i == f.operations_left) =>
+                            {
+                                Err(IO)
+                            }
                             op => {
                                 // Always leave room to report a subsequent operation's error.
                                 let tail = if i + 1 < request.count { 12 } else { 0 };
-                                let limit = budget.saturating_sub(reply.len() + 8 + tail);
-                                self.perform(
-                                    op,
-                                    &mut context,
-                                    request.count,
-                                    i,
-                                    limit,
-                                    &mut payload,
-                                )
+                                let limit = budget.saturating_sub(reply.len() + tail);
+                                self.perform(op, &mut context, request.count, i, limit, &mut reply)
                             }
                         }
                     }
@@ -373,24 +413,25 @@ impl Server {
                     self.io_error();
                 }
                 if error == DENIED {
-                    reply.u32(result_opcode);
-                    reply.u32(error);
-                    reply.fixed(payload.bytes());
+                    reply.patch_u32(result_at + 4, error);
                 } else {
+                    reply.truncate(result_at);
                     operation_error(result_opcode, error, &mut reply);
                 }
                 reply.patch_u32(0, error);
                 break;
             }
-            reply.u32(result_opcode);
-            reply.u32(OK);
-            reply.fixed(payload.bytes());
         }
         for ino in context.closed_inodes {
             self.core.forget_inode(ino, 1);
         }
         reply.patch_u32(count_at, count);
-        let reply = reply.into_bytes();
+        // The socket and the replay slot share the exact same response body.
+        let mut bytes = reply.into_bytes();
+        if replay_slot.is_some() && bytes.capacity() > budget {
+            bytes.shrink_to_fit();
+        }
+        let reply = Arc::new(bytes);
         if let Some((sequence, digest)) = replay_slot {
             if let Some(session) = self.sessions.get_mut(&sequence.session) {
                 session.slots[sequence.slot as usize] = Slot {
@@ -628,6 +669,7 @@ impl Server {
                 slots: (0..channel.slots).map(|_| Slot::default()).collect(),
             },
         );
+        let start = w.len();
         w.fixed(&id);
         w.u32(request.sequence);
         w.u32(0); // volatile, no callback connection, no RDMA
@@ -640,7 +682,7 @@ impl Server {
         client.confirmed = true;
         client.active = Instant::now();
         client.next_sequence = request.sequence.wrapping_add(1);
-        client.create_reply = Some((request.sequence, w.bytes().to_vec()));
+        client.create_reply = Some((request.sequence, w.bytes()[start..].to_vec()));
         Ok(())
     }
 
@@ -690,7 +732,7 @@ impl Server {
 
 enum Sequenced {
     New(u64, usize),
-    Replay(Vec<u8>),
+    Replay(Arc<Vec<u8>>),
 }
 
 #[cfg(test)]

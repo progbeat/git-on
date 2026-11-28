@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 import unittest
+from support.run_storage import run_directories
 
 SPEC = importlib.util.spec_from_file_location(
     'git_on_ssh_regressions', Path(__file__).with_name('ssh_regressions.py'))
@@ -138,18 +139,17 @@ class NativeJobControlTests(unittest.TestCase):
         shell.send((shlex.join(argv) + '\n').encode())
         shell.expect(b"identity': ")
         runner, = children(shell.pid)
-        git, = children(runner)
-        self.runner, self.native_group = runner, os.getpgid(git)
+        helper, = children(runner)
+        self.runner, self.native_group = runner, os.getpgid(helper)
         shell.groups.update((runner, self.native_group))
         self.assertEqual(os.getpgid(runner), runner)
-        self.assertEqual(self.native_group, git)
+        self.assertEqual(self.native_group, helper)
         self.assertNotEqual(self.native_group, runner)
-        self.assertEqual(os.getsid(git), shell.pid if native_terminal else git)
+        self.assertEqual(os.getsid(helper), shell.pid if native_terminal else helper)
         self.assertEqual(os.tcgetpgrp(shell.fd), self.native_group if native_terminal else runner)
-        transports = children(git)
-        self.assertTrue(transports, 'real native Git did not own an SSH transport')
-        self.transport_pids = transports
-        self.assertTrue(any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh' for pid in transports))
+        self.transport_pids = [helper, *children(helper)]
+        self.assertTrue(any(Path(f'/proc/{pid}/exe').resolve().name == 'ssh'
+                            for pid in self.transport_pids), 'the job did not own an SSH process')
 
     def stop_authentication(self):
         self.begin_authentication()
@@ -188,7 +188,7 @@ class NativeJobControlTests(unittest.TestCase):
         shell.expect(f'native-job-status={expected}\r\n'.encode())
         shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd), shell.pid)
-        self.assertEqual(list(self.f.root.glob('git-on-*')), [], 'runner leaked recovery state')
+        self.assertEqual(run_directories(self.f.root), [], 'runner leaked recovery state')
         self.assertEqual(list(self.f.root.glob('*/ssh-control')), [], 'runner leaked SSH socket')
         if expected == 125:
             self.assertIn(b'native Git verify-commit failed', output)
@@ -243,7 +243,7 @@ class NativeJobControlTests(unittest.TestCase):
                     argv=[shutil.which('env'),'-u','SSH_ASKPASS','SSH_ASKPASS_REQUIRE=force']
                     if helper=='empty':argv.append('SSH_ASKPASS=')
                     if backend=='materialized':argv.append('PATH='+str(tools))
-                    argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1"; shift; exec "$@"',
+                    argv.extend(['/bin/sh','-c','printf "%s" "$$" > "$1.tmp"; /bin/mv "$1.tmp" "$1"; shift; exec "$@"',
                                  'fixture',str(runner_file),str(remote.OPTIONS.binary),self.url,
                                  'HEAD','--verify',*(['--write-policy=all'] if backend=='materialized' else []),'--','/bin/true'])
                     shell.send((shlex.join(argv)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
@@ -258,7 +258,7 @@ class NativeJobControlTests(unittest.TestCase):
                     shell.groups.clear()
                     self.assertIn(b'\r\nASKPASS-STATUS:125\r\n',output)
                     self.assertNotIn(b"identity': ",output)
-                    self.assertEqual(list(f.root.glob('git-on-*')),[])
+                    self.assertEqual(run_directories(f.root),[])
                     if backend=='materialized':self.assertIn(b'Permission denied',output)
 
 
@@ -286,9 +286,9 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
         shell.send((shlex.join(command)+'; printf "ASKPASS-STATUS:%d\\n" "$?"\n').encode())
         output=shell.expect(shell.prompt,timeout=20)
         self.assertIn(b'\r\nASKPASS-STATUS:0\r\n',output)
-        self.assertEqual(list(f.root.glob('git-on-*')),[])
+        self.assertEqual(run_directories(f.root),[])
 
-    def test_repeated_managed_credentials_keep_foreground_and_finish_materialization(self):
+    def test_managed_credentials_keep_foreground_and_finish_materialization(self):
         import base64
         f=remote.Fixture(); self.addCleanup(f.close)
         # Fork the shell before starting the fixture's HTTPS server thread.
@@ -320,11 +320,6 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                  str(remote.OPTIONS.binary),url,'HEAD','--write-policy=all','--',
                  sys.executable,'-I','-S','-c',
                  "from pathlib import Path; assert Path('deep/file').read_bytes()==b'expected\\n'; print('https-helper-command-ok')"]
-        # A finite per-file limit retains bounded object transfers, so this
-        # scenario continues to exercise authentication on subsequent fetches.
-        command=[sys.executable,'-c',
-                 'import os,resource,sys; resource.setrlimit(resource.RLIMIT_FSIZE,(1048576,1048576)); os.execv(sys.argv[1],sys.argv[1:])',
-                 *command]
         shell.send((shlex.join(command)+'\n').encode())
         prompts=0; deadline=time.monotonic()+20
         while b'\r\nhttps-helper-command-ok\r\n' not in shell.pending:
@@ -339,13 +334,13 @@ class HttpsCredentialTerminalTests(unittest.TestCase):
                                  'credential helper took the terminal from git-on')
                 shell.send(b'fixture-token\n'); prompts+=1
             else: shell.read()
-        self.assertGreaterEqual(prompts,2,'fixture did not exercise authentication after initial fetch')
+        self.assertEqual(prompts,1,'expected one credential lookup for the stream')
         shell.expect(shell.prompt)
         shell.groups.clear()
         shell.send(b'printf "https-helper-status=%s\\n" "$?"\n')
         shell.expect(b'https-helper-status=0\r\n'); shell.expect(shell.prompt)
         self.assertEqual(os.tcgetpgrp(shell.fd),shell.pid)
-        self.assertEqual(list(f.root.glob('git-on-*')),[],'HTTPS run leaked temporary storage')
+        self.assertEqual(run_directories(f.root),[],'HTTPS run leaked temporary storage')
 
 
 def replay_baseline():

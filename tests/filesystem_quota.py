@@ -33,7 +33,7 @@ def _allocated():
 
 
 def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, source=None,
-                     write_policy='all', git_config=None):
+                     write_policy='all', git_config=None, tls_ca=None):
     unshare=shutil.which('unshare')
     if not unshare:
         if os.environ.get('GITHUB_ACTIONS')=='true':test.fail('unshare is required for quota coverage')
@@ -56,7 +56,7 @@ def compare_on_tmpfs(test, root, binary, repo, programs, command, size_mib=9, so
     driver=r'''
 import json,os,shutil,subprocess,sys
 from pathlib import Path
-volume,binary,repo,mount,programs,uid,gid,command,size,source,policy,config=sys.argv[1:]
+volume,binary,repo,mount,programs,uid,gid,command,size,source,policy,config,tls_ca=sys.argv[1:]
 uid,gid,size=int(uid),int(gid),int(size);volume=Path(volume);command=json.loads(command)
 subprocess.run([mount,'-t','tmpfs','-o',f'size={size}m,mode=700,uid={uid},gid={gid}','tmpfs',str(volume)],check=True)
 if os.geteuid()==0 and uid!=0:
@@ -66,6 +66,7 @@ home=volume/'home';home.mkdir()
 env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
 env.update(PATH=programs,TMPDIR=str(temporary),HOME=str(home),XDG_CONFIG_HOME=str(home/'config'),
            GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1')
+if tls_ca:env['GIT_SSL_CAINFO']=tls_ca
 config=json.loads(config)
 env['GIT_CONFIG_COUNT']=str(len(config))
 for index,(key,value) in enumerate(config.items()):
@@ -90,6 +91,6 @@ print('git-on + command passed on tmpfs',flush=True)
     result=subprocess.run([*prefix,sys.executable,'-I','-S','-c',driver,str(volume),str(binary),
                            str(repo),shutil.which('mount'),programs,str(uid),str(gid),
                            json.dumps(command),str(size_mib),source or '',write_policy,
-                           json.dumps(git_config or {})],capture_output=True,timeout=30)
+                           json.dumps(git_config or {}),tls_ca or ''],capture_output=True,timeout=30)
     test.assertEqual(result.returncode,0,result.stderr)
     test.assertIn(b'git-on + command passed on tmpfs',result.stdout)

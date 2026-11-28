@@ -88,6 +88,10 @@ impl Writer {
         self.bytes
     }
 
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(len);
+    }
+
     pub(super) fn fixed(&mut self, value: &[u8]) {
         self.bytes.extend_from_slice(value);
     }

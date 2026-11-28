@@ -207,14 +207,18 @@ macOS uses the [separate NFSv4.1 protocol adapter](nfs.md). Linux FUSE
 acceptance runs on a host with a real FUSE device.
 
 Linux passthrough uses FUSE_PASSTHROUGH, FUSE_DEV_IOC_BACKING_OPEN/CLOSE and
-FOPEN_PASSTHROUGH for command-created regular files only, after policy and access
-checks. Create/open handles share one BackingId per inode, retained through
-release. Git-backed and copied-up tracked inodes never qualify. getattr refreshes
+FOPEN_PASSTHROUGH for physically backed writable regular files after policy
+and access checks. Create/open handles share one BackingId per inode, retained
+through release. A tracked file can qualify on reopen after copy-up and the
+release of its ordinary FUSE handles, provided its attributes can be preserved.
+getattr refreshes
 size, blocks and data timestamps from the backing descriptor without replacing
 logical overlay mode, uid, gid or link count. Lack of the kernel capability,
 CAP_SYS_ADMIN or a successful registration retains userspace I/O on this same
 FUSE mount. No new privileged child, detached process or early teardown exists.
 
 `tests/passthrough.py` must establish real negotiation and bypass, metadata,
-reopen/truncate, executable and mmap behavior on a capable kernel. Protocol
+reopen/truncate, executable and mmap behavior on a capable kernel. Its tracked
+file control checks a simultaneous cached reopen, a later passthrough reopen,
+preserved bytes and timestamps, and read callback counts. Protocol
 responses and ordinary mount tests alone do not demonstrate kernel bypass.

@@ -1,11 +1,15 @@
 //! Native Git configuration and signature policy. No replacement objects.
 use anyhow::{bail, Context, Result};
-use git2::Oid;
+use git2::{ObjectType, Oid};
+
+mod index;
 use std::{
     ffi::{OsStr, OsString},
+    io::{BufRead, Read, Write},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
 };
 
 #[derive(Debug, Clone)]
@@ -13,12 +17,139 @@ pub struct Git {
     pub cwd: PathBuf,
     config: Vec<(OsString, Option<OsString>)>,
     original_dir: Option<PathBuf>,
+    remote: Option<OsString>,
 }
+
+pub(crate) struct HttpsOptions {
+    pub(crate) ca: Option<PathBuf>,
+    pub(crate) extra_header: Option<String>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) follow_initial_redirects: bool,
+}
+
+fn remote_property<'a>(name: &OsStr, key: &'a OsStr) -> Option<&'a [u8]> {
+    key.as_bytes()
+        .strip_prefix(b"remote.")?
+        .strip_prefix(name.as_bytes())?
+        .strip_prefix(b".")
+}
+
+pub(crate) fn read_only(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    for (name, _) in std::env::vars_os() {
+        if name.as_bytes().starts_with(b"GIT_TRACE") {
+            command.env_remove(name);
+        }
+    }
+    // Trace2 also reads target paths from effective Git configuration.
+    command
+        .env("GIT_TRACE2", "0")
+        .env("GIT_TRACE2_EVENT", "0")
+        .env("GIT_TRACE2_PERF", "0")
+}
+
+pub(crate) fn native_scratch(run: &Path, prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = std::fs::Permissions::from_mode(0o700);
+    #[cfg(target_os = "linux")]
+    if let Some(id) = std::fs::read(run.join(".state"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|state| uuid::Uuid::parse_str(state.get("id")?.as_str()?).ok())
+    {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        for parent in runtime
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([Path::new("/dev/shm")])
+            .filter(|path| path.is_absolute())
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .filter(|path| is_tmpfs(path))
+        {
+            let name = format!("git-on-native-{id}");
+            let marker = run.join(".native-scratch");
+            // Register the exact path before it can contain anything. The
+            // symlink preserves byte paths and is created atomically.
+            match std::os::unix::fs::symlink(parent.join(&name), &marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => break,
+                Err(error) => return Err(error),
+            }
+            let mut builder = tempfile::Builder::new();
+            builder
+                .prefix(&name)
+                .rand_bytes(0)
+                .permissions(permissions.clone());
+            match builder.tempdir_in(&parent) {
+                Ok(directory) => return Ok(directory),
+                Err(error) => {
+                    std::fs::remove_file(marker)?;
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        break;
+                    }
+                }
+            };
+        }
+    }
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(permissions)
+        .tempdir_in(run)
+}
+
+#[cfg(target_os = "linux")]
+fn is_tmpfs(path: &Path) -> bool {
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    unsafe {
+        libc::statfs(name.as_ptr(), stats.as_mut_ptr()) == 0
+            && stats.assume_init().f_type == libc::TMPFS_MAGIC
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn cleanup_native_scratch(run: &Path, id: &str) -> Result<()> {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let target = match fs::read_link(run.join(".native-scratch")) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read native Git scratch record"),
+    };
+    let name = format!("git-on-native-{}", uuid::Uuid::parse_str(id)?);
+    anyhow::ensure!(
+        target.is_absolute() && target.file_name() == Some(OsStr::new(&name)),
+        "invalid native Git scratch record"
+    );
+    let metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect native Git scratch"),
+    };
+    let parent = target
+        .parent()
+        .context("missing native Git scratch parent")?;
+    anyhow::ensure!(
+        fs::canonicalize(parent)? == parent
+            && is_tmpfs(parent)
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "native Git scratch ownership changed"
+    );
+    fs::remove_dir_all(target).context("remove native Git scratch")
+}
+
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
         let mut command = Command::new("git");
-        command
+        read_only(&mut command)
             .current_dir(cwd)
+            .env_remove("GIT_CONFIG")
             .args(["config", "--null", "--list", "--includes"])
             .stdin(Stdio::null());
         let output = run(command, true).map_err(|error| {
@@ -53,9 +184,10 @@ impl Git {
         Ok(Self {
             cwd: cwd.to_path_buf(),
             config,
+            remote: None,
             original_dir: {
                 let mut command = Command::new("git");
-                command
+                read_only(&mut command)
                     .current_dir(cwd)
                     .args(["rev-parse", "--absolute-git-dir"])
                     .stdin(Stdio::null());
@@ -70,12 +202,49 @@ impl Git {
             },
         })
     }
+    pub(crate) fn select_remote(&mut self, name: &OsStr) -> bool {
+        let named = self
+            .config
+            .iter()
+            .any(|(key, _)| remote_property(name, key) == Some(b"url"));
+        self.remote = named.then(|| name.to_os_string());
+        named
+    }
+
+    pub(crate) fn worktree_root(&self) -> Result<Option<PathBuf>> {
+        let mut command = self.command(None);
+        read_only(&mut command)
+            .args(["rev-parse", "--show-toplevel"])
+            .stdin(Stdio::null());
+        let output = run(command, true)?;
+        Ok(output.status.success().then(|| {
+            PathBuf::from(OsStr::from_bytes(
+                output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout),
+            ))
+        }))
+    }
+
+    pub(crate) fn transport_directory(&self) -> Result<PathBuf> {
+        if self.original_dir.is_none() {
+            return Ok(self.cwd.clone());
+        }
+        Ok(self.worktree_root()?.unwrap_or_else(|| self.cwd.clone()))
+    }
+
+    fn transport_path(&self, path: PathBuf) -> Result<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        Ok(self.transport_directory()?.join(path))
+    }
+
+    fn selected_remote_property<'a>(&self, key: &'a OsStr) -> Option<&'a [u8]> {
+        remote_property(self.remote.as_deref()?, key)
+    }
+
     pub fn command(&self, dir: Option<&Path>) -> Command {
         let mut command = Command::new("git");
-        command
-            .current_dir(&self.cwd)
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_NO_LAZY_FETCH", "1");
+        command.current_dir(&self.cwd);
         if let Some(dir) = dir {
             if self.original_dir.as_deref() != Some(dir) {
                 // Replay each effective value exactly once in the private repo.
@@ -88,8 +257,8 @@ impl Git {
                 for (key, value) in &self.config {
                     // Object/ref storage belongs to the private repository,
                     // rather than the caller's format. Replaying format zero
-                    // over a newly created promisor pack would make native Git
-                    // reject its intentionally missing tree objects.
+                    // over a private signature repository could make
+                    // native Git open that repository in the wrong format.
                     if key == "core.repositoryformatversion"
                         || key.as_bytes().starts_with(b"extensions.")
                         // The deprecated loose-object durability switch can
@@ -123,28 +292,41 @@ impl Git {
                 .arg(dir)
                 .args(["-c", "core.bare=true"]);
         }
+        self.set_helper_environment(&mut command);
+        command
+    }
+
+    pub(crate) fn set_helper_environment(&self, command: &mut Command) {
+        command
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1");
         if let Some(program) = self.config.iter().rev().find_map(|(key, value)| {
             (key == "core.askpass")
                 .then_some(value.as_deref())
                 .flatten()
         }) {
-            crate::terminal_ui::core_askpass(&mut command, program);
+            crate::terminal_ui::core_askpass(command, program);
         }
-        command
     }
     pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
-        // Keep caller-defined server programs, server options and fsck policy
-        // on native fetch's complete compatibility path.
-        if self.config.iter().any(|(key, value)| {
-            let key = key.as_bytes();
-            key.ends_with(b".uploadpack")
-                || key.ends_with(b".vcs")
-                || key.ends_with(b".serveroption")
-                || key.starts_with(b"fsck.")
-                || key == b"fetch.fsckobjects"
-                || key == b"transfer.fsckobjects"
-                || (key == b"protocol.version" && value.as_deref() != Some(OsStr::new("2")))
-        }) {
+        // Reject server and validation policies the direct loader cannot honor.
+        let protocol = self.config_value("protocol.version");
+        let fsck = self
+            .config_value("fetch.fsckobjects")
+            .or_else(|| self.config_value("transfer.fsckobjects"));
+        if protocol.is_some_and(|value| value != Some(OsStr::new("2")))
+            || fsck.is_some_and(|value| {
+                value
+                    .and_then(OsStr::to_str)
+                    .is_none_or(|value| git2::Config::parse_bool(value).unwrap_or(true))
+            })
+            || self.config.iter().any(|(key, _)| {
+                matches!(
+                    self.selected_remote_property(key),
+                    Some(b"uploadpack" | b"vcs" | b"serveroption")
+                )
+            })
+        {
             return Ok(false);
         }
 
@@ -152,9 +334,9 @@ impl Git {
             return Ok(true);
         };
         // Git exports its standard helper directory to external subcommands.
-        // A genuinely custom directory still selects the compatibility path.
+        // A custom directory can replace the Git helpers we rely on.
         let mut command = self.command(None);
-        command
+        read_only(&mut command)
             .arg("--exec-path")
             .env_remove("GIT_EXEC_PATH")
             .stdin(Stdio::null());
@@ -162,43 +344,200 @@ impl Git {
         Ok(result.status.success()
             && result.stdout.strip_suffix(b"\n") == Some(inherited.as_bytes()))
     }
-    pub(crate) fn http2_compatible(&self) -> bool {
-        // Native Git remains responsible for explicit HTTP configuration
-        // and transport policy. Apply this before any libcurl discovery.
-        self.transport_policy_is_default("https")
-            && !self.config.iter().any(|(key, _)| {
-                let key = key.as_bytes();
-                key.starts_with(b"http.")
-                    || key.starts_with(b"remote.")
-                        && (key.ends_with(b".proxy") || key.ends_with(b".proxyauthmethod"))
-            })
-            && !std::env::vars_os().any(|(key, _)| {
-                let key = key.as_bytes();
-                key.starts_with(b"GIT_HTTP_")
-                    || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
-                    || matches!(
-                        key,
-                        b"GIT_TRACE_CURL" | b"GIT_TRACE_PACKET" | b"GIT_CURL_VERBOSE"
-                    )
-            })
-    }
-    pub(crate) fn transport_policy_is_default(&self, protocol: &str) -> bool {
-        let key = format!("protocol.{protocol}.allow");
-        !self
-            .config
+    fn config_value(&self, key: &str) -> Option<Option<&OsStr>> {
+        self.config
             .iter()
-            .any(|(configured, _)| configured == "protocol.allow" || configured == key.as_str())
-            && std::env::var_os("GIT_ALLOW_PROTOCOL").is_none()
-            && std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none()
+            .rev()
+            .find(|(configured, _)| configured == key)
+            .map(|(_, value)| value.as_deref())
     }
 
-    pub(crate) fn sets_protocol_version(&self) -> bool {
-        self.config.iter().any(|(key, _)| key == "protocol.version")
+    pub(crate) fn https_options(&self, url: &OsStr) -> Result<HttpsOptions> {
+        anyhow::ensure!(
+            self.transport_allowed("https")
+                && !self.config.iter().any(|(key, value)| {
+                    match self.selected_remote_property(key) {
+                        Some(b"proxy") => value.as_deref() != Some(OsStr::new("")),
+                        Some(b"proxyauthmethod") => true,
+                        _ => false,
+                    }
+                })
+                && !std::env::vars_os().any(|(key, _)| {
+                    let key = key.as_bytes();
+                    key.starts_with(b"GIT_HTTP_") && key != b"GIT_HTTP_USER_AGENT"
+                        || key.starts_with(b"GIT_SSL_") && key != b"GIT_SSL_CAINFO"
+                }),
+            "unsupported Git HTTPS configuration"
+        );
+        let mut settings = HttpsOptions {
+            ca: std::env::var_os("GIT_SSL_CAINFO")
+                .map(|path| self.transport_path(PathBuf::from(path)))
+                .transpose()?,
+            extra_header: None,
+            user_agent: std::env::var_os("GIT_HTTP_USER_AGENT")
+                .map(|value| {
+                    value
+                        .into_string()
+                        .ok()
+                        .context("invalid Git HTTP user agent")
+                })
+                .transpose()?,
+            follow_initial_redirects: true,
+        };
+        if !self
+            .config
+            .iter()
+            .any(|(key, _)| key.as_bytes().starts_with(b"http."))
+        {
+            return Ok(settings);
+        }
+        // Resolve only settings that apply to this URL using Git's precedence.
+        let url_match = |key: &str, path: bool| -> Result<Vec<u8>> {
+            let mut command = self.command(None);
+            read_only(&mut command)
+                .env_remove("GIT_CONFIG")
+                .args(["config", "--null"]);
+            if path {
+                command.arg("--type=path");
+            }
+            command
+                .args(["--get-urlmatch", key])
+                .arg(url)
+                .stdin(Stdio::null());
+            let result = run(command, true)?;
+            anyhow::ensure!(
+                result.status.success()
+                    || result.status.code() == Some(1) && result.stderr.is_empty(),
+                "read Git HTTP settings: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            );
+            Ok(result.stdout)
+        };
+        for record in url_match("http", false)?
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let (key, value) = record.split_once_byte(b'\n');
+            match (key, value) {
+                (b"http.extraheader", Some(value)) => {
+                    let value = std::str::from_utf8(value).context("invalid Git HTTP header")?;
+                    anyhow::ensure!(!value.contains(['\r', '\n']), "invalid Git HTTP header");
+                    settings.extra_header = (!value.is_empty()).then(|| value.to_owned());
+                }
+                (b"http.sslcainfo", Some(_)) => {
+                    if settings.ca.is_none() {
+                        let path = url_match("http.sslCAInfo", true)?;
+                        let path = path
+                            .strip_suffix(b"\0")
+                            .context("invalid Git CA bundle path")?;
+                        settings.ca =
+                            Some(self.transport_path(PathBuf::from(OsStr::from_bytes(path)))?);
+                    }
+                }
+                (b"http.useragent", Some(value)) => {
+                    if settings.user_agent.is_none() {
+                        settings.user_agent = Some(std::str::from_utf8(value)?.to_owned());
+                    }
+                }
+                (b"http.followredirects", Some(b"initial")) => {}
+                (b"http.followredirects", value) => {
+                    settings.follow_initial_redirects = value
+                        .map(git2::Config::parse_bool)
+                        .transpose()?
+                        .unwrap_or(true);
+                }
+                // Git's post buffer controls its HTTP upload framing.
+                // Our HTTP/2 requests already have a known length.
+                (b"http.postbuffer", Some(value)) if git2::Config::parse_i64(value).is_ok() => {}
+                (b"http.sslverify", value)
+                    if value.is_none_or(|value| {
+                        std::str::from_utf8(value)
+                            .is_ok_and(|value| git2::Config::parse_bool(value).unwrap_or(false))
+                    }) => {}
+                (b"http.uploadpack" | b"http.receivepack", _)
+                | (b"http.version", Some(b"HTTP/2"))
+                | (b"http.proxy", Some(b"")) => {}
+                _ => bail!("unsupported Git HTTPS configuration"),
+            }
+        }
+        Ok(settings)
+    }
+    pub(crate) fn transport_allowed(&self, protocol: &str) -> bool {
+        if let Some(allowed) = std::env::var_os("GIT_ALLOW_PROTOCOL") {
+            return allowed
+                .as_bytes()
+                .split(|byte| *byte == b':')
+                .any(|entry| entry == protocol.as_bytes());
+        }
+        let key = format!("protocol.{protocol}.allow");
+        let setting = |key: &str| {
+            self.config_value(key)
+                .map(|value| value.and_then(OsStr::to_str).unwrap_or(""))
+        };
+        match setting(&key)
+            .or_else(|| setting("protocol.allow"))
+            .unwrap_or("always")
+        {
+            "always" => true,
+            "user" => std::env::var_os("GIT_PROTOCOL_FROM_USER").is_none_or(|value| {
+                value
+                    .to_str()
+                    .is_some_and(|value| git2::Config::parse_bool(value).unwrap_or(false))
+            }),
+            _ => false,
+        }
     }
 
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
-        let mut command = self.command(dir);
-        command.args(args).stdin(Stdio::null());
+        Self::read_output(self.command(dir), args)
+    }
+
+    pub(crate) fn source_url(&self, source: &OsStr) -> Result<Vec<u8>> {
+        let mut command;
+        let name;
+        let source = if source
+            .to_str()
+            .and_then(|source| url::Url::parse(source).ok())
+            .is_some_and(|url| url.scheme() == "https" && url.password().is_some())
+        {
+            let url = self
+                .config
+                .iter()
+                .filter(|(key, _)| self.selected_remote_property(key) == Some(b"url"))
+                .try_fold(None, |first, (_, value)| {
+                    let value = value
+                        .as_deref()
+                        .context("configured Git remote has no URL")?;
+                    Ok::<_, anyhow::Error>((!value.is_empty()).then_some(first.unwrap_or(value)))
+                })?
+                .unwrap_or(source);
+            // Match rewrites using includes resolved in the caller's repo.
+            command = self.command(Some(Path::new("/dev/null")));
+            name = format!("git-on-url-{}", uuid::Uuid::new_v4().simple());
+            command
+                .arg(format!("--config-env=remote.{name}.url=GIT_ON_SOURCE_URL"))
+                .env("GIT_ON_SOURCE_URL", url);
+            OsStr::new(&name)
+        } else {
+            command = self.command(None);
+            source
+        };
+        Self::read_output(
+            command,
+            &[
+                OsStr::new("ls-remote"),
+                OsStr::new("--get-url"),
+                OsStr::new("--"),
+                source,
+            ],
+        )
+    }
+
+    fn read_output(mut command: Command, args: &[&OsStr]) -> Result<Vec<u8>> {
+        read_only(&mut command)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .stdin(Stdio::null());
         let out = run(command, true)?;
         if !out.status.success() {
             bail!(
@@ -209,7 +548,29 @@ impl Git {
         }
         Ok(out.stdout)
     }
-    pub fn resolve(&self, revision: &OsStr) -> Result<Oid> {
+    pub(crate) fn resolve(&self, revision: &OsStr, run_directory: &Path) -> Result<Oid> {
+        if self.config.iter().any(|(key, value)| {
+            let key = key.as_bytes();
+            key == b"extensions.partialclone"
+                || key.starts_with(b"remote.")
+                    && key.ends_with(b".promisor")
+                    && value
+                        .as_ref()
+                        .and_then(|value| value.to_str())
+                        .is_none_or(|value| git2::Config::parse_bool(value).unwrap_or(true))
+        }) {
+            let mut probe = self.command(None);
+            read_only(&mut probe)
+                .args(["--no-lazy-fetch", "--version"])
+                .stdin(Stdio::null());
+            anyhow::ensure!(
+                run(probe, true)?.status.success(),
+                "local partial clones require a Git version that supports --no-lazy-fetch"
+            );
+        }
+        if index::selects_from_index(revision) {
+            return index::resolve(self, revision, run_directory);
+        }
         let out = self.output(
             None,
             &[
@@ -222,14 +583,67 @@ impl Git {
         Oid::from_str(std::str::from_utf8(&out)?.trim())
             .context("resolve exact SHA-1 revision (SHA-256 repositories unsupported)")
     }
+    pub(crate) fn object_repository(&self) -> Result<git2::Repository> {
+        if ["GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"]
+            .into_iter()
+            .all(|key| std::env::var_os(key).is_none())
+        {
+            if let Ok(repo) = git2::Repository::open(self.repository_dir()?) {
+                return Ok(repo);
+            }
+        }
+        // Git resolves relative overrides in its source context. Open only
+        // that primary ODB; native cat-file handles any remaining alternates.
+        let path = self.output(
+            None,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ]
+            .map(OsStr::new),
+        )?;
+        let odb = git2::Odb::new()?;
+        if let Ok(path) = std::str::from_utf8(path.strip_suffix(b"\n").unwrap_or(&path)) {
+            let _ = odb.add_disk_alternate(path);
+        }
+        Ok(git2::Repository::from_odb(odb)?)
+    }
+
     pub fn repository_dir(&self) -> Result<&Path> {
         self.original_dir
             .as_deref()
             .context("native Git did not identify the selected repository directory")
     }
-    pub fn verify(&self, dir: &Path, oid: Oid, kind: git2::ObjectType) -> Result<()> {
-        let operation = match kind { git2::ObjectType::Commit => "verify-commit", git2::ObjectType::Tag => "verify-tag", _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature") };
-        let mut command = self.command(Some(dir));
+    pub fn verify(
+        &self,
+        oid: Oid,
+        kind: ObjectType,
+        remote: Option<(&git2::Repository, &Path)>,
+    ) -> Result<()> {
+        let operation = match kind {
+            ObjectType::Commit => "verify-commit",
+            ObjectType::Tag => "verify-tag",
+            _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"),
+        };
+        // Only a remote object needs a private native Git context.
+        let directory = if let Some((repo, run)) = remote {
+            let objects = repo.odb()?;
+            let object = objects.read(oid)?;
+            let directory = native_scratch(run, "git-on-signature-")?;
+            let mut options = git2::RepositoryInitOptions::new();
+            options.bare(true).external_template(false);
+            let verification = git2::Repository::init_opts(directory.path(), &options)?;
+            anyhow::ensure!(
+                verification.odb()?.write(kind, object.data())? == oid,
+                "selected signature object changed"
+            );
+            Some(directory)
+        } else {
+            None
+        };
+        let mut command = self.command(directory.as_ref().map(tempfile::TempDir::path));
         command
             .arg(operation)
             .arg(oid.to_string())
@@ -277,6 +691,90 @@ impl Git {
         })
     }
 }
+pub(crate) struct LocalObjects {
+    pub(crate) git: Git,
+    headers: Mutex<Option<crate::transport::NativeProcess>>,
+    contents: Mutex<Option<crate::transport::NativeProcess>>,
+}
+
+impl LocalObjects {
+    pub(crate) fn new(git: Git) -> Self {
+        Self {
+            git,
+            headers: Mutex::new(None),
+            contents: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn object_header(&self, oid: Oid) -> Result<(usize, ObjectType)> {
+        self.cat_file(oid, false, |size, kind, _| Ok((size, kind)))
+    }
+
+    pub(crate) fn read_object<T>(
+        &self,
+        oid: Oid,
+        consume: impl FnOnce(usize, ObjectType, &mut dyn Read) -> Result<T>,
+    ) -> Result<T> {
+        self.cat_file(oid, true, consume)
+    }
+
+    fn cat_file<T>(
+        &self,
+        oid: Oid,
+        contents: bool,
+        consume: impl FnOnce(usize, ObjectType, &mut dyn Read) -> Result<T>,
+    ) -> Result<T> {
+        let (slot, option) = if contents {
+            (&self.contents, "--batch")
+        } else {
+            (&self.headers, "--batch-check")
+        };
+        let mut batch = slot.lock().unwrap_or_else(|error| error.into_inner());
+        if batch.is_none() {
+            let mut command = self.git.command(None);
+            read_only(&mut command).args(["-c", "core.fsmonitor=false", "cat-file", option]);
+            *batch = Some(crate::transport::NativeProcess::spawn(
+                command, None, false,
+            )?);
+        }
+        let result = (|| {
+            let (request, response) = batch.as_mut().unwrap().pipes();
+            writeln!(request, "{oid}")?;
+            let (actual, kind, size) = read_batch_header(response)?
+                .context("native Git did not return the requested object")?;
+            anyhow::ensure!(actual == oid, "native Git returned an unexpected object");
+            if !contents {
+                return consume(size, kind, &mut std::io::empty());
+            }
+            let mut payload = Read::by_ref(response).take(size as u64);
+            let value = consume(size, kind, &mut payload)?;
+            anyhow::ensure!(payload.limit() == 0, "incomplete Git object");
+            let mut delimiter = [0];
+            response.read_exact(&mut delimiter)?;
+            anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
+            Ok(value)
+        })();
+        result.with_context(|| {
+            // A failed consumer may have left a partial record on the pipe.
+            let diagnostics = batch.take().unwrap().error_text();
+            format!("native Git cat-file failed: {}", diagnostics.trim())
+        })
+    }
+
+    pub(crate) fn stop(&self) -> Result<()> {
+        for slot in [&self.headers, &self.contents] {
+            if let Some(batch) = slot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                batch.stop()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 trait SplitByte {
     fn split_once_byte(&self, b: u8) -> (&[u8], Option<&[u8]>);
 }
@@ -324,18 +822,45 @@ pub fn initialize_cancellation() -> std::io::Result<()> {
         .map(|_| ())
         .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
 }
-/// Wait for owned transport/verifier groups without trapping cancellation in
-/// blocking pipe reads. Temporary capture files have no application quota.
+fn read_batch_header(input: &mut impl BufRead) -> Result<Option<(Oid, ObjectType, usize)>> {
+    let mut header = Vec::new();
+    if Read::by_ref(input)
+        .take(128)
+        .read_until(b'\n', &mut header)?
+        == 0
+    {
+        return Ok(None);
+    }
+    let header = std::str::from_utf8(
+        header
+            .strip_suffix(b"\n")
+            .context("invalid native Git batch header")?,
+    )?;
+    let mut fields = header.split(' ');
+    let id = fields
+        .next()
+        .filter(|id| id.len() == 40)
+        .context("invalid native Git object ID")?;
+    let oid = Oid::from_str(id)?;
+    let kind = match fields.next() {
+        Some("blob") => ObjectType::Blob,
+        Some("tree") => ObjectType::Tree,
+        Some("commit") => ObjectType::Commit,
+        Some("tag") => ObjectType::Tag,
+        Some("missing") => bail!("native Git could not find object {oid}"),
+        _ => bail!("unknown native Git object type"),
+    };
+    let size = fields
+        .next()
+        .context("missing native Git object size")?
+        .parse()?;
+    anyhow::ensure!(fields.next().is_none(), "invalid native Git batch header");
+    Ok(Some((oid, kind, size)))
+}
+
 pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
     let managed = crate::terminal_ui::owns_terminal();
-    let mut output = run_captured(
-        command,
-        capture || managed,
-        capture || managed,
-        None,
-        None,
-        false,
-    )?;
+    let mut output = run_captured(command, capture || managed, capture || managed, None, None)?;
     if managed && !capture {
         use std::io::Write;
         let _drawing = crate::terminal_ui::native_terminal_lease(true);
@@ -343,17 +868,6 @@ pub fn run(command: Command, capture: bool) -> Result<std::process::Output> {
         std::io::stderr().write_all(&output.stderr)?;
         output.stdout.clear();
         output.stderr.clear();
-    }
-    Ok(output)
-}
-pub(crate) fn run_fetch(
-    command: Command,
-    input: Option<&mut dyn std::io::Read>,
-) -> Result<std::process::Output> {
-    let progress = crate::terminal_ui::progress_enabled();
-    let mut output = run_captured(command, true, true, None, input, true)?;
-    if progress {
-        output.stderr = crate::terminal_ui::progress_diagnostics(&output.stderr);
     }
     Ok(output)
 }
@@ -388,7 +902,7 @@ pub(crate) fn run_with_output<T: Send>(
                 failed.store(result.is_err(), Ordering::Release);
                 result
             })?;
-        let result = run_captured(command, false, true, Some(&failed), input, false);
+        let result = run_captured(command, false, true, Some(&failed), input);
         finished.store(true, Ordering::Release);
         let value = transfer
             .join()
@@ -397,7 +911,8 @@ pub(crate) fn run_with_output<T: Send>(
     })
 }
 
-pub(crate) fn run_to_writer<W: std::io::Write + Send>(
+#[cfg(all(test, target_os = "linux"))]
+fn run_to_writer<W: std::io::Write + Send>(
     command: Command,
     mut output: W,
     input: Option<&mut dyn std::io::Read>,
@@ -465,10 +980,8 @@ fn run_captured(
     capture_stderr: bool,
     failed_output: Option<&std::sync::atomic::AtomicBool>,
     input: Option<&mut dyn std::io::Read>,
-    progress: bool,
 ) -> Result<std::process::Output> {
     use std::{
-        io::{Read, Seek},
         os::unix::{io::AsRawFd, process::CommandExt},
         time::Duration,
     };
@@ -484,15 +997,16 @@ fn run_captured(
     let mut input = input
         .map(|source| NativeInput::new(&mut command, source))
         .transpose()?;
-    let mut stdout = capture_stdout.then(tempfile::tempfile).transpose()?;
-    let mut stderr = capture_stderr.then(tempfile::tempfile).transpose()?;
-    let mut progress = (progress && crate::terminal_ui::progress_enabled())
-        .then(crate::terminal_ui::NativeProgress::new);
-    if let Some(stdout) = &stdout {
-        command.stdout(stdout.try_clone()?);
+    let mut captured = [None, None];
+    if capture_stdout {
+        let (output, writer) = Capture::new(None)?;
+        command.stdout(writer);
+        captured[0] = Some(output);
     }
-    if let Some(stderr) = &stderr {
-        command.stderr(stderr.try_clone()?);
+    if capture_stderr {
+        let (output, writer) = Capture::new(None)?;
+        command.stderr(writer);
+        captured[1] = Some(output);
     }
     let managed = crate::terminal_ui::owns_terminal();
     crate::terminal_ui::configure(&mut command);
@@ -529,12 +1043,10 @@ fn run_captured(
             return Err(error).context("start native Git operation");
         }
     };
+    drop(command);
     let _operation = crate::terminal_ui::NativeOperation::new(child.id());
     let wakeup = ChildExitWakeup::new(child.id());
     let outcome = loop {
-        if let (Some(progress), Some(stderr)) = (&mut progress, &stderr) {
-            progress.poll(stderr);
-        }
         match crate::terminal_ui::try_wait(&mut child) {
             Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error.into()),
@@ -570,6 +1082,10 @@ fn run_captured(
                 }
             }
         }
+        if let Err(error) = captured.iter_mut().flatten().try_for_each(Capture::pump) {
+            break stop_request_operation(&mut child)
+                .and(Err(error).context("read native Git output"));
+        }
         if let Some(fd) = tty_fd {
             if let Err(error) = relay_native_job_control(child.id(), fd, parent_group) {
                 break stop_request_operation(&mut child).and(Err(error));
@@ -578,9 +1094,11 @@ fn run_captured(
         wakeup.wait(
             Duration::from_millis(10),
             input.as_ref().map(|input| input.pipe.as_raw_fd()),
+            captured
+                .each_ref()
+                .map(|output| output.as_ref().and_then(Capture::fd)),
         );
     };
-    drop(progress);
     // A background resume must leave the terminal with the invoking shell.
     if let Some(fd) = tty_fd {
         if unsafe { libc::tcgetpgrp(fd) } == child.id() as libc::pid_t {
@@ -594,21 +1112,79 @@ fn run_captured(
         // group, so the runner's own signal handler may never receive them.
         cancel_by_signal(signal);
     }
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    if let Some(stdout) = &mut stdout {
-        stdout.rewind()?;
-        stdout.read_to_end(&mut out)?;
-    }
-    if let Some(stderr) = &mut stderr {
-        stderr.rewind()?;
-        stderr.read_to_end(&mut err)?;
-    }
+    let [stdout, stderr] = captured.map(|output| output.map(Capture::finish).transpose());
     Ok(std::process::Output {
         status,
-        stdout: out,
-        stderr: err,
+        stdout: stdout?.unwrap_or_default(),
+        stderr: stderr?.unwrap_or_default(),
     })
+}
+
+pub(crate) struct Capture {
+    stream: Option<std::os::unix::net::UnixStream>,
+    pub(crate) bytes: Vec<u8>,
+    tail: Option<usize>,
+}
+
+impl Capture {
+    pub(crate) fn new(tail: Option<usize>) -> std::io::Result<(Self, Stdio)> {
+        use std::{os::fd::OwnedFd, os::unix::net::UnixStream};
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        Ok((
+            Self {
+                stream: Some(reader),
+                bytes: Vec::new(),
+                tail,
+            },
+            Stdio::from(OwnedFd::from(writer)),
+        ))
+    }
+
+    fn fd(&self) -> Option<i32> {
+        self.stream.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+    }
+
+    pub(crate) fn pump(&mut self) -> std::io::Result<()> {
+        use std::io::ErrorKind;
+        let Some(input) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        let mut bytes = [0; 8192];
+        for _ in 0..8 {
+            match input.read(&mut bytes) {
+                Ok(0) => {
+                    self.stream = None;
+                    break;
+                }
+                Ok(count) => {
+                    self.bytes.extend_from_slice(&bytes[..count]);
+                    if let Some(tail) = self.tail {
+                        let extra = self.bytes.len().saturating_sub(tail);
+                        self.bytes.drain(..extra);
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn drain_available(&mut self) -> std::io::Result<()> {
+        // Drain queued socket data without waiting for inherited writers in
+        // a verifier's subprocesses.
+        for _ in 0..8 {
+            self.pump()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        self.drain_available()?;
+        Ok(self.bytes)
+    }
 }
 struct NativeInput<'a> {
     source: &'a mut dyn std::io::Read,
@@ -703,12 +1279,12 @@ impl ChildExitWakeup {
             Self {}
         }
     }
-    fn wait(&self, duration: std::time::Duration, input: Option<i32>) {
+    fn wait(&self, duration: std::time::Duration, input: Option<i32>, output: [Option<i32>; 2]) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let exit = -1;
-        if exit >= 0 || input.is_some() {
+        if exit >= 0 || input.is_some() || output.iter().any(Option::is_some) {
             let mut descriptors = [
                 libc::pollfd {
                     fd: exit,
@@ -720,9 +1296,24 @@ impl ChildExitWakeup {
                     events: libc::POLLOUT,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: output[0].unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: output[1].unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
-            let result =
-                unsafe { libc::poll(descriptors.as_mut_ptr(), 2, duration.as_millis() as i32) };
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as _,
+                    duration.as_millis() as i32,
+                )
+            };
             if result < 0
                 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
             {
@@ -849,16 +1440,41 @@ mod transport_policy_tests {
     use super::*;
 
     #[test]
-    fn explicit_transport_policy_keeps_http2_on_native_git() {
+    fn direct_https_respects_explicit_transport_denial() {
         for key in ["protocol.allow", "protocol.https.allow"] {
             let git = Git {
                 cwd: PathBuf::new(),
                 config: vec![(key.into(), Some("never".into()))],
                 original_dir: None,
+                remote: None,
             };
-            assert!(!git.http2_compatible(), "{key}");
+            assert!(
+                git.https_options(OsStr::new("https://example.invalid/repo.git"))
+                    .is_err(),
+                "{key}"
+            );
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn recovery_removes_external_native_scratch() {
+    if !is_tmpfs(Path::new("/dev/shm")) || tempfile::tempdir_in("/dev/shm").is_err() {
+        return;
+    }
+    let run = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4();
+    std::fs::write(run.path().join(".state"), format!(r#"{{"id":"{id}"}}"#)).unwrap();
+    let scratch = native_scratch(run.path(), "scratch-").unwrap();
+    std::fs::write(scratch.path().join("data"), b"native Git temporary bytes").unwrap();
+    assert_eq!(
+        std::fs::read_link(run.path().join(".native-scratch")).unwrap(),
+        scratch.path()
+    );
+    cleanup_native_scratch(run.path(), &id.to_string()).unwrap();
+    assert!(!scratch.path().exists());
+    cleanup_native_scratch(run.path(), &id.to_string()).unwrap();
 }
 
 #[cfg(all(test, target_os = "macos"))]

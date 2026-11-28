@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from support.run_storage import run_directories
 
 PARSER=argparse.ArgumentParser()
 PARSER.add_argument('--binary',type=Path,required=True)
@@ -314,7 +315,7 @@ def main():
                 record(dict(type='transport',**case,initial_resolution_fetches=sum(info['commit'] in r.get('wants',[]) for r in requests),
                     exact_object_fetches=sum(bool(r.get('wants')) and info['commit'] not in r['wants'] for r in requests),
                     response_bytes=sum(r.get('response_bytes',0) for r in requests),http_requests=len(requests),objects=sorted(wants)))
-                assert not list(f.root.glob('git-on-*')),'run cleanup failed'
+                assert not run_directories(f.root),'run cleanup failed'
                 assert f.git('show-ref')==before,'source refs changed'
     finally:
         def cleanup_fixture():

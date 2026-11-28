@@ -91,6 +91,36 @@ deprecation practices so that users know what to expect.
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
 
+For mounted files, the [filesystem policy](specification.md#filesystem-policy)
+defines when a file switches from the verified source to private writable backing.
+
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 
 **Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.
+
+**Question:** Which version should PR #41 use? Cold reviews consider this a
+SemVer 2.0 blocker. The 1.5.2 documentation promised support for
+`git on PATH main:refs/heads/demo`. Under your latest instruction, both
+forms of local execution remain available, and that command fails if the
+tree has no such path. Old network modes are also being retired.
+
+**Answer:** That promise was a bug. From the user's perspective Git-on
+materializes a tree without Git plumbing, so behavior that depends on the
+temporary bare repository falls outside the contract.
+
+**Question:** How should the retirement of older networking modes be
+reflected in the release? The decision about the temporary bare repository
+covers local refspecs. Version 1.5.2 separately documented proxy support
+and explicitly selected Git protocol v0/v1. Under the agreed transport
+profile those invocations now fail.
+
+**Answer:** Use 1.5.3. I never asked for that support. It was a mistake for
+the AI agent to add and document it without asking me.
+
+**Question.** Do you allow a narrow exception to the write rule for an
+explicitly configured OpenSSH `Match exec`? OpenSSH can run that command
+during `ssh -G`, before connecting, and run it again while configuring a
+connection. The local review noted that the specification previously agreed
+on an exception only for the verifier.
+
+**Answer.** Document an exception for `Match exec`.

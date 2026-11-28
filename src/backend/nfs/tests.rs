@@ -21,7 +21,7 @@ pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
     tree.insert("tracked", blob, 0o100644).unwrap();
     let tree = tree.write().unwrap().to_string();
     let id = uuid::Uuid::new_v4();
-    let snapshot = Snapshot::load(directory.path(), tree.as_ref(), &id.to_string()).unwrap();
+    let snapshot = Snapshot::load(directory.path(), tree.as_ref()).unwrap();
     let core =
         Overlay::with_write_policy(snapshot, directory.path().join("backing"), policy).unwrap();
     (

@@ -661,19 +661,20 @@ impl Server {
                 }
             })?;
 
+        let start = w.len();
         w.fixed(&verifier);
         let mut issued = None;
         for (child, kind, name, row_cookie) in rows {
-            let mut row = Writer::default();
-            row.boolean(true);
-            row.u64(row_cookie);
-            row.opaque(name.as_bytes());
-            self.directory_attributes(ino, child, kind, &name, mask, &mut row)?;
-            if w.len() + row.len() + 8 > maxcount {
+            let row_start = w.len();
+            w.boolean(true);
+            w.u64(row_cookie);
+            w.opaque(name.as_bytes());
+            self.directory_attributes(ino, child, kind, &name, mask, w)?;
+            if w.len() - start + 8 > maxcount {
+                w.truncate(row_start);
                 eof = false;
                 break;
             }
-            w.fixed(row.bytes());
             issued = Some(row_cookie);
         }
         if let Some(last) = issued {

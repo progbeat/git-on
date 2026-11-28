@@ -152,7 +152,7 @@ a release result, or claim an SLA from a single machine's median.
 
 The per-sample timeout first sends TERM to the private measurement session and
 then KILL after five seconds. Normal signal handling lets git-on unmount and
-clean up; a force kill can leave temporary mount/backing state and a Git pin.
+clean up; a force kill can leave temporary mount and backing state.
 Use `git on --cleanup <stale-temporary-directory>` if recovery is needed. The
 harness does not discover or remove unrelated temporary directories. An escaped
 descendant retaining a capture descriptor cannot turn a timeout into a success;

@@ -18,7 +18,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, OpenOptionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -28,15 +28,20 @@ use std::{
 };
 
 mod cli;
+mod run_directory;
 
 // Ephemeral recovery information only: no invocation history, arguments or logs.
 #[derive(Serialize, Deserialize)]
 struct Recovery {
     format: String,
     id: String,
+    // Preserve these fields when reading recovery records from 1.5.2.
+    #[serde(skip_serializing)]
     git_dir: Option<PathBuf>,
-    tree_oid: Option<String>,
+    #[serde(skip_serializing)]
     pin_ref: Option<String>,
+    #[serde(skip_serializing)]
+    tree_oid: Option<String>,
 }
 fn private_dir(path: &Path) -> Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -58,9 +63,11 @@ fn lock(dir: &Path, create: bool) -> Result<File> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(create)
+        .create_new(create)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join(".lock"))?;
+    anyhow::ensure!(f.metadata()?.is_file(), "invalid temporary run lock");
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("run is active or locked");
     }
@@ -70,25 +77,6 @@ fn kill_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
     }
-}
-fn release_pin(m: &Recovery) -> Result<()> {
-    if let (Some(repo), Some(pin), Some(oid)) = (&m.git_dir, &m.pin_ref, &m.tree_oid) {
-        if pin != &format!("refs/git-on/{}", m.id) {
-            bail!("invalid pin reference");
-        }
-        let repo = git2::Repository::open(repo)?;
-        match repo.find_reference(pin) {
-            Ok(mut r) => {
-                if r.target().map(|x| x.to_string()).as_ref() != Some(oid) {
-                    bail!("pin changed; refusing deletion");
-                }
-                r.delete()?;
-            }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
-            Err(e) => return Err(e.into()),
-        };
-    }
-    Ok(())
 }
 struct Terminal {
     tty: Option<File>,
@@ -225,9 +213,7 @@ fn clean_unmount_with(mut unmount: Command, mountpoint: &Path) -> Result<()> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            bail!(
-                "mount is busy or unmount failed; transient data and pin preserved for --cleanup"
-            );
+            bail!("mount is busy or unmount failed; transient data preserved for --cleanup");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -262,8 +248,8 @@ impl Mounted {
             #[cfg(target_os = "linux")]
             if let Err(error) = result {
                 // Do not invoke fuser's lazy-unmount fallback on a busy mount.
-                // Process exit closes the FUSE connection; the persistent pin
-                // and run artifacts allow explicit, checked stale cleanup.
+                // Process exit closes the FUSE connection. The run directory
+                // remains available for checked stale cleanup.
                 std::mem::forget(session);
                 return Err(error);
             }
@@ -476,8 +462,12 @@ fn relay_job_control(pid: u32, terminal: &Terminal) -> Result<()> {
 }
 fn cleanup(dir: &Path) -> Result<()> {
     let dir = fs::canonicalize(dir)?;
-    let _lock = lock(&dir, false)?;
-    let state: Recovery = serde_json::from_reader(File::open(dir.join(".state"))?)?;
+    let _group = run_directory::Group::for_run(&dir);
+    let record = dir.join(".state");
+    // A cleaner that already consumed the record is removing the lock.
+    anyhow::ensure!(record.try_exists()?, "unrecognized temporary directory");
+    let held_lock = lock(&dir, false)?;
+    let state: Recovery = serde_json::from_reader(File::open(&record)?)?;
     if state.format != "git-on-temp-v1" {
         bail!("unrecognized temporary directory");
     }
@@ -489,10 +479,68 @@ fn cleanup(dir: &Path) -> Result<()> {
     }
     ensure_unmounted(&dir)?;
     git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+    #[cfg(target_os = "linux")]
+    git_on::git::cleanup_native_scratch(&dir, &state.id)?;
     #[cfg(target_os = "macos")]
     git_on::platform::cleanup_nfs_socket(&state.id)?;
     git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
-    release_pin(&state)?;
+    // Finish checked mount and socket teardown even when the old record
+    // must remain available to release its source ref with the prior version.
+    if let (Some(pin), Some(repository)) = (&state.pin_ref, &state.git_dir) {
+        if !repository.starts_with(&dir) {
+            anyhow::ensure!(
+                pin == &format!("refs/git-on/{}", state.id),
+                "invalid legacy source reference in recovery record"
+            );
+            let repo = git2::Repository::open(repository).with_context(|| {
+                format!(
+                    "legacy source repository unavailable: {}",
+                    repository.display()
+                )
+            })?;
+            match repo.find_reference(pin) {
+                Ok(reference) => {
+                    let recorded = state
+                        .tree_oid
+                        .as_deref()
+                        .and_then(|oid| git2::Oid::from_str(oid).ok());
+                    if recorded.is_none() || reference.target() != recorded {
+                        bail!("legacy source ref {pin} has a different target; recovery record retained");
+                    }
+                    bail!(
+                    "legacy run records source ref {pin} in {}; use git-on 1.5.2 to clean up this run",
+                    repository.display()
+                    );
+                }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                Err(error) => return Err(error).context("inspect legacy recovery reference"),
+            };
+        }
+    }
+    remove_run(&dir, || drop(held_lock))
+}
+
+fn remove_run(dir: &Path, release_lock: impl FnOnce()) -> Result<()> {
+    // Keep the recovery record until all removable data is gone, then remove
+    // it under the lock so no second cleaner can take over.
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if matches!(entry.file_name().as_encoded_bytes(), b".state" | b".lock") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    match fs::remove_file(dir.join(".state")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // An open writable lock can leave a busy unlinked file on NFS.
+    release_lock();
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -570,30 +618,24 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
     let mut signals = subscribe_signals()?;
     #[cfg(target_os = "macos")]
     let _child_exit = UnblockedChildExit::new().context("unblock child exit notification")?;
-    let mut progress = git_on::terminal_ui::StartupProgress::start(invoked, &tree)?;
     if let Some(signal) = git_on::git::cancelled_signal() {
         return Ok(ExitStatus::from_raw(signal));
     }
-    let temp = tempfile::Builder::new()
-        .prefix("git-on-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .with_context(|| {
+    let (_group, dir, id) = run_directory::Group::create().with_context(|| {
             format!("cannot create a private snapshot in {}; check the directory's write/search permissions and available space, or choose another TMPDIR", env::temp_dir().display())
         })?;
-    let dir = fs::canonicalize(temp.path())?;
-    let held_lock = lock(&dir, true)?;
-    let _retained = temp.keep();
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut state = Recovery {
+    let held_lock = lock(&dir, true).inspect_err(|_| {
+        let _ = fs::remove_dir_all(&dir);
+    })?;
+    let state = Recovery {
         format: "git-on-temp-v1".into(),
         id: id.clone(),
         git_dir: None,
-        tree_oid: None,
         pin_ref: None,
+        tree_oid: None,
     };
-    let _lock = held_lock;
     let mut observed = None;
+    let mut progress = None;
     #[cfg(feature = "test-metrics")]
     let mut measured_backend = None;
     let mut result = (|| -> Result<ExitStatus> {
@@ -605,6 +647,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             }
         }
         save(&dir, &state)?;
+        let progress = progress.insert(git_on::terminal_ui::StartupProgress::start(
+            invoked, &tree, &dir,
+        )?);
 
         let native = Backend::native();
         let selected = if backend == Backend::Auto {
@@ -620,20 +665,13 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         };
         let materialized = selected == Backend::Copy
             || (allow_fallback && unavailable.as_ref().is_ok_and(Option::is_some));
-        let snapshot = Snapshot::load_source_with_pin_record(
+        let snapshot = Snapshot::load_source(
             &env::current_dir()?,
             source.as_deref(),
             &tree,
             verify,
             materialized,
             &dir,
-            &id,
-            |git_dir, pin, oid| {
-                state.git_dir = Some(git_dir.into());
-                state.pin_ref = Some(pin.into());
-                state.tree_oid = Some(oid.to_string());
-                save(&dir, &state)
-            },
         )?;
         observed = Some(snapshot.clone());
 
@@ -667,7 +705,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
                 return Ok(ExitStatus::from_raw(signal));
             }
             if !materialized {
-                snapshot.fetch_copy_objects()?;
+                snapshot.prepare_copy_after_mount_failure()?;
             }
             git_on::materialize::materialize(&snapshot, &dir.join("mount"))?;
         }
@@ -684,7 +722,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .env("GIT_ON_TREE_OID", state.tree_oid.as_ref().unwrap());
+            .env("GIT_ON_TREE_OID", snapshot.tree_oid.to_string());
         let mut terminal = Terminal::capture();
         let tty_fd = terminal.descriptor();
         let transfer = tty_fd.is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() });
@@ -735,21 +773,31 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
 
         let pid = child.id();
         terminal.child = Some(pid as libc::pid_t);
-        let outcome = supervise(&mut child, &mut signals, &terminal, session.as_ref());
+        let mut outcome = supervise(&mut child, &mut signals, &terminal, session.as_ref());
 
         if let Ok(status) = &outcome {
             if let Some(signal) = status.signal() {
                 git_on::git::cancel_by_signal(signal);
             }
         }
-        // Escaped or terminated readers can leave a FUSE callback inside a
-        // native fetch. Stop it before unmounting or inspecting snapshot state.
-        git_on::git::stop_operations();
         if outcome.is_err() {
             kill_group(pid, libc::SIGKILL);
             let _ = child.wait();
         }
         drop(terminal);
+        // Normal exit still needs the verdict of packs that supplied bytes.
+        // Cancel other work before unmount so unused reads cannot block it.
+        if outcome
+            .as_ref()
+            .is_ok_and(|status| status.signal().is_none())
+            && git_on::git::cancelled_signal().is_none()
+        {
+            snapshot.finish_remote_reads();
+            if let Some(signal) = git_on::git::cancelled_signal() {
+                outcome = Ok(ExitStatus::from_raw(signal));
+            }
+        }
+        git_on::git::stop_operations();
 
         let unmount = session.as_mut().map_or(Ok(()), Mounted::finish);
 
@@ -759,7 +807,9 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })();
-    progress.finish();
+    if let Some(mut progress) = progress {
+        progress.finish();
+    }
     // Also cover errors before the child could start. State inspection below
     // must never wait behind an owned operation that the run no longer needs.
     git_on::git::stop_operations();
@@ -798,24 +848,22 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
         ensure_unmounted(&dir)?;
         // Also cover errors before an observed Snapshot could be returned.
         git_on::remote::stop_connection(&dir.join("ssh-control"))?;
+        #[cfg(target_os = "linux")]
+        git_on::git::cleanup_native_scratch(&dir, &id)?;
         #[cfg(target_os = "macos")]
         git_on::platform::cleanup_nfs_socket(&id)?;
         git_on::materialize::prepare_cleanup(&dir.join("mount"))?;
-        release_pin(&state)?;
-        if dir.join("remote-repository").exists() {
-            fs::remove_dir_all(dir.join("remote-repository"))?;
-        }
         match fs::remove_file(dir.join(git_on::remote::SSH_CONTROL_OWNER_FILE)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("remove SSH recovery identity"),
         }
-        fs::remove_dir_all(&dir)?;
-        Ok(())
+        drop(observed.take());
+        remove_run(&dir, || drop(held_lock))
     })();
 
     if let Err(e) = cleanup_result {
-        // Keep the exact pin available to a later checked --cleanup.
+        // Leave the retained run for explicit cleanup without retrying transport shutdown.
         if let Some(snapshot) = observed.take() {
             std::mem::forget(snapshot);
         }
@@ -904,6 +952,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     // Fork briefly inherits other threads' flock descriptions before exec.
     // Keep process-spawning and lock-release assertions in separate test epochs.
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1079,8 +1128,8 @@ mod tests {
             format: "git-on-temp-v1".into(),
             id: "unit-test".into(),
             git_dir: None,
-            tree_oid: None,
             pin_ref: None,
+            tree_oid: None,
         }
     }
     #[test]
@@ -1098,22 +1147,23 @@ mod tests {
         assert!(!dir.exists());
     }
     #[test]
-    fn recovery_releases_only_its_own_pin() {
+    fn recovery_cannot_take_over_when_normal_cleanup_releases_the_lock() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(root.path().join("repo")).unwrap();
-        let oid = repo.treebuilder(None).unwrap().write().unwrap();
-        let mut state = recovery();
-        state.git_dir = Some(repo.path().into());
-        state.tree_oid = Some(oid.to_string());
-        state.pin_ref = Some("refs/git-on/unit-test".into());
-        repo.reference(state.pin_ref.as_ref().unwrap(), oid, false, "test")
-            .unwrap();
-        release_pin(&state).unwrap();
-        assert!(repo
-            .find_reference(state.pin_ref.as_ref().unwrap())
-            .is_err());
-        state.pin_ref = Some("refs/heads/master".into());
-        assert!(release_pin(&state).is_err());
+        let dir = root.path().join("run");
+        private_dir(&dir).unwrap();
+        let held = lock(&dir, true).unwrap();
+        save(&dir, &recovery()).unwrap();
+        fs::write(dir.join("payload"), b"disposable").unwrap();
+        remove_run(&dir, || {
+            drop(held);
+            let error = cleanup(&dir).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unrecognized temporary directory"));
+        })
+        .unwrap();
+        assert!(!dir.exists());
     }
     #[test]
     fn event_supervisor_preserves_exit_and_signal() {

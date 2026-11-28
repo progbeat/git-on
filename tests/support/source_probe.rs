@@ -28,15 +28,13 @@ fn main() -> Result<()> {
     let source = args.first().context("source required")?;
     let revision = args.get(1).context("revision required")?;
     let run = tempfile::tempdir()?;
-    let loaded = Snapshot::load_source_with_pin_record(
+    let loaded = Snapshot::load_source(
         &env::current_dir()?,
         (source != "local").then_some(source.as_os_str()),
         revision,
         args.iter().any(|x| x == "--verify"),
-        false,
+        args.iter().any(|x| x == "--eager"),
         run.path(),
-        "probe",
-        |_, _, _| Ok(()),
     );
     let snapshot = match loaded {
         Ok(snapshot) => snapshot,

@@ -34,8 +34,14 @@ the declared runtime/build version to its locked edge. If the manifest and lock
 cannot identify one edge, validation fails explicitly instead of guessing its kind.
 
 Choose the version according to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
-Git-on's public API is the behavior promised in the [specification](specification.md)
-and user guides.
+The [specification](specification.md) and user guides define the public CLI
+contract for selecting a tree and running a command in a temporary view.
+
+The author selected 1.5.3 for this change. See the [release decision](interview.md).
+This patch restores read-only access to the source repository. The previous
+release inserted temporary refs that kept source objects alive during garbage
+collection. With read-only source access, a lazy read fails if the source has
+pruned its object. The CLI continues to select the same tree by object ID.
 
 For bootstrap, a base with no Cargo package introduces `0.1.0`
 and `<!-- Bump: initial -->`. Later PRs cannot reuse this exception.

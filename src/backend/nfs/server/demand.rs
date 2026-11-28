@@ -7,7 +7,7 @@ use super::{
         Job, REMOTE_READ_WINDOW,
     },
     protocol::{self, Credentials, Rpc, SessionId, MAX_OPS},
-    Context, Server, Writer, MIN_CHANNEL_SIZE,
+    Context, DemandFailure, Server, Writer, MIN_CHANNEL_SIZE,
 };
 use crate::{backend::FileType, filesystem::SourceLookup, snapshot::PendingObject};
 use git2::Oid;
@@ -57,8 +57,12 @@ impl Server {
             while index < parked.len() {
                 if parked[index].object.ready() {
                     let call = parked.swap_remove(index);
-                    call.object.finish();
-                    if call.recheck_lookup {
+                    let failure = call.object.finish().err().map(|_| DemandFailure {
+                        // A parent tree is needed by LOOKUP, before GETFH and
+                        // GETATTR. All other demands serve the last operation.
+                        operations_left: if call.recheck_lookup { 3 } else { 1 },
+                    });
+                    if call.recheck_lookup && failure.is_none() {
                         let next = match &call.job {
                             Job::Call(data, _) => {
                                 self.read_request(data, parked.iter().map(|call| call.slot))
@@ -78,7 +82,7 @@ impl Server {
                             }
                         }
                     }
-                    call.job.run(self);
+                    call.job.run(self, failure);
                 } else {
                     index += 1;
                 }
@@ -137,7 +141,7 @@ impl Server {
                     _ => (),
                 },
             }
-            job.run(self);
+            job.run(self, None);
         }
     }
 
@@ -313,11 +317,44 @@ mod tests {
     use super::*;
     use crate::{
         backend::nfs::{
-            status::{ACCESS, OK, SEQ_FALSE_RETRY},
+            status::{ACCESS, IO, OK, SEQ_FALSE_RETRY},
             tests::{call_as, fixture, results, sequence, session_with, xdr},
         },
         policy::WritePolicy,
     };
+
+    #[test]
+    fn failed_demand_returns_and_replays_the_compound_error() {
+        let (_dir, mut server) = fixture(WritePolicy::None);
+        let call = |xid, count, ops: &[u8]| call_as(xid, count, ops, 10, 11, &[]);
+        let session = session_with(&mut server, call);
+        let request = |xid, seq| {
+            let ops = xdr(|w| {
+                sequence(w, &session, seq, 0, 3);
+                w.u32(24); // PUTROOTFH
+                w.u32(15); // LOOKUP
+                w.opaque(b"tracked");
+                w.u32(10); // GETFH
+                w.u32(9); // GETATTR size
+                w.u32(1);
+                w.u32(1 << 4);
+            });
+            call(xid, 5, &ops)
+        };
+        let first = request(3, 1);
+        let reply = server
+            .rpc_after_demand(&first, Some(DemandFailure { operations_left: 3 }))
+            .unwrap();
+        let replay = server.rpc_after_demand(&first, None).unwrap();
+        assert!(Arc::ptr_eq(
+            reply.body.as_ref().unwrap(),
+            replay.body.as_ref().unwrap(),
+        ));
+        let reply = reply.into_bytes();
+        results(&reply, IO, 3);
+        assert_eq!(replay.into_bytes(), reply);
+        results(&server.rpc(&request(4, 2)).unwrap(), OK, 5);
+    }
 
     #[test]
     fn mixed_uid_attribute_calls_preserve_permissions_and_slot_order() {

@@ -58,27 +58,25 @@ class ObjectReuseTests(unittest.TestCase):
         for backend in ('fuse','materialized'):
             good=object_reuse_row('a'*40,backend);count=good['files']
             validate_runner(good,count,8192,144,backend)
-            for change in ('remote_fetches','remote_fetch_operations','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads',
-                           'remote_decode_operations','native','unpack','phase','payload','stat'):
+            for change in ('remote_fetches','remote_raw_blob_imports','remote_raw_blob_bytes','blob_loads',
+                           'native','phase','payload','stat'):
                 broken=copy.deepcopy(good)
                 if change in broken['metrics']:broken['metrics'][change]+=1
-                elif change=='native':broken['native_commands']['cat-file']+=1
-                elif change=='unpack':broken['native_commands']['unpack-objects']=1
+                elif change=='native':broken['native_commands']['cat-file']=1
                 elif change=='phase':broken['child_observations'].pop()
                 elif change=='payload':broken['child_observations'][0]['payload_bytes']+=1
                 elif change=='stat':broken['child_observations'][0]['metadata_result_bytes']=0
                 with self.subTest(backend=backend,change=change),self.assertRaises(AssertionError):
                     validate_runner(broken,count,8192,144,backend)
 
-    def test_session_counts_replace_native_demands_without_hiding_repeat_work(self):
-        good=dict(child_observations=[dict(completed=p,files=160,payload_bytes=1310720,metadata_result_bytes=23040) for p in ('first','repeat')],
-            metrics=dict(remote_fetches=162,remote_raw_blob_imports=160,remote_raw_blob_bytes=1310720,blob_loads=160,blob_cache_bytes=100,blob_cache_limit=8388608,
-                remote_fetch_operations=1,remote_decode_operations=1,remote_session_fetch_operations=161,remote_session_decode_operations=161,remote_session_starts=1),
-            fuse_requests={'read':1},native_commands={'fetch':1,'cat-file':1})
-        validate_runner(good,160,8192,144,'fuse')
-        for key in ('remote_fetch_operations','remote_decode_operations','remote_session_fetch_operations','remote_session_decode_operations','remote_session_starts'):
-            broken=copy.deepcopy(good);broken['metrics'][key]+=1
-            with self.assertRaises(AssertionError):validate_runner(broken,160,8192,144,'fuse')
+    def test_validator_checks_protocol_counts(self):
+        good = object_reuse_row('a' * 40, 'fuse')
+        for key in ('remote_http2_fetch_operations', 'remote_session_fetch_operations',
+                    'remote_session_decode_operations', 'remote_session_starts'):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                broken = copy.deepcopy(good)
+                broken['metrics'][key] += 1
+                validate_runner(broken, 160, 8192, 144, 'fuse')
 
 
 if __name__=='__main__':unittest.main()
