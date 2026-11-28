@@ -569,11 +569,27 @@ class SshRegressionTests(unittest.TestCase):
                           'and startup failed before authentication', file=sys.stderr)
                 self.loaded_read(url, f)
 
+    def test_copy_connects_directly_with_configured_proxy_jump(self):
+        f = self.f
+        url = f.ssh()
+        config = f.root / 'proxy_config'
+        config.write_text('Host *\n    ProxyJump unused-jump\n')
+        f.env['GIT_SSH_COMMAND'] = f.env['GIT_SSH_COMMAND'].replace(
+            '-F /dev/null', '-F ' + shlex.quote(str(config)))
+        result = subprocess.run(
+            [remote.OPTIONS.binary, url, 'HEAD', '--backend=copy', '--write-policy=all',
+             '--', 'cat', 'deep/file'], cwd=f.cwd, env=f.env, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'expected\n')
+
     def test_short_proxy_jump_option_remains_usable_for_lazy_reads(self):
         f = self.f
         url = f.ssh(encrypted=True)
-        # OpenSSH -J none is a native direct-host configuration. Inserting a
-        # ProxyCommand=false fallback guard wrongly conflicts even with -J none.
+        config = f.root / 'proxy_config'
+        config.write_text('Host *\n    ProxyCommand /usr/bin/false\n')
+        f.env['GIT_SSH_COMMAND'] = f.env['GIT_SSH_COMMAND'].replace(
+            '-F /dev/null', '-F ' + shlex.quote(str(config)))
         f.env['GIT_SSH_COMMAND'] += ' -J none'
         self.loaded_read(url)
         self.assertEqual((f.root / 'prompts').read_text().splitlines(), ['prompt'])
@@ -582,7 +598,7 @@ class SshRegressionTests(unittest.TestCase):
         f = self.f
         url = f.ssh()
         original = f.env['GIT_SSH_COMMAND']
-        for flags in ('--', '-M-', '--M'):
+        for flags in ('--', '-M-', '--M', '-M-Jnone'):
             with self.subTest(flags=flags):
                 f.env['GIT_SSH_COMMAND'] = original + ' ' + flags
                 process = f.probe(url)

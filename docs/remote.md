@@ -16,7 +16,7 @@ their servers implement the same profile.
 | Transport | Protocol |
 | --- | --- |
 | Direct HTTPS | TLS, HTTP/2 and Git protocol v2 |
-| OpenSSH | SSH with Git protocol v2 forwarded to `git-upload-pack` |
+| Direct OpenSSH | SSH with Git protocol v2 forwarded to `git-upload-pack` |
 
 Git 2.45.1 or newer is required for remote execution. Network sources must
 provide SHA-1 object IDs and support exact-object wants and filtering. Specify
@@ -46,9 +46,11 @@ replies up to 256 KiB. Select by full SHA-1 OID when a reference reply is larger
 
 HTTPS sends the single effective URL-matched `http.extraHeader` when configured.
 For URLs without user information, libcurl can read matching `.netrc` entries.
-If discovery, ref listing, or an object request receives a Basic challenge,
-Git-on passes the effective repository URL and any supplied credentials to
-`git credential fill` through its standard input for read-only lookup.
+For HTTPS credential lookup, the supported GitHub profile advertises Basic
+in its own `WWW-Authenticate` field. When discovery, ref listing, or an object
+request receives this challenge, Git-on passes the effective repository URL
+and any supplied credentials to `git credential fill` through its standard
+input for read-only lookup.
 After launching the command, credential lookup runs without interactive prompts.
 Git-on does not ask credential helpers to store or erase credentials. SSH uses
 OpenSSH's configured identity and agent and requires a previously trusted host
@@ -58,10 +60,12 @@ during teardown. If that connection is lost, outstanding reads fail.
 A direct SSH copy uses a single foreground SSH process. Copy after a mount
 fallback can reuse the connection already established for that mount.
 
-OpenSSH evaluates the user's settings when configuring a connection and can
-execute explicitly configured `Match exec` commands, including when opening
-another channel on the connection. Those commands have their configured
-effects. The [source contract](specification.md#source-selection-and-observable-state)
+Git-on connects directly even when OpenSSH configuration contains
+`ProxyCommand` or `ProxyJump`. The direct profile accepts `-J none` in a
+configured SSH command. Specifying a jump host with `-J` returns an error.
+OpenSSH can run explicitly configured `Match exec` commands when evaluating
+connection settings, including while opening additional channels. Those
+commands have their configured effects. The [source contract](specification.md#source-selection-and-observable-state)
 applies to Git-on and its ordinary helper operations.
 
 ## Object loading

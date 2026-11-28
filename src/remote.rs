@@ -1503,6 +1503,14 @@ fn validate_ssh_command(command: &OsStr) -> Result<()> {
 // prefixes and compounds cannot safely identify the OpenSSH executable.
 // Transparent GIT_SSH executables that forward OpenSSH argv remain supported.
 const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
+    require_no_jump() {
+        case "$1" in
+            [Nn][Oo][Nn][Ee]) ;;
+            *)
+                echo 'git-on: OpenSSH jump hosts are unsupported. Use a direct connection.' >&2
+                exit 125 ;;
+        esac
+    }
     executable=$1; shift
     case "$executable" in
         env|exec|command|sh|bash|dash|zsh|ksh|*=*)
@@ -1513,7 +1521,10 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
     while [ "$remaining" -gt 0 ]; do
         argument=$1; shift; remaining=$((remaining - 1)); drop=0
         if [ -n "$next_option_arg" ]; then
-            if [ "$next_option_arg" = drop ]; then drop=1; fi
+            if [ "$next_option_arg" = jump ]; then
+                require_no_jump "$argument"
+                drop=1
+            fi
             next_option_arg=
         else
             case "$argument" in
@@ -1529,14 +1540,16 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
                             E|O)
                                 echo 'git-on: SSH control commands (-O) and log files (-E) are unsupported' >&2
                                 exit 125 ;;
-                            B|b|c|D|e|F|I|i|J|L|l|m|o|p|P|Q|R|S|W|w)
-                                if [ "$flag" = J ] && [ "$GIT_ON_SSH_MODE" = channel ]; then
-                                    # The jump has already been applied to our master.
-                                    if [ -z "$flags" ]; then next_option_arg=drop; fi
+                            J)
+                                if [ -z "$flags" ]; then
+                                    next_option_arg=jump
                                 else
-                                    kept=$kept$flag$flags
-                                    if [ -z "$flags" ]; then next_option_arg=keep; fi
+                                    require_no_jump "$flags"
                                 fi
+                                flags= ;;
+                            B|b|c|D|e|F|I|i|L|l|m|o|p|P|Q|R|S|W|w)
+                                kept=$kept$flag$flags
+                                if [ -z "$flags" ]; then next_option_arg=keep; fi
                                 flags= ;;
                             *) kept=$kept$flag ;;
                         esac
@@ -1577,7 +1590,8 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
         # a replacement connection if ordinary session multiplexing fails.
         exec "$executable" -o "ControlPath=$control_path" -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=/usr/bin/false "$@"
     fi
-    exec "$executable" -o "ControlPath=$control_path" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
+    # The first ProxyCommand also takes precedence over any ProxyJump setting.
+    exec "$executable" -o ProxyCommand=none -o "ControlPath=$control_path" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
 }"#;
 
 #[cfg(test)]
