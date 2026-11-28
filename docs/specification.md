@@ -49,7 +49,8 @@ With one operand, native Git resolves the revision through
 `git rev-parse --verify --end-of-options`. Git interprets abbreviations,
 ancestry, reflogs and `HEAD:path`. With an explicit local source, including
 `file://` or a remote name that resolves to a local path, resolve the revision
-and read its objects as in `git -C PATH on REV`. Object directories and
+and read its objects as in `git -C PATH on REV`. A named remote uses the
+effective `remote.<name>.url` setting. Object directories and
 alternates follow native Git's repository setup, including bare repositories,
 linked worktrees and byte-valued paths. Do not interpret a local revision as
 a fetch destination.
@@ -374,7 +375,9 @@ not replace them or establish proof for all possible sequences.
 The implementation uses a shared pinned object store, demand-only metadata/blob
 access, content caches and deferred inode creation. A byte-budgeted LRU holds
 small blobs and reused disk blocks. A separate LRU retains the eight most
-recently used complete large blobs. The copy backend
+recently used complete large blobs, with capacity measured in objects. A
+first read can load a whole large blob for a range. After eviction, disk
+reads verify just the blocks they touch. The copy backend
 uses a 128 MiB payload LRU for complete blobs before materialization. Readers
 of the same OID share verified buffers. Trusted descriptors, digests of spilled blocks and parsed directories
 remain in RAM for touched unique objects outside that payload budget. Raw tree

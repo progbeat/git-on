@@ -25,12 +25,13 @@ impl Group {
         } else {
             &base
         })?;
-        Self::create_in(&base, rename_group)
+        Self::create_in(&base, rename_group, create_run)
     }
 
     fn create_in(
         base: &Path,
         rename: impl Fn(&CStr, &CStr) -> io::Result<()>,
+        create: impl Fn(&File, &CStr) -> io::Result<()>,
     ) -> io::Result<(Option<Self>, PathBuf, String)> {
         let uid = unsafe { libc::geteuid() };
         for name in [GROUP_NAME.to_owned(), private_name(uid)] {
@@ -64,12 +65,14 @@ impl Group {
                 let id = uuid::Uuid::new_v4().to_string();
                 let name = &id[..8];
                 let entry = CString::new(name).expect("UUID is ASCII");
-                let fd = directory.as_raw_fd();
-                if unsafe { libc::mkdirat(fd, entry.as_ptr(), 0o700) } == 0 {
-                    let run = path.join(name);
-                    return Ok((Some(Self { path, metadata }), run, id));
-                }
-                let error = io::Error::last_os_error();
+                let error = match create(&directory, &entry) {
+                    Ok(()) => {
+                        let run = path.join(name);
+                        return Ok((Some(Self { path, metadata }), run, id));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => break,
+                    Err(error) => error,
+                };
                 if error.raw_os_error() == Some(libc::ESTALE) && !retried_stale {
                     retried_stale = true;
                 } else if !matches!(
@@ -107,6 +110,14 @@ impl Group {
             path: path.to_owned(),
             metadata,
         })
+    }
+}
+
+fn create_run(directory: &File, name: &CStr) -> io::Result<()> {
+    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -257,7 +268,7 @@ mod tests {
 
         // A concurrent creator must leave an existing empty directory alone.
         publish_group(base, &fallback, rename_group).unwrap();
-        let (group, run, _) = Group::create_in(base, rename_group).unwrap();
+        let (group, run, _) = Group::create_in(base, rename_group, create_run).unwrap();
         assert!(group.is_none());
         assert_eq!(run.parent(), Some(base));
         assert!(run.is_dir());
@@ -272,13 +283,44 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let base = temporary.path();
         for errno in [libc::ENOTSUP, libc::EPERM] {
-            let (group, run, _) =
-                Group::create_in(base, |_, _| Err(io::Error::from_raw_os_error(errno))).unwrap();
+            let (group, run, _) = Group::create_in(
+                base,
+                |_, _| Err(io::Error::from_raw_os_error(errno)),
+                create_run,
+            )
+            .unwrap();
             assert!(group.is_none());
             assert_eq!(run.parent(), Some(base));
             assert_eq!(fs::symlink_metadata(&run).unwrap().mode() & 0o777, 0o700);
             fs::remove_dir(run).unwrap();
             assert_eq!(fs::read_dir(base).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn denied_group_creation_uses_the_private_group() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path();
+        let primary = base.join(GROUP_NAME);
+        let fallback = base.join(private_name(unsafe { libc::geteuid() }));
+        for directory in [&primary, &fallback] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+            write_marker(directory).unwrap();
+        }
+        let primary_inode = fs::metadata(&primary).unwrap().ino();
+        let (group, run, _) = Group::create_in(
+            base,
+            |_, _| unreachable!("groups already exist"),
+            |directory, name| {
+                if directory.metadata()?.ino() == primary_inode {
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
+                create_run(directory, name)
+            },
+        )
+        .unwrap();
+        assert!(group.is_some());
+        assert_eq!(run.parent(), Some(fallback.as_path()));
+        assert!(run.is_dir());
     }
 }

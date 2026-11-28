@@ -517,9 +517,13 @@ fn cleanup(dir: &Path) -> Result<()> {
             };
         }
     }
-    // Keep both recovery files until all removable data is gone. Consume the
-    // recovery record under the lock so another cleaner cannot also succeed.
-    for entry in fs::read_dir(&dir)? {
+    remove_run(&dir, || drop(held_lock))
+}
+
+fn remove_run(dir: &Path, release_lock: impl FnOnce()) -> Result<()> {
+    // Keep the recovery record until all removable data is gone, then remove
+    // it under the lock so no second cleaner can take over.
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if matches!(entry.file_name().as_encoded_bytes(), b".state" | b".lock") {
             continue;
@@ -530,9 +534,13 @@ fn cleanup(dir: &Path) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
-    fs::remove_file(record)?;
+    match fs::remove_file(dir.join(".state")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     // An open writable lock can leave a busy unlinked file on NFS.
-    drop(held_lock);
+    release_lock();
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -851,9 +859,7 @@ fn execute(invoked: Instant, run: cli::RunArgs<'_>) -> Result<ExitStatus> {
             Err(error) => return Err(error).context("remove SSH recovery identity"),
         }
         drop(observed.take());
-        drop(held_lock);
-        fs::remove_dir_all(&dir)?;
-        Ok(())
+        remove_run(&dir, || drop(held_lock))
     })();
 
     if let Err(e) = cleanup_result {
@@ -1138,6 +1144,25 @@ mod tests {
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         cleanup(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+    #[test]
+    fn recovery_cannot_take_over_when_normal_cleanup_releases_the_lock() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("run");
+        private_dir(&dir).unwrap();
+        let held = lock(&dir, true).unwrap();
+        save(&dir, &recovery()).unwrap();
+        fs::write(dir.join("payload"), b"disposable").unwrap();
+        remove_run(&dir, || {
+            drop(held);
+            let error = cleanup(&dir).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unrecognized temporary directory"));
+        })
+        .unwrap();
         assert!(!dir.exists());
     }
     #[test]

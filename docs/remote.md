@@ -2,11 +2,12 @@
 
 `git on REPOSITORY REV -- COMMAND` accepts a configured remote name, a local
 path or `file://` URL, or a network URL. Effective Git URL rewrites apply once.
-A remote name requires the repository that defines it. A local source always
-uses native Git revision syntax, including `HEAD:path`, and honors the same
-index and object environment as `git -C PATH on REV`. A local partial clone
-requires a Git version that supports `--no-lazy-fetch` and can use the objects
-already available to that repository.
+A named remote uses the effective `remote.<name>.url` setting.
+Repository-local settings apply when Git discovers that repository.
+A local source always uses native Git revision syntax, including `HEAD:path`,
+and honors the same index and object environment as `git -C PATH on REV`.
+A local partial clone requires a Git version that supports `--no-lazy-fetch`
+and can use the objects already available to that repository.
 
 ## Network profile
 
