@@ -132,7 +132,9 @@ fn publish_group(
             if error.raw_os_error() == Some(libc::ENOTSUP)
                 || matches!(
                     error.kind(),
-                    io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                    io::ErrorKind::Unsupported
+                        | io::ErrorKind::InvalidInput
+                        | io::ErrorKind::PermissionDenied
                 ) =>
         {
             Ok(false)
@@ -269,14 +271,14 @@ mod tests {
     fn unsupported_group_rename_allows_a_standalone_run() {
         let temporary = tempfile::tempdir().unwrap();
         let base = temporary.path();
-        let (group, run, _) = Group::create_in(base, |_, _| {
-            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-        })
-        .unwrap();
-        assert!(group.is_none());
-        assert_eq!(run.parent(), Some(base));
-        assert_eq!(fs::symlink_metadata(&run).unwrap().mode() & 0o777, 0o700);
-        fs::remove_dir(run).unwrap();
-        assert_eq!(fs::read_dir(base).unwrap().count(), 0);
+        for errno in [libc::ENOTSUP, libc::EPERM] {
+            let (group, run, _) =
+                Group::create_in(base, |_, _| Err(io::Error::from_raw_os_error(errno))).unwrap();
+            assert!(group.is_none());
+            assert_eq!(run.parent(), Some(base));
+            assert_eq!(fs::symlink_metadata(&run).unwrap().mode() & 0o777, 0o700);
+            fs::remove_dir(run).unwrap();
+            assert_eq!(fs::read_dir(base).unwrap().count(), 0);
+        }
     }
 }
