@@ -12,7 +12,7 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, FromRawFd},
-        net::UnixStream,
+        net::{SocketAddr, UnixStream},
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -21,8 +21,22 @@ use std::{
 };
 
 pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
+const SSH_CONTROL_SOCKET: &str = "ssh-control";
+const SHORT_SSH_CONTROL_SOCKET: &str = "ssh";
 const SSH_STANDBY_DELAY: Duration = Duration::from_millis(250);
 const SSH_STANDBY_CHANNELS: usize = 2;
+
+fn ssh_control_path(run: &Path) -> PathBuf {
+    let path = run.join(SSH_CONTROL_SOCKET);
+    let mut listener = path.as_os_str().to_os_string();
+    // OpenSSH appends a dot and sixteen random characters while binding.
+    listener.push(".XXXXXXXXXXXXXXXX");
+    if SocketAddr::from_pathname(&listener).is_ok() {
+        path
+    } else {
+        run.join(SHORT_SSH_CONTROL_SOCKET)
+    }
+}
 
 fn require_native_git(cwd: &Path) -> Result<()> {
     let mut command = Command::new("git");
@@ -409,7 +423,7 @@ impl Remote {
             git.demand_session_compatible()?,
             "Git configuration requires a transport outside the Git protocol v2 profile"
         );
-        let socket = ssh_transport.then(|| run.join("ssh-control"));
+        let socket = ssh_transport.then(|| ssh_control_path(run));
         let ssh = socket
             .as_ref()
             .map(|_| git.ssh_command().unwrap_or_else(|| OsString::from("ssh")));
@@ -1122,6 +1136,7 @@ impl Drop for Remote {
 }
 /// Stop only the control connection in a validated run's private directory.
 /// Recovery callers must validate and lock that run before invoking this.
+/// The standard socket path also recognizes the short name through its recorded identity.
 pub fn stop_connection(socket: &Path) -> Result<()> {
     let record = socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE);
     if !fs::symlink_metadata(&record).is_ok_and(|metadata| metadata.file_type().is_file()) {
@@ -1149,9 +1164,18 @@ pub fn stop_connection(socket: &Path) -> Result<()> {
         inode,
         client: None,
     };
-    if !owned_socket(socket, &identity) {
+    let alternate;
+    let socket = if owned_socket(socket, &identity) {
+        socket
+    } else if socket.file_name() == Some(OsStr::new(SSH_CONTROL_SOCKET)) {
+        alternate = socket.with_file_name(SHORT_SSH_CONTROL_SOCKET);
+        if !owned_socket(&alternate, &identity) {
+            return Ok(());
+        }
+        alternate.as_path()
+    } else {
         return Ok(());
-    }
+    };
     // Once socket ownership is established, malformed client provenance is a
     // recoverable shutdown failure, not permission to unlink a live socket.
     let owner = serde_json::from_value::<SocketOwner>(value)
@@ -1597,6 +1621,28 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_matches_the_short_control_socket_by_identity() {
+        let run = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = run.path().join(SHORT_SSH_CONTROL_SOCKET);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let metadata = fs::symlink_metadata(&socket).unwrap();
+        fs::write(
+            run.path().join(SSH_CONTROL_OWNER_FILE),
+            serde_json::to_vec(&SocketOwner {
+                format: "git-on-ssh-control-v1".into(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                client: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        drop(listener);
+        stop_connection(&run.path().join(SSH_CONTROL_SOCKET)).unwrap();
+        assert!(!socket.exists());
+    }
 
     #[test]
     fn scp_transport_locates_the_separator_after_a_bracketed_host() {

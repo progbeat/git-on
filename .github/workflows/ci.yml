@@ -505,6 +505,7 @@ jobs:
             RemoteTests.test_cancel_concurrent_https_demands \
             RemoteTests.test_cold_directory_demand_overlaps_file_lookup \
             RemoteTests.test_concurrent_https_lookups_combine_only_requested_objects \
+            RemoteTests.test_ssh_mount_at_the_existing_tmpdir_path_boundary \
             RemoteTests.test_real_mount_caught_spilled_blob_failure_is_sticky
           GIT_ON_TEST_FSYNC_ERROR=1 cargo test --locked --lib --features test-metrics backend::nfs::tests::sync_errors_are_returned_in_rpc_replies -- --exact --ignored
       - name: Multiplex exact Git demands through real NFS

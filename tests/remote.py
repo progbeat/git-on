@@ -2527,6 +2527,27 @@ print('delta payload verified')
                 with contextlib.suppress(ChildProcessError): os.waitpid(pid,0)
             os.close(fd)
 
+    @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
+    def test_ssh_mount_at_the_existing_tmpdir_path_boundary(self):
+        f = self.f
+        url = f.ssh()
+        backend = 'nfs' if OPTIONS.require_nfs else 'fuse'
+        # OpenSSH appends a dot and 16 characters to the control socket path.
+        # These TMPDIR lengths fit the standalone layout on each platform.
+        budget = 60 if backend == 'nfs' else 64
+        with tempfile.TemporaryDirectory(prefix='go-path-', dir='/tmp') as temporary:
+            base = Path(temporary).resolve()
+            runtime = base / ('p' * (budget - len(os.fsencode(base)) - 1))
+            self.assertEqual(len(os.fsencode(runtime)), budget)
+            runtime.mkdir()
+            result = subprocess.run(
+                [OPTIONS.binary, url, 'HEAD', f'--backend={backend}', '--', 'cat', 'deep/file'],
+                cwd=f.cwd, env=dict(f.env, TMPDIR=str(runtime)), capture_output=True, timeout=25,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b'expected\n')
+            self.assertEqual(list(runtime.iterdir()), [])
+
     def test_real_mount_remote_active_cleanup_and_sigkill_stale_recovery(self):
         if not OPTIONS.require_fuse: self.skipTest('real FUSE explicitly required in CI')
         f=self.f; url=f.ssh(); ready=f.root/'remote-ready'
