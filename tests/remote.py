@@ -3026,25 +3026,36 @@ signal.pause()
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_real_mount_caught_spilled_blob_failure_is_sticky(self):
-        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
-            self.skipTest("requires a native mount")
         f = self.f
         oids = [f.git("hash-object", "-w", "--stdin", data=bytes([index]) * 65537)
                 for index in range(9)]
-        rows = "".join(f"100644 blob {oid}\tf{index}\n" for index, oid in enumerate(oids))
+        # Keep the target and each pressure blob in a separate tree.
+        subtrees = [f.git("mktree", data=f"100644 blob {oid}\tfile\n".encode())
+                    for oid in oids]
+        rows = "".join(f"040000 tree {oid}\td{index}\n" for index, oid in enumerate(subtrees))
         tree = f.git("mktree", data=rows.encode())
         commit = f.git("commit-tree", tree, data=b"spill fixture\n")
         f.git("update-ref", "refs/heads/main", commit)
         source = f.https()
         body = f"""import errno
 from pathlib import Path
-for index in range(9):
-    assert Path(f'f{{index}}').stat().st_size == 65537
-spill, = Path.cwd().parent.glob('raw-objects-*/{oids[0]}')
+from time import monotonic, sleep
+target = Path('d0/file')
+assert target.stat().st_size == 65537
+for index in range(1, 9):
+    with Path(f'd{{index}}/file').open('rb', buffering=0) as pressure:
+        assert pressure.read(1) == bytes([index])
+run = Path.cwd().parent
+deadline = monotonic() + 5
+while not (spills := list(run.glob('raw-objects-*/{oids[0]}'))):
+    assert monotonic() < deadline, 'target blob was not spilled after eight later reads'
+    sleep(.01)
+spill, = spills
+assert spill.stat().st_size == 65537
 with spill.open('r+b') as output:
     output.write(b'!')
 try:
-    with open('f0', 'rb') as source:
+    with target.open('rb') as source:
         source.read(1)
 except OSError as error:
     assert error.errno == errno.EIO, error

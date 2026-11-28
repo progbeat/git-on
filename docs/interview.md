@@ -91,6 +91,11 @@ deprecation practices so that users know what to expect.
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
 
+The later copy-up decision scopes this guarantee to immutable Git data. After
+the first successful content change, the private file uses ordinary I/O for
+its entire contents, including inherited ranges. The immutable source remains
+subject to its integrity checks. [Copy-up and writable backing](resources.md#files-and-temporary-disk-space)
+
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 
 **Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.

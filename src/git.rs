@@ -932,7 +932,7 @@ impl LocalObjects {
             anyhow::ensure!(payload.limit() == 0, "incomplete Git object");
             let mut delimiter = [0];
             response.read_exact(&mut delimiter)?;
-            anyhow::ensure!(delimiter == [b'\n'], "invalid native Git object delimiter");
+            anyhow::ensure!(delimiter == *b"\n", "invalid native Git object delimiter");
             Ok(value)
         })();
         result.with_context(|| {
