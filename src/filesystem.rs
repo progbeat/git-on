@@ -13,6 +13,8 @@ use git2::Oid;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -903,6 +905,16 @@ impl Overlay {
                     times
                 };
                 let _ = file.set_times(times);
+                // Managed reads preserve the overlay's logical atime. FUSE
+                // passthrough opens its own backing descriptor with the
+                // flags of the user's file when it takes over.
+                unsafe {
+                    let fd = file.as_raw_fd();
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NOATIME);
+                    }
+                }
             }
             change(file)
         };
@@ -1218,12 +1230,18 @@ impl Overlay {
         if n.attr.nlink == 0 {
             return Err(libc::ENOENT);
         }
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(self.backing.join(ino.to_string()))
-            .map_err(errno)
+        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let path = self.backing.join(ino.to_string());
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(target_os = "linux")]
+        if n.snapshot_path.is_some() && !n.external_io {
+            match options.custom_flags(flags | libc::O_NOATIME).open(&path) {
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+                result => return result.map_err(errno),
+            }
+        }
+        options.custom_flags(flags).open(path).map_err(errno)
     }
     fn record_data_change(attr: &mut FileAttr, metadata: &fs::Metadata) {
         attr.size = metadata.len();
@@ -2895,16 +2913,42 @@ mod tests {
         let ino = fs.ensure(Path::new("tracked.tmp")).unwrap();
         let writer = fs.open_file(ino, libc::O_RDWR).unwrap();
         #[cfg(target_os = "linux")]
-        assert!(fs.eligible_backing(ino, writer, false).is_none());
+        let atime = {
+            assert!(fs.eligible_backing(ino, writer, false).is_none());
+            let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+            fs.set_attributes(
+                ino,
+                0,
+                SetAttributes {
+                    atime: Some(TimeOrNow::SpecificTime(atime)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            atime
+        };
         fs.write_data(ino, writer, 0, b"e", 0, 0).unwrap();
         #[cfg(target_os = "linux")]
         let writer = {
-            let second = fs.open_file(ino, libc::O_RDONLY).unwrap();
+            let second = fs.open_file(ino, libc::O_RDONLY | libc::O_NOATIME).unwrap();
             assert!(fs.eligible_backing(ino, second, false).is_none());
+            assert_eq!(fs.read_data(ino, second, 13, 1).unwrap(), b"t");
+            let file = fs.disk_file(ino).unwrap();
+            assert_eq!(file.metadata().unwrap().accessed().unwrap(), atime);
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NOATIME != 0);
+            let ctime = fs.attributes(ino, Some(second)).unwrap().ctime;
             fs.release_handle(ino, second).unwrap();
             fs.release_handle(ino, writer).unwrap();
             let fresh = fs.open_file(ino, libc::O_RDONLY).unwrap();
-            assert!(fs.eligible_backing(ino, fresh, false).is_some());
+            assert_eq!(fs.read_data(ino, fresh, 13, 1).unwrap(), b"t");
+            assert!(
+                fs.eligible_backing(ino, fresh, false).is_some(),
+                "ordinary reads must not prevent backing registration"
+            );
+            fs.enable_external_io(ino);
+            let attr = fs.attributes(ino, Some(fresh)).unwrap();
+            assert_eq!((attr.atime, attr.ctime), (atime, ctime));
             fresh
         };
         fs.disk_file(ino).unwrap().write_all_at(b"!", 13).unwrap();
