@@ -43,9 +43,9 @@ snapshot before invoking uv:
 git on origin main -- sh -c 'cd examples/uv-project && uv run --locked main.py'
 ```
 
-With two positional operands, Git interprets the second as a fetch refspec;
-`main:examples/uv-project` would name a destination ref, not a subtree.
-Add `--verify` after the revision/refspec when native Git should verify the selected
+For a local source, the second operand is a Git revision such as
+`HEAD:examples/uv-project`. For a network source, it selects a ref or a full OID.
+Add `--verify` when native Git should verify the selected
 commit or annotated tag under your existing configuration. Verification does not
 assert passed tests.
 

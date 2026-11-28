@@ -58,6 +58,9 @@ After launching the command, credential lookup runs without interactive prompts.
 Git-on does not ask credential helpers to store or erase credentials. SSH uses
 OpenSSH's configured identity and agent and requires a previously trusted host
 key. Host-key files and the agent's identity list stay unchanged.
+On macOS, Git-on disables Apple OpenSSH's `UseKeychain` setting, which
+controls both looking up and saving a passphrase. An encrypted key can still
+be used through the agent or by entering its passphrase.
 Lazy mounts reuse an invocation-owned OpenSSH control connection and close it
 during teardown. If that connection is lost, outstanding reads fail.
 A direct SSH copy uses a single foreground SSH process. Copy after a mount

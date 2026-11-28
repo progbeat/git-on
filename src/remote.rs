@@ -908,6 +908,7 @@ impl Remote {
         command
             .env("GIT_ON_SSH_CONTROL_PATH", socket)
             .env("GIT_ON_SSH_MODE", mode.name())
+            .env("GIT_ON_SSH_PLATFORM", std::env::consts::OS)
             .env("GIT_SSH_COMMAND", &script)
             .env("GIT_SSH_VARIANT", "ssh");
         if mode == SshMode::Channel
@@ -1616,12 +1617,60 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
         exec "$executable" -o "ControlPath=$control_path" -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=/usr/bin/false "$@"
     fi
     # The first ProxyCommand also takes precedence over any ProxyJump setting.
+    # Query the option without evaluating user or system SSH configuration.
+    if [ "$GIT_ON_SSH_PLATFORM" = macos ] &&
+        "$executable" -G -F /dev/null -o UseKeychain=no localhost >/dev/null 2>&1; then
+        set -- -o UseKeychain=no "$@"
+    fi
     exec "$executable" -o ProxyCommand=none -o "ControlPath=$control_path" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
 }"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_ssh_does_not_enable_keychain() {
+        let directory = tempfile::tempdir().unwrap();
+        let ssh = directory.path().join("ssh");
+        fs::write(
+            &ssh,
+            b"#!/bin/sh\nif [ \"$1\" = -G ]; then\n  [ \"$2 $3\" = '-F /dev/null' ] && [ -z \"$TEST_PORTABLE_SSH\" ]\n  exit $?\nfi\nprintf '%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = format!(
+            r#"{SSH_WRAPPER}; git_on_git_argc=1; git_on_ssh_command "$0" -o UseKeychain=yes "$@""#
+        );
+        for (mode, portable, keychain_option) in [
+            (SshMode::Copy, "", b"UseKeychain=no".as_slice()),
+            (SshMode::Master, "", b"UseKeychain=no".as_slice()),
+            (SshMode::Copy, "1", b"UseKeychain=yes".as_slice()),
+        ] {
+            let output = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .arg(&ssh)
+                .arg("localhost")
+                .env("GIT_ON_SSH_MODE", mode.name())
+                .env("GIT_ON_SSH_CONTROL_PATH", "/tmp/git-on-ssh-config")
+                .env("GIT_ON_SSH_PLATFORM", std::env::consts::OS)
+                .env("TEST_PORTABLE_SSH", portable)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            assert_eq!(
+                output
+                    .stdout
+                    .split(|byte| *byte == b'\n')
+                    .find(|line| line.starts_with(b"UseKeychain=")),
+                Some(keychain_option),
+                "unexpected first UseKeychain option in {} mode",
+                mode.name()
+            );
+        }
+    }
 
     #[test]
     fn recovery_matches_the_short_control_socket_by_identity() {
