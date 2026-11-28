@@ -490,38 +490,6 @@ impl Remote {
         }
     }
 
-    fn command(&self, mode: SshMode) -> Result<Command> {
-        if let Some(error) = self.failure() {
-            bail!("remote object transport previously failed: {error}");
-        }
-        let mut command = self.git.command(None);
-        if let (Some(socket), Some(ssh)) = (&self.socket, &self.ssh) {
-            // Git appends argv to the outer function, so its argument count
-            // gives the inner function a structural user/Git boundary. User
-            // shell expansion cannot impersonate that boundary. Remove short
-            // -M (which bypasses first-value -o precedence) and place the owned
-            // -S after user options and before Git's host.
-            let mut text = OsString::from(SSH_WRAPPER);
-            text.push("; git_on_ssh() { git_on_git_argc=$#; git_on_ssh_command ");
-            text.push(ssh);
-            text.push(" \"$@\"; }; git_on_ssh");
-            command
-                .env("GIT_ON_SSH_CONTROL_PATH", socket)
-                .env("GIT_ON_SSH_MODE", mode.name());
-            command
-                .env("GIT_SSH_COMMAND", text)
-                .env("GIT_SSH_VARIANT", "ssh");
-        }
-        if mode == SshMode::Channel
-            && !(crate::terminal_ui::preparing() && crate::terminal_ui::owns_terminal())
-        {
-            command
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("GIT_ASKPASS", "/bin/false")
-                .env("SSH_ASKPASS", "/bin/false");
-        }
-        Ok(command)
-    }
     fn fetch_eager(
         &mut self,
         exact: Option<Oid>,
@@ -905,14 +873,37 @@ impl Remote {
 
     fn ssh_command(&self, mode: SshMode) -> Result<Command> {
         let (host, port, path) = ssh_target(&self.demand_url)?;
-        let native = self.command(mode)?;
-        let ssh = native
-            .get_envs()
-            .find_map(|(key, value)| (key == "GIT_SSH_COMMAND").then_some(value).flatten())
+        if let Some(error) = self.failure() {
+            bail!("remote object transport previously failed: {error}");
+        }
+        let (socket, ssh) = self
+            .socket
+            .as_ref()
+            .zip(self.ssh.as_ref())
             .context("no OpenSSH command configured")?;
-        let mut script = ssh.to_os_string();
-        script.push(" \"$@\"");
+        // The outer function counts transport argv before expanding user SSH
+        // options. The wrapper puts the owned -S between those options and
+        // the host, and removes the short -M override.
+        let mut script = OsString::from(SSH_WRAPPER);
+        script.push("; git_on_ssh() { git_on_git_argc=$#; git_on_ssh_command ");
+        script.push(ssh);
+        script.push(" \"$@\"; }; git_on_ssh");
         let mut command = Command::new("/bin/sh");
+        self.git.set_helper_environment(&mut command);
+        command
+            .env("GIT_ON_SSH_CONTROL_PATH", socket)
+            .env("GIT_ON_SSH_MODE", mode.name())
+            .env("GIT_SSH_COMMAND", &script)
+            .env("GIT_SSH_VARIANT", "ssh");
+        if mode == SshMode::Channel
+            && !(crate::terminal_ui::preparing() && crate::terminal_ui::owns_terminal())
+        {
+            command
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "/bin/false")
+                .env("SSH_ASKPASS", "/bin/false");
+        }
+        script.push(" \"$@\"");
         command.args([OsStr::new("-c"), &script, OsStr::new("git-on-ssh")]);
         command.args(["-o", "SendEnv=GIT_PROTOCOL"]);
         if let Some(port) = port {
@@ -923,13 +914,6 @@ impl Remote {
         remote.extend_from_slice(&gix_quote::single(path.as_slice().into()));
         command.arg(OsString::from_vec(remote));
         command.current_dir(&self.ssh_directory);
-        for (key, value) in native.get_envs() {
-            if let Some(value) = value {
-                command.env(key, value);
-            } else {
-                command.env_remove(key);
-            }
-        }
         // Match native Git's local transport child environment for this exact
         // installed Git version, including config/object-location overrides.
         let local = self.git.output(

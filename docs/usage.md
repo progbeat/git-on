@@ -157,10 +157,12 @@ selected tree ID. The rest of the caller's environment is inherited. No `GIT_ON_
 `GIT_ON_RUN_DIR`, or `GIT_ON_OUTPUT_DIR` is generated or consumed. If callers already
 set those names, they remain ordinary inherited variables.
 
-Generated and copied-up modified files use a private run directory under
-`TMPDIR/git-on` or the system temporary location's `git-on` group. Storage
-capacity follows the chosen filesystem and operating-system resource limits.
-The last run removes the group when it is empty and owned by the current user.
+Generated and copied-up modified files use a private run directory, normally
+under `TMPDIR/git-on` or the system temporary location's `git-on` group.
+If neither that group nor the per-user group is available, the run uses a
+private directory directly under the same temporary location. Storage capacity
+follows the filesystem and operating-system resource limits. The last run
+removes a group that Git-on owns when it is empty.
 
 git-on unmounts and removes temporary writes after the command finishes.
 `--keep` and `-k` were removed in 1.3.0. Use explicit external paths for required

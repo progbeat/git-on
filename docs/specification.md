@@ -122,11 +122,12 @@ The native mount and write-policy contracts apply to local and remote runs.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
   error to the caller. Denial alone does not make git-on kill the application.
   The application may handle the error, continue, or exit normally.
-- The writable layer is fresh for each run. Each run has a private directory
-  under `TMPDIR/git-on` or the system temporary location's `git-on` group.
-  If a user-owned path occupies the group name, Git-on uses a separate group
-  for the current user. The temporary filesystem's capacity and operating-system
-  limits apply.
+- The writable layer is fresh for each run. Git-on creates a private directory,
+  normally in the system temporary location's `git-on` group or in a group
+  for the current user. Git-on publishes a new group with its ownership record
+  in place. If neither group is available, the run uses a private directory
+  directly under the system temporary location. The temporary filesystem's
+  capacity and operating-system limits apply.
 - Completion unmounts the snapshot when mounted and deletes the private run.
   The last run removes its empty group when Git-on owns it.
   `--keep` and `-k` are removed before the separator; child argv remains literal.

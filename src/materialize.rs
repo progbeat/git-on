@@ -212,23 +212,16 @@ fn directory(
                     );
                 }
                 EntryKind::Symlink => {
-                    let target = if let Some(source) = prepared.get(&entry.oid) {
-                        let mut target = Vec::new();
+                    let mut target = Vec::new();
+                    if let Some(source) = prepared.get(&entry.oid) {
                         source.copy_to(root, entry.oid, &mut target)?;
-                        ensure!(
-                            !target.is_empty() && !target.contains(&0),
-                            "unusable symlink target"
-                        );
-                        target
                     } else {
-                        let mut target = Vec::new();
                         snapshot.copy_verified_blob(entry.oid, &mut target)?;
-                        ensure!(
-                            !target.is_empty() && !target.contains(&0),
-                            "unusable symlink target"
-                        );
-                        target
-                    };
+                    }
+                    ensure!(
+                        !target.is_empty() && !target.contains(&0),
+                        "unusable symlink target"
+                    );
                     symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
                     ensure!(
                         fs::read_link(&path)?.as_os_str().as_bytes() == target,

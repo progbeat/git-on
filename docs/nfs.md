@@ -4,8 +4,8 @@ On macOS 26 and later, git-on exports one pinned Git tree and an invocation-loca
 writable layer to the built-in Darwin client. The Rust server uses the shared
 Overlay for Git object verification, inode identity, copy-on-write and all four
 write policies. The server opens a Unix stream socket in a short 0700 directory
-under `/private/tmp`. The writable backing stays in the private run under `TMPDIR/git-on`. Only the
-mounting user and the kernel can access the local endpoint. The process uses
+under `/private/tmp`. The writable backing stays in the [private run directory](usage.md#standard-streams-and-temporary-writes).
+Only the mounting user and the kernel can access the local endpoint. The process uses
 `mount_nfs` with NFSv4.1 and `AUTH_SYS`; it needs neither a TCP listener nor
 rpcbind. Symlink targets and component names are handled as bytes.
 

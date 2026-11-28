@@ -244,10 +244,7 @@ impl Git {
 
     pub fn command(&self, dir: Option<&Path>) -> Command {
         let mut command = Command::new("git");
-        command
-            .current_dir(&self.cwd)
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_NO_LAZY_FETCH", "1");
+        command.current_dir(&self.cwd);
         if let Some(dir) = dir {
             if self.original_dir.as_deref() != Some(dir) {
                 // Replay each effective value exactly once in the private repo.
@@ -295,14 +292,21 @@ impl Git {
                 .arg(dir)
                 .args(["-c", "core.bare=true"]);
         }
+        self.set_helper_environment(&mut command);
+        command
+    }
+
+    pub(crate) fn set_helper_environment(&self, command: &mut Command) {
+        command
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1");
         if let Some(program) = self.config.iter().rev().find_map(|(key, value)| {
             (key == "core.askpass")
                 .then_some(value.as_deref())
                 .flatten()
         }) {
-            crate::terminal_ui::core_askpass(&mut command, program);
+            crate::terminal_ui::core_askpass(command, program);
         }
-        command
     }
     pub(crate) fn demand_session_compatible(&self) -> Result<bool> {
         // Reject server and validation policies the direct loader cannot honor.

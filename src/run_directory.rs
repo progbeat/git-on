@@ -1,10 +1,10 @@
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
     io,
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -18,27 +18,33 @@ pub(super) struct Group {
 }
 
 impl Group {
-    pub(super) fn create() -> io::Result<(Self, PathBuf, String)> {
+    pub(super) fn create() -> io::Result<(Option<Self>, PathBuf, String)> {
         let base = std::env::temp_dir();
         let base = fs::canonicalize(if base.as_os_str().is_empty() {
             Path::new(".")
         } else {
             &base
         })?;
+        Self::create_in(&base, rename_group)
+    }
+
+    fn create_in(
+        base: &Path,
+        rename: impl Fn(&CStr, &CStr) -> io::Result<()>,
+    ) -> io::Result<(Option<Self>, PathBuf, String)> {
         let uid = unsafe { libc::geteuid() };
         for name in [GROUP_NAME.to_owned(), private_name(uid)] {
             let path = base.join(name);
             let mut retried_stale = false;
-            let mut retried_marker = false;
             loop {
-                let created = match fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => true,
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-                    Err(error) => return Err(error),
-                };
                 let directory = match open_group(&path) {
                     Ok(directory) => directory,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if publish_group(base, &path, &rename)? {
+                            continue;
+                        }
+                        break;
+                    }
                     Err(error)
                         if matches!(
                             error.raw_os_error(),
@@ -50,37 +56,18 @@ impl Group {
                     Err(error) => return Err(error),
                 };
                 let metadata = directory.metadata()?;
-                if !usable(&metadata, uid) {
+                if !usable(&metadata, uid)
+                    || metadata.mode() & 0o1777 != 0o1777 && !has_marker(&path, uid)
+                {
                     break;
                 }
-                if created {
-                    match write_marker(&path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(error) => {
-                            let _ = fs::remove_dir(&path);
-                            return Err(error);
-                        }
-                    }
-                } else if metadata.mode() & 0o1777 != 0o1777 && !has_marker(&path, uid) {
-                    if !retried_marker {
-                        // A launch can be between mkdir and publishing ownership.
-                        retried_marker = true;
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
-                    break;
-                }
-                let group = Self {
-                    path: path.clone(),
-                    metadata,
-                };
                 let id = uuid::Uuid::new_v4().to_string();
                 let name = &id[..8];
                 let entry = CString::new(name).expect("UUID is ASCII");
                 let fd = directory.as_raw_fd();
                 if unsafe { libc::mkdirat(fd, entry.as_ptr(), 0o700) } == 0 {
-                    return Ok((group, path.join(name), id));
+                    let run = path.join(name);
+                    return Ok((Some(Self { path, metadata }), run, id));
                 }
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ESTALE) && !retried_stale {
@@ -93,10 +80,15 @@ impl Group {
                 }
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "no usable private git-on group in the system temporary directory",
-        ))
+        // Neither group is available. A standalone run also works on
+        // filesystems that cannot publish a directory without replacing it.
+        let run = tempfile::Builder::new()
+            .prefix("git-on-")
+            .rand_bytes(8)
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(base)?
+            .keep();
+        Ok((None, run, uuid::Uuid::new_v4().to_string()))
     }
 
     pub(super) fn for_run(run: &Path) -> Option<Self> {
@@ -115,6 +107,59 @@ impl Group {
             path: path.to_owned(),
             metadata,
         })
+    }
+}
+
+fn publish_group(
+    base: &Path,
+    path: &Path,
+    rename: impl Fn(&CStr, &CStr) -> io::Result<()>,
+) -> io::Result<bool> {
+    let staged = tempfile::Builder::new()
+        .prefix(".git-on-group-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(base)?;
+    write_marker(staged.path())?;
+    let from = CString::new(staged.path().as_os_str().as_encoded_bytes())?;
+    let to = CString::new(path.as_os_str().as_encoded_bytes())?;
+    match rename(&from, &to) {
+        Ok(()) => {
+            let _ = staged.keep();
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(true),
+        Err(error)
+            if error.raw_os_error() == Some(libc::ENOTSUP)
+                || matches!(
+                    error.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn rename_group(from: &CStr, to: &CStr) -> io::Result<()> {
+    // An ordinary rename can replace an existing empty directory.
+    #[cfg(target_os = "macos")]
+    let status = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -192,4 +237,46 @@ fn usable(group: &fs::Metadata, uid: u32) -> bool {
     group.is_dir()
         && (group.uid() == uid && mode & 0o722 == 0o700
             || group.uid() == 0 && mode & 0o1777 == 0o1777)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn occupied_group_and_unmarked_fallback_allow_a_private_run() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path();
+        let occupied = base.join(GROUP_NAME);
+        fs::write(&occupied, b"user data").unwrap();
+        let fallback = base.join(private_name(unsafe { libc::geteuid() }));
+        fs::DirBuilder::new().mode(0o700).create(&fallback).unwrap();
+
+        // A concurrent creator must leave an existing empty directory alone.
+        publish_group(base, &fallback, rename_group).unwrap();
+        let (group, run, _) = Group::create_in(base, rename_group).unwrap();
+        assert!(group.is_none());
+        assert_eq!(run.parent(), Some(base));
+        assert!(run.is_dir());
+        fs::remove_dir(run).unwrap();
+        assert_eq!(fs::read_dir(&fallback).unwrap().count(), 0);
+        assert_eq!(fs::read(&occupied).unwrap(), b"user data");
+        assert_eq!(fs::read_dir(base).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn unsupported_group_rename_allows_a_standalone_run() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path();
+        let (group, run, _) = Group::create_in(base, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        })
+        .unwrap();
+        assert!(group.is_none());
+        assert_eq!(run.parent(), Some(base));
+        assert_eq!(fs::symlink_metadata(&run).unwrap().mode() & 0o777, 0o700);
+        fs::remove_dir(run).unwrap();
+        assert_eq!(fs::read_dir(base).unwrap().count(), 0);
+    }
 }
