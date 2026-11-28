@@ -120,6 +120,9 @@ The native mount and write-policy contracts apply to local and remote runs.
   directory renames keep demand-loaded source origins. Git objects, the index,
   and the working copy stay unchanged. Unsupported filesystem operations retain
   their existing error contracts.
+  Reads remain verified while a file is backed by its pinned Git object. Once
+  a write or truncation commits private writable backing, the whole file uses
+  ordinary I/O and normal passthrough eligibility, including inherited ranges.
 - The same rule governs all programs and languages. No Python, uv, Numba, cache,
   or environment-directory exception exists.
 - A disallowed filesystem operation returns an appropriate ordinary filesystem
@@ -378,11 +381,12 @@ The implementation uses a shared pinned object store, demand-only metadata/blob
 access, content caches and deferred inode creation. A byte-budgeted LRU holds
 small blobs and reused disk blocks. A separate LRU retains the eight most
 recently used complete large blobs, with capacity measured in objects. A
-first read can load a whole large blob for a range. After eviction, disk
-reads verify just the blocks they touch. The copy backend
-uses a 128 MiB payload LRU for complete blobs before materialization. Readers
-of the same OID share verified buffers. Trusted descriptors, digests of spilled blocks and parsed directories
-remain in RAM for touched unique objects outside that payload budget. Raw tree
+first read from a local or remote repository can load a whole large blob for
+a range. After eviction, disk reads verify just the blocks they touch.
+Network copy uses a 128 MiB payload LRU for complete blobs before
+materialization. Readers of the same OID share verified buffers. Trusted
+descriptors, digests of spilled blocks and parsed directories remain in RAM for
+touched unique objects outside that payload budget. Raw tree
 bytes and disk object/name indexes are not retained. The FUSE layer retains no
 duplicate snapshot payloads. Source
 errors are reported when the relevant operation reaches them: submodules fail

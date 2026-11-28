@@ -91,6 +91,9 @@ deprecation practices so that users know what to expect.
 
 **Answer:** Verify each Git object against its OID before exposing its contents. Subsequent reads must preserve this guarantee despite tampering with temporary storage by unprivileged processes. Root and access to Git-on’s process memory are outside the threat model.
 
+For mounted files, the [filesystem policy](specification.md#filesystem-policy)
+defines when a file switches from the verified source to private writable backing.
+
 **Question**: How much free disk space should be sufficient for Git-on to run a command?
 
 **Answer**: If the command can finish with two checked-out copies of the selected revision on disk, Git-on must be able to run it too.
