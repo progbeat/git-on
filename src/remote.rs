@@ -627,7 +627,7 @@ impl Remote {
             for &oid in oids {
                 if self.raw_blobs.get(oid)?.is_some() || odb.exists(oid) {
                     if let Some(pool) = &self.demand_pool {
-                        pool.observe_cached(oid);
+                        pool.observe_cached(oid)?;
                     }
                     continue;
                 }

@@ -64,6 +64,7 @@ enum ReceiptState {
     #[default]
     Pending,
     Observed(Arc<ResponseCompletion>),
+    Failed(String),
     Finished,
 }
 
@@ -74,8 +75,11 @@ struct ResponseReceipt {
 }
 
 impl ResponseReceipt {
-    fn observe(&self, completion: &Arc<ResponseCompletion>) {
+    fn observe(&self, completion: &Arc<ResponseCompletion>) -> Result<()> {
         let mut receipt = self.state.lock().unwrap();
+        if let ReceiptState::Failed(error) = &*receipt {
+            bail!("{error}");
+        }
         if matches!(*receipt, ReceiptState::Pending) {
             let mut pending = completion.pending.lock().unwrap();
             if !completion.sealed.load(Ordering::Relaxed) {
@@ -83,6 +87,18 @@ impl ResponseReceipt {
                 *receipt = ReceiptState::Observed(completion.clone());
             }
         }
+        Ok(())
+    }
+
+    // A speculative response can publish an object before its tail fails.
+    // Retain the error for a later reader, without failing an unrelated run.
+    fn record_failure(&self, error: &anyhow::Error) -> bool {
+        let mut receipt = self.state.lock().unwrap();
+        if matches!(*receipt, ReceiptState::Observed(_)) {
+            return true;
+        }
+        *receipt = ReceiptState::Failed(format!("{error:#}"));
+        false
     }
 }
 
@@ -92,6 +108,9 @@ struct ResponseGuard(Arc<ResponseReceipt>);
 impl Drop for ResponseGuard {
     fn drop(&mut self) {
         let mut receipt = self.0.state.lock().unwrap();
+        if matches!(*receipt, ReceiptState::Failed(_)) {
+            return;
+        }
         if let ReceiptState::Observed(completion) =
             std::mem::replace(&mut *receipt, ReceiptState::Finished)
         {
@@ -252,7 +271,9 @@ impl Demand {
             .unwrap();
         let batch = state.batch.as_ref().unwrap();
         if batch.delivery == Delivery::Response {
-            state.observe(completion);
+            if let Err(error) = state.observe(completion) {
+                return Batch::new(batch.oids.clone(), Err(error));
+            }
         }
         batch.clone()
     }
@@ -275,15 +296,16 @@ impl Demand {
         self.0.required.load(Ordering::Relaxed)
     }
 
-    fn observe_cached(&self, completion: &Arc<ResponseCompletion>) {
+    fn observe_cached(&self, completion: &Arc<ResponseCompletion>) -> Result<()> {
         let state = self.0.state.lock().unwrap();
         if state
             .batch
             .as_ref()
             .is_none_or(|batch| batch.delivery == Delivery::Response)
         {
-            state.observe(completion);
+            state.observe(completion)?;
         }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -298,10 +320,11 @@ impl Demand {
 }
 
 impl FlightState {
-    fn observe(&self, completion: &Arc<ResponseCompletion>) {
+    fn observe(&self, completion: &Arc<ResponseCompletion>) -> Result<()> {
         if let Some(response) = &self.response {
-            response.observe(completion);
+            response.observe(completion)?;
         }
+        Ok(())
     }
 }
 
@@ -595,6 +618,8 @@ impl Queue {
             if demand.required() {
                 demand.complete(Batch::new(vec![oid], Ok(Acquired::Packed(object))));
             } else {
+                // A completed pack has now validated this same OID.
+                // A future read may use its already verified cached bytes.
                 self.pending.remove(&oid);
             }
             self.waiting.retain(|item| item.oid != oid);
@@ -815,11 +840,12 @@ impl Pool {
         Ok(demand)
     }
 
-    pub(crate) fn observe_cached(&self, oid: Oid) {
+    pub(crate) fn observe_cached(&self, oid: Oid) -> Result<()> {
         let demand = self.shared.queue.lock().unwrap().pending.get(&oid).cloned();
         if let Some(demand) = demand {
-            demand.observe_cached(&self.shared.completion);
+            demand.observe_cached(&self.shared.completion)?;
         }
+        Ok(())
     }
 
     pub(crate) fn prefetch<I: Iterator<Item = Oid>>(
@@ -1018,20 +1044,26 @@ impl Shared {
         if let Some(index) = lane {
             queue.busy[index] = false;
         }
-        // A speculative pack can already have exposed verified bytes before
-        // its trailer or transport fails. Retrying an outstanding want must
-        // not erase that failure.
-        let needed = result.is_err()
-            && work.items.iter().any(|item| {
-                !item.demand.resolved_by_extra() && (!work.speculative || item.demand.ready())
-            });
+        let speculative_failure = result.as_ref().err().filter(|error| {
+            work.speculative && !object::is_cancelled(error) && !is_retryable_spill(error)
+        });
+        let needed = speculative_failure.is_some_and(|error| work.response.0.record_failure(error))
+            || result.is_err()
+                && !work.speculative
+                && work
+                    .items
+                    .iter()
+                    .any(|item| !item.demand.resolved_by_extra());
         // Retire a speculative success from the queue once its verified blob
         // is visible in the raw store. A foreground waiter still holds a clone.
         work.items.retain(|item| {
             if !item.demand.ready() {
                 return true;
             }
-            if work.speculative && !item.demand.required() {
+            if work.speculative
+                && !item.demand.required()
+                && (needed || speculative_failure.is_none())
+            {
                 queue.pending.remove(&item.oid);
             }
             false
@@ -1638,6 +1670,54 @@ mod tests {
         assert_eq!(queue.waiting[0].oid, used);
         assert!(Arc::ptr_eq(&demand.0, &queue.waiting[0].demand.0));
         assert!(!demand.ready());
+    }
+
+    #[test]
+    fn ready_prefetch_failure_requires_a_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = RawBlobs::new(directory.path()).unwrap();
+        let (wanted, oid, prefix, _, tail) = two_blob_response();
+        for observed in [false, true] {
+            let shared = Shared::default();
+            let (work, demand) = {
+                let mut queue = shared.queue.lock().unwrap();
+                let item = queue.insert(oid);
+                let demand = item.demand.clone();
+                queue.ahead.push_back(item);
+                (Work::take(&mut queue.ahead, true).unwrap(), demand)
+            };
+            demand.complete(Batch::new(vec![oid], Ok(Acquired::Stored)));
+            if observed {
+                demand.observe_cached(&shared.completion).unwrap();
+            }
+            shared.finish(
+                work,
+                Err(anyhow::anyhow!("prefetch connection closed")),
+                Instant::now(),
+                None,
+                &scratch,
+            );
+            let mut queue = shared.queue.lock().unwrap();
+            assert_eq!(queue.failure.is_some(), observed);
+            if !observed {
+                let error = queue.pending[&oid]
+                    .observe_cached(&shared.completion)
+                    .unwrap_err();
+                assert!(error.to_string().contains("prefetch connection closed"));
+
+                let mut response = pack_stream::Response::new(vec![wanted], Box::new(|_| Ok(())));
+                response.write_http(&prefix).unwrap();
+                response.write_http(&tail).unwrap();
+                let extra = response
+                    .finish_http()
+                    .unwrap()
+                    .objects
+                    .remove(&oid)
+                    .unwrap();
+                queue.complete_extra(oid, extra);
+                assert!(!queue.pending.contains_key(&oid));
+            }
+        }
     }
 
     #[test]

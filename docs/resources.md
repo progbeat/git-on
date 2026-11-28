@@ -27,8 +27,8 @@ readable and the failed remote read can be retried once space is available.
 
 Reads from a whole resident blob hold the cached buffer until the reply has
 consumed the requested range. The FUSE reply sends that range directly.
-For large packed local blobs without a libgit2 reader, the existing native
-batch reader streams the verified data into the cache.
+Local packed objects use libgit2 when available. The native batch reader
+streams objects from local stores that libgit2 cannot read.
 
 Mounted HTTPS reads decode responses outside the network dispatcher. A large
 victim stays readable in memory while its spill is written. Independent

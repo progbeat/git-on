@@ -545,44 +545,19 @@ impl State {
                 );
                 (raw.insert(oid, length, reader)?, true)
             } else {
-                // The packed backend has no libgit2 reader. Stream its large
-                // blobs through the existing native batch reader so an ODB
-                // allocation and a second whole cache buffer never coexist.
-                let header_size = self
-                    .headers
-                    .get(&oid)
-                    .copied()
-                    .or_else(|| odb.read_header(oid).ok().map(|(size, _)| size as u64));
-                let object = if self.local_git.is_none()
-                    || header_size.is_some_and(|size| size <= crate::raw_blob::BLOCK as u64)
-                {
-                    match odb.read(oid) {
-                        Ok(object) => Some(object),
-                        Err(error)
-                            if self.local_git.is_some() && error.code() == ErrorCode::NotFound =>
-                        {
-                            None
-                        }
-                        Err(error) => return Err(error).context("decode Git blob"),
-                    }
-                } else {
-                    None
-                };
-                match object {
-                    Some(object) => (raw.insert_odb_blob(oid, &object)?, false),
-                    None => (
-                        self.local_git.as_ref().unwrap().read_object(
-                            oid,
-                            |length, kind, input| {
-                                anyhow::ensure!(
-                                    kind == ObjectType::Blob,
-                                    "snapshot file does not reference a blob"
-                                );
-                                raw.insert(oid, length, input)
-                            },
-                        )?,
+                match (odb.read(oid), self.local_git.as_ref()) {
+                    (Ok(object), _) => (raw.insert_odb_blob(oid, &object)?, false),
+                    (Err(error), Some(git)) if error.code() == ErrorCode::NotFound => (
+                        git.read_object(oid, |length, kind, input| {
+                            anyhow::ensure!(
+                                kind == ObjectType::Blob,
+                                "snapshot file does not reference a blob"
+                            );
+                            raw.insert(oid, length, input)
+                        })?,
                         true,
                     ),
+                    (Err(error), _) => return Err(error).context("decode Git blob"),
                 }
             };
             self.metrics.blob_loads += 1;
@@ -1383,8 +1358,8 @@ mod tests {
         drop(probe);
         let probe = crate::object::HashProbe::start(large);
         assert_eq!(snapshot.read(large, 128_000, 129).unwrap(), vec![b'L'; 129]);
-        assert_eq!(snapshot.metrics().streamed_blob_loads, 1);
-        assert_eq!(probe.bytes(), 256 * 1024);
+        assert_eq!(snapshot.metrics().streamed_blob_loads, 0);
+        assert_eq!(probe.bytes(), 0);
         drop(probe);
         let loose = vec![b'l'; 128 * 1024];
         let loose_oid = Repository::open(tmp.path()).unwrap().blob(&loose).unwrap();
@@ -1422,7 +1397,7 @@ mod tests {
     fn corrupt_packed_oid_is_rejected_with_native_or_embedding_verification() {
         let mode = std::env::var("GIT_ON_NATIVE_CORRUPT_CHILD").ok();
         if mode.is_none() {
-            for mode in ["native", "embedding", "streamed"] {
+            for mode in ["native", "embedding"] {
                 let result = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -1442,8 +1417,7 @@ mod tests {
             return;
         }
         let native = mode.as_deref() == Some("native");
-        let streamed = mode.as_deref() == Some("streamed");
-        if native || streamed {
+        if native {
             unsafe { crate::object::configure_pack_descriptors() }.unwrap();
         } else {
             // Fault injection in this isolated process only: an embedding
@@ -1454,8 +1428,7 @@ mod tests {
         use sha1_checked::{Digest, Sha1};
         use std::io::Write;
         let (tmp, _) = fixture();
-        let size = if streamed { 256 * 1024 } else { 16 * 1024 };
-        let wanted = vec![b'a'; size];
+        let wanted = vec![b'a'; 16 * 1024];
         let actual = vec![b'b'; wanted.len()];
         let repo = Repository::open(tmp.path()).unwrap();
         let oid = repo.blob(&wanted).unwrap();
