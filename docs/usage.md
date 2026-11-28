@@ -192,8 +192,6 @@ git on --cleanup /path/to/stale-temporary-directory
 
 Cleanup refuses active locked runs and unmounts only matching git-on
 filesystems. Stop any processes using a busy mount before trying again.
-Cleanup retains a registered run with a live SSH control socket whose owner
-was not recorded. The socket remains available until its SSH master exits.
 Cleanup leaves source repositories unchanged. If a ref recorded by 1.5.2
 still exists in the source repository, cleanup retains the recovery record and
 directs you to the 1.5.2 cleanup command. Clean up those runs with 1.5.2 before upgrading. If the source repository loses an unread object during a
@@ -216,8 +214,9 @@ enumerate the source. Lookup loads ancestor directory metadata and the requested
 header, directory listing loads only that directory, and read loads the requested
 content. Write checks load only applicable pinned ignore files.
 
-Mount and copy retain up to 16 MiB of small blobs and authenticated disk blocks,
-plus the eight most recently used complete large blobs. Evicted blobs remain
+Mounted runs retain up to 16 MiB of small blobs and authenticated disk blocks,
+plus the eight most recently used complete large blobs. The network copy backend
+uses a 128 MiB payload cache before materialization. Evicted blobs remain
 reusable in private backing for the invocation. Active object and delta
 decoding, kernel caches and loaded metadata also use memory. The
 [resource guide](resources.md) describes retention and cleanup. The ignore-rule

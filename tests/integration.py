@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
-from support.run_storage import run_directories, run_lock
+from support.run_storage import run_directories
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser(description=__doc__)
@@ -151,61 +151,6 @@ class MountedRepositoryTest(RepositoryTest):
 
 
 class CliTests(RepositoryTest):
-    def test_cleanup_preserves_an_unregistered_empty_directory(self):
-        group = self.system_tmp / "git-on"
-        group.mkdir(mode=0o700)
-        (group / ".git-on-owner").touch(mode=0o600)
-        directory = group / "0123abcd"
-        directory.mkdir(mode=0o700)
-        result = self.cleanup_run(directory)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(directory.is_dir())
-
-        retired = group / "retired"
-        retired.mkdir()
-        identity = retired.stat()
-        marker = group / f".run-0123abcd-0000-4000-8000-000000000000.{identity.st_dev:x}.{identity.st_ino:x}"
-        marker.touch(mode=0o600)
-        result = self.cleanup_run(directory)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(directory.is_dir())
-
-    def test_cleanup_recovers_owned_registrations(self):
-        import fcntl
-
-        for phase in ("reserved", "created", "ready", "removed"):
-            with self.subTest(phase=phase):
-                parent = self.system_tmp / phase
-                parent.mkdir()
-                group = parent / "git-on"
-                group.mkdir(mode=0o700)
-                (group / ".git-on-owner").touch(mode=0o600)
-                run = group / "0123abcd"
-                record = ".run-0123abcd-0000-4000-8000-000000000000"
-                if phase != "reserved":
-                    run.mkdir(mode=0o700)
-                if phase in ("ready", "removed"):
-                    identity = run.stat()
-                    record += f".{identity.st_dev:x}.{identity.st_ino:x}"
-                if phase == "removed":
-                    run.rmdir()
-                marker = group / record
-                marker.touch(mode=0o600)
-                if phase == "created":
-                    unrelated = run / "unrelated"
-                    unrelated.write_text("keep")
-                    self.assertNotEqual(self.cleanup_run(run).returncode, 0)
-                    self.assertEqual(unrelated.read_text(), "keep")
-                    unrelated.unlink()
-                if phase == "ready":
-                    with marker.open("r+b") as held:
-                        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        active = self.cleanup_run(run)
-                        self.assertNotEqual(active.returncode, 0)
-                        self.assertIn(b"run is active or locked", active.stderr)
-                self.assert_success(self.cleanup_run(run))
-                self.assertFalse(group.exists())
-
     def test_copy_preserves_an_occupied_git_on_group_name(self):
         occupied = self.system_tmp / "git-on"
         for kind in ("file", "directory", "symlink"):
@@ -255,8 +200,7 @@ class CliTests(RepositoryTest):
             self.assertTrue(ready.exists(), "interactive command did not start")
             child = int(ready.read_text())
             run, = run_directories(self.system_tmp)
-            terminal_dir, = run.glob(".git-on-terminal-*")
-            self.assertFalse((terminal_dir / "environment").exists())
+            self.assertTrue(list(self.system_tmp.rglob(".git-on-terminal-*")))
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
             pid = None
@@ -310,6 +254,18 @@ class CliTests(RepositoryTest):
                     finally:
                         if runner.poll() is None:runner.kill()
                         runner.communicate(timeout=10)
+
+    def test_file_limit_during_run_setup_reports_error_and_cleans_up(self):
+        try:
+            result = subprocess.run([str(BINARY), 'HEAD', '--', 'true'],
+                                    cwd=self.repo, env=self.environment(), capture_output=True,
+                                    preexec_fn=lambda: file_size_limits(0), timeout=30)
+            self.assertEqual(result.returncode, 125, result.stderr.decode(errors='replace'))
+            self.assertIn(b'File too large', result.stderr)
+            self.assert_no_runtime_files()
+        finally:
+            for run in run_directories(self.system_tmp):
+                self.cleanup_run(run)
 
     def test_child_inherits_default_or_ignored_file_limit_signal(self):
         for action, expected in ((signal.SIG_DFL, -signal.SIGXFSZ), (signal.SIG_IGN, 0)):
@@ -491,19 +447,6 @@ class CliTests(RepositoryTest):
 
 @unittest.skipUnless(MOUNT_AVAILABLE, "real FUSE or NFS mount required")
 class MountTests(MountedRepositoryTest):
-    def test_readonly_run_setup_needs_no_regular_file_payload(self):
-        try:
-            result = subprocess.run(
-                [str(BINARY), 'HEAD', *MOUNT_ARGS, '--write-policy=none', '--', 'true'],
-                cwd=self.repo, env=self.environment(), capture_output=True,
-                preexec_fn=lambda: file_size_limits(0), timeout=30,
-            )
-            self.assert_success(result)
-            self.assert_no_runtime_files()
-        finally:
-            for run in run_directories(self.system_tmp):
-                self.cleanup_run(run)
-
     def lazy_native_stat_fixture(self):
         size=7*1024*1024
         (self.repo/'large').write_bytes(b'x'*size)
@@ -721,55 +664,6 @@ print('source retained after backing unlink failure')
 ''',str(loose)]
         result,_=self.invoke_argv(['HEAD','--write-policy=all','--',*command],extra_env=env)
         self.assert_success(result);self.assert_no_runtime_files()
-
-    @fuse_only
-    def test_spilled_source_recovers_after_write_and_copy_up_rollback_fail(self):
-        (self.repo / 'large').write_bytes(b'x' * (1024 * 1024 + 1))
-        for index in range(8):
-            (self.repo / f'hot-{index}').write_bytes(bytes([index]) * (65536 + 1))
-        git(self.repo, 'add', '.')
-        git(self.repo, 'commit', '-qm', 'copy-up rollback')
-        code = r'''
-import errno
-import os
-import sys
-from pathlib import Path
-retry = sys.argv[1]
-with open('large', 'r+b', buffering=0) as source:
-    assert source.read(1) == b'x'
-    for index in range(8):
-        assert Path(f'hot-{index}').read_bytes()[0] == index
-    try:
-        if retry == 'failed-truncate':
-            os.ftruncate(source.fileno(), 0)
-        else:
-            os.pwrite(source.fileno(), b'y', 1024 * 1024)
-    except OSError as error:
-        assert error.errno == errno.EIO, error
-    else:
-        raise AssertionError('first change was not faulted')
-    if retry != 'reopen':
-        assert os.fstat(source.fileno()).st_size == 1024 * 1024 + 1
-        os.ftruncate(source.fileno(), 0)
-        assert os.fstat(source.fileno()).st_size == 0
-        assert os.pread(source.fileno(), 1, 0) == b''
-if retry == 'reopen':
-    with open('large', 'r+b', buffering=0) as reopened:
-        fd = reopened.fileno()
-        assert os.pread(fd, 1, 1024 * 1024) == b'x', 'cold read lost the original spill'
-        assert os.pwrite(fd, b'z', 1024 * 1024) == 1
-        assert os.pread(fd, 1, 1024 * 1024) == b'z'
-'''
-        faults = self.transfer_fault()
-        for retry in ('reopen', 'truncate', 'failed-truncate'):
-            with self.subTest(retry=retry):
-                fault = 'truncate' if retry == 'failed-truncate' else 'write'
-                result, _ = self.invoke_argv(
-                    ['HEAD', '--write-policy=all', '--', sys.executable, '-I', '-S', '-c', code, retry],
-                    extra_env=dict(faults, GIT_ON_TEST_COPY_UP_ROLLBACK=fault),
-                )
-                self.assert_success(result)
-                self.assert_no_runtime_files()
 
     @fuse_only
     def test_shared_sources_succeed_on_sixteen_mib_tmpfs(self):
@@ -2432,7 +2326,7 @@ print(index)
             for run in runs:
                 self.assertEqual(run.parent, self.system_tmp / "git-on")
                 self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
-                self.assertIsNotNone(run_lock(run))
+                self.assertTrue((run / ".state").is_file())
                 self.assertFalse((run / "manifest.json").exists())
                 self.assertFalse((run / "stdout.log").exists())
                 self.assertFalse((run / "stderr.log").exists())
@@ -2848,7 +2742,7 @@ assert p.exists()
                 mountpoints = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
             self.assertIn(str(run / "mount"), mountpoints, "busy mount must remain for recovery")
             self.assertTrue((run / "backing").is_dir())
-            self.assertIsNotNone(run_lock(run))
+            self.assertTrue((run / ".state").is_file())
             cleanup = self.cleanup_run(run)
             if sys.platform == "darwin":
                 self.assert_success(cleanup)  # The checked recovery detaches a dead server.
@@ -2940,7 +2834,7 @@ time.sleep(300)
         process, run, _ = self.start_sleeping_run()
         active_cleanup = self.cleanup_run(run)
         self.assertNotEqual(active_cleanup.returncode, 0)
-        self.assertIsNotNone(run_lock(run))
+        self.assertTrue((run / ".state").is_file())
         self.assertTrue((run / "backing").is_dir())
         process.send_signal(signal.SIGTERM)
         _, stderr = process.communicate(timeout=15)
@@ -2953,7 +2847,7 @@ time.sleep(300)
         try: os.killpg(child_pid, signal.SIGKILL)
         except ProcessLookupError: pass
         process.communicate(timeout=10)
-        self.assertIsNotNone(run_lock(run))
+        self.assertTrue((run / ".state").is_file())
         self.assertTrue((run / "backing").is_dir())
         self.assert_success(self.cleanup_run(run))
         self.assertFalse(run.exists())
@@ -3025,10 +2919,7 @@ run = Path.cwd().parent
 assert Path.cwd().name == 'mount'
 assert run.parent == Path(os.environ['TMPDIR']) / 'git-on'
 assert stat.S_IMODE(run.stat().st_mode) == 0o700
-identity = run.stat()
-marker, = run.parent.glob(f'.run-{run.name}-*.{identity.st_dev:x}.{identity.st_ino:x}')
-assert marker.is_file() and marker.stat().st_size == 0
-assert not (run / '.state').exists()
+assert (run / '.state').is_file()
 assert (run / 'backing').is_dir()
 assert not (run / 'manifest.json').exists()
 assert not (run / 'stdout.log').exists()

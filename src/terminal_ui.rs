@@ -25,15 +25,12 @@ use std::{
 
 const DIRECTORY: &str = "GIT_ON_TERMINAL_DIRECTORY";
 const CORE_ASKPASS: &str = "GIT_ON_TERMINAL_CORE_ASKPASS";
-const ENVIRONMENT: [(&str, &str); 5] = [
-    ("GIT_ASKPASS", "GIT_ON_PREPARATION_GIT_ASKPASS"),
-    ("SSH_ASKPASS", "GIT_ON_PREPARATION_SSH_ASKPASS"),
-    (
-        "SSH_ASKPASS_REQUIRE",
-        "GIT_ON_PREPARATION_SSH_ASKPASS_REQUIRE",
-    ),
-    ("DISPLAY", "GIT_ON_PREPARATION_DISPLAY"),
-    ("WAYLAND_DISPLAY", "GIT_ON_PREPARATION_WAYLAND_DISPLAY"),
+const ENVIRONMENT: [&str; 5] = [
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
 ];
 static DIRECTORY_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PREPARING: AtomicBool = AtomicBool::new(false);
@@ -140,6 +137,8 @@ pub(crate) fn has_exited(child: &std::process::Child) -> std::io::Result<bool> {
     Ok(crate::platform::siginfo_pid(&info) != 0)
 }
 
+type Environment = Vec<Option<Vec<u8>>>;
+
 pub(crate) fn preparing() -> bool {
     PREPARING.load(Ordering::Acquire)
 }
@@ -207,6 +206,16 @@ impl StartupProgress {
             let private = tempfile::Builder::new()
                 .prefix(".git-on-terminal-")
                 .tempdir_in(run)?;
+            let environment: Environment = ENVIRONMENT
+                .iter()
+                .map(|key| std::env::var_os(key).map(|value| value.as_bytes().to_vec()))
+                .collect();
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(private.path().join("environment"))?;
+            serde_json::to_writer(file, &environment)?;
             let executable = std::env::current_exe()?;
             symlink(&executable, private.path().join("git-askpass"))?;
             symlink(&executable, private.path().join("ssh-askpass"))?;
@@ -619,13 +628,6 @@ pub(crate) fn configure(command: &mut Command) {
             command
                 .env(DIRECTORY, directory)
                 .env("GIT_ASKPASS", directory.join("git-askpass"));
-            for (key, saved) in ENVIRONMENT {
-                if let Some(value) = std::env::var_os(key) {
-                    command.env(saved, value);
-                } else {
-                    command.env_remove(saved);
-                }
-            }
             let requirement = std::env::var("SSH_ASKPASS_REQUIRE").unwrap_or_default();
             let display = ["DISPLAY", "WAYLAND_DISPLAY"]
                 .iter()
@@ -648,12 +650,11 @@ pub(crate) fn core_askpass(command: &mut Command, program: &OsStr) {
         command.env(CORE_ASKPASS, program);
     }
 }
-fn restore(command: &mut Command, environment: &[Option<std::ffi::OsString>; ENVIRONMENT.len()]) {
-    for ((key, saved), value) in ENVIRONMENT.into_iter().zip(environment) {
-        command.env_remove(saved);
+fn restore(command: &mut Command, environment: &Environment) {
+    for (key, value) in ENVIRONMENT.iter().zip(environment) {
         match value {
             Some(value) => {
-                command.env(key, value);
+                command.env(key, OsStr::from_bytes(value));
             }
             None => {
                 command.env_remove(key);
@@ -663,8 +664,9 @@ fn restore(command: &mut Command, environment: &[Option<std::ffi::OsString>; ENV
     command.env_remove(DIRECTORY).env_remove(CORE_ASKPASS);
 }
 fn askpass(directory: &Path, ssh: bool) -> Result<i32> {
-    let environment = ENVIRONMENT.map(|(_, saved)| std::env::var_os(saved));
-    let value = |index: usize| environment[index].as_deref();
+    let environment: Environment =
+        serde_json::from_reader(File::open(directory.join("environment"))?)?;
+    let value = |index: usize| environment[index].as_deref().map(OsStr::from_bytes);
     let hint = std::env::var_os("SSH_ASKPASS_PROMPT");
     let program = if ssh {
         let requirement = value(2).and_then(OsStr::to_str);

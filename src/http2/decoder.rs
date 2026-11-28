@@ -39,7 +39,7 @@ impl Decoder {
             .name("git-on-http-pack".into())
             .spawn(move || {
                 let result = (|| {
-                    while let Ok(chunk) = pack.wait_for_input(|| chunks.recv()) {
+                    for chunk in chunks {
                         if pending.fetch_sub(1, Ordering::AcqRel) >= QUEUE_CHUNKS {
                             signal_http2(&wake);
                         }

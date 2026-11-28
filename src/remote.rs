@@ -1,10 +1,10 @@
 //! Explicit exact-object fetches. Git's promisor auto-fetch is never the loader.
 use crate::{git::Git, pack_stream, transport};
 use anyhow::{bail, Context, Result};
-use git2::{ObjectType, Oid};
+use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -20,15 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
-const SSH_CONTROL_OWNER_PREFIX: &str = "ssh-control-owner-";
-const SSH_CONTROL_NAME: &str = "ssh-control";
+pub const SSH_CONTROL_OWNER_FILE: &str = "ssh-control-owner";
 const SSH_STANDBY_DELAY: Duration = Duration::from_millis(250);
 const SSH_STANDBY_CHANNELS: usize = 2;
 
-fn require_native_git(git: &Git) -> Result<()> {
-    let mut command = git.command(None);
+fn require_native_git(cwd: &Path) -> Result<()> {
+    let mut command = Command::new("git");
     crate::git::read_only(&mut command)
+        .current_dir(cwd)
         .arg("--version")
         .stdin(Stdio::null());
     let output = crate::git::run(command, true).map_err(|error| {
@@ -153,7 +152,8 @@ pub struct Remote {
     failed: Option<String>,
     eager_loaded: bool,
     pub(crate) raw_blobs: crate::raw_blob::RawBlobs,
-    metadata: HashMap<Oid, pack_stream::VerifiedObject>,
+    #[cfg(feature = "test-metrics")]
+    metadata_oids: HashSet<Oid>,
 }
 pub(crate) enum Source {
     Local(PathBuf),
@@ -177,8 +177,8 @@ impl SshMode {
     }
 }
 
-pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, run: &Path) -> Result<Source> {
-    let mut git = Git::capture_in(cwd, Some(run)).map_err(|error| {
+pub(crate) fn resolve_source(cwd: &Path, source: &OsStr) -> Result<Source> {
+    let mut git = Git::capture(cwd).map_err(|error| {
         if error.chain().any(|cause| {
             cause
                 .downcast_ref::<std::io::Error>()
@@ -190,28 +190,18 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, run: &Path) -> Result<S
         }
     })?;
     let named = git.select_remote(source);
-    let url = git.output(
-        None,
-        &[
-            OsStr::new("ls-remote"),
-            OsStr::new("--get-url"),
-            OsStr::new("--"),
-            source,
-        ],
-    )?;
+    let url = git.source_url(source)?;
     let url = url.strip_suffix(b"\n").unwrap_or(&url);
     let path = if let Some(file) = url.strip_prefix(b"file://") {
-        let mut file = decode_url_path(file)?;
         let start = file
             .iter()
             .position(|&byte| byte == b'/')
             .context("file URL requires an absolute repository path")?;
-        file.drain(..start);
-        file
+        decode_url_path(&file[start..])?
     } else {
         let path = Path::new(OsStr::from_bytes(url));
         let leading_segment = url.split(|&byte| byte == b'/').next().unwrap();
-        if leading_segment.contains(&b':') {
+        if leading_segment.contains(&b':') && !cwd.join(path).is_dir() {
             return Ok(Source::Network {
                 git,
                 url: path.as_os_str().to_os_string(),
@@ -220,9 +210,7 @@ pub(crate) fn resolve_source(cwd: &Path, source: &OsStr, run: &Path) -> Result<S
         anyhow::ensure!(!url.is_empty(), "missing local repository path");
         url.to_vec()
     };
-    let worktree = if Path::new(OsStr::from_bytes(&path)).is_relative()
-        && (named || git.recognizes_remote(source)?)
-    {
+    let worktree = if named && Path::new(OsStr::from_bytes(&path)).is_relative() {
         git.worktree_root()?
     } else {
         None
@@ -395,6 +383,12 @@ fn selection(revision: &OsStr) -> Result<(Option<Oid>, Option<transport::BranchQ
     Ok((exact, branch))
 }
 
+fn memory_repository() -> Result<Repository> {
+    let odb = git2::Odb::new()?;
+    odb.add_new_mempack_backend(100)?;
+    Ok(Repository::from_odb(odb)?)
+}
+
 impl Remote {
     pub(crate) fn open_for_execution(
         git: Git,
@@ -402,9 +396,9 @@ impl Remote {
         revision: &OsStr,
         run: &Path,
         materialized: bool,
-    ) -> Result<(Self, Oid)> {
+    ) -> Result<(Self, Repository, Oid)> {
         let cwd = &git.cwd;
-        require_native_git(&git)?;
+        require_native_git(cwd)?;
         let text = url.to_string_lossy();
         let ssh_transport = text.starts_with("ssh://") || scp_separator(url.as_bytes()).is_some();
         anyhow::ensure!(
@@ -415,7 +409,7 @@ impl Remote {
             git.demand_session_compatible()?,
             "Git configuration requires a transport outside the Git protocol v2 profile"
         );
-        let socket = ssh_transport.then(|| control_socket(run));
+        let socket = ssh_transport.then(|| run.join("ssh-control"));
         let ssh = socket
             .as_ref()
             .map(|_| git.ssh_command().unwrap_or_else(|| OsString::from("ssh")));
@@ -433,13 +427,10 @@ impl Remote {
         } else {
             cwd.clone()
         };
-        let control_client = if materialized {
-            None
-        } else {
-            ssh.as_deref()
-                .map(|ssh| ControlClient::resolve(&ssh_directory, ssh))
-                .transpose()?
-        };
+        let control_client = ssh
+            .as_deref()
+            .map(|ssh| ControlClient::resolve(&ssh_directory, ssh))
+            .transpose()?;
         let mut remote = Self {
             git,
             run: run.to_path_buf(),
@@ -463,18 +454,20 @@ impl Remote {
             failed: None,
             eager_loaded: false,
             raw_blobs: crate::raw_blob::RawBlobs::new(run)?,
-            metadata: HashMap::new(),
+            #[cfg(feature = "test-metrics")]
+            metadata_oids: HashSet::new(),
         };
         let (exact, branch) = selection(revision)?;
         if materialized {
-            let oid = remote
+            let (repo, oid) = remote
                 .fetch_eager(exact, branch.as_ref())?
                 .context("copy requires direct Git v2 and a single available revision")?;
-            return Ok((remote, oid));
+            return Ok((remote, repo, oid));
         }
+        let repo = memory_repository()?;
         let oid = if ssh_transport {
             remote
-                .select_ssh(exact, branch.as_ref())
+                .select_ssh(&repo, exact, branch.as_ref())
                 .map_err(|error| remote.ssh_error(error))?
                 .context("OpenSSH could not select a revision using filtered Git protocol v2")?
         } else {
@@ -482,10 +475,10 @@ impl Remote {
             let oid = exact
                 .or(selected)
                 .context("remote did not select a revision")?;
-            remote.fetch(&[oid])?;
+            remote.fetch(&repo, &[oid])?;
             oid
         };
-        Ok((remote, oid))
+        Ok((remote, repo, oid))
     }
     fn ssh_error(&self, error: anyhow::Error) -> anyhow::Error {
         let advice =
@@ -533,7 +526,9 @@ impl Remote {
         &mut self,
         exact: Option<Oid>,
         branch: Option<&transport::BranchQuery>,
-    ) -> Result<Option<Oid>> {
+    ) -> Result<Option<(Repository, Oid)>> {
+        self.raw_blobs
+            .enable_copy_cache(crate::raw_blob::COPY_MEMORY_BUDGET);
         let selection = if self.socket.is_some() {
             self.fetch_eager_ssh(exact, branch)
                 .map_err(|error| self.ssh_error(error))?
@@ -543,9 +538,10 @@ impl Remote {
         let Some((oid, pack)) = selection else {
             return Ok(None);
         };
+        let repo = memory_repository()?;
         for object in pack.objects.into_values() {
             crate::object::check_transfer()?;
-            self.publish_received(object.decode()?)?;
+            self.publish_received(&repo, object.decode()?)?;
         }
         self.eager_loaded = true;
         self.eager_http2_fetches += u64::from(self.socket.is_none());
@@ -554,14 +550,15 @@ impl Remote {
         self.session_fetch_operations += 1;
         self.session_decode_operations += 1;
         self.completed_fetches += 1;
-        Ok(Some(oid))
+        Ok(Some((repo, oid)))
     }
 
-    pub(crate) fn prepare_copy(&mut self, oid: Oid) -> Result<()> {
+    pub(crate) fn prepare_copy(&mut self, oid: Oid) -> Result<Repository> {
         self.stop_demand_channels()?;
-        self.fetch_eager(Some(oid), None)?
+        let (repo, _) = self
+            .fetch_eager(Some(oid), None)?
             .context("cannot materialize the pinned remote revision")?;
-        Ok(())
+        Ok(repo)
     }
 
     fn fetch_eager_http2(
@@ -578,10 +575,7 @@ impl Remote {
         let oid = exact
             .or(selected)
             .context("remote did not select a revision")?;
-        let pack = client.fetch_eager(
-            oid,
-            crate::pack_stream::Response::eager(oid, self.raw_blobs.clone()),
-        )?;
+        let pack = client.fetch_eager(oid, self.raw_blobs.eager_response(oid))?;
         Ok(Some((oid, pack)))
     }
 
@@ -611,63 +605,34 @@ impl Remote {
         let oid = exact
             .or(selected)
             .context("remote did not select a revision")?;
-        let pack = session.fetch_eager(
-            oid,
-            crate::pack_stream::Response::eager(oid, self.raw_blobs.clone()),
-        )?;
+        let pack = session.fetch_eager(oid, self.raw_blobs.eager_response(oid))?;
         Ok(Some((oid, pack)))
     }
 
-    pub(crate) fn kind(&self, oid: Oid) -> Result<ObjectType> {
-        if let Some(object) = self.metadata.get(&oid) {
-            return Ok(object.kind());
-        }
-        self.raw_blobs
-            .get(oid)?
-            .map(|raw| raw.kind())
-            .with_context(|| format!("remote object {oid} is unavailable"))
-    }
-
-    pub(crate) fn revision_target(&self, oid: Oid) -> Result<Oid> {
-        let object = self
-            .metadata
-            .get(&oid)
-            .context("missing revision metadata")?;
-        crate::object::revision_target(object.kind(), object.data())
-    }
-
-    pub(crate) fn verify(&self, oid: Oid) -> Result<()> {
-        let object = self.metadata.get(&oid)
-            .context("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature")?;
-        self.git.verify(
-            oid,
-            object.kind(),
-            object.data().len(),
-            Some(object.data()),
-            &self.run,
-        )
+    pub(crate) fn verify(&self, repo: &Repository, oid: Oid, kind: git2::ObjectType) -> Result<()> {
+        self.git.verify(oid, kind, Some((repo, &self.run)))
     }
 
     pub(crate) fn eager_loaded(&self) -> bool {
         self.eager_loaded
     }
-    pub(crate) fn ensure(&mut self, oid: Oid) -> Result<()> {
-        self.ensure_batch(&[oid])
+    pub(crate) fn ensure_in(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
+        self.ensure_batch_in(repo, &[oid])
     }
 
-    pub(crate) fn ensure_batch(&mut self, oids: &[Oid]) -> Result<()> {
+    pub(crate) fn ensure_batch_in(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         let outcome = (|| {
+            let odb = repo.odb()?;
             let mut missing = Vec::new();
             for &oid in oids {
-                if self.metadata.contains_key(&oid)
-                    || self
-                        .raw_blobs
-                        .observe_cached(oid, &self.response_completion)?
-                {
+                if self.raw_blobs.get(oid)?.is_some() || odb.exists(oid) {
+                    if let Some(pool) = &self.demand_pool {
+                        pool.observe_cached(oid);
+                    }
                     continue;
                 }
                 if let Some(object) = self.raw_blobs.packed_object(oid) {
-                    self.publish_received(object.decode()?)?;
+                    self.publish_received(repo, object.decode()?)?;
                 } else {
                     missing.push(oid);
                 }
@@ -676,7 +641,7 @@ impl Remote {
                 return Ok(());
             }
             anyhow::ensure!(!self.eager_loaded, "eager pack omitted {}", missing[0]);
-            self.fetch(&missing)
+            self.fetch(repo, &missing)
         })();
         self.record_result(outcome)
     }
@@ -687,6 +652,7 @@ impl Remote {
 
     pub(crate) fn start_demand<I: Iterator<Item = Oid>>(
         &mut self,
+        repo: &Repository,
         oid: Oid,
         candidates: Option<impl FnOnce(bool) -> I>,
     ) -> Result<Option<crate::demand::Demand>> {
@@ -694,7 +660,8 @@ impl Remote {
             if !self.reusable_transport() || self.failure().is_some() {
                 return Ok(None);
             }
-            let wanted = !self.raw_blobs.available(oid) && !self.metadata.contains_key(&oid);
+            let odb = repo.odb()?;
+            let wanted = !self.raw_blobs.available(oid) && !odb.exists(oid);
             if !wanted && candidates.is_none() {
                 return Ok(None);
             }
@@ -704,7 +671,7 @@ impl Remote {
             };
             let demand = wanted.then(|| pool.request(oid)).transpose()?;
             if let Some(candidates) = candidates.filter(|_| self.forecast_seen.insert(oid)) {
-                pool.prefetch(oid, candidates, |oid| self.metadata.contains_key(&oid));
+                pool.prefetch(oid, candidates, |oid| odb.exists(oid));
             }
             Ok(demand)
         })();
@@ -731,6 +698,7 @@ impl Remote {
             session,
             connection,
             &self.raw_blobs,
+            &self.response_completion,
         )?);
         Ok(())
     }
@@ -740,22 +708,30 @@ impl Remote {
         branch: Option<crate::transport::BranchQuery>,
     ) -> Result<Option<Oid>> {
         let configuration = crate::http2::Configuration::new(&self.demand_url, &self.git)?;
-        let (pool, selected) = crate::demand::Pool::http2(configuration, branch, &self.raw_blobs)?
-            .context("HTTPS requires filtered Git protocol v2 over HTTP/2")?;
+        let (pool, selected) = crate::demand::Pool::http2(
+            configuration,
+            branch,
+            &self.raw_blobs,
+            &self.response_completion,
+        )?
+        .context("HTTPS requires filtered Git protocol v2 over HTTP/2")?;
         self.demand_pool = Some(pool);
         self.session_starts += 1;
         Ok(selected)
     }
 
-    pub(crate) fn finish_demand(&mut self, batch: &crate::demand::Batch) -> Result<()> {
+    pub(crate) fn finish_demand(
+        &mut self,
+        repo: &Repository,
+        batch: &crate::demand::Batch,
+    ) -> Result<()> {
         batch.publish(|acquired| {
             let outcome = acquired.and_then(|acquired| match acquired {
-                crate::demand::Acquired::Stored(oid) => self
-                    .raw_blobs
-                    .observe_cached(oid, &self.response_completion)
-                    .map(drop),
-                crate::demand::Acquired::Packed(object) => self.publish_received(object.decode()?),
-                crate::demand::Acquired::Object(object) => self.publish_received(object),
+                crate::demand::Acquired::Stored => Ok(()),
+                crate::demand::Acquired::Packed(object) => {
+                    self.publish_received(repo, object.decode()?)
+                }
+                crate::demand::Acquired::Object(object) => self.publish_received(repo, object),
             });
             self.demand_pool.as_ref().unwrap().retire(&batch.oids);
             self.record_result(outcome)
@@ -763,7 +739,7 @@ impl Remote {
     }
     fn record_result<T>(&mut self, outcome: Result<T>) -> Result<T> {
         if let Err(error) = &outcome {
-            // Publication failures are just as incomplete as a failed fetch. Keep
+            // ODB failures are just as incomplete as a failed fetch. Keep
             // the original failure even when later demands retry that operation.
             if !crate::object::is_cancelled(error)
                 && !crate::raw_blob::is_retryable_spill(error)
@@ -777,7 +753,7 @@ impl Remote {
         }
         outcome
     }
-    fn fetch(&mut self, oids: &[Oid]) -> Result<()> {
+    fn fetch(&mut self, repo: &Repository, oids: &[Oid]) -> Result<()> {
         if let Some(error) = self.failure() {
             bail!("remote object transport previously failed: {error}");
         }
@@ -791,11 +767,11 @@ impl Remote {
                 .collect::<Result<_>>()?;
             for request in pending {
                 let batch = request.wait(&self.response_completion);
-                self.finish_demand(&batch)?;
+                self.finish_demand(repo, &batch)?;
             }
         } else {
             for &oid in oids {
-                self.fetch_in_session(oid)?;
+                self.fetch_in_session(repo, oid)?;
             }
         }
         Ok(())
@@ -813,6 +789,7 @@ impl Remote {
 
     fn select_ssh(
         &mut self,
+        repo: &Repository,
         exact: Option<Oid>,
         branch: Option<&crate::transport::BranchQuery>,
     ) -> Result<Option<Oid>> {
@@ -885,11 +862,12 @@ impl Remote {
         // A candidate with an outstanding selection is not a clean demand
         // channel if another candidate won startup.
         candidates.retain(|candidate| !candidate.has_queued_selection());
-        self.fetch_selected_ssh(oid, session, connection, candidates)
+        self.fetch_selected_ssh(repo, oid, session, connection, candidates)
     }
 
     fn fetch_selected_ssh(
         &mut self,
+        repo: &Repository,
         oid: Oid,
         session: transport::Session,
         connection: Option<transport::Connection>,
@@ -898,7 +876,7 @@ impl Remote {
         self.session = Some(session);
         self.session_starts += 1;
         let fetch_started = Instant::now();
-        self.fetch_in_session(oid)?;
+        self.fetch_in_session(repo, oid)?;
         if let Some(connection) = connection {
             if fetch_started.elapsed() >= crate::demand::SLOW_REPLY {
                 // Let the first fetch finish before negotiating the next
@@ -909,8 +887,12 @@ impl Remote {
                     }
                 }
             }
-            let mut pool =
-                crate::demand::Pool::prepare_native(&connection, &self.raw_blobs, candidates)?;
+            let mut pool = crate::demand::Pool::prepare_native(
+                &connection,
+                &self.raw_blobs,
+                &self.response_completion,
+                candidates,
+            )?;
             let primary = self
                 .session
                 .take()
@@ -963,29 +945,29 @@ impl Remote {
         command.env("GIT_PROTOCOL", "version=2");
         Ok(command)
     }
-    fn fetch_in_session(&mut self, oid: Oid) -> Result<()> {
+    fn fetch_in_session(&mut self, repo: &Repository, oid: Oid) -> Result<()> {
         let ready = Arc::new(std::sync::Mutex::new(None));
         let received = ready.clone();
         let response = pack_stream::Response::new(
             vec![oid],
             Box::new(move |object| {
-                if object.kind() != ObjectType::Blob {
+                if object.kind() != git2::ObjectType::Blob {
                     *received.lock().unwrap() = Some(object);
                 }
                 Ok(())
             }),
         )
-        .cache_blobs(self.raw_blobs.clone(), None);
+        .with_output(self.raw_blobs.pack_output());
         let session = self
             .session
             .as_mut()
             .context("no open Git v2 demand channel")?;
         let mut pack = session.fetch_stream(&[oid], response)?;
-        if let Some(error) = pack.cache_errors.remove(&oid) {
+        if let Some(error) = pack.object_errors.remove(&oid) {
             return Err(error);
         }
         if let Some(object) = ready.lock().unwrap().take() {
-            self.publish_received(object)?;
+            self.publish_received(repo, object)?;
         }
         for object in pack.objects.into_values() {
             self.raw_blobs.remember_packed(object);
@@ -1002,45 +984,53 @@ impl Remote {
         self.raw_blobs
             .packed_oids()
             .into_iter()
-            .chain(self.metadata.keys().copied())
+            .chain(self.metadata_oids.iter().copied())
     }
 
-    fn publish_received(&mut self, object: pack_stream::VerifiedObject) -> Result<()> {
+    fn retain_metadata(
+        &mut self,
+        odb: &git2::Odb<'_>,
+        object: &pack_stream::VerifiedObject,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            odb.write(object.kind(), object.data())? == object.oid(),
+            "received metadata OID changed"
+        );
+        #[cfg(feature = "test-metrics")]
+        self.metadata_oids.insert(object.oid());
+        Ok(())
+    }
+
+    fn publish_received(
+        &mut self,
+        repo: &Repository,
+        object: pack_stream::VerifiedObject,
+    ) -> Result<()> {
         let oid = object.oid();
         match object.kind() {
-            ObjectType::Blob => {
-                self.raw_blobs.insert_verified_blob(&object, None)?;
-                self.raw_blobs
-                    .observe_cached(oid, &self.response_completion)?;
-            }
-            ObjectType::Tree => self.raw_blobs.insert_verified_tree(&object)?,
-            ObjectType::Commit | ObjectType::Tag => {
-                self.metadata.entry(oid).or_insert(object);
-            }
-            _ => bail!("unsupported object type in remote pack"),
+            git2::ObjectType::Blob => self.raw_blobs.insert_verified_blob(&object)?,
+            git2::ObjectType::Tree => self.raw_blobs.insert_verified_tree(&object)?,
+            _ => self.retain_metadata(&repo.odb()?, &object)?,
         }
         self.raw_blobs.forget_packed(oid);
         Ok(())
     }
-    fn stop_demand_channels(&mut self) -> Result<()> {
+    fn stop_demand_channels(&self) -> Result<()> {
         if let Some(pool) = &self.demand_pool {
             pool.stop()?;
         }
-        if let Some(session) = &mut self.session {
-            if let Some(failure) = session.stop()? {
-                self.failed.get_or_insert(failure);
-            }
+        if let Some(session) = &self.session {
+            session.stop()?;
         }
         Ok(())
     }
 
-    pub fn stop_transport(&mut self) -> Result<()> {
-        let channels = self.stop_demand_channels();
-        let connection = match (&self.socket, &self.socket_owner) {
-            (Some(socket), Some(owner)) => stop_owned_connection(socket, owner),
-            _ => Ok(()),
-        };
-        channels.and(connection)
+    pub fn stop_transport(&self) -> Result<()> {
+        self.stop_demand_channels()?;
+        if let (Some(socket), Some(owner)) = (&self.socket, &self.socket_owner) {
+            stop_owned_connection(socket, owner)?;
+        }
+        Ok(())
     }
     fn record_socket_owner(&mut self) -> Result<()> {
         let Some(socket) = &self.socket else {
@@ -1068,12 +1058,14 @@ impl Remote {
             client: self.control_client.clone(),
         };
         self.socket_owner = Some(owner.clone());
-        OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(socket_owner_marker(socket, &owner))
+            .open(socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE))
             .context("record owned SSH control socket")?;
+        serde_json::to_writer(&mut file, &owner)?;
+        std::io::Write::flush(&mut file)?;
         Ok(())
     }
     pub fn failure(&self) -> Option<String> {
@@ -1146,57 +1138,7 @@ impl Drop for Remote {
 }
 /// Stop only the control connection in a validated run's private directory.
 /// Recovery callers must validate and lock that run before invoking this.
-pub fn stop_run_connection(run: &Path) -> Result<()> {
-    let socket = control_socket(run);
-    stop_connection(&socket)?;
-    // The master can start listening before its inode is recorded. Keep that
-    // endpoint reachable after a crash in a registered run.
-    if socket
-        .symlink_metadata()
-        .is_ok_and(|entry| entry.file_type().is_socket())
-        && crate::git::run_marker(run)?.is_some()
-        && !endpoint_absent(&socket)?
-    {
-        bail!(
-            "live SSH control socket has no matching ownership record at {}; run retained",
-            socket.display()
-        );
-    }
-    if !socket.ends_with(SSH_CONTROL_NAME) {
-        stop_connection(&run.join(SSH_CONTROL_NAME))?;
-    }
-    Ok(())
-}
-
-fn control_socket(run: &Path) -> PathBuf {
-    let socket = run.join(SSH_CONTROL_NAME);
-    // OpenSSH adds a dot and 16 characters before binding the socket.
-    let mut bind_name = socket.as_os_str().to_owned();
-    bind_name.push(".0123456789abcdef");
-    if std::os::unix::net::SocketAddr::from_pathname(Path::new(&bind_name)).is_ok() {
-        socket
-    } else {
-        run.join("s")
-    }
-}
-
 pub fn stop_connection(socket: &Path) -> Result<()> {
-    if let Ok(metadata) = socket.symlink_metadata() {
-        if metadata.file_type().is_socket() {
-            let owner = SocketOwner {
-                format: "git-on-ssh-control-v1".into(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                client: None,
-            };
-            let marker = socket_owner_marker(socket, &owner);
-            if marker.symlink_metadata().is_ok_and(|entry| {
-                entry.is_file() && entry.uid() == metadata.uid() && entry.len() == 0
-            }) {
-                return stop_owned_connection(socket, &owner);
-            }
-        }
-    }
     let record = socket.parent().unwrap().join(SSH_CONTROL_OWNER_FILE);
     if !fs::symlink_metadata(&record).is_ok_and(|metadata| metadata.file_type().is_file()) {
         return Ok(());
@@ -1231,12 +1173,6 @@ pub fn stop_connection(socket: &Path) -> Result<()> {
     let owner = serde_json::from_value::<SocketOwner>(value)
         .context("invalid owned SSH recovery record; retain the run for --cleanup")?;
     stop_owned_connection(socket, &owner)
-}
-fn socket_owner_marker(socket: &Path, owner: &SocketOwner) -> PathBuf {
-    socket.with_file_name(format!(
-        "{SSH_CONTROL_OWNER_PREFIX}{}-{}",
-        owner.device, owner.inode
-    ))
 }
 fn owned_socket(socket: &Path, owner: &SocketOwner) -> bool {
     // Type alone is insufficient: a socket may be hardlinked or replaced after
@@ -1655,14 +1591,9 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
         # Ask the master to open the session. A rejected channel in raw mux
         # proxy mode can disconnect the master. The false proxy forbids
         # a replacement connection if ordinary session multiplexing fails.
-        exec "$executable" -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=/usr/bin/false "$@"
+        exec "$executable" -o "ControlPath=$control_path" -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=/usr/bin/false "$@"
     fi
-    # OpenSSH's address check may append to known_hosts even in strict mode.
-    if "$executable" -G -T "$@" </dev/null 2>/dev/null | grep -qx 'checkhostip yes'; then
-        echo 'git-on: OpenSSH CheckHostIP=yes is outside the direct SSH profile because it can update known_hosts' >&2
-        exit 125
-    fi
-    exec "$executable" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
+    exec "$executable" -o "ControlPath=$control_path" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
 }"#;
 
 #[cfg(test)]

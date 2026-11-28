@@ -9,17 +9,7 @@ use std::{
     },
 };
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static FAIL_NEXT_FILE_METADATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    pub(crate) static FAIL_NEXT_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 pub(crate) fn private_file_metadata(file: &File) -> io::Result<Metadata> {
-    #[cfg(test)]
-    if FAIL_NEXT_FILE_METADATA.replace(false) {
-        return Err(io::Error::from_raw_os_error(libc::EIO));
-    }
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
     {
@@ -36,12 +26,6 @@ pub(crate) fn open_private_file(
     name: &CStr,
     flags: libc::c_int,
 ) -> io::Result<(File, Metadata)> {
-    let file = open_file_at(directory, name, flags)?;
-    let metadata = private_file_metadata(&file)?;
-    Ok((file, metadata))
-}
-
-pub(crate) fn open_file_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -53,23 +37,7 @@ pub(crate) fn open_file_at(directory: &File, name: &CStr, flags: libc::c_int) ->
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-pub(crate) fn remove_file_at(directory: &File, name: &CStr) -> io::Result<()> {
-    #[cfg(test)]
-    if FAIL_NEXT_UNLINK.replace(false) {
-        return Err(io::Error::from_raw_os_error(libc::EIO));
-    }
-    loop {
-        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        match error.kind() {
-            io::ErrorKind::NotFound => return Ok(()),
-            io::ErrorKind::Interrupted => (),
-            _ => return Err(error),
-        }
-    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = private_file_metadata(&file)?;
+    Ok((file, metadata))
 }

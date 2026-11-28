@@ -213,10 +213,8 @@ class CiPlanTests(unittest.TestCase):
             data.pop();write()
             with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
-            data=pack_scaling_rows(HEAD)
-            data[-1]['pack_metadata_syscalls']=1;write()
-            with self.assertRaisesRegex(ValueError,'streamed demand used on-disk pack metadata'):
-                validate_resources(dict(head=HEAD),root)
+            data[0]['pack_metadata_syscalls']=1;data.append(dict(data[0],distinct_blobs=512));write()
+            with self.assertRaises(ValueError):validate_resources(dict(head=HEAD),root)
 
     def test_resource_gate_requires_complete_current_cache_reports(self):
         plan=dict(head=HEAD,required=dict(scale=False,resources=True,stress=False,lazy=False))

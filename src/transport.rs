@@ -10,7 +10,7 @@ use std::{
         unix::{
             fs::{FileTypeExt, MetadataExt},
             net::UnixStream,
-            process::{CommandExt, ExitStatusExt},
+            process::CommandExt,
         },
     },
     path::PathBuf,
@@ -19,14 +19,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn invalid(message: &str) -> anyhow::Error {
     crate::object::InvalidObject(message.into()).into()
 }
 type Stop = Option<Arc<AtomicBool>>;
-const SSH_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 fn check_transfer(stop: &Stop) -> io::Result<()> {
     if stop
@@ -249,170 +248,36 @@ impl NativeProcess {
         self.owner.stop().map(|_| ())
     }
 
-    fn close_stdin(&self) -> io::Result<()> {
-        match self.input.0.shutdown(Shutdown::Write) {
-            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
-            result => result,
-        }
-    }
-
-    fn finish_ssh(
-        &mut self,
-        stopping: bool,
-        check_stdout: bool,
-        timeout: Duration,
-    ) -> Result<ExitStatus> {
+    fn finish_ssh(&mut self) -> Result<()> {
         ensure!(
-            !check_stdout || self.output.buffer().is_empty(),
+            self.output.read(&mut [0])? == 0,
             "unexpected data after the Git SSH pack"
         );
-        let Input(output, stop, errors) = self.output.get_mut();
-        if check_stdout {
-            output.set_nonblocking(true)?;
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            if stopping {
-                // Shutdown has already cancelled reads. Still wait for the
-                // channel's verdict unless the whole invocation is signalled.
-                if crate::git::cancelled_signal().is_some() {
-                    return Err(crate::object::OperationCancelled.into());
-                }
-            } else {
-                check_transfer(stop)?;
-            }
+        let Input(_, stop, errors) = self.output.get_mut();
+        while !self.owner.exited()? {
+            check_transfer(stop)?;
             errors.pump()?;
-            let mut finished = self.owner.exited()?;
-            if check_stdout {
-                match output.read(&mut [0]) {
-                    Ok(0) => {}
-                    Ok(_) => bail!("unexpected data after the Git SSH pack"),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => finished = false,
-                    // A descendant can keep stdout open after OpenSSH exits.
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if finished {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(UsedSshChannelFailure::Timeout.into());
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            std::thread::sleep(Duration::from_millis(5));
         }
         // Keep the exited leader unreaped until its process group has been
         // stopped. The detached, recorded OpenSSH master is owned separately.
-        self.owner.stop()?.context("missing SSH exit status")
+        let status = self.owner.stop()?.context("missing SSH exit status")?;
+        ensure!(status.success(), "OpenSSH upload-pack failed with {status}");
+        Ok(())
     }
 
     pub(crate) fn error_text(&mut self) -> String {
         let _ = self.stop();
-        self.diagnostics()
-    }
-
-    fn diagnostics(&mut self) -> String {
         let errors = &mut self.output.get_mut().2;
         let _ = errors.pump();
         String::from_utf8_lossy(&errors.bytes).into_owned()
     }
-
-    fn stdout_finished(&self) -> bool {
-        let fd = self.output.get_ref().0.as_raw_fd();
-        let mut state = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut state, 1, 0) } <= 0 {
-            return false;
-        }
-        if state.revents & libc::POLLHUP != 0 {
-            return true;
-        }
-        // A peer can half-close its output without closing the socket.
-        let mut byte = 0u8;
-        unsafe {
-            libc::recv(
-                fd,
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            ) == 0
-        }
-    }
-
-    fn failed_ssh_exit(
-        &mut self,
-        used: bool,
-        cause: &anyhow::Error,
-        timeout: Duration,
-    ) -> Result<Option<ExitStatus>, UsedSshChannelFailure> {
-        // EOF can precede process exit. Let a channel that already supplied
-        // objects report its status before we would obscure it by killing it.
-        let disconnected = cause.downcast_ref::<io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionReset
-            )
-        });
-        let closed_during_stop = used
-            && crate::git::cancelled_signal().is_none()
-            && crate::object::is_cancelled(cause)
-            && self.stdout_finished();
-        let reported = if used && (disconnected || closed_during_stop) && self.close_stdin().is_ok()
-        {
-            match self.finish_ssh(true, !closed_during_stop, timeout) {
-                Ok(status) => Some(status),
-                Err(error) if error.is::<UsedSshChannelFailure>() => {
-                    let _ = self.owner.stop();
-                    return Err(UsedSshChannelFailure::Timeout);
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        Ok(reported.or_else(|| {
-            self.owner
-                .stop()
-                .ok()
-                .flatten()
-                .filter(|status| status.signal() != Some(libc::SIGKILL))
-        }))
-    }
 }
-
-#[derive(Debug)]
-pub(crate) enum UsedSshChannelFailure {
-    Exit(ExitStatus),
-    Connection,
-    Timeout,
-}
-impl std::fmt::Display for UsedSshChannelFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Exit(status) => write!(formatter, "OpenSSH upload-pack failed with {status}"),
-            Self::Connection => {
-                formatter.write_str("lost an OpenSSH channel that supplied Git objects")
-            }
-            Self::Timeout => {
-                formatter.write_str("timed out waiting for OpenSSH upload-pack to exit")
-            }
-        }
-    }
-}
-
-impl std::error::Error for UsedSshChannelFailure {}
 
 pub(crate) struct Session {
     process: NativeProcess,
     ref_requested: bool,
     early_fetch: Option<(Oid, bool)>,
-    completed_stream: bool,
 }
 pub(crate) struct StartingSession(Session);
 
@@ -426,7 +291,6 @@ impl StartingSession {
             process: NativeProcess::spawn(command, stop, foreground)?,
             ref_requested: false,
             early_fetch: None,
-            completed_stream: false,
         }))
     }
 
@@ -512,16 +376,6 @@ pub(crate) fn packet_text(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 impl Session {
-    pub(crate) fn check_connection(&self, connection: &Connection) -> Result<()> {
-        connection.check().map_err(|error| {
-            if self.completed_stream {
-                error.context(UsedSshChannelFailure::Connection)
-            } else {
-                error
-            }
-        })
-    }
-
     #[cfg(test)]
     fn connect(command: Command) -> Result<Option<Self>> {
         StartingSession::spawn(command, None, false)?.negotiate()
@@ -550,9 +404,7 @@ impl Session {
         oids: &[Oid],
         response: crate::pack_stream::Response,
     ) -> Result<crate::pack_stream::Received> {
-        let result = self.fetch_response(oids, response, false);
-        self.completed_stream |= result.is_ok();
-        result
+        self.fetch_response(oids, response, false)
     }
 
     pub(crate) fn fetch_eager(
@@ -582,73 +434,39 @@ impl Session {
                 self.process.input.write_all(&fetch_request(oids, full)?)?;
             }
             if full {
-                self.process.close_stdin()?;
+                match self.process.input.0.shutdown(Shutdown::Write) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             let pack = response.read(&mut self.process.output)?;
             if full {
-                let status = self.process.finish_ssh(false, true, SSH_EXIT_GRACE)?;
-                ensure!(status.success(), "OpenSSH upload-pack failed with {status}");
+                self.process.finish_ssh()?;
             }
             Ok(pack)
         })();
-        self.with_fetch_context(oids, result, SSH_EXIT_GRACE)
+        self.with_fetch_context(oids, result)
     }
 
-    fn with_fetch_context<T>(
-        &mut self,
-        oids: &[Oid],
-        result: Result<T>,
-        timeout: Duration,
-    ) -> Result<T> {
-        result.map_err(|error| {
-            let status = self
-                .process
-                .failed_ssh_exit(self.completed_stream, &error, timeout);
-            let diagnostic = self.process.diagnostics();
+    fn with_fetch_context<T>(&mut self, oids: &[Oid], result: Result<T>) -> Result<T> {
+        result.with_context(|| {
+            let diagnostic = self.error_text();
             let wanted = if let [oid] = oids {
                 format!("object {oid}")
             } else {
                 format!("objects ({} requests, first {})", oids.len(), oids[0])
             };
-            let error = error.context(format!(
+            format!(
                 "remote fetch of exact {wanted} failed: {}",
                 diagnostic.trim()
-            ));
-            match status {
-                Err(failure) => error.context(failure),
-                Ok(Some(status)) if self.completed_stream && !status.success() => {
-                    error.context(UsedSshChannelFailure::Exit(status))
-                }
-                Ok(_) => error,
-            }
+            )
         })
     }
-    pub(crate) fn stop(&mut self) -> Result<Option<String>> {
-        self.stop_with_timeout(SSH_EXIT_GRACE)
+    pub(crate) fn stop(&self) -> Result<()> {
+        self.process.stop()
     }
-
-    fn stop_with_timeout(&mut self, timeout: Duration) -> Result<Option<String>> {
-        if !std::mem::take(&mut self.completed_stream) || crate::git::cancelled_signal().is_some() {
-            self.process.stop()?;
-            return Ok(None);
-        }
-        let result = self
-            .process
-            .close_stdin()
-            .context("close Git SSH input")
-            .and_then(|()| self.process.finish_ssh(true, true, timeout));
-        match result {
-            Ok(status) => Ok(
-                (!status.success()).then(|| format!("OpenSSH upload-pack failed with {status}"))
-            ),
-            Err(error) => {
-                self.process.stop()?;
-                Ok((!crate::object::is_cancelled(&error))
-                    .then(|| format!("finish OpenSSH upload-pack: {error:#}")))
-            }
-        }
-    }
-    fn error_text(&mut self) -> String {
+    pub(crate) fn error_text(&mut self) -> String {
         self.process.error_text()
     }
 }
@@ -902,7 +720,6 @@ mod tests {
             },
             ref_requested: false,
             early_fetch: None,
-            completed_stream: false,
         };
         (session, peer)
     }
@@ -978,15 +795,10 @@ mod tests {
             .find(|(_, bytes)| bytes.last() == Some(&b'\n'))
             .unwrap();
         let oid = Oid::hash_object(git2::ObjectType::Blob, &payload).unwrap();
-        for (lf, shallow, valid) in [
-            (false, format!("shallow {oid}"), true),
-            (true, format!("shallow {oid}"), true),
-            (true, "shallow incomplete".into(), false),
-            (true, format!("unshallow {oid}"), false),
-        ] {
+        for lf in [false, true] {
             let mut bytes = Vec::new();
             text_packet(&mut bytes, b"shallow-info", lf);
-            text_packet(&mut bytes, shallow.as_bytes(), lf);
+            text_packet(&mut bytes, format!("shallow {oid}").as_bytes(), lf);
             bytes.extend_from_slice(b"0001");
             text_packet(&mut bytes, b"packfile", lf);
             write!(bytes, "{:04x}", packed.len() + 5).unwrap();
@@ -1002,15 +814,8 @@ mod tests {
                     Ok(())
                 }),
             );
-            let result = session.fetch_stream(&[oid], response);
-            if valid {
-                assert_eq!(result.unwrap().bytes as usize, packed.len());
-            } else {
-                assert!(
-                    format!("{:#}", result.err().expect("malformed shallow row"))
-                        .contains("invalid Git shallow section")
-                );
-            }
+            let actual = session.fetch_stream(&[oid], response).unwrap();
+            assert_eq!(actual.bytes as usize, packed.len());
         }
     }
     #[test]
@@ -1022,96 +827,6 @@ mod tests {
                 Box::new(|_| panic!("invalid object was published")),
             );
             assert!(session.fetch_stream(&[Oid::zero()], response).is_err());
-        }
-    }
-
-    #[test]
-    fn ssh_completion_uses_the_helpers_status_with_inherited_stdout() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 4 & exit 23"]);
-        let mut process = NativeProcess::spawn(command, None, false).unwrap();
-        let start = std::time::Instant::now();
-        assert_eq!(
-            process
-                .finish_ssh(false, true, SSH_EXIT_GRACE)
-                .unwrap()
-                .code(),
-            Some(23)
-        );
-        assert!(start.elapsed() < Duration::from_secs(3));
-
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exit 23"]);
-        let session = StartingSession::spawn(command, None, false).unwrap().0;
-        let mut session = Session {
-            completed_stream: true,
-            ..session
-        };
-        let start = std::time::Instant::now();
-        while !session.process.owner.exited().unwrap() {
-            assert!(start.elapsed() < Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            session.stop_with_timeout(Duration::ZERO).unwrap().unwrap(),
-            "OpenSSH upload-pack failed with exit status: 23"
-        );
-        assert!(session.stop().unwrap().is_none());
-    }
-
-    #[test]
-    fn ssh_shutdown_times_out_and_reaps_a_used_channel() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "read -r unused; exec sleep 1"]);
-        let session = StartingSession::spawn(command, None, false).unwrap().0;
-        let mut session = Session {
-            completed_stream: true,
-            ..session
-        };
-        let error = session
-            .stop_with_timeout(Duration::from_millis(60))
-            .unwrap()
-            .expect("a stalled channel must fail shutdown");
-        assert!(error.contains("timed out waiting for OpenSSH upload-pack to exit"));
-        assert!(session.process.owner.0.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn cancelling_unused_input_reports_the_closed_channels_status_or_timeout() {
-        use std::io::BufRead;
-
-        for (command_exit, timeout) in [
-            ("exit 23", SSH_EXIT_GRACE),
-            ("exec sleep 1", Duration::from_millis(60)),
-        ] {
-            let mut command = Command::new("/bin/sh");
-            command.arg("-c").arg(format!(
-                "printf unused; exec 1>&-; read -r line; {command_exit}"
-            ));
-            let mut session = StartingSession::spawn(command, None, false).unwrap().0;
-            session.completed_stream = true;
-            assert_eq!(session.process.output.fill_buf().unwrap(), b"unused");
-            let stdout = &mut session.process.output.get_mut().0;
-            let mut ready = libc::pollfd {
-                fd: stdout.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(unsafe { libc::poll(&mut ready, 1, 3000) }, 1);
-            assert_eq!(stdout.read(&mut [0]).unwrap(), 0);
-            assert!(!session.process.owner.exited().unwrap());
-            let result: Result<()> = Err(crate::object::OperationCancelled.into());
-            let error = session
-                .with_fetch_context(&[Oid::zero()], result, timeout)
-                .unwrap_err();
-            match error.downcast_ref::<UsedSshChannelFailure>().unwrap() {
-                UsedSshChannelFailure::Exit(status) if command_exit == "exit 23" => {
-                    assert_eq!(status.code(), Some(23));
-                }
-                UsedSshChannelFailure::Timeout if command_exit == "exec sleep 1" => {}
-                failure => panic!("unexpected SSH failure: {failure}"),
-            }
-            assert!(session.process.owner.0.lock().unwrap().is_none());
         }
     }
 

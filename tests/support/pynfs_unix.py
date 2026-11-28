@@ -9,14 +9,8 @@ import sys
 source = Path(sys.argv[1]).resolve(strict=True)
 point = os.fsencode(os.getcwd())
 mounts = subprocess.check_output(["/sbin/mount"]).splitlines()
-mount_target = b">:/ on " + point + b" (nfs"
-for line in mounts:
-    address, match, _ = line.partition(mount_target)
-    if match and address.startswith(b"<"):
-        mounted = address[1:]
-        break
-else:
-    raise RuntimeError("could not find the Unix NFS socket for the test mount")
+mounted = next(line.split(b">:/", 1)[0][1:] for line in mounts
+               if line.startswith(b"</private/tmp/git-on-nfs-") and b" on " + point + b" (nfs" in line)
 original_getaddrinfo = socket.getaddrinfo
 
 

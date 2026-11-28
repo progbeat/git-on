@@ -58,12 +58,12 @@ struct Slot {
 struct Replay {
     digest: [u8; 32],
     credentials: Credentials,
-    reply: Arc<Writer>,
+    reply: Arc<Vec<u8>>,
 }
 
 pub(super) struct RpcReply {
     pub(super) header: Vec<u8>,
-    pub(super) body: Option<Arc<Writer>>,
+    pub(super) body: Option<Arc<Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -71,9 +71,7 @@ impl RpcReply {
     pub(super) fn into_bytes(self) -> Vec<u8> {
         let Self { mut header, body } = self;
         if let Some(body) = body {
-            for part in body.segments() {
-                header.extend_from_slice(part);
-            }
+            header.extend_from_slice(&body);
         }
         header
     }
@@ -326,7 +324,7 @@ impl Server {
         raw_request: &[u8],
         request_size: usize,
         failure: Option<DemandFailure>,
-    ) -> Arc<Writer> {
+    ) -> Arc<Vec<u8>> {
         let mut reply = Writer::default();
         reply.u32(OK);
         reply.opaque(request.tag);
@@ -335,10 +333,10 @@ impl Server {
 
         if request.minor != 1 {
             reply.patch_u32(0, MINOR_MISMATCH);
-            return Arc::new(reply);
+            return Arc::new(reply.into_bytes());
         }
         if request.count == 0 {
-            return Arc::new(reply);
+            return Arc::new(reply.into_bytes());
         }
         let mut context = Context::new(credentials);
         let mut budget = MAX_RECORD - RPC_REPLY_HEADER;
@@ -428,23 +426,20 @@ impl Server {
             self.core.forget_inode(ino, 1);
         }
         reply.patch_u32(count_at, count);
-        if replay_slot.is_some() {
-            reply.shrink_inline(budget);
+        // The socket and the replay slot share the exact same response body.
+        let mut bytes = reply.into_bytes();
+        if replay_slot.is_some() && bytes.capacity() > budget {
+            bytes.shrink_to_fit();
         }
-        let reply = Arc::new(reply);
+        let reply = Arc::new(bytes);
         if let Some((sequence, digest)) = replay_slot {
             if let Some(session) = self.sessions.get_mut(&sequence.session) {
-                // A short range can own a much larger blob. Compact only the
-                // replay copy when retaining that allocation exceeds its budget.
-                let cached = reply
-                    .compact_for_replay(budget)
-                    .map_or_else(|| reply.clone(), Arc::new);
                 session.slots[sequence.slot as usize] = Slot {
                     sequence: sequence.id,
                     last: Some(Replay {
                         digest,
                         credentials,
-                        reply: cached,
+                        reply: reply.clone(),
                     }),
                 };
                 if let Some(client) = self.clients.get_mut(&session.client) {
@@ -737,7 +732,7 @@ impl Server {
 
 enum Sequenced {
     New(u64, usize),
-    Replay(Arc<Writer>),
+    Replay(Arc<Vec<u8>>),
 }
 
 #[cfg(test)]

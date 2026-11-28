@@ -1,7 +1,7 @@
 //! Invocation-local verified contents. Only payload bytes spill to disk;
 //! object identity, length and ordered block digests stay in protected RAM.
 use crate::{
-    spool::{open_file_at, open_private_file, private_file_metadata, remove_file_at},
+    spool::{open_private_file, private_file_metadata},
     tree::Directory,
 };
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use std::{
     ffi::CString,
     fs::{File, Metadata},
     io::{self, Read, Write},
-    ops::{Deref, Range},
+    ops::Range,
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::Path,
     sync::{
@@ -21,6 +21,7 @@ use std::{
 };
 
 pub(crate) const MEMORY_BUDGET: usize = 16 * 1024 * 1024;
+pub(crate) const COPY_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 // Conservatively covers the LRU node, table slack/control bytes and Vec header.
 const ENTRY_CHARGE: usize = 512;
 pub(crate) const BLOCK: usize = 64 * 1024;
@@ -116,8 +117,19 @@ impl std::error::Error for BackingError {
     }
 }
 
+fn capacity_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSPC | libc::EDQUOT | libc::EFBIG | libc::EMFILE | libc::ENFILE)
+    )
+}
+
 pub(crate) fn is_retryable_spill(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<BackingError>()) && !crate::object::is_cancelled(error)
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BackingError>()
+            .is_some_and(|error| capacity_error(&error.0))
+    })
 }
 struct Descriptor {
     size: u64,
@@ -126,7 +138,6 @@ struct Descriptor {
     used: bool,
     content_checked: bool,
     directory: Option<Arc<Directory>>,
-    response: Option<Arc<crate::demand::ResponseReceipt>>,
     pack_readers: usize,
     discard_after_pack: bool,
 }
@@ -139,51 +150,9 @@ impl Descriptor {
         }
     }
 }
-#[derive(Clone)]
-pub(crate) enum CachedBytes {
-    Vec(Arc<Vec<u8>>),
-    Odb(Arc<crate::object::OdbBuffer>),
-}
-
-impl CachedBytes {
-    fn capacity(&self) -> usize {
-        match self {
-            Self::Vec(bytes) => bytes.capacity(),
-            Self::Odb(bytes) => bytes.data().len(),
-        }
-    }
-}
-
-impl From<Arc<Vec<u8>>> for CachedBytes {
-    fn from(bytes: Arc<Vec<u8>>) -> Self {
-        Self::Vec(bytes)
-    }
-}
-
-impl Deref for CachedBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Vec(bytes) => bytes.as_slice(),
-            Self::Odb(bytes) => bytes.data(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for CachedBytes {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CachedBytes")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
 struct Resident {
     block: usize,
-    bytes: CachedBytes,
+    bytes: Arc<Vec<u8>>,
 }
 fn verify_installed(file: &File, path: &Path, size: u64, blocks: &[[u8; 32]]) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -211,25 +180,26 @@ fn verify_installed(file: &File, path: &Path, size: u64, blocks: &[[u8; 32]]) ->
 }
 
 fn open_copy(
-    target: &FailedTransfer,
+    parent: &File,
+    name: &std::ffi::CStr,
     source: Option<&File>,
-    created: &mut bool,
 ) -> io::Result<(File, bool)> {
-    let parent = &target.parent;
-    let name = &target.name;
     #[cfg(target_os = "macos")]
     if let Some(source) = source {
         if unsafe { libc::fclonefileat(source.as_raw_fd(), parent.as_raw_fd(), name.as_ptr(), 0) }
             == 0
         {
-            *created = true;
-            return open_private_file(parent, name, libc::O_RDWR).map(|(file, _)| (file, true));
+            return match open_private_file(parent, name, libc::O_RDWR) {
+                Ok((file, _)) => Ok((file, true)),
+                Err(error) => {
+                    unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+                    Err(error)
+                }
+            };
         }
     }
 
-    let file = open_file_at(parent, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)?;
-    *created = true;
-    private_file_metadata(&file)?;
+    let (file, _) = open_private_file(parent, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)?;
     #[cfg(target_os = "linux")]
     let cloned = source.is_some_and(|source| unsafe {
         libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) == 0
@@ -246,7 +216,7 @@ pub(crate) struct RawBlob {
     size: u64,
     kind: ObjectType,
 }
-pub(crate) struct PackBlob(pub(crate) RawBlob);
+struct PackBlob(RawBlob);
 
 impl Drop for PackBlob {
     fn drop(&mut self) {
@@ -268,6 +238,60 @@ impl Drop for PackBlob {
         }
     }
 }
+
+struct PackBlobs {
+    cache: RawBlobs,
+    bases: HashMap<Oid, PackBlob>,
+    checked: Option<CheckedBlock>,
+}
+
+impl crate::pack_stream::PackOutput for PackBlobs {
+    fn place(
+        &mut self,
+        object: &crate::pack_stream::VerifiedObject,
+        as_base: bool,
+    ) -> Result<crate::pack_stream::Placement> {
+        use crate::pack_stream::Placement;
+        if object.kind() != ObjectType::Blob {
+            return Ok(Placement::InPack);
+        }
+        let placed = if as_base {
+            match self.bases.entry(object.oid()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    self.cache.pin_pack_blob(object).map(|blob| {
+                        slot.insert(blob);
+                    })
+                }
+                std::collections::hash_map::Entry::Occupied(_) => Ok(()),
+            }
+        } else {
+            self.cache.insert_verified_blob(object)
+        };
+        match placed {
+            Ok(()) => Ok(Placement::InOutput),
+            Err(error) if is_retryable_spill(&error) => Ok(Placement::Retry(error)),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn with_base(
+        &mut self,
+        oid: Oid,
+        decode: &mut crate::pack_stream::DecodeWithBase<'_>,
+    ) -> Result<Option<crate::pack_stream::VerifiedObject>> {
+        let Some(blob) = self.bases.get(&oid) else {
+            return Ok(None);
+        };
+        let mut visitor = blob.0.visitor(&mut self.checked);
+        decode(
+            ObjectType::Blob,
+            usize::try_from(visitor.len())?,
+            &mut |range, emit| visitor.visit(range, emit),
+        )
+        .map(Some)
+    }
+}
+
 impl RawBlob {
     pub(crate) fn kind(&self) -> ObjectType {
         self.kind
@@ -291,7 +315,7 @@ impl RawBlob {
     ) -> Result<()> {
         self.visitor(&mut None).visit(range, consume)
     }
-    pub(crate) fn visitor<'a>(&'a self, checked: &'a mut Option<CheckedBlock>) -> BlobVisit<'a> {
+    fn visitor<'a>(&'a self, checked: &'a mut Option<CheckedBlock>) -> BlobVisit<'a> {
         let resident = self
             .state
             .lock()
@@ -390,7 +414,7 @@ impl RawBlob {
         store: &mut Store,
         file: &mut Option<Arc<File>>,
         block: usize,
-    ) -> Result<CachedBytes> {
+    ) -> Result<Arc<Vec<u8>>> {
         if let Some(resident) = store
             .memory
             .get(&self.oid)
@@ -400,14 +424,6 @@ impl RawBlob {
         }
         let start = block as u64 * BLOCK as u64;
         let size = usize::try_from((self.size - start).min(BLOCK as u64))?;
-        if file.is_none()
-            && store
-                .failed_transfers
-                .get(&self.oid)
-                .is_some_and(|output| output.linked)
-        {
-            store.recover_transfer(self.oid)?;
-        }
         let object = store
             .objects
             .get(&self.oid)
@@ -426,11 +442,14 @@ impl RawBlob {
         {
             store.authenticated_bytes += size as u64;
         }
-        let bytes = CachedBytes::Vec(Arc::new(bytes));
-        // A failed optional spill keeps the old resident.
-        if let Err(error) = store.admit(self.oid, block, bytes.clone()) {
-            if error.downcast_ref::<io::Error>().is_none() {
-                return Err(error);
+        let bytes = Arc::new(bytes);
+        // Copy mode leaves room for whole blobs. Mounted readers may retain
+        // the checked block; a failed optional spill keeps the old resident.
+        if !store.copy_cache {
+            if let Err(error) = store.admit(self.oid, block, bytes.clone()) {
+                if error.downcast_ref::<io::Error>().is_none() {
+                    return Err(error);
+                }
             }
         }
         Ok(bytes)
@@ -447,24 +466,24 @@ impl RawBlob {
 }
 
 /// One spill block shared by successive reads of the same delta base.
-pub(crate) struct CheckedBlock {
+struct CheckedBlock {
     oid: Oid,
     offset: usize,
     bytes: ReadData,
 }
 
-pub(crate) struct BlobVisit<'a> {
+struct BlobVisit<'a> {
     blob: &'a RawBlob,
-    resident: Option<CachedBytes>,
+    resident: Option<Arc<Vec<u8>>>,
     checked: &'a mut Option<CheckedBlock>,
 }
 
 impl BlobVisit<'_> {
-    pub(crate) fn len(&self) -> u64 {
+    fn len(&self) -> u64 {
         self.blob.size
     }
 
-    pub(crate) fn visit(
+    fn visit(
         &mut self,
         range: Range<usize>,
         mut consume: impl FnMut(&[u8]) -> Result<()>,
@@ -511,28 +530,12 @@ impl BlobVisit<'_> {
 pub(crate) enum ReadData {
     Owned(Vec<u8>),
     Cached {
-        bytes: CachedBytes,
+        bytes: Arc<Vec<u8>>,
         range: Range<usize>,
     },
 }
 
 impl ReadData {
-    #[cfg(target_os = "macos")]
-    pub(crate) fn backing_ptr(&self) -> *const u8 {
-        match self {
-            Self::Owned(bytes) => bytes.as_ptr(),
-            Self::Cached { bytes, .. } => bytes.as_ptr(),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn backing_capacity(&self) -> usize {
-        match self {
-            Self::Owned(bytes) => bytes.capacity(),
-            Self::Cached { bytes, .. } => bytes.capacity(),
-        }
-    }
-
     pub(crate) fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Owned(bytes) => bytes,
@@ -573,7 +576,6 @@ struct RawDirectory {
     reader: Option<(Oid, Arc<File>)>,
     _owner: tempfile::TempDir,
     writes: Arc<WriteMetrics>,
-    abandoned: Arc<Mutex<Vec<CString>>>,
     #[cfg(test)]
     open_calls: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -593,7 +595,6 @@ impl RawDirectory {
             fd: Arc::new(fd),
             reader: None,
             _owner: owner,
-            abandoned: Arc::default(),
             writes: Arc::new(WriteMetrics {
                 #[cfg(feature = "test-metrics")]
                 gate: std::env::var_os("GIT_ON_TEST_SPILL_GATE").map(std::path::PathBuf::from),
@@ -651,26 +652,21 @@ impl RawDirectory {
         self.reader = Some((oid, file.clone()));
         Ok(file)
     }
+    fn pending_name(&self, name: CString) -> Result<Pending> {
+        let file = self.open_name(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, None)?;
+        Ok(Pending {
+            directory: self.fd.clone(),
+            name,
+            file,
+            committed: false,
+        })
+    }
     fn start_spill(&self, oid: Oid) -> Result<Pending> {
         #[cfg(test)]
         if let Some(error) = self.spill_error {
             return Err(io::Error::from_raw_os_error(error).into());
         }
-        self.abandoned
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|name| remove_file_at(&self.fd, name).is_err());
-        let name = CString::new(format!(".partial-{}", uuid::Uuid::new_v4().simple()))?;
-        let file = open_file_at(&self.fd, &name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
-            .context("open private raw object")?;
-        Ok(Pending {
-            directory: self.fd.clone(),
-            abandoned: self.abandoned.clone(),
-            name,
-            destination: CString::new(oid.to_string())?,
-            file,
-            committed: false,
-        })
+        self.pending_name(CString::new(oid.to_string())?)
     }
     fn spill(&self, oid: Oid, bytes: &[u8]) -> Result<Box<[[u8; 32]]>> {
         self.start_spill(oid)?.write(bytes, &self.writes)
@@ -686,46 +682,8 @@ impl Pending {
             },
             bytes,
         )?;
-        self.publish(bytes.len() as u64)?;
-        Ok(blocks.into_boxed_slice())
-    }
-
-    fn publish(mut self, size: u64) -> Result<()> {
-        let directory = self.directory.as_raw_fd();
-        RawDirectory::validate_size(&private_file_metadata(&self.file)?, Some(size))?;
-        crate::object::check_transfer()?;
-        // The store serializes publication of each OID. Keep unexpected
-        // existing entries intact and move the completed inode without
-        // copying its payload.
-        let mut metadata = std::mem::MaybeUninit::uninit();
-        if unsafe {
-            libc::fstatat(
-                directory,
-                self.destination.as_ptr(),
-                metadata.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EEXIST).into());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
-        if unsafe {
-            libc::renameat(
-                directory,
-                self.name.as_ptr(),
-                directory,
-                self.destination.as_ptr(),
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
         self.committed = true;
-        Ok(())
+        Ok(blocks.into_boxed_slice())
     }
 }
 
@@ -756,7 +714,7 @@ impl Write for RawWriter<'_> {
                 }
             }
             if gate.join("fail").exists() {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
             }
         }
         Ok(count)
@@ -767,22 +725,16 @@ impl Write for RawWriter<'_> {
 }
 struct Pending {
     directory: Arc<File>,
-    abandoned: Arc<Mutex<Vec<CString>>>,
     name: CString,
-    destination: CString,
     file: File,
     committed: bool,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
-        if !self.committed && remove_file_at(&self.directory, &self.name).is_err() {
-            // Release payload blocks now if possible and retry the unlink
-            // before allocating the next spill.
-            let _ = self.file.set_len(0);
-            self.abandoned
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(self.name.clone());
+        if !self.committed {
+            unsafe {
+                libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+            }
         }
     }
 }
@@ -793,7 +745,7 @@ pub(crate) struct RawBlobs {
     prepared: Arc<Condvar>,
 }
 enum BlobPayload {
-    Resident(CachedBytes),
+    Resident(Arc<Vec<u8>>),
     Spilled(Box<[[u8; 32]]>),
 }
 
@@ -811,12 +763,23 @@ impl Drop for BlobPreparation<'_> {
 }
 
 impl RawBlobs {
+    pub(crate) fn pack_output(&self) -> impl crate::pack_stream::PackOutput + 'static {
+        PackBlobs {
+            cache: self.clone(),
+            bases: HashMap::new(),
+            checked: None,
+        }
+    }
+
+    pub(crate) fn eager_response(&self, oid: Oid) -> crate::pack_stream::Response {
+        crate::pack_stream::Response::eager(oid, self.pack_output())
+    }
+
     pub(crate) fn new(directory: &Path) -> Result<Self> {
         Ok(Self {
             state: Arc::new(Mutex::new(Store {
                 directory: RawDirectory::new(directory)?,
                 objects: HashMap::new(),
-                failed_transfers: HashMap::new(),
                 preparing: HashSet::new(),
                 packed: HashMap::new(),
                 packed_blobs: lru::LruCache::unbounded(),
@@ -827,6 +790,7 @@ impl RawBlobs {
                 large_bytes: 0,
                 spilling_large: None,
                 memory_limit: MEMORY_BUDGET,
+                copy_cache: false,
                 memory_high_water: 0,
                 failure: None,
                 blob_entries: 0,
@@ -838,6 +802,11 @@ impl RawBlobs {
             })),
             prepared: Arc::default(),
         })
+    }
+    pub(crate) fn enable_copy_cache(&self, limit: usize) {
+        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        store.copy_cache = true;
+        store.memory_limit = limit;
     }
     fn blob(&self, oid: Oid, object: &Descriptor) -> RawBlob {
         RawBlob {
@@ -851,49 +820,6 @@ impl RawBlobs {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(state.objects.get(&oid).map(|object| self.blob(oid, object)))
     }
-
-    pub(crate) fn observe_cached(
-        &self,
-        oid: Oid,
-        completion: &Arc<crate::demand::ResponseCompletion>,
-    ) -> Result<bool> {
-        let mut store = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(object) = store.objects.get_mut(&oid) else {
-            return Ok(false);
-        };
-        if let Some(response) = &object.response {
-            if !response.observe(completion)? {
-                object.response = None;
-            }
-        }
-        Ok(true)
-    }
-
-    pub(crate) fn reject_response(
-        &self,
-        response: &Arc<crate::demand::ResponseReceipt>,
-        covered: impl Iterator<Item = Oid>,
-        error: &anyhow::Error,
-    ) -> bool {
-        // Serialize the failure with cache observations. An unused duplicate
-        // can reuse its authenticated bytes once another pack covers the OID.
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let used = response.fail(error);
-        if !used {
-            for oid in covered {
-                if let Some(object) = state.objects.get_mut(&oid).filter(|object| {
-                    object
-                        .response
-                        .as_ref()
-                        .is_some_and(|receipt| Arc::ptr_eq(receipt, response))
-                }) {
-                    object.response = None;
-                }
-            }
-        }
-        used
-    }
-
     pub(crate) fn available(&self, oid: Oid) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.objects.contains_key(&oid)
@@ -978,22 +904,15 @@ impl RawBlobs {
     pub(crate) fn insert_odb_blob(
         &mut self,
         oid: Oid,
-        object: git2::OdbObject<'_>,
+        object: &git2::OdbObject<'_>,
     ) -> Result<RawBlob> {
         anyhow::ensure!(
             object.id() == oid && object.kind() == ObjectType::Blob,
             "ODB object identity/type changed before raw import"
         );
-        let size = object.len();
-        match crate::object::OdbBuffer::take(object) {
-            Ok(buffer) => self.insert_with(oid, size, true, false, None, || {
-                crate::object::check_transfer()?;
-                Ok(BlobPayload::Resident(CachedBytes::Odb(Arc::new(buffer))))
-            }),
-            Err(object) => self.insert_blob(oid, size, true, |output| {
-                crate::object::copy_odb_blob(&object, output)
-            }),
-        }
+        self.insert_blob(oid, object.len(), true, |output| {
+            crate::object::copy_odb_blob(object, output)
+        })
     }
     #[cfg(test)]
     fn insert_fetched(&mut self, oid: Oid, size: usize, input: impl Read) -> Result<RawBlob> {
@@ -1004,41 +923,37 @@ impl RawBlobs {
     pub(crate) fn insert_verified_blob(
         &self,
         object: &crate::pack_stream::VerifiedObject,
-        response: Option<Arc<crate::demand::ResponseReceipt>>,
     ) -> Result<()> {
-        self.insert_packed(object, false, response)?;
+        self.insert_packed(object, false)?;
         Ok(())
     }
 
-    pub(crate) fn pin_pack_blob(
-        &self,
-        object: &crate::pack_stream::VerifiedObject,
-        response: Option<Arc<crate::demand::ResponseReceipt>>,
-    ) -> Result<PackBlob> {
-        Ok(PackBlob(self.insert_packed(object, true, response)?))
+    fn pin_pack_blob(&self, object: &crate::pack_stream::VerifiedObject) -> Result<PackBlob> {
+        Ok(PackBlob(self.insert_packed(object, true)?))
     }
 
     fn insert_packed(
         &self,
         object: &crate::pack_stream::VerifiedObject,
         pin: bool,
-        response: Option<Arc<crate::demand::ResponseReceipt>>,
     ) -> Result<RawBlob> {
         anyhow::ensure!(
             object.kind() == ObjectType::Blob,
             "streamed object is not a blob"
         );
-        self.insert_with(
-            object.oid(),
-            object.data().len(),
-            false,
-            pin,
-            response,
-            || Ok(BlobPayload::Resident(object.shared_data().into())),
-        )
-        // The object is already verified. I/O here only places its bytes
-        // in the cache and can be retried without discarding the response.
-        .map_err(backing_error)
+        self.insert_with(object.oid(), object.data().len(), false, pin, || {
+            Ok(BlobPayload::Resident(object.shared_data()))
+        })
+        .map_err(|error| {
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(capacity_error)
+            {
+                backing_error(error)
+            } else {
+                error
+            }
+        })
     }
 
     fn insert_blob(
@@ -1048,7 +963,7 @@ impl RawBlobs {
         used: bool,
         transfer: impl FnOnce(&mut dyn Write) -> Result<()>,
     ) -> Result<RawBlob> {
-        self.insert_with(oid, size, used, false, None, || {
+        self.insert_with(oid, size, used, false, || {
             let backing = {
                 let store = self.state.lock().unwrap_or_else(|error| error.into_inner());
                 if size > store.whole_limit(size) {
@@ -1068,13 +983,18 @@ impl RawBlobs {
                 let mut output = SealedWrite::new(output, crate::object::check_transfer);
                 transfer(&mut output)?;
                 let blocks = output.finish();
-                pending.publish(size as u64)?;
+                anyhow::ensure!(
+                    pending.file.metadata()?.len() == size as u64,
+                    "verified blob length changed"
+                );
+                crate::object::check_transfer()?;
+                pending.committed = true;
                 return Ok(BlobPayload::Spilled(blocks.into_boxed_slice()));
             }
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(size)?;
             transfer(&mut bytes)?;
-            Ok(BlobPayload::Resident(Arc::new(bytes).into()))
+            Ok(BlobPayload::Resident(Arc::new(bytes)))
         })
     }
 
@@ -1084,7 +1004,6 @@ impl RawBlobs {
         size: usize,
         used: bool,
         pin: bool,
-        response: Option<Arc<crate::demand::ResponseReceipt>>,
         load: impl FnOnce() -> Result<BlobPayload>,
     ) -> Result<RawBlob> {
         let mut store = self.wait_for_preparation(oid);
@@ -1101,7 +1020,7 @@ impl RawBlobs {
         let blocks = match payload {
             BlobPayload::Resident(bytes) => {
                 anyhow::ensure!(bytes.len() == size, "verified blob length changed");
-                if store.memory_limit != 0 && size > BLOCK {
+                if !store.copy_cache && store.memory_limit != 0 && size > BLOCK {
                     store = self.make_large_room(store)?;
                 }
                 store.retain_blob(oid, bytes)?
@@ -1118,7 +1037,6 @@ impl RawBlobs {
                 used,
                 content_checked: false,
                 directory: None,
-                response,
                 pack_readers: usize::from(pin),
                 discard_after_pack: false,
             },
@@ -1199,14 +1117,6 @@ impl RawBlobs {
     ) -> Result<RawBlob> {
         self.store_tree(oid, size, || Directory::verified(oid, size, input))
     }
-    pub(crate) fn insert_odb_tree(
-        &mut self,
-        oid: Oid,
-        object: &git2::OdbObject<'_>,
-    ) -> Result<RawBlob> {
-        self.store_tree(oid, object.len(), || Directory::from_odb(oid, object))
-    }
-
     pub(crate) fn insert_verified_tree(
         &mut self,
         object: &crate::pack_stream::VerifiedObject,
@@ -1236,7 +1146,6 @@ impl RawBlobs {
                 used: false,
                 content_checked: false,
                 directory: Some(directory),
-                response: None,
                 pack_readers: 0,
                 discard_after_pack: false,
             },
@@ -1256,43 +1165,6 @@ impl RawBlobs {
         })
     }
 
-    pub(crate) fn promote_empty<T>(
-        &self,
-        oid: Oid,
-        path: &Path,
-        backing: &Arc<File>,
-        exclusive: bool,
-        unlinked: bool,
-        change: impl FnOnce(&File) -> io::Result<T>,
-    ) -> Result<(File, u64, T)> {
-        let mut store = self.wait_for_preparation(oid);
-        store.recover_transfer(oid)?;
-        let output = (!unlinked)
-            .then(|| FailedTransfer::with_parent(path, Arc::clone(backing)))
-            .transpose()?;
-        let mut created = false;
-        let result = (|| -> Result<_> {
-            let file = match &output {
-                Some(output) => {
-                    open_copy(output, None, &mut created)
-                        .map_err(BackingError)?
-                        .0
-                }
-                None => tempfile::tempfile_in(path.parent().context("backing parent")?)
-                    .map_err(BackingError)?,
-            };
-            let result = change(&file).map_err(BackingError)?;
-            if exclusive {
-                store.forget_blob(oid).map_err(backing_error)?;
-            }
-            Ok((file, 0, result))
-        })();
-        if let Some(output) = output.filter(|_| result.is_err() && created) {
-            store.rollback_transfer(oid, output);
-        }
-        result
-    }
-
     pub(crate) fn install_spill(&self, oid: Oid, path: &Path) -> Result<(File, u64)> {
         let (file, size, ()) = self.transfer(oid, path, true, true, |_| Ok(()))?;
         Ok((file, size))
@@ -1306,11 +1178,17 @@ impl RawBlobs {
         verify_materialization: bool,
         use_file: impl FnOnce(&File) -> Result<T>,
     ) -> Result<(File, u64, T)> {
-        let mut store = self.wait_for_preparation(oid);
-        store.recover_transfer(oid)?;
-        let mut target = FailedTransfer::new(path)?;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let parent = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.parent().context("backing parent")?)
+            .map_err(BackingError)?;
+        let name = CString::new(path.file_name().context("backing name")?.as_bytes())?;
         let mut created = false;
         let result = (|| {
+            let mut store = self.wait_for_preparation(oid);
             let object = store.objects.get(&oid).context("missing prepared source")?;
             anyhow::ensure!(
                 object.kind() == ObjectType::Blob,
@@ -1360,8 +1238,8 @@ impl RawBlobs {
                     libc::linkat(
                         store.directory.fd.as_raw_fd(),
                         raw_name.as_ptr(),
-                        target.parent.as_raw_fd(),
-                        target.name.as_ptr(),
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
                         0,
                     )
                 };
@@ -1381,12 +1259,11 @@ impl RawBlobs {
                 false
             };
             let (mut output, cloned) = if linked {
-                target.linked = true;
-                created = true;
                 (input.take().unwrap(), true)
             } else {
-                open_copy(&target, input.as_ref(), &mut created).map_err(BackingError)?
+                open_copy(&parent, &name, input.as_ref()).map_err(BackingError)?
             };
+            created = true;
             if let Some(input) = input {
                 if !cloned {
                     // Writable copies use ordinary I/O. Immutable readers
@@ -1441,10 +1318,14 @@ impl RawBlobs {
         if let Err(error) = &result {
             if error.downcast_ref::<BackingError>().is_none() && !crate::object::is_cancelled(error)
             {
-                store.failure.get_or_insert_with(|| format!("{error:#}"));
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failure
+                    .get_or_insert_with(|| format!("{error:#}"));
             }
             if created {
-                store.rollback_transfer(oid, target);
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
             }
         }
         result
@@ -1452,12 +1333,6 @@ impl RawBlobs {
 
     pub(crate) fn discard(&self, oid: Oid) -> Result<()> {
         self.wait_for_preparation(oid).forget_blob(oid)
-    }
-    pub(crate) fn recover_transfer(&self, oid: Oid) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .recover_transfer(oid)
     }
     #[cfg(feature = "test-metrics")]
     pub(crate) fn oids(&self) -> Result<Vec<Oid>> {
@@ -1556,65 +1431,26 @@ impl RawBlobs {
         Ok(())
     }
     #[cfg(test)]
-    pub(crate) fn disk_only(directory: &Path) -> Result<Self> {
+    fn disk_only(directory: &Path) -> Result<Self> {
         let value = Self::new(directory)?;
         value.state.lock().unwrap().memory_limit = 0;
         Ok(value)
     }
-    #[cfg(test)]
-    pub(crate) fn set_spill_error_for_test(&self, error: Option<i32>) {
-        self.state.lock().unwrap().directory.spill_error = error;
-    }
-    #[cfg(test)]
-    pub(crate) fn set_memory_limit_for_test(&self, limit: usize) {
-        self.state.lock().unwrap().memory_limit = limit;
-    }
 }
-struct FailedTransfer {
-    parent: Arc<File>,
-    name: CString,
-    linked: bool,
-}
-impl FailedTransfer {
-    fn new(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let parent = File::options()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path.parent().context("backing parent")?)
-            .map_err(BackingError)?;
-        Self::with_parent(path, Arc::new(parent))
-    }
-
-    fn with_parent(path: &Path, parent: Arc<File>) -> Result<Self> {
-        use std::os::unix::ffi::OsStrExt;
-        let name = CString::new(path.file_name().context("backing name")?.as_bytes())?;
-        Ok(Self {
-            parent,
-            name,
-            linked: false,
-        })
-    }
-
-    fn remove(&self) -> io::Result<()> {
-        remove_file_at(&self.parent, &self.name)
-    }
-}
-
 struct Store {
     directory: RawDirectory,
     objects: HashMap<Oid, Descriptor>,
-    failed_transfers: HashMap<Oid, FailedTransfer>,
     preparing: HashSet<Oid>,
     packed: HashMap<Oid, crate::pack_stream::PackedObject>,
     packed_blobs: lru::LruCache<Oid, crate::pack_stream::PackedObject>,
     packed_blob_bytes: usize,
     memory: lru::LruCache<Oid, Resident>,
-    large: lru::LruCache<Oid, CachedBytes>,
+    large: lru::LruCache<Oid, Arc<Vec<u8>>>,
     memory_bytes: usize,
     large_bytes: usize,
     spilling_large: Option<Oid>,
     memory_limit: usize,
+    copy_cache: bool,
     memory_high_water: usize,
     failure: Option<String>,
     blob_entries: u64,
@@ -1625,24 +1461,6 @@ struct Store {
     authenticated_bytes: u64,
 }
 impl Store {
-    fn rollback_transfer(&mut self, oid: Oid, output: FailedTransfer) {
-        // Keep the directory and name for the next operation if unlink fails.
-        if output.remove().is_err() {
-            self.failed_transfers.insert(oid, output);
-        }
-    }
-
-    fn recover_transfer(&mut self, oid: Oid) -> Result<()> {
-        if let Some(output) = self.failed_transfers.get(&oid) {
-            output
-                .remove()
-                .map_err(BackingError)
-                .context("rollback private backing")?;
-            self.failed_transfers.remove(&oid);
-        }
-        Ok(())
-    }
-
     fn forget_packed(&mut self, oid: Oid) {
         self.packed.remove(&oid);
         if let Some(removed) = self.packed_blobs.pop(&oid) {
@@ -1650,7 +1468,7 @@ impl Store {
         }
     }
 
-    fn whole_blob(&mut self, oid: Oid, size: u64) -> Option<CachedBytes> {
+    fn whole_blob(&mut self, oid: Oid, size: u64) -> Option<Arc<Vec<u8>>> {
         self.large.get(&oid).cloned().or_else(|| {
             let resident = self.memory.get(&oid)?;
             (resident.block == 0 && resident.bytes.len() as u64 == size)
@@ -1658,7 +1476,6 @@ impl Store {
         })
     }
     fn forget_blob(&mut self, oid: Oid) -> Result<()> {
-        self.recover_transfer(oid)?;
         if let Some(object) = self.objects.get_mut(&oid) {
             anyhow::ensure!(
                 object.kind() == ObjectType::Blob,
@@ -1706,20 +1523,20 @@ impl Store {
         }
     }
     fn whole_limit(&self, size: usize) -> usize {
-        if size <= BLOCK || self.memory_limit == 0 {
+        if self.copy_cache || size <= BLOCK || self.memory_limit == 0 {
             self.memory_limit.saturating_sub(ENTRY_CHARGE)
         } else {
             usize::MAX
         }
     }
-    fn retain_blob(&mut self, oid: Oid, bytes: CachedBytes) -> Result<Option<Box<[[u8; 32]]>>> {
+    fn retain_blob(&mut self, oid: Oid, bytes: Arc<Vec<u8>>) -> Result<Option<Box<[[u8; 32]]>>> {
         if bytes.is_empty() {
             return Ok(None);
         }
         if bytes.capacity() > self.whole_limit(bytes.len()) {
             return Ok(Some(self.directory.spill(oid, &bytes)?));
         }
-        if bytes.len() <= BLOCK {
+        if self.copy_cache || bytes.len() <= BLOCK {
             self.admit(oid, 0, bytes)?;
         } else {
             debug_assert!(self.large.len() < self.large.cap().get());
@@ -1777,7 +1594,7 @@ impl Store {
         }
         Ok(())
     }
-    fn admit(&mut self, oid: Oid, block: usize, bytes: CachedBytes) -> Result<()> {
+    fn admit(&mut self, oid: Oid, block: usize, bytes: Arc<Vec<u8>>) -> Result<()> {
         let weight = bytes
             .capacity()
             .checked_add(ENTRY_CHARGE)
@@ -1996,9 +1813,7 @@ mod tests {
             let oid = Oid::from_bytes(&[fill; 20]).unwrap();
             let bytes = Arc::new(vec![fill; size]);
             store
-                .insert_with(oid, size, false, false, None, || {
-                    Ok(BlobPayload::Resident(bytes.into()))
-                })
+                .insert_with(oid, size, false, false, || Ok(BlobPayload::Resident(bytes)))
                 .unwrap();
         }
         assert_eq!(store.large_memory_metrics(), (2 * size, 2));
@@ -2113,31 +1928,6 @@ mod tests {
         drop(state);
         assert_eq!(store.disk_metrics(), (0, 0));
         assert_eq!(store.memory_metrics().1, 1);
-        assert_eq!(reader.read_all().unwrap(), bytes);
-    }
-    #[test]
-    fn spill_retries_when_a_previous_partial_path_cannot_be_unlinked() {
-        use std::os::unix::ffi::OsStrExt;
-        let root = tempfile::tempdir().unwrap();
-        let mut store = RawBlobs::new(root.path()).unwrap();
-        let bytes = b"verified resident";
-        let oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
-        let reader = store.insert(oid, bytes.len(), bytes.as_slice()).unwrap();
-        let state = store.state.lock().unwrap();
-        let mut spill = state.directory.start_spill(oid).unwrap();
-        let partial = state
-            .directory
-            ._owner
-            .path()
-            .join(std::ffi::OsStr::from_bytes(spill.name.as_bytes()));
-        drop(state);
-        spill.file.write_all(&bytes[..3]).unwrap();
-        crate::spool::FAIL_NEXT_UNLINK.set(true);
-        drop(spill);
-        assert_eq!(std::fs::metadata(&partial).unwrap().len(), 0);
-        store.evict_all_for_test().unwrap();
-        assert!(!partial.exists(), "retry left abandoned spill data on disk");
-        assert!(reader.on_disk());
         assert_eq!(reader.read_all().unwrap(), bytes);
     }
     #[test]

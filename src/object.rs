@@ -13,23 +13,6 @@ use std::{
 // keeps the original Rust verification path.
 static NATIVE_OID_VERIFICATION: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn revision_target(kind: ObjectType, bytes: &[u8]) -> Result<Oid> {
-    let prefix = match kind {
-        ObjectType::Commit => b"tree ".as_slice(),
-        ObjectType::Tag => b"object ".as_slice(),
-        _ => anyhow::bail!("Git revision metadata must be a commit or tag"),
-    };
-    let line = bytes
-        .split(|&byte| byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let target = line
-        .strip_prefix(prefix)
-        .filter(|value| value.len() == 40)
-        .context("invalid Git revision target")?;
-    Ok(Oid::from_str(std::str::from_utf8(target)?)?)
-}
-
 #[cfg(test)]
 thread_local! {
     static HASH_PROBE: std::cell::Cell<Option<(Oid, usize)>> = const { std::cell::Cell::new(None) };
@@ -193,17 +176,13 @@ impl<W: Write> Write for VerifiedWriter<W> {
 
 /// The owned ODB buffer was verified before libgit2 returned it. Only the
 /// audited startup policy establishes that fact; arbitrary streams never use
-/// this route.
-pub(crate) fn odb_is_verified() -> bool {
-    NATIVE_OID_VERIFICATION.load(Ordering::Acquire)
-}
-
+/// this route. Block digests are still formed from these same copied bytes.
 pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write) -> Result<()> {
     anyhow::ensure!(
         object.kind() == ObjectType::Blob,
         "ODB object is not a blob"
     );
-    if !odb_is_verified() {
+    if !NATIVE_OID_VERIFICATION.load(Ordering::Acquire) {
         return copy_verified(
             object.data(),
             output,
@@ -219,36 +198,6 @@ pub(crate) fn copy_odb_blob(object: &git2::OdbObject<'_>, mut output: impl Write
             .context("copy verified ODB buffer")?;
     }
     check_transfer()
-}
-
-pub(crate) struct OdbBuffer(git2::OdbObject<'static>);
-
-// SAFETY: On the audited libgit2 version, the ODB object owns its immutable
-// allocation and releases it through an atomic reference count.
-unsafe impl Send for OdbBuffer {}
-// SAFETY: The only shared access exposes the immutable allocation as a slice.
-unsafe impl Sync for OdbBuffer {}
-
-impl OdbBuffer {
-    pub(crate) fn take<'a>(
-        object: git2::OdbObject<'a>,
-    ) -> std::result::Result<Self, git2::OdbObject<'a>> {
-        if !odb_is_verified() {
-            return Err(object);
-        }
-        // SAFETY: The version check in configure_pack_descriptors also pins
-        // the audited ownership model. libgit2 1.9.7 odb_object__alloc puts
-        // the decoded buffer and metadata in its own refcounted allocation,
-        // without an ODB reference. git2 only ties the Rust handle to the ODB
-        // through PhantomData. data() and Drop need only the owned allocation.
-        Ok(Self(unsafe {
-            std::mem::transmute::<git2::OdbObject<'a>, git2::OdbObject<'static>>(object)
-        }))
-    }
-
-    pub(crate) fn data(&self) -> &[u8] {
-        self.0.data()
-    }
 }
 
 /// # Safety

@@ -2,7 +2,6 @@
 """Focused SSH review regressions using disposable real OpenSSH fixtures."""
 import argparse
 import importlib.util
-import hashlib
 import contextlib
 import json
 import os
@@ -19,7 +18,7 @@ import sys
 import time
 import unittest
 import uuid
-from support.run_storage import run_directories, run_lock, ssh_owner_marker
+from support.run_storage import run_directories
 
 SPEC = importlib.util.spec_from_file_location('git_on_remote_fixtures', Path(__file__).with_name('remote.py'))
 remote = importlib.util.module_from_spec(SPEC)
@@ -158,6 +157,9 @@ class SshRegressionTests(unittest.TestCase):
         checked=subprocess.run(control,capture_output=True,check=True,timeout=5)
         descriptor=os.pidfd_open(int(re.search(rb'pid=(\d+)',checked.stderr).group(1)))
         try:
+            if mode=='recovery':
+                process.kill(); process.communicate(timeout=10)
+                self.assertEqual(process.returncode,-signal.SIGKILL)
             if mode=='spawn-race': armed.touch()
             else:
                 executable.write_bytes(replacement)
@@ -167,8 +169,12 @@ class SshRegressionTests(unittest.TestCase):
                                  (metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns))
             (directory/'.lock').touch()
             (directory/'.state').write_text(json.dumps(dict(format='git-on-temp-v1',id='probe')))
-            process.stdin.write(b'exit\n'); process.stdin.flush()
-            _,errors=process.communicate(timeout=10); status=process.returncode
+            if mode=='recovery':
+                result=subprocess.run([str(binary),'--cleanup',str(directory)],env=f.env,capture_output=True,timeout=10)
+                status,errors=result.returncode,result.stderr
+            else:
+                process.stdin.write(b'exit\n'); process.stdin.flush()
+                _,errors=process.communicate(timeout=10); status=process.returncode
             if before:
                 self.assertTrue(marker.exists(),'authentic baseline did not execute the changed client')
                 if mode=='spawn-race': self.assertFalse(armed.exists(),'baseline did not reach the armed spawn race')
@@ -200,8 +206,10 @@ class SshRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_equal_length_restored_mtime_client_change_retains_live_master_and_run(self):
-        if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown('drop',before=True)
-        self.client_rewrite_shutdown('drop')
+        for mode in ('drop','recovery'):
+            with self.subTest(mode=mode):
+                if SSH_OPTIONS.before_client_probe is not None: self.client_rewrite_shutdown(mode,before=True)
+                self.client_rewrite_shutdown(mode)
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux process instrumentation')
     def test_shutdown_never_executes_selected_path_after_validation(self):
@@ -221,21 +229,9 @@ class SshRegressionTests(unittest.TestCase):
         process = f.probe(url)
         f.line(process)
         directory = next(f.root.glob('*/ssh-control')).parent
-        marker = ssh_owner_marker(directory)
-        self.assertIsNotNone(marker)
         record_path = directory / 'ssh-control-owner'
-        self.assertFalse(record_path.exists())
-        endpoint = (directory / 'ssh-control').stat()
-        client = executable.stat()
-        # Exercise old records explicitly. Current runs persist the socket
-        # identity in the name of the empty marker above.
-        record = dict(format='git-on-ssh-control-v1', device=endpoint.st_dev,
-                      inode=endpoint.st_ino, client=dict(
-                          path=list(os.fsencode(executable)),
-                          device=client.st_dev, inode=client.st_ino, size=client.st_size,
-                          modified_seconds=client.st_mtime_ns // 1_000_000_000,
-                          modified_nanoseconds=client.st_mtime_ns % 1_000_000_000,
-                          content_sha256=list(hashlib.sha256(executable.read_bytes()).digest())))
+        record = json.loads(record_path.read_text())
+        self.assertNotIn(str(f.root / 'identity'), record_path.read_text())
         control = [ssh, '-F', '/dev/null', '-S', str(directory / 'ssh-control'), '-O', 'check', 'git-on-control']
         checked = subprocess.run(control, capture_output=True, check=True, timeout=5)
         descriptor = os.pidfd_open(int(re.search(rb'pid=(\d+)', checked.stderr).group(1)))
@@ -250,7 +246,6 @@ class SshRegressionTests(unittest.TestCase):
             self.assertIn(b'probe recovery retained', errors)
             self.assertTrue(directory.exists())
             self.assertFalse(select.select([descriptor], [], [], 0)[0])
-            marker.unlink()
             (directory / '.lock').touch()
             (directory / '.state').write_text(json.dumps(dict(
                 format='git-on-temp-v1', id='probe')))
@@ -707,9 +702,9 @@ class SshRegressionTests(unittest.TestCase):
         native_children = []
         try:
             deadline = time.monotonic() + 5
-            while not any(run_lock(path) for path in run_directories(f.root)) and process.poll() is None and time.monotonic() < deadline:
+            while not any((path / '.state').is_file() for path in run_directories(f.root)) and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
-            self.assertTrue(any(run_lock(path) for path in run_directories(f.root)), 'runner lock was never created')
+            self.assertTrue(any((path / '.state').is_file() for path in run_directories(f.root)), 'runner state was never created')
             deadline = time.monotonic() + 5
             while not native_children and process.poll() is None and time.monotonic() < deadline:
                 for entry in Path('/proc').iterdir():
@@ -782,29 +777,6 @@ class SshRegressionTests(unittest.TestCase):
                 check = subprocess.run(['ssh', '-F', '/dev/null', '-S', str(unrelated), '-O', 'check', 'unused'],
                                        capture_output=True, timeout=5)
                 self.assertEqual(check.returncode, 0, 'cleanup stopped a replaced/unrecorded external socket')
-
-    def test_stale_cleanup_preserves_a_live_socket_before_the_ownership_record(self):
-        f = self.f
-        run_id = str(uuid.uuid4())
-        group = f.root / "git-on"
-        group.mkdir(mode=0o700)
-        (group / ".git-on-owner").touch(mode=0o600)
-        run = group / run_id[:8]
-        run.mkdir(mode=0o700)
-        (run / (".lock-" + run_id)).touch(mode=0o600)
-        control = run / "ssh-control"
-        cleanup = [str(remote.OPTIONS.binary.resolve()), "--cleanup", str(run)]
-        with socket.socket(socket.AF_UNIX) as master:
-            # The listener exists, but Git-on did not survive to record its inode.
-            master.bind(str(control))
-            master.listen()
-            result = subprocess.run(cleanup, env=f.env, capture_output=True, timeout=5)
-            self.assertEqual(result.returncode, 125, result.stderr)
-            self.assertIn(b"live SSH control socket", result.stderr)
-            self.assertTrue(control.is_socket())
-        result = subprocess.run(cleanup, env=f.env, capture_output=True, timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(run.exists())
 
 
 if __name__ == '__main__':

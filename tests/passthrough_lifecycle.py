@@ -16,7 +16,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from support.run_storage import run_directories, run_id
 
 
 def wait_file(path, process, seconds=20):
@@ -125,10 +124,11 @@ def scenario(binary, expected, mode):
         # enabled scenario; validate the exact private run reported by our child.
         allowed_parents = [temporary]
         if expected == 'enabled': allowed_parents.append(Path(tempfile.gettempdir()).resolve())
-        assert any(run_directory in run_directories(parent) for parent in allowed_parents)
-        assert mount.name == 'mount', mount
+        assert run_directory.parent in allowed_parents and mount.name == 'mount', mount
+        assert run_directory.name.startswith('git-on-')
         assert run_directory.stat().st_uid == os.getuid() and run_directory.stat().st_mode & 0o777 == 0o700
-        assert len(run_id(run_directory)) == 36
+        state = json.loads((run_directory / '.state').read_text())
+        assert state['format'] == 'git-on-temp-v1'
         assert str(mount) in mounts_below(run_directory), 'real FUSE mount required'
         worker = subprocess.Popen([sys.executable, '-c', WORKER], cwd=mount,
                                   env=environment, stdout=logs, stderr=logs)

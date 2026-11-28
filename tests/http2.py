@@ -239,42 +239,45 @@ class Http2Tests(unittest.TestCase):
                 self.assertEqual(result.returncode, 125 if policy == "false" else 0, result.stderr)
                 self.assertEqual(result.stdout, b"" if policy == "false" else b"expected\n")
 
-    def test_url_username_reaches_the_credential_lookup(self):
+    def test_url_credentials_reach_the_credential_lookup(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         token = base64.b64encode(b"fixture:example-password").decode()
-        url = fixture.https(authorization="Basic " + token).replace("https://", "https://fixture@", 1)
-        result = subprocess.run(
-            [OPTIONS.binary, url, fixture.commit, "--backend=copy", "--write-policy=all",
-             "--", "cat", "deep/file"],
-            cwd=fixture.cwd, env=dict(fixture.env, GIT_CONFIG_COUNT="1",
-                                      GIT_CONFIG_KEY_0="credential.helper",
-                                      GIT_CONFIG_VALUE_0="!f() { echo password=example-password; }; f"),
-            capture_output=True, timeout=20,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b"expected\n")
-
-    def test_explicit_https_credentials_are_used_after_a_basic_challenge(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        token = base64.b64encode(b"x-access-token:example-password").decode()
-        server = Multiplexer(fixture, fixture.http1_upstream(), "Basic " + token)
-        server.start(self.addCleanup)
-        url = server.url.replace("https://", "https://x-access-token:example%2Dpassword@", 1)
-        marker = fixture.root / "credential-helper-called"
-        env = dict(fixture.env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="credential.helper",
-                   GIT_CONFIG_VALUE_0=f"!touch {shlex.quote(str(marker))}")
-        for backend in dict.fromkeys(["copy", *tested_backends()]):
-            with self.subTest(backend=backend):
+        url = fixture.https(authorization="Basic " + token)
+        env, invocations = record_git_invocations(fixture.root, fixture.env)
+        for userinfo, helper, named in (
+            ("fixture", "!f() { echo password=example-password; }; f", False),
+            ("fixture:example%2Dpassword", "!false", False),
+            ("fixture:example%2Dpassword", "!false", True),
+        ):
+            with self.subTest(explicit_password=":" in userinfo, named=named):
+                source = url.replace("https://", f"https://{userinfo}@", 1)
+                config = dict(env, GIT_CONFIG_COUNT="2",
+                              GIT_CONFIG_KEY_0="credential.helper", GIT_CONFIG_VALUE_0=helper,
+                              GIT_CONFIG_KEY_1="http.userAgent", GIT_CONFIG_VALUE_1="git-on-fixture")
+                if named:
+                    key = f"remote.{source}.url"
+                    config.update(GIT_CONFIG_COUNT="5",
+                                  GIT_CONFIG_KEY_2=key, GIT_CONFIG_VALUE_2="file:///nonexistent/",
+                                  GIT_CONFIG_KEY_3=key, GIT_CONFIG_VALUE_3="",
+                                  GIT_CONFIG_KEY_4=key, GIT_CONFIG_VALUE_4=source)
+                elif ":" in userinfo:
+                    include = fixture.root / "unexpected-rewrite.conf"
+                    include.write_text(f'[url "file:///nonexistent/"]\n\tinsteadOf = {source}\n')
+                    config.update(GIT_CONFIG_COUNT="3",
+                                  GIT_CONFIG_KEY_2=f"includeIf.hasconfig:remote.*.url:{source}.path",
+                                  GIT_CONFIG_VALUE_2=str(include))
                 result = subprocess.run(
-                    [OPTIONS.binary, url, fixture.commit, f"--backend={backend}", "--write-policy=all",
-                     "--", "cat", "deep/file"],
-                    cwd=fixture.cwd, env=env, capture_output=True, timeout=20,
+                    [OPTIONS.binary, source, fixture.commit, "--backend=copy",
+                     "--write-policy=all", "--", "cat", "deep/file"],
+                    cwd=fixture.cwd,
+                    env=config,
+                    capture_output=True, timeout=20,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, b"expected\n")
-        self.assertFalse(marker.exists())
+        self.assertFalse(any("example%2Dpassword" in arg or "example-password" in arg
+                             for call in git_invocations(invocations) for arg in call))
 
     @unittest.skipUnless(OPTIONS.require_nfs or OPTIONS.require_fuse, "requires a native mount")
     def test_post_authentication_and_multiplexed_fetches(self):

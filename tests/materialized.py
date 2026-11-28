@@ -60,19 +60,6 @@ class MaterializedTests(unittest.TestCase):
         self.assertEqual(self.git('status', '--porcelain'), self.before)
         self.assertEqual(self.git('for-each-ref', '--format=%(refname)', 'refs/git-on/'), b'')
 
-    @unittest.skipUnless(sys.platform == "darwin", "Apple Git launcher")
-    def test_apple_git_leaves_the_system_temp_directory_empty(self):
-        runtime = self.root / "native-git-tmp"
-        runtime.mkdir()
-        env = dict(self.env, PATH="/usr/bin:/bin:/usr/sbin:/sbin", TMPDIR=str(runtime))
-        result = subprocess.run(
-            [BINARY, "HEAD", "--backend=copy", "--write-policy=all", "--", "/bin/cat", "tracked"],
-            cwd=self.repo, env=env, capture_output=True, timeout=20,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b"committed\x00\xff\r\n")
-        self.assertEqual(list(runtime.iterdir()), [])
-
     def test_default_and_protected_policies_are_never_relaxed(self):
         for options in [[], ['--write-policy=none'], ['--write-policy=ignored'], ['--write-policy=untracked']]:
             result = self.invoke('raise Exception("child must not start")', *options)
@@ -235,72 +222,6 @@ print(os.environ['GIT_ON_TREE_OID'])
                                 capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b"native repository\n")
-
-    def test_native_objects_when_libgit2_cannot_open_the_odb(self):
-        objects = self.repo / ".git/objects"
-        alternate = self.root / "alternate"
-        objects.rename(alternate)
-        (alternate / "info/alternates").mkdir()
-        (objects / "info").mkdir(parents=True)
-        (objects / "info/alternates").write_text(f"{alternate}\n")
-        expected = self.git("cat-file", "blob", "HEAD:tracked")
-        self.assertEqual(expected, b"committed\x00\xff\r\n")
-        result = subprocess.run(
-            [BINARY, self.repo, "HEAD", "--backend=copy", "--write-policy=all",
-             "--", "/bin/cat", "tracked"],
-            cwd=self.root, env=self.env, capture_output=True, timeout=15,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, expected)
-        self.clean()
-
-    def test_relative_disk_alternate_uses_the_selected_source_directory(self):
-        objects = self.repo / '.git/objects'
-        oid = self.git('rev-parse', 'HEAD:tracked').strip().decode()
-        object_name = Path(oid[:2]) / oid[2:]
-        alternate = objects / 'pool'
-        other = self.root / 'pool'
-        (alternate / object_name.parent).mkdir(parents=True)
-        (other / object_name.parent).mkdir(parents=True)
-        (objects / object_name).rename(other / object_name)
-        (objects / 'info/alternates').write_text('pool\n')
-        command = [BINARY, self.repo, 'HEAD', '--backend=copy',
-                   '--write-policy=all', '--', '/bin/cat', 'tracked']
-        oracle = subprocess.run(['git', '-C', self.repo, 'cat-file', 'blob', oid],
-                                env=self.env, capture_output=True, timeout=15)
-        self.assertNotEqual(oracle.returncode, 0)
-        result = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True, timeout=15)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertEqual(result.stdout, b'')
-        (other / object_name).rename(alternate / object_name)
-        result = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, self.git('cat-file', 'blob', oid))
-        self.clean()
-
-    def test_shared_clone_reads_objects_without_a_native_helper(self):
-        shared = self.root / 'shared'
-        reference = self.root / 'reference'
-        self.git('clone', '--quiet', self.repo, reference)
-        self.git('clone', '--shared', '--reference', reference, '--quiet', self.repo, shared)
-        alternates = (shared / '.git/objects/info/alternates').read_text().splitlines()
-        self.assertEqual({Path(line).resolve() for line in alternates},
-                         {(repo / '.git/objects').resolve() for repo in (self.repo, reference)})
-        # Each alternate must contribute a blob to materialize the checkout.
-        for repo, name in ((self.repo, 'link'), (reference, 'tracked')):
-            oid = self.git('rev-parse', f'HEAD:{name}').strip().decode()
-            (repo / '.git/objects' / oid[:2] / oid[2:]).unlink()
-        self.before = self.git('status', '--porcelain')
-        env, log = record_git_invocations(self.root, self.env)
-        result = subprocess.run(
-            [BINARY, shared, 'HEAD', '--backend=copy', '--write-policy=all',
-             '--', '/bin/cat', 'tracked', 'link'],
-            cwd=self.root, env=env, capture_output=True, timeout=15,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, self.git('cat-file', 'blob', 'HEAD:tracked') * 2)
-        self.assertFalse(any('cat-file' in argv for argv in git_invocations(log)))
-        self.clean()
 
     def test_explicit_index_and_alternates_match_implicit_source_on_older_git(self):
         pool = self.root / 'objects'
@@ -516,16 +437,10 @@ os.chmod('.',0)
             self.git('update-index', '--add', '--cacheinfo', mode + ',' + oid.decode() + ',unsupported')
             self.git('commit', '-qm', 'unsupported')
             self.before = self.git('status', '--porcelain')
-            for storage in ('loose', 'packed') if data is not None else ('loose',):
-                with self.subTest(mode=mode, storage=storage):
-                    if storage == 'packed':
-                        self.git('repack', '-a', '-d', '--window=0')
-                    result = self.invoke('print("launched")', '--write-policy=all')
-                    self.assertEqual(result.returncode, 125, result.stderr)
-                    if data is not None:
-                        self.assertIn(b'Git LFS pointer', result.stderr)
-                    self.assertEqual(result.stdout, b'')
-                    self.clean()
+            result = self.invoke('print("launched")', '--write-policy=all')
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertEqual(result.stdout, b'')
+            self.clean()
 
     @unittest.skipUnless(sys.platform == 'darwin', 'host representation limit test on default macOS volume')
     def test_case_collision_fails_before_child(self):

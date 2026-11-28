@@ -29,13 +29,6 @@ fn snapshot_errno(_error: anyhow::Error) -> i32 {
     libc::EIO
 }
 
-fn backing_errno(error: anyhow::Error) -> i32 {
-    error
-        .downcast_ref::<crate::raw_blob::BackingError>()
-        .and_then(|error| error.0.raw_os_error())
-        .unwrap_or(libc::EIO)
-}
-
 struct Node {
     attr: FileAttr,
     // Metadata still belongs to the pristine snapshot. Private metadata can
@@ -217,7 +210,6 @@ pub struct Overlay {
     policy: Policy,
     write_policy: WritePolicy,
     backing: PathBuf,
-    backing_directory: Arc<File>,
     paths: BTreeMap<PathBuf, u64>,
     inode_paths: HashMap<u64, PathBuf>,
     upper_paths: BTreeMap<PathBuf, u64>,
@@ -292,12 +284,12 @@ impl Overlay {
         write_policy: WritePolicy,
     ) -> Result<Self> {
         fs::create_dir_all(&backing).context("create writable backing directory")?;
-        let backing_directory = File::options()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&backing)
-            .context("open writable backing directory")?;
-        backing_directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        let meta = fs::symlink_metadata(&backing)?;
+        anyhow::ensure!(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "backing must be a real directory"
+        );
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o700))?;
         snapshot.set_spool_directory(&backing)?;
         let policy = Policy::with_mode(&snapshot, write_policy)?;
         let snapshot_time = SystemTime::now();
@@ -336,7 +328,6 @@ impl Overlay {
             policy,
             write_policy,
             backing,
-            backing_directory: Arc::new(backing_directory),
             paths,
             inode_paths: HashMap::from([(1, PathBuf::new())]),
             upper_paths: BTreeMap::new(),
@@ -915,17 +906,46 @@ impl Overlay {
             }
             change(file)
         };
-        let (file, size, result) = self
-            ._snapshot
-            .promote_source(
-                oid,
-                &disk_path,
-                &self.backing_directory,
-                preserve_content,
-                unlinked,
-                change,
-            )
-            .map_err(backing_errno)?;
+        let (file, size, result) = if preserve_content {
+            self._snapshot
+                .promote_source(oid, &disk_path, change)
+                .map_err(|error| {
+                    error
+                        .downcast_ref::<crate::raw_blob::BackingError>()
+                        .map_or(libc::EIO, |error| {
+                            error.0.raw_os_error().unwrap_or(libc::EIO)
+                        })
+                })?
+        } else {
+            self._snapshot
+                .prepare_source_removal(oid)
+                .map_err(snapshot_errno)?;
+            let file = if unlinked {
+                tempfile::tempfile_in(&self.backing)
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&disk_path)
+            }
+            .map_err(errno)?;
+            let result = change(&file).map_err(errno).and_then(|result| {
+                self._snapshot.consume_source(oid).map_err(snapshot_errno)?;
+                Ok(result)
+            });
+            match result {
+                Ok(result) => (file, 0, result),
+                Err(error) => {
+                    if !unlinked {
+                        let _ = fs::remove_file(&disk_path);
+                    }
+                    return Err(error);
+                }
+            }
+        };
         // Existing readers of this inode must observe the same changed bytes.
         let mut fh = self.inode_handles.get(&ino).copied().unwrap_or(0);
         while fh != 0 {
@@ -1181,19 +1201,14 @@ impl Overlay {
         if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0 {
             self.writable(ino)?;
         }
-        if node.oid.is_none() && node.file.is_none() {
+        if flags & libc::O_TRUNC != 0 {
+            self.truncate(ino, 0)?;
+        }
+        if self.node(ino)?.oid.is_none() && self.node(ino)?.file.is_none() {
             let file = self.disk_file(ino)?;
             self.node_mut(ino)?.file = Some(file);
         }
-        // Keep the descriptor created by copy-up on the first truncating open.
-        let handle = self.new_handle(ino, flags);
-        if flags & libc::O_TRUNC != 0 {
-            if let Err(error) = self.truncate(ino, 0) {
-                self.close_handle(ino, handle);
-                return Err(error);
-            }
-        }
-        Ok(handle)
+        Ok(self.new_handle(ino, flags))
     }
     fn disk_file(&self, ino: u64) -> FsResult<File> {
         let n = self.node(ino)?;
@@ -1238,8 +1253,10 @@ impl Overlay {
         if size == 0 && node.oid.is_some() {
             // The new backing is already empty. Opening or duplicating it
             // after committing would allow EMFILE to report a false failure.
-            let metadata = self.copy_up(ino, false, File::metadata)?;
-            Self::record_data_change(&mut self.node_mut(ino)?.attr, &metadata);
+            self.copy_up(ino, false, |_| Ok(()))?;
+            let attr = &mut self.node_mut(ino)?.attr;
+            attr.mtime = SystemTime::now();
+            attr.ctime = attr.mtime;
             return Ok(());
         }
         let metadata = self
@@ -1907,15 +1924,15 @@ impl Overlay {
         self.ensure_size(ino)?;
         Ok(self.node(ino)?.attr)
     }
-    pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<ReadData> {
+    pub(crate) fn read_link(&mut self, ino: u64) -> FsResult<Vec<u8>> {
         let n = self.node(ino)?;
         if n.attr.kind != FileType::Symlink {
             return Err(libc::EINVAL);
         }
         if let Some(oid) = n.oid {
-            self._snapshot.read_link_data(oid).map_err(snapshot_errno)
+            self._snapshot.read_link(oid).map_err(snapshot_errno)
         } else {
-            Ok(ReadData::Owned(n.bytes.clone()))
+            Ok(n.bytes.clone())
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3170,28 +3187,13 @@ mod tests {
     #[test]
     fn all_truncate_to_zero_skips_source_content_and_directory_errors_are_atomic() {
         let (_temp, mut overlay) = fixture_policy(WritePolicy::All);
-        let file = overlay
-            .lookup_entry(1, OsStr::new("tracked.tmp"))
-            .unwrap()
-            .ino;
+        let file = overlay.ensure(Path::new("tracked.tmp")).unwrap();
         let before = overlay._snapshot.metrics();
-        let moved = overlay.backing.with_extension("moved");
-        fs::rename(&overlay.backing, &moved).unwrap();
-        crate::spool::FAIL_NEXT_FILE_METADATA.set(true);
-        let failed = overlay.open_file(file, libc::O_RDWR | libc::O_TRUNC);
-        assert_eq!(failed, Err(libc::EIO));
-        assert!(overlay.unchanged_source_data(file));
-        let opened = overlay.open_file(file, libc::O_RDWR | libc::O_TRUNC);
-        fs::rename(moved, &overlay.backing).unwrap();
-        let handle = opened.unwrap();
+        let handle = overlay
+            .open_file(file, libc::O_RDWR | libc::O_TRUNC)
+            .unwrap();
         assert!(overlay.read_data(file, handle, 0, 100).unwrap().is_empty());
         assert_eq!(overlay._snapshot.metrics().blob_loads, before.blob_loads);
-        #[cfg(target_os = "linux")]
-        {
-            overlay.release_handle(file, handle).unwrap();
-            let handle = overlay.open_file(file, libc::O_RDWR).unwrap();
-            assert!(overlay.eligible_backing(file, handle, false).is_some());
-        }
         let (_temp, mut overlay) = directory_fixture();
         assert_eq!(
             overlay.remove(1, OsStr::new("source"), true),

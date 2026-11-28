@@ -7,8 +7,6 @@ uses native Git revision syntax, including `HEAD:path`, and honors the same
 index and object environment as `git -C PATH on REV`. A local partial clone
 requires a Git version that supports `--no-lazy-fetch` and can use the objects
 already available to that repository.
-OpenSSH's `user@host:path` form selects the network. Prefix a literal
-relative path containing a colon in its first component with `./`.
 
 ## Network profile
 
@@ -48,9 +46,8 @@ replies up to 256 KiB. Select by full SHA-1 OID when a reference reply is larger
 
 HTTPS sends the single effective URL-matched `http.extraHeader` when configured.
 If discovery, ref listing, or an object request receives a Basic challenge,
-Git-on passes the effective repository URL, including any supplied username
-and password, to `git credential fill` through its standard input. This
-supports the HTTPS URL format used by GitHub App installation tokens.
+Git-on passes the effective repository URL and any supplied credentials to
+`git credential fill` through its standard input for read-only lookup.
 After launching the command, credential lookup runs without interactive prompts.
 Git-on does not ask credential helpers to store or erase credentials. SSH uses
 OpenSSH's configured identity and agent and requires a previously trusted host
@@ -60,13 +57,10 @@ during teardown. If that connection is lost, outstanding reads fail.
 A direct SSH copy uses a single foreground SSH process. Copy after a mount
 fallback can reuse the connection already established for that mount.
 
-Git-on rejects a direct connection configured with `CheckHostIP=yes`.
-OpenSSH can append an address to `known_hosts` with that option enabled.
-Host-key verification remains mandatory. OpenSSH can run explicitly
-configured `Match exec` commands when Git-on queries its effective
-configuration and again when it connects or opens another channel.
-Those commands have their configured effects. The
-[source contract](specification.md#source-selection-and-observable-state)
+OpenSSH evaluates the user's settings when configuring a connection and can
+execute explicitly configured `Match exec` commands, including when opening
+another channel on the connection. Those commands have their configured
+effects. The [source contract](specification.md#source-selection-and-observable-state)
 applies to Git-on and its ordinary helper operations.
 
 ## Object loading
@@ -85,12 +79,9 @@ The mount can read a verified wanted object before its pack ends. A delta
 base received as an extra becomes available to other requests after the
 pack and transport complete. The completed response can satisfy an exact
 request already in flight, independently of the duplicate transfer's outcome.
-After the user command exits normally, Git-on continues validating the
-responses that supplied data. The run fails if any of them fails or waits
-30 seconds for more input. This timer runs only while the response waits
-for input. Other in-flight requests can be cancelled during teardown.
-Git-on waits up to ten seconds for a closing SSH channel to report its exit
-status. Copy starts that wait after validating the pack.
+After the user command exits normally, Git-on checks the outcome of
+responses that served it. Other in-flight requests can be cancelled
+during teardown.
 A temporary cache placement failure is reported for the affected object.
 It can be retried after capacity returns. The rest of its response still
 undergoes normal validation.
@@ -105,8 +96,9 @@ reads check the block digests before returning bytes.
 The copy backend requests one shallow pack for the chosen revision and
 writes its visible tree before launch. Copy requires the complete verified
 pack and successful transport completion before starting the command.
-Copy uses the same small-blob and large-blob LRUs as mounting. The inflating
-object and Git metadata use additional memory. Copy and mounting stream pack data
+A 128 MiB payload LRU holds complete
+verified blobs until materialization consumes them. The inflating object
+and Git metadata use additional memory. Copy and mounting stream pack data
 without a private fetch repository, service refs, pack files or indexes.
 Submodules, Git LFS payloads and SHA-256 object stores are outside the
 supported profile.

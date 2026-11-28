@@ -511,7 +511,7 @@ assert not list(Path.cwd().parent.rglob('*.pack'))
         self.assertEqual(process.returncode, 0, errors)
         self.assertEqual(sum(large in request['wants'] for request in fixture.requests), 1)
 
-    def test_remote_reads_retry_after_a_partial_spill_write_fails(self):
+    def test_remote_reads_retry_after_a_spill_runs_out_of_space(self):
         fixture = fixture_in_short_tmp()
         self.addCleanup(fixture.close)
         entries = []
@@ -539,7 +539,7 @@ for index in range(8):
 try:
     read(8)
 except OSError as error:
-    assert error.errno == errno.EIO, error
+    assert error.errno in (errno.EIO, errno.ENOSPC), error
 else:
     raise AssertionError('the first eviction should have failed')
 Path(sys.argv[1]).unlink()

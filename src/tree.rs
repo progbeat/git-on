@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read},
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::OsStringExt,
     sync::Arc,
 };
 fn invalid(message: &str) -> anyhow::Error {
@@ -32,7 +32,7 @@ pub(crate) struct Directory {
 impl Directory {
     pub(crate) fn verified(oid: Oid, size: usize, input: impl Read) -> Result<Self> {
         let mut input = Checked::new(input, size);
-        let directory = Self::parse(BufReader::with_capacity(64 * 1024, &mut input))?;
+        let directory = Self::parse(&mut input)?;
         input.finish(oid)?;
         Ok(directory)
     }
@@ -43,18 +43,7 @@ impl Directory {
         );
         Self::parse(object.data())
     }
-    pub(crate) fn from_odb(oid: Oid, object: &git2::OdbObject<'_>) -> Result<Self> {
-        anyhow::ensure!(
-            object.id() == oid && object.kind() == git2::ObjectType::Tree,
-            "snapshot directory does not reference the requested tree"
-        );
-        if crate::object::odb_is_verified() {
-            return Self::parse(object.data());
-        }
-        Self::verified(oid, object.len(), object.data())
-    }
-
-    fn parse(input: impl BufRead) -> Result<Self> {
+    fn parse(input: impl Read) -> Result<Self> {
         let mut parser = Parser::new(input);
         let mut entries = Vec::new();
         let mut names = HashMap::new();
@@ -62,7 +51,7 @@ impl Directory {
             if entries.len().is_multiple_of(256) {
                 crate::object::check_transfer()?;
             }
-            let name: Arc<OsStr> = Arc::from(OsStr::from_bytes(item.name));
+            let name: Arc<OsStr> = Arc::from(OsString::from_vec(item.name.to_vec()));
             if names.insert(name.clone(), entries.len()).is_some() {
                 return Err(invalid("duplicate path in Git tree"));
             }
@@ -166,7 +155,7 @@ impl<R: Read> Read for Checked<R> {
     }
 }
 struct Parser<R> {
-    input: R,
+    input: BufReader<R>,
     name: Vec<u8>,
 }
 struct Item<'a> {
@@ -174,10 +163,10 @@ struct Item<'a> {
     mode: u32,
     oid: Oid,
 }
-impl<R: BufRead> Parser<R> {
+impl<R: Read> Parser<R> {
     fn new(input: R) -> Self {
         Self {
-            input,
+            input: BufReader::with_capacity(64 * 1024, input),
             name: Vec::new(),
         }
     }

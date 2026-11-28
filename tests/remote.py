@@ -13,7 +13,6 @@ import json
 import os
 import pty
 from pathlib import Path
-from urllib.parse import quote_from_bytes, urlsplit
 import pwd
 import queue
 import random
@@ -32,7 +31,7 @@ import threading
 import time
 import unittest
 import unicodedata
-from support.run_storage import run_directories, run_id, run_lock, ssh_owner_marker
+from support.run_storage import run_directories
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER = argparse.ArgumentParser()
@@ -396,18 +395,26 @@ os.execv({self.native_git!r}, [{self.native_git!r}, *args])
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.addCleanup(self.f.close)
+    def fetched_oid(self, source, revision):
+        """Native fetch is the oracle; the caller repository is never its target."""
+        f=self.f
+        with tempfile.TemporaryDirectory(dir=f.root,prefix='fetch-oracle-') as directory:
+            f.git('init','--bare','--quiet',directory,at=f.root)
+            result=subprocess.run(['git','-C',directory,'fetch','--no-tags',
+                                   '--filter=tree:0','--refmap=','--',source,revision],
+                                  env=f.env,capture_output=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr)
+            rows=(Path(directory)/'FETCH_HEAD').read_bytes().splitlines()
+            selected=[row.split(b'\t',1)[0].decode() for row in rows
+                      if b'\tnot-for-merge\t' not in row]
+            self.assertEqual(len(selected),1,rows)
+            return selected[0]
     def test_explicit_local_paths_preserve_original_bytes(self):
         f=self.f
         weird=f.root/os.fsdecode(b'server-\xff.git')
         literal = f.cwd / '~git-on-test-source'
         literal.symlink_to(f.repo, target_is_directory=True)
         paths = [str(f.repo), '../server.git', literal.name]
-        for separators in ('', '/'):
-            encoded = quote_from_bytes(os.fsencode(f.repo), safe=separators)
-            encoded = '%2F' + encoded[1:] if separators else encoded
-            source = 'file://' + encoded
-            self.assertEqual(f.git('ls-remote', source, 'HEAD', at=f.cwd).split()[0], f.commit)
-            paths.append(source)
         try:
             weird.symlink_to(f.repo, target_is_directory=True)
         except OSError as error:
@@ -439,29 +446,6 @@ class RemoteTests(unittest.TestCase):
                                 cwd=nested, env=f.env, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, expected)
-    def test_relative_legacy_local_remotes_use_the_caller_worktree_root(self):
-        f = self.f
-        f.git('init', '--quiet', at=f.cwd)
-        nested = f.cwd / 'nested'
-        nested.mkdir()
-        for directory, definition in (
-            ('remotes', 'URL: ../server.git\nPull: refs/heads/main:refs/heads/main\n'),
-            ('branches', '../server.git#main\n'),
-        ):
-            with self.subTest(directory=directory):
-                name = f'local-{directory}'
-                remote = f.cwd / '.git' / directory / name
-                remote.parent.mkdir(exist_ok=True)
-                remote.write_text(definition)
-                self.assertEqual(f.git('ls-remote', name, 'HEAD', at=nested).split()[0],
-                                 f.commit)
-                result = subprocess.run(
-                    [OPTIONS.binary, name, 'HEAD', '--backend=copy',
-                     '--write-policy=all', '--', 'cat', 'deep/file'],
-                    cwd=nested, env=f.env, capture_output=True, timeout=20,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, b'expected\n')
     def test_local_branch_tag_collision_follows_native_revision_precedence(self):
         f=self.f; source='file://'+str(f.repo)
         other_tree=f.git('mktree',data=f'100644 blob {f.other}\tfile\n'.encode())
@@ -950,55 +934,6 @@ class RemoteTests(unittest.TestCase):
         commit=f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'commit-tree','-S',f.tree,data=b'signed fixture\n')
         f.git('-c','gpg.format=ssh','-c','user.signingkey='+str(key),'tag','-s','-m','signed tag','signed',commit)
         return commit,allowed
-    def test_native_verification_uses_owned_temporary_files(self):
-        f = self.f
-        signed, _ = self.signing()
-        observed = f.root / "observed-signature"
-        verifier = f.root / "observe-verifier"
-        verifier.write_text(f"""#!{sys.executable}
-import json, os, sys
-from pathlib import Path
-sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-from support.run_storage import run_directories
-if '-s' in sys.argv:
-    signature = Path(sys.argv[sys.argv.index('-s') + 1]).resolve()
-    roots = []
-    for run in run_directories(Path({str(f.root)!r})):
-        roots.append(run.resolve())
-        marker = run / '.native-scratch'
-        if marker.is_symlink():
-            roots.append(marker.resolve())
-    assert signature.is_file()
-    with open({str(observed)!r}, 'a') as output:
-        print(json.dumps([str(signature), any(signature.is_relative_to(root) for root in roots)]),
-              file=output)
-os.execvp('ssh-keygen', ['ssh-keygen', *sys.argv[1:]])
-""")
-        verifier.chmod(0o700)
-        url = f.https()
-        f.git('init', '--quiet', at=f.cwd)
-        nested = f.cwd / 'nested'
-        nested.mkdir()
-        env = dict(f.env, GIT_CONFIG_COUNT='3', GIT_CONFIG_VALUE_1='../allowed-signers',
-                   GIT_CONFIG_KEY_2='gpg.ssh.program',
-                   GIT_CONFIG_VALUE_2=str(verifier))
-        for source in (str(f.repo), url):
-            with self.subTest(source=source):
-                observed.unlink(missing_ok=True)
-                result = subprocess.run(
-                    [OPTIONS.binary, source, signed, '--verify', '--backend=copy',
-                     '--write-policy=all', '--', 'cat', 'deep/file'],
-                    cwd=nested, env=env, capture_output=True, timeout=20,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, b'expected\n')
-                signatures = list(map(json.loads, observed.read_text().splitlines()))
-                self.assertTrue(signatures)
-                for file, owned in signatures:
-                    self.assertTrue(owned, file)
-                    self.assertFalse(Path(file).parent.exists(), file)
-                self.assertEqual(run_directories(f.root), [])
-
     def test_review_peeled_tag_advertisement_rows_are_not_selectable_refs(self):
         f=self.f; signed,_=self.signing()
         url=f.https(); self.addCleanup(f.server.shutdown)
@@ -1165,9 +1100,9 @@ os.execvp('ssh-keygen', ['ssh-keygen', *sys.argv[1:]])
         directory,=run_directories(f.root)
         process.kill(); self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
         self.assertFalse(select.select([descriptor],[],[],.1)[0],'startup native operation unexpectedly stopped with runner death')
-        self.assertIsNone(ssh_owner_marker(directory))
+        self.assertFalse((directory/'ssh-control-owner').exists())
         self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
-        with run_lock(directory).open('r+b') as held: fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        with (directory/'.lock').open('rb') as held: fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
         # This live pidfd identifies only the disposable child captured above.
         os.killpg(native_pid,signal.SIGKILL)
         self.assertTrue(select.select([descriptor],[],[],5)[0])
@@ -1387,13 +1322,6 @@ os.execv({native!r}, [{native!r}, *args])
         self.assertEqual(result.stdout, b"expected\n")
         self.assertEqual(known.read_bytes(), original)
         self.assertFalse(marker.exists())
-        with config.open("a") as settings:
-            settings.write("  CheckHostIP yes\n")
-        result = subprocess.run(args, cwd=f.cwd, env=f.env, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn(b"CheckHostIP", result.stderr)
-        self.assertEqual(result.stdout, b"")
-        self.assertEqual(known.read_bytes(), original)
 
     def openpgp_signing(self):
         f=self.f; signing=f.root/'gpg-sign'; signing.mkdir(mode=0o700)
@@ -1555,7 +1483,7 @@ os.execv({native!r}, [{native!r}, *args])
     @unittest.skipIf(OPTIONS.require_fuse, 'copy and NFS fallback run in their own jobs')
     def test_materialized_remote_fetches_the_selected_tree_once(self):
         f=self.f;entries=[]
-        for index in range(2):
+        for index in range(12):
             blob=f.git('hash-object','-w','--stdin',data=f'file {index}\n'.encode())
             tree=f.git('mktree',data=f'100644 blob {blob}\tfile\n'.encode())
             entries.append(f'040000 tree {tree}\td{index}\n')
@@ -1566,36 +1494,20 @@ os.execv({native!r}, [{native!r}, *args])
         url=f.https();self.addCleanup(f.server.shutdown)
         code=("import os; from pathlib import Path; "
               f"assert os.environ['GIT_ON_TREE_OID']=={tree!r}; "
-              "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(2)); "
+              "assert all(Path(f'd{i}/file').read_text()==f'file {i}\\n' for i in range(12)); "
               "print('verified')")
         if OPTIONS.require_nfs:
-            ssh = f.ssh()
-            target = urlsplit(ssh)
-            scp = f"{target.username}@{target.hostname}:{target.path}"
-            cases = [('https', url, 'auto'), ('ssh', ssh, 'auto'), ('scp', scp, 'auto')]
+            cases = [('https', url, 'auto'), ('ssh', f.ssh(), 'auto')]
         else:
             cases = [('https', url, 'copy')]
         for transport, source, backend in cases:
             with self.subTest(transport=transport, backend=backend):
-                # Git syntax selects the transport before any local path check.
-                lookalike = f.cwd / source
-                lookalike.parent.mkdir(parents=True, exist_ok=True)
-                lookalike.symlink_to(f.repo, target_is_directory=True)
                 f.requests.clear()
                 env = dict(f.env)
                 if backend == 'auto':
                     env['GIT_ON_TEST_NFS_MOUNT_ERROR'] = '1'
-                if transport in ('ssh', 'scp'):
-                    log = f.root / 'sshd.log'
-                    connections = log.read_text().count('Accepted publickey')
+                if transport == 'ssh':
                     env['GIT_SSH_COMMAND'] += ' -J none'
-                    if transport == 'scp':
-                        env['GIT_SSH_COMMAND'] += f' -p {target.port}'
-                    root = f.root.resolve()
-                    tmpdir = root / ('s' * (58 - len(os.fsencode(root))))
-                    tmpdir.mkdir(exist_ok=True)
-                    self.assertEqual(len(os.fsencode(tmpdir)), 59)
-                    env['TMPDIR'] = str(tmpdir)
                 else:
                     env.update(GIT_CONFIG_COUNT='6', GIT_CONFIG_KEY_0='http.version',
                                GIT_CONFIG_VALUE_0='HTTP/2',
@@ -1619,32 +1531,9 @@ os.execv({native!r}, [{native!r}, *args])
                                      'eager preparation performs separate directory/object fetches')
                     self.assertTrue(f.requests[-1]['shallow'], 'copy fetch did not ask for depth one')
                 else:
-                    self.assertEqual(log.read_text().count('Accepted publickey'), connections + 1)
-                    if transport == 'scp':
-                        local = subprocess.run([str(OPTIONS.binary), './' + source, 'HEAD',
-                                                '--backend=copy', '--write-policy=all', '--',
-                                                sys.executable, '-c', code],
-                                               cwd=f.cwd, env=env, capture_output=True, timeout=30)
-                        self.assertEqual(local.returncode, 0, local.stderr)
-                        self.assertEqual(local.stdout, result.stdout)
-                        self.assertEqual(log.read_text().count('Accepted publickey'), connections + 1)
-                self.assertEqual(run_directories(Path(env['TMPDIR'])), [])
-
-    @unittest.skipIf(OPTIONS.require_fuse, 'eager preparation runs in the copy suite')
-    def test_eager_copy_keeps_large_blobs_in_the_shared_cache(self):
-        f = self.f
-        size = 64 * 1024 + 1
-        objects = [f.git('hash-object', '-w', '--stdin', data=byte * size) for byte in (b'a', b'b')]
-        tree = f.git('mktree', data=''.join(
-            f'100644 blob {oid}\tfile-{index}\n' for index, oid in enumerate(objects)
-        ).encode())
-        commit = f.git('commit-tree', tree, data=b'eager large-blob policy\n')
-        f.git('update-ref', 'refs/heads/main', commit)
-        probe = f.probe(f.https(), commit, eager=True)
-        metrics = f.line(probe)['metrics']
-        f.finish(probe)
-        self.assertEqual(metrics['spool_bytes'], 0, metrics)
-        self.assertEqual(metrics['large_blob_cache_entries'], 2, metrics)
+                    log = (f.root / 'sshd.log').read_text()
+                    self.assertEqual(log.count('Accepted publickey'), 1, log)
+                self.assertEqual(run_directories(f.root),[])
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_git_on_in_a_terminal_reuses_the_https_demand_session(self):
@@ -2255,13 +2144,10 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         self.assertNotEqual(process.wait(timeout=10),0)
         self.assertEqual((f.root/'sshd.log').read_text().count('Accepted publickey'),1)
 
-    def delta_session_fixture(self, prefix_size=20000, include_base=False, root_extras=None,
-                              packet_size=60000, payload_prefix=None, hold_tail=False):
+    def delta_session_fixture(self, prefix_size=20000, include_base=False, root_extras=None, packet_size=60000):
         import hashlib,zlib
         f=self.f;native=shutil.which('git')
-        prefix = b'a' * prefix_size if payload_prefix is None else payload_prefix
-        prefix_size = len(prefix)
-        base=prefix+b'base';wanted=prefix+b'changed'
+        base=b'a'*prefix_size+b'base';wanted=b'a'*prefix_size+b'changed'
         base_oid=f.git('hash-object','-w','--stdin',data=base)
         wanted_oid=f.git('hash-object','-w','--stdin',data=wanted)
         entries=f'100644 blob {wanted_oid}\tfile\n'
@@ -2291,23 +2177,6 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         forward = server.forward
         packs = {tree.encode(): tree_pack, wanted_oid.encode(): data}
 
-        def framed(pack):
-            reply = bytearray(b'000dpackfile\n')
-            for start in range(0, len(pack), packet_size):
-                chunk = pack[start:start + packet_size]
-                reply.extend(f'{len(chunk)+5:04x}'.encode() + b'\x01' + chunk)
-            return bytes(reply)
-
-        if hold_tail:
-            from types import SimpleNamespace
-            server.split_pack = SimpleNamespace(
-                wants={wanted_oid.encode()},
-                prefix=framed(data[:-20]),
-                tail=b'0019\x01' + data[-20:] + b'0000',
-                started=f.root / 'delta-pack-started',
-                release=f.root / 'delta-pack-release',
-            )
-
         def send_pack(method, path, headers, body):
             wants = re.findall(rb'want ([0-9a-f]{40})', body)
             if len(wants) != 1 or wants[0] not in packs:
@@ -2315,16 +2184,22 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
             [oid] = wants
             with trace.open('ab') as output:
                 output.write(oid + b'\n')
-            return 200, [('content-type', 'application/x-git-upload-pack-result')], framed(packs[oid]) + b'0000'
+            pack = packs[oid]
+            reply = bytearray(b'000dpackfile\n')
+            for start in range(0, len(pack), packet_size):
+                chunk = pack[start:start + packet_size]
+                reply.extend(f'{len(chunk)+5:04x}'.encode() + b'\x01' + chunk)
+            reply.extend(b'0000')
+            return 200, [('content-type', 'application/x-git-upload-pack-result')], bytes(reply)
 
         server.forward = send_pack
-        return wanted, base_oid, wanted_oid, tree, commit, trace, server
+        return wanted, base_oid, wanted_oid, tree, commit, trace, server.url
 
     def test_session_imports_required_delta_pack_without_a_second_fetch(self):
         f = self.f
         extras = {f'extra{index}': bytes([index]) * 70000 for index in range(7)}
-        wanted, _, wanted_oid, tree, _, trace, server = self.delta_session_fixture(70000, root_extras=extras)
-        process=f.probe(server.url);f.line(process)
+        wanted, _, wanted_oid, tree, _, trace, url = self.delta_session_fixture(70000, root_extras=extras)
+        process=f.probe(url);f.line(process)
         value,first=f.operation(process,'range 69990 100 file')
         self.assertEqual(bytes(value['bytes']),wanted[69990:])
         f.operation(process,'release')
@@ -2345,24 +2220,23 @@ with os.scandir('.') as stream, ThreadPoolExecutor(1) as pool:
         f.finish(process)
 
     def test_delta_base_requested_later_uses_its_received_pack_without_refetch(self):
-        f = self.f
-        _, _, wanted, tree, commit, _, server = self.delta_session_fixture(include_base=True, packet_size=31)
-        process = f.probe(server.url)
-        f.line(process)
-        f.operation(process, 'range 0 1 file')
-        f.operation(process, 'release')
-        f.wait_for_packs(process, 3, 'remote_http2_fetch_operations')
-        value, _ = f.operation(process, 'range 19990 100 base')
-        self.assertEqual(bytes(value['bytes']), b'a' * 10 + b'base')
+        f=self.f;wanted,base_oid,_,tree,_,trace,url=self.delta_session_fixture(include_base=True, packet_size=31)
+        process=f.probe(url);f.line(process)
+        f.operation(process,'range 0 1 file')
+        f.operation(process,'release')
+        value,prepared=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        self.assertEqual(trace.read_text().splitlines(),[tree,f.git('hash-object','--stdin',data=wanted)])
+        f.operation(process,'release')
+        value,reopened=f.operation(process,'range 19990 100 base')
+        self.assertEqual(bytes(value['bytes']),b'a'*10+b'base')
+        for field in ('remote_fetch_operations','remote_decode_operations','blob_loads'):
+            self.assertEqual(prepared['metrics'][field],reopened['metrics'][field])
         f.finish(process)
-        self.assertCountEqual(
-            [oid.decode() for _, wants in server.records for oid in wants],
-            [commit, tree, wanted],
-        )
 
     def test_real_mount_session_delta_reuses_fitting_payloads_in_ram(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
-        f=self.f;wanted,_,wanted_oid,tree,_,trace,server=self.delta_session_fixture(40000)
+        f=self.f;wanted,_,wanted_oid,tree,_,trace,url=self.delta_session_fixture(40000)
         code=r'''
 import errno,os,sys
 from pathlib import Path
@@ -2397,7 +2271,7 @@ if sys.argv[1]=='untracked':
         for policy in ('none','untracked','all'):
             with self.subTest(policy=policy):
                 trace.unlink(missing_ok=True)
-                result=subprocess.run([str(OPTIONS.binary),server.url,'HEAD',
+                result=subprocess.run([str(OPTIONS.binary),url,'HEAD',
                     '--write-policy='+policy,'--',sys.executable,'-I','-S','-c',code,policy],
                     cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
                 self.assertEqual(result.returncode,0,result.stderr)
@@ -2407,7 +2281,7 @@ if sys.argv[1]=='untracked':
 
     def large_delta_storage_fixture(self):
         size=7*1024*1024
-        _,_,wanted_oid,tree,_,trace,server=self.delta_session_fixture(size-7)
+        _,_,wanted_oid,tree,_,trace,url=self.delta_session_fixture(size-7)
         from filesystem_quota import STORAGE_OBSERVATION
         command=[sys.executable,'-I','-S','-c',STORAGE_OBSERVATION+r'''
 import sys
@@ -2423,7 +2297,7 @@ if sys.argv[1]=='rewrite':
  assert allocated()<9*1024*1024,('delta mutation duplicated source',allocated())
 print('delta payload verified')
 ''']
-        return command,wanted_oid,tree,trace,server.url
+        return command,wanted_oid,tree,trace,url
 
     def test_delta_base_is_not_a_second_materialized_file(self):
         if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
@@ -2449,48 +2323,6 @@ print('delta payload verified')
         compare_on_tmpfs(self,f.root,OPTIONS.binary,f.repo,f.env['PATH'],[*command,'rewrite'],source=url,tls_ca=f.env['GIT_SSL_CAINFO'])
 
 
-
-    def test_spilled_delta_copy_up_before_the_trailer_fits_two_checkouts(self):
-        if not OPTIONS.require_fuse:self.skipTest('real FUSE explicitly required in CI')
-        from filesystem_quota import compare_on_tmpfs
-        from random import Random
-        f = self.f
-        pressure = {f'pressure-{index}': bytes([index]) * (65536 + 1) for index in range(8)}
-        prefix = Random(18).randbytes(7 * 1024 * 1024 - 7)
-        _, _, wanted_oid, _, _, _, server = self.delta_session_fixture(
-            root_extras=pressure, payload_prefix=prefix, hold_tail=True,
-        )
-        release = f.root / 'delta-pack-release'
-        code = r'''
-import sys
-from pathlib import Path
-from random import Random
-entry = Path('file')
-release = Path(sys.argv[1])
-mounted = not Path('.git').exists()
-try:
-    expected = Random(18).randbytes(7 * 1024 * 1024 - 7) + b'changed'
-    assert entry.read_bytes() == expected
-    for index in range(8):
-        with open(f'pressure-{index}', 'rb', buffering=0) as pressure:
-            assert pressure.read(1) == bytes([index])
-    if mounted:
-        (spill,) = Path.cwd().parent.glob('raw-objects-*/' + sys.argv[2])
-        assert spill.stat().st_size == len(expected)
-        assert not release.exists()
-    with entry.open('r+b', buffering=0) as output:
-        assert output.write(b'z') == 1
-    assert entry.read_bytes() == b'z' + expected[1:]
-    print('spilled delta copy-up verified')
-finally:
-    if mounted:
-        release.touch()
-'''
-        command = [sys.executable, '-I', '-S', '-c', code, str(release), wanted_oid]
-        compare_on_tmpfs(self, f.root, OPTIONS.binary, f.repo, f.env['PATH'], command,
-                         size_mib=16, source=server.url, tls_ca=f.env['GIT_SSL_CAINFO'])
-        self.assertTrue((f.root / 'delta-pack-started').exists())
-        self.assertTrue(release.exists())
 
     @unittest.skipUnless(sys.platform=='linux', 'Linux /proc descriptor and RSS observation')
     def test_remote_pack_descriptors_stay_bounded_with_reduced_rlimit(self):
@@ -2715,7 +2547,7 @@ finally:
                 with contextlib.suppress(ProcessLookupError): signal.pidfd_send_signal(master_fd,signal.SIGTERM)
             os.close(master_fd)
         self.addCleanup(dispose_master)
-        self.assertIsNotNone(ssh_owner_marker(directory))
+        self.assertTrue((directory/'ssh-control-owner').is_file())
         def cleanup():
             with contextlib.suppress(ProcessLookupError): os.killpg(state['pid'],signal.SIGKILL)
             if process.poll() is None: process.kill()
@@ -2724,10 +2556,10 @@ finally:
         self.addCleanup(cleanup)
         active=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=10)
         self.assertNotEqual(active.returncode,0); self.assertTrue((directory/'backing').exists())
-        recovery_id=run_id(directory)
+        recovery=json.loads((directory/'.state').read_text())
         mountpoint=directory/'mount'
         def mounted():
-            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery_id in line
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery['id'] in line
                        for line in Path('/proc/self/mountinfo').read_text().splitlines())
         self.assertTrue(mounted())
         self.assertEqual((mountpoint/'out/result').read_bytes(),b'recover')
@@ -2744,12 +2576,15 @@ finally:
         self.assertEqual(json.loads(inaccessible.stdout)['errno'],errno.ENOTCONN)
         self.assertEqual(subprocess.run(control,capture_output=True,timeout=5).returncode,0)
         self.assertFalse(select.select([master_fd],[],[],0)[0])
-        self.assertIsNotNone(ssh_owner_marker(directory))
+        self.assertTrue((directory/'ssh-control-owner').is_file())
         self.assertTrue(any(path.is_file() and path.read_bytes()==b'recover'
                             for path in (directory/'backing').iterdir()),'raw writable payload was lost')
+        self.assertTrue((directory/'ssh-control-owner').is_file())
         # Kernel flock ownership ends with the killed process.
-        with run_lock(directory).open('r+b') as held:
-            fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        for lockfile in (directory/'.lock',):
+            with lockfile.open('rb') as held:
+                fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                fcntl.flock(held,fcntl.LOCK_UN)
         print('SIGKILL runtime evidence:',json.dumps(dict(mount_remaining=mounted(),
               mount_errno=errno.ENOTCONN,child_alive=True,ssh_master_alive=True,
               run_retained=True,locks_released=True)),flush=True)
@@ -2829,9 +2664,9 @@ finally:
         helper_text,point=ready.read_text().splitlines(); helper_pid=int(helper_text)
         helper_fd=os.pidfd_open(helper_pid)
         mountpoint=Path(point); directory=mountpoint.parent
-        recovery_id=run_id(directory)
+        state=json.loads((directory/'.state').read_text())
         def mounted():
-            return any(line.split()[4]==str(mountpoint) and 'git-on:'+recovery_id in line
+            return any(line.split()[4]==str(mountpoint) and 'git-on:'+state['id'] in line
                        for line in Path('/proc/self/mountinfo').read_text().splitlines())
         self.assertTrue(mounted()); self.assertFalse(child.exists())
         process.kill(); self.assertEqual(process.wait(timeout=10),-signal.SIGKILL)
@@ -2905,7 +2740,7 @@ finally:
         self.assertEqual(process.returncode,125,errors)
         self.assertIn(b'recorded SSH shutdown executable changed',errors)
         self.assertIn(str(directory).encode(),errors)
-        self.assertIsNotNone(ssh_owner_marker(directory))
+        self.assertTrue((directory/'ssh-control-owner').is_file())
         self.assertFalse(select.select([master_fd],[],[],0)[0])
         self.assertFalse(any(line.split()[4]==str(directory/'mount') for line in Path('/proc/self/mountinfo').read_text().splitlines()))
         original.replace(selected)
@@ -2924,7 +2759,7 @@ finally:
             result=subprocess.run([str(OPTIONS.binary.resolve()),url,'HEAD','--',sys.executable,'-c',code,child,str(runfile),str(ready)],cwd=f.cwd,env=f.env,capture_output=True,timeout=30)
             self.assertEqual(result.returncode,125,result.stderr)
             directory=Path(runfile.read_text())
-            self.assertIsNotNone(run_lock(directory))
+            self.assertTrue((directory/'ssh-control-owner').is_file())
             self.assertIn(str(directory/'mount'),[line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()])
             refused=subprocess.run([str(OPTIONS.binary.resolve()),'--cleanup',str(directory)],capture_output=True,timeout=20)
             self.assertNotEqual(refused.returncode,0)
@@ -3026,36 +2861,25 @@ signal.pause()
 
     @unittest.skipUnless(OPTIONS.require_fuse or OPTIONS.require_nfs, 'requires a native mount')
     def test_real_mount_caught_spilled_blob_failure_is_sticky(self):
+        if not (OPTIONS.require_fuse or OPTIONS.require_nfs):
+            self.skipTest("requires a native mount")
         f = self.f
         oids = [f.git("hash-object", "-w", "--stdin", data=bytes([index]) * 65537)
                 for index in range(9)]
-        # Keep the target and each pressure blob in a separate tree.
-        subtrees = [f.git("mktree", data=f"100644 blob {oid}\tfile\n".encode())
-                    for oid in oids]
-        rows = "".join(f"040000 tree {oid}\td{index}\n" for index, oid in enumerate(subtrees))
+        rows = "".join(f"100644 blob {oid}\tf{index}\n" for index, oid in enumerate(oids))
         tree = f.git("mktree", data=rows.encode())
         commit = f.git("commit-tree", tree, data=b"spill fixture\n")
         f.git("update-ref", "refs/heads/main", commit)
         source = f.https()
         body = f"""import errno
 from pathlib import Path
-from time import monotonic, sleep
-target = Path('d0/file')
-assert target.stat().st_size == 65537
-for index in range(1, 9):
-    with Path(f'd{{index}}/file').open('rb', buffering=0) as pressure:
-        assert pressure.read(1) == bytes([index])
-run = Path.cwd().parent
-deadline = monotonic() + 5
-while not (spills := list(run.glob('raw-objects-*/{oids[0]}'))):
-    assert monotonic() < deadline, 'target blob was not spilled after eight later reads'
-    sleep(.01)
-spill, = spills
-assert spill.stat().st_size == 65537
+for index in range(9):
+    assert Path(f'f{{index}}').stat().st_size == 65537
+spill, = Path.cwd().parent.glob('raw-objects-*/{oids[0]}')
 with spill.open('r+b') as output:
     output.write(b'!')
 try:
-    with target.open('rb') as source:
+    with open('f0', 'rb') as source:
         source.read(1)
 except OSError as error:
     assert error.errno == errno.EIO, error

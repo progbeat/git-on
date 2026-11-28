@@ -212,31 +212,31 @@ fn directory(
                     );
                 }
                 EntryKind::Symlink => {
-                    let install = |target: &[u8]| -> Result<u64> {
-                        symlink(std::ffi::OsStr::from_bytes(target), &path)?;
-                        ensure!(
-                            fs::read_link(&path)?.as_os_str().as_bytes() == target,
-                            "host cannot preserve symlink target"
-                        );
-                        Ok(target.len() as u64)
-                    };
-                    let size = if let Some(source) = prepared.get(&entry.oid) {
+                    let target = if let Some(source) = prepared.get(&entry.oid) {
                         let mut target = Vec::new();
                         source.copy_to(root, entry.oid, &mut target)?;
                         ensure!(
                             !target.is_empty() && !target.contains(&0),
                             "unusable symlink target"
                         );
-                        install(&target)?
+                        target
                     } else {
-                        let target = snapshot.read_link_data(entry.oid)?;
-                        let size = install(&target)?;
-                        snapshot.release_copy_blob(entry.oid)?;
-                        size
+                        let mut target = Vec::new();
+                        snapshot.copy_verified_blob(entry.oid, &mut target)?;
+                        ensure!(
+                            !target.is_empty() && !target.contains(&0),
+                            "unusable symlink target"
+                        );
+                        target
                     };
+                    symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
+                    ensure!(
+                        fs::read_link(&path)?.as_os_str().as_bytes() == target,
+                        "host cannot preserve symlink target"
+                    );
                     prepared.entry(entry.oid).or_insert_with(|| PreparedBlob {
                         path: relative.clone(),
-                        size,
+                        size: target.len() as u64,
                         kind: entry.kind,
                     });
                 }

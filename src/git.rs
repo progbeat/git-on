@@ -18,7 +18,6 @@ pub struct Git {
     config: Vec<(OsString, Option<OsString>)>,
     original_dir: Option<PathBuf>,
     remote: Option<OsString>,
-    runtime: Option<PathBuf>,
 }
 
 pub(crate) struct HttpsOptions {
@@ -33,32 +32,6 @@ fn remote_property<'a>(name: &OsStr, key: &'a OsStr) -> Option<&'a [u8]> {
         .strip_prefix(b"remote.")?
         .strip_prefix(name.as_bytes())?
         .strip_prefix(b".")
-}
-
-fn supports_disk_alternates(objects: &Path) -> bool {
-    let list = objects.join("info/alternates");
-    let metadata = match list.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    let Ok(contents) = std::fs::read_to_string(list) else {
-        return false;
-    };
-    // Shared clones can list several plain, absolute paths. Native Git handles
-    // quoting, relative paths and nested alternate lists.
-    let contents = contents.strip_suffix('\n').unwrap_or(&contents);
-    contents.split('\n').all(|alternate| {
-        alternate.starts_with('/')
-            && !alternate.contains(['\r', '\0'])
-            && !alternate.split('/').any(|part| matches!(part, "." | ".."))
-            && Path::new(alternate)
-                .join("info/alternates")
-                .symlink_metadata()
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    })
 }
 
 pub(crate) fn read_only(command: &mut Command) -> &mut Command {
@@ -77,132 +50,32 @@ pub(crate) fn read_only(command: &mut Command) -> &mut Command {
         .env("GIT_TRACE2_PERF", "0")
 }
 
-fn native_command(cwd: &Path, runtime: Option<&Path>) -> Command {
-    let mut command = Command::new("git");
-    command.current_dir(cwd);
-    if let Some(runtime) = runtime {
-        // Native launchers may cache their tool lookup (macOS xcrun).
-        command.env("TMPDIR", runtime);
-    }
-    command
-}
-
-const RUN_LOCK_PREFIX: &str = ".lock-";
-
-#[doc(hidden)]
-pub fn run_lock_path(run: &Path, id: &str) -> PathBuf {
-    run.join(format!("{RUN_LOCK_PREFIX}{id}"))
-}
-
-#[doc(hidden)]
-pub fn run_marker(run: &Path) -> std::io::Result<Option<(PathBuf, uuid::Uuid)>> {
-    if let Some(registration) = crate::run_directory::run_registration(run)? {
-        return Ok(Some(registration));
-    }
-    let Some(short) = run
-        .file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| name.len() == 8)
-    else {
-        return Ok(None);
-    };
-    let mut marker = None;
-    for entry in std::fs::read_dir(run)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(RUN_LOCK_PREFIX))
-        else {
-            continue;
-        };
-        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
-            continue;
-        };
-        if !id.starts_with(short) || id != uuid.to_string() || !entry.file_type()?.is_file() {
-            continue;
-        }
-        if marker.replace((entry.path(), uuid)).is_some() {
-            return Err(std::io::Error::other("ambiguous git-on run marker"));
-        }
-    }
-    Ok(marker)
-}
-
-pub(crate) struct NativeScratch {
-    directory: Option<PathBuf>,
-    marker: Option<PathBuf>,
-}
-
-impl NativeScratch {
-    pub(crate) fn path(&self) -> &Path {
-        self.directory.as_deref().unwrap()
-    }
-
-    fn close(&mut self) -> Result<()> {
-        if let Some(path) = self.directory.take() {
-            remove_native_scratch(&path, self.marker.as_deref())?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for NativeScratch {
-    fn drop(&mut self) {
-        let _ = self.close();
-    }
-}
-
-fn remove_native_scratch(path: &Path, marker: Option<&Path>) -> Result<()> {
-    use std::{fs, io::ErrorKind};
-    crate::platform::ensure_unmounted(path)?;
-    if let Err(error) = fs::remove_dir_all(path) {
-        if error.kind() != ErrorKind::NotFound {
-            return Err(error).context("remove native Git scratch");
-        }
-    }
-    if let Some(marker) = marker {
-        if fs::read_link(marker).is_ok_and(|target| target == path) {
-            fs::remove_file(marker).context("remove native Git scratch record")?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn native_scratch<T>(
-    run: &Path,
-    prefix: &str,
-    minimum_bytes: usize,
-    mut prepare: impl FnMut(&Path) -> Result<T>,
-) -> Result<(NativeScratch, T)> {
+pub(crate) fn native_scratch(run: &Path, prefix: &str) -> std::io::Result<tempfile::TempDir> {
     use std::os::unix::fs::PermissionsExt;
     let permissions = std::fs::Permissions::from_mode(0o700);
-    #[cfg(not(target_os = "linux"))]
-    let _ = minimum_bytes;
     #[cfg(target_os = "linux")]
-    if let Some((_, id)) = run_marker(run)? {
+    if let Some(id) = std::fs::read(run.join(".state"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|state| uuid::Uuid::parse_str(state.get("id")?.as_str()?).ok())
+    {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-        let mut attempted = None;
         for parent in runtime
             .iter()
             .map(PathBuf::as_path)
             .chain([Path::new("/dev/shm")])
             .filter(|path| path.is_absolute())
             .filter_map(|path| std::fs::canonicalize(path).ok())
-            .filter(|path| tmpfs_has_room(path, minimum_bytes))
+            .filter(|path| is_tmpfs(path))
         {
-            if attempted.as_ref() == Some(&parent) {
-                continue;
-            }
-            attempted = Some(parent.clone());
             let name = format!("git-on-native-{id}");
             let marker = run.join(".native-scratch");
             // Register the exact path before it can contain anything. The
             // symlink preserves byte paths and is created atomically.
             match std::os::unix::fs::symlink(parent.join(&name), &marker) {
                 Ok(()) => {}
-                Err(error) if native_scratch_marker_unavailable(&error) => break,
-                Err(error) => return Err(error.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => break,
+                Err(error) => return Err(error),
             }
             let mut builder = tempfile::Builder::new();
             builder
@@ -210,25 +83,7 @@ pub(crate) fn native_scratch<T>(
                 .rand_bytes(0)
                 .permissions(permissions.clone());
             match builder.tempdir_in(&parent) {
-                Ok(directory) => {
-                    let mut scratch = NativeScratch {
-                        directory: Some(directory.keep()),
-                        marker: Some(marker),
-                    };
-                    match prepare(scratch.path()) {
-                        Ok(value)
-                            if minimum_bytes == 0
-                                || tmpfs_has_room(scratch.path(), minimum_bytes) =>
-                        {
-                            return Ok((scratch, value));
-                        }
-                        Err(error) if crate::object::is_cancelled(&error) => return Err(error),
-                        // A writable tmpfs can still run out of blocks during setup.
-                        _ => scratch
-                            .close()
-                            .context("remove incomplete native Git scratch")?,
-                    }
-                }
+                Ok(directory) => return Ok(directory),
                 Err(error) => {
                     std::fs::remove_file(marker)?;
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -238,74 +93,21 @@ pub(crate) fn native_scratch<T>(
             };
         }
     }
-    let directory = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix(prefix)
         .permissions(permissions)
-        .tempdir_in(run)?;
-    let scratch = NativeScratch {
-        directory: Some(directory.keep()),
-        marker: None,
-    };
-    let value = prepare(scratch.path())?;
-    Ok((scratch, value))
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn native_scratch_marker_unavailable(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::AlreadyExists
-            | std::io::ErrorKind::Unsupported
-            | std::io::ErrorKind::PermissionDenied
-    )
-}
-
-#[cfg(test)]
-#[test]
-fn unavailable_scratch_marker_allows_the_local_fallback() {
-    for error in [
-        std::io::Error::from(std::io::ErrorKind::Unsupported),
-        std::io::Error::from_raw_os_error(libc::EPERM),
-    ] {
-        assert!(native_scratch_marker_unavailable(&error), "{error}");
-    }
+        .tempdir_in(run)
 }
 
 #[cfg(target_os = "linux")]
 fn is_tmpfs(path: &Path) -> bool {
-    tmpfs_stats(path).is_some()
-}
-
-#[cfg(target_os = "linux")]
-#[cfg(test)]
-thread_local! {
-    static TMPFS_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(target_os = "linux")]
-fn tmpfs_has_room(path: &Path, minimum_bytes: usize) -> bool {
-    #[cfg(test)]
-    if TMPFS_EXHAUSTED.get() {
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
-    }
-    tmpfs_stats(path).is_some_and(|stats| {
-        (stats.f_files == 0 || stats.f_ffree > 0)
-            && (stats.f_blocks == 0
-                || (stats.f_bavail as u128) * (stats.f_bsize as u128)
-                    >= minimum_bytes.max(1) as u128)
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn tmpfs_stats(path: &Path) -> Option<libc::statfs> {
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    };
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     unsafe {
-        if libc::statfs(name.as_ptr(), stats.as_mut_ptr()) != 0 {
-            return None;
-        }
-        let stats = stats.assume_init();
-        (stats.f_type == libc::TMPFS_MAGIC).then_some(stats)
+        libc::statfs(name.as_ptr(), stats.as_mut_ptr()) == 0
+            && stats.assume_init().f_type == libc::TMPFS_MAGIC
     }
 }
 
@@ -313,8 +115,7 @@ fn tmpfs_stats(path: &Path) -> Option<libc::statfs> {
 #[doc(hidden)]
 pub fn cleanup_native_scratch(run: &Path, id: &str) -> Result<()> {
     use std::{fs, os::unix::fs::MetadataExt};
-    let marker = run.join(".native-scratch");
-    let target = match fs::read_link(&marker) {
+    let target = match fs::read_link(run.join(".native-scratch")) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("read native Git scratch record"),
@@ -340,18 +141,14 @@ pub fn cleanup_native_scratch(run: &Path, id: &str) -> Result<()> {
             && metadata.mode() & 0o077 == 0,
         "native Git scratch ownership changed"
     );
-    remove_native_scratch(&target, Some(&marker))
+    fs::remove_dir_all(target).context("remove native Git scratch")
 }
 
 impl Git {
     pub fn capture(cwd: &Path) -> Result<Self> {
-        Self::capture_in(cwd, None)
-    }
-
-    pub(crate) fn capture_in(cwd: &Path, runtime: Option<&Path>) -> Result<Self> {
-        let runtime = runtime.map(std::path::absolute).transpose()?;
-        let mut command = native_command(cwd, runtime.as_deref());
+        let mut command = Command::new("git");
         read_only(&mut command)
+            .current_dir(cwd)
             .env_remove("GIT_CONFIG")
             .args(["config", "--null", "--list", "--includes"])
             .stdin(Stdio::null());
@@ -389,8 +186,9 @@ impl Git {
             config,
             remote: None,
             original_dir: {
-                let mut command = native_command(cwd, runtime.as_deref());
+                let mut command = Command::new("git");
                 read_only(&mut command)
+                    .current_dir(cwd)
                     .args(["rev-parse", "--absolute-git-dir"])
                     .stdin(Stdio::null());
                 run(command, true)
@@ -402,7 +200,6 @@ impl Git {
                         ))
                     })
             },
-            runtime,
         })
     }
     pub(crate) fn select_remote(&mut self, name: &OsStr) -> bool {
@@ -412,18 +209,6 @@ impl Git {
             .any(|(key, _)| remote_property(name, key) == Some(b"url"));
         self.remote = named.then(|| name.to_os_string());
         named
-    }
-
-    pub(crate) fn recognizes_remote(&self, name: &OsStr) -> Result<bool> {
-        if self.original_dir.is_none() {
-            return Ok(false);
-        }
-        let mut command = self.command(None);
-        read_only(&mut command)
-            .args(["remote", "get-url", "--"])
-            .arg(name)
-            .stdin(Stdio::null());
-        Ok(run(command, true)?.status.success())
     }
 
     pub(crate) fn worktree_root(&self) -> Result<Option<PathBuf>> {
@@ -458,8 +243,9 @@ impl Git {
     }
 
     pub fn command(&self, dir: Option<&Path>) -> Command {
-        let mut command = native_command(&self.cwd, self.runtime.as_deref());
+        let mut command = Command::new("git");
         command
+            .current_dir(&self.cwd)
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_NO_LAZY_FETCH", "1");
         if let Some(dir) = dir {
@@ -699,7 +485,51 @@ impl Git {
     }
 
     pub fn output(&self, dir: Option<&Path>, args: &[&OsStr]) -> Result<Vec<u8>> {
-        let mut command = self.command(dir);
+        Self::read_output(self.command(dir), args)
+    }
+
+    pub(crate) fn source_url(&self, source: &OsStr) -> Result<Vec<u8>> {
+        let mut command;
+        let name;
+        let source = if source
+            .to_str()
+            .and_then(|source| url::Url::parse(source).ok())
+            .is_some_and(|url| url.scheme() == "https" && url.password().is_some())
+        {
+            let url = self
+                .config
+                .iter()
+                .filter(|(key, _)| self.selected_remote_property(key) == Some(b"url"))
+                .try_fold(None, |first, (_, value)| {
+                    let value = value
+                        .as_deref()
+                        .context("configured Git remote has no URL")?;
+                    Ok::<_, anyhow::Error>((!value.is_empty()).then_some(first.unwrap_or(value)))
+                })?
+                .unwrap_or(source);
+            // Match rewrites using includes resolved in the caller's repo.
+            command = self.command(Some(Path::new("/dev/null")));
+            name = format!("git-on-url-{}", uuid::Uuid::new_v4().simple());
+            command
+                .arg(format!("--config-env=remote.{name}.url=GIT_ON_SOURCE_URL"))
+                .env("GIT_ON_SOURCE_URL", url);
+            OsStr::new(&name)
+        } else {
+            command = self.command(None);
+            source
+        };
+        Self::read_output(
+            command,
+            &[
+                OsStr::new("ls-remote"),
+                OsStr::new("--get-url"),
+                OsStr::new("--"),
+                source,
+            ],
+        )
+    }
+
+    fn read_output(mut command: Command, args: &[&OsStr]) -> Result<Vec<u8>> {
         read_only(&mut command)
             .args(["-c", "core.fsmonitor=false"])
             .args(args)
@@ -755,14 +585,11 @@ impl Git {
             .all(|key| std::env::var_os(key).is_none())
         {
             if let Ok(repo) = git2::Repository::open(self.repository_dir()?) {
-                if supports_disk_alternates(&repo.commondir().join("objects")) && repo.odb().is_ok()
-                {
-                    return Ok(repo);
-                }
-                return Ok(git2::Repository::from_odb(git2::Odb::new()?)?);
+                return Ok(repo);
             }
         }
-        // Git resolves relative overrides in its source context.
+        // Git resolves relative overrides in its source context. Open only
+        // that primary ODB; native cat-file handles any remaining alternates.
         let path = self.output(
             None,
             &[
@@ -774,11 +601,7 @@ impl Git {
             .map(OsStr::new),
         )?;
         let odb = git2::Odb::new()?;
-        let path = OsStr::from_bytes(path.strip_suffix(b"\n").unwrap_or(&path));
-        if let Some(path) = path
-            .to_str()
-            .filter(|path| supports_disk_alternates(Path::new(path)))
-        {
+        if let Ok(path) = std::str::from_utf8(path.strip_suffix(b"\n").unwrap_or(&path)) {
             let _ = odb.add_disk_alternate(path);
         }
         Ok(git2::Repository::from_odb(odb)?)
@@ -789,43 +612,35 @@ impl Git {
             .as_deref()
             .context("native Git did not identify the selected repository directory")
     }
-    pub(crate) fn verify(
+    pub fn verify(
         &self,
         oid: Oid,
         kind: ObjectType,
-        size: usize,
-        remote: Option<&[u8]>,
-        run_directory: &Path,
+        remote: Option<(&git2::Repository, &Path)>,
     ) -> Result<()> {
         let operation = match kind {
             ObjectType::Commit => "verify-commit",
             ObjectType::Tag => "verify-tag",
             _ => bail!("--verify requires a signed commit or annotated tag; raw trees and blobs have no signature"),
         };
-        // Git's detached signature file is at most the size of the selected
-        // object. Choose scratch with room before starting the verifier.
-        let (scratch, ()) = native_scratch(run_directory, "git-on-signature-", size, |path| {
-            // Only a remote object needs a private native Git context.
-            if let Some(object) = remote {
-                let mut options = git2::RepositoryInitOptions::new();
-                options.bare(true).external_template(false);
-                let verification = git2::Repository::init_opts(path, &options)?;
-                anyhow::ensure!(
-                    verification.odb()?.write(kind, object)? == oid,
-                    "selected signature object changed"
-                );
-            }
-            Ok(())
-        })?;
-        let directory = std::path::absolute(scratch.path())?;
-        let mut command = self.command(remote.map(|_| directory.as_path()));
-        if remote.is_some() {
-            // Native Git resolves relative verifier settings from the caller's
-            // worktree root. The private bare directory cannot discover it.
-            command.current_dir(self.transport_directory()?);
-        }
+        // Only a remote object needs a private native Git context.
+        let directory = if let Some((repo, run)) = remote {
+            let objects = repo.odb()?;
+            let object = objects.read(oid)?;
+            let directory = native_scratch(run, "git-on-signature-")?;
+            let mut options = git2::RepositoryInitOptions::new();
+            options.bare(true).external_template(false);
+            let verification = git2::Repository::init_opts(directory.path(), &options)?;
+            anyhow::ensure!(
+                verification.odb()?.write(kind, object.data())? == oid,
+                "selected signature object changed"
+            );
+            Some(directory)
+        } else {
+            None
+        };
+        let mut command = self.command(directory.as_ref().map(tempfile::TempDir::path));
         command
-            .env("TMPDIR", directory)
             .arg(operation)
             .arg(oid.to_string())
             .stdin(Stdio::null())
@@ -1322,7 +1137,7 @@ impl Capture {
         ))
     }
 
-    pub(crate) fn fd(&self) -> Option<i32> {
+    fn fd(&self) -> Option<i32> {
         self.stream.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
     }
 
@@ -1353,7 +1168,7 @@ impl Capture {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> std::io::Result<Vec<u8>> {
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
         // Drain queued socket data without waiting for inherited writers in
         // a verifier's subprocesses.
         for _ in 0..8 {
@@ -1410,12 +1225,12 @@ impl<'a> NativeInput<'a> {
 /// Exit notification removes the artificial polling floor for short native
 /// operations. Cancellation/TTY checks keep the same maximum polling interval.
 /// Unsupported kernels or descriptor pressure retain the existing fallback.
-pub(crate) struct ChildExitWakeup {
+struct ChildExitWakeup {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: Option<std::os::fd::OwnedFd>,
 }
 impl ChildExitWakeup {
-    pub(crate) fn new(pid: u32) -> Self {
+    fn new(pid: u32) -> Self {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::FromRawFd;
@@ -1455,12 +1270,7 @@ impl ChildExitWakeup {
             Self {}
         }
     }
-    pub(crate) fn wait(
-        &self,
-        duration: std::time::Duration,
-        input: Option<i32>,
-        output: [Option<i32>; 2],
-    ) {
+    fn wait(&self, duration: std::time::Duration, input: Option<i32>, output: [Option<i32>; 2]) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit = self.fd.as_ref().map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1628,7 +1438,6 @@ mod transport_policy_tests {
                 config: vec![(key.into(), Some("never".into()))],
                 original_dir: None,
                 remote: None,
-                runtime: None,
             };
             assert!(
                 git.https_options(OsStr::new("https://example.invalid/repo.git"))
@@ -1642,104 +1451,21 @@ mod transport_policy_tests {
 #[cfg(all(test, target_os = "linux"))]
 #[test]
 fn recovery_removes_external_native_scratch() {
-    const SECOND_TMPFS_FIXTURE: &str = "GIT_ON_TEST_SECOND_TMPFS";
-    let Some(runtime) = std::env::var_os(SECOND_TMPFS_FIXTURE).map(PathBuf::from) else {
-        if !is_tmpfs(Path::new("/dev/shm")) {
-            return;
-        }
-        let Ok(first) = tempfile::tempdir_in("/dev/shm") else {
-            return;
-        };
-        let result = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "git::recovery_removes_external_native_scratch"])
-            .env("XDG_RUNTIME_DIR", first.path())
-            .env(SECOND_TMPFS_FIXTURE, first.path())
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
-        );
+    if !is_tmpfs(Path::new("/dev/shm")) || tempfile::tempdir_in("/dev/shm").is_err() {
         return;
-    };
-    let runtime = runtime.canonicalize().unwrap();
-    let other_tmpfs = Path::new("/dev/shm").canonicalize().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    }
+    let run = tempfile::tempdir().unwrap();
     let id = uuid::Uuid::new_v4();
-    let id = id.to_string();
-    let run = root.path().join(&id[..8]);
-    std::fs::create_dir(&run).unwrap();
-    std::fs::File::create(run_lock_path(&run, &id)).unwrap();
-    let (scratch, ()) = native_scratch(&run, "scratch-", 0, |path| {
-        std::fs::write(path.join("data"), b"native Git temporary bytes")?;
-        Ok(())
-    })
-    .unwrap();
-    let record = run.join(".native-scratch");
-    let path = scratch.path().to_owned();
-    assert_eq!(std::fs::read_link(&record).unwrap(), path);
-    crate::platform::TEST_MOUNTPOINT.set(Some(path.join("mounted")));
-    let result = cleanup_native_scratch(&run, &id);
-    drop(scratch);
-    crate::platform::TEST_MOUNTPOINT.set(None);
-    assert!(result.unwrap_err().to_string().contains("a mount remains"));
+    std::fs::write(run.path().join(".state"), format!(r#"{{"id":"{id}"}}"#)).unwrap();
+    let scratch = native_scratch(run.path(), "scratch-").unwrap();
+    std::fs::write(scratch.path().join("data"), b"native Git temporary bytes").unwrap();
     assert_eq!(
-        std::fs::read(path.join("data")).unwrap(),
-        b"native Git temporary bytes"
+        std::fs::read_link(run.path().join(".native-scratch")).unwrap(),
+        scratch.path()
     );
-    assert_eq!(std::fs::read_link(&record).unwrap(), path);
-    cleanup_native_scratch(&run, &id).unwrap();
-    assert!(!path.exists());
-    cleanup_native_scratch(&run, &id).unwrap();
-    assert!(!record.is_symlink());
-
-    let (second, ()) = native_scratch(&run, "scratch-", 0, |path| {
-        if path.starts_with(&runtime) {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
-        }
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(second.path().parent(), Some(other_tmpfs.as_path()));
-    assert!(!runtime.join(second.path().file_name().unwrap()).exists());
-    drop(second);
-    assert!(!run.join(".native-scratch").is_symlink());
-
-    let mut attempts = Vec::new();
-    let (fallback, ()) = native_scratch(&run, "scratch-", 0, |path| {
-        attempts.push(path.to_path_buf());
-        std::fs::File::create(path.join("data"))?;
-        if !path.starts_with(&run) {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
-        }
-        std::fs::write(path.join("data"), b"native Git temporary bytes")?;
-        Ok(())
-    })
-    .unwrap();
-    assert!(attempts.len() >= 2);
-    assert!(attempts[..attempts.len() - 1]
-        .iter()
-        .all(|path| !path.exists()));
-    assert_eq!(fallback.path().parent(), Some(run.as_path()));
-    assert!(!run.join(".native-scratch").is_symlink());
-
-    let (spacious, ()) = native_scratch(&run, "signature-", usize::MAX, |path| {
-        assert_eq!(path.parent(), Some(run.as_path()));
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(spacious.path().parent(), Some(run.as_path()));
-
-    let (spacious, ()) = native_scratch(&run, "signature-", 1, |path| {
-        if path.parent() != Some(run.as_path()) {
-            TMPFS_EXHAUSTED.set(true);
-        }
-        Ok(())
-    })
-    .unwrap();
-    TMPFS_EXHAUSTED.set(false);
-    assert_eq!(spacious.path().parent(), Some(run.as_path()));
+    cleanup_native_scratch(run.path(), &id.to_string()).unwrap();
+    assert!(!scratch.path().exists());
+    cleanup_native_scratch(run.path(), &id.to_string()).unwrap();
 }
 
 #[cfg(all(test, target_os = "macos"))]

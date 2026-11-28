@@ -11,8 +11,6 @@ pub mod platform;
 pub mod policy;
 mod raw_blob;
 pub mod remote;
-#[doc(hidden)]
-pub mod run_directory;
 pub mod snapshot;
 mod spool;
 #[doc(hidden)]

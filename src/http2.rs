@@ -51,8 +51,6 @@ impl Configuration {
             "direct HTTPS requires TLS and HTTP/2 support"
         );
         let credential = (git.command(None), parsed.clone());
-        // Git parses the original userinfo on a Basic challenge. Keep the
-        // password out of the Git config command and the curl request URL.
         parsed
             .set_password(None)
             .map_err(|_| anyhow::anyhow!("invalid HTTPS authority"))?;

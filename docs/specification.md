@@ -85,15 +85,11 @@ outside Git-on's guarantee as well.
 
 Store decoded objects in memory. Only cache eviction writes raw payloads to
 private storage. Native Git may require private files for local index-revision
-resolution and signature verification. Use an existing writable tmpfs
+resolution and remote signature verification. Use an existing writable tmpfs
 for that scratch state when available, otherwise use the private run under
 the system temporary directory. Delete it on exit and error. `--backend=copy`
-writes the visible selected tree and writable mounts may write private backing.
-Runtime recovery uses empty markers. Their names identify the invocation and
-any owned SSH control socket. A new run binds its marker to the directory
-identity before creating snapshot data. The initial reservation allows
-recovery to remove an empty directory at the reserved path. Recovery
-preserves directories without a matching marker or a valid legacy record.
+writes the visible selected tree and writable
+mounts may write private backing.
 
 ## Filesystem policy
 
@@ -178,11 +174,12 @@ Host filesystem operations, xattrs and locks follow the host's ordinary behavior
 this backend implements the explicit-all subset.
 The lazy startup and performance requirements below apply to both native mounts.
 
-Remote materialization obtains the selected revision in one streamed shallow
-transfer. A mount fallback reuses the original selection and fetches the full
-snapshot in one additional shallow transfer. Materialization reuses verified
-contents for repeated OIDs. The inherited per-file limit applies to the files
-that are written, including visible files and evicted blobs.
+Remote materialization obtains the selected revision in one shallow transfer
+when host per-file limits permit it. A mount fallback reuses the original
+selection and fetches the full snapshot in one additional shallow transfer.
+Compressed objects are decoded into their final paths;
+already prepared contents are reused for repeated OIDs. Finite per-file limits
+retain bounded transfers rather than creating a pack that exceeds that limit.
 
 ## FUSE operation coverage requirement
 
@@ -376,9 +373,9 @@ not replace them or establish proof for all possible sequences.
 The implementation uses a shared pinned object store, demand-only metadata/blob
 access, content caches and deferred inode creation. A byte-budgeted LRU holds
 small blobs and reused disk blocks. A separate LRU retains the eight most
-recently used complete large blobs. Copy uses these same caches before
-materialization. Readers of the same OID share verified buffers. Trusted
-descriptors, digests of spilled blocks and parsed directories
+recently used complete large blobs. The copy backend
+uses a 128 MiB payload LRU for complete blobs before materialization. Readers
+of the same OID share verified buffers. Trusted descriptors, digests of spilled blocks and parsed directories
 remain in RAM for touched unique objects outside that payload budget. Raw tree
 bytes and disk object/name indexes are not retained. The FUSE layer retains no
 duplicate snapshot payloads. Source

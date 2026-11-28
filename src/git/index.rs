@@ -24,74 +24,68 @@ pub(super) fn resolve(git: &Git, revision: &OsStr, run_directory: &Path) -> Resu
         git,
         &["--path-format=absolute", "--git-path", "index"],
     )?);
-    let (_, output) = super::native_scratch(run_directory, "git-on-index-", 0, |scratch| {
-        // Git reads a missing split-index base from beside the primary index,
-        // but refreshes only the path in its Git directory. The usual index
-        // therefore needs no copy. Preserve git-dir-first lookup for a separate
-        // GIT_INDEX_FILE by staging just the base it actually refers to.
-        let index_location = index
-            .parent()
-            .context("native Git returned an index without a parent")?;
-        let separate_index = index_location != git_dir;
-        let private_index = scratch.join("index");
-        let effective_index = if separate_index {
-            symlink(&index, &private_index)?;
-            &private_index
-        } else {
-            &index
-        };
-        let head = git_dir.join("HEAD");
-        let private_head = scratch.join("HEAD");
-        if let Some(reference) = fs::read_link(&head)
-            .ok()
-            .filter(|target| target.as_os_str().as_bytes().starts_with(b"refs/"))
-        {
-            let mut contents = b"ref: ".to_vec();
-            contents.extend_from_slice(reference.as_os_str().as_bytes());
-            contents.push(b'\n');
-            fs::write(private_head, contents)?;
-        } else {
-            fs::copy(head, private_head)?;
-        }
-        copy_if_present(git_dir, scratch, OsStr::new("config.worktree"))?;
+    let scratch = super::native_scratch(run_directory, "git-on-index-")?;
+    // Git reads a missing split-index base from beside the primary index,
+    // but refreshes only the path in its Git directory. The usual index
+    // therefore needs no copy. Preserve git-dir-first lookup for a separate
+    // GIT_INDEX_FILE by staging just the base it actually refers to.
+    let index_location = index
+        .parent()
+        .context("native Git returned an index without a parent")?;
+    let separate_index = index_location != git_dir;
+    let private_index = scratch.path().join("index");
+    let effective_index = if separate_index {
+        symlink(&index, &private_index)?;
+        &private_index
+    } else {
+        &index
+    };
+    let head = git_dir.join("HEAD");
+    let private_head = scratch.path().join("HEAD");
+    if let Some(reference) = fs::read_link(&head)
+        .ok()
+        .filter(|target| target.as_os_str().as_bytes().starts_with(b"refs/"))
+    {
+        let mut contents = b"ref: ".to_vec();
+        contents.extend_from_slice(reference.as_os_str().as_bytes());
+        contents.push(b'\n');
+        fs::write(private_head, contents)?;
+    } else {
+        fs::copy(head, private_head)?;
+    }
+    copy_if_present(git_dir, scratch.path(), OsStr::new("config.worktree"))?;
 
-        let worktree = git.worktree_root()?;
-        let resolve = || {
-            let mut command = git.command(None);
-            super::read_only(&mut command)
-                .args(["-c", "core.fsmonitor=false"])
-                .arg("--git-dir")
-                .arg(scratch)
-                .env("GIT_COMMON_DIR", &common)
-                .env("GIT_INDEX_FILE", effective_index)
-                .env("TMPDIR", scratch)
-                .env("LC_ALL", "C");
-            if let Some(worktree) = &worktree {
-                command.arg("--work-tree").arg(worktree);
-            }
-            command
-                .args(["rev-parse", "--verify", "--end-of-options"])
-                .arg(revision)
-                .stdin(Stdio::null());
-            run(command, true)
-        };
-        let mut output = resolve()?;
-        if separate_index && !output.status.success() {
-            if let Some(base) = missing_base(&output.stderr, scratch) {
-                let destination = scratch.join(&base);
-                fs::copy(git_dir.join(&base), &destination).or_else(|error| {
-                    match error.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            fs::copy(index_location.join(base), &destination)
-                        }
-                        _ => Err(error),
-                    }
-                })?;
-                output = resolve()?;
-            }
+    let worktree = git.worktree_root()?;
+    let resolve = || {
+        let mut command = git.command(None);
+        super::read_only(&mut command)
+            .args(["-c", "core.fsmonitor=false"])
+            .arg("--git-dir")
+            .arg(scratch.path())
+            .env("GIT_COMMON_DIR", &common)
+            .env("GIT_INDEX_FILE", effective_index)
+            .env("TMPDIR", scratch.path())
+            .env("LC_ALL", "C");
+        if let Some(worktree) = &worktree {
+            command.arg("--work-tree").arg(worktree);
         }
-        Ok(output)
-    })?;
+        command
+            .args(["rev-parse", "--verify", "--end-of-options"])
+            .arg(revision)
+            .stdin(Stdio::null());
+        run(command, true)
+    };
+    let mut output = resolve()?;
+    if separate_index && !output.status.success() {
+        if let Some(base) = missing_base(&output.stderr, scratch.path()) {
+            let destination = scratch.path().join(&base);
+            fs::copy(git_dir.join(&base), &destination).or_else(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => fs::copy(index_location.join(base), &destination),
+                _ => Err(error),
+            })?;
+            output = resolve()?;
+        }
+    }
     anyhow::ensure!(
         output.status.success(),
         "Git rev-parse failed: {}",

@@ -168,7 +168,6 @@ jobs:
           "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/release/git-on --require-fuse \
             Http2Tests.test_post_authentication_and_multiplexed_fetches \
             Http2Tests.test_reports_actual_pack_progress_while_the_stream_is_open \
-            Http2Tests.test_explicit_https_credentials_are_used_after_a_basic_challenge \
             Http2Tests.test_url_matched_authorization_header_is_sent_once
           "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/release/git-on --require-fuse
       - name: Share the exact-head instrumented runner with WebKit
@@ -513,7 +512,6 @@ jobs:
           "$RUNNER_TEMP/http2-tests/bin/python" tests/http2.py --binary target/debug/git-on --require-nfs \
             Http2Tests.test_post_authentication_and_multiplexed_fetches \
             Http2Tests.test_reports_actual_pack_progress_while_the_stream_is_open \
-            Http2Tests.test_explicit_https_credentials_are_used_after_a_basic_challenge \
             Http2Tests.test_url_matched_authorization_header_is_sent_once
           "$RUNNER_TEMP/http2-tests/bin/python" tests/streaming.py --binary target/debug/git-on --require-nfs
       - name: Run upstream pynfs over the production socket

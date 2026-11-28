@@ -59,7 +59,7 @@ def exercise(binary,count,before=False):
             if not PACK_PATH.search(line): continue
             if PACK_METADATA.search(line): pack_metadata+=1
             if 'getdents64(' in line:
-                returned=re.search(r'= (\d+)(?: |$)',line)
+                returned=re.search(r'= (\d+) ',line)
                 if returned: pack_bytes+=int(returned.group(1))
         # source-probe owns and cleans its private run. Explicitly sampled live
         # retained pack counts are covered by the interactive permanent test.

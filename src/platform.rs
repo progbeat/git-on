@@ -83,26 +83,16 @@ pub fn mount_unavailable() -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn mount_is_ours(
-    dir: &Path,
-    id: &str,
-    #[cfg(target_os = "macos")] recorded_socket: Option<&Path>,
-) -> Result<bool> {
+pub fn mount_is_ours(dir: &Path, id: &str) -> Result<bool> {
     let point = dir.join("mount");
     #[cfg(target_os = "macos")]
-    let expected = nfs_sockets(Path::new(NFS_SOCKET_ROOT), id, recorded_socket)?;
+    let expected = nfs_mount_source(id);
     #[cfg(target_os = "linux")]
-    let expected = format!("git-on:{id}");
+    let expected = Some(format!("git-on:{id}"));
     let mut found = false;
     for (path, source) in mounts()? {
         if path == point {
-            #[cfg(target_os = "macos")]
-            let matches = expected
-                .iter()
-                .any(|socket| source == nfs_mount_source(socket));
-            #[cfg(target_os = "linux")]
-            let matches = source == expected;
-            if !matches || found {
+            if expected.as_deref() != Some(source.as_str()) || found {
                 bail!("mountpoint is occupied by a different or stacked filesystem");
             }
             found = true;
@@ -112,114 +102,45 @@ pub fn mount_is_ours(
 }
 
 #[cfg(target_os = "macos")]
-const NFS_SOCKET_ROOT: &str = "/private/tmp";
-
-#[cfg(target_os = "macos")]
-fn nfs_sockets(root: &Path, id: &str, recorded: Option<&Path>) -> Result<Vec<std::path::PathBuf>> {
-    if !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id) {
-        anyhow::ensure!(recorded.is_none(), "invalid recorded NFS socket identity");
-        return Ok(Vec::new());
-    }
-    let mut sockets = crate::run_directory::child_locations(root, &format!("nfs-{id}"))
-        .map(|path| path.join("s"))
-        .to_vec();
-    if let Some(recorded) = recorded {
-        anyhow::ensure!(
-            sockets.iter().any(|socket| socket == recorded),
-            "invalid recorded NFS socket path"
-        );
-        sockets.retain(|socket| socket == recorded);
-    } else {
-        sockets.push(root.join(format!("git-on-nfs-{id}")).join("s"));
-    }
-    Ok(sockets)
+pub fn nfs_socket(id: &str) -> Option<std::path::PathBuf> {
+    let uuid = uuid::Uuid::parse_str(id).ok()?;
+    (uuid.to_string() == id).then(|| format!("/private/tmp/git-on-nfs-{id}/s").into())
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn prepare_nfs_socket(
-    id: &str,
-) -> std::io::Result<(crate::run_directory::Group, std::path::PathBuf)> {
-    let (group, directory) = crate::run_directory::Group::create_named(
-        Path::new(NFS_SOCKET_ROOT),
-        &format!("nfs-{id}"),
-    )?;
-    Ok((group, directory.join("s")))
+pub fn nfs_mount_source(id: &str) -> Option<String> {
+    Some(format!("<{}>:/", nfs_socket(id)?.display()))
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn nfs_mount_source(socket: &Path) -> String {
-    format!("<{}>:/", socket.display())
-}
-
-#[cfg(target_os = "macos")]
-pub fn cleanup_nfs_socket(id: &str, recorded: Option<&Path>) -> Result<()> {
-    cleanup_nfs_socket_under(Path::new(NFS_SOCKET_ROOT), id, recorded)
-}
-
-#[cfg(target_os = "macos")]
-fn cleanup_nfs_socket_under(root: &Path, id: &str, recorded: Option<&Path>) -> Result<()> {
+pub fn cleanup_nfs_socket(id: &str) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(socket) = nfs_socket(id) else {
+        return Ok(());
+    };
+    let directory = socket.parent().context("missing NFS socket directory")?;
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect NFS socket directory"),
+    };
     let uid = unsafe { libc::geteuid() };
-    for socket in nfs_sockets(root, id, recorded)? {
-        let directory = socket.parent().context("missing NFS socket directory")?;
-        let parent = directory.parent().context("missing NFS socket group")?;
-        let _group = if parent == root {
-            None
-        } else {
-            let Some(group) = crate::run_directory::nfs_cleanup_group(parent, recorded.is_some())
-                .context("inspect NFS socket group")?
-            else {
-                continue;
-            };
-            Some(group)
-        };
-        let metadata = match directory.symlink_metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("inspect NFS socket directory"),
-        };
-        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-            bail!("NFS socket directory has unexpected type or ownership");
-        }
-        let source = nfs_mount_source(&socket);
-        if mounts()?.iter().any(|(_, current)| *current == source) {
-            bail!("NFS socket still belongs to a system mount");
-        }
-        match socket.symlink_metadata() {
-            Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == uid => {
-                std::fs::remove_file(&socket).context("remove private NFS socket")?;
-            }
-            Ok(_) => bail!("NFS socket has unexpected type or ownership"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error).context("inspect private NFS socket"),
-        }
-        std::fs::remove_dir(directory).context("remove private NFS socket directory")?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!("NFS socket directory has unexpected type or ownership");
     }
-    Ok(())
-}
-
-#[cfg(all(test, target_os = "macos"))]
-#[test]
-fn legacy_nfs_cleanup_removes_only_the_recorded_socket_group() {
-    use std::os::unix::fs::DirBuilderExt;
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let [primary, private] =
-        crate::run_directory::child_locations(root.path(), &format!("nfs-{id}"));
-    for group in [&primary, &private] {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(group)
-            .unwrap();
+    let source = nfs_mount_source(id).context("invalid NFS mount identity")?;
+    if mounts()?.iter().any(|(_, current)| *current == source) {
+        bail!("NFS socket still belongs to a system mount");
     }
-    let recorded = private.join("s");
-    drop(std::os::unix::net::UnixListener::bind(&recorded).unwrap());
-    cleanup_nfs_socket_under(root.path(), &id, None).unwrap();
-    assert!(recorded.exists());
-    cleanup_nfs_socket_under(root.path(), &id, Some(&recorded)).unwrap();
-    assert!(!private.parent().unwrap().exists());
-    assert!(primary.is_dir());
+    match std::fs::symlink_metadata(&socket) {
+        Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == uid => {
+            std::fs::remove_file(&socket).context("remove private NFS socket")?;
+        }
+        Ok(_) => bail!("NFS socket has unexpected type or ownership"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("inspect private NFS socket"),
+    }
+    std::fs::remove_dir(directory).context("remove private NFS socket directory")
 }
 
 pub fn ensure_unmounted(dir: &Path) -> Result<()> {
@@ -229,14 +150,6 @@ pub fn ensure_unmounted(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_MOUNTPOINT: std::cell::RefCell<Option<std::path::PathBuf>> = const {
-        std::cell::RefCell::new(None)
-    };
 }
 
 #[cfg(target_os = "linux")]
@@ -254,10 +167,6 @@ fn mounts() -> Result<Vec<(std::path::PathBuf, String)>> {
             Path::new(std::ffi::OsStr::from_bytes(&decode_mount(path))).to_path_buf(),
             source.to_string(),
         ));
-    }
-    #[cfg(test)]
-    if let Some(path) = TEST_MOUNTPOINT.with_borrow(Clone::clone) {
-        out.push((path, String::new()));
     }
     Ok(out)
 }

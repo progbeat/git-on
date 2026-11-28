@@ -8,19 +8,13 @@ mod status;
 mod xdr;
 
 use self::server::{DemandFailure, RpcReply, Server};
-use crate::{
-    filesystem::Overlay,
-    git::{self, Capture, ChildExitWakeup},
-    platform,
-    policy::WritePolicy,
-};
-use anyhow::{bail, Context};
+use crate::{filesystem::Overlay, platform, policy::WritePolicy};
 use std::{
-    fs,
+    fs::{self, DirBuilder},
     io::{self, IoSlice},
-    os::unix::{net::UnixListener as StdListener, process::CommandExt},
+    os::unix::{fs::DirBuilderExt, net::UnixListener as StdListener},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
@@ -48,7 +42,6 @@ pub(super) struct FilesystemFailures {
 }
 
 pub struct Session {
-    source: String,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<io::Result<()>>>,
     failed: Arc<AtomicBool>,
@@ -58,15 +51,11 @@ pub struct Session {
 impl Session {
     pub(super) fn start(overlay: Overlay, id: &str) -> io::Result<Self> {
         let run = uuid::Uuid::parse_str(id).map_err(io::Error::other)?;
-        if run.to_string() != id {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-        let (_group, socket) = platform::prepare_nfs_socket(id)?;
+        let socket = platform::nfs_socket(id).ok_or(io::ErrorKind::InvalidInput)?;
         let directory = socket.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        let mut bound = false;
+        DirBuilder::new().mode(0o700).create(directory)?;
         let setup = (|| {
             let listener = StdListener::bind(&socket)?;
-            bound = true;
             listener.set_nonblocking(true)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -99,7 +88,6 @@ impl Session {
                     result
                 })?;
             Ok(Self {
-                source: platform::nfs_mount_source(&socket),
                 shutdown: Some(shutdown),
                 server: Some(server),
                 failed,
@@ -107,15 +95,14 @@ impl Session {
             })
         })();
         if setup.is_err() {
-            if bound {
-                let _ = fs::remove_file(&socket);
-            }
+            let _ = fs::remove_file(&socket);
             let _ = fs::remove_dir(directory);
         }
         setup
     }
 
-    fn mount_command(&self, path: &Path, policy: WritePolicy) -> Command {
+    pub fn mount_command(path: &Path, id: &str, policy: WritePolicy) -> io::Result<Command> {
+        let source = platform::nfs_mount_source(id).ok_or(io::ErrorKind::InvalidInput)?;
         let mut options = String::from(
             "vers=4.1,proto=ticotsord,sec=sys,nocallback,nolocallocks,noquota,retrycnt=1,hard,intr,nodev,nosuid,nobrowse,nonfc,nonamedattr,noacl,nordirplus",
         );
@@ -125,22 +112,8 @@ impl Session {
             options.push_str(",noac,nonegnamecache");
         }
         let mut cmd = Command::new("/sbin/mount_nfs");
-        cmd.args(["-o", &options, &self.source]).arg(path);
-        cmd
-    }
-
-    pub fn attach(&self, path: &Path, id: &str, policy: WritePolicy) -> anyhow::Result<()> {
-        #[cfg(feature = "test-metrics")]
-        if std::env::var_os("GIT_ON_TEST_NFS_MOUNT_ERROR").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-        {
-            bail!("test NFS mount failure");
-        }
-        run_mount_helper(self.mount_command(path, policy), || self.failed())?;
-        if !platform::mount_is_ours(path.parent().unwrap(), id, None)? {
-            bail!("NFS mount did not become ready");
-        }
-        Ok(())
+        cmd.args(["-o", &options, &source]).arg(path);
+        Ok(cmd)
     }
 
     pub fn failed(&self) -> bool {
@@ -181,41 +154,6 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.stop();
     }
-}
-
-fn run_mount_helper(mut command: Command, failed: impl Fn() -> bool) -> anyhow::Result<()> {
-    let (mut diagnostic, stderr) = Capture::new(Some(4096))?;
-    let mut child = command
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .context("start mount_nfs")?;
-    drop(command);
-    let wakeup = ChildExitWakeup::new(child.id());
-    let status = (|| loop {
-        if git::cancelled_signal().is_some() || failed() {
-            bail!("NFS mount interrupted or server stopped");
-        }
-        if let Some(status) = child.try_wait().context("wait for mount_nfs")? {
-            return Ok(status);
-        }
-        diagnostic.pump().context("read mount_nfs diagnostics")?;
-        wakeup.wait(Duration::from_millis(10), None, [None, diagnostic.fd()]);
-    })()
-    .inspect_err(|_| {
-        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-        let _ = child.wait();
-    })?;
-    if !status.success() {
-        let message = diagnostic.finish().context("read mount_nfs diagnostics")?;
-        bail!(
-            "mount_nfs returned {status}: {}",
-            String::from_utf8_lossy(&message).trim()
-        );
-    }
-    Ok(())
 }
 
 fn notify_failure(failed: &AtomicBool) {
@@ -367,29 +305,19 @@ async fn write_response(
     let Some(RpcReply { header, body }) = response else {
         return Ok(());
     };
-    let size = header.len() + body.as_ref().map_or(0, |body| body.len());
+    let body = body.as_deref().map_or(&[][..], Vec::as_slice);
+    let size = header.len() + body.len();
     if size > MAX_RECORD {
         return Err(io::Error::other("NFS response exceeds record limit"));
     }
     let record = (0x8000_0000 | size as u32).to_be_bytes();
     tokio::time::timeout(idle, async {
-        let mut parts = body.iter().flat_map(|body| body.segments());
         let mut buffers = [
             IoSlice::new(&record),
             IoSlice::new(&header),
-            IoSlice::new(parts.next().unwrap_or_default()),
-            IoSlice::new(parts.next().unwrap_or_default()),
-            IoSlice::new(parts.next().unwrap_or_default()),
+            IoSlice::new(body),
         ];
-        let mut extra;
-        let mut pending = if let Some(part) = parts.next() {
-            extra = buffers.to_vec();
-            extra.push(IoSlice::new(part));
-            extra.extend(parts.map(IoSlice::new));
-            extra.as_mut_slice()
-        } else {
-            &mut buffers[..if body.is_some() { 5 } else { 2 }]
-        };
+        let mut pending = &mut buffers[..if body.is_empty() { 2 } else { 3 }];
         while !pending.is_empty() {
             let written = output.write_vectored(pending).await?;
             if written == 0 {

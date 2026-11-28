@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     let snapshot = match loaded {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(cleanup) = git_on::remote::stop_run_connection(run.path()) {
+            if let Err(cleanup) = git_on::remote::stop_connection(&run.path().join("ssh-control")) {
                 let retained = run.keep();
                 return Err(anyhow::anyhow!(
                     "{error:#}; shutdown: {cleanup:#}; probe recovery retained at {}",

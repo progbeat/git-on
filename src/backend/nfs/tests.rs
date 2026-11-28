@@ -13,20 +13,6 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
-#[test]
-fn mount_helper_captures_diagnostics_without_a_file() {
-    let mut command = std::process::Command::new("/bin/sh");
-    command.args([
-        "-c",
-        "test ! -f /dev/fd/2 || exit 9; head -c 131072 /dev/zero >&2; printf 'mount failure\n' >&2; exit 3",
-    ]);
-    let message = super::run_mount_helper(command, || false)
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("exit status: 3"));
-    assert!(message.ends_with("mount failure"));
-}
-
 pub(super) fn fixture(policy: WritePolicy) -> (tempfile::TempDir, Server) {
     let directory = tempfile::tempdir().unwrap();
     let repo = git2::Repository::init(directory.path()).unwrap();
@@ -105,87 +91,6 @@ pub(super) fn results(reply: &[u8], expected: u32, count: u32) -> Reader<'_> {
 
 fn session(server: &mut Server) -> [u8; 16] {
     session_with(server, call)
-}
-
-#[test]
-fn readlink_keeps_the_target_in_a_separate_reply_segment() {
-    let (_directory, mut server) = fixture(WritePolicy::All);
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-    let target = b"tracked";
-    server
-        .core
-        .create_node(
-            1,
-            "link".as_ref(),
-            crate::backend::FileType::Symlink,
-            0o777,
-            uid,
-            gid,
-            target.to_vec(),
-        )
-        .unwrap();
-    let session = session(&mut server);
-    let ops = xdr(|w| {
-        sequence(w, &session, 1, 0, 3);
-        w.u32(24); // PUTROOTFH
-        w.u32(15); // LOOKUP
-        w.opaque(b"link");
-        w.u32(27); // READLINK
-    });
-    let reply = server.rpc_after_demand(&call(3, 4, &ops), None).unwrap();
-    assert_eq!(
-        reply.body.as_ref().unwrap().segments().nth(1),
-        Some(target.as_slice())
-    );
-    let reply = reply.into_bytes();
-    let mut r = results(&reply, OK, 4);
-    stat(&mut r, 53, OK);
-    r.take(36).unwrap();
-    stat(&mut r, 24, OK);
-    stat(&mut r, 15, OK);
-    stat(&mut r, 27, OK);
-    assert_eq!(r.opaque(255).unwrap(), target);
-    r.finish().unwrap();
-}
-
-#[test]
-fn compound_read_keeps_both_cached_ranges_in_the_reply() {
-    let (_directory, mut server) = fixture(WritePolicy::None);
-    let ino = server.core.lookup_inode(1, "tracked".as_ref()).unwrap();
-    let cached = server.core.read_without_handle(ino, 0, 13).unwrap();
-    let session = session(&mut server);
-    let ops = xdr(|w| {
-        sequence(w, &session, 1, 0, 3);
-        lookup_tracked(w);
-        for (offset, size) in [(0, 3), (8, 5)] {
-            w.u32(25); // READ
-            StateId::READ_BYPASS.encode(w);
-            w.u64(offset);
-            w.u32(size);
-        }
-    });
-    let reply = server.rpc_after_demand(&call(3, 5, &ops), None).unwrap();
-    let segments: Vec<_> = reply.body.as_ref().unwrap().segments().collect();
-    assert_eq!(segments[1].as_ptr(), cached.as_ptr());
-    assert_eq!(
-        segments.get(3).map(|data| data.as_ptr()),
-        Some(cached[8..].as_ptr())
-    );
-    assert_eq!(segments[1], &cached[..3]);
-    assert_eq!(segments[3], &cached[8..]);
-    let reply = reply.into_bytes();
-    let mut r = results(&reply, OK, 5);
-    stat(&mut r, 53, OK);
-    r.take(36).unwrap();
-    stat(&mut r, 24, OK);
-    stat(&mut r, 15, OK);
-    for (data, eof) in [(&cached[..3], false), (&cached[8..], true)] {
-        stat(&mut r, 25, OK);
-        assert_eq!(r.boolean().unwrap(), eof);
-        assert_eq!(r.opaque(13).unwrap(), data);
-    }
-    r.finish().unwrap();
 }
 
 pub(super) fn session_with(

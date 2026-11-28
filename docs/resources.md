@@ -6,9 +6,8 @@ Each invocation owns its prepared objects and temporary storage. Mounted runs
 share a 16 MiB LRU for complete blobs up to 64 KiB and authenticated blocks read
 from spills. Each entry is charged by allocation capacity plus 512 bytes.
 A separate LRU retains the eight most recently used complete large blobs.
-This budget counts objects. Eight 32 MiB blobs can retain 256 MiB of payload,
-so the working set needs enough RAM for the large blobs it keeps resident.
-Active read buffers and decoder allocations are accounted separately.
+Readers of one OID share a resident buffer. Active read buffers and decoder
+allocations are accounted separately.
 
 An additional 16 MiB LRU holds compressed copies of unrequested remote delta
 bases that might be needed later. Entries are charged by allocation capacity
@@ -28,11 +27,8 @@ readable and the failed remote read can be retried once space is available.
 
 Reads from a whole resident blob hold the cached buffer until the reply has
 consumed the requested range. The FUSE reply sends that range directly.
-On first access to a packed local blob, libgit2 normally returns a full
-decoded buffer. With the audited libgit2 build, the cache owns that buffer
-and reads borrow ranges from it. Embeddings without the audited startup
-policy verify and import the bytes into their own buffer. Objects unavailable
-through libgit2 use native `git cat-file` in the source repository.
+For large packed local blobs without a libgit2 reader, the existing native
+batch reader streams the verified data into the cache.
 
 Mounted HTTPS reads decode responses outside the network dispatcher. A large
 victim stays readable in memory while its spill is written. Independent
@@ -60,11 +56,6 @@ The wholly readonly `none` policy permits kernel directory-page caching on FUSE
 ABI 7.28 and later. Mutable policies keep directory contents live. Cached pages
 cover enumerated directories and do not preload leaf contents or subtrees.
 
-An NFS READ response can send a slice directly from a verified blob. NFS keeps
-the last response for each session slot so it can answer duplicates. If retaining
-the shared backing allocation would exceed the slot's replay budget, Git-on
-copies the response bytes into compact replay storage.
-
 ## Files and temporary disk space
 
 Raw backing uses one file per spilled original object. The store shares one
@@ -81,7 +72,7 @@ recovery contract.
 
 The copy backend writes verified local data into the private execution tree.
 For a network source it requests a shallow pack for the selected revision.
-Copy uses the same small-blob and large-blob caches as mounting.
+A 128 MiB payload LRU retains verified blobs until materialization consumes them.
 An evicted file's backing can be transferred into the visible tree within the
 same private run. Git-on checks the installed file and its block digests before
 launching the command.
