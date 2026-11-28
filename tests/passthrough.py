@@ -26,6 +26,7 @@ with tempfile.TemporaryDirectory() as scratch:
     (repo/'.gitignore').write_text('out/\n')
     (repo/'program.c').write_text('#include <stdio.h>\nint main(void) { puts("compiled"); return 0; }\n')
     (repo/'tracked').write_bytes(b'x' * (256 * 1024))
+    (repo/'truncate-first').write_bytes(b'original')
     git('add','.'); git('commit','-qm','fixture')
     code=r'''
 import mmap,os,subprocess,time
@@ -158,11 +159,20 @@ with tracked.open('rb', buffering=0) as reopened:
     assert (attrs.st_atime_ns, attrs.st_mtime_ns) == (stamp, stamp)
     assert os.pread(reopened.fileno(), 7, 0) == b'changed'
     assert os.pread(reopened.fileno(), 1, attrs.st_size - 1) == b'x'
+
+os.truncate('truncate-first', 0)
+truncated = os.open('truncate-first', os.O_RDWR)
+try:
+    assert os.fstat(truncated).st_size == 0
+    assert os.write(truncated, b'new') == 3
+    assert os.pread(truncated, 3, 0) == b'new'
+finally:
+    os.close(truncated)
 '''
     _, tracked = run_case(tracked_code, '--write-policy=all')
     callbacks = tracked['fuse_requests'].get('read', 0)
     if args.expect == 'enabled':
-        assert tracked['passthrough_handles'] == 1 and callbacks == 0, tracked
+        assert tracked['passthrough_handles'] == 2 and callbacks == 0, tracked
     else:
         assert tracked['passthrough_handles'] == 0 and callbacks > 0, tracked
     assert subprocess.check_output(['git','status','--porcelain'],cwd=repo)==b''

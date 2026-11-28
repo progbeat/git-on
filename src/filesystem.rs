@@ -1269,12 +1269,9 @@ impl Overlay {
             return Ok(());
         }
         if size == 0 && node.oid.is_some() {
-            // The new backing is already empty. Opening or duplicating it
-            // after committing would allow EMFILE to report a false failure.
-            self.copy_up(ino, false, |_| Ok(()))?;
-            let attr = &mut self.node_mut(ino)?.attr;
-            attr.mtime = SystemTime::now();
-            attr.ctime = attr.mtime;
+            // Capture the empty backing's timestamps before committing it.
+            let metadata = self.copy_up(ino, false, File::metadata)?;
+            Self::record_data_change(&mut self.node_mut(ino)?.attr, &metadata);
             return Ok(());
         }
         let metadata = self
