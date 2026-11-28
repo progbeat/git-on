@@ -1622,16 +1622,18 @@ const SSH_WRAPPER: &str = r#"git_on_ssh_command() {
         "$executable" -G -F /dev/null -o UseKeychain=no localhost >/dev/null 2>&1; then
         set -- -o UseKeychain=no "$@"
     fi
-    exec "$executable" -o ProxyCommand=none -o "ControlPath=$control_path" -o "ControlMaster=$master" -o "ControlPersist=$persist" -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
+    exec "$executable" -o ProxyCommand=none -o "ControlPath=$control_path" \
+        -o "ControlMaster=$master" -o "ControlPersist=$persist" \
+        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UpdateHostKeys=no \
+        -o AddKeysToAgent=no -o PermitLocalCommand=no -o ClearAllForwardings=yes "$@"
 }"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn apple_ssh_does_not_enable_keychain() {
+    fn direct_ssh_disables_address_recording_and_apple_keychain() {
         let directory = tempfile::tempdir().unwrap();
         let ssh = directory.path().join("ssh");
         fs::write(
@@ -1641,7 +1643,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
         let script = format!(
-            r#"{SSH_WRAPPER}; git_on_git_argc=1; git_on_ssh_command "$0" -o UseKeychain=yes "$@""#
+            r#"{SSH_WRAPPER}; git_on_git_argc=1; git_on_ssh_command "$0" -o CheckHostIP=yes -o UseKeychain=yes "$@""#
         );
         for (mode, portable, keychain_option) in [
             (SshMode::Copy, "", b"UseKeychain=no".as_slice()),
@@ -1655,16 +1657,22 @@ mod tests {
                 .arg("localhost")
                 .env("GIT_ON_SSH_MODE", mode.name())
                 .env("GIT_ON_SSH_CONTROL_PATH", "/tmp/git-on-ssh-config")
-                .env("GIT_ON_SSH_PLATFORM", std::env::consts::OS)
+                .env("GIT_ON_SSH_PLATFORM", "macos")
                 .env("TEST_PORTABLE_SSH", portable)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{:?}", output.stderr);
+            let mut options = output.stdout.split(|byte| *byte == b'\n');
             assert_eq!(
-                output
-                    .stdout
-                    .split(|byte| *byte == b'\n')
-                    .find(|line| line.starts_with(b"UseKeychain=")),
+                options
+                    .clone()
+                    .find(|line| line.starts_with(b"CheckHostIP=")),
+                Some(b"CheckHostIP=no".as_slice()),
+                "unexpected first CheckHostIP option in {} mode",
+                mode.name()
+            );
+            assert_eq!(
+                options.find(|line| line.starts_with(b"UseKeychain=")),
                 Some(keychain_option),
                 "unexpected first UseKeychain option in {} mode",
                 mode.name()

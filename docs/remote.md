@@ -57,7 +57,8 @@ input for read-only lookup.
 After launching the command, credential lookup runs without interactive prompts.
 Git-on does not ask credential helpers to store or erase credentials. SSH uses
 OpenSSH's configured identity and agent and requires a previously trusted host
-key. Host-key files and the agent's identity list stay unchanged.
+key. The additional IP-address lookup and recording are disabled
+(`CheckHostIP=no`). Host-key files and the agent's identity list stay unchanged.
 On macOS, Git-on disables Apple OpenSSH's `UseKeychain` setting, which
 controls both looking up and saving a passphrase. An encrypted key can still
 be used through the agent or by entering its passphrase.
